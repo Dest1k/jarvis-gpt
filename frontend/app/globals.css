@@ -443,7 +443,9 @@ h3 {
 }
 
 .taskControls button,
-.memoryForm button {
+.memoryForm button,
+.fileForm button,
+.fileSearchForm button {
   display: grid;
   place-items: center;
   width: 28px;
@@ -455,7 +457,9 @@ h3 {
 }
 
 .taskControls button:hover,
-.memoryForm button:hover {
+.memoryForm button:hover,
+.fileForm button:hover,
+.fileSearchForm button:hover {
   border-color: var(--teal);
   color: var(--teal);
 }
@@ -511,7 +515,10 @@ h3 {
 }
 
 .toolList,
-.memoryList {
+.memoryList,
+.fileList,
+.fileMatches,
+.auditList {
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -542,14 +549,22 @@ h3 {
   background: var(--surface-2);
 }
 
-.memoryForm {
+.memoryForm,
+.fileForm,
+.fileSearchForm {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 32px;
   gap: 8px;
   padding: 12px 12px 0;
 }
 
-.memoryForm input {
+.fileSearchForm {
+  padding-top: 8px;
+}
+
+.memoryForm input,
+.fileForm input,
+.fileSearchForm input {
   min-width: 0;
   height: 32px;
   border: 1px solid var(--line);
@@ -560,9 +575,17 @@ h3 {
   outline: none;
 }
 
-.memoryForm input:focus {
+.memoryForm input:focus,
+.fileForm input:focus,
+.fileSearchForm input:focus {
   border-color: var(--teal);
   box-shadow: 0 0 0 3px rgba(13, 118, 111, 0.12);
+}
+
+.fileForm input[type="file"] {
+  padding: 4px 8px;
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .memoryRow {
@@ -587,6 +610,123 @@ h3 {
   font-size: 12px;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 3;
+}
+
+.fileRow {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) 34px 54px;
+  gap: 8px;
+  align-items: center;
+  min-height: 34px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.fileRow svg {
+  color: var(--graphite);
+}
+
+.fileRow.indexed svg {
+  color: var(--teal);
+}
+
+.fileRow strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink);
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fileRow span {
+  display: grid;
+  place-items: center;
+  min-width: 28px;
+  height: 22px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--graphite);
+}
+
+.fileRow small {
+  overflow: hidden;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fileMatches {
+  padding-top: 0;
+}
+
+.fileMatch {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 10px;
+  background: #ffffff;
+}
+
+.fileMatch div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.fileMatch strong {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fileMatch span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.fileMatch p {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 4;
+}
+
+.auditRow {
+  display: grid;
+  grid-template-columns: 18px minmax(86px, 0.42fr) minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  min-height: 34px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.auditRow svg {
+  color: var(--teal);
+}
+
+.auditRow strong,
+.auditRow p {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.auditRow strong {
+  color: var(--ink);
+  font-weight: 650;
+}
+
+.auditRow span {
+  font-variant-numeric: tabular-nums;
 }
 
 .emptyState {

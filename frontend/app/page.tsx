@@ -6,15 +6,19 @@ import {
   CheckCircle2,
   ClipboardCheck,
   Database,
+  FileText,
+  History,
   Loader2,
   MessageSquare,
   Play,
   RefreshCw,
   Save,
+  Search,
   Send,
   Server,
   ShieldAlert,
   Sparkles,
+  Upload,
   Wrench
 } from "lucide-react";
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
@@ -81,6 +85,43 @@ type MemoryItem = {
   rank?: number | null;
 };
 
+type FileItem = {
+  id: string;
+  name: string;
+  source_path?: string | null;
+  stored_path: string;
+  mime_type: string;
+  size: number;
+  sha256: string;
+  status: string;
+  error?: string | null;
+  chunk_count: number;
+  created_at: string;
+  updated_at: string;
+};
+
+type FileChunkHit = {
+  file_id: string;
+  file_name: string;
+  chunk_id: string;
+  position: number;
+  content: string;
+  created_at: string;
+  rank?: number | null;
+};
+
+type AuditEntry = {
+  id: string;
+  ts: string;
+  actor: string;
+  action: string;
+  target_type: string;
+  target_id?: string | null;
+  summary: string;
+  before: Record<string, unknown>;
+  after: Record<string, unknown>;
+};
+
 type ToolInfo = {
   name: string;
   description: string;
@@ -119,8 +160,13 @@ export default function CommandCenter() {
   const [diagnostics, setDiagnostics] = useState<DiagnosticCheck[]>([]);
   const [tools, setTools] = useState<ToolInfo[]>([]);
   const [memories, setMemories] = useState<MemoryItem[]>([]);
+  const [files, setFiles] = useState<FileItem[]>([]);
+  const [fileHits, setFileHits] = useState<FileChunkHit[]>([]);
+  const [audit, setAudit] = useState<AuditEntry[]>([]);
   const [input, setInput] = useState("");
   const [memoryDraft, setMemoryDraft] = useState("");
+  const [fileQuery, setFileQuery] = useState("");
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [lines, setLines] = useState<ChatLine[]>([
     {
@@ -134,16 +180,21 @@ export default function CommandCenter() {
   const refresh = useCallback(async () => {
     try {
       setError(null);
-      const [statusData, missionData, toolData, memoryData] = await Promise.all([
-        api<RuntimeStatus>("/api/status"),
-        api<Mission[]>("/api/missions"),
-        api<ToolInfo[]>("/api/tools"),
-        api<MemoryItem[]>("/api/memory?limit=8")
-      ]);
+      const [statusData, missionData, toolData, memoryData, fileData, auditData] =
+        await Promise.all([
+          api<RuntimeStatus>("/api/status"),
+          api<Mission[]>("/api/missions"),
+          api<ToolInfo[]>("/api/tools"),
+          api<MemoryItem[]>("/api/memory?limit=8"),
+          api<FileItem[]>("/api/files?limit=8"),
+          api<AuditEntry[]>("/api/audit?limit=8")
+        ]);
       setStatus(statusData);
       setMissions(missionData);
       setTools(toolData);
       setMemories(memoryData);
+      setFiles(fileData);
+      setAudit(auditData);
       if (statusData.health.length) {
         setDiagnostics(statusData.health);
       }
@@ -285,6 +336,60 @@ export default function CommandCenter() {
     }
   }
 
+  async function uploadSelectedFile(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!selectedFile || busy) return;
+    const form = event.currentTarget;
+    const formData = new FormData();
+    formData.append("file", selectedFile);
+    setBusy(true);
+    try {
+      const response = await fetch(`${API_URL}/api/files/upload`, {
+        method: "POST",
+        body: formData
+      });
+      if (!response.ok) {
+        throw new Error(`${response.status} ${response.statusText}`);
+      }
+      const result = (await response.json()) as { file: FileItem; chunks_indexed: number };
+      setSelectedFile(null);
+      form.reset();
+      setFiles((current) => [result.file, ...current].slice(0, 8));
+      setLines((current) => [
+        ...current,
+        {
+          role: "system",
+          content: `Файл загружен: ${result.file.name} (${result.chunks_indexed} chunks)`
+        }
+      ]);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "File upload failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function searchFileChunks(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const query = fileQuery.trim();
+    if (!query) {
+      setFileHits([]);
+      return;
+    }
+    setBusy(true);
+    try {
+      const hits = await api<FileChunkHit[]>(
+        `/api/files/search?q=${encodeURIComponent(query)}&limit=6`
+      );
+      setFileHits(hits);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "File search failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <main className="shell">
       <aside className="rail" aria-label="Навигация">
@@ -300,8 +405,14 @@ export default function CommandCenter() {
         <IconButton label="Память">
           <Database size={20} />
         </IconButton>
+        <IconButton label="Файлы">
+          <FileText size={20} />
+        </IconButton>
         <IconButton label="Диагностика">
           <Activity size={20} />
+        </IconButton>
+        <IconButton label="Audit">
+          <History size={20} />
         </IconButton>
       </aside>
 
@@ -350,9 +461,9 @@ export default function CommandCenter() {
             tone="neutral"
           />
           <StatusTile
-            icon={<Activity size={19} />}
-            label="Миссии"
-            value={`${counters.missions ?? 0}`}
+            icon={<FileText size={19} />}
+            label="Файлы"
+            value={`${counters.files ?? 0}`}
             tone="neutral"
           />
         </section>
@@ -479,6 +590,55 @@ export default function CommandCenter() {
             </div>
 
             <div className="panelHeader lower">
+              <h2>Файлы</h2>
+              <span>{files.length}</span>
+            </div>
+            <form className="fileForm" onSubmit={uploadSelectedFile}>
+              <input
+                type="file"
+                aria-label="Файл"
+                onChange={(event) => setSelectedFile(event.currentTarget.files?.[0] ?? null)}
+              />
+              <button type="submit" disabled={busy || !selectedFile} title="Загрузить">
+                {busy && selectedFile ? <Loader2 className="spin" size={15} /> : <Upload size={15} />}
+              </button>
+            </form>
+            <form className="fileSearchForm" onSubmit={searchFileChunks}>
+              <input
+                value={fileQuery}
+                onChange={(event) => setFileQuery(event.target.value)}
+                placeholder="Поиск по файлам"
+                aria-label="Поиск по файлам"
+              />
+              <button type="submit" disabled={busy || !fileQuery.trim()} title="Найти">
+                <Search size={15} />
+              </button>
+            </form>
+            <div className="fileList">
+              {files.slice(0, 5).map((file) => (
+                <div className={`fileRow ${file.status}`} key={file.id}>
+                  <FileText size={14} />
+                  <strong>{file.name}</strong>
+                  <span>{file.chunk_count}</span>
+                  <small>{formatBytes(file.size)}</small>
+                </div>
+              ))}
+            </div>
+            {fileHits.length > 0 && (
+              <div className="fileMatches">
+                {fileHits.slice(0, 4).map((hit) => (
+                  <article className="fileMatch" key={hit.chunk_id}>
+                    <div>
+                      <strong>{hit.file_name}</strong>
+                      <span>#{hit.position}</span>
+                    </div>
+                    <p>{hit.content}</p>
+                  </article>
+                ))}
+              </div>
+            )}
+
+            <div className="panelHeader lower">
               <h2>Память</h2>
               <span>{memories.length}</span>
             </div>
@@ -499,6 +659,21 @@ export default function CommandCenter() {
                   <strong>{memory.namespace}</strong>
                   <p>{memory.content}</p>
                 </article>
+              ))}
+            </div>
+
+            <div className="panelHeader lower">
+              <h2>Audit</h2>
+              <span>{audit.length}</span>
+            </div>
+            <div className="auditList">
+              {audit.slice(0, 6).map((entry) => (
+                <div className="auditRow" key={entry.id}>
+                  <History size={14} />
+                  <strong>{entry.action}</strong>
+                  <p>{entry.summary}</p>
+                  <span>{entry.ts.slice(11, 19)}</span>
+                </div>
               ))}
             </div>
           </section>
@@ -539,4 +714,10 @@ function StatusTile({
       <strong>{value}</strong>
     </article>
   );
+}
+
+function formatBytes(size: number) {
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${Math.round(size / 1024)} KB`;
+  return `${(size / 1024 / 1024).toFixed(1)} MB`;
 }

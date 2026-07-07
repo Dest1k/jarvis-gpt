@@ -22,6 +22,10 @@ py -3.11 .\jarvis.py diag
 py -3.11 .\jarvis.py chat "JARVIS, оформи это как mission plan: ..."
 py -3.11 .\jarvis.py tools
 py -3.11 .\jarvis.py tool-run memory.search --set query=runtime --set limit=5
+py -3.11 .\jarvis.py ingest README.md
+py -3.11 .\jarvis.py files
+py -3.11 .\jarvis.py file-search Jarvis --limit 5
+py -3.11 .\jarvis.py audit
 py -3.11 .\jarvis.py mission-next <mission_id>
 py -3.11 .\jarvis.py serve --reload
 ```
@@ -38,6 +42,11 @@ POST /api/missions/{mission_id}/execute-next
 PATCH /api/missions/{mission_id}/tasks/{task_id}
 GET  /api/memory
 POST /api/memory
+GET  /api/files
+POST /api/files/upload
+GET  /api/files/search
+GET  /api/files/{file_id}
+GET  /api/audit
 GET  /api/tools
 POST /api/tools/{tool_name}/run
 GET  /api/tool-runs
@@ -53,6 +62,12 @@ SQLite хранится в:
 D:\jarvis\data\jarvis-gpt\state\jarvis.sqlite3
 ```
 
+Файлы, загруженные через Command Center или CLI, копируются в:
+
+```text
+D:\jarvis\data\jarvis-gpt\files
+```
+
 Сейчас схема покрывает:
 
 - `conversations`
@@ -60,8 +75,11 @@ D:\jarvis\data\jarvis-gpt\state\jarvis.sqlite3
 - `memories`
 - `missions`
 - `mission_tasks`
+- `files`
+- `file_chunks`
 - `runtime_events`
 - `health_snapshots`
 - `tool_runs`
+- `audit_log`
 
-Если SQLite собран с FTS5, память дополнительно индексируется в `memories_fts`. Если FTS5 нет, поиск автоматически деградирует до `LIKE`.
+Если SQLite собран с FTS5, память индексируется в `memories_fts`, а файловые чанки — в `file_chunks_fts`. Если FTS5 нет, поиск автоматически деградирует до `LIKE`.

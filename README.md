@@ -4,13 +4,15 @@
 
 ## Что уже есть
 
-- FastAPI backend с `/health`, `/api/status`, `/api/chat`, `/api/missions`, `/api/memory`, `/api/diagnostics`.
+- FastAPI backend с `/health`, `/api/status`, `/api/chat`, `/api/missions`, `/api/memory`, `/api/files`, `/api/audit`, `/api/diagnostics`.
 - Offline-first агент: сохраняет диалоги, создаёт mission plans и деградирует корректно, если локальная LLM не поднята.
 - Safe tools runtime: диагностика, статус, память, файловое чтение в разрешённых корнях и execution brief для миссий.
+- File ingestion: загрузка текстовых файлов, хранение в `D:\jarvis\data\jarvis-gpt\files`, chunk search и audit trail.
 - Исполнение следующего шага mission plan с прогрессом задач и журналом tool runs.
 - SQLite WAL-хранилище в `D:\jarvis\data\jarvis-gpt\state\jarvis.sqlite3`.
 - Два runtime-профиля: `gemma4-mono` и `gemma4-turbo`.
 - Next.js Command Center: чат, статус runtime, миссии и диагностика.
+- Command Center показывает файлы, поиск по чанкам, ручную память, tools и audit stream.
 - CLI `py -3.11 .\jarvis.py ...` и Docker Compose для повторяемого запуска.
 
 ## Быстрый старт
@@ -50,6 +52,7 @@ D:\jarvis\
     jarvis-gpt\
   data\
     jarvis-gpt\
+      files\
       state\
         jarvis.sqlite3
   logs\
@@ -66,6 +69,9 @@ py -3.11 .\jarvis.py --profile gemma4-mono serve
 py -3.11 .\jarvis.py --profile gemma4-turbo serve
 py -3.11 .\jarvis.py tools
 py -3.11 .\jarvis.py tool-run memory.search --set query=runtime --set limit=5
+py -3.11 .\jarvis.py ingest README.md
+py -3.11 .\jarvis.py file-search Jarvis
+py -3.11 .\jarvis.py audit
 py -3.11 .\jarvis.py mission-next <mission_id>
 ```
 
@@ -84,6 +90,6 @@ docker compose up --build
 
 1. Подключить полноценный OpenAI-compatible Gemma dispatcher.
 2. Расширить tools runtime: host bridge, sandbox, browser, web, Docker.
-3. Развернуть cognitive core: audit, RAG-ingestion, richer project tasks, health snapshots.
+3. Развернуть cognitive core: richer project tasks, retrieval ranking, health snapshots.
 4. Добавить HITL-gates для опасных действий.
 5. Подключить voice/PWA слой после стабилизации текстового runtime.

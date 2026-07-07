@@ -16,6 +16,8 @@ Agent Runtime
   |-- mission planner
   |-- safe tools registry
   |-- memory lookup
+  |-- file ingestion and chunk search
+  |-- audit trail
   |-- task lifecycle
   |-- diagnostics
   |-- event stream
@@ -40,6 +42,8 @@ External host runtime
 - UI видит явные состояния: success, warn, error, mission, event.
 - LLM является заменяемым маршрутом, а не фундаментом всей системы.
 - Опасные действия не входят в safe tools layer; shell/host control появятся только через HITL-gates.
+- Файлы попадают в runtime-хранилище через upload/CLI, а агент читает только индексированные чанки через safe tools.
+- Audit log фиксирует изменения памяти, миссий, task lifecycle, tool runs и ingestion.
 
 ## Runtime profiles
 

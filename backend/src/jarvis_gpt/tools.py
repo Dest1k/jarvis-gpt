@@ -164,6 +164,24 @@ class ToolRegistry:
         )
         self.add(
             ToolSpec(
+                name="files.list",
+                description="List files that were uploaded or indexed into local runtime storage.",
+                category="memory",
+                input_schema={"limit": "Maximum results"},
+                handler=_files_list,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="files.search",
+                description="Search indexed file chunks for local project context.",
+                category="memory",
+                input_schema={"query": "Text query", "limit": "Maximum chunk hits"},
+                handler=_files_search,
+            )
+        )
+        self.add(
+            ToolSpec(
                 name="mission.brief",
                 description="Produce a deterministic execution brief for a mission task.",
                 category="mission",
@@ -259,10 +277,40 @@ def _memory_save(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     )
 
 
+def _files_list(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    limit = _int_arg(args.get("limit"), default=10, minimum=1, maximum=50)
+    files = ctx.storage.list_files(limit=limit)
+    return ToolRunResponse(
+        tool="files.list",
+        ok=True,
+        summary=f"Listed {len(files)} file(s).",
+        data={"files": files, "limit": limit},
+    )
+
+
+def _files_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    query = str(args.get("query") or "").strip()
+    if not query:
+        return ToolRunResponse(
+            tool="files.search",
+            ok=False,
+            summary="File search query is required.",
+        )
+    limit = _int_arg(args.get("limit"), default=8, minimum=1, maximum=30)
+    hits = ctx.storage.search_file_chunks(query, limit=limit)
+    return ToolRunResponse(
+        tool="files.search",
+        ok=True,
+        summary=f"File search returned {len(hits)} chunk(s).",
+        data={"hits": hits, "query": query, "limit": limit},
+    )
+
+
 def _mission_brief(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     goal = str(args.get("goal") or "").strip()
     task_title = str(args.get("task_title") or "").strip()
     memory = ctx.storage.search_memory(f"{goal} {task_title}".strip(), limit=5)
+    file_hits = ctx.storage.search_file_chunks(f"{goal} {task_title}".strip(), limit=5)
     brief = {
         "goal": goal,
         "task_title": task_title,
@@ -272,6 +320,7 @@ def _mission_brief(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
             "then refresh mission progress."
         ),
         "memory_hits": memory,
+        "file_hits": file_hits,
     }
     return ToolRunResponse(
         tool="mission.brief",

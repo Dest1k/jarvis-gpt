@@ -84,6 +84,48 @@ class MemoryItem(BaseModel):
     rank: float | None = None
 
 
+class FileItem(BaseModel):
+    id: str
+    name: str
+    source_path: str | None = None
+    stored_path: str
+    mime_type: str
+    size: int
+    sha256: str
+    status: str
+    error: str | None = None
+    chunk_count: int
+    created_at: str
+    updated_at: str
+
+
+class FileChunkHit(BaseModel):
+    file_id: str
+    file_name: str
+    chunk_id: str
+    position: int
+    content: str
+    created_at: str
+    rank: float | None = None
+
+
+class FileIngestResponse(BaseModel):
+    file: FileItem
+    chunks_indexed: int
+
+
+class AuditEntry(BaseModel):
+    id: str
+    ts: str
+    actor: str
+    action: str
+    target_type: str
+    target_id: str | None = None
+    summary: str
+    before: dict[str, Any] = Field(default_factory=dict)
+    after: dict[str, Any] = Field(default_factory=dict)
+
+
 class ToolInfo(BaseModel):
     name: str
     description: str

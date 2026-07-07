@@ -3,18 +3,23 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from .agent import AgentRuntime
 from .config import ensure_runtime_dirs, load_settings
 from .diagnostics import run_diagnostics
 from .event_bus import EventBus
+from .ingest import FileIngestor
 from .llm import LLMRouter
 from .models import (
+    AuditEntry,
     ChatRequest,
     ChatResponse,
     DiagnosticsResponse,
+    FileChunkHit,
+    FileIngestResponse,
+    FileItem,
     MemoryCreateRequest,
     MemoryItem,
     Mission,
@@ -39,12 +44,14 @@ async def lifespan(app: FastAPI):
     llm = LLMRouter(settings)
     bus = EventBus()
     agent = AgentRuntime(settings=settings, storage=storage, llm=llm, bus=bus)
+    ingestor = FileIngestor(settings=settings, storage=storage)
 
     app.state.settings = settings
     app.state.storage = storage
     app.state.llm = llm
     app.state.bus = bus
     app.state.agent = agent
+    app.state.ingestor = ingestor
     storage.add_event(kind="runtime.start", title="JARVIS GPT backend started")
     try:
         yield
@@ -170,6 +177,61 @@ async def add_memory(request: MemoryCreateRequest) -> MemoryItem:
         namespace=request.namespace,
         tags=request.tags,
         importance=request.importance,
+    )
+
+
+@app.get("/api/files", response_model=list[FileItem])
+async def list_files(limit: int = Query(default=25, ge=1, le=200)) -> list[FileItem]:
+    return app.state.storage.list_files(limit=limit)
+
+
+@app.post("/api/files/upload", response_model=FileIngestResponse)
+async def upload_file(file: UploadFile = File(...)) -> FileIngestResponse:
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Filename is required")
+    try:
+        result = app.state.ingestor.ingest_upload(file.filename, file.file)
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        await file.close()
+    await app.state.bus.publish(
+        {
+            "channel": "files",
+            "event": "uploaded",
+            "file_id": result["file"]["id"],
+            "chunks_indexed": result["chunks_indexed"],
+        }
+    )
+    return result
+
+
+@app.get("/api/files/search", response_model=list[FileChunkHit])
+async def search_files(
+    q: str = Query(min_length=1, max_length=500),
+    limit: int = Query(default=12, ge=1, le=50),
+) -> list[FileChunkHit]:
+    return app.state.storage.search_file_chunks(q, limit=limit)
+
+
+@app.get("/api/files/{file_id}", response_model=FileItem)
+async def get_file(file_id: str) -> FileItem:
+    item = app.state.storage.get_file(file_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="File not found")
+    return item
+
+
+@app.get("/api/audit", response_model=list[AuditEntry])
+async def list_audit(
+    limit: int = Query(default=25, ge=1, le=200),
+    target_type: str | None = Query(default=None, max_length=80),
+    target_id: str | None = Query(default=None, max_length=120),
+) -> list[AuditEntry]:
+    return app.state.storage.list_audit(
+        limit=limit,
+        target_type=target_type,
+        target_id=target_id,
     )
 
 

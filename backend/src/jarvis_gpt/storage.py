@@ -44,7 +44,8 @@ class JarvisStorage:
         self.database_path = database_path
         self._lock = threading.RLock()
         self._conn: sqlite3.Connection | None = None
-        self._fts_available = False
+        self._memory_fts_available = False
+        self._file_fts_available = False
 
     def connect(self) -> sqlite3.Connection:
         if self._conn is None:
@@ -64,7 +65,8 @@ class JarvisStorage:
         with self._lock:
             conn = self.connect()
             conn.executescript(SCHEMA)
-            self._fts_available = self._ensure_memory_fts(conn)
+            self._memory_fts_available = self._ensure_memory_fts(conn)
+            self._file_fts_available = self._ensure_file_chunks_fts(conn)
             conn.commit()
 
     def _ensure_memory_fts(self, conn: sqlite3.Connection) -> bool:
@@ -86,6 +88,25 @@ class JarvisStorage:
         except sqlite3.OperationalError:
             return False
 
+    def _ensure_file_chunks_fts(self, conn: sqlite3.Connection) -> bool:
+        try:
+            conn.execute(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS file_chunks_fts
+                USING fts5(file_id UNINDEXED, chunk_id UNINDEXED, content)
+                """
+            )
+            conn.execute("DELETE FROM file_chunks_fts")
+            conn.execute(
+                """
+                INSERT INTO file_chunks_fts(file_id, chunk_id, content)
+                SELECT file_id, id, content FROM file_chunks
+                """
+            )
+            return True
+        except sqlite3.OperationalError:
+            return False
+
     def ping(self) -> bool:
         with self._lock:
             self.connect().execute("SELECT 1").fetchone()
@@ -98,7 +119,10 @@ class JarvisStorage:
             "memories",
             "missions",
             "mission_tasks",
+            "files",
+            "file_chunks",
             "tool_runs",
+            "audit_log",
         ]
         with self._lock:
             conn = self.connect()
@@ -238,7 +262,7 @@ class JarvisStorage:
                 """,
                 {**row, "tags": _json(row["tags"])},
             )
-            if self._fts_available:
+            if self._memory_fts_available:
                 conn.execute(
                     """
                     INSERT INTO memories_fts(id, namespace, content, tags)
@@ -247,10 +271,18 @@ class JarvisStorage:
                     (row["id"], row["namespace"], row["content"], _json(row["tags"])),
                 )
             conn.commit()
+        self.record_audit(
+            actor="system",
+            action="memory.create",
+            target_type="memory",
+            target_id=row["id"],
+            summary=f"Memory saved in namespace {row['namespace']}.",
+            after=row,
+        )
         return row
 
     def search_memory(self, query: str | None = None, limit: int = 25) -> list[dict[str, Any]]:
-        if query and self._fts_available:
+        if query and self._memory_fts_available:
             match = _fts_query(query)
             if match:
                 try:
@@ -324,6 +356,14 @@ class JarvisStorage:
         mission = self.get_mission(mission_id)
         if mission is None:
             raise RuntimeError("Mission was not persisted")
+        self.record_audit(
+            actor="system",
+            action="mission.create",
+            target_type="mission",
+            target_id=mission_id,
+            summary=f"Mission created: {mission['title']}",
+            after=mission,
+        )
         return mission
 
     def list_missions(self, limit: int = 50) -> list[dict[str, Any]]:
@@ -393,6 +433,7 @@ class JarvisStorage:
             ).fetchone()
             if existing is None:
                 return None
+            before = dict(existing)
             next_title = title if title is not None else existing["title"]
             next_status = status if status is not None else existing["status"]
             next_notes = notes if notes is not None else existing["notes"]
@@ -414,7 +455,18 @@ class JarvisStorage:
                 """,
                 (task_id,),
             ).fetchone()
-        return dict(row) if row else None
+        updated = dict(row) if row else None
+        if updated:
+            self.record_audit(
+                actor="system",
+                action="mission.task.update",
+                target_type="mission_task",
+                target_id=task_id,
+                summary=f"Task status is {updated['status']}: {updated['title']}",
+                before=before,
+                after=updated,
+            )
+        return updated
 
     def list_mission_tasks(self, mission_id: str) -> list[dict[str, Any]]:
         with self._lock:
@@ -472,7 +524,16 @@ class JarvisStorage:
                 ),
             )
             self.connect().commit()
-        return {**row, "ok": bool(row["ok"])}
+        result = {**row, "ok": bool(row["ok"])}
+        self.record_audit(
+            actor="agent",
+            action="tool.run",
+            target_type="tool_run",
+            target_id=row["id"],
+            summary=row["summary"],
+            after=result,
+        )
+        return result
 
     def list_tool_runs(self, limit: int = 50) -> list[dict[str, Any]]:
         with self._lock:
@@ -494,6 +555,255 @@ class JarvisStorage:
             }
             for row in rows
         ]
+
+    def record_audit(
+        self,
+        *,
+        actor: str,
+        action: str,
+        target_type: str,
+        summary: str,
+        target_id: str | None = None,
+        before: dict[str, Any] | None = None,
+        after: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        row = {
+            "id": new_id("aud"),
+            "ts": utc_now(),
+            "actor": actor[:80],
+            "action": action[:120],
+            "target_type": target_type[:80],
+            "target_id": target_id,
+            "summary": summary[:500],
+            "before": before or {},
+            "after": after or {},
+        }
+        with self._lock:
+            self.connect().execute(
+                """
+                INSERT INTO audit_log(
+                    id, ts, actor, action, target_type, target_id, summary, before_json, after_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["id"],
+                    row["ts"],
+                    row["actor"],
+                    row["action"],
+                    row["target_type"],
+                    row["target_id"],
+                    row["summary"],
+                    _json(row["before"]),
+                    _json(row["after"]),
+                ),
+            )
+            self.connect().commit()
+        return row
+
+    def list_audit(
+        self,
+        *,
+        limit: int = 50,
+        target_type: str | None = None,
+        target_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        conditions: list[str] = []
+        params: list[Any] = []
+        if target_type:
+            conditions.append("target_type = ?")
+            params.append(target_type)
+        if target_id:
+            conditions.append("target_id = ?")
+            params.append(target_id)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        params.append(limit)
+        with self._lock:
+            rows = self.connect().execute(
+                f"""
+                SELECT
+                    id, ts, actor, action, target_type, target_id, summary,
+                    before_json, after_json
+                FROM audit_log
+                {where}
+                ORDER BY ts DESC, rowid DESC
+                LIMIT ?
+                """,
+                tuple(params),
+            ).fetchall()
+        return [
+            {
+                "id": row["id"],
+                "ts": row["ts"],
+                "actor": row["actor"],
+                "action": row["action"],
+                "target_type": row["target_type"],
+                "target_id": row["target_id"],
+                "summary": row["summary"],
+                "before": _loads(row["before_json"], {}),
+                "after": _loads(row["after_json"], {}),
+            }
+            for row in rows
+        ]
+
+    def create_file_record(
+        self,
+        *,
+        name: str,
+        stored_path: Path,
+        sha256: str,
+        size: int,
+        mime_type: str,
+        status: str,
+        source_path: Path | None = None,
+        error: str | None = None,
+        chunk_count: int = 0,
+    ) -> dict[str, Any]:
+        now = utc_now()
+        row = {
+            "id": new_id("file"),
+            "name": name[:260],
+            "source_path": str(source_path) if source_path else None,
+            "stored_path": str(stored_path),
+            "mime_type": mime_type[:120],
+            "size": int(size),
+            "sha256": sha256,
+            "status": status[:40],
+            "error": error,
+            "chunk_count": int(chunk_count),
+            "created_at": now,
+            "updated_at": now,
+        }
+        with self._lock:
+            self.connect().execute(
+                """
+                INSERT INTO files(
+                    id, name, source_path, stored_path, mime_type, size, sha256,
+                    status, error, chunk_count, created_at, updated_at
+                )
+                VALUES (
+                    :id, :name, :source_path, :stored_path, :mime_type, :size, :sha256,
+                    :status, :error, :chunk_count, :created_at, :updated_at
+                )
+                """,
+                row,
+            )
+            self.connect().commit()
+        return row
+
+    def add_file_chunks(self, file_id: str, chunks: list[str]) -> None:
+        now = utc_now()
+        with self._lock:
+            conn = self.connect()
+            conn.execute("DELETE FROM file_chunks WHERE file_id = ?", (file_id,))
+            if self._file_fts_available:
+                conn.execute("DELETE FROM file_chunks_fts WHERE file_id = ?", (file_id,))
+            for position, content in enumerate(chunks, start=1):
+                chunk_id = new_id("chunk")
+                conn.execute(
+                    """
+                    INSERT INTO file_chunks(id, file_id, position, content, char_count, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (chunk_id, file_id, position, content, len(content), now),
+                )
+                if self._file_fts_available:
+                    conn.execute(
+                        """
+                        INSERT INTO file_chunks_fts(file_id, chunk_id, content)
+                        VALUES (?, ?, ?)
+                        """,
+                        (file_id, chunk_id, content),
+                    )
+            conn.execute(
+                """
+                UPDATE files
+                SET chunk_count = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (len(chunks), now, file_id),
+            )
+            conn.commit()
+
+    def list_files(self, limit: int = 50) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self.connect().execute(
+                """
+                SELECT
+                    id, name, source_path, stored_path, mime_type, size, sha256,
+                    status, error, chunk_count, created_at, updated_at
+                FROM files
+                ORDER BY updated_at DESC, rowid DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_file(self, file_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self.connect().execute(
+                """
+                SELECT
+                    id, name, source_path, stored_path, mime_type, size, sha256,
+                    status, error, chunk_count, created_at, updated_at
+                FROM files
+                WHERE id = ?
+                """,
+                (file_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def search_file_chunks(self, query: str, limit: int = 20) -> list[dict[str, Any]]:
+        if query and self._file_fts_available:
+            match = _fts_query(query)
+            if match:
+                try:
+                    with self._lock:
+                        rows = self.connect().execute(
+                            """
+                            SELECT
+                                f.id AS file_id,
+                                f.name AS file_name,
+                                c.id AS chunk_id,
+                                c.position,
+                                c.content,
+                                c.created_at,
+                                bm25(file_chunks_fts) AS rank
+                            FROM file_chunks_fts
+                            JOIN file_chunks c ON c.id = file_chunks_fts.chunk_id
+                            JOIN files f ON f.id = c.file_id
+                            WHERE file_chunks_fts MATCH ?
+                            ORDER BY rank ASC, c.position ASC
+                            LIMIT ?
+                            """,
+                            (match, limit),
+                        ).fetchall()
+                    return [dict(row) for row in rows]
+                except sqlite3.OperationalError:
+                    pass
+
+        like = f"%{query}%"
+        with self._lock:
+            rows = self.connect().execute(
+                """
+                SELECT
+                    f.id AS file_id,
+                    f.name AS file_name,
+                    c.id AS chunk_id,
+                    c.position,
+                    c.content,
+                    c.created_at,
+                    NULL AS rank
+                FROM file_chunks c
+                JOIN files f ON f.id = c.file_id
+                WHERE c.content LIKE ? OR f.name LIKE ?
+                ORDER BY f.updated_at DESC, c.position ASC
+                LIMIT ?
+                """,
+                (like, like, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def _refresh_mission_progress(
         self,
@@ -622,6 +932,30 @@ CREATE TABLE IF NOT EXISTS mission_tasks (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS files (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    source_path TEXT,
+    stored_path TEXT NOT NULL,
+    mime_type TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    sha256 TEXT NOT NULL,
+    status TEXT NOT NULL,
+    error TEXT,
+    chunk_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS file_chunks (
+    id TEXT PRIMARY KEY,
+    file_id TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    char_count INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS health_snapshots (
     id TEXT PRIMARY KEY,
     ts TEXT NOT NULL,
@@ -643,10 +977,27 @@ CREATE TABLE IF NOT EXISTS tool_runs (
     task_id TEXT REFERENCES mission_tasks(id) ON DELETE SET NULL
 );
 
+CREATE TABLE IF NOT EXISTS audit_log (
+    id TEXT PRIMARY KEY,
+    ts TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    action TEXT NOT NULL,
+    target_type TEXT NOT NULL,
+    target_id TEXT,
+    summary TEXT NOT NULL,
+    before_json TEXT NOT NULL DEFAULT '{}',
+    after_json TEXT NOT NULL DEFAULT '{}'
+);
+
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_memories_namespace ON memories(namespace, importance);
 CREATE INDEX IF NOT EXISTS idx_mission_tasks_mission ON mission_tasks(mission_id, position);
+CREATE INDEX IF NOT EXISTS idx_files_sha256 ON files(sha256);
+CREATE INDEX IF NOT EXISTS idx_files_updated ON files(updated_at);
+CREATE INDEX IF NOT EXISTS idx_file_chunks_file ON file_chunks(file_id, position);
 CREATE INDEX IF NOT EXISTS idx_health_component ON health_snapshots(component, ts);
 CREATE INDEX IF NOT EXISTS idx_tool_runs_ts ON tool_runs(ts);
 CREATE INDEX IF NOT EXISTS idx_tool_runs_mission ON tool_runs(mission_id, task_id);
+CREATE INDEX IF NOT EXISTS idx_audit_log_target ON audit_log(target_type, target_id, ts);
+CREATE INDEX IF NOT EXISTS idx_audit_log_ts ON audit_log(ts);
 """

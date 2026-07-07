@@ -87,6 +87,7 @@ class JarvisSettings:
             },
             "paths": {
                 "data": str(self.data_dir),
+                "files": str(self.data_dir / "files"),
                 "cache": str(self.cache_dir),
                 "logs": str(self.log_dir),
                 "models": str(self.model_dir),
@@ -141,6 +142,7 @@ def ensure_runtime_dirs(settings: JarvisSettings) -> list[Path]:
     paths = [
         settings.home,
         settings.data_dir,
+        settings.data_dir / "files",
         settings.cache_dir,
         settings.log_dir,
         settings.model_dir.parent,

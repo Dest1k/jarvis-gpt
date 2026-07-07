@@ -11,6 +11,7 @@ from .agent import AgentRuntime
 from .config import PROFILES, ensure_runtime_dirs, load_settings
 from .diagnostics import run_diagnostics
 from .event_bus import EventBus
+from .ingest import FileIngestor
 from .llm import LLMRouter
 from .storage import JarvisStorage
 
@@ -90,6 +91,37 @@ def cmd_tools(args: argparse.Namespace) -> None:
     storage.close()
 
 
+def cmd_ingest(args: argparse.Namespace) -> None:
+    settings, storage, _llm, _agent = _runtime(args.profile)
+    result = FileIngestor(settings=settings, storage=storage).ingest_path(args.path)
+    _print_json(result)
+    storage.close()
+
+
+def cmd_files(args: argparse.Namespace) -> None:
+    _settings, storage, _llm, _agent = _runtime(args.profile)
+    _print_json(storage.list_files(limit=args.limit))
+    storage.close()
+
+
+def cmd_file_search(args: argparse.Namespace) -> None:
+    _settings, storage, _llm, _agent = _runtime(args.profile)
+    _print_json(storage.search_file_chunks(args.query, limit=args.limit))
+    storage.close()
+
+
+def cmd_audit(args: argparse.Namespace) -> None:
+    _settings, storage, _llm, _agent = _runtime(args.profile)
+    _print_json(
+        storage.list_audit(
+            limit=args.limit,
+            target_type=args.target_type,
+            target_id=args.target_id,
+        )
+    )
+    storage.close()
+
+
 def cmd_tool_run(args: argparse.Namespace) -> None:
     async def run() -> None:
         _settings, storage, _llm, agent = _runtime(args.profile)
@@ -147,6 +179,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     tools_parser = sub.add_parser("tools", help="List registered safe tools")
     tools_parser.set_defaults(func=cmd_tools)
+
+    ingest_parser = sub.add_parser("ingest", help="Copy and index a local text file")
+    ingest_parser.add_argument("path")
+    ingest_parser.set_defaults(func=cmd_ingest)
+
+    files_parser = sub.add_parser("files", help="List indexed or stored files")
+    files_parser.add_argument("--limit", type=int, default=25)
+    files_parser.set_defaults(func=cmd_files)
+
+    file_search_parser = sub.add_parser("file-search", help="Search indexed file chunks")
+    file_search_parser.add_argument("query")
+    file_search_parser.add_argument("--limit", type=int, default=12)
+    file_search_parser.set_defaults(func=cmd_file_search)
+
+    audit_parser = sub.add_parser("audit", help="Show audit trail")
+    audit_parser.add_argument("--limit", type=int, default=25)
+    audit_parser.add_argument("--target-type", default=None)
+    audit_parser.add_argument("--target-id", default=None)
+    audit_parser.set_defaults(func=cmd_audit)
 
     tool_run_parser = sub.add_parser("tool-run", help="Run a registered safe tool")
     tool_run_parser.add_argument("name")
