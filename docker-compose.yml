@@ -6,7 +6,7 @@ services:
       JARVIS_HOME: /runtime
       JARVIS_PROFILE: ${JARVIS_PROFILE:-gemma4-mono}
       JARVIS_LLM_BASE_URL: ${JARVIS_LLM_BASE_URL:-http://host.docker.internal:8001/v1}
-      JARVIS_LLM_MODEL: ${JARVIS_LLM_MODEL:-gemma4-dispatcher}
+      JARVIS_LLM_MODEL: ${JARVIS_LLM_MODEL:-dispatcher}
       JARVIS_LLM_ENABLED: ${JARVIS_LLM_ENABLED:-1}
     volumes:
       - type: bind

@@ -18,9 +18,11 @@ Agent Runtime
   |-- memory lookup
   |-- file ingestion and chunk search
   |-- audit trail
+  |-- HITL approval gates
   |-- task lifecycle
   |-- diagnostics
   |-- event stream
+  |-- model catalog
   |
 LLM Router
   |
@@ -28,6 +30,7 @@ OpenAI-compatible Gemma dispatcher
 
 External host runtime
   D:\jarvis\models
+  D:\jarvis\data\models
   D:\jarvis\data
   D:\jarvis\cache
   D:\jarvis\logs
@@ -44,6 +47,8 @@ External host runtime
 - Опасные действия не входят в safe tools layer; shell/host control появятся только через HITL-gates.
 - Файлы попадают в runtime-хранилище через upload/CLI, а агент читает только индексированные чанки через safe tools.
 - Audit log фиксирует изменения памяти, миссий, task lifecycle, tool runs и ingestion.
+- Профили `gemma4-mono` и `gemma4-turbo` указывают на реальные каталоги весов в `D:\jarvis\data\models`; backend не хранит веса в репозитории.
+- Любое действие с риском выше safe должно сначала стать approval gate; выполнение после approve будет добавляться отдельным gated executor.
 
 ## Runtime profiles
 

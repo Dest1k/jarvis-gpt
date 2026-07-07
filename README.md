@@ -4,15 +4,18 @@
 
 ## Что уже есть
 
-- FastAPI backend с `/health`, `/api/status`, `/api/chat`, `/api/missions`, `/api/memory`, `/api/files`, `/api/audit`, `/api/diagnostics`.
+- FastAPI backend с `/health`, `/api/status`, `/api/models`, `/api/chat`, `/api/missions`, `/api/memory`, `/api/files`, `/api/approvals`, `/api/audit`, `/api/diagnostics`.
 - Offline-first агент: сохраняет диалоги, создаёт mission plans и деградирует корректно, если локальная LLM не поднята.
 - Safe tools runtime: диагностика, статус, память, файловое чтение в разрешённых корнях и execution brief для миссий.
 - File ingestion: загрузка текстовых файлов, хранение в `D:\jarvis\data\jarvis-gpt\files`, chunk search и audit trail.
+- Model catalog: активные профили знают реальные Gemma 4 веса в `D:\jarvis\data\models`.
+- HITL approvals: опасные действия оформляются как durable approval gates, а не выполняются молча.
 - Исполнение следующего шага mission plan с прогрессом задач и журналом tool runs.
 - SQLite WAL-хранилище в `D:\jarvis\data\jarvis-gpt\state\jarvis.sqlite3`.
 - Два runtime-профиля: `gemma4-mono` и `gemma4-turbo`.
 - Next.js Command Center: чат, статус runtime, миссии и диагностика.
 - Command Center показывает файлы, поиск по чанкам, ручную память, tools и audit stream.
+- Command Center показывает локальные модели, approvals, активный профиль и dispatcher-конфигурацию.
 - CLI `py -3.11 .\jarvis.py ...` и Docker Compose для повторяемого запуска.
 
 ## Быстрый старт
@@ -51,6 +54,9 @@ D:\jarvis\
   cache\
     jarvis-gpt\
   data\
+    models\
+      gemma4-31b-it-nvfp4\
+      gemma4-26b-a4b-nvfp4\
     jarvis-gpt\
       files\
       state\
@@ -68,16 +74,21 @@ py -3.11 .\jarvis.py profiles
 py -3.11 .\jarvis.py --profile gemma4-mono serve
 py -3.11 .\jarvis.py --profile gemma4-turbo serve
 py -3.11 .\jarvis.py tools
+py -3.11 .\jarvis.py models
+py -3.11 .\jarvis.py models --env
+py -3.11 .\jarvis.py llm-health
 py -3.11 .\jarvis.py tool-run memory.search --set query=runtime --set limit=5
 py -3.11 .\jarvis.py ingest README.md
 py -3.11 .\jarvis.py file-search Jarvis
 py -3.11 .\jarvis.py audit
+py -3.11 .\jarvis.py approvals
+py -3.11 .\jarvis.py approval-request "Host action" "Needs review" --risk danger
 py -3.11 .\jarvis.py mission-next <mission_id>
 ```
 
-`gemma4-mono` — стабильный baseline для холодного старта и диагностики.
+`gemma4-mono` — стабильный baseline на `gemma4-31b-it-nvfp4` для холодного старта и диагностики.
 
-`gemma4-turbo` — быстрый профиль для прогретого runtime.
+`gemma4-turbo` — быстрый профиль на `gemma4-26b-a4b-nvfp4` для прогретого runtime.
 
 ## Docker
 

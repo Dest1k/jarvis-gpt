@@ -13,7 +13,8 @@ def test_settings_use_external_home(monkeypatch, tmp_path):
 
     assert settings.home == tmp_path
     assert settings.database_path.parent.exists()
-    assert settings.model_dir.name == "gemma4-mono"
+    assert settings.model_root == tmp_path / "models"
+    assert settings.model_dir.name == "gemma4-31b-it-nvfp4"
 
 
 def test_storage_persists_mission(tmp_path):
@@ -56,4 +57,29 @@ def test_storage_updates_task_progress_and_searches_memory(tmp_path):
     assert refreshed is not None
     assert refreshed["progress"] == 0.5
     assert memory["id"] in {item["id"] for item in hits}
+    storage.close()
+
+
+def test_storage_records_approval_gate(tmp_path):
+    storage = JarvisStorage(tmp_path / "state" / "jarvis.sqlite3")
+    storage.initialize()
+
+    approval = storage.create_approval(
+        title="Apply host patch",
+        description="Needs operator review before changing host state.",
+        requested_action="host.patch",
+        risk="danger",
+        payload={"path": "D:/jarvis"},
+    )
+    updated = storage.update_approval(
+        approval["id"],
+        status="approved",
+        result={"operator": "test"},
+    )
+    audit = storage.list_audit(target_type="approval", target_id=approval["id"])
+
+    assert updated is not None
+    assert updated["status"] == "approved"
+    assert storage.counters()["approvals"] == 1
+    assert {entry["action"] for entry in audit} == {"approval.request", "approval.update"}
     storage.close()

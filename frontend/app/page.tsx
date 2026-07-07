@@ -5,6 +5,7 @@ import {
   Brain,
   CheckCircle2,
   ClipboardCheck,
+  Cpu,
   Database,
   FileText,
   History,
@@ -122,6 +123,45 @@ type AuditEntry = {
   after: Record<string, unknown>;
 };
 
+type ApprovalItem = {
+  id: string;
+  created_at: string;
+  updated_at: string;
+  status: string;
+  risk: string;
+  title: string;
+  description: string;
+  requested_action: string;
+  payload: Record<string, unknown>;
+  result: Record<string, unknown>;
+};
+
+type ModelArtifact = {
+  id: string;
+  path: string;
+  exists: boolean;
+  active: boolean;
+  size_bytes: number;
+  shard_count: number;
+  model_type?: string | null;
+  dtype?: string | null;
+  quantization?: string | null;
+};
+
+type ModelCatalog = {
+  root: string;
+  active_profile: string;
+  active_model: ModelArtifact;
+  models: ModelArtifact[];
+  dispatcher: {
+    base_url: string;
+    served_model_name: string;
+    model_path: string;
+    docker_model_path: string;
+    env: Record<string, string>;
+  };
+};
+
 type ToolInfo = {
   name: string;
   description: string;
@@ -163,6 +203,8 @@ export default function CommandCenter() {
   const [files, setFiles] = useState<FileItem[]>([]);
   const [fileHits, setFileHits] = useState<FileChunkHit[]>([]);
   const [audit, setAudit] = useState<AuditEntry[]>([]);
+  const [modelCatalog, setModelCatalog] = useState<ModelCatalog | null>(null);
+  const [approvals, setApprovals] = useState<ApprovalItem[]>([]);
   const [input, setInput] = useState("");
   const [memoryDraft, setMemoryDraft] = useState("");
   const [fileQuery, setFileQuery] = useState("");
@@ -180,14 +222,24 @@ export default function CommandCenter() {
   const refresh = useCallback(async () => {
     try {
       setError(null);
-      const [statusData, missionData, toolData, memoryData, fileData, auditData] =
-        await Promise.all([
+      const [
+        statusData,
+        missionData,
+        toolData,
+        memoryData,
+        fileData,
+        auditData,
+        modelData,
+        approvalData
+      ] = await Promise.all([
           api<RuntimeStatus>("/api/status"),
           api<Mission[]>("/api/missions"),
           api<ToolInfo[]>("/api/tools"),
           api<MemoryItem[]>("/api/memory?limit=8"),
           api<FileItem[]>("/api/files?limit=8"),
-          api<AuditEntry[]>("/api/audit?limit=8")
+          api<AuditEntry[]>("/api/audit?limit=8"),
+          api<ModelCatalog>("/api/models"),
+          api<ApprovalItem[]>("/api/approvals?limit=8")
         ]);
       setStatus(statusData);
       setMissions(missionData);
@@ -195,6 +247,8 @@ export default function CommandCenter() {
       setMemories(memoryData);
       setFiles(fileData);
       setAudit(auditData);
+      setModelCatalog(modelData);
+      setApprovals(approvalData);
       if (statusData.health.length) {
         setDiagnostics(statusData.health);
       }
@@ -390,6 +444,24 @@ export default function CommandCenter() {
     }
   }
 
+  async function updateApprovalStatus(approvalId: string, statusValue: string) {
+    setBusy(true);
+    try {
+      const updated = await api<ApprovalItem>(`/api/approvals/${approvalId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ status: statusValue, result: { source: "command-center" } })
+      });
+      setApprovals((current) =>
+        current.map((approval) => (approval.id === approvalId ? updated : approval))
+      );
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Approval update failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <main className="shell">
       <aside className="rail" aria-label="Навигация">
@@ -401,6 +473,9 @@ export default function CommandCenter() {
         </IconButton>
         <IconButton label="Runtime">
           <Server size={20} />
+        </IconButton>
+        <IconButton label="Модели">
+          <Cpu size={20} />
         </IconButton>
         <IconButton label="Память">
           <Database size={20} />
@@ -451,7 +526,7 @@ export default function CommandCenter() {
           <StatusTile
             icon={<Sparkles size={19} />}
             label="LLM"
-            value={status?.settings.llm.enabled ? status.settings.llm.model : "disabled"}
+            value={modelCatalog?.active_model.id ?? status?.settings.llm.model ?? "disabled"}
             tone={status?.settings.llm.enabled ? "ok" : "warn"}
           />
           <StatusTile
@@ -562,6 +637,47 @@ export default function CommandCenter() {
             </div>
 
             <div className="panelHeader lower">
+              <h2>Approvals</h2>
+              <span>{approvals.filter((approval) => approval.status === "pending").length}</span>
+            </div>
+            <div className="approvalList">
+              {approvals.length === 0 ? (
+                <div className="emptyState compact">No pending gates</div>
+              ) : (
+                approvals.slice(0, 5).map((approval) => (
+                  <article className={`approvalRow ${approval.status}`} key={approval.id}>
+                    <ShieldAlert size={15} />
+                    <div>
+                      <strong>{approval.title}</strong>
+                      <p>{approval.description}</p>
+                    </div>
+                    <span>{approval.risk}</span>
+                    <div className="approvalControls">
+                      <button
+                        type="button"
+                        title="Approve"
+                        aria-label="Approve"
+                        disabled={busy || approval.status !== "pending"}
+                        onClick={() => updateApprovalStatus(approval.id, "approved")}
+                      >
+                        <CheckCircle2 size={14} />
+                      </button>
+                      <button
+                        type="button"
+                        title="Reject"
+                        aria-label="Reject"
+                        disabled={busy || approval.status !== "pending"}
+                        onClick={() => updateApprovalStatus(approval.id, "rejected")}
+                      >
+                        <ShieldAlert size={14} />
+                      </button>
+                    </div>
+                  </article>
+                ))
+              )}
+            </div>
+
+            <div className="panelHeader lower">
               <h2>Здоровье</h2>
               <span>{diagnostics.length}</span>
             </div>
@@ -573,6 +689,25 @@ export default function CommandCenter() {
                   <p>{check.message}</p>
                 </div>
               ))}
+            </div>
+
+            <div className="panelHeader lower">
+              <h2>Модели</h2>
+              <span>{modelCatalog?.models.length ?? 0}</span>
+            </div>
+            <div className="modelList">
+              {modelCatalog ? (
+                modelCatalog.models.slice(0, 5).map((model) => (
+                  <div className={`modelRow ${model.active ? "active" : ""}`} key={model.id}>
+                    <Cpu size={14} />
+                    <strong>{model.id}</strong>
+                    <span>{model.quantization ?? model.dtype ?? model.model_type ?? "model"}</span>
+                    <small>{formatBytes(model.size_bytes)}</small>
+                  </div>
+                ))
+              ) : (
+                <div className="emptyState compact">Model catalog offline</div>
+              )}
             </div>
 
             <div className="panelHeader lower">

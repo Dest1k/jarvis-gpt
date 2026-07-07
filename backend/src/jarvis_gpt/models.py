@@ -114,6 +114,30 @@ class FileIngestResponse(BaseModel):
     chunks_indexed: int
 
 
+class ModelArtifact(BaseModel):
+    id: str
+    path: str
+    exists: bool
+    active: bool
+    size_bytes: int
+    shard_count: int
+    modified_at: str | None = None
+    model_type: str | None = None
+    architectures: list[str] = Field(default_factory=list)
+    dtype: str | None = None
+    quantization: str | None = None
+    metadata: dict[str, bool] = Field(default_factory=dict)
+    generation: dict[str, Any] = Field(default_factory=dict)
+
+
+class ModelCatalogResponse(BaseModel):
+    root: str
+    active_profile: str
+    active_model: ModelArtifact
+    models: list[ModelArtifact]
+    dispatcher: dict[str, Any]
+
+
 class AuditEntry(BaseModel):
     id: str
     ts: str
@@ -124,6 +148,32 @@ class AuditEntry(BaseModel):
     summary: str
     before: dict[str, Any] = Field(default_factory=dict)
     after: dict[str, Any] = Field(default_factory=dict)
+
+
+class ApprovalCreateRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=240)
+    description: str = Field(min_length=1, max_length=20000)
+    requested_action: str = Field(min_length=1, max_length=120)
+    risk: Literal["review", "danger"] = "review"
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class ApprovalUpdateRequest(BaseModel):
+    status: Literal["approved", "rejected", "executed", "cancelled"]
+    result: dict[str, Any] = Field(default_factory=dict)
+
+
+class ApprovalItem(BaseModel):
+    id: str
+    created_at: str
+    updated_at: str
+    status: str
+    risk: str
+    title: str
+    description: str
+    requested_action: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+    result: dict[str, Any] = Field(default_factory=dict)
 
 
 class ToolInfo(BaseModel):

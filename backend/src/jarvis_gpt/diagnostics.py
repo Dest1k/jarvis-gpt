@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .config import JarvisSettings
 from .llm import LLMRouter
+from .model_catalog import ModelCatalog
 from .models import DiagnosticCheck, DiagnosticsResponse
 from .storage import JarvisStorage
 
@@ -61,6 +62,8 @@ async def run_diagnostics(
     llm: LLMRouter,
     persist: bool = True,
 ) -> DiagnosticsResponse:
+    catalog = ModelCatalog(settings).response()
+    active_model = catalog["active_model"]
     checks: list[DiagnosticCheck] = [
         DiagnosticCheck(
             name="python",
@@ -72,7 +75,17 @@ async def run_diagnostics(
         _check_path("runtime.data", settings.data_dir),
         _check_path("runtime.cache", settings.cache_dir),
         _check_path("runtime.logs", settings.log_dir),
-        _check_path("models.profile", settings.model_dir, must_exist=False),
+        _check_path("models.root", settings.model_root, must_exist=False),
+        DiagnosticCheck(
+            name="models.profile",
+            status="ok" if active_model["exists"] else "warn",
+            message=f"{settings.profile.name} -> {settings.model_dir}",
+            details={
+                "active_model": active_model,
+                "model_count": len(catalog["models"]),
+                "dispatcher": catalog["dispatcher"],
+            },
+        ),
         _command_version("git", ["git", "--version"]),
         _command_version("docker", ["docker", "--version"]),
     ]

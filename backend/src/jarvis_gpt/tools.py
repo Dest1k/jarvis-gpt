@@ -10,6 +10,7 @@ from typing import Any, Literal
 from .config import JarvisSettings
 from .diagnostics import run_diagnostics
 from .llm import LLMRouter
+from .model_catalog import ModelCatalog
 from .models import ToolInfo, ToolRunResponse
 from .storage import JarvisStorage
 
@@ -141,6 +142,40 @@ class ToolRegistry:
         )
         self.add(
             ToolSpec(
+                name="llm.health",
+                description="Check the OpenAI-compatible LLM route and local model catalog.",
+                category="runtime",
+                input_schema={},
+                handler=_llm_health,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="models.list",
+                description="List local model artifacts and active dispatcher configuration.",
+                category="runtime",
+                input_schema={},
+                handler=_models_list,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="approval.request",
+                description="Create a human approval gate for a risky or irreversible action.",
+                category="safety",
+                input_schema={
+                    "title": "Short title",
+                    "description": "Why approval is needed",
+                    "requested_action": "Action identifier",
+                    "risk": "review or danger",
+                    "payload": "Structured action details",
+                },
+                handler=_approval_request,
+                danger_level="review",
+            )
+        )
+        self.add(
+            ToolSpec(
                 name="memory.search",
                 description="Search long-term memory using FTS when available.",
                 category="memory",
@@ -233,6 +268,62 @@ async def _diagnostics_run(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunRe
         ok=diagnostics.ok,
         summary=f"Diagnostics finished: {error_count} errors, {warn_count} warnings.",
         data=diagnostics.model_dump(),
+    )
+
+
+async def _llm_health(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunResponse:
+    health = await ctx.llm.health()
+    return ToolRunResponse(
+        tool="llm.health",
+        ok=bool(health.get("ok")),
+        summary="LLM endpoint is responding."
+        if health.get("ok")
+        else "LLM endpoint is unavailable.",
+        data=health,
+    )
+
+
+def _models_list(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunResponse:
+    catalog = ModelCatalog(ctx.settings).response()
+    return ToolRunResponse(
+        tool="models.list",
+        ok=bool(catalog["active_model"]["exists"]),
+        summary=(
+            f"Model catalog contains {len(catalog['models'])} model(s); "
+            f"active profile is {catalog['active_profile']}."
+        ),
+        data=catalog,
+    )
+
+
+def _approval_request(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    title = str(args.get("title") or "").strip()
+    description = str(args.get("description") or "").strip()
+    requested_action = str(args.get("requested_action") or "manual.review").strip()
+    risk = str(args.get("risk") or "review").strip()
+    if risk not in {"review", "danger"}:
+        risk = "review"
+    if not title or not description:
+        return ToolRunResponse(
+            tool="approval.request",
+            ok=False,
+            summary="Approval title and description are required.",
+        )
+    payload = args.get("payload")
+    if not isinstance(payload, dict):
+        payload = {}
+    approval = ctx.storage.create_approval(
+        title=title,
+        description=description,
+        requested_action=requested_action,
+        risk=risk,
+        payload=payload,
+    )
+    return ToolRunResponse(
+        tool="approval.request",
+        ok=True,
+        summary=f"Approval requested: {approval['title']}",
+        data={"approval": approval},
     )
 
 

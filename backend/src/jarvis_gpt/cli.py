@@ -13,6 +13,7 @@ from .diagnostics import run_diagnostics
 from .event_bus import EventBus
 from .ingest import FileIngestor
 from .llm import LLMRouter
+from .model_catalog import ModelCatalog
 from .storage import JarvisStorage
 
 
@@ -65,6 +66,16 @@ def cmd_status(args: argparse.Namespace) -> None:
     storage.close()
 
 
+def cmd_models(args: argparse.Namespace) -> None:
+    settings, storage, _llm, _agent = _runtime(args.profile)
+    catalog = ModelCatalog(settings).response()
+    if args.env:
+        _print_json(catalog["dispatcher"]["env"])
+    else:
+        _print_json(catalog)
+    storage.close()
+
+
 def cmd_diag(args: argparse.Namespace) -> None:
     async def run() -> None:
         settings, storage, llm, _agent = _runtime(args.profile)
@@ -89,6 +100,15 @@ def cmd_tools(args: argparse.Namespace) -> None:
     settings, storage, _llm, agent = _runtime(args.profile)
     _print_json([tool.model_dump() for tool in agent.tools.list()])
     storage.close()
+
+
+def cmd_llm_health(args: argparse.Namespace) -> None:
+    async def run() -> None:
+        _settings, storage, llm, _agent = _runtime(args.profile)
+        _print_json(await llm.health())
+        storage.close()
+
+    asyncio.run(run())
 
 
 def cmd_ingest(args: argparse.Namespace) -> None:
@@ -119,6 +139,36 @@ def cmd_audit(args: argparse.Namespace) -> None:
             target_id=args.target_id,
         )
     )
+    storage.close()
+
+
+def cmd_approvals(args: argparse.Namespace) -> None:
+    _settings, storage, _llm, _agent = _runtime(args.profile)
+    _print_json(storage.list_approvals(limit=args.limit, status=args.status))
+    storage.close()
+
+
+def cmd_approval_request(args: argparse.Namespace) -> None:
+    _settings, storage, _llm, _agent = _runtime(args.profile)
+    payload = _json_argument(args.payload)
+    approval = storage.create_approval(
+        title=args.title,
+        description=args.description,
+        requested_action=args.action,
+        risk=args.risk,
+        payload=payload,
+    )
+    _print_json(approval)
+    storage.close()
+
+
+def cmd_approval_update(args: argparse.Namespace) -> None:
+    _settings, storage, _llm, _agent = _runtime(args.profile)
+    result = _json_argument(args.result)
+    updated = storage.update_approval(args.id, status=args.status, result=result)
+    if updated is None:
+        raise SystemExit(f"Approval not found: {args.id}")
+    _print_json(updated)
     storage.close()
 
 
@@ -169,6 +219,10 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser = sub.add_parser("status", help="Show local runtime status")
     status_parser.set_defaults(func=cmd_status)
 
+    models_parser = sub.add_parser("models", help="Show local model catalog and dispatcher config")
+    models_parser.add_argument("--env", action="store_true", help="Print vLLM dispatcher env only")
+    models_parser.set_defaults(func=cmd_models)
+
     diag_parser = sub.add_parser("diag", help="Run diagnostics")
     diag_parser.set_defaults(func=cmd_diag)
 
@@ -179,6 +233,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     tools_parser = sub.add_parser("tools", help="List registered safe tools")
     tools_parser.set_defaults(func=cmd_tools)
+
+    llm_health_parser = sub.add_parser("llm-health", help="Check OpenAI-compatible LLM route")
+    llm_health_parser.set_defaults(func=cmd_llm_health)
 
     ingest_parser = sub.add_parser("ingest", help="Copy and index a local text file")
     ingest_parser.add_argument("path")
@@ -198,6 +255,29 @@ def build_parser() -> argparse.ArgumentParser:
     audit_parser.add_argument("--target-type", default=None)
     audit_parser.add_argument("--target-id", default=None)
     audit_parser.set_defaults(func=cmd_audit)
+
+    approvals_parser = sub.add_parser("approvals", help="List human approval gates")
+    approvals_parser.add_argument("--limit", type=int, default=25)
+    approvals_parser.add_argument("--status", default=None)
+    approvals_parser.set_defaults(func=cmd_approvals)
+
+    approval_request_parser = sub.add_parser("approval-request", help="Create a HITL gate")
+    approval_request_parser.add_argument("title")
+    approval_request_parser.add_argument("description")
+    approval_request_parser.add_argument("--action", default="manual.review")
+    approval_request_parser.add_argument("--risk", choices=["review", "danger"], default="review")
+    approval_request_parser.add_argument("--payload", default="{}")
+    approval_request_parser.set_defaults(func=cmd_approval_request)
+
+    approval_update_parser = sub.add_parser("approval-update", help="Update a HITL gate")
+    approval_update_parser.add_argument("id")
+    approval_update_parser.add_argument(
+        "--status",
+        choices=["approved", "rejected", "executed", "cancelled"],
+        required=True,
+    )
+    approval_update_parser.add_argument("--result", default="{}")
+    approval_update_parser.set_defaults(func=cmd_approval_update)
 
     tool_run_parser = sub.add_parser("tool-run", help="Run a registered safe tool")
     tool_run_parser.add_argument("name")

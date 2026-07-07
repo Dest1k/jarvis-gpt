@@ -33,26 +33,38 @@ class RuntimeProfile:
     eager_mode: bool
     max_steps: int
     temperature: float
+    max_model_len: int
+    gpu_memory_utilization: float
+    kv_cache_dtype: str
+    max_num_seqs: int
 
 
 PROFILES: dict[str, RuntimeProfile] = {
     "gemma4-mono": RuntimeProfile(
         name="gemma4-mono",
         title="Gemma 4 Mono",
-        description="Stable baseline profile for cold starts, diagnostics and reliable execution.",
-        model_dir_name="gemma4-mono",
+        description="Stable Gemma 4 31B IT NVFP4 profile for cold starts and reliable execution.",
+        model_dir_name="gemma4-31b-it-nvfp4",
         eager_mode=True,
         max_steps=12,
         temperature=0.15,
+        max_model_len=32768,
+        gpu_memory_utilization=0.86,
+        kv_cache_dtype="fp8",
+        max_num_seqs=16,
     ),
     "gemma4-turbo": RuntimeProfile(
         name="gemma4-turbo",
         title="Gemma 4 Turbo",
-        description="Performance profile for warmed runtime and higher concurrency.",
-        model_dir_name="gemma4-turbo",
+        description="Fast Gemma 4 26B A4B NVFP4 profile for warmed runtime and throughput.",
+        model_dir_name="gemma4-26b-a4b-nvfp4",
         eager_mode=False,
         max_steps=24,
         temperature=0.25,
+        max_model_len=32768,
+        gpu_memory_utilization=0.82,
+        kv_cache_dtype="fp8",
+        max_num_seqs=16,
     ),
 }
 
@@ -64,6 +76,7 @@ class JarvisSettings:
     data_dir: Path
     cache_dir: Path
     log_dir: Path
+    model_root: Path
     model_dir: Path
     docker_dir: Path
     state_dir: Path
@@ -84,13 +97,18 @@ class JarvisSettings:
                 "eager_mode": self.profile.eager_mode,
                 "max_steps": self.profile.max_steps,
                 "temperature": self.profile.temperature,
+                "max_model_len": self.profile.max_model_len,
+                "gpu_memory_utilization": self.profile.gpu_memory_utilization,
+                "kv_cache_dtype": self.profile.kv_cache_dtype,
+                "max_num_seqs": self.profile.max_num_seqs,
             },
             "paths": {
                 "data": str(self.data_dir),
                 "files": str(self.data_dir / "files"),
                 "cache": str(self.cache_dir),
                 "logs": str(self.log_dir),
-                "models": str(self.model_dir),
+                "models": str(self.model_root),
+                "active_model": str(self.model_dir),
                 "docker": str(self.docker_dir),
                 "state": str(self.state_dir),
                 "database": str(self.database_path),
@@ -115,7 +133,7 @@ def load_settings(profile_name: str | None = None) -> JarvisSettings:
     data_dir = home / "data" / "jarvis-gpt"
     cache_dir = home / "cache" / "jarvis-gpt"
     log_dir = home / "logs" / "jarvis-gpt"
-    model_root = home / "models"
+    model_root = _model_root(home)
     docker_dir = home / "docker" / "jarvis-gpt"
     state_dir = data_dir / "state"
     database_path = state_dir / "jarvis.sqlite3"
@@ -126,12 +144,13 @@ def load_settings(profile_name: str | None = None) -> JarvisSettings:
         data_dir=data_dir,
         cache_dir=cache_dir,
         log_dir=log_dir,
+        model_root=model_root,
         model_dir=model_root / profile.model_dir_name,
         docker_dir=docker_dir,
         state_dir=state_dir,
         database_path=database_path,
         llm_base_url=os.environ.get("JARVIS_LLM_BASE_URL", "http://localhost:8001/v1").rstrip("/"),
-        llm_model=os.environ.get("JARVIS_LLM_MODEL", "gemma4-dispatcher"),
+        llm_model=os.environ.get("JARVIS_LLM_MODEL", "dispatcher"),
         llm_enabled=_bool_env("JARVIS_LLM_ENABLED", True),
         api_host=os.environ.get("JARVIS_API_HOST", "0.0.0.0"),
         api_port=int(os.environ.get("JARVIS_API_PORT", "8000")),
@@ -145,10 +164,20 @@ def ensure_runtime_dirs(settings: JarvisSettings) -> list[Path]:
         settings.data_dir / "files",
         settings.cache_dir,
         settings.log_dir,
-        settings.model_dir.parent,
+        settings.model_root,
         settings.docker_dir,
         settings.state_dir,
     ]
     for path in paths:
         path.mkdir(parents=True, exist_ok=True)
     return paths
+
+
+def _model_root(home: Path) -> Path:
+    raw = os.environ.get("JARVIS_MODEL_ROOT")
+    if raw:
+        return Path(raw)
+    data_models = home / "data" / "models"
+    if data_models.exists():
+        return data_models
+    return home / "models"

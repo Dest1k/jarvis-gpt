@@ -122,6 +122,7 @@ class JarvisStorage:
             "files",
             "file_chunks",
             "tool_runs",
+            "approvals",
             "audit_log",
         ]
         with self._lock:
@@ -805,6 +806,163 @@ class JarvisStorage:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def create_approval(
+        self,
+        *,
+        title: str,
+        description: str,
+        requested_action: str,
+        risk: str = "review",
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        now = utc_now()
+        row = {
+            "id": new_id("apr"),
+            "created_at": now,
+            "updated_at": now,
+            "status": "pending",
+            "risk": risk[:40],
+            "title": title[:240],
+            "description": description,
+            "requested_action": requested_action[:120],
+            "payload": payload or {},
+            "result": {},
+        }
+        with self._lock:
+            self.connect().execute(
+                """
+                INSERT INTO approvals(
+                    id, created_at, updated_at, status, risk, title, description,
+                    requested_action, payload, result
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["id"],
+                    row["created_at"],
+                    row["updated_at"],
+                    row["status"],
+                    row["risk"],
+                    row["title"],
+                    row["description"],
+                    row["requested_action"],
+                    _json(row["payload"]),
+                    _json(row["result"]),
+                ),
+            )
+            self.connect().commit()
+        self.record_audit(
+            actor="agent",
+            action="approval.request",
+            target_type="approval",
+            target_id=row["id"],
+            summary=f"Approval requested: {row['title']}",
+            after=row,
+        )
+        return row
+
+    def list_approvals(
+        self,
+        *,
+        limit: int = 50,
+        status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        params: tuple[Any, ...]
+        where = ""
+        if status:
+            where = "WHERE status = ?"
+            params = (status, limit)
+        else:
+            params = (limit,)
+        with self._lock:
+            rows = self.connect().execute(
+                f"""
+                SELECT
+                    id, created_at, updated_at, status, risk, title, description,
+                    requested_action, payload, result
+                FROM approvals
+                {where}
+                ORDER BY updated_at DESC, rowid DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [
+            {
+                **dict(row),
+                "payload": _loads(row["payload"], {}),
+                "result": _loads(row["result"], {}),
+            }
+            for row in rows
+        ]
+
+    def update_approval(
+        self,
+        approval_id: str,
+        *,
+        status: str,
+        result: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        now = utc_now()
+        with self._lock:
+            conn = self.connect()
+            existing = conn.execute(
+                """
+                SELECT
+                    id, created_at, updated_at, status, risk, title, description,
+                    requested_action, payload, result
+                FROM approvals
+                WHERE id = ?
+                """,
+                (approval_id,),
+            ).fetchone()
+            if existing is None:
+                return None
+            before = {
+                **dict(existing),
+                "payload": _loads(existing["payload"], {}),
+                "result": _loads(existing["result"], {}),
+            }
+            conn.execute(
+                """
+                UPDATE approvals
+                SET status = ?, result = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (status, _json(result or {}), now, approval_id),
+            )
+            conn.commit()
+            row = conn.execute(
+                """
+                SELECT
+                    id, created_at, updated_at, status, risk, title, description,
+                    requested_action, payload, result
+                FROM approvals
+                WHERE id = ?
+                """,
+                (approval_id,),
+            ).fetchone()
+        updated = (
+            {
+                **dict(row),
+                "payload": _loads(row["payload"], {}),
+                "result": _loads(row["result"], {}),
+            }
+            if row
+            else None
+        )
+        if updated:
+            self.record_audit(
+                actor="operator",
+                action="approval.update",
+                target_type="approval",
+                target_id=approval_id,
+                summary=f"Approval {status}: {updated['title']}",
+                before=before,
+                after=updated,
+            )
+        return updated
+
     def _refresh_mission_progress(
         self,
         conn: sqlite3.Connection,
@@ -977,6 +1135,19 @@ CREATE TABLE IF NOT EXISTS tool_runs (
     task_id TEXT REFERENCES mission_tasks(id) ON DELETE SET NULL
 );
 
+CREATE TABLE IF NOT EXISTS approvals (
+    id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    status TEXT NOT NULL,
+    risk TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL,
+    requested_action TEXT NOT NULL,
+    payload TEXT NOT NULL DEFAULT '{}',
+    result TEXT NOT NULL DEFAULT '{}'
+);
+
 CREATE TABLE IF NOT EXISTS audit_log (
     id TEXT PRIMARY KEY,
     ts TEXT NOT NULL,
@@ -998,6 +1169,7 @@ CREATE INDEX IF NOT EXISTS idx_file_chunks_file ON file_chunks(file_id, position
 CREATE INDEX IF NOT EXISTS idx_health_component ON health_snapshots(component, ts);
 CREATE INDEX IF NOT EXISTS idx_tool_runs_ts ON tool_runs(ts);
 CREATE INDEX IF NOT EXISTS idx_tool_runs_mission ON tool_runs(mission_id, task_id);
+CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_audit_log_target ON audit_log(target_type, target_id, ts);
 CREATE INDEX IF NOT EXISTS idx_audit_log_ts ON audit_log(ts);
 """

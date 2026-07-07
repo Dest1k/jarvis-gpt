@@ -3,7 +3,15 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import (
+    FastAPI,
+    File,
+    HTTPException,
+    Query,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
 
 from .agent import AgentRuntime
@@ -12,7 +20,11 @@ from .diagnostics import run_diagnostics
 from .event_bus import EventBus
 from .ingest import FileIngestor
 from .llm import LLMRouter
+from .model_catalog import ModelCatalog
 from .models import (
+    ApprovalCreateRequest,
+    ApprovalItem,
+    ApprovalUpdateRequest,
     AuditEntry,
     ChatRequest,
     ChatResponse,
@@ -27,6 +39,7 @@ from .models import (
     MissionExecutionResponse,
     MissionTask,
     MissionTaskUpdateRequest,
+    ModelCatalogResponse,
     StatusResponse,
     ToolInfo,
     ToolRunRequest,
@@ -45,6 +58,7 @@ async def lifespan(app: FastAPI):
     bus = EventBus()
     agent = AgentRuntime(settings=settings, storage=storage, llm=llm, bus=bus)
     ingestor = FileIngestor(settings=settings, storage=storage)
+    models = ModelCatalog(settings)
 
     app.state.settings = settings
     app.state.storage = storage
@@ -52,6 +66,7 @@ async def lifespan(app: FastAPI):
     app.state.bus = bus
     app.state.agent = agent
     app.state.ingestor = ingestor
+    app.state.models = models
     storage.add_event(kind="runtime.start", title="JARVIS GPT backend started")
     try:
         yield
@@ -106,6 +121,11 @@ async def status() -> StatusResponse:
         health=health_checks,
         recent_events=app.state.storage.list_events(limit=25),
     )
+
+
+@app.get("/api/models", response_model=ModelCatalogResponse)
+async def models() -> ModelCatalogResponse:
+    return app.state.models.response()
 
 
 @app.post("/api/chat", response_model=ChatResponse)
@@ -233,6 +253,43 @@ async def list_audit(
         target_type=target_type,
         target_id=target_id,
     )
+
+
+@app.get("/api/approvals", response_model=list[ApprovalItem])
+async def list_approvals(
+    limit: int = Query(default=25, ge=1, le=200),
+    status: str | None = Query(default=None, max_length=40),
+) -> list[ApprovalItem]:
+    return app.state.storage.list_approvals(limit=limit, status=status)
+
+
+@app.post("/api/approvals", response_model=ApprovalItem)
+async def create_approval(request: ApprovalCreateRequest) -> ApprovalItem:
+    return app.state.storage.create_approval(
+        title=request.title,
+        description=request.description,
+        requested_action=request.requested_action,
+        risk=request.risk,
+        payload=request.payload,
+    )
+
+
+@app.patch("/api/approvals/{approval_id}", response_model=ApprovalItem)
+async def update_approval(
+    approval_id: str,
+    request: ApprovalUpdateRequest,
+) -> ApprovalItem:
+    updated = app.state.storage.update_approval(
+        approval_id,
+        status=request.status,
+        result=request.result,
+    )
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Approval not found")
+    await app.state.bus.publish(
+        {"channel": "approvals", "approval_id": approval_id, "status": request.status}
+    )
+    return updated
 
 
 @app.get("/api/tools", response_model=list[ToolInfo])

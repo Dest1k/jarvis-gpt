@@ -42,6 +42,7 @@ MISSION_MARKERS = (
 class AgentContext:
     conversation_id: str
     memory_hits: list[dict[str, Any]]
+    file_hits: list[dict[str, Any]]
 
 
 class AgentRuntime:
@@ -241,18 +242,32 @@ class AgentRuntime:
         if conversation_id is None:
             conversation_id = self.storage.create_conversation(self._title_from_goal(message))
         memory_hits = self.storage.search_memory(message[:120], limit=5)
-        return AgentContext(conversation_id=conversation_id, memory_hits=memory_hits)
+        file_hits = self.storage.search_file_chunks(message[:160], limit=5)
+        return AgentContext(
+            conversation_id=conversation_id,
+            memory_hits=memory_hits,
+            file_hits=file_hits,
+        )
 
     def _build_llm_messages(self, context: AgentContext, message: str) -> list[dict[str, str]]:
         memory_block = ""
         if context.memory_hits:
             lines = [f"- {item['content']}" for item in context.memory_hits[:5]]
             memory_block = "Память, которая может быть полезна:\n" + "\n".join(lines)
+        file_block = ""
+        if context.file_hits:
+            lines = [
+                f"- {item['file_name']}#{item['position']}: {item['content'][:900]}"
+                for item in context.file_hits[:5]
+            ]
+            file_block = "Индексированные файлы, которые могут быть полезны:\n" + "\n".join(lines)
 
         recent = self.storage.recent_messages(context.conversation_id, limit=12)
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         if memory_block:
             messages.append({"role": "system", "content": memory_block})
+        if file_block:
+            messages.append({"role": "system", "content": file_block})
         for item in recent:
             if item["role"] in {"user", "assistant"}:
                 messages.append({"role": item["role"], "content": item["content"]})
