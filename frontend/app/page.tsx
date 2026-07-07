@@ -193,6 +193,16 @@ type HostBridgeStatus = {
   start_command: string;
 };
 
+type AutonomyStatus = {
+  enabled: boolean;
+  running_tasks: string[];
+  telemetry_interval_sec: number;
+  learning_interval_sec: number;
+  last_telemetry_at?: string | null;
+  last_learning_at?: string | null;
+  last_error?: string | null;
+};
+
 type ToolInfo = {
   name: string;
   description: string;
@@ -238,6 +248,7 @@ export default function CommandCenter() {
   const [dispatcher, setDispatcher] = useState<DispatcherStatus | null>(null);
   const [telemetry, setTelemetry] = useState<TelemetrySnapshot | null>(null);
   const [hostBridge, setHostBridge] = useState<HostBridgeStatus | null>(null);
+  const [autonomy, setAutonomy] = useState<AutonomyStatus | null>(null);
   const [approvals, setApprovals] = useState<ApprovalItem[]>([]);
   const [input, setInput] = useState("");
   const [memoryDraft, setMemoryDraft] = useState("");
@@ -267,6 +278,7 @@ export default function CommandCenter() {
         dispatcherData,
         telemetryData,
         hostBridgeData,
+        autonomyData,
         approvalData
       ] = await Promise.all([
           api<RuntimeStatus>("/api/status"),
@@ -279,6 +291,7 @@ export default function CommandCenter() {
           api<DispatcherStatus>("/api/dispatcher"),
           api<TelemetrySnapshot>("/api/telemetry"),
           api<HostBridgeStatus>("/api/host-bridge"),
+          api<AutonomyStatus>("/api/autonomy"),
           api<ApprovalItem[]>("/api/approvals?limit=8")
         ]);
       setStatus(statusData);
@@ -291,6 +304,7 @@ export default function CommandCenter() {
       setDispatcher(dispatcherData);
       setTelemetry(telemetryData);
       setHostBridge(hostBridgeData);
+      setAutonomy(autonomyData);
       setApprovals(approvalData);
       if (statusData.health.length) {
         setDiagnostics(statusData.health);
@@ -823,6 +837,12 @@ export default function CommandCenter() {
                 <strong>Host bridge</strong>
                 <span>{hostBridge?.port_open ? "online" : "offline"}</span>
                 <small>{hostBridge?.token_available ? "token" : "no token"}</small>
+              </div>
+              <div className={`bridgeRow ${autonomy?.enabled ? "online" : ""}`}>
+                <Brain size={14} />
+                <strong>Autonomy</strong>
+                <span>{autonomy?.enabled ? "on" : "off"}</span>
+                <small>{autonomy?.running_tasks.length ?? 0} tasks</small>
               </div>
               <button
                 className="iconText compact full"

@@ -20,6 +20,7 @@ Agent Runtime
   |-- audit trail
   |-- HITL approval gates
   |-- telemetry and learning tick
+  |-- autonomous supervisor
   |-- host bridge status
   |-- task lifecycle
   |-- diagnostics
@@ -55,6 +56,7 @@ External host runtime
 - Dispatcher вынесен в отдельный Compose profile `llm`, чтобы Command Center можно было запускать без случайной загрузки тяжёлых весов в VRAM.
 - Любое действие с риском выше safe должно сначала стать approval gate; выполнение после approve будет добавляться отдельным gated executor.
 - Self-learning пока идёт через explicit `learning.tick`: он добывает lessons из audit/tool/approval истории и пишет их в долговременную память.
+- Autonomous supervisor безопасно выполняет только наблюдение: telemetry snapshots и learning tick по расписанию; действия с риском остаются через approvals.
 - Performance слой разделяет лёгкий backend и тяжёлый dispatcher; GPU утилизируется vLLM-профилем, а backend собирает telemetry без удержания весов.
 
 ## Runtime profiles

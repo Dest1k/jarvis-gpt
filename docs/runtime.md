@@ -10,6 +10,9 @@
 | `JARVIS_LLM_BASE_URL` | `http://localhost:8001/v1` | OpenAI-compatible endpoint |
 | `JARVIS_LLM_MODEL` | `dispatcher` | Имя модели для chat completions |
 | `JARVIS_LLM_ENABLED` | `1` | Включить/выключить LLM route |
+| `JARVIS_AUTONOMY_ENABLED` | `1` | Включить безопасный фоновой supervisor |
+| `JARVIS_TELEMETRY_INTERVAL_SEC` | `120` | Интервал telemetry snapshots |
+| `JARVIS_LEARNING_INTERVAL_SEC` | `600` | Интервал autonomous learning tick |
 | `JARVIS_API_HOST` | `0.0.0.0` | Host FastAPI backend |
 | `JARVIS_API_PORT` | `8000` | Port FastAPI backend |
 
@@ -28,6 +31,7 @@ py -3.11 .\jarvis.py dispatcher-up
 py -3.11 .\jarvis.py dispatcher-down
 py -3.11 .\jarvis.py telemetry --persist
 py -3.11 .\jarvis.py host-bridge
+py -3.11 .\jarvis.py autonomy
 py -3.11 .\jarvis.py learning-tick
 py -3.11 .\jarvis.py diag
 py -3.11 .\jarvis.py chat "JARVIS, оформи это как mission plan: ..."
@@ -53,6 +57,7 @@ GET  /api/models
 GET  /api/dispatcher
 GET  /api/telemetry
 GET  /api/host-bridge
+GET  /api/autonomy
 POST /api/learning/tick
 POST /api/chat
 GET  /api/missions

@@ -181,6 +181,18 @@ class HostBridgeResponse(BaseModel):
     start_command: str
 
 
+class AutonomyStatusResponse(BaseModel):
+    enabled: bool
+    started_at: str | None = None
+    running_tasks: list[str] = Field(default_factory=list)
+    telemetry_interval_sec: int
+    learning_interval_sec: int
+    last_telemetry_at: str | None = None
+    last_learning_at: str | None = None
+    last_error: str | None = None
+    capabilities: list[str] = Field(default_factory=list)
+
+
 class AuditEntry(BaseModel):
     id: str
     ts: str

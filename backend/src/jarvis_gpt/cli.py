@@ -18,6 +18,7 @@ from .learning import LearningEngine
 from .llm import LLMRouter
 from .model_catalog import ModelCatalog
 from .storage import JarvisStorage
+from .supervisor import RuntimeSupervisor
 from .telemetry import TelemetryCollector
 
 
@@ -168,6 +169,12 @@ def cmd_learning_tick(args: argparse.Namespace) -> None:
 def cmd_host_bridge(args: argparse.Namespace) -> None:
     settings, storage, _llm, _agent = _runtime(args.profile)
     _print_json(HostBridgeStatus(settings).snapshot())
+    storage.close()
+
+
+def cmd_autonomy(args: argparse.Namespace) -> None:
+    settings, storage, _llm, _agent = _runtime(args.profile)
+    _print_json(RuntimeSupervisor(settings=settings, storage=storage).status())
     storage.close()
 
 
@@ -326,6 +333,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     host_bridge_parser = sub.add_parser("host-bridge", help="Show native host bridge status")
     host_bridge_parser.set_defaults(func=cmd_host_bridge)
+
+    autonomy_parser = sub.add_parser("autonomy", help="Show autonomous supervisor settings")
+    autonomy_parser.set_defaults(func=cmd_autonomy)
 
     ingest_parser = sub.add_parser("ingest", help="Copy and index a local text file")
     ingest_parser.add_argument("path")

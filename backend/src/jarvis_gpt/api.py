@@ -29,6 +29,7 @@ from .models import (
     ApprovalItem,
     ApprovalUpdateRequest,
     AuditEntry,
+    AutonomyStatusResponse,
     ChatRequest,
     ChatResponse,
     DiagnosticsResponse,
@@ -53,6 +54,7 @@ from .models import (
     ToolRunResponse,
 )
 from .storage import JarvisStorage
+from .supervisor import RuntimeSupervisor
 from .telemetry import TelemetryCollector
 
 
@@ -71,6 +73,7 @@ async def lifespan(app: FastAPI):
     telemetry = TelemetryCollector(settings)
     learning = LearningEngine(storage)
     host_bridge = HostBridgeStatus(settings)
+    supervisor = RuntimeSupervisor(settings=settings, storage=storage)
 
     app.state.settings = settings
     app.state.storage = storage
@@ -83,10 +86,13 @@ async def lifespan(app: FastAPI):
     app.state.telemetry = telemetry
     app.state.learning = learning
     app.state.host_bridge = host_bridge
+    app.state.supervisor = supervisor
     storage.add_event(kind="runtime.start", title="JARVIS GPT backend started")
+    await supervisor.start()
     try:
         yield
     finally:
+        await supervisor.stop()
         storage.add_event(kind="runtime.stop", title="JARVIS GPT backend stopped")
         storage.close()
 
@@ -166,6 +172,11 @@ async def learning_tick() -> LearningTickResponse:
 @app.get("/api/host-bridge", response_model=HostBridgeResponse)
 async def host_bridge() -> HostBridgeResponse:
     return app.state.host_bridge.snapshot()
+
+
+@app.get("/api/autonomy", response_model=AutonomyStatusResponse)
+async def autonomy() -> AutonomyStatusResponse:
+    return app.state.supervisor.status()
 
 
 @app.post("/api/chat", response_model=ChatResponse)

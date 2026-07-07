@@ -84,6 +84,9 @@ class JarvisSettings:
     llm_base_url: str
     llm_model: str
     llm_enabled: bool
+    autonomy_enabled: bool
+    telemetry_interval_sec: int
+    learning_interval_sec: int
     api_host: str
     api_port: int
 
@@ -117,6 +120,11 @@ class JarvisSettings:
                 "enabled": self.llm_enabled,
                 "base_url": self.llm_base_url,
                 "model": self.llm_model,
+            },
+            "autonomy": {
+                "enabled": self.autonomy_enabled,
+                "telemetry_interval_sec": self.telemetry_interval_sec,
+                "learning_interval_sec": self.learning_interval_sec,
             },
             "api": {"host": self.api_host, "port": self.api_port},
         }
@@ -152,6 +160,9 @@ def load_settings(profile_name: str | None = None) -> JarvisSettings:
         llm_base_url=os.environ.get("JARVIS_LLM_BASE_URL", "http://localhost:8001/v1").rstrip("/"),
         llm_model=os.environ.get("JARVIS_LLM_MODEL", "dispatcher"),
         llm_enabled=_bool_env("JARVIS_LLM_ENABLED", True),
+        autonomy_enabled=_bool_env("JARVIS_AUTONOMY_ENABLED", True),
+        telemetry_interval_sec=int(os.environ.get("JARVIS_TELEMETRY_INTERVAL_SEC", "120")),
+        learning_interval_sec=int(os.environ.get("JARVIS_LEARNING_INTERVAL_SEC", "600")),
         api_host=os.environ.get("JARVIS_API_HOST", "0.0.0.0"),
         api_port=int(os.environ.get("JARVIS_API_PORT", "8000")),
     )
