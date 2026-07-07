@@ -1,57 +1,84 @@
 # JARVIS GPT
 
-Новая архитектура JARVIS: локальный автономный AI-агент для Windows 11 + WSL2 + Docker.
+Новая версия JARVIS строится как локальная агентская операционная система, а не как чат-обёртка над LLM. Репозиторий остаётся лёгким и воспроизводимым; модели, базы, кэши и логи живут на машине в `D:\jarvis`.
 
-## Vision
+## Что уже есть
 
-JARVIS GPT — это не чат над LLM. Это локальная агентская операционная система:
+- FastAPI backend с `/health`, `/api/status`, `/api/chat`, `/api/missions`, `/api/memory`, `/api/diagnostics`.
+- Offline-first агент: сохраняет диалоги, создаёт mission plans и деградирует корректно, если локальная LLM не поднята.
+- SQLite WAL-хранилище в `D:\jarvis\data\jarvis-gpt\state\jarvis.sqlite3`.
+- Два runtime-профиля: `gemma4-mono` и `gemma4-turbo`.
+- Next.js Command Center: чат, статус runtime, миссии и диагностика.
+- CLI `py -3.11 .\jarvis.py ...` и Docker Compose для повторяемого запуска.
 
-- единое ядро агента;
-- локальные модели из `D:\jarvis\models`;
-- offline-first runtime;
-- native Windows control;
-- память и знания;
-- mission execution;
-- самодиагностика.
+## Быстрый старт
 
-## Runtime profiles
-
-Поддерживаются только два пользовательских профиля:
-
-- `gemma4-mono` — стабильный режим;
-- `gemma4-turbo` — максимальная производительность.
-
-Модели и тяжёлые данные находятся вне репозитория:
-
+```powershell
+py -3.11 .\jarvis.py init
+py -3.11 .\jarvis.py diag
+py -3.11 .\jarvis.py serve --reload
 ```
+
+В отдельном окне:
+
+```powershell
+cd frontend
+npm install
+npm run dev
+```
+
+Command Center:
+
+```text
+http://localhost:3000
+```
+
+Backend:
+
+```text
+http://localhost:8000
+```
+
+## Локальные данные
+
+```text
 D:\jarvis\
-├── models\
-├── cache\
-├── data\
-├── logs\
-└── docker\
+  models\
+  cache\
+    jarvis-gpt\
+  data\
+    jarvis-gpt\
+      state\
+        jarvis.sqlite3
+  logs\
+    jarvis-gpt\
+  docker\
+    jarvis-gpt\
 ```
 
-## Architecture
+## Профили
 
-```
-Windows Host
-  └── Native Bridge
-
-Docker / WSL2
-  ├── Agent Core
-  ├── LLM Router
-  ├── Memory System
-  ├── Tools Runtime
-  ├── Diagnostics
-  └── API
-
-Frontend
-  └── Jarvis Command Center
+```powershell
+py -3.11 .\jarvis.py profiles
+py -3.11 .\jarvis.py --profile gemma4-mono serve
+py -3.11 .\jarvis.py --profile gemma4-turbo serve
 ```
 
-## Status
+`gemma4-mono` — стабильный baseline для холодного старта и диагностики.
 
-Repository bootstrap phase.
+`gemma4-turbo` — быстрый профиль для прогретого runtime.
 
-The system is being rebuilt from scratch with lessons extracted from the original JARVIS-OS project.
+## Docker
+
+```powershell
+$env:JARVIS_HOST_HOME="D:/jarvis"
+docker compose up --build
+```
+
+## Линия развития
+
+1. Подключить полноценный OpenAI-compatible Gemma dispatcher.
+2. Расширить tools runtime: host bridge, sandbox, filesystem, browser, web, Docker.
+3. Развернуть cognitive core: audit, RAG-ingestion, project tasks, health snapshots.
+4. Добавить HITL-gates для опасных действий.
+5. Подключить voice/PWA слой после стабилизации текстового runtime.

@@ -1,0 +1,152 @@
+from __future__ import annotations
+
+import os
+import platform
+from dataclasses import dataclass
+from pathlib import Path
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off", ""}
+
+
+def default_home() -> Path:
+    raw = os.environ.get("JARVIS_HOME")
+    if raw:
+        return Path(raw)
+    if platform.system().lower() == "windows":
+        return Path(r"D:\jarvis")
+    if Path("/mnt/d").exists():
+        return Path("/mnt/d/jarvis")
+    return Path.home() / ".jarvis"
+
+
+@dataclass(frozen=True)
+class RuntimeProfile:
+    name: str
+    title: str
+    description: str
+    model_dir_name: str
+    eager_mode: bool
+    max_steps: int
+    temperature: float
+
+
+PROFILES: dict[str, RuntimeProfile] = {
+    "gemma4-mono": RuntimeProfile(
+        name="gemma4-mono",
+        title="Gemma 4 Mono",
+        description="Stable baseline profile for cold starts, diagnostics and reliable execution.",
+        model_dir_name="gemma4-mono",
+        eager_mode=True,
+        max_steps=12,
+        temperature=0.15,
+    ),
+    "gemma4-turbo": RuntimeProfile(
+        name="gemma4-turbo",
+        title="Gemma 4 Turbo",
+        description="Performance profile for warmed runtime and higher concurrency.",
+        model_dir_name="gemma4-turbo",
+        eager_mode=False,
+        max_steps=24,
+        temperature=0.25,
+    ),
+}
+
+
+@dataclass(frozen=True)
+class JarvisSettings:
+    home: Path
+    profile: RuntimeProfile
+    data_dir: Path
+    cache_dir: Path
+    log_dir: Path
+    model_dir: Path
+    docker_dir: Path
+    state_dir: Path
+    database_path: Path
+    llm_base_url: str
+    llm_model: str
+    llm_enabled: bool
+    api_host: str
+    api_port: int
+
+    def public_dict(self) -> dict[str, object]:
+        return {
+            "home": str(self.home),
+            "profile": {
+                "name": self.profile.name,
+                "title": self.profile.title,
+                "description": self.profile.description,
+                "eager_mode": self.profile.eager_mode,
+                "max_steps": self.profile.max_steps,
+                "temperature": self.profile.temperature,
+            },
+            "paths": {
+                "data": str(self.data_dir),
+                "cache": str(self.cache_dir),
+                "logs": str(self.log_dir),
+                "models": str(self.model_dir),
+                "docker": str(self.docker_dir),
+                "state": str(self.state_dir),
+                "database": str(self.database_path),
+            },
+            "llm": {
+                "enabled": self.llm_enabled,
+                "base_url": self.llm_base_url,
+                "model": self.llm_model,
+            },
+            "api": {"host": self.api_host, "port": self.api_port},
+        }
+
+
+def load_settings(profile_name: str | None = None) -> JarvisSettings:
+    home = default_home()
+    selected_name = profile_name or os.environ.get("JARVIS_PROFILE", "gemma4-mono")
+    profile = PROFILES.get(selected_name)
+    if profile is None:
+        valid = ", ".join(sorted(PROFILES))
+        raise ValueError(f"Unknown JARVIS_PROFILE={selected_name!r}. Valid profiles: {valid}")
+
+    data_dir = home / "data" / "jarvis-gpt"
+    cache_dir = home / "cache" / "jarvis-gpt"
+    log_dir = home / "logs" / "jarvis-gpt"
+    model_root = home / "models"
+    docker_dir = home / "docker" / "jarvis-gpt"
+    state_dir = data_dir / "state"
+    database_path = state_dir / "jarvis.sqlite3"
+
+    return JarvisSettings(
+        home=home,
+        profile=profile,
+        data_dir=data_dir,
+        cache_dir=cache_dir,
+        log_dir=log_dir,
+        model_dir=model_root / profile.model_dir_name,
+        docker_dir=docker_dir,
+        state_dir=state_dir,
+        database_path=database_path,
+        llm_base_url=os.environ.get("JARVIS_LLM_BASE_URL", "http://localhost:8001/v1").rstrip("/"),
+        llm_model=os.environ.get("JARVIS_LLM_MODEL", "gemma4-dispatcher"),
+        llm_enabled=_bool_env("JARVIS_LLM_ENABLED", True),
+        api_host=os.environ.get("JARVIS_API_HOST", "0.0.0.0"),
+        api_port=int(os.environ.get("JARVIS_API_PORT", "8000")),
+    )
+
+
+def ensure_runtime_dirs(settings: JarvisSettings) -> list[Path]:
+    paths = [
+        settings.home,
+        settings.data_dir,
+        settings.cache_dir,
+        settings.log_dir,
+        settings.model_dir.parent,
+        settings.docker_dir,
+        settings.state_dir,
+    ]
+    for path in paths:
+        path.mkdir(parents=True, exist_ok=True)
+    return paths

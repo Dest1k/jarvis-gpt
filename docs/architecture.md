@@ -1,48 +1,53 @@
 # JARVIS GPT Architecture
 
-## Design goals
+## Принцип
 
-JARVIS GPT is built as a local agent runtime, not a chat wrapper.
+JARVIS GPT — локальный agent runtime. UI не управляет моделью напрямую: он работает с backend-ядром, а ядро уже решает, нужен ли LLM, память, mission plan, инструмент или диагностика.
 
-## Components
+## Слои
 
-```
-User
- |
-Command Center
- |
+```text
+Command Center (Next.js)
+  |
+FastAPI Gateway
+  |
 Agent Runtime
- |
-+-- Planner
-+-- Memory
-+-- Tool Registry
-+-- Diagnostics
- |
+  |-- conversation context
+  |-- mission planner
+  |-- memory lookup
+  |-- diagnostics
+  |-- event stream
+  |
 LLM Router
- |
-Gemma Mono / Turbo
+  |
+OpenAI-compatible Gemma dispatcher
+
+External host runtime
+  D:\jarvis\models
+  D:\jarvis\data
+  D:\jarvis\cache
+  D:\jarvis\logs
+  D:\jarvis\docker
 ```
 
-## Storage principle
+## Почему так
 
-Large runtime assets live outside git. The host machine provides the storage root with:
+- Репозиторий не хранит тяжёлые артефакты.
+- Backend можно запускать нативно, в WSL2 или Docker.
+- SQLite достаточно для одиночного локального ядра и легко мигрирует дальше.
+- UI видит явные состояния: success, warn, error, mission, event.
+- LLM является заменяемым маршрутом, а не фундаментом всей системы.
 
-- models
-- cache
-- runtime data
-- logs
-- docker resources
+## Runtime profiles
 
-The repository remains lightweight and reproducible.
+`gemma4-mono`:
 
-## Profiles
+- надёжный cold-start;
+- eager mode;
+- профиль разработки и диагностики.
 
-Mono:
-- reliable baseline
-- eager execution
-- primary development mode
+`gemma4-turbo`:
 
-Turbo:
-- performance mode
-- optimized execution
-- enabled after validation
+- быстрый warmed runtime;
+- больше шагов агента;
+- включается после проверки окружения.
