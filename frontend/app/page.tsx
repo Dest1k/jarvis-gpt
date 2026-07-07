@@ -162,6 +162,18 @@ type ModelCatalog = {
   };
 };
 
+type DispatcherStatus = {
+  service: string;
+  container: string;
+  docker_available: boolean;
+  port: number;
+  port_open: boolean;
+  base_url: string;
+  model: string;
+  active_model: ModelArtifact;
+  container_status?: { exists?: boolean; status?: string } | null;
+};
+
 type ToolInfo = {
   name: string;
   description: string;
@@ -204,6 +216,7 @@ export default function CommandCenter() {
   const [fileHits, setFileHits] = useState<FileChunkHit[]>([]);
   const [audit, setAudit] = useState<AuditEntry[]>([]);
   const [modelCatalog, setModelCatalog] = useState<ModelCatalog | null>(null);
+  const [dispatcher, setDispatcher] = useState<DispatcherStatus | null>(null);
   const [approvals, setApprovals] = useState<ApprovalItem[]>([]);
   const [input, setInput] = useState("");
   const [memoryDraft, setMemoryDraft] = useState("");
@@ -230,6 +243,7 @@ export default function CommandCenter() {
         fileData,
         auditData,
         modelData,
+        dispatcherData,
         approvalData
       ] = await Promise.all([
           api<RuntimeStatus>("/api/status"),
@@ -239,6 +253,7 @@ export default function CommandCenter() {
           api<FileItem[]>("/api/files?limit=8"),
           api<AuditEntry[]>("/api/audit?limit=8"),
           api<ModelCatalog>("/api/models"),
+          api<DispatcherStatus>("/api/dispatcher"),
           api<ApprovalItem[]>("/api/approvals?limit=8")
         ]);
       setStatus(statusData);
@@ -248,6 +263,7 @@ export default function CommandCenter() {
       setFiles(fileData);
       setAudit(auditData);
       setModelCatalog(modelData);
+      setDispatcher(dispatcherData);
       setApprovals(approvalData);
       if (statusData.health.length) {
         setDiagnostics(statusData.health);
@@ -696,6 +712,14 @@ export default function CommandCenter() {
               <span>{modelCatalog?.models.length ?? 0}</span>
             </div>
             <div className="modelList">
+              {dispatcher && (
+                <div className={`dispatcherRow ${dispatcher.port_open ? "online" : ""}`}>
+                  <Server size={14} />
+                  <strong>{dispatcher.model}</strong>
+                  <span>{dispatcher.port_open ? "online" : "offline"}</span>
+                  <small>{dispatcher.container_status?.status ?? "port 8001"}</small>
+                </div>
+              )}
               {modelCatalog ? (
                 modelCatalog.models.slice(0, 5).map((model) => (
                   <div className={`modelRow ${model.active ? "active" : ""}`} key={model.id}>

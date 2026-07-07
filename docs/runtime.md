@@ -22,6 +22,10 @@ py -3.11 .\jarvis.py status
 py -3.11 .\jarvis.py models
 py -3.11 .\jarvis.py models --env
 py -3.11 .\jarvis.py llm-health
+py -3.11 .\jarvis.py dispatcher-status
+py -3.11 .\jarvis.py dispatcher-compose --env
+py -3.11 .\jarvis.py dispatcher-up
+py -3.11 .\jarvis.py dispatcher-down
 py -3.11 .\jarvis.py diag
 py -3.11 .\jarvis.py chat "JARVIS, оформи это как mission plan: ..."
 py -3.11 .\jarvis.py tools
@@ -43,6 +47,7 @@ py -3.11 .\jarvis.py serve --reload
 GET  /health
 GET  /api/status
 GET  /api/models
+GET  /api/dispatcher
 POST /api/chat
 GET  /api/missions
 POST /api/missions
@@ -86,6 +91,14 @@ D:\jarvis\data\models
 ```
 
 `gemma4-mono` указывает на `gemma4-31b-it-nvfp4`, `gemma4-turbo` — на `gemma4-26b-a4b-nvfp4`. Команда `models --env` печатает переменные для OpenAI-compatible vLLM dispatcher.
+
+Dispatcher запускается отдельно, чтобы не грузить GPU при обычном старте Command Center:
+
+```powershell
+.\scripts\dispatcher.ps1 up
+.\scripts\dispatcher.ps1 status
+.\scripts\dispatcher.ps1 logs
+```
 
 Сейчас схема покрывает:
 

@@ -138,6 +138,21 @@ class ModelCatalogResponse(BaseModel):
     dispatcher: dict[str, Any]
 
 
+class DispatcherStatusResponse(BaseModel):
+    service: str
+    container: str
+    docker_available: bool
+    docker_path: str | None = None
+    port: int
+    port_open: bool
+    base_url: str
+    model: str
+    active_model: dict[str, Any]
+    compose: list[str]
+    container_status: dict[str, Any] | None = None
+    env: dict[str, str]
+
+
 class AuditEntry(BaseModel):
     id: str
     ts: str

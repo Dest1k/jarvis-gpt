@@ -1,4 +1,60 @@
 services:
+  dispatcher:
+    profiles: ["llm"]
+    image: ${JARVIS_VLLM_IMAGE:-vllm/vllm-openai:nightly}
+    container_name: jarvis-gpt-dispatcher
+    restart: unless-stopped
+    ipc: host
+    command: >
+      --model ${JARVIS_QWEN_MODEL_PATH:-/models/gemma4-31b-it-nvfp4}
+      --served-model-name ${JARVIS_QWEN_MODEL_NAME:-dispatcher}
+      --dtype ${JARVIS_QWEN_DTYPE:-auto}
+      ${JARVIS_QWEN_QUANT_ARGS:-}
+      ${JARVIS_QWEN_ENFORCE_EAGER:---enforce-eager}
+      --max-model-len ${JARVIS_QWEN_MAX_LEN:-32768}
+      --gpu-memory-utilization ${JARVIS_QWEN_GPU_UTIL:-0.86}
+      --kv-cache-dtype ${JARVIS_QWEN_KV_DTYPE:-fp8}
+      --enable-prefix-caching
+      --max-num-seqs ${JARVIS_QWEN_MAX_NUM_SEQS:-16}
+      ${JARVIS_QWEN_EXTRA_ARGS:-}
+      --host 0.0.0.0
+      --port 8001
+    environment:
+      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
+      VLLM_WORKER_MULTIPROC_METHOD: spawn
+      NVIDIA_VISIBLE_DEVICES: "0"
+      CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-0}
+      CUDA_DEVICE_ORDER: ${CUDA_DEVICE_ORDER:-PCI_BUS_ID}
+      CUDA_DISABLE_P2P: ${CUDA_DISABLE_P2P:-1}
+      NCCL_P2P_DISABLE: ${NCCL_P2P_DISABLE:-1}
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      HF_HUB_ENABLE_HF_TRANSFER: "0"
+      HF_HUB_DOWNLOAD_TIMEOUT: "120"
+    volumes:
+      - type: bind
+        source: ${JARVIS_MODEL_ROOT:-D:/jarvis/data/models}
+        target: /models
+        read_only: true
+      - type: bind
+        source: ${JARVIS_HOST_HOME:-D:/jarvis}/cache
+        target: /root/.cache
+    ports:
+      - "127.0.0.1:8001:8001"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 20s
+      timeout: 5s
+      retries: 40
+      start_period: 600s
+
   backend:
     build:
       context: ./backend

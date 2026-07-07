@@ -77,6 +77,8 @@ py -3.11 .\jarvis.py tools
 py -3.11 .\jarvis.py models
 py -3.11 .\jarvis.py models --env
 py -3.11 .\jarvis.py llm-health
+py -3.11 .\jarvis.py dispatcher-status
+.\scripts\dispatcher.ps1 up
 py -3.11 .\jarvis.py tool-run memory.search --set query=runtime --set limit=5
 py -3.11 .\jarvis.py ingest README.md
 py -3.11 .\jarvis.py file-search Jarvis
@@ -95,6 +97,14 @@ py -3.11 .\jarvis.py mission-next <mission_id>
 ```powershell
 $env:JARVIS_HOST_HOME="D:/jarvis"
 docker compose up --build
+```
+
+LLM dispatcher поднимается отдельным профилем, чтобы тяжёлая модель не стартовала случайно:
+
+```powershell
+.\scripts\dispatcher.ps1 up
+# или
+docker compose --profile llm up -d dispatcher
 ```
 
 ## Линия развития

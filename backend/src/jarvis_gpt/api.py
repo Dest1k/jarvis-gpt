@@ -17,6 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .agent import AgentRuntime
 from .config import ensure_runtime_dirs, load_settings
 from .diagnostics import run_diagnostics
+from .dispatcher import DispatcherManager
 from .event_bus import EventBus
 from .ingest import FileIngestor
 from .llm import LLMRouter
@@ -29,6 +30,7 @@ from .models import (
     ChatRequest,
     ChatResponse,
     DiagnosticsResponse,
+    DispatcherStatusResponse,
     FileChunkHit,
     FileIngestResponse,
     FileItem,
@@ -59,6 +61,7 @@ async def lifespan(app: FastAPI):
     agent = AgentRuntime(settings=settings, storage=storage, llm=llm, bus=bus)
     ingestor = FileIngestor(settings=settings, storage=storage)
     models = ModelCatalog(settings)
+    dispatcher = DispatcherManager(settings)
 
     app.state.settings = settings
     app.state.storage = storage
@@ -67,6 +70,7 @@ async def lifespan(app: FastAPI):
     app.state.agent = agent
     app.state.ingestor = ingestor
     app.state.models = models
+    app.state.dispatcher = dispatcher
     storage.add_event(kind="runtime.start", title="JARVIS GPT backend started")
     try:
         yield
@@ -126,6 +130,11 @@ async def status() -> StatusResponse:
 @app.get("/api/models", response_model=ModelCatalogResponse)
 async def models() -> ModelCatalogResponse:
     return app.state.models.response()
+
+
+@app.get("/api/dispatcher", response_model=DispatcherStatusResponse)
+async def dispatcher() -> DispatcherStatusResponse:
+    return app.state.dispatcher.status()
 
 
 @app.post("/api/chat", response_model=ChatResponse)

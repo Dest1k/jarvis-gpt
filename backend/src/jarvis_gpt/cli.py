@@ -10,6 +10,7 @@ import uvicorn
 from .agent import AgentRuntime
 from .config import PROFILES, ensure_runtime_dirs, load_settings
 from .diagnostics import run_diagnostics
+from .dispatcher import DispatcherManager
 from .event_bus import EventBus
 from .ingest import FileIngestor
 from .llm import LLMRouter
@@ -109,6 +110,41 @@ def cmd_llm_health(args: argparse.Namespace) -> None:
         storage.close()
 
     asyncio.run(run())
+
+
+def cmd_dispatcher_status(args: argparse.Namespace) -> None:
+    settings, storage, _llm, _agent = _runtime(args.profile)
+    _print_json(DispatcherManager(settings).status())
+    storage.close()
+
+
+def cmd_dispatcher_compose(args: argparse.Namespace) -> None:
+    settings, storage, _llm, _agent = _runtime(args.profile)
+    manager = DispatcherManager(settings)
+    if args.env:
+        _print_json(manager.compose_env())
+    else:
+        _print_json(
+            {
+                "up": manager.compose_command("up"),
+                "down": manager.compose_command("down"),
+                "logs": manager.compose_command("logs"),
+                "env": manager.compose_env(),
+            }
+        )
+    storage.close()
+
+
+def cmd_dispatcher_up(args: argparse.Namespace) -> None:
+    settings, storage, _llm, _agent = _runtime(args.profile)
+    _print_json(DispatcherManager(settings).run_compose("up"))
+    storage.close()
+
+
+def cmd_dispatcher_down(args: argparse.Namespace) -> None:
+    settings, storage, _llm, _agent = _runtime(args.profile)
+    _print_json(DispatcherManager(settings).run_compose("down"))
+    storage.close()
 
 
 def cmd_ingest(args: argparse.Namespace) -> None:
@@ -236,6 +272,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     llm_health_parser = sub.add_parser("llm-health", help="Check OpenAI-compatible LLM route")
     llm_health_parser.set_defaults(func=cmd_llm_health)
+
+    dispatcher_status_parser = sub.add_parser("dispatcher-status", help="Show dispatcher status")
+    dispatcher_status_parser.set_defaults(func=cmd_dispatcher_status)
+
+    dispatcher_compose_parser = sub.add_parser(
+        "dispatcher-compose",
+        help="Show dispatcher docker compose commands and env",
+    )
+    dispatcher_compose_parser.add_argument("--env", action="store_true")
+    dispatcher_compose_parser.set_defaults(func=cmd_dispatcher_compose)
+
+    dispatcher_up_parser = sub.add_parser("dispatcher-up", help="Start vLLM dispatcher service")
+    dispatcher_up_parser.set_defaults(func=cmd_dispatcher_up)
+
+    dispatcher_down_parser = sub.add_parser("dispatcher-down", help="Stop vLLM dispatcher service")
+    dispatcher_down_parser.set_defaults(func=cmd_dispatcher_down)
 
     ingest_parser = sub.add_parser("ingest", help="Copy and index a local text file")
     ingest_parser.add_argument("path")
