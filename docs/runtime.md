@@ -46,6 +46,7 @@ py -3.11 .\jarvis.py approval-request "Host action" "Needs review" --risk danger
 py -3.11 .\jarvis.py approval-update <approval_id> --status approved
 py -3.11 .\jarvis.py mission-next <mission_id>
 py -3.11 .\jarvis.py serve --reload
+.\scripts\doctor.ps1
 ```
 
 ## API

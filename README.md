@@ -96,6 +96,12 @@ py -3.11 .\jarvis.py approval-request "Host action" "Needs review" --risk danger
 py -3.11 .\jarvis.py mission-next <mission_id>
 ```
 
+Полная локальная проверка:
+
+```powershell
+.\scripts\doctor.ps1
+```
+
 `gemma4-mono` — стабильный baseline на `gemma4-31b-it-nvfp4` для холодного старта и диагностики.
 
 `gemma4-turbo` — быстрый профиль на `gemma4-26b-a4b-nvfp4` для прогретого runtime.
