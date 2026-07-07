@@ -19,6 +19,8 @@ Agent Runtime
   |-- file ingestion and chunk search
   |-- audit trail
   |-- HITL approval gates
+  |-- telemetry and learning tick
+  |-- host bridge status
   |-- task lifecycle
   |-- diagnostics
   |-- event stream
@@ -52,6 +54,8 @@ External host runtime
 - Профили `gemma4-mono` и `gemma4-turbo` указывают на реальные каталоги весов в `D:\jarvis\data\models`; backend не хранит веса в репозитории.
 - Dispatcher вынесен в отдельный Compose profile `llm`, чтобы Command Center можно было запускать без случайной загрузки тяжёлых весов в VRAM.
 - Любое действие с риском выше safe должно сначала стать approval gate; выполнение после approve будет добавляться отдельным gated executor.
+- Self-learning пока идёт через explicit `learning.tick`: он добывает lessons из audit/tool/approval истории и пишет их в долговременную память.
+- Performance слой разделяет лёгкий backend и тяжёлый dispatcher; GPU утилизируется vLLM-профилем, а backend собирает telemetry без удержания весов.
 
 ## Runtime profiles
 

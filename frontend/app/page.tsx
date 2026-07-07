@@ -9,6 +9,7 @@ import {
   Database,
   FileText,
   History,
+  Gauge,
   Loader2,
   MessageSquare,
   Play,
@@ -19,6 +20,7 @@ import {
   Server,
   ShieldAlert,
   Sparkles,
+  Zap,
   Upload,
   Wrench
 } from "lucide-react";
@@ -174,6 +176,23 @@ type DispatcherStatus = {
   container_status?: { exists?: boolean; status?: string } | null;
 };
 
+type TelemetrySnapshot = {
+  ts: string;
+  host: { hostname: string; platform: string; cpu_count: number };
+  memory: { total?: number | null; available?: number | null; used?: number | null; used_ratio?: number | null };
+  disks: { path: string; total: number; used: number; free: number; used_ratio: number }[];
+  gpu: { available: boolean; gpus?: { name: string; memory_used_ratio?: number | null; utilization_gpu?: number | null; temperature_c?: number | null }[]; error?: string };
+  docker: { available: boolean; containers?: { name?: string; status?: string }[]; error?: string };
+  performance: Record<string, unknown>;
+};
+
+type HostBridgeStatus = {
+  port_open: boolean;
+  token_available: boolean;
+  script_available: boolean;
+  start_command: string;
+};
+
 type ToolInfo = {
   name: string;
   description: string;
@@ -217,6 +236,8 @@ export default function CommandCenter() {
   const [audit, setAudit] = useState<AuditEntry[]>([]);
   const [modelCatalog, setModelCatalog] = useState<ModelCatalog | null>(null);
   const [dispatcher, setDispatcher] = useState<DispatcherStatus | null>(null);
+  const [telemetry, setTelemetry] = useState<TelemetrySnapshot | null>(null);
+  const [hostBridge, setHostBridge] = useState<HostBridgeStatus | null>(null);
   const [approvals, setApprovals] = useState<ApprovalItem[]>([]);
   const [input, setInput] = useState("");
   const [memoryDraft, setMemoryDraft] = useState("");
@@ -244,6 +265,8 @@ export default function CommandCenter() {
         auditData,
         modelData,
         dispatcherData,
+        telemetryData,
+        hostBridgeData,
         approvalData
       ] = await Promise.all([
           api<RuntimeStatus>("/api/status"),
@@ -254,6 +277,8 @@ export default function CommandCenter() {
           api<AuditEntry[]>("/api/audit?limit=8"),
           api<ModelCatalog>("/api/models"),
           api<DispatcherStatus>("/api/dispatcher"),
+          api<TelemetrySnapshot>("/api/telemetry"),
+          api<HostBridgeStatus>("/api/host-bridge"),
           api<ApprovalItem[]>("/api/approvals?limit=8")
         ]);
       setStatus(statusData);
@@ -264,6 +289,8 @@ export default function CommandCenter() {
       setAudit(auditData);
       setModelCatalog(modelData);
       setDispatcher(dispatcherData);
+      setTelemetry(telemetryData);
+      setHostBridge(hostBridgeData);
       setApprovals(approvalData);
       if (statusData.health.length) {
         setDiagnostics(statusData.health);
@@ -478,6 +505,25 @@ export default function CommandCenter() {
     }
   }
 
+  async function runLearningTick() {
+    setBusy(true);
+    try {
+      const result = await api<{ lesson_count: number }>("/api/learning/tick", {
+        method: "POST",
+        body: "{}"
+      });
+      setLines((current) => [
+        ...current,
+        { role: "system", content: `Learning tick: ${result.lesson_count} lessons saved` }
+      ]);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Learning tick failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <main className="shell">
       <aside className="rail" aria-label="Навигация">
@@ -501,6 +547,9 @@ export default function CommandCenter() {
         </IconButton>
         <IconButton label="Диагностика">
           <Activity size={20} />
+        </IconButton>
+        <IconButton label="Ресурсы">
+          <Gauge size={20} />
         </IconButton>
         <IconButton label="Audit">
           <History size={20} />
@@ -556,6 +605,12 @@ export default function CommandCenter() {
             label="Файлы"
             value={`${counters.files ?? 0}`}
             tone="neutral"
+          />
+          <StatusTile
+            icon={<Gauge size={19} />}
+            label="GPU"
+            value={telemetry?.gpu.available ? `${telemetry.gpu.gpus?.length ?? 0}` : "offline"}
+            tone={telemetry?.gpu.available ? "ok" : "warn"}
           />
         </section>
 
@@ -735,6 +790,52 @@ export default function CommandCenter() {
             </div>
 
             <div className="panelHeader lower">
+              <h2>Ресурсы</h2>
+              <span>{telemetry?.host.cpu_count ?? 0} CPU</span>
+            </div>
+            <div className="resourceList">
+              <div className="resourceRow">
+                <Gauge size={14} />
+                <strong>RAM</strong>
+                <div className="meter">
+                  <span style={{ width: `${ratioPercent(telemetry?.memory.used_ratio)}%` }} />
+                </div>
+                <small>{ratioLabel(telemetry?.memory.used_ratio)}</small>
+              </div>
+              <div className="resourceRow">
+                <Zap size={14} />
+                <strong>GPU</strong>
+                <div className="meter">
+                  <span
+                    style={{
+                      width: `${ratioPercent(telemetry?.gpu.gpus?.[0]?.memory_used_ratio)}%`
+                    }}
+                  />
+                </div>
+                <small>
+                  {telemetry?.gpu.available
+                    ? `${Math.round(telemetry.gpu.gpus?.[0]?.utilization_gpu ?? 0)}% util`
+                    : "offline"}
+                </small>
+              </div>
+              <div className={`bridgeRow ${hostBridge?.port_open ? "online" : ""}`}>
+                <Server size={14} />
+                <strong>Host bridge</strong>
+                <span>{hostBridge?.port_open ? "online" : "offline"}</span>
+                <small>{hostBridge?.token_available ? "token" : "no token"}</small>
+              </div>
+              <button
+                className="iconText compact full"
+                type="button"
+                onClick={runLearningTick}
+                disabled={busy}
+              >
+                <Brain size={15} />
+                <span>Learning tick</span>
+              </button>
+            </div>
+
+            <div className="panelHeader lower">
               <h2>Инструменты</h2>
               <span>{tools.length}</span>
             </div>
@@ -879,4 +980,13 @@ function formatBytes(size: number) {
   if (size < 1024) return `${size} B`;
   if (size < 1024 * 1024) return `${Math.round(size / 1024)} KB`;
   return `${(size / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function ratioPercent(value?: number | null) {
+  if (typeof value !== "number" || Number.isNaN(value)) return 0;
+  return Math.max(0, Math.min(100, Math.round(value * 100)));
+}
+
+function ratioLabel(value?: number | null) {
+  return `${ratioPercent(value)}%`;
 }

@@ -19,7 +19,9 @@ from .config import ensure_runtime_dirs, load_settings
 from .diagnostics import run_diagnostics
 from .dispatcher import DispatcherManager
 from .event_bus import EventBus
+from .host_bridge import HostBridgeStatus
 from .ingest import FileIngestor
+from .learning import LearningEngine
 from .llm import LLMRouter
 from .model_catalog import ModelCatalog
 from .models import (
@@ -34,6 +36,8 @@ from .models import (
     FileChunkHit,
     FileIngestResponse,
     FileItem,
+    HostBridgeResponse,
+    LearningTickResponse,
     MemoryCreateRequest,
     MemoryItem,
     Mission,
@@ -43,11 +47,13 @@ from .models import (
     MissionTaskUpdateRequest,
     ModelCatalogResponse,
     StatusResponse,
+    TelemetryResponse,
     ToolInfo,
     ToolRunRequest,
     ToolRunResponse,
 )
 from .storage import JarvisStorage
+from .telemetry import TelemetryCollector
 
 
 @asynccontextmanager
@@ -62,6 +68,9 @@ async def lifespan(app: FastAPI):
     ingestor = FileIngestor(settings=settings, storage=storage)
     models = ModelCatalog(settings)
     dispatcher = DispatcherManager(settings)
+    telemetry = TelemetryCollector(settings)
+    learning = LearningEngine(storage)
+    host_bridge = HostBridgeStatus(settings)
 
     app.state.settings = settings
     app.state.storage = storage
@@ -71,6 +80,9 @@ async def lifespan(app: FastAPI):
     app.state.ingestor = ingestor
     app.state.models = models
     app.state.dispatcher = dispatcher
+    app.state.telemetry = telemetry
+    app.state.learning = learning
+    app.state.host_bridge = host_bridge
     storage.add_event(kind="runtime.start", title="JARVIS GPT backend started")
     try:
         yield
@@ -135,6 +147,25 @@ async def models() -> ModelCatalogResponse:
 @app.get("/api/dispatcher", response_model=DispatcherStatusResponse)
 async def dispatcher() -> DispatcherStatusResponse:
     return app.state.dispatcher.status()
+
+
+@app.get("/api/telemetry", response_model=TelemetryResponse)
+async def telemetry() -> TelemetryResponse:
+    snapshot = app.state.telemetry.snapshot()
+    app.state.storage.record_telemetry(snapshot)
+    return snapshot
+
+
+@app.post("/api/learning/tick", response_model=LearningTickResponse)
+async def learning_tick() -> LearningTickResponse:
+    result = app.state.learning.tick()
+    await app.state.bus.publish({"channel": "learning", "lesson_count": result["lesson_count"]})
+    return result
+
+
+@app.get("/api/host-bridge", response_model=HostBridgeResponse)
+async def host_bridge() -> HostBridgeResponse:
+    return app.state.host_bridge.snapshot()
 
 
 @app.post("/api/chat", response_model=ChatResponse)

@@ -153,6 +153,34 @@ class DispatcherStatusResponse(BaseModel):
     env: dict[str, str]
 
 
+class TelemetryResponse(BaseModel):
+    ts: str
+    host: dict[str, Any]
+    memory: dict[str, Any]
+    disks: list[dict[str, Any]]
+    gpu: dict[str, Any]
+    docker: dict[str, Any]
+    performance: dict[str, Any]
+
+
+class LearningTickResponse(BaseModel):
+    saved: list[MemoryItem]
+    lesson_count: int
+    examined: dict[str, int]
+
+
+class HostBridgeResponse(BaseModel):
+    name: str
+    host: str
+    port: int
+    port_open: bool
+    token_path: str | None = None
+    token_available: bool
+    script_path: str
+    script_available: bool
+    start_command: str
+
+
 class AuditEntry(BaseModel):
     id: str
     ts: str

@@ -9,10 +9,13 @@ from typing import Any, Literal
 
 from .config import JarvisSettings
 from .diagnostics import run_diagnostics
+from .host_bridge import HostBridgeStatus
+from .learning import LearningEngine
 from .llm import LLMRouter
 from .model_catalog import ModelCatalog
 from .models import ToolInfo, ToolRunResponse
 from .storage import JarvisStorage
+from .telemetry import TelemetryCollector
 
 DangerLevel = Literal["safe", "review", "danger"]
 ToolHandler = Callable[
@@ -160,6 +163,37 @@ class ToolRegistry:
         )
         self.add(
             ToolSpec(
+                name="telemetry.snapshot",
+                description=(
+                    "Collect CPU, memory, disk, GPU, Docker and performance policy telemetry."
+                ),
+                category="runtime",
+                input_schema={"persist": "Store snapshot in SQLite"},
+                handler=_telemetry_snapshot,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="learning.tick",
+                description=(
+                    "Mine recent audit/tool/approval history into durable learning memories."
+                ),
+                category="learning",
+                input_schema={"limit": "Maximum recent records to inspect"},
+                handler=_learning_tick,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="host.bridge.status",
+                description="Inspect native host RPC bridge readiness, token and port state.",
+                category="host",
+                input_schema={},
+                handler=_host_bridge_status,
+            )
+        )
+        self.add(
+            ToolSpec(
                 name="approval.request",
                 description="Create a human approval gate for a risky or irreversible action.",
                 category="safety",
@@ -293,6 +327,45 @@ def _models_list(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunResponse:
             f"active profile is {catalog['active_profile']}."
         ),
         data=catalog,
+    )
+
+
+def _telemetry_snapshot(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    snapshot = TelemetryCollector(ctx.settings).snapshot()
+    if bool(args.get("persist")):
+        ctx.storage.record_telemetry(snapshot)
+    gpu = snapshot.get("gpu", {})
+    gpu_count = len(gpu.get("gpus") or []) if gpu.get("available") else 0
+    return ToolRunResponse(
+        tool="telemetry.snapshot",
+        ok=True,
+        summary=f"Telemetry collected: {gpu_count} GPU(s) visible.",
+        data=snapshot,
+    )
+
+
+def _learning_tick(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    limit = _int_arg(args.get("limit"), default=20, minimum=5, maximum=100)
+    result = LearningEngine(ctx.storage).tick(limit=limit)
+    return ToolRunResponse(
+        tool="learning.tick",
+        ok=True,
+        summary=f"Learning tick saved {result['lesson_count']} lesson(s).",
+        data=result,
+    )
+
+
+def _host_bridge_status(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunResponse:
+    status = HostBridgeStatus(ctx.settings).snapshot()
+    return ToolRunResponse(
+        tool="host.bridge.status",
+        ok=bool(status["script_available"]),
+        summary="Host bridge is listening."
+        if status["port_open"]
+        else "Host bridge script found but port is offline."
+        if status["script_available"]
+        else "Host bridge script is missing.",
+        data=status,
     )
 
 

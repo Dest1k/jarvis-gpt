@@ -123,6 +123,7 @@ class JarvisStorage:
             "file_chunks",
             "tool_runs",
             "approvals",
+            "telemetry_snapshots",
             "audit_log",
         ]
         with self._lock:
@@ -1032,6 +1033,39 @@ class JarvisStorage:
             ).fetchall()
         return [{**dict(row), "details": _loads(row["details"], {})} for row in rows]
 
+    def record_telemetry(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        row = {
+            "id": new_id("tel"),
+            "ts": str(snapshot.get("ts") or utc_now()),
+            "snapshot": snapshot,
+        }
+        with self._lock:
+            self.connect().execute(
+                """
+                INSERT INTO telemetry_snapshots(id, ts, snapshot)
+                VALUES (?, ?, ?)
+                """,
+                (row["id"], row["ts"], _json(row["snapshot"])),
+            )
+            self.connect().commit()
+        return row
+
+    def list_telemetry(self, limit: int = 24) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self.connect().execute(
+                """
+                SELECT id, ts, snapshot
+                FROM telemetry_snapshots
+                ORDER BY ts DESC, rowid DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [
+            {"id": row["id"], "ts": row["ts"], "snapshot": _loads(row["snapshot"], {})}
+            for row in rows
+        ]
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runtime_events (
@@ -1148,6 +1182,12 @@ CREATE TABLE IF NOT EXISTS approvals (
     result TEXT NOT NULL DEFAULT '{}'
 );
 
+CREATE TABLE IF NOT EXISTS telemetry_snapshots (
+    id TEXT PRIMARY KEY,
+    ts TEXT NOT NULL,
+    snapshot TEXT NOT NULL DEFAULT '{}'
+);
+
 CREATE TABLE IF NOT EXISTS audit_log (
     id TEXT PRIMARY KEY,
     ts TEXT NOT NULL,
@@ -1170,6 +1210,7 @@ CREATE INDEX IF NOT EXISTS idx_health_component ON health_snapshots(component, t
 CREATE INDEX IF NOT EXISTS idx_tool_runs_ts ON tool_runs(ts);
 CREATE INDEX IF NOT EXISTS idx_tool_runs_mission ON tool_runs(mission_id, task_id);
 CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_telemetry_ts ON telemetry_snapshots(ts);
 CREATE INDEX IF NOT EXISTS idx_audit_log_target ON audit_log(target_type, target_id, ts);
 CREATE INDEX IF NOT EXISTS idx_audit_log_ts ON audit_log(ts);
 """

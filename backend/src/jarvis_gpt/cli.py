@@ -12,10 +12,13 @@ from .config import PROFILES, ensure_runtime_dirs, load_settings
 from .diagnostics import run_diagnostics
 from .dispatcher import DispatcherManager
 from .event_bus import EventBus
+from .host_bridge import HostBridgeStatus
 from .ingest import FileIngestor
+from .learning import LearningEngine
 from .llm import LLMRouter
 from .model_catalog import ModelCatalog
 from .storage import JarvisStorage
+from .telemetry import TelemetryCollector
 
 
 def _print_json(data: Any) -> None:
@@ -144,6 +147,27 @@ def cmd_dispatcher_up(args: argparse.Namespace) -> None:
 def cmd_dispatcher_down(args: argparse.Namespace) -> None:
     settings, storage, _llm, _agent = _runtime(args.profile)
     _print_json(DispatcherManager(settings).run_compose("down"))
+    storage.close()
+
+
+def cmd_telemetry(args: argparse.Namespace) -> None:
+    settings, storage, _llm, _agent = _runtime(args.profile)
+    snapshot = TelemetryCollector(settings).snapshot()
+    if args.persist:
+        storage.record_telemetry(snapshot)
+    _print_json(snapshot)
+    storage.close()
+
+
+def cmd_learning_tick(args: argparse.Namespace) -> None:
+    _settings, storage, _llm, _agent = _runtime(args.profile)
+    _print_json(LearningEngine(storage).tick(limit=args.limit))
+    storage.close()
+
+
+def cmd_host_bridge(args: argparse.Namespace) -> None:
+    settings, storage, _llm, _agent = _runtime(args.profile)
+    _print_json(HostBridgeStatus(settings).snapshot())
     storage.close()
 
 
@@ -288,6 +312,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     dispatcher_down_parser = sub.add_parser("dispatcher-down", help="Stop vLLM dispatcher service")
     dispatcher_down_parser.set_defaults(func=cmd_dispatcher_down)
+
+    telemetry_parser = sub.add_parser("telemetry", help="Collect host/GPU/Docker telemetry")
+    telemetry_parser.add_argument("--persist", action="store_true")
+    telemetry_parser.set_defaults(func=cmd_telemetry)
+
+    learning_tick_parser = sub.add_parser(
+        "learning-tick",
+        help="Mine audit/tool history into memory",
+    )
+    learning_tick_parser.add_argument("--limit", type=int, default=20)
+    learning_tick_parser.set_defaults(func=cmd_learning_tick)
+
+    host_bridge_parser = sub.add_parser("host-bridge", help="Show native host bridge status")
+    host_bridge_parser.set_defaults(func=cmd_host_bridge)
 
     ingest_parser = sub.add_parser("ingest", help="Copy and index a local text file")
     ingest_parser.add_argument("path")

@@ -26,6 +26,9 @@ py -3.11 .\jarvis.py dispatcher-status
 py -3.11 .\jarvis.py dispatcher-compose --env
 py -3.11 .\jarvis.py dispatcher-up
 py -3.11 .\jarvis.py dispatcher-down
+py -3.11 .\jarvis.py telemetry --persist
+py -3.11 .\jarvis.py host-bridge
+py -3.11 .\jarvis.py learning-tick
 py -3.11 .\jarvis.py diag
 py -3.11 .\jarvis.py chat "JARVIS, оформи это как mission plan: ..."
 py -3.11 .\jarvis.py tools
@@ -48,6 +51,9 @@ GET  /health
 GET  /api/status
 GET  /api/models
 GET  /api/dispatcher
+GET  /api/telemetry
+GET  /api/host-bridge
+POST /api/learning/tick
 POST /api/chat
 GET  /api/missions
 POST /api/missions
@@ -113,6 +119,7 @@ Dispatcher запускается отдельно, чтобы не грузит
 - `health_snapshots`
 - `tool_runs`
 - `approvals`
+- `telemetry_snapshots`
 - `audit_log`
 
 Если SQLite собран с FTS5, память индексируется в `memories_fts`, а файловые чанки — в `file_chunks_fts`. Если FTS5 нет, поиск автоматически деградирует до `LIKE`.

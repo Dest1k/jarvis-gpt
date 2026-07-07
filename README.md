@@ -10,12 +10,15 @@
 - File ingestion: загрузка текстовых файлов, хранение в `D:\jarvis\data\jarvis-gpt\files`, chunk search и audit trail.
 - Model catalog: активные профили знают реальные Gemma 4 веса в `D:\jarvis\data\models`.
 - HITL approvals: опасные действия оформляются как durable approval gates, а не выполняются молча.
+- Telemetry/performance: CPU/RAM/disk/GPU/Docker snapshots, performance profile и host bridge status.
+- Self-learning tick: аудит, tool runs и approvals превращаются в долговременные lessons.
 - Исполнение следующего шага mission plan с прогрессом задач и журналом tool runs.
 - SQLite WAL-хранилище в `D:\jarvis\data\jarvis-gpt\state\jarvis.sqlite3`.
 - Два runtime-профиля: `gemma4-mono` и `gemma4-turbo`.
 - Next.js Command Center: чат, статус runtime, миссии и диагностика.
 - Command Center показывает файлы, поиск по чанкам, ручную память, tools и audit stream.
 - Command Center показывает локальные модели, approvals, активный профиль и dispatcher-конфигурацию.
+- Command Center показывает ресурсы, GPU, host bridge и запускает learning tick.
 - CLI `py -3.11 .\jarvis.py ...` и Docker Compose для повторяемого запуска.
 
 ## Быстрый старт
@@ -79,6 +82,9 @@ py -3.11 .\jarvis.py models --env
 py -3.11 .\jarvis.py llm-health
 py -3.11 .\jarvis.py dispatcher-status
 .\scripts\dispatcher.ps1 up
+py -3.11 .\jarvis.py telemetry --persist
+py -3.11 .\jarvis.py host-bridge
+py -3.11 .\jarvis.py learning-tick
 py -3.11 .\jarvis.py tool-run memory.search --set query=runtime --set limit=5
 py -3.11 .\jarvis.py ingest README.md
 py -3.11 .\jarvis.py file-search Jarvis
