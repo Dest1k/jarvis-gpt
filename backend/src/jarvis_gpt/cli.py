@@ -84,6 +84,34 @@ def cmd_chat(args: argparse.Namespace) -> None:
     asyncio.run(run())
 
 
+def cmd_tools(args: argparse.Namespace) -> None:
+    settings, storage, _llm, agent = _runtime(args.profile)
+    _print_json([tool.model_dump() for tool in agent.tools.list()])
+    storage.close()
+
+
+def cmd_tool_run(args: argparse.Namespace) -> None:
+    async def run() -> None:
+        _settings, storage, _llm, agent = _runtime(args.profile)
+        arguments = _json_argument(args.arguments)
+        arguments.update(_set_arguments(args.sets))
+        response = await agent.tools.run(args.name, arguments)
+        _print_json(response.model_dump())
+        storage.close()
+
+    asyncio.run(run())
+
+
+def cmd_mission_next(args: argparse.Namespace) -> None:
+    async def run() -> None:
+        _settings, storage, _llm, agent = _runtime(args.profile)
+        response = await agent.execute_next_mission_step(args.mission_id)
+        _print_json(response.model_dump())
+        storage.close()
+
+    asyncio.run(run())
+
+
 def cmd_serve(args: argparse.Namespace) -> None:
     settings = load_settings(args.profile)
     uvicorn.run(
@@ -117,6 +145,29 @@ def build_parser() -> argparse.ArgumentParser:
     chat_parser.add_argument("--mode", choices=["auto", "chat", "mission"], default="auto")
     chat_parser.set_defaults(func=cmd_chat)
 
+    tools_parser = sub.add_parser("tools", help="List registered safe tools")
+    tools_parser.set_defaults(func=cmd_tools)
+
+    tool_run_parser = sub.add_parser("tool-run", help="Run a registered safe tool")
+    tool_run_parser.add_argument("name")
+    tool_run_parser.add_argument(
+        "--arguments",
+        default="{}",
+        help="JSON object with tool arguments",
+    )
+    tool_run_parser.add_argument(
+        "--set",
+        dest="sets",
+        action="append",
+        default=[],
+        help="Set one argument as key=value. Can be repeated.",
+    )
+    tool_run_parser.set_defaults(func=cmd_tool_run)
+
+    mission_next_parser = sub.add_parser("mission-next", help="Execute next pending mission task")
+    mission_next_parser.add_argument("mission_id")
+    mission_next_parser.set_defaults(func=cmd_mission_next)
+
     serve_parser = sub.add_parser("serve", help="Start FastAPI backend")
     serve_parser.add_argument("--host", default=None)
     serve_parser.add_argument("--port", type=int, default=None)
@@ -124,6 +175,44 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.set_defaults(func=cmd_serve)
 
     return parser
+
+
+def _json_argument(raw: str | None) -> dict[str, Any]:
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"Invalid JSON for --arguments: {exc}") from exc
+    if not isinstance(data, dict):
+        raise SystemExit("--arguments must be a JSON object")
+    return data
+
+
+def _set_arguments(items: list[str]) -> dict[str, Any]:
+    parsed: dict[str, Any] = {}
+    for item in items:
+        if "=" not in item:
+            raise SystemExit(f"--set expects key=value, got: {item}")
+        key, value = item.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise SystemExit("--set key cannot be empty")
+        parsed[key] = _parse_set_value(value)
+    return parsed
+
+
+def _parse_set_value(value: str) -> Any:
+    value = value.strip()
+    if not value:
+        return ""
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        pass
+    if "," in value:
+        return [part.strip() for part in value.split(",") if part.strip()]
+    return value
 
 
 def main() -> None:

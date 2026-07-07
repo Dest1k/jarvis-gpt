@@ -20,6 +20,9 @@ py -3.11 .\jarvis.py profiles
 py -3.11 .\jarvis.py status
 py -3.11 .\jarvis.py diag
 py -3.11 .\jarvis.py chat "JARVIS, оформи это как mission plan: ..."
+py -3.11 .\jarvis.py tools
+py -3.11 .\jarvis.py tool-run memory.search --set query=runtime --set limit=5
+py -3.11 .\jarvis.py mission-next <mission_id>
 py -3.11 .\jarvis.py serve --reload
 ```
 
@@ -31,8 +34,13 @@ GET  /api/status
 POST /api/chat
 GET  /api/missions
 POST /api/missions
+POST /api/missions/{mission_id}/execute-next
+PATCH /api/missions/{mission_id}/tasks/{task_id}
 GET  /api/memory
 POST /api/memory
+GET  /api/tools
+POST /api/tools/{tool_name}/run
+GET  /api/tool-runs
 POST /api/diagnostics
 WS   /ws/events
 ```
@@ -54,3 +62,6 @@ D:\jarvis\data\jarvis-gpt\state\jarvis.sqlite3
 - `mission_tasks`
 - `runtime_events`
 - `health_snapshots`
+- `tool_runs`
+
+Если SQLite собран с FTS5, память дополнительно индексируется в `memories_fts`. Если FTS5 нет, поиск автоматически деградирует до `LIKE`.

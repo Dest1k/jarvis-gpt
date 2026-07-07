@@ -4,15 +4,18 @@ import {
   Activity,
   Brain,
   CheckCircle2,
+  ClipboardCheck,
   Database,
   Loader2,
   MessageSquare,
   Play,
   RefreshCw,
+  Save,
   Send,
   Server,
   ShieldAlert,
-  Sparkles
+  Sparkles,
+  Wrench
 } from "lucide-react";
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
@@ -51,6 +54,7 @@ type MissionTask = {
   id: string;
   title: string;
   status: string;
+  notes?: string | null;
   position: number;
 };
 
@@ -66,6 +70,33 @@ type Mission = {
 type ChatLine = {
   role: "user" | "assistant" | "system";
   content: string;
+};
+
+type MemoryItem = {
+  id: string;
+  namespace: string;
+  content: string;
+  tags: string[];
+  importance: number;
+  rank?: number | null;
+};
+
+type ToolInfo = {
+  name: string;
+  description: string;
+  category: string;
+  danger_level: "safe" | "review" | "danger";
+};
+
+type MissionExecution = {
+  mission: Mission;
+  task: MissionTask | null;
+  result: {
+    tool: string;
+    ok: boolean;
+    summary: string;
+    data: Record<string, unknown>;
+  };
 };
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
@@ -86,7 +117,10 @@ export default function CommandCenter() {
   const [status, setStatus] = useState<RuntimeStatus | null>(null);
   const [missions, setMissions] = useState<Mission[]>([]);
   const [diagnostics, setDiagnostics] = useState<DiagnosticCheck[]>([]);
+  const [tools, setTools] = useState<ToolInfo[]>([]);
+  const [memories, setMemories] = useState<MemoryItem[]>([]);
   const [input, setInput] = useState("");
+  const [memoryDraft, setMemoryDraft] = useState("");
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [lines, setLines] = useState<ChatLine[]>([
     {
@@ -100,12 +134,16 @@ export default function CommandCenter() {
   const refresh = useCallback(async () => {
     try {
       setError(null);
-      const [statusData, missionData] = await Promise.all([
+      const [statusData, missionData, toolData, memoryData] = await Promise.all([
         api<RuntimeStatus>("/api/status"),
-        api<Mission[]>("/api/missions")
+        api<Mission[]>("/api/missions"),
+        api<ToolInfo[]>("/api/tools"),
+        api<MemoryItem[]>("/api/memory?limit=8")
       ]);
       setStatus(statusData);
       setMissions(missionData);
+      setTools(toolData);
+      setMemories(memoryData);
       if (statusData.health.length) {
         setDiagnostics(statusData.health);
       }
@@ -167,6 +205,81 @@ export default function CommandCenter() {
       await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Диагностика не ответила");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function executeNextMissionStep(missionId: string) {
+    setBusy(true);
+    try {
+      const response = await api<MissionExecution>(`/api/missions/${missionId}/execute-next`, {
+        method: "POST",
+        body: "{}"
+      });
+      setMissions((current) =>
+        current.map((mission) => (mission.id === response.mission.id ? response.mission : mission))
+      );
+      setLines((current) => [
+        ...current,
+        {
+          role: "system",
+          content: `${response.result.summary}${response.task ? `\n${response.task.title}` : ""}`
+        }
+      ]);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Mission step failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function updateTaskStatus(missionId: string, taskId: string, statusValue: string) {
+    setBusy(true);
+    try {
+      const updated = await api<MissionTask>(`/api/missions/${missionId}/tasks/${taskId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ status: statusValue })
+      });
+      setMissions((current) =>
+        current.map((mission) =>
+          mission.id === missionId
+            ? {
+                ...mission,
+                tasks: mission.tasks.map((task) => (task.id === taskId ? updated : task))
+              }
+            : mission
+        )
+      );
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Task update failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function saveMemory(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const content = memoryDraft.trim();
+    if (!content || busy) return;
+    setBusy(true);
+    try {
+      const saved = await api<MemoryItem>("/api/memory", {
+        method: "POST",
+        body: JSON.stringify({
+          content,
+          namespace: "operator",
+          tags: ["manual"],
+          importance: 0.65
+        })
+      });
+      setMemoryDraft("");
+      setMemories((current) => [saved, ...current].slice(0, 8));
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Memory save failed");
     } finally {
       setBusy(false);
     }
@@ -285,15 +398,52 @@ export default function CommandCenter() {
                   <article className="missionItem" key={mission.id}>
                     <div className="missionTitle">
                       <CheckCircle2 size={17} />
-                      <h3>{mission.title}</h3>
+                      <div>
+                        <h3>{mission.title}</h3>
+                        <div className="progressTrack" aria-label="Mission progress">
+                          <span style={{ width: `${Math.round(mission.progress * 100)}%` }} />
+                        </div>
+                      </div>
                     </div>
                     <div className="taskList">
-                      {mission.tasks.slice(0, 4).map((task) => (
-                        <div className="taskRow" key={task.id}>
+                      {mission.tasks.slice(0, 6).map((task) => (
+                        <div className={`taskRow ${task.status}`} key={task.id}>
                           <span>{task.position}</span>
                           <p>{task.title}</p>
+                          <div className="taskControls">
+                            <button
+                              type="button"
+                              title="Done"
+                              aria-label="Done"
+                              disabled={busy || task.status === "done"}
+                              onClick={() => updateTaskStatus(mission.id, task.id, "done")}
+                            >
+                              <ClipboardCheck size={14} />
+                            </button>
+                            <button
+                              type="button"
+                              title="Blocked"
+                              aria-label="Blocked"
+                              disabled={busy || task.status === "blocked"}
+                              onClick={() => updateTaskStatus(mission.id, task.id, "blocked")}
+                            >
+                              <ShieldAlert size={14} />
+                            </button>
+                          </div>
                         </div>
                       ))}
+                    </div>
+                    <div className="missionActions">
+                      <button
+                        className="iconText compact"
+                        type="button"
+                        onClick={() => executeNextMissionStep(mission.id)}
+                        disabled={busy || mission.status === "done"}
+                      >
+                        <Play size={15} />
+                        <span>Следующий шаг</span>
+                      </button>
+                      <small>{Math.round(mission.progress * 100)}%</small>
                     </div>
                   </article>
                 ))
@@ -311,6 +461,44 @@ export default function CommandCenter() {
                   <strong>{check.name}</strong>
                   <p>{check.message}</p>
                 </div>
+              ))}
+            </div>
+
+            <div className="panelHeader lower">
+              <h2>Инструменты</h2>
+              <span>{tools.length}</span>
+            </div>
+            <div className="toolList">
+              {tools.slice(0, 8).map((tool) => (
+                <div className="toolRow" key={tool.name}>
+                  <Wrench size={14} />
+                  <strong>{tool.name}</strong>
+                  <span>{tool.category}</span>
+                </div>
+              ))}
+            </div>
+
+            <div className="panelHeader lower">
+              <h2>Память</h2>
+              <span>{memories.length}</span>
+            </div>
+            <form className="memoryForm" onSubmit={saveMemory}>
+              <input
+                value={memoryDraft}
+                onChange={(event) => setMemoryDraft(event.target.value)}
+                placeholder="Новая запись"
+                aria-label="Новая запись памяти"
+              />
+              <button type="submit" disabled={busy || !memoryDraft.trim()} title="Сохранить">
+                <Save size={15} />
+              </button>
+            </form>
+            <div className="memoryList">
+              {memories.slice(0, 5).map((memory) => (
+                <article className="memoryRow" key={memory.id}>
+                  <strong>{memory.namespace}</strong>
+                  <p>{memory.content}</p>
+                </article>
               ))}
             </div>
           </section>

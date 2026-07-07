@@ -1,0 +1,389 @@
+from __future__ import annotations
+
+import inspect
+import math
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Literal
+
+from .config import JarvisSettings
+from .diagnostics import run_diagnostics
+from .llm import LLMRouter
+from .models import ToolInfo, ToolRunResponse
+from .storage import JarvisStorage
+
+DangerLevel = Literal["safe", "review", "danger"]
+ToolHandler = Callable[
+    ["ToolContext", dict[str, Any]],
+    ToolRunResponse | Awaitable[ToolRunResponse],
+]
+
+
+@dataclass(frozen=True)
+class ToolContext:
+    settings: JarvisSettings
+    storage: JarvisStorage
+    llm: LLMRouter
+    mission_id: str | None = None
+    task_id: str | None = None
+
+
+@dataclass(frozen=True)
+class ToolSpec:
+    name: str
+    description: str
+    category: str
+    input_schema: dict[str, Any]
+    handler: ToolHandler
+    danger_level: DangerLevel = "safe"
+
+    def info(self) -> ToolInfo:
+        return ToolInfo(
+            name=self.name,
+            description=self.description,
+            category=self.category,
+            input_schema=self.input_schema,
+            danger_level=self.danger_level,
+        )
+
+
+class ToolRegistry:
+    def __init__(self, settings: JarvisSettings, storage: JarvisStorage, llm: LLMRouter) -> None:
+        self.settings = settings
+        self.storage = storage
+        self.llm = llm
+        self._tools: dict[str, ToolSpec] = {}
+        self._register_defaults()
+
+    def list(self) -> list[ToolInfo]:
+        return [tool.info() for tool in sorted(self._tools.values(), key=lambda item: item.name)]
+
+    def get(self, name: str) -> ToolSpec | None:
+        return self._tools.get(name)
+
+    def add(self, spec: ToolSpec) -> None:
+        self._tools[spec.name] = spec
+
+    async def run(
+        self,
+        name: str,
+        arguments: dict[str, Any] | None = None,
+        *,
+        mission_id: str | None = None,
+        task_id: str | None = None,
+    ) -> ToolRunResponse:
+        spec = self.get(name)
+        args = arguments or {}
+        if spec is None:
+            response = ToolRunResponse(
+                tool=name,
+                ok=False,
+                summary=f"Tool {name!r} is not registered.",
+                data={"available": [tool.name for tool in self.list()]},
+            )
+        else:
+            context = ToolContext(
+                settings=self.settings,
+                storage=self.storage,
+                llm=self.llm,
+                mission_id=mission_id,
+                task_id=task_id,
+            )
+            try:
+                raw = spec.handler(context, args)
+                response = await raw if inspect.isawaitable(raw) else raw
+            except Exception as exc:  # noqa: BLE001
+                response = ToolRunResponse(
+                    tool=name,
+                    ok=False,
+                    summary=f"Tool failed: {exc}",
+                    data={"error": str(exc)},
+                )
+
+        self.storage.record_tool_run(
+            tool=response.tool,
+            ok=response.ok,
+            summary=response.summary,
+            arguments=args,
+            data=response.data,
+            mission_id=mission_id,
+            task_id=task_id,
+        )
+        self.storage.add_event(
+            kind="tool.run",
+            title=response.summary,
+            level="info" if response.ok else "warn",
+            payload={"tool": response.tool, "mission_id": mission_id, "task_id": task_id},
+        )
+        return response
+
+    def _register_defaults(self) -> None:
+        self.add(
+            ToolSpec(
+                name="runtime.status",
+                description="Return current runtime settings, counters and recent health snapshot.",
+                category="runtime",
+                input_schema={},
+                handler=_runtime_status,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="diagnostics.run",
+                description=(
+                    "Run local diagnostics for paths, SQLite, Git, Docker and LLM endpoint."
+                ),
+                category="runtime",
+                input_schema={},
+                handler=_diagnostics_run,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="memory.search",
+                description="Search long-term memory using FTS when available.",
+                category="memory",
+                input_schema={"query": "Text query", "limit": "Maximum results"},
+                handler=_memory_search,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="memory.save",
+                description="Store a durable memory item with namespace, tags and importance.",
+                category="memory",
+                input_schema={
+                    "content": "Memory content",
+                    "namespace": "Memory namespace",
+                    "tags": "List of tags",
+                    "importance": "0.0 to 1.0",
+                },
+                handler=_memory_save,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="mission.brief",
+                description="Produce a deterministic execution brief for a mission task.",
+                category="mission",
+                input_schema={"goal": "Mission goal", "task_title": "Current task title"},
+                handler=_mission_brief,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="filesystem.list",
+                description="List files below the repository or JARVIS_HOME.",
+                category="filesystem",
+                input_schema={"path": "Path to list", "limit": "Maximum entries"},
+                handler=_filesystem_list,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="filesystem.read_text",
+                description="Read a small text file below the repository or JARVIS_HOME.",
+                category="filesystem",
+                input_schema={"path": "Path to read", "max_chars": "Maximum characters"},
+                handler=_filesystem_read_text,
+            )
+        )
+
+
+def _runtime_status(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunResponse:
+    data = {
+        "settings": ctx.settings.public_dict(),
+        "counters": ctx.storage.counters(),
+        "health": ctx.storage.latest_health(limit=20),
+        "recent_events": ctx.storage.list_events(limit=10),
+    }
+    return ToolRunResponse(
+        tool="runtime.status",
+        ok=True,
+        summary="Runtime status collected.",
+        data=data,
+    )
+
+
+async def _diagnostics_run(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunResponse:
+    diagnostics = await run_diagnostics(settings=ctx.settings, storage=ctx.storage, llm=ctx.llm)
+    warn_count = sum(1 for check in diagnostics.checks if check.status == "warn")
+    error_count = sum(1 for check in diagnostics.checks if check.status == "error")
+    return ToolRunResponse(
+        tool="diagnostics.run",
+        ok=diagnostics.ok,
+        summary=f"Diagnostics finished: {error_count} errors, {warn_count} warnings.",
+        data=diagnostics.model_dump(),
+    )
+
+
+def _memory_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    query = str(args.get("query") or "")
+    limit = _int_arg(args.get("limit"), default=10, minimum=1, maximum=50)
+    items = ctx.storage.search_memory(query or None, limit=limit)
+    return ToolRunResponse(
+        tool="memory.search",
+        ok=True,
+        summary=f"Memory search returned {len(items)} item(s).",
+        data={"items": items, "query": query, "limit": limit},
+    )
+
+
+def _memory_save(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    content = str(args.get("content") or "").strip()
+    if not content:
+        return ToolRunResponse(
+            tool="memory.save",
+            ok=False,
+            summary="Memory content is required.",
+        )
+    namespace = str(args.get("namespace") or "core")[:80]
+    tags = args.get("tags") or []
+    if isinstance(tags, str):
+        tags = [item.strip() for item in tags.split(",") if item.strip()]
+    if not isinstance(tags, list):
+        tags = []
+    importance = _float_arg(args.get("importance"), default=0.5, minimum=0.0, maximum=1.0)
+    item = ctx.storage.add_memory(
+        content=content,
+        namespace=namespace,
+        tags=[str(tag)[:80] for tag in tags[:12]],
+        importance=importance,
+    )
+    return ToolRunResponse(
+        tool="memory.save",
+        ok=True,
+        summary="Memory item saved.",
+        data={"item": item},
+    )
+
+
+def _mission_brief(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    goal = str(args.get("goal") or "").strip()
+    task_title = str(args.get("task_title") or "").strip()
+    memory = ctx.storage.search_memory(f"{goal} {task_title}".strip(), limit=5)
+    brief = {
+        "goal": goal,
+        "task_title": task_title,
+        "recommended_action": _recommended_action(task_title),
+        "acceptance_check": (
+            "Record the observable result, mark the task done or blocked, "
+            "then refresh mission progress."
+        ),
+        "memory_hits": memory,
+    }
+    return ToolRunResponse(
+        tool="mission.brief",
+        ok=True,
+        summary="Mission step brief prepared.",
+        data=brief,
+    )
+
+
+def _filesystem_list(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    try:
+        path = _resolve_allowed_path(ctx.settings, str(args.get("path") or "."))
+    except ValueError as exc:
+        return ToolRunResponse(tool="filesystem.list", ok=False, summary=str(exc))
+    limit = _int_arg(args.get("limit"), default=100, minimum=1, maximum=500)
+    if not path.exists():
+        return ToolRunResponse(
+            tool="filesystem.list",
+            ok=False,
+            summary=f"Path does not exist: {path}",
+            data={"path": str(path)},
+        )
+    if not path.is_dir():
+        return ToolRunResponse(
+            tool="filesystem.list",
+            ok=False,
+            summary=f"Path is not a directory: {path}",
+            data={"path": str(path)},
+        )
+    entries = []
+    children = sorted(path.iterdir(), key=lambda item: (not item.is_dir(), item.name.lower()))
+    for child in children[:limit]:
+        entries.append(
+            {
+                "name": child.name,
+                "path": str(child),
+                "type": "directory" if child.is_dir() else "file",
+                "size": child.stat().st_size if child.is_file() else None,
+            }
+        )
+    return ToolRunResponse(
+        tool="filesystem.list",
+        ok=True,
+        summary=f"Listed {len(entries)} item(s).",
+        data={"path": str(path), "entries": entries},
+    )
+
+
+def _filesystem_read_text(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    try:
+        path = _resolve_allowed_path(ctx.settings, str(args.get("path") or ""))
+    except ValueError as exc:
+        return ToolRunResponse(tool="filesystem.read_text", ok=False, summary=str(exc))
+    max_chars = _int_arg(args.get("max_chars"), default=8000, minimum=1, maximum=50000)
+    if not path.exists() or not path.is_file():
+        return ToolRunResponse(
+            tool="filesystem.read_text",
+            ok=False,
+            summary=f"File does not exist: {path}",
+            data={"path": str(path)},
+        )
+    content = path.read_text(encoding="utf-8", errors="replace")[:max_chars]
+    return ToolRunResponse(
+        tool="filesystem.read_text",
+        ok=True,
+        summary=f"Read {len(content)} character(s).",
+        data={"path": str(path), "content": content, "truncated": path.stat().st_size > max_chars},
+    )
+
+
+def _resolve_allowed_path(settings: JarvisSettings, raw_path: str) -> Path:
+    if not raw_path:
+        raise ValueError("Path is required.")
+    candidate = Path(raw_path)
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+    candidate = candidate.resolve(strict=False)
+    roots = [Path.cwd().resolve(strict=False), settings.home.resolve(strict=False)]
+    for root in roots:
+        try:
+            candidate.relative_to(root)
+            return candidate
+        except ValueError:
+            continue
+    roots_text = ", ".join(str(root) for root in roots)
+    raise ValueError(f"Path is outside allowed roots: {roots_text}")
+
+
+def _recommended_action(task_title: str) -> str:
+    lowered = task_title.lower()
+    if any(word in lowered for word in ("контекст", "context", "код", "окружение")):
+        return "Inspect repository files, runtime paths and diagnostics before changing behavior."
+    if any(word in lowered for word in ("реализ", "implement", "срез", "runtime")):
+        return "Make a narrow code change, run tests, then record the exact verification result."
+    if any(word in lowered for word in ("провер", "verify", "health", "диагност")):
+        return "Run diagnostics and tests, then attach the health summary to task notes."
+    return "Break the task into a concrete action, execute the smallest safe step, then verify it."
+
+
+def _int_arg(value: Any, *, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(maximum, parsed))
+
+
+def _float_arg(value: Any, *, default: float, minimum: float, maximum: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = default
+    if math.isnan(parsed):
+        parsed = default
+    return max(minimum, min(maximum, parsed))

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,7 +19,13 @@ from .models import (
     MemoryItem,
     Mission,
     MissionCreateRequest,
+    MissionExecutionResponse,
+    MissionTask,
+    MissionTaskUpdateRequest,
     StatusResponse,
+    ToolInfo,
+    ToolRunRequest,
+    ToolRunResponse,
 )
 from .storage import JarvisStorage
 
@@ -121,6 +128,33 @@ async def get_mission(mission_id: str) -> Mission:
     return mission
 
 
+@app.post("/api/missions/{mission_id}/execute-next", response_model=MissionExecutionResponse)
+async def execute_next_mission_step(mission_id: str) -> MissionExecutionResponse:
+    if app.state.storage.get_mission(mission_id) is None:
+        raise HTTPException(status_code=404, detail="Mission not found")
+    return await app.state.agent.execute_next_mission_step(mission_id)
+
+
+@app.patch("/api/missions/{mission_id}/tasks/{task_id}", response_model=MissionTask)
+async def update_mission_task(
+    mission_id: str,
+    task_id: str,
+    request: MissionTaskUpdateRequest,
+) -> MissionTask:
+    mission = app.state.storage.get_mission(mission_id)
+    if mission is None:
+        raise HTTPException(status_code=404, detail="Mission not found")
+    updated = app.state.storage.update_mission_task(
+        task_id,
+        title=request.title,
+        status=request.status,
+        notes=request.notes,
+    )
+    if updated is None or updated["mission_id"] != mission_id:
+        raise HTTPException(status_code=404, detail="Mission task not found")
+    return updated
+
+
 @app.get("/api/memory", response_model=list[MemoryItem])
 async def search_memory(
     q: str | None = None,
@@ -137,6 +171,21 @@ async def add_memory(request: MemoryCreateRequest) -> MemoryItem:
         tags=request.tags,
         importance=request.importance,
     )
+
+
+@app.get("/api/tools", response_model=list[ToolInfo])
+async def list_tools() -> list[ToolInfo]:
+    return app.state.agent.tools.list()
+
+
+@app.post("/api/tools/{tool_name}/run", response_model=ToolRunResponse)
+async def run_tool(tool_name: str, request: ToolRunRequest) -> ToolRunResponse:
+    return await app.state.agent.tools.run(tool_name, request.arguments)
+
+
+@app.get("/api/tool-runs")
+async def list_tool_runs(limit: int = Query(default=50, ge=1, le=200)) -> list[dict[str, Any]]:
+    return app.state.storage.list_tool_runs(limit=limit)
 
 
 @app.post("/api/diagnostics", response_model=DiagnosticsResponse)

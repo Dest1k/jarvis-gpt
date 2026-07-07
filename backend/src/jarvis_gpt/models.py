@@ -38,6 +38,12 @@ class MissionCreateRequest(BaseModel):
     title: str | None = Field(default=None, max_length=240)
 
 
+class MissionTaskUpdateRequest(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=500)
+    status: Literal["pending", "running", "done", "blocked", "skipped"] | None = None
+    notes: str | None = Field(default=None, max_length=20000)
+
+
 class MissionTask(BaseModel):
     id: str
     mission_id: str
@@ -75,6 +81,32 @@ class MemoryItem(BaseModel):
     importance: float
     created_at: str
     updated_at: str
+    rank: float | None = None
+
+
+class ToolInfo(BaseModel):
+    name: str
+    description: str
+    category: str
+    input_schema: dict[str, Any]
+    danger_level: Literal["safe", "review", "danger"] = "safe"
+
+
+class ToolRunRequest(BaseModel):
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+
+class ToolRunResponse(BaseModel):
+    tool: str
+    ok: bool
+    summary: str
+    data: dict[str, Any] = Field(default_factory=dict)
+
+
+class MissionExecutionResponse(BaseModel):
+    mission: Mission
+    task: MissionTask | None = None
+    result: ToolRunResponse
 
 
 class DiagnosticCheck(BaseModel):

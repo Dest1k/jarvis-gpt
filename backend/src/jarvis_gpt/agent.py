@@ -7,8 +7,16 @@ from typing import Any
 from .config import JarvisSettings
 from .event_bus import EventBus
 from .llm import LLMRouter
-from .models import ChatEvent, ChatResponse
+from .models import (
+    ChatEvent,
+    ChatResponse,
+    Mission,
+    MissionExecutionResponse,
+    MissionTask,
+    ToolRunResponse,
+)
 from .storage import JarvisStorage
+from .tools import ToolRegistry
 
 SYSTEM_PROMPT = """Ты JARVIS GPT: локальный агент Windows/WSL/Docker.
 Говори по-русски, действуй как инженерный помощник, отделяй факты от предположений.
@@ -44,11 +52,13 @@ class AgentRuntime:
         storage: JarvisStorage,
         llm: LLMRouter,
         bus: EventBus | None = None,
+        tools: ToolRegistry | None = None,
     ) -> None:
         self.settings = settings
         self.storage = storage
         self.llm = llm
         self.bus = bus
+        self.tools = tools or ToolRegistry(settings, storage, llm)
 
     async def chat(
         self,
@@ -162,6 +172,71 @@ class AgentRuntime:
         )
         return mission
 
+    async def execute_next_mission_step(self, mission_id: str) -> MissionExecutionResponse:
+        mission = self.storage.get_mission(mission_id)
+        if mission is None:
+            result = ToolRunResponse(
+                tool="mission.execute_next",
+                ok=False,
+                summary="Mission not found.",
+                data={"mission_id": mission_id},
+            )
+            return MissionExecutionResponse(
+                mission=_empty_mission(mission_id),
+                task=None,
+                result=result,
+            )
+
+        task = self.storage.next_mission_task(mission_id)
+        if task is None:
+            result = ToolRunResponse(
+                tool="mission.execute_next",
+                ok=True,
+                summary="No pending mission tasks.",
+                data={"mission_id": mission_id},
+            )
+            return MissionExecutionResponse(
+                mission=Mission.model_validate(mission),
+                task=None,
+                result=result,
+            )
+
+        running_task = self.storage.update_mission_task(task["id"], status="running")
+        result = await self.tools.run(
+            "mission.brief",
+            {"goal": mission["goal"], "task_title": task["title"]},
+            mission_id=mission_id,
+            task_id=task["id"],
+        )
+        notes = _task_notes_from_result(result)
+        final_status = "done" if result.ok else "blocked"
+        updated_task = self.storage.update_mission_task(
+            task["id"],
+            status=final_status,
+            notes=notes,
+        )
+        if result.ok:
+            self.storage.add_memory(
+                content=f"Mission step completed: {task['title']}. {result.summary}",
+                namespace="missions",
+                tags=["mission", mission_id, task["id"]],
+                importance=0.62,
+            )
+        refreshed = self.storage.get_mission(mission_id) or mission
+        await self._emit(
+            ChatEvent(
+                type="mission_step",
+                title="Mission step executed",
+                content=task["title"],
+                payload={"mission_id": mission_id, "task_id": task["id"], "ok": result.ok},
+            )
+        )
+        return MissionExecutionResponse(
+            mission=Mission.model_validate(refreshed),
+            task=MissionTask.model_validate(updated_task or running_task or task),
+            result=result,
+        )
+
     def _prepare_context(self, message: str, conversation_id: str | None) -> AgentContext:
         if conversation_id is None:
             conversation_id = self.storage.create_conversation(self._title_from_goal(message))
@@ -236,3 +311,28 @@ class AgentRuntime:
         self.storage.add_event(kind=f"agent.{event.type}", title=event.title, payload=event.payload)
         if self.bus is not None:
             await self.bus.publish({"channel": "agent", **event.model_dump()})
+
+
+def _task_notes_from_result(result: ToolRunResponse) -> str:
+    if result.ok:
+        action = result.data.get("recommended_action")
+        if not action and isinstance(result.data.get("recommended_action"), str):
+            action = result.data["recommended_action"]
+        if not action and isinstance(result.data, dict):
+            action = result.data.get("recommended_action")
+        action_text = f"\nRecommended action: {action}" if action else ""
+        return f"{result.summary}{action_text}"
+    return f"Blocked by tool result: {result.summary}"
+
+
+def _empty_mission(mission_id: str) -> Mission:
+    return Mission(
+        id=mission_id,
+        title="Missing mission",
+        goal="",
+        status="blocked",
+        progress=0,
+        created_at="",
+        updated_at="",
+        tasks=[],
+    )

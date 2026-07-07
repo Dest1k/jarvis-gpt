@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import uuid
@@ -31,11 +32,19 @@ def _loads(data: str | None, default: Any) -> Any:
         return default
 
 
+def _fts_query(query: str) -> str:
+    tokens = re.findall(r"[\w-]+", query, flags=re.UNICODE)
+    clean = [token.replace('"', "").replace("'", "") for token in tokens[:8]]
+    clean = [token for token in clean if token]
+    return " OR ".join(f'"{token}"' for token in clean)
+
+
 class JarvisStorage:
     def __init__(self, database_path: Path) -> None:
         self.database_path = database_path
         self._lock = threading.RLock()
         self._conn: sqlite3.Connection | None = None
+        self._fts_available = False
 
     def connect(self) -> sqlite3.Connection:
         if self._conn is None:
@@ -55,7 +64,27 @@ class JarvisStorage:
         with self._lock:
             conn = self.connect()
             conn.executescript(SCHEMA)
+            self._fts_available = self._ensure_memory_fts(conn)
             conn.commit()
+
+    def _ensure_memory_fts(self, conn: sqlite3.Connection) -> bool:
+        try:
+            conn.execute(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts
+                USING fts5(id UNINDEXED, namespace, content, tags)
+                """
+            )
+            conn.execute("DELETE FROM memories_fts")
+            conn.execute(
+                """
+                INSERT INTO memories_fts(id, namespace, content, tags)
+                SELECT id, namespace, content, tags FROM memories
+                """
+            )
+            return True
+        except sqlite3.OperationalError:
+            return False
 
     def ping(self) -> bool:
         with self._lock:
@@ -63,7 +92,14 @@ class JarvisStorage:
         return True
 
     def counters(self) -> dict[str, int]:
-        tables = ["conversations", "messages", "memories", "missions", "mission_tasks"]
+        tables = [
+            "conversations",
+            "messages",
+            "memories",
+            "missions",
+            "mission_tasks",
+            "tool_runs",
+        ]
         with self._lock:
             conn = self.connect()
             return {
@@ -190,7 +226,8 @@ class JarvisStorage:
             "updated_at": now,
         }
         with self._lock:
-            self.connect().execute(
+            conn = self.connect()
+            conn.execute(
                 """
                 INSERT INTO memories(
                     id, namespace, content, tags, importance, created_at, updated_at
@@ -201,10 +238,46 @@ class JarvisStorage:
                 """,
                 {**row, "tags": _json(row["tags"])},
             )
-            self.connect().commit()
+            if self._fts_available:
+                conn.execute(
+                    """
+                    INSERT INTO memories_fts(id, namespace, content, tags)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (row["id"], row["namespace"], row["content"], _json(row["tags"])),
+                )
+            conn.commit()
         return row
 
     def search_memory(self, query: str | None = None, limit: int = 25) -> list[dict[str, Any]]:
+        if query and self._fts_available:
+            match = _fts_query(query)
+            if match:
+                try:
+                    with self._lock:
+                        rows = self.connect().execute(
+                            """
+                            SELECT
+                                m.id,
+                                m.namespace,
+                                m.content,
+                                m.tags,
+                                m.importance,
+                                m.created_at,
+                                m.updated_at,
+                                bm25(memories_fts) AS rank
+                            FROM memories_fts
+                            JOIN memories m ON m.id = memories_fts.id
+                            WHERE memories_fts MATCH ?
+                            ORDER BY rank ASC, m.importance DESC, m.updated_at DESC
+                            LIMIT ?
+                            """,
+                            (match, limit),
+                        ).fetchall()
+                    return [{**dict(row), "tags": _loads(row["tags"], [])} for row in rows]
+                except sqlite3.OperationalError:
+                    pass
+
         params: tuple[Any, ...]
         where = ""
         if query:
@@ -214,7 +287,7 @@ class JarvisStorage:
         else:
             params = (limit,)
         sql = f"""
-            SELECT id, namespace, content, tags, importance, created_at, updated_at
+            SELECT id, namespace, content, tags, importance, created_at, updated_at, NULL AS rank
             FROM memories
             {where}
             ORDER BY importance DESC, updated_at DESC
@@ -246,6 +319,7 @@ class JarvisStorage:
                     """,
                     (new_id("task"), mission_id, task_title, position, now, now),
                 )
+            self._refresh_mission_progress(conn, mission_id, now=now)
             conn.commit()
         mission = self.get_mission(mission_id)
         if mission is None:
@@ -284,6 +358,64 @@ class JarvisStorage:
         mission["tasks"] = self.list_mission_tasks(mission_id)
         return mission
 
+    def next_mission_task(self, mission_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self.connect().execute(
+                """
+                SELECT id, mission_id, title, status, notes, position, created_at, updated_at
+                FROM mission_tasks
+                WHERE mission_id = ? AND status = 'pending'
+                ORDER BY position ASC
+                LIMIT 1
+                """,
+                (mission_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def update_mission_task(
+        self,
+        task_id: str,
+        *,
+        title: str | None = None,
+        status: str | None = None,
+        notes: str | None = None,
+    ) -> dict[str, Any] | None:
+        now = utc_now()
+        with self._lock:
+            conn = self.connect()
+            existing = conn.execute(
+                """
+                SELECT id, mission_id, title, status, notes, position, created_at, updated_at
+                FROM mission_tasks
+                WHERE id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            if existing is None:
+                return None
+            next_title = title if title is not None else existing["title"]
+            next_status = status if status is not None else existing["status"]
+            next_notes = notes if notes is not None else existing["notes"]
+            conn.execute(
+                """
+                UPDATE mission_tasks
+                SET title = ?, status = ?, notes = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (next_title, next_status, next_notes, now, task_id),
+            )
+            self._refresh_mission_progress(conn, existing["mission_id"], now=now)
+            conn.commit()
+            row = conn.execute(
+                """
+                SELECT id, mission_id, title, status, notes, position, created_at, updated_at
+                FROM mission_tasks
+                WHERE id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
     def list_mission_tasks(self, mission_id: str) -> list[dict[str, Any]]:
         with self._lock:
             rows = self.connect().execute(
@@ -296,6 +428,105 @@ class JarvisStorage:
                 (mission_id,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def record_tool_run(
+        self,
+        *,
+        tool: str,
+        ok: bool,
+        summary: str,
+        arguments: dict[str, Any] | None = None,
+        data: dict[str, Any] | None = None,
+        mission_id: str | None = None,
+        task_id: str | None = None,
+    ) -> dict[str, Any]:
+        row = {
+            "id": new_id("run"),
+            "ts": utc_now(),
+            "tool": tool,
+            "ok": 1 if ok else 0,
+            "summary": summary,
+            "arguments": arguments or {},
+            "data": data or {},
+            "mission_id": mission_id,
+            "task_id": task_id,
+        }
+        with self._lock:
+            self.connect().execute(
+                """
+                INSERT INTO tool_runs(
+                    id, ts, tool, ok, summary, arguments, data, mission_id, task_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["id"],
+                    row["ts"],
+                    row["tool"],
+                    row["ok"],
+                    row["summary"],
+                    _json(row["arguments"]),
+                    _json(row["data"]),
+                    row["mission_id"],
+                    row["task_id"],
+                ),
+            )
+            self.connect().commit()
+        return {**row, "ok": bool(row["ok"])}
+
+    def list_tool_runs(self, limit: int = 50) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self.connect().execute(
+                """
+                SELECT id, ts, tool, ok, summary, arguments, data, mission_id, task_id
+                FROM tool_runs
+                ORDER BY ts DESC, rowid DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [
+            {
+                **dict(row),
+                "ok": bool(row["ok"]),
+                "arguments": _loads(row["arguments"], {}),
+                "data": _loads(row["data"], {}),
+            }
+            for row in rows
+        ]
+
+    def _refresh_mission_progress(
+        self,
+        conn: sqlite3.Connection,
+        mission_id: str,
+        *,
+        now: str | None = None,
+    ) -> None:
+        rows = conn.execute(
+            "SELECT status FROM mission_tasks WHERE mission_id = ?",
+            (mission_id,),
+        ).fetchall()
+        total = len(rows)
+        done = sum(1 for row in rows if row["status"] in {"done", "skipped"})
+        running = any(row["status"] == "running" for row in rows)
+        blocked = any(row["status"] == "blocked" for row in rows)
+        progress = 1.0 if total == 0 else done / total
+        if total > 0 and done == total:
+            mission_status = "done"
+        elif blocked:
+            mission_status = "blocked"
+        elif running or done > 0:
+            mission_status = "running"
+        else:
+            mission_status = "planned"
+        conn.execute(
+            """
+            UPDATE missions
+            SET status = ?, progress = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (mission_status, progress, now or utc_now(), mission_id),
+        )
 
     def record_health(
         self,
@@ -400,8 +631,22 @@ CREATE TABLE IF NOT EXISTS health_snapshots (
     details TEXT NOT NULL DEFAULT '{}'
 );
 
+CREATE TABLE IF NOT EXISTS tool_runs (
+    id TEXT PRIMARY KEY,
+    ts TEXT NOT NULL,
+    tool TEXT NOT NULL,
+    ok INTEGER NOT NULL,
+    summary TEXT NOT NULL,
+    arguments TEXT NOT NULL DEFAULT '{}',
+    data TEXT NOT NULL DEFAULT '{}',
+    mission_id TEXT REFERENCES missions(id) ON DELETE SET NULL,
+    task_id TEXT REFERENCES mission_tasks(id) ON DELETE SET NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_memories_namespace ON memories(namespace, importance);
 CREATE INDEX IF NOT EXISTS idx_mission_tasks_mission ON mission_tasks(mission_id, position);
 CREATE INDEX IF NOT EXISTS idx_health_component ON health_snapshots(component, ts);
+CREATE INDEX IF NOT EXISTS idx_tool_runs_ts ON tool_runs(ts);
+CREATE INDEX IF NOT EXISTS idx_tool_runs_mission ON tool_runs(mission_id, task_id);
 """

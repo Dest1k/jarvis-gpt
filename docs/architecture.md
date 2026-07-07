@@ -14,7 +14,9 @@ FastAPI Gateway
 Agent Runtime
   |-- conversation context
   |-- mission planner
+  |-- safe tools registry
   |-- memory lookup
+  |-- task lifecycle
   |-- diagnostics
   |-- event stream
   |
@@ -37,6 +39,7 @@ External host runtime
 - SQLite достаточно для одиночного локального ядра и легко мигрирует дальше.
 - UI видит явные состояния: success, warn, error, mission, event.
 - LLM является заменяемым маршрутом, а не фундаментом всей системы.
+- Опасные действия не входят в safe tools layer; shell/host control появятся только через HITL-gates.
 
 ## Runtime profiles
 
