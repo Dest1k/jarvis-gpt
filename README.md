@@ -155,6 +155,10 @@ docker compose --profile llm up -d dispatcher
 ## Current readiness
 
 - Unified launcher `.\jarvis.cmd` provides keyboard-menu start/stop/restart/status/logs/doctor/open flows plus `gemma4-turbo` and `gemma4-mono` startup shortcuts.
+- Experience API persists operator preferences, autonomy policy, daily briefing, self-heal reports and benchmark history in SQLite.
+- Command Center exposes briefing, autonomy policy modes, self-heal suggestions, benchmark telemetry and operator communication preferences.
+- Self-heal scans diagnostics/resources/dispatcher state and proposes safe or approval-gated actions without silently mutating host state.
+- Performance benchmark records storage, telemetry, dispatcher and LLM health latency with resource-guard recommendations.
 - OpenAI-compatible Gemma dispatcher is wired and can be started/stopped from CLI, API, and Command Center.
 - Chat supports streamed NDJSON deltas through `/api/chat/stream`; the UI renders tokens as they arrive.
 - Conversation history is durable and can be restored from Command Center after reload.

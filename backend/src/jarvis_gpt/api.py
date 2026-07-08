@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from contextlib import asynccontextmanager
 from typing import Any
@@ -22,6 +23,7 @@ from .config import ensure_runtime_dirs, load_settings
 from .diagnostics import run_diagnostics
 from .dispatcher import DispatcherManager
 from .event_bus import EventBus
+from .experience import ExperienceManager
 from .host_bridge import HostBridgeStatus
 from .ingest import FileIngestor
 from .learning import LearningEngine
@@ -33,10 +35,14 @@ from .models import (
     ApprovalItem,
     ApprovalUpdateRequest,
     AuditEntry,
+    AutonomyPolicyResponse,
+    AutonomyPolicyUpdateRequest,
     AutonomyStatusResponse,
+    BenchmarkResponse,
     ChatRequest,
     ChatResponse,
     ConversationItem,
+    DailyBriefingResponse,
     DiagnosticsResponse,
     DispatcherActionResponse,
     DispatcherStatusResponse,
@@ -54,6 +60,9 @@ from .models import (
     MissionTask,
     MissionTaskUpdateRequest,
     ModelCatalogResponse,
+    RuntimePreferencesResponse,
+    RuntimePreferencesUpdateRequest,
+    SelfHealResponse,
     StatusResponse,
     TelemetryResponse,
     ToolInfo,
@@ -80,6 +89,7 @@ async def lifespan(app: FastAPI):
     telemetry = TelemetryCollector(settings)
     learning = LearningEngine(storage)
     host_bridge = HostBridgeStatus(settings)
+    experience = ExperienceManager(settings=settings, storage=storage)
     supervisor = RuntimeSupervisor(settings=settings, storage=storage, llm=llm)
     approval_executor = ApprovalExecutor(
         storage=storage,
@@ -99,6 +109,7 @@ async def lifespan(app: FastAPI):
     app.state.telemetry = telemetry
     app.state.learning = learning
     app.state.host_bridge = host_bridge
+    app.state.experience = experience
     app.state.supervisor = supervisor
     app.state.approval_executor = approval_executor
     storage.add_event(kind="runtime.start", title="JARVIS GPT backend started")
@@ -210,6 +221,40 @@ async def host_bridge() -> HostBridgeResponse:
 @app.get("/api/autonomy", response_model=AutonomyStatusResponse)
 async def autonomy() -> AutonomyStatusResponse:
     return app.state.supervisor.status()
+
+
+@app.get("/api/preferences", response_model=RuntimePreferencesResponse)
+async def preferences() -> RuntimePreferencesResponse:
+    return app.state.experience.preferences()
+
+
+@app.patch("/api/preferences", response_model=RuntimePreferencesResponse)
+async def update_preferences(
+    request: RuntimePreferencesUpdateRequest,
+) -> RuntimePreferencesResponse:
+    updated = app.state.experience.update_preferences(request.model_dump(exclude_none=True))
+    await app.state.bus.publish({"channel": "preferences", "operator": updated["operator_name"]})
+    return updated
+
+
+@app.get("/api/autonomy/policy", response_model=AutonomyPolicyResponse)
+async def autonomy_policy() -> AutonomyPolicyResponse:
+    return app.state.experience.autonomy_policy()
+
+
+@app.patch("/api/autonomy/policy", response_model=AutonomyPolicyResponse)
+async def update_autonomy_policy(
+    request: AutonomyPolicyUpdateRequest,
+) -> AutonomyPolicyResponse:
+    updated = app.state.experience.update_autonomy_policy(request.model_dump(exclude_none=True))
+    await app.state.bus.publish({"channel": "autonomy.policy", "mode": updated["mode"]})
+    return updated
+
+
+@app.get("/api/briefing", response_model=DailyBriefingResponse)
+async def briefing() -> DailyBriefingResponse:
+    dispatcher_status = await asyncio.to_thread(app.state.dispatcher.status)
+    return app.state.experience.daily_briefing(dispatcher_status=dispatcher_status)
 
 
 @app.post("/api/chat", response_model=ChatResponse)
@@ -467,6 +512,40 @@ async def diagnostics() -> DiagnosticsResponse:
     )
     await app.state.bus.publish({"channel": "diagnostics", "ok": result.ok})
     return result
+
+
+@app.post("/api/self-heal", response_model=SelfHealResponse)
+async def self_heal() -> SelfHealResponse:
+    result = await run_diagnostics(
+        settings=app.state.settings,
+        storage=app.state.storage,
+        llm=app.state.llm,
+    )
+    telemetry_snapshot = await asyncio.to_thread(app.state.telemetry.snapshot)
+    app.state.storage.record_telemetry(telemetry_snapshot)
+    dispatcher_status = await asyncio.to_thread(app.state.dispatcher.status)
+    report = app.state.experience.self_heal_report(
+        checks=result.checks,
+        telemetry_snapshot=telemetry_snapshot,
+        dispatcher_status=dispatcher_status,
+    )
+    await app.state.bus.publish(
+        {"channel": "self-heal", "ok": report["ok"], "actions": len(report["actions"])}
+    )
+    return report
+
+
+@app.post("/api/benchmark", response_model=BenchmarkResponse)
+async def benchmark() -> BenchmarkResponse:
+    report = await app.state.experience.run_benchmark(
+        llm=app.state.llm,
+        telemetry=app.state.telemetry,
+        dispatcher=app.state.dispatcher,
+    )
+    await app.state.bus.publish(
+        {"channel": "benchmark", "summary": report["summary"], "profile": report["profile"]}
+    )
+    return report
 
 
 @app.websocket("/ws/events")

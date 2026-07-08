@@ -410,6 +410,9 @@ class AgentRuntime:
 
         recent = self.storage.recent_messages(context.conversation_id, limit=12)
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        operator_prompt = self._operator_prompt()
+        if operator_prompt:
+            messages.append({"role": "system", "content": operator_prompt})
         if memory_block:
             messages.append({"role": "system", "content": memory_block})
         if file_block:
@@ -419,6 +422,30 @@ class AgentRuntime:
                 messages.append({"role": item["role"], "content": item["content"]})
         messages.append({"role": "user", "content": message})
         return messages
+
+    def _operator_prompt(self) -> str:
+        preferences = self.storage.get_runtime_value("experience.preferences", {})
+        if not isinstance(preferences, dict):
+            return ""
+        operator_name = str(preferences.get("operator_name") or "Admin")[:80]
+        style = str(preferences.get("communication_style") or "concise")
+        quiet_hours = str(preferences.get("quiet_hours") or "")[:80]
+        style_rules = {
+            "concise": (
+                "Keep answers compact and action-oriented unless the operator asks for detail."
+            ),
+            "balanced": "Give enough context for decisions, then move to concrete next actions.",
+            "detailed": "Explain reasoning, trade-offs and verification steps more fully.",
+        }
+        return "\n".join(
+            [
+                "Operator preferences:",
+                f"- operator_name: {operator_name}",
+                f"- communication_style: {style}",
+                f"- quiet_hours: {quiet_hours or 'none'}",
+                f"- style_rule: {style_rules.get(style, style_rules['concise'])}",
+            ]
+        )
 
     @staticmethod
     def _looks_like_mission(message: str) -> bool:

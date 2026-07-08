@@ -496,7 +496,8 @@ h3 {
 .fileForm button,
 .fileSearchForm button,
 .hostCommandForm button,
-.webFetchForm button {
+.webFetchForm button,
+.preferencesForm button {
   display: grid;
   place-items: center;
   width: 28px;
@@ -513,7 +514,8 @@ h3 {
 .fileForm button:hover,
 .fileSearchForm button:hover,
 .hostCommandForm button:hover,
-.webFetchForm button:hover {
+.webFetchForm button:hover,
+.preferencesForm button:hover {
   border-color: var(--teal);
   color: var(--teal);
 }
@@ -623,6 +625,171 @@ h3 {
 
 .healthRow.error .dot {
   background: var(--coral);
+}
+
+.briefingPanel,
+.selfHealPanel,
+.policyPanel,
+.benchmarkPanel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+}
+
+.briefingHero {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  min-height: 36px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.briefingHero svg {
+  color: var(--teal);
+}
+
+.briefingHero strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.briefingHero span {
+  max-width: 96px;
+  overflow: hidden;
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.briefingList {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.briefingList p {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.briefingList.suggestions p {
+  color: var(--graphite);
+}
+
+.selfHealReport,
+.benchmarkReport {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 10px;
+  background: #ffffff;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.selfHealReport.warn {
+  border-color: rgba(183, 121, 31, 0.45);
+}
+
+.selfHealReport.ok {
+  border-color: rgba(13, 118, 111, 0.32);
+}
+
+.selfHealReport div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.selfHealReport strong,
+.benchmarkReport strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.selfHealReport span {
+  flex: 0 0 auto;
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: var(--surface-2);
+}
+
+.selfHealReport p,
+.benchmarkReport p {
+  display: -webkit-box;
+  overflow: hidden;
+  line-height: 1.45;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.segmentedControl {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.segmentedControl button {
+  min-height: 32px;
+  border: 0;
+  border-right: 1px solid var(--line);
+  background: #ffffff;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.segmentedControl button:last-child {
+  border-right: 0;
+}
+
+.segmentedControl button.active {
+  background: var(--teal-2);
+  color: var(--teal);
+  font-weight: 700;
+}
+
+.policyFlags,
+.metricRows {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.policyFlags span,
+.metricRows span {
+  min-height: 24px;
+  padding: 4px 7px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.policyFlags span.on {
+  background: var(--teal-2);
+  color: var(--teal);
+}
+
+.benchmarkReport {
+  display: grid;
+  gap: 8px;
 }
 
 .toolList,
@@ -868,6 +1035,13 @@ h3 {
   padding: 12px 12px 0;
 }
 
+.preferencesForm {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(108px, 0.7fr) minmax(0, 1fr) 32px;
+  gap: 8px;
+  padding: 12px 12px 0;
+}
+
 .fileSearchForm {
   padding-top: 8px;
 }
@@ -880,7 +1054,9 @@ h3 {
 .fileForm input,
 .fileSearchForm input,
 .hostCommandForm input,
-.webFetchForm input {
+.webFetchForm input,
+.preferencesForm input,
+.preferencesForm select {
   min-width: 0;
   height: 32px;
   border: 1px solid var(--line);
@@ -895,7 +1071,9 @@ h3 {
 .fileForm input:focus,
 .fileSearchForm input:focus,
 .hostCommandForm input:focus,
-.webFetchForm input:focus {
+.webFetchForm input:focus,
+.preferencesForm input:focus,
+.preferencesForm select:focus {
   border-color: var(--teal);
   box-shadow: 0 0 0 3px rgba(13, 118, 111, 0.12);
 }
@@ -1155,5 +1333,13 @@ h3 {
 
   .transcript {
     max-height: none;
+  }
+
+  .preferencesForm {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 32px;
+  }
+
+  .preferencesForm input:first-child {
+    grid-column: 1 / -1;
   }
 }

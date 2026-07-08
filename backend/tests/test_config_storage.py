@@ -111,3 +111,18 @@ def test_storage_records_approval_gate(tmp_path):
     assert storage.counters()["approvals"] == 1
     assert {entry["action"] for entry in audit} == {"approval.request", "approval.update"}
     storage.close()
+
+
+def test_storage_persists_runtime_values(tmp_path):
+    storage = JarvisStorage(tmp_path / "state" / "jarvis.sqlite3")
+    storage.initialize()
+
+    saved = storage.set_runtime_value("experience.preferences", {"operator_name": "Tony"})
+    loaded = storage.get_runtime_value("experience.preferences", {})
+    rows = storage.list_runtime_values("experience.")
+
+    assert saved["key"] == "experience.preferences"
+    assert loaded == {"operator_name": "Tony"}
+    assert rows[0]["value"] == {"operator_name": "Tony"}
+    assert storage.counters()["runtime_kv"] == 1
+    storage.close()

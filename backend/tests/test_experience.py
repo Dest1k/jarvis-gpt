@@ -1,0 +1,145 @@
+from __future__ import annotations
+
+import asyncio
+from typing import Any
+
+from jarvis_gpt.config import ensure_runtime_dirs, load_settings
+from jarvis_gpt.experience import ExperienceManager
+from jarvis_gpt.models import DiagnosticCheck
+from jarvis_gpt.storage import JarvisStorage
+
+
+class FakeLLM:
+    async def health(self) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "status_code": 200,
+            "served_models": ["dispatcher"],
+            "configured_model": "dispatcher",
+        }
+
+
+class FakeTelemetry:
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "ts": "2026-07-08T00:00:00+00:00",
+            "memory": {"used_ratio": 0.41, "available": 1024},
+            "gpu": {
+                "available": True,
+                "gpus": [
+                    {
+                        "name": "RTX",
+                        "memory_used_ratio": 0.5,
+                        "utilization_gpu": 35,
+                    }
+                ],
+            },
+            "disks": [{"path": "D:/jarvis", "used_ratio": 0.2}],
+        }
+
+
+class FakeDispatcher:
+    def status(self) -> dict[str, Any]:
+        return {
+            "port_open": True,
+            "base_url": "http://127.0.0.1:8001/v1",
+            "model": "dispatcher",
+            "container_status": {"exists": True, "status": "running"},
+        }
+
+
+def _manager(monkeypatch, tmp_path) -> tuple[ExperienceManager, JarvisStorage]:
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    settings = load_settings("gemma4-turbo")
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    return ExperienceManager(settings=settings, storage=storage), storage
+
+
+def test_preferences_and_policy_are_persistent(monkeypatch, tmp_path):
+    manager, storage = _manager(monkeypatch, tmp_path)
+
+    preferences = manager.update_preferences(
+        {
+            "operator_name": "Operator",
+            "communication_style": "detailed",
+            "working_roots": ["D:/jarvis", "C:/work"],
+        }
+    )
+    policy = manager.update_autonomy_policy({"mode": "safe"})
+    reloaded = ExperienceManager(settings=manager.settings, storage=storage)
+
+    assert preferences["operator_name"] == "Operator"
+    assert reloaded.preferences()["communication_style"] == "detailed"
+    assert policy["mode"] == "safe"
+    assert policy["max_autonomous_steps"] == 1
+    assert reloaded.autonomy_policy()["resource_guard"]["max_gpu_memory_ratio"] == 0.84
+    storage.close()
+
+
+def test_daily_briefing_summarizes_risk_and_pending_approval(monkeypatch, tmp_path):
+    manager, storage = _manager(monkeypatch, tmp_path)
+    storage.record_health(
+        component="llm.router",
+        status="warn",
+        message="LLM endpoint is unavailable",
+    )
+    storage.create_approval(
+        title="Host command",
+        description="Needs operator review",
+        requested_action="tool.run",
+        risk="danger",
+    )
+
+    briefing = manager.daily_briefing(dispatcher_status={"port_open": False})
+
+    assert briefing["headline"] == "Runtime needs attention"
+    assert briefing["pending_approvals"] == 1
+    assert any("self-heal" in item for item in briefing["suggestions"])
+    assert any("Dispatcher" in item for item in briefing["focus"])
+    storage.close()
+
+
+def test_self_heal_report_suggests_non_destructive_actions(monkeypatch, tmp_path):
+    manager, storage = _manager(monkeypatch, tmp_path)
+    checks = [
+        DiagnosticCheck(
+            name="llm.router",
+            status="warn",
+            message="LLM endpoint is unavailable",
+        )
+    ]
+
+    report = manager.self_heal_report(
+        checks=checks,
+        telemetry_snapshot=FakeTelemetry().snapshot(),
+        dispatcher_status={"port_open": False},
+    )
+
+    assert report["ok"] is False
+    assert {action["id"] for action in report["actions"]} >= {
+        "dispatcher.inspect",
+        "dispatcher.start",
+    }
+    assert all(action["kind"] in {"safe", "approval"} for action in report["actions"])
+    storage.close()
+
+
+def test_benchmark_records_history(monkeypatch, tmp_path):
+    manager, storage = _manager(monkeypatch, tmp_path)
+
+    report = asyncio.run(
+        manager.run_benchmark(
+            llm=FakeLLM(),
+            telemetry=FakeTelemetry(),
+            dispatcher=FakeDispatcher(),
+        )
+    )
+
+    assert report["llm"]["ok"] is True
+    assert report["dispatcher"]["port_open"] is True
+    assert report["history"][0]["profile"] == "gemma4-turbo"
+    latest = storage.get_runtime_value("performance.benchmark.latest", {})
+    assert latest["profile"] == "gemma4-turbo"
+    storage.close()

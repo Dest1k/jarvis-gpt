@@ -124,6 +124,38 @@ def test_agent_context_includes_relevance_snippets(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_agent_context_includes_operator_preferences(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    storage.set_runtime_value(
+        "experience.preferences",
+        {
+            "operator_name": "Alex",
+            "communication_style": "detailed",
+            "quiet_hours": "23:00-08:00",
+        },
+    )
+    agent = AgentRuntime(
+        settings=settings,
+        storage=storage,
+        llm=LLMRouter(settings),
+        bus=EventBus(),
+    )
+
+    context = agent._prepare_context("hello", None)
+    messages = agent._build_llm_messages(context, "hello")
+    rendered = "\n".join(message["content"] for message in messages)
+
+    assert "operator_name: Alex" in rendered
+    assert "communication_style: detailed" in rendered
+    assert "quiet_hours: 23:00-08:00" in rendered
+    storage.close()
+
+
 class FakeStreamingLLM:
     def __init__(self) -> None:
         self.max_tokens: int | None = None

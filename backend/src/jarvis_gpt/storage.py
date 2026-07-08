@@ -204,6 +204,7 @@ class JarvisStorage:
 
     def counters(self) -> dict[str, int]:
         tables = [
+            "runtime_kv",
             "conversations",
             "messages",
             "memories",
@@ -264,6 +265,66 @@ class JarvisStorage:
         return [
             {**dict(row), "payload": _loads(row["payload"], {})}
             for row in rows.fetchall()
+        ]
+
+    def get_runtime_value(self, key: str, default: Any = None) -> Any:
+        with self._lock:
+            row = self.connect().execute(
+                """
+                SELECT value
+                FROM runtime_kv
+                WHERE key = ?
+                """,
+                (key,),
+            ).fetchone()
+        if row is None:
+            return default
+        return _loads(row["value"], default)
+
+    def set_runtime_value(self, key: str, value: Any) -> dict[str, Any]:
+        now = utc_now()
+        row = {"key": key[:160], "value": value, "updated_at": now}
+        with self._lock:
+            self.connect().execute(
+                """
+                INSERT INTO runtime_kv(key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (row["key"], _json(row["value"]), row["updated_at"]),
+            )
+            self.connect().commit()
+        return row
+
+    def list_runtime_values(self, prefix: str | None = None) -> list[dict[str, Any]]:
+        with self._lock:
+            if prefix:
+                rows = self.connect().execute(
+                    """
+                    SELECT key, value, updated_at
+                    FROM runtime_kv
+                    WHERE key LIKE ?
+                    ORDER BY updated_at DESC
+                    """,
+                    (f"{prefix}%",),
+                ).fetchall()
+            else:
+                rows = self.connect().execute(
+                    """
+                    SELECT key, value, updated_at
+                    FROM runtime_kv
+                    ORDER BY updated_at DESC
+                    """
+                ).fetchall()
+        return [
+            {
+                "key": row["key"],
+                "value": _loads(row["value"], None),
+                "updated_at": row["updated_at"],
+            }
+            for row in rows
         ]
 
     def create_conversation(self, title: str = "Новый диалог") -> str:
@@ -1234,6 +1295,12 @@ class JarvisStorage:
 
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS runtime_kv (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS runtime_events (
     id TEXT PRIMARY KEY,
     ts TEXT NOT NULL,
@@ -1366,6 +1433,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
     after_json TEXT NOT NULL DEFAULT '{}'
 );
 
+CREATE INDEX IF NOT EXISTS idx_runtime_kv_updated ON runtime_kv(updated_at);
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_memories_namespace ON memories(namespace, importance);
 CREATE INDEX IF NOT EXISTS idx_mission_tasks_mission ON mission_tasks(mission_id, position);

@@ -253,6 +253,64 @@ type AutonomyStatus = {
   last_error?: string | null;
 };
 
+type RuntimePreferences = {
+  operator_name: string;
+  communication_style: "concise" | "balanced" | "detailed";
+  daily_briefing: boolean;
+  voice_reply: boolean;
+  preferred_profile: "gemma4-turbo" | "gemma4-mono";
+  quiet_hours: string;
+  working_roots: string[];
+};
+
+type AutonomyPolicy = {
+  mode: "safe" | "balanced" | "operator";
+  allow_safe_tools: boolean;
+  allow_review_tools: boolean;
+  allow_danger_tools: boolean;
+  allow_background_learning: boolean;
+  allow_self_healing_suggestions: boolean;
+  approval_required_for: string[];
+  max_autonomous_steps: number;
+  resource_guard: Record<string, number>;
+};
+
+type DailyBriefing = {
+  ts: string;
+  operator_name: string;
+  profile: string;
+  home: string;
+  headline: string;
+  focus: string[];
+  risks: string[];
+  suggestions: string[];
+  pending_approvals: number;
+  policy_mode: string;
+  counters: Record<string, number>;
+  resources: Record<string, unknown>;
+  recent_events: RuntimeEvent[];
+};
+
+type SelfHealReport = {
+  ts: string;
+  ok: boolean;
+  summary: string;
+  issues: { check: string; status: "warn" | "error"; message: string }[];
+  actions: { id: string; label: string; kind: "safe" | "approval"; risk: string; reason: string }[];
+};
+
+type BenchmarkReport = {
+  ts: string;
+  profile: string;
+  summary: string;
+  metrics: Record<string, number>;
+  telemetry: Record<string, unknown>;
+  dispatcher: Record<string, unknown>;
+  llm: Record<string, unknown>;
+  recommendations: string[];
+  history: { ts?: string; summary?: string; total_ms?: number; llm_ok?: boolean }[];
+};
+
 type ToolInfo = {
   name: string;
   description: string;
@@ -407,6 +465,16 @@ export default function CommandCenter() {
   const [telemetry, setTelemetry] = useState<TelemetrySnapshot | null>(null);
   const [hostBridge, setHostBridge] = useState<HostBridgeStatus | null>(null);
   const [autonomy, setAutonomy] = useState<AutonomyStatus | null>(null);
+  const [preferences, setPreferences] = useState<RuntimePreferences | null>(null);
+  const [preferenceDraft, setPreferenceDraft] = useState({
+    operator_name: "",
+    communication_style: "concise" as RuntimePreferences["communication_style"],
+    quiet_hours: ""
+  });
+  const [autonomyPolicy, setAutonomyPolicy] = useState<AutonomyPolicy | null>(null);
+  const [briefing, setBriefing] = useState<DailyBriefing | null>(null);
+  const [selfHealReport, setSelfHealReport] = useState<SelfHealReport | null>(null);
+  const [benchmarkReport, setBenchmarkReport] = useState<BenchmarkReport | null>(null);
   const [approvals, setApprovals] = useState<ApprovalItem[]>([]);
   const [input, setInput] = useState("");
   const [voiceAvailable, setVoiceAvailable] = useState(false);
@@ -450,6 +518,9 @@ export default function CommandCenter() {
         telemetryData,
         hostBridgeData,
         autonomyData,
+        preferencesData,
+        autonomyPolicyData,
+        briefingData,
         approvalData
       ] = await Promise.all([
           api<RuntimeStatus>("/api/status"),
@@ -464,6 +535,9 @@ export default function CommandCenter() {
           api<TelemetrySnapshot>("/api/telemetry"),
           api<HostBridgeStatus>("/api/host-bridge"),
           api<AutonomyStatus>("/api/autonomy"),
+          api<RuntimePreferences>("/api/preferences"),
+          api<AutonomyPolicy>("/api/autonomy/policy"),
+          api<DailyBriefing>("/api/briefing"),
           api<ApprovalItem[]>("/api/approvals?limit=8")
         ]);
       setStatus(statusData);
@@ -478,6 +552,14 @@ export default function CommandCenter() {
       setTelemetry(telemetryData);
       setHostBridge(hostBridgeData);
       setAutonomy(autonomyData);
+      setPreferences(preferencesData);
+      setPreferenceDraft({
+        operator_name: preferencesData.operator_name,
+        communication_style: preferencesData.communication_style,
+        quiet_hours: preferencesData.quiet_hours
+      });
+      setAutonomyPolicy(autonomyPolicyData);
+      setBriefing(briefingData);
       setApprovals(approvalData);
       if (statusData.health.length) {
         setDiagnostics(statusData.health);
@@ -682,6 +764,84 @@ export default function CommandCenter() {
       await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Диагностика не ответила");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function runSelfHeal() {
+    setBusy(true);
+    try {
+      const report = await api<SelfHealReport>("/api/self-heal", {
+        method: "POST",
+        body: "{}"
+      });
+      setSelfHealReport(report);
+      setLines((current) => [
+        ...current,
+        { role: "system", content: `Self-heal: ${report.summary}` }
+      ]);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Self-heal scan failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function runBenchmark() {
+    setBusy(true);
+    try {
+      const report = await api<BenchmarkReport>("/api/benchmark", {
+        method: "POST",
+        body: "{}"
+      });
+      setBenchmarkReport(report);
+      setLines((current) => [
+        ...current,
+        { role: "system", content: `Benchmark: ${report.summary}` }
+      ]);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Benchmark failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function updatePolicyMode(mode: AutonomyPolicy["mode"]) {
+    setBusy(true);
+    try {
+      const updated = await api<AutonomyPolicy>("/api/autonomy/policy", {
+        method: "PATCH",
+        body: JSON.stringify({ mode })
+      });
+      setAutonomyPolicy(updated);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Policy update failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function savePreferences(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setBusy(true);
+    try {
+      const updated = await api<RuntimePreferences>("/api/preferences", {
+        method: "PATCH",
+        body: JSON.stringify(preferenceDraft)
+      });
+      setPreferences(updated);
+      setPreferenceDraft({
+        operator_name: updated.operator_name,
+        communication_style: updated.communication_style,
+        quiet_hours: updated.quiet_hours
+      });
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Preferences save failed");
     } finally {
       setBusy(false);
     }
@@ -1226,6 +1386,28 @@ export default function CommandCenter() {
             </div>
 
             <div className="panelHeader lower">
+              <h2>Briefing</h2>
+              <span>{briefing?.policy_mode ?? autonomyPolicy?.mode ?? "..."}</span>
+            </div>
+            <div className="briefingPanel">
+              <div className="briefingHero">
+                <Brain size={16} />
+                <strong>{briefing?.headline ?? "Runtime snapshot pending"}</strong>
+                <span>{briefing?.operator_name ?? preferences?.operator_name ?? "operator"}</span>
+              </div>
+              <div className="briefingList">
+                {(briefing?.focus ?? []).slice(0, 4).map((item) => (
+                  <p key={item}>{item}</p>
+                ))}
+              </div>
+              <div className="briefingList suggestions">
+                {(briefing?.suggestions ?? []).slice(0, 4).map((item) => (
+                  <p key={item}>{item}</p>
+                ))}
+              </div>
+            </div>
+
+            <div className="panelHeader lower">
               <h2>Dialog History</h2>
               <span>{conversations.length}</span>
             </div>
@@ -1263,6 +1445,30 @@ export default function CommandCenter() {
                   <p>{check.message}</p>
                 </div>
               ))}
+            </div>
+            <div className="selfHealPanel">
+              <button
+                className="iconText compact full"
+                type="button"
+                onClick={runSelfHeal}
+                disabled={busy}
+              >
+                {busy ? <Loader2 className="spin" size={15} /> : <Activity size={15} />}
+                <span>Self-heal scan</span>
+              </button>
+              {selfHealReport && (
+                <article className={`selfHealReport ${selfHealReport.ok ? "ok" : "warn"}`}>
+                  <div>
+                    <strong>{selfHealReport.summary}</strong>
+                    <span>{selfHealReport.actions.length} actions</span>
+                  </div>
+                  {selfHealReport.actions.slice(0, 3).map((action) => (
+                    <p key={action.id}>
+                      {action.label}: {action.reason}
+                    </p>
+                  ))}
+                </article>
+              )}
             </div>
 
             <div className="panelHeader lower">
@@ -1390,6 +1596,72 @@ export default function CommandCenter() {
             </div>
 
             <div className="panelHeader lower">
+              <h2>Autonomy Policy</h2>
+              <span>{autonomyPolicy?.max_autonomous_steps ?? 0} steps</span>
+            </div>
+            <div className="policyPanel">
+              <div className="segmentedControl" role="group" aria-label="Autonomy policy mode">
+                {(["safe", "balanced", "operator"] as AutonomyPolicy["mode"][]).map((mode) => (
+                  <button
+                    className={autonomyPolicy?.mode === mode ? "active" : ""}
+                    disabled={busy}
+                    key={mode}
+                    onClick={() => updatePolicyMode(mode)}
+                    type="button"
+                  >
+                    {mode}
+                  </button>
+                ))}
+              </div>
+              <div className="policyFlags">
+                <span className={autonomyPolicy?.allow_review_tools ? "on" : ""}>review</span>
+                <span className={autonomyPolicy?.allow_danger_tools ? "on" : ""}>danger</span>
+                <span className={autonomyPolicy?.allow_background_learning ? "on" : ""}>
+                  learning
+                </span>
+                <span>
+                  {Math.round((autonomyPolicy?.resource_guard.max_gpu_memory_ratio ?? 0) * 100)}%
+                  GPU
+                </span>
+              </div>
+            </div>
+
+            <div className="panelHeader lower">
+              <h2>Performance</h2>
+              <span>
+                {typeof benchmarkReport?.metrics.total_ms === "number"
+                  ? `${Math.round(benchmarkReport.metrics.total_ms)} ms`
+                  : "ready"}
+              </span>
+            </div>
+            <div className="benchmarkPanel">
+              <button
+                className="iconText compact full"
+                type="button"
+                onClick={runBenchmark}
+                disabled={busy}
+              >
+                {busy ? <Loader2 className="spin" size={15} /> : <Gauge size={15} />}
+                <span>Benchmark</span>
+              </button>
+              {benchmarkReport && (
+                <article className="benchmarkReport">
+                  <strong>{benchmarkReport.summary}</strong>
+                  <div className="metricRows">
+                    <span>storage {Math.round(benchmarkReport.metrics.storage_ping_ms ?? 0)} ms</span>
+                    <span>LLM {Math.round(benchmarkReport.metrics.llm_health_ms ?? 0)} ms</span>
+                    <span>
+                      {benchmarkReport.dispatcher.port_open ? "dispatcher on" : "dispatcher off"}
+                    </span>
+                  </div>
+                  {benchmarkReport.recommendations.slice(0, 3).map((item) => (
+                    <p key={item}>{item}</p>
+                  ))}
+                </article>
+              )}
+            </div>
+
+            <div className="panelHeader lower">
               <h2>Инструменты</h2>
               <span>{tools.length}</span>
             </div>
@@ -1477,6 +1749,57 @@ export default function CommandCenter() {
                 ))}
               </div>
             )}
+
+            <div className="panelHeader lower">
+              <h2>Preferences</h2>
+              <span>{preferences?.communication_style ?? "concise"}</span>
+            </div>
+            <form className="preferencesForm" onSubmit={savePreferences}>
+              <input
+                value={preferenceDraft.operator_name}
+                onChange={(event) =>
+                  setPreferenceDraft((current) => ({
+                    ...current,
+                    operator_name: event.target.value
+                  }))
+                }
+                placeholder="Operator"
+                aria-label="Operator name"
+              />
+              <select
+                value={preferenceDraft.communication_style}
+                onChange={(event) =>
+                  setPreferenceDraft((current) => ({
+                    ...current,
+                    communication_style: event.target.value as RuntimePreferences["communication_style"]
+                  }))
+                }
+                aria-label="Communication style"
+              >
+                <option value="concise">concise</option>
+                <option value="balanced">balanced</option>
+                <option value="detailed">detailed</option>
+              </select>
+              <input
+                value={preferenceDraft.quiet_hours}
+                onChange={(event) =>
+                  setPreferenceDraft((current) => ({
+                    ...current,
+                    quiet_hours: event.target.value
+                  }))
+                }
+                placeholder="quiet hours"
+                aria-label="Quiet hours"
+              />
+              <button
+                type="submit"
+                disabled={busy}
+                title="Save preferences"
+                aria-label="Save preferences"
+              >
+                {busy ? <Loader2 className="spin" size={15} /> : <Save size={15} />}
+              </button>
+            </form>
 
             <div className="panelHeader lower">
               <h2>Память</h2>

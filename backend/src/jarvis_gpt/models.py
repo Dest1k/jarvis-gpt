@@ -101,6 +101,9 @@ class MemoryItem(BaseModel):
     created_at: str
     updated_at: str
     rank: float | None = None
+    relevance: float | None = None
+    snippet: str | None = None
+    matched_terms: list[str] = Field(default_factory=list)
 
 
 class FileItem(BaseModel):
@@ -126,6 +129,9 @@ class FileChunkHit(BaseModel):
     content: str
     created_at: str
     rank: float | None = None
+    relevance: float | None = None
+    snippet: str | None = None
+    matched_terms: list[str] = Field(default_factory=list)
 
 
 class FileIngestResponse(BaseModel):
@@ -195,6 +201,7 @@ class TelemetryResponse(BaseModel):
 class LearningTickResponse(BaseModel):
     saved: list[MemoryItem]
     lesson_count: int
+    skipped_duplicates: int = 0
     examined: dict[str, int]
 
 
@@ -307,6 +314,103 @@ class DiagnosticCheck(BaseModel):
 class DiagnosticsResponse(BaseModel):
     ok: bool
     checks: list[DiagnosticCheck]
+
+
+class RuntimePreferencesResponse(BaseModel):
+    operator_name: str
+    communication_style: Literal["concise", "balanced", "detailed"]
+    daily_briefing: bool
+    voice_reply: bool
+    preferred_profile: Literal["gemma4-turbo", "gemma4-mono"]
+    quiet_hours: str
+    working_roots: list[str] = Field(default_factory=list)
+
+
+class RuntimePreferencesUpdateRequest(BaseModel):
+    operator_name: str | None = Field(default=None, max_length=80)
+    communication_style: Literal["concise", "balanced", "detailed"] | None = None
+    daily_briefing: bool | None = None
+    voice_reply: bool | None = None
+    preferred_profile: Literal["gemma4-turbo", "gemma4-mono"] | None = None
+    quiet_hours: str | None = Field(default=None, max_length=80)
+    working_roots: list[str] | None = None
+
+
+class AutonomyPolicyResponse(BaseModel):
+    mode: Literal["safe", "balanced", "operator"]
+    allow_safe_tools: bool
+    allow_review_tools: bool
+    allow_danger_tools: bool
+    allow_background_learning: bool
+    allow_self_healing_suggestions: bool
+    approval_required_for: list[str] = Field(default_factory=list)
+    max_autonomous_steps: int
+    resource_guard: dict[str, float] = Field(default_factory=dict)
+
+
+class AutonomyPolicyUpdateRequest(BaseModel):
+    mode: Literal["safe", "balanced", "operator"] | None = None
+    allow_safe_tools: bool | None = None
+    allow_review_tools: bool | None = None
+    allow_danger_tools: bool | None = None
+    allow_background_learning: bool | None = None
+    allow_self_healing_suggestions: bool | None = None
+    approval_required_for: list[str] | None = None
+    max_autonomous_steps: int | None = Field(default=None, ge=1, le=24)
+    resource_guard: dict[str, float] | None = None
+
+
+class DailyBriefingResponse(BaseModel):
+    ts: str
+    operator_name: str
+    profile: str
+    home: str
+    headline: str
+    focus: list[str] = Field(default_factory=list)
+    risks: list[str] = Field(default_factory=list)
+    suggestions: list[str] = Field(default_factory=list)
+    pending_approvals: int
+    policy_mode: str
+    counters: dict[str, int] = Field(default_factory=dict)
+    resources: dict[str, Any] = Field(default_factory=dict)
+    recent_events: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class SelfHealIssue(BaseModel):
+    check: str
+    status: Literal["warn", "error"]
+    message: str
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class SelfHealAction(BaseModel):
+    id: str
+    label: str
+    kind: Literal["safe", "approval"]
+    risk: Literal["safe", "review", "danger"]
+    reason: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class SelfHealResponse(BaseModel):
+    ts: str
+    ok: bool
+    summary: str
+    issues: list[SelfHealIssue] = Field(default_factory=list)
+    actions: list[SelfHealAction] = Field(default_factory=list)
+    checks: list[DiagnosticCheck] = Field(default_factory=list)
+
+
+class BenchmarkResponse(BaseModel):
+    ts: str
+    profile: str
+    summary: str
+    metrics: dict[str, Any] = Field(default_factory=dict)
+    telemetry: dict[str, Any] = Field(default_factory=dict)
+    dispatcher: dict[str, Any] = Field(default_factory=dict)
+    llm: dict[str, Any] = Field(default_factory=dict)
+    recommendations: list[str] = Field(default_factory=list)
+    history: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class StatusResponse(BaseModel):
