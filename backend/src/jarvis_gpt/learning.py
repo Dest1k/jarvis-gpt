@@ -14,6 +14,7 @@ class LearningEngine:
         tool_runs = self.storage.list_tool_runs(limit=limit)
         approvals = self.storage.list_approvals(limit=limit)
         lessons = self._derive_lessons(audit=audit, tool_runs=tool_runs, approvals=approvals)
+        consolidation = self.storage.consolidate_memories(limit=max(200, limit * 20))
         saved = []
         skipped_duplicates = 0
         for lesson in lessons:
@@ -41,6 +42,7 @@ class LearningEngine:
             "saved": saved,
             "lesson_count": len(saved),
             "skipped_duplicates": skipped_duplicates,
+            "consolidated": consolidation,
             "examined": {
                 "audit": len(audit),
                 "tool_runs": len(tool_runs),

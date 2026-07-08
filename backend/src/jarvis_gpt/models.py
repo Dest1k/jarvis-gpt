@@ -33,6 +33,7 @@ class ChatResponse(BaseModel):
     answer: str
     events: list[ChatEvent]
     mission_id: str | None = None
+    duration_ms: int | None = None
 
 
 class ConversationItem(BaseModel):
@@ -225,6 +226,7 @@ class LearningTickResponse(BaseModel):
     saved: list[MemoryItem]
     lesson_count: int
     skipped_duplicates: int = 0
+    consolidated: dict[str, int] = Field(default_factory=dict)
     examined: dict[str, int]
 
 

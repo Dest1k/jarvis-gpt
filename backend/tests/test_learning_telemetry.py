@@ -51,6 +51,7 @@ def test_learning_tick_deduplicates_lessons(monkeypatch, tmp_path):
     assert first["lesson_count"] >= 1
     assert second["lesson_count"] == 0
     assert second["skipped_duplicates"] >= 1
+    assert "consolidated" in second
     storage.close()
 
 

@@ -101,6 +101,9 @@ type ChatLine = {
   id?: string;
   role: "user" | "assistant" | "system";
   content: string;
+  durationMs?: number | null;
+  pending?: boolean;
+  startedAt?: number | null;
 };
 
 type ChatWindow = {
@@ -137,6 +140,7 @@ type MessageItem = {
   conversation_id: string;
   role: "user" | "assistant" | "system";
   content: string;
+  metadata?: Record<string, unknown>;
   created_at: string;
 };
 
@@ -533,7 +537,9 @@ type ChatStreamItem = {
   content?: string;
   conversation_id?: string;
   answer?: string;
+  duration_ms?: number;
   error?: string;
+  message_id?: string;
 };
 
 type VoiceState = "idle" | "listening";
@@ -699,10 +705,38 @@ function createInitialChatWindow(): ChatWindow {
 }
 
 function normalizeStoredLine(line: ChatLine): ChatLine {
+  const durationMs = coerceDurationMs(line.durationMs);
   if (line.id === "system-boot" && line.content.includes("Command Center")) {
-    return { ...line, content: BOOT_MESSAGE };
+    return { ...line, content: BOOT_MESSAGE, durationMs, pending: false, startedAt: null };
   }
-  return line;
+  return {
+    ...line,
+    durationMs,
+    pending: false,
+    startedAt: null
+  };
+}
+
+function coerceDurationMs(value: unknown): number | null {
+  const numeric = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(numeric) || numeric < 0) return null;
+  return Math.round(numeric);
+}
+
+function formatDuration(ms: number) {
+  if (ms < 1000) return `${ms} ms`;
+  if (ms < 10000) return `${(ms / 1000).toFixed(1)} s`;
+  return `${Math.round(ms / 1000)} s`;
+}
+
+function assistantDuration(line: ChatLine, now: number) {
+  if (line.role !== "assistant") return null;
+  const stored = coerceDurationMs(line.durationMs);
+  if (stored !== null) return formatDuration(stored);
+  if (line.pending && line.startedAt) {
+    return formatDuration(Math.max(0, now - line.startedAt));
+  }
+  return null;
 }
 
 function readStoredChatWindows(): { windows: ChatWindow[]; activeId: string } {
@@ -893,6 +927,7 @@ export default function CommandCenter() {
   const [maxTokens, setMaxTokens] = useState(512);
   const [busy, setBusy] = useState(false);
   const [chatBusy, setChatBusy] = useState(false);
+  const [chatTicker, setChatTicker] = useState(Date.now());
   const [dispatcherBusy, setDispatcherBusy] = useState(false);
   const [cleanupBusy, setCleanupBusy] = useState(false);
   const [activeOperation, setActiveOperation] = useState<ActiveOperation | null>(null);
@@ -1135,6 +1170,13 @@ export default function CommandCenter() {
   }, [activeChatWindowId, lines.length, latestLine?.content]);
 
   useEffect(() => {
+    if (!chatBusy) return;
+    setChatTicker(Date.now());
+    const timer = window.setInterval(() => setChatTicker(Date.now()), 250);
+    return () => window.clearInterval(timer);
+  }, [chatBusy]);
+
+  useEffect(() => {
     if (!storageReady) return;
     const compactWindows = chatWindows.slice(0, 8).map((window) => ({
       ...window,
@@ -1357,6 +1399,7 @@ export default function CommandCenter() {
     const previousConversationId = activeChatWindow.conversationId;
     const userId = randomId("msg");
     const assistantId = randomId("msg");
+    const assistantStartedAt = Date.now();
     let receivedDelta = false;
     setChatBusy(true);
     updateChatWindow(chatWindowId, (window) => ({
@@ -1368,7 +1411,13 @@ export default function CommandCenter() {
       lines: [
         ...window.lines,
         { id: userId, role: "user", content: message },
-        { id: assistantId, role: "assistant", content: "" }
+        {
+          id: assistantId,
+          role: "assistant",
+          content: "",
+          pending: true,
+          startedAt: assistantStartedAt
+        }
       ]
     }));
     try {
@@ -1397,27 +1446,42 @@ export default function CommandCenter() {
             }));
           }
           if (item.type === "done") {
+            const durationMs = coerceDurationMs(item.duration_ms);
             if (item.conversation_id) {
               updateChatWindow(chatWindowId, (window) => ({
                 ...window,
                 conversationId: item.conversation_id ?? window.conversationId
               }));
             }
-            if (!receivedDelta && item.answer) {
-              updateChatWindow(chatWindowId, (window) => ({
-                ...window,
-                lines: window.lines.map((line) =>
-                  line.id === assistantId ? { ...line, content: item.answer ?? "" } : line
-                )
-              }));
-            }
-          }
-          if (item.type === "error") {
             updateChatWindow(chatWindowId, (window) => ({
               ...window,
               lines: window.lines.map((line) =>
                 line.id === assistantId
-                  ? { ...line, content: item.error ?? "Ошибка потока ответа" }
+                  ? {
+                      ...line,
+                      id: item.message_id ?? line.id,
+                      content: !receivedDelta && item.answer ? item.answer : line.content,
+                      durationMs,
+                      pending: false,
+                      startedAt: null
+                    }
+                  : line
+              )
+            }));
+          }
+          if (item.type === "error") {
+            const durationMs = Math.max(0, Date.now() - assistantStartedAt);
+            updateChatWindow(chatWindowId, (window) => ({
+              ...window,
+              lines: window.lines.map((line) =>
+                line.id === assistantId
+                  ? {
+                      ...line,
+                      content: item.error ?? "Ошибка потока ответа",
+                      durationMs,
+                      pending: false,
+                      startedAt: null
+                    }
                   : line
               )
             }));
@@ -1432,7 +1496,10 @@ export default function CommandCenter() {
           line.id === assistantId
             ? {
                 ...line,
-                content: err instanceof Error ? `Ошибка backend: ${err.message}` : "Ошибка backend"
+                content: err instanceof Error ? `Ошибка backend: ${err.message}` : "Ошибка backend",
+                durationMs: Math.max(0, Date.now() - assistantStartedAt),
+                pending: false,
+                startedAt: null
               }
             : line
         )
@@ -1530,7 +1597,10 @@ export default function CommandCenter() {
           .map((message) => ({
             id: message.id,
             role: message.role,
-            content: message.content
+            content: message.content,
+            durationMs: coerceDurationMs(message.metadata?.duration_ms),
+            pending: false,
+            startedAt: null
           }))
       );
     } catch (err) {
@@ -2744,12 +2814,22 @@ export default function CommandCenter() {
               ))}
             </div>
             <div className="transcript" ref={transcriptRef}>
-              {lines.map((line, index) => (
-                <article className={`bubble ${line.role}`} key={line.id ?? `${line.role}-${index}`}>
-                  <span>{line.role}</span>
-                  <p>{line.role === "assistant" ? cleanAssistantText(line.content) : line.content}</p>
-                </article>
-              ))}
+              {lines.map((line, index) => {
+                const durationLabel = assistantDuration(line, chatTicker);
+                return (
+                  <article className={`bubble ${line.role}`} key={line.id ?? `${line.role}-${index}`}>
+                    <div className="bubbleMeta">
+                      <span>{line.role}</span>
+                      {durationLabel && (
+                        <time className="bubbleTimer" dateTime={`PT${Math.max(0, coerceDurationMs(line.durationMs) ?? 0) / 1000}S`}>
+                          {durationLabel}
+                        </time>
+                      )}
+                    </div>
+                    <p>{line.role === "assistant" ? cleanAssistantText(line.content) : line.content}</p>
+                  </article>
+                );
+              })}
             </div>
             <form className="composer" onSubmit={sendChat}>
               <textarea

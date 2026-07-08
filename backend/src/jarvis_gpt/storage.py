@@ -10,6 +10,78 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+_QUERY_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "how",
+    "i",
+    "in",
+    "is",
+    "it",
+    "me",
+    "my",
+    "of",
+    "on",
+    "or",
+    "the",
+    "to",
+    "what",
+    "with",
+    "а",
+    "без",
+    "бы",
+    "в",
+    "во",
+    "вот",
+    "где",
+    "да",
+    "для",
+    "до",
+    "же",
+    "за",
+    "и",
+    "из",
+    "или",
+    "как",
+    "к",
+    "ко",
+    "ли",
+    "мне",
+    "мой",
+    "моя",
+    "мы",
+    "на",
+    "над",
+    "не",
+    "но",
+    "о",
+    "об",
+    "он",
+    "она",
+    "они",
+    "от",
+    "по",
+    "под",
+    "про",
+    "с",
+    "со",
+    "так",
+    "там",
+    "то",
+    "у",
+    "что",
+    "это",
+    "я",
+}
+
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
@@ -40,7 +112,7 @@ def _query_terms(query: str | None, *, limit: int = 12) -> list[str]:
     for token in re.findall(r"[\w-]+", query, flags=re.UNICODE):
         clean = token.replace('"', "").replace("'", "").strip()
         normalized = clean.casefold()
-        if not clean or normalized in seen:
+        if not clean or normalized in seen or normalized in _QUERY_STOPWORDS:
             continue
         terms.append(clean)
         seen.add(normalized)
@@ -120,13 +192,57 @@ def _relevance(
     importance: float,
 ) -> float:
     try:
-        raw_rank = float(rank)
+        raw_rank = abs(float(rank))
     except (TypeError, ValueError):
         raw_rank = 3.0
     rank_score = 1.0 / (1.0 + max(raw_rank, 0.0))
     coverage = len(matched_terms) / len(query_terms) if query_terms else 0.0
-    score = (rank_score * 0.55) + (coverage * 0.35) + (max(0.0, min(1.0, importance)) * 0.10)
+    score = (rank_score * 0.35) + (coverage * 0.45) + (max(0.0, min(1.0, importance)) * 0.20)
     return round(max(0.0, min(1.0, score)), 4)
+
+
+def _normalize_memory_content(content: str) -> str:
+    cleaned = re.sub(r"\s+", " ", content).strip().casefold()
+    return re.sub(r"[^\w:/\\.-]+", " ", cleaned, flags=re.UNICODE).strip()
+
+
+def _normalize_tags(tags: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    normalized: list[str] = []
+    for tag in tags:
+        clean = str(tag).strip()[:80]
+        key = clean.casefold()
+        if not clean or key in seen:
+            continue
+        normalized.append(clean)
+        seen.add(key)
+        if len(normalized) >= 16:
+            break
+    return normalized
+
+
+def _merge_tags(*tag_lists: Iterable[str]) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for tags in tag_lists:
+        for tag in tags:
+            clean = str(tag).strip()[:80]
+            key = clean.casefold()
+            if not clean or key in seen:
+                continue
+            merged.append(clean)
+            seen.add(key)
+            if len(merged) >= 16:
+                return merged
+    return merged
+
+
+def _memory_sort_key(item: dict[str, Any]) -> tuple[float, float, str]:
+    return (
+        float(item.get("relevance") or 0),
+        float(item.get("importance") or 0),
+        str(item.get("updated_at") or ""),
+    )
 
 
 class JarvisStorage:
@@ -437,6 +553,29 @@ class JarvisStorage:
             for row in rows
         ]
 
+    def list_messages_slice(
+        self,
+        conversation_id: str,
+        *,
+        offset: int = 0,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self.connect().execute(
+                """
+                SELECT id, conversation_id, role, content, metadata, created_at
+                FROM messages
+                WHERE conversation_id = ?
+                ORDER BY created_at ASC, rowid ASC
+                LIMIT ? OFFSET ?
+                """,
+                (conversation_id, max(1, limit), max(0, offset)),
+            ).fetchall()
+        return [
+            {**dict(row), "metadata": _loads(row["metadata"], {})}
+            for row in rows
+        ]
+
     def recent_messages(self, conversation_id: str, limit: int = 20) -> list[dict[str, Any]]:
         with self._lock:
             rows = self.connect().execute(
@@ -463,17 +602,63 @@ class JarvisStorage:
         importance: float = 0.5,
     ) -> dict[str, Any]:
         now = utc_now()
+        content = " ".join(str(content).split()).strip()[:20000]
+        namespace = (str(namespace).strip() or "core")[:80]
+        tags = _normalize_tags(tags)
+        importance = max(0.0, min(1.0, float(importance)))
+        content_key = _normalize_memory_content(content)
         row = {
             "id": new_id("mem"),
             "namespace": namespace,
             "content": content,
-            "tags": list(tags),
-            "importance": float(importance),
+            "tags": tags,
+            "importance": importance,
             "created_at": now,
             "updated_at": now,
         }
         with self._lock:
             conn = self.connect()
+            existing_rows = conn.execute(
+                """
+                SELECT id, namespace, content, tags, importance, created_at, updated_at
+                FROM memories
+                WHERE namespace = ?
+                ORDER BY updated_at DESC
+                LIMIT 250
+                """,
+                (namespace,),
+            ).fetchall()
+            for existing in existing_rows:
+                existing_dict = dict(existing)
+                if _normalize_memory_content(str(existing_dict["content"])) != content_key:
+                    continue
+                merged_tags = _merge_tags(_loads(existing_dict["tags"], []), tags)
+                merged_importance = max(float(existing_dict["importance"] or 0), importance)
+                row = {
+                    **existing_dict,
+                    "tags": merged_tags,
+                    "importance": merged_importance,
+                    "updated_at": now,
+                }
+                conn.execute(
+                    """
+                    UPDATE memories
+                    SET tags = ?, importance = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (_json(merged_tags), merged_importance, now, row["id"]),
+                )
+                self._replace_memory_fts(conn, row)
+                conn.commit()
+                self.record_audit(
+                    actor="system",
+                    action="memory.merge",
+                    target_type="memory",
+                    target_id=row["id"],
+                    summary=f"Memory refreshed in namespace {row['namespace']}.",
+                    after=row,
+                )
+                return row
             conn.execute(
                 """
                 INSERT INTO memories(
@@ -485,14 +670,7 @@ class JarvisStorage:
                 """,
                 {**row, "tags": _json(row["tags"])},
             )
-            if self._memory_fts_available:
-                conn.execute(
-                    """
-                    INSERT INTO memories_fts(id, namespace, content, tags)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (row["id"], row["namespace"], row["content"], _json(row["tags"])),
-                )
+            self._replace_memory_fts(conn, row)
             conn.commit()
         self.record_audit(
             actor="system",
@@ -504,14 +682,52 @@ class JarvisStorage:
         )
         return row
 
-    def search_memory(self, query: str | None = None, limit: int = 25) -> list[dict[str, Any]]:
+    def _replace_memory_fts(self, conn: sqlite3.Connection, row: dict[str, Any]) -> None:
+        if not self._memory_fts_available:
+            return
+        conn.execute("DELETE FROM memories_fts WHERE id = ?", (row["id"],))
+        conn.execute(
+            """
+            INSERT INTO memories_fts(id, namespace, content, tags)
+            VALUES (?, ?, ?, ?)
+            """,
+            (row["id"], row["namespace"], row["content"], _json(row["tags"])),
+        )
+
+    def search_memory(
+        self,
+        query: str | None = None,
+        limit: int = 25,
+        *,
+        namespaces: Iterable[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        namespace_filter = [str(item) for item in (namespaces or []) if str(item).strip()]
+        seen_ids: set[str] = set()
+        decorated: list[dict[str, Any]] = []
+
+        def add_rows(rows: Iterable[sqlite3.Row]) -> None:
+            for row in rows:
+                item = dict(row)
+                if item["id"] in seen_ids:
+                    continue
+                seen_ids.add(item["id"])
+                decorated.append(_decorate_memory_hit(item, query))
+
         if query and self._memory_fts_available:
             match = _fts_query(query)
             if match:
                 try:
+                    namespace_sql = ""
+                    params: list[Any] = [match]
+                    if namespace_filter:
+                        placeholders = ",".join("?" for _ in namespace_filter)
+                        namespace_sql = f" AND m.namespace IN ({placeholders})"
+                        params.extend(namespace_filter)
+                    oversample = max(limit * 4, limit)
+                    params.append(min(200, oversample))
                     with self._lock:
                         rows = self.connect().execute(
-                            """
+                            f"""
                             SELECT
                                 m.id,
                                 m.namespace,
@@ -524,33 +740,143 @@ class JarvisStorage:
                             FROM memories_fts
                             JOIN memories m ON m.id = memories_fts.id
                             WHERE memories_fts MATCH ?
+                            {namespace_sql}
                             ORDER BY rank ASC, m.importance DESC, m.updated_at DESC
                             LIMIT ?
                             """,
-                            (match, limit),
+                            tuple(params),
                         ).fetchall()
-                    return [_decorate_memory_hit(dict(row), query) for row in rows]
+                    add_rows(rows)
                 except sqlite3.OperationalError:
                     pass
 
-        params: tuple[Any, ...]
+        if query and len(decorated) < limit:
+            terms = _query_terms(query, limit=8)
+            clauses: list[str] = []
+            params: list[Any] = []
+            for term in terms:
+                like = f"%{term}%"
+                clauses.append("(content LIKE ? OR tags LIKE ? OR namespace LIKE ?)")
+                params.extend([like, like, like])
+            namespace_sql = ""
+            if namespace_filter:
+                placeholders = ",".join("?" for _ in namespace_filter)
+                namespace_sql = f" AND namespace IN ({placeholders})"
+                params.extend(namespace_filter)
+            if clauses:
+                sql = f"""
+                    SELECT
+                        id, namespace, content, tags, importance, created_at, updated_at,
+                        NULL AS rank
+                    FROM memories
+                    WHERE ({" OR ".join(clauses)}){namespace_sql}
+                    ORDER BY importance DESC, updated_at DESC
+                    LIMIT ?
+                """
+                params.append(min(200, max(limit * 4, limit)))
+                with self._lock:
+                    rows = self.connect().execute(sql, tuple(params)).fetchall()
+                add_rows(rows)
+
+        if decorated:
+            decorated.sort(key=_memory_sort_key, reverse=True)
+            return decorated[:limit]
+
+        params: list[Any]
         where = ""
+        namespace_sql = ""
+        if namespace_filter:
+            placeholders = ",".join("?" for _ in namespace_filter)
+            namespace_sql = f"namespace IN ({placeholders})"
         if query:
-            where = "WHERE content LIKE ? OR tags LIKE ? OR namespace LIKE ?"
+            where = "content LIKE ? OR tags LIKE ? OR namespace LIKE ?"
             like = f"%{query}%"
-            params = (like, like, like, limit)
+            params = [like, like, like]
         else:
-            params = (limit,)
+            params = []
+        if namespace_sql:
+            where = f"({where}) AND {namespace_sql}" if where else namespace_sql
+            params.extend(namespace_filter)
+        params.append(limit)
         sql = f"""
             SELECT id, namespace, content, tags, importance, created_at, updated_at, NULL AS rank
             FROM memories
-            {where}
+            {"WHERE " + where if where else ""}
             ORDER BY importance DESC, updated_at DESC
             LIMIT ?
         """
         with self._lock:
-            rows = self.connect().execute(sql, params).fetchall()
+            rows = self.connect().execute(sql, tuple(params)).fetchall()
         return [_decorate_memory_hit(dict(row), query) for row in rows]
+
+    def consolidate_memories(self, limit: int = 1000) -> dict[str, int]:
+        with self._lock:
+            conn = self.connect()
+            rows = conn.execute(
+                """
+                SELECT id, namespace, content, tags, importance, created_at, updated_at
+                FROM memories
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (max(1, min(5000, limit)),),
+            ).fetchall()
+            groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+            for row in rows:
+                item = dict(row)
+                key = (str(item["namespace"]), _normalize_memory_content(str(item["content"])))
+                if not key[1]:
+                    continue
+                groups.setdefault(key, []).append(item)
+
+            removed = 0
+            merged = 0
+            for items in groups.values():
+                if len(items) < 2:
+                    continue
+                keep = max(
+                    items,
+                    key=lambda item: (
+                        float(item.get("importance") or 0),
+                        str(item.get("updated_at") or ""),
+                    ),
+                )
+                duplicate_ids = [item["id"] for item in items if item["id"] != keep["id"]]
+                merged_tags = _merge_tags(*(_loads(item.get("tags"), []) for item in items))
+                merged_importance = max(float(item.get("importance") or 0) for item in items)
+                now = utc_now()
+                conn.execute(
+                    """
+                    UPDATE memories
+                    SET tags = ?, importance = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (_json(merged_tags), merged_importance, now, keep["id"]),
+                )
+                keep = {
+                    **keep,
+                    "tags": merged_tags,
+                    "importance": merged_importance,
+                    "updated_at": now,
+                }
+                self._replace_memory_fts(conn, keep)
+                for duplicate_id in duplicate_ids:
+                    if self._memory_fts_available:
+                        conn.execute("DELETE FROM memories_fts WHERE id = ?", (duplicate_id,))
+                    conn.execute("DELETE FROM memories WHERE id = ?", (duplicate_id,))
+                removed += len(duplicate_ids)
+                merged += 1
+            conn.commit()
+        if removed:
+            self.add_event(
+                kind="memory.consolidate",
+                title=(
+                    f"Memory consolidation merged {merged} group(s), "
+                    f"removed {removed} duplicate(s)"
+                ),
+                payload={"examined": len(rows), "merged": merged, "removed": removed},
+            )
+        return {"examined": len(rows), "merged": merged, "removed": removed}
 
     def create_mission(self, *, title: str, goal: str, tasks: list[str]) -> dict[str, Any]:
         now = utc_now()

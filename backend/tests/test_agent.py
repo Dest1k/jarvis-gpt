@@ -1807,6 +1807,121 @@ def test_agent_context_includes_relevance_snippets(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_agent_captures_explicit_operator_memory(monkeypatch, tmp_path):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+
+    response = asyncio.run(agent.chat("запомни: модели лежат в D:\\jarvis\\models"))
+    hits = storage.search_memory("модели D:\\jarvis\\models", limit=5)
+
+    assert any(event.type == "memory" for event in response.events)
+    assert hits
+    assert hits[0]["namespace"] == "operator"
+    assert "D:\\jarvis\\models" in hits[0]["content"]
+    storage.close()
+
+
+def test_agent_compacts_long_conversation_with_fallback(monkeypatch, tmp_path):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    conversation_id = storage.create_conversation("Long memory")
+    for index in range(16):
+        storage.add_message(
+            conversation_id=conversation_id,
+            role="user",
+            content=f"важно: шаг {index} требует сохранить контекст проекта Jarvis",
+        )
+        storage.add_message(
+            conversation_id=conversation_id,
+            role="assistant",
+            content=f"Принял шаг {index}, продолжу работу с учетом контекста.",
+        )
+
+    asyncio.run(agent.chat("продолжай с учетом старого контекста", conversation_id))
+    hits = storage.search_memory(
+        "long-term continuity Jarvis",
+        limit=5,
+        namespaces=["conversation"],
+    )
+
+    assert hits
+    assert "Conversation summary" in hits[0]["content"]
+    storage.close()
+
+
+def test_agent_compacts_very_long_conversation_in_chunks(monkeypatch, tmp_path):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    conversation_id = storage.create_conversation("Very long memory")
+    for index in range(90):
+        storage.add_message(
+            conversation_id=conversation_id,
+            role="user",
+            content=f"важно: длинный диалог шаг {index} требует не потерять контекст",
+        )
+        storage.add_message(
+            conversation_id=conversation_id,
+            role="assistant",
+            content=f"Шаг {index} учтен.",
+        )
+
+    asyncio.run(agent._compact_conversation_memory(conversation_id))
+    first_offset = storage.get_runtime_value(f"memory.compacted.{conversation_id}")
+    asyncio.run(agent._compact_conversation_memory(conversation_id))
+    second_offset = storage.get_runtime_value(f"memory.compacted.{conversation_id}")
+    hits = storage.search_memory("длинный диалог контекст", limit=10, namespaces=["conversation"])
+
+    assert first_offset == 60
+    assert second_offset == 120
+    assert hits
+    storage.close()
+
+
+def test_agent_compacts_long_conversation_with_llm(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "1")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    conversation_id = storage.create_conversation("LLM memory")
+    for index in range(16):
+        storage.add_message(
+            conversation_id=conversation_id,
+            role="user",
+            content=f"нужно запомнить решение {index}: LAN запуск остается дефолтным",
+        )
+        storage.add_message(
+            conversation_id=conversation_id,
+            role="assistant",
+            content=f"Решение {index} принято.",
+        )
+
+    class FakeCompressionLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None):
+            self.messages = messages
+            return type(
+                "Result",
+                (),
+                {
+                    "ok": True,
+                    "content": (
+                        "- LAN запуск остается дефолтным.\n"
+                        "- Решения по запуску нужно сохранять как проектный контекст."
+                    ),
+                },
+            )()
+
+    fake_llm = FakeCompressionLLM()
+    agent = AgentRuntime(settings=settings, storage=storage, llm=fake_llm, bus=EventBus())
+
+    asyncio.run(agent._compact_conversation_memory(conversation_id))
+    hits = storage.search_memory("LAN запуск дефолтным", limit=5, namespaces=["conversation"])
+
+    assert hits
+    assert hits[0]["content"].startswith("LLM-compressed conversation memory")
+    assert "LAN запуск остается дефолтным" in hits[0]["content"]
+    assert "Сожми этот фрагмент" in fake_llm.messages[-1]["content"]
+    storage.close()
+
+
 def test_agent_context_includes_operator_preferences(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")

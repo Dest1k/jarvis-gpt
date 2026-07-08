@@ -685,12 +685,33 @@ h3 {
   background: transparent;
 }
 
-.bubble span {
-  display: block;
+.bubbleMeta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
   margin-bottom: 6px;
+}
+
+.bubbleMeta span {
+  display: block;
   color: var(--muted);
   font-size: 11px;
   text-transform: uppercase;
+}
+
+.bubbleTimer {
+  display: inline-flex;
+  align-items: center;
+  min-height: 18px;
+  padding: 0 7px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1;
+  white-space: nowrap;
 }
 
 .bubble p {

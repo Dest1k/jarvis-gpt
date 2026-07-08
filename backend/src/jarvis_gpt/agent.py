@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
+import time
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -138,6 +140,7 @@ class AgentRuntime:
         temperature: float | None = None,
         max_tokens: int | None = None,
     ) -> ChatResponse:
+        started_at = time.perf_counter()
         context = self._prepare_context(message, conversation_id)
         events: list[ChatEvent] = [
             ChatEvent(
@@ -155,23 +158,32 @@ class AgentRuntime:
             content=message,
             metadata={"max_tokens": max_tokens, "mode": mode, "temperature": temperature},
         )
+        await self._compact_conversation_memory(context.conversation_id)
+        for event in self._capture_explicit_memories(message, context):
+            events.append(event)
+            await self._emit(event)
 
         direct_action = await self._try_direct_action(message, context)
         if direct_action is not None:
             for event in direct_action.events:
                 events.append(event)
                 await self._emit(event)
+            duration_ms = _elapsed_ms(started_at)
             message_id = self.storage.add_message(
                 conversation_id=context.conversation_id,
                 role="assistant",
                 content=direct_action.answer,
-                metadata={"events": [event.model_dump() for event in events]},
+                metadata={
+                    "duration_ms": duration_ms,
+                    "events": [event.model_dump() for event in events],
+                },
             )
             return ChatResponse(
                 conversation_id=context.conversation_id,
                 message_id=message_id,
                 answer=direct_action.answer,
                 events=events,
+                duration_ms=duration_ms,
             )
 
         forced_mission = mode == "mission"
@@ -187,11 +199,13 @@ class AgentRuntime:
                 )
             )
             await self._emit(events[-1])
+            duration_ms = _elapsed_ms(started_at)
             message_id = self.storage.add_message(
                 conversation_id=context.conversation_id,
                 role="assistant",
                 content=answer,
                 metadata={
+                    "duration_ms": duration_ms,
                     "mission_id": mission["id"],
                     "events": [event.model_dump() for event in events],
                 },
@@ -202,6 +216,7 @@ class AgentRuntime:
                 answer=answer,
                 events=events,
                 mission_id=mission["id"],
+                duration_ms=duration_ms,
             )
 
         llm_messages = self._build_llm_messages(context, message)
@@ -239,17 +254,22 @@ class AgentRuntime:
                 )
             )
         await self._emit(events[-1])
+        duration_ms = _elapsed_ms(started_at)
         message_id = self.storage.add_message(
             conversation_id=context.conversation_id,
             role="assistant",
             content=answer,
-            metadata={"events": [event.model_dump() for event in events]},
+            metadata={
+                "duration_ms": duration_ms,
+                "events": [event.model_dump() for event in events],
+            },
         )
         return ChatResponse(
             conversation_id=context.conversation_id,
             message_id=message_id,
             answer=answer,
             events=events,
+            duration_ms=duration_ms,
         )
 
     async def stream_chat(
@@ -260,6 +280,7 @@ class AgentRuntime:
         temperature: float | None = None,
         max_tokens: int | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
+        started_at = time.perf_counter()
         context = self._prepare_context(message, conversation_id)
         events: list[ChatEvent] = [
             ChatEvent(
@@ -279,6 +300,11 @@ class AgentRuntime:
             content=message,
             metadata={"max_tokens": max_tokens, "mode": mode, "temperature": temperature},
         )
+        await self._compact_conversation_memory(context.conversation_id)
+        for event in self._capture_explicit_memories(message, context):
+            events.append(event)
+            await self._emit(event)
+            yield {"type": "event", "event": event.model_dump()}
 
         direct_action = await self._try_direct_action(message, context)
         if direct_action is not None:
@@ -287,16 +313,21 @@ class AgentRuntime:
                 await self._emit(event)
                 yield {"type": "event", "event": event.model_dump()}
             yield {"type": "delta", "content": direct_action.answer}
+            duration_ms = _elapsed_ms(started_at)
             message_id = self.storage.add_message(
                 conversation_id=context.conversation_id,
                 role="assistant",
                 content=direct_action.answer,
-                metadata={"events": [event.model_dump() for event in events]},
+                metadata={
+                    "duration_ms": duration_ms,
+                    "events": [event.model_dump() for event in events],
+                },
             )
             yield {
                 "type": "done",
                 "answer": direct_action.answer,
                 "conversation_id": context.conversation_id,
+                "duration_ms": duration_ms,
                 "events": [event.model_dump() for event in events],
                 "message_id": message_id,
             }
@@ -317,11 +348,13 @@ class AgentRuntime:
             await self._emit(events[-1])
             yield {"type": "event", "event": events[-1].model_dump()}
             yield {"type": "delta", "content": answer}
+            duration_ms = _elapsed_ms(started_at)
             message_id = self.storage.add_message(
                 conversation_id=context.conversation_id,
                 role="assistant",
                 content=answer,
                 metadata={
+                    "duration_ms": duration_ms,
                     "mission_id": mission["id"],
                     "events": [event.model_dump() for event in events],
                 },
@@ -330,6 +363,7 @@ class AgentRuntime:
                 "type": "done",
                 "answer": answer,
                 "conversation_id": context.conversation_id,
+                "duration_ms": duration_ms,
                 "events": [event.model_dump() for event in events],
                 "message_id": message_id,
                 "mission_id": mission["id"],
@@ -393,16 +427,21 @@ class AgentRuntime:
 
         await self._emit(events[-1])
         yield {"type": "event", "event": events[-1].model_dump()}
+        duration_ms = _elapsed_ms(started_at)
         message_id = self.storage.add_message(
             conversation_id=context.conversation_id,
             role="assistant",
             content=answer,
-            metadata={"events": [event.model_dump() for event in events]},
+            metadata={
+                "duration_ms": duration_ms,
+                "events": [event.model_dump() for event in events],
+            },
         )
         yield {
             "type": "done",
             "answer": answer,
             "conversation_id": context.conversation_id,
+            "duration_ms": duration_ms,
             "events": [event.model_dump() for event in events],
             "message_id": message_id,
         }
@@ -915,7 +954,8 @@ class AgentRuntime:
     def _prepare_context(self, message: str, conversation_id: str | None) -> AgentContext:
         if conversation_id is None:
             conversation_id = self.storage.create_conversation(self._title_from_goal(message))
-        memory_hits = self.storage.search_memory(message[:120], limit=5)
+        recent = self.storage.recent_messages(conversation_id, limit=6)
+        memory_hits = self.storage.search_memory(_memory_search_query(message, recent), limit=8)
         file_hits = self.storage.search_file_chunks(message[:160], limit=5)
         return AgentContext(
             conversation_id=conversation_id,
@@ -927,10 +967,17 @@ class AgentRuntime:
         memory_block = ""
         if context.memory_hits:
             lines = [
-                f"- [{_context_relevance(item)}] {_context_snippet(item)}"
-                for item in context.memory_hits[:5]
+                (
+                    f"- [{_context_relevance(item)} | {item.get('namespace', 'core')}"
+                    f"{_context_tags(item)}] {_context_snippet(item, 520)}"
+                )
+                for item in context.memory_hits[:8]
             ]
-            memory_block = "Память, которая может быть полезна:\n" + "\n".join(lines)
+            memory_block = (
+                "Relevant durable memory. Prefer higher relevance and newer records; "
+                "ignore a memory if it is unrelated to the current task:\n"
+                + "\n".join(lines)
+            )
         file_block = ""
         if context.file_hits:
             lines = [
@@ -959,6 +1006,131 @@ class AgentRuntime:
                 messages.append({"role": item["role"], "content": item["content"]})
         messages.append({"role": "user", "content": message})
         return messages
+
+    def _capture_explicit_memories(
+        self,
+        message: str,
+        context: AgentContext,
+    ) -> list[ChatEvent]:
+        candidates = _explicit_memory_candidates(message)
+        if not candidates:
+            return []
+        saved: list[dict[str, Any]] = []
+        for candidate in candidates[:4]:
+            item = self.storage.add_memory(
+                content=candidate["content"],
+                namespace=candidate["namespace"],
+                tags=candidate["tags"],
+                importance=candidate["importance"],
+            )
+            saved.append(item)
+        if not saved:
+            return []
+        context.memory_hits = _merge_context_memories(
+            [_memory_hit_from_saved(item) for item in saved],
+            context.memory_hits,
+            limit=8,
+        )
+        return [
+            ChatEvent(
+                type="memory",
+                title="Memory updated",
+                content=f"Saved {len(saved)} durable memory item(s).",
+                payload={
+                    "count": len(saved),
+                    "namespaces": sorted({item["namespace"] for item in saved}),
+                },
+            )
+        ]
+
+    async def _compact_conversation_memory(self, conversation_id: str) -> None:
+        state_key = f"memory.compacted.{conversation_id}"
+        last_compacted = int(self.storage.get_runtime_value(state_key, 0) or 0)
+        conversation = self.storage.get_conversation(conversation_id) or {}
+        message_count = int(conversation.get("message_count") or 0)
+        if message_count < 28 or message_count - last_compacted < 12:
+            return
+        cutoff = max(0, message_count - 12)
+        if cutoff <= last_compacted:
+            return
+        chunk_limit = min(60, cutoff - last_compacted)
+        candidates = self.storage.list_messages_slice(
+            conversation_id,
+            offset=last_compacted,
+            limit=chunk_limit,
+        )
+        if not candidates:
+            self.storage.set_runtime_value(state_key, cutoff)
+            return
+        next_offset = min(cutoff, last_compacted + len(candidates))
+        summary = await self._llm_conversation_memory_summary(candidates)
+        if not summary:
+            summary = _conversation_memory_summary(candidates)
+        if not summary:
+            self.storage.set_runtime_value(state_key, next_offset)
+            return
+        item = self.storage.add_memory(
+            content=summary,
+            namespace="conversation",
+            tags=["auto-summary", conversation_id],
+            importance=0.58,
+        )
+        self.storage.set_runtime_value(state_key, next_offset)
+        self.storage.add_event(
+            kind="memory.compact",
+            title="Conversation context compacted into memory",
+            payload={
+                "conversation_id": conversation_id,
+                "message_count": len(candidates),
+                "memory_id": item["id"],
+                "offset": next_offset,
+            },
+        )
+
+    async def _llm_conversation_memory_summary(self, messages: list[dict[str, Any]]) -> str:
+        if not self.settings.llm_enabled:
+            return ""
+        transcript = _conversation_summary_transcript(messages)
+        if not transcript:
+            return ""
+        try:
+            result = await asyncio.wait_for(
+                self.llm.complete(
+                    [
+                        {
+                            "role": "system",
+                            "content": (
+                                "You compress a Jarvis operator conversation into durable memory. "
+                                "Return concise Russian bullet points only. Preserve stable facts, "
+                                "operator preferences, paths, decisions, unresolved bugs, "
+                                "tool lessons and project constraints. Drop greetings, filler "
+                                "and transient wording. "
+                                "Do not invent facts."
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": (
+                                "Сожми этот фрагмент диалога в долговременную память Jarvis. "
+                                "Формат: 4-10 коротких пунктов, каждый должен быть полезен "
+                                "в будущих задачах.\n\n"
+                                f"{transcript}"
+                            ),
+                        },
+                    ],
+                    temperature=0.0,
+                    max_tokens=700,
+                ),
+                timeout=min(12.0, max(3.0, float(self.settings.llm_timeout_sec or 12))),
+            )
+        except Exception:
+            return ""
+        if not result.ok or not result.content:
+            return ""
+        summary = _clean_memory_summary(result.content)
+        if len(summary) < 80:
+            return ""
+        return "LLM-compressed conversation memory:\n" + summary
 
     def _operator_prompt(self) -> str:
         preferences = self.storage.get_runtime_value("experience.preferences", {})
@@ -1092,6 +1264,207 @@ def _context_snippet(item: dict[str, Any], max_chars: int = 700) -> str:
     if len(text) <= max_chars:
         return text
     return f"{text[:max_chars].rstrip()}..."
+
+
+def _context_tags(item: dict[str, Any]) -> str:
+    tags = item.get("tags")
+    if not isinstance(tags, list) or not tags:
+        return ""
+    rendered = ", ".join(str(tag) for tag in tags[:4])
+    return f" | tags: {rendered}"
+
+
+def _memory_search_query(message: str, recent: list[dict[str, Any]]) -> str:
+    parts = [message]
+    for item in recent[-4:]:
+        content = str(item.get("content") or "")
+        if content:
+            parts.append(content[:260])
+    return " ".join(parts)[:1400]
+
+
+def _memory_hit_from_saved(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        **item,
+        "rank": None,
+        "relevance": 1.0,
+        "snippet": item.get("content"),
+        "matched_terms": [],
+    }
+
+
+def _merge_context_memories(
+    primary: list[dict[str, Any]],
+    secondary: list[dict[str, Any]],
+    *,
+    limit: int,
+) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in [*primary, *secondary]:
+        item_id = str(item.get("id") or "")
+        if item_id and item_id in seen:
+            continue
+        if item_id:
+            seen.add(item_id)
+        merged.append(item)
+        if len(merged) >= limit:
+            break
+    return merged
+
+
+def _explicit_memory_candidates(message: str) -> list[dict[str, Any]]:
+    cleaned = " ".join(message.split()).strip()
+    if len(cleaned) < 6 or len(cleaned) > 2000:
+        return []
+    candidates: list[dict[str, Any]] = []
+    patterns = [
+        (
+            r"(?i)(?:^|\b)(?:запомни|запомнить|помни|remember)\s*(?::|,|-)?\s*(.+)$",
+            "operator",
+            ["operator", "explicit"],
+            0.9,
+        ),
+        (
+            r"(?i)(?:^|\b)(?:меня зовут|моё имя|мое имя|my name is)\s+(.+)$",
+            "profile",
+            ["operator", "identity"],
+            0.92,
+        ),
+        (
+            r"(?i)(?:^|\b)(?:я предпочитаю|мне нравится|мне удобнее|предпочтение|i prefer)\s+(.+)$",
+            "preferences",
+            ["operator", "preference"],
+            0.86,
+        ),
+        (
+            r"(?i)(?:^|\b)(?:всегда|не забывай|по умолчанию)\s+(.+)$",
+            "instructions",
+            ["operator", "instruction"],
+            0.88,
+        ),
+        (
+            r"(?i)(?:^|\b)(?:не делай|никогда не|never)\s+(.+)$",
+            "instructions",
+            ["operator", "negative-instruction"],
+            0.88,
+        ),
+        (
+            r"(?i)(?:^|\b)(?:лежит|лежат|находится|путь|папка|директория|folder|path)\s+(.+)$",
+            "environment",
+            ["operator", "path"],
+            0.82,
+        ),
+    ]
+    for pattern, namespace, tags, importance in patterns:
+        match = re.search(pattern, cleaned)
+        if not match:
+            continue
+        content = _memory_content_from_match(cleaned, match.group(1), namespace)
+        if content:
+            candidates.append(
+                {
+                    "content": content,
+                    "namespace": namespace,
+                    "tags": tags,
+                    "importance": importance,
+                }
+            )
+            break
+    return candidates
+
+
+def _memory_content_from_match(message: str, value: str, namespace: str) -> str:
+    value = value.strip(" .,:;\"'«»")
+    if len(value) < 3:
+        return ""
+    if namespace == "profile" and not value.casefold().startswith(
+        ("operator name", "имя оператора")
+    ):
+        return f"Operator identity: {value[:500]}"
+    if namespace == "preferences":
+        return f"Operator preference: {value[:700]}"
+    if namespace == "instructions":
+        return f"Operator instruction: {value[:900]}"
+    if namespace == "environment":
+        return f"Operator environment/path note: {message[:1000]}"
+    return value[:1200]
+
+
+def _conversation_memory_summary(messages: list[dict[str, Any]]) -> str:
+    useful: list[str] = []
+    markers = (
+        "запомни",
+        "важно",
+        "надо",
+        "нужно",
+        "сделай",
+        "исправь",
+        "ошибка",
+        "баг",
+        "пофикс",
+        "добавь",
+        "путь",
+        "папк",
+        "модель",
+        "docker",
+        "llm",
+        "gpu",
+        "память",
+        "remember",
+        "fix",
+        "bug",
+        "error",
+        "path",
+        "model",
+    )
+    for item in messages:
+        role = str(item.get("role") or "")
+        if role not in {"user", "assistant"}:
+            continue
+        content = " ".join(str(item.get("content") or "").split())
+        if len(content) < 18:
+            continue
+        normalized = content.casefold()
+        if role == "user" or any(marker in normalized for marker in markers):
+            useful.append(f"{role}: {_short_value(content, 260)}")
+        if len(useful) >= 14:
+            break
+    if len(useful) < 4:
+        return ""
+    return "Conversation summary for long-term continuity:\n" + "\n".join(
+        f"- {line}" for line in useful
+    )
+
+
+def _conversation_summary_transcript(messages: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for item in messages[-50:]:
+        role = str(item.get("role") or "")
+        if role not in {"user", "assistant"}:
+            continue
+        content = " ".join(str(item.get("content") or "").split())
+        if len(content) < 8:
+            continue
+        lines.append(f"{role}: {_short_value(content, 700)}")
+    return "\n".join(lines)[-12000:]
+
+
+def _clean_memory_summary(content: str) -> str:
+    cleaned = content.strip()
+    cleaned = re.sub(r"(?is)^```(?:\w+)?\s*|\s*```$", "", cleaned).strip()
+    lines = []
+    for raw in cleaned.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        line = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "- ", line)
+        if not line.startswith("- "):
+            line = f"- {line}"
+        lines.append(line[:600])
+        if len(lines) >= 12:
+            break
+    return "\n".join(lines)
 
 
 def _clean_assistant_answer(text: str) -> str:
@@ -3652,6 +4025,10 @@ def _host_command_from_message(message: str) -> str | None:
 
 def _contains_any(text: str, markers: tuple[str, ...]) -> bool:
     return any(marker in text for marker in markers)
+
+
+def _elapsed_ms(started_at: float) -> int:
+    return max(0, round((time.perf_counter() - started_at) * 1000))
 
 
 def _wants_console_target(normalized: str) -> bool:

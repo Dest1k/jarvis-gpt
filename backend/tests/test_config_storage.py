@@ -104,6 +104,70 @@ def test_storage_updates_task_progress_and_searches_memory(tmp_path):
     storage.close()
 
 
+def test_storage_merges_duplicate_memories_and_hybrid_search(tmp_path):
+    storage = JarvisStorage(tmp_path / "state" / "jarvis.sqlite3")
+    storage.initialize()
+
+    first = storage.add_memory(
+        content="LLM models live in D:\\jarvis\\models.",
+        namespace="environment",
+        tags=["models"],
+        importance=0.5,
+    )
+    second = storage.add_memory(
+        content="LLM models live in D:\\jarvis\\models.",
+        namespace="environment",
+        tags=["paths"],
+        importance=0.8,
+    )
+    storage.add_memory(
+        content="Operator prefers concise status updates.",
+        namespace="preferences",
+        tags=["operator"],
+        importance=0.7,
+    )
+
+    hits = storage.search_memory("where are llm models stored jarvis", limit=5)
+
+    assert first["id"] == second["id"]
+    assert second["importance"] == 0.8
+    assert {"models", "paths"}.issubset(set(second["tags"]))
+    assert hits[0]["namespace"] == "environment"
+    assert "D:\\jarvis\\models" in hits[0]["content"]
+    storage.close()
+
+
+def test_storage_consolidates_existing_duplicate_memories(tmp_path):
+    storage = JarvisStorage(tmp_path / "state" / "jarvis.sqlite3")
+    storage.initialize()
+
+    storage.add_memory(content="Use LAN launch mode by default.", namespace="instructions")
+    with storage.connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO memories(id, namespace, content, tags, importance, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "mem_duplicate",
+                "instructions",
+                "Use LAN launch mode by default.",
+                '["legacy"]',
+                0.9,
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+        conn.commit()
+    result = storage.consolidate_memories()
+    hits = storage.search_memory("LAN launch mode", limit=10, namespaces=["instructions"])
+
+    assert result["removed"] == 1
+    assert len(hits) == 1
+    assert "legacy" in hits[0]["tags"]
+    storage.close()
+
+
 def test_storage_records_approval_gate(tmp_path):
     storage = JarvisStorage(tmp_path / "state" / "jarvis.sqlite3")
     storage.initialize()
