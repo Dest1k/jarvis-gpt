@@ -1335,34 +1335,41 @@ export default function CommandCenter() {
   const webFetchStatus =
     typeof webFetchResult?.data.status_code === "number" ? webFetchResult.data.status_code : null;
 
+  function scrollToSection(sectionId: string) {
+    document.getElementById(sectionId)?.scrollIntoView({
+      behavior: "smooth",
+      block: "start"
+    });
+  }
+
   return (
     <main className="shell">
       <aside className="rail" aria-label="Навигация">
         <div className="brandMark">
           <Brain size={22} />
         </div>
-        <IconButton label="Диалог">
+        <IconButton label="Диалог" targetId="dialog" onSelect={scrollToSection}>
           <MessageSquare size={20} />
         </IconButton>
-        <IconButton label="Runtime">
+        <IconButton label="Runtime" targetId="runtime" onSelect={scrollToSection}>
           <Server size={20} />
         </IconButton>
-        <IconButton label="Модели">
+        <IconButton label="Модели" targetId="models" onSelect={scrollToSection}>
           <Cpu size={20} />
         </IconButton>
-        <IconButton label="Память">
+        <IconButton label="Память" targetId="memory" onSelect={scrollToSection}>
           <Database size={20} />
         </IconButton>
-        <IconButton label="Файлы">
+        <IconButton label="Файлы" targetId="files" onSelect={scrollToSection}>
           <FileText size={20} />
         </IconButton>
-        <IconButton label="Диагностика">
+        <IconButton label="Диагностика" targetId="health" onSelect={scrollToSection}>
           <Activity size={20} />
         </IconButton>
-        <IconButton label="Ресурсы">
+        <IconButton label="Ресурсы" targetId="resources" onSelect={scrollToSection}>
           <Gauge size={20} />
         </IconButton>
-        <IconButton label="Audit">
+        <IconButton label="Audit" targetId="audit" onSelect={scrollToSection}>
           <History size={20} />
         </IconButton>
       </aside>
@@ -1392,7 +1399,7 @@ export default function CommandCenter() {
           </div>
         )}
 
-        <section className="statusGrid" aria-label="Сводка runtime">
+        <section className="statusGrid" id="runtime" aria-label="Сводка runtime">
           <StatusTile
             icon={<Server size={19} />}
             label="Профиль"
@@ -1426,7 +1433,7 @@ export default function CommandCenter() {
         </section>
 
         <section className="mainGrid">
-          <section className="chatPanel" aria-label="Диалог">
+          <section className="chatPanel" id="dialog" aria-label="Диалог">
             <div className="panelHeader">
               <h2>Диалог</h2>
               <span>{conversationId ? "active" : "new"}</span>
@@ -1641,7 +1648,7 @@ export default function CommandCenter() {
               )}
             </div>
 
-            <div className="panelHeader lower">
+            <div className="panelHeader lower" id="health">
               <h2>Health</h2>
               <span>{diagnostics.length}</span>
             </div>
@@ -1679,7 +1686,7 @@ export default function CommandCenter() {
               )}
             </div>
 
-            <div className="panelHeader lower">
+            <div className="panelHeader lower" id="models">
               <h2>Модели</h2>
               <span>{modelCatalog?.models.length ?? 0}</span>
             </div>
@@ -1735,7 +1742,7 @@ export default function CommandCenter() {
               )}
             </div>
 
-            <div className="panelHeader lower">
+            <div className="panelHeader lower" id="resources">
               <h2>Ресурсы</h2>
               <span>{telemetry?.host.cpu_count ?? 0} CPU</span>
             </div>
@@ -2033,7 +2040,7 @@ export default function CommandCenter() {
               ))}
             </div>
 
-            <div className="panelHeader lower">
+            <div className="panelHeader lower" id="files">
               <h2>Файлы</h2>
               <span>{files.length}</span>
             </div>
@@ -2157,7 +2164,7 @@ export default function CommandCenter() {
               </button>
             </form>
 
-            <div className="panelHeader lower">
+            <div className="panelHeader lower" id="memory">
               <h2>Память</h2>
               <span>{memories.length}</span>
             </div>
@@ -2181,7 +2188,7 @@ export default function CommandCenter() {
               ))}
             </div>
 
-            <div className="panelHeader lower">
+            <div className="panelHeader lower" id="audit">
               <h2>Audit</h2>
               <span>{audit.length}</span>
             </div>
@@ -2207,9 +2214,26 @@ export default function CommandCenter() {
   );
 }
 
-function IconButton({ children, label }: { children: ReactNode; label: string }) {
+function IconButton({
+  children,
+  label,
+  targetId,
+  onSelect
+}: {
+  children: ReactNode;
+  label: string;
+  targetId: string;
+  onSelect: (targetId: string) => void;
+}) {
   return (
-    <button className="railButton" type="button" title={label} aria-label={label}>
+    <button
+      className="railButton"
+      type="button"
+      title={label}
+      aria-label={label}
+      aria-controls={targetId}
+      onClick={() => onSelect(targetId)}
+    >
       {children}
     </button>
   );

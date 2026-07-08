@@ -50,9 +50,12 @@ button:disabled {
 
 .rail {
   display: flex;
+  position: sticky;
+  top: 0;
   flex-direction: column;
   align-items: center;
   gap: 12px;
+  height: 100vh;
   padding: 18px 12px;
   background: #202725;
   border-right: 1px solid #111614;
@@ -79,10 +82,12 @@ button:disabled {
   border: 1px solid transparent;
 }
 
-.railButton:hover {
+.railButton:hover,
+.railButton:focus-visible {
   color: #ffffff;
   border-color: #3b4743;
   background: #2b3431;
+  outline: none;
 }
 
 .workspace {
@@ -182,6 +187,7 @@ h3 {
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 12px;
+  scroll-margin-top: 18px;
 }
 
 .statusTile {
@@ -276,6 +282,11 @@ h3 {
 .panelHeader.lower {
   margin-top: 12px;
   border-top: 1px solid var(--line);
+}
+
+.chatPanel,
+.panelHeader[id] {
+  scroll-margin-top: 18px;
 }
 
 .transcript {
