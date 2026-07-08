@@ -34,6 +34,9 @@ def test_agent_creates_mission_from_large_goal(monkeypatch, tmp_path):
     assert response.mission_id is not None
     assert "mission plan" in response.answer
     assert storage.counters()["mission_tasks"] >= 4
+    mission = storage.get_mission(response.mission_id)
+    task_titles = [task["title"] for task in mission["tasks"]]
+    assert any("Command Center" in title for title in task_titles)
     storage.close()
 
 

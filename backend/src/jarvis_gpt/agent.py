@@ -432,14 +432,45 @@ class AgentRuntime:
 
     @staticmethod
     def _mission_tasks(goal: str) -> list[str]:
-        return [
+        normalized = goal.lower()
+        tasks = [
             "Зафиксировать цель, границы автономии и ожидаемый результат",
             "Собрать контекст: код, окружение, ограничения и доступные локальные ресурсы",
             "Разложить систему на runtime, память, инструменты, интерфейс и диагностику",
-            "Реализовать минимальный рабочий вертикальный срез",
-            "Подключить проверки, health-снимки и журнал решений",
-            "Провести верификацию и оформить следующий исполнимый шаг",
         ]
+        if _contains_any(normalized, ("ui", "web", "интерфейс", "command center", "frontend")):
+            tasks.append(
+                "Спроектировать удобный Command Center: основные панели, состояния, "
+                "управление и адаптивность"
+            )
+        if _contains_any(normalized, ("llm", "модель", "model", "gemma", "dispatcher", "vllm")):
+            tasks.append(
+                "Проверить LLM-маршрут, модельный профиль, streaming, лимиты токенов "
+                "и деградацию без модели"
+            )
+        if _contains_any(normalized, ("docker", "compose", "контейнер", "gpu", "vram")):
+            tasks.append(
+                "Стабилизировать Docker/GPU runtime: профили, health checks, логи "
+                "и повторяемый запуск"
+            )
+        if _contains_any(normalized, ("host", "bridge", "windows", "машин", "powershell")):
+            tasks.append(
+                "Подключить host bridge через token-auth и HITL-gates для опасных "
+                "локальных действий"
+            )
+        if _contains_any(normalized, ("производ", "performance", "быстр", "ресурс", "утилиз")):
+            tasks.append(
+                "Снять performance-профиль и настроить использование CPU/RAM/GPU "
+                "без лишнего давления на систему"
+            )
+        tasks.extend(
+            [
+                "Реализовать минимальный рабочий вертикальный срез",
+                "Подключить проверки, health-снимки и журнал решений",
+                "Провести верификацию, обновить документацию и оформить следующий исполнимый шаг",
+            ]
+        )
+        return _dedupe(tasks)
 
     @staticmethod
     def _mission_answer(mission: dict[str, Any]) -> str:
@@ -478,6 +509,21 @@ def _task_notes_from_result(result: ToolRunResponse) -> str:
         action_text = f"\nRecommended action: {action}" if action else ""
         return f"{result.summary}{action_text}"
     return f"Blocked by tool result: {result.summary}"
+
+
+def _contains_any(text: str, markers: tuple[str, ...]) -> bool:
+    return any(marker in text for marker in markers)
+
+
+def _dedupe(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        result.append(item)
+    return result
 
 
 def _empty_mission(mission_id: str) -> Mission:
