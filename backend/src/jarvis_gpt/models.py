@@ -27,6 +27,7 @@ class ChatRequest(BaseModel):
     temperature: float | None = Field(default=None, ge=0.0, le=2.0)
     max_tokens: int | None = Field(default=None, ge=1, le=8192)
     attachments: list[ChatAttachment] = Field(default_factory=list, max_length=8)
+    thinking_enabled: bool = True
 
 
 class ChatEvent(BaseModel):

@@ -454,6 +454,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
         temperature=request.temperature,
         max_tokens=request.max_tokens,
         attachments=[item.model_dump() for item in request.attachments],
+        thinking_enabled=request.thinking_enabled,
     )
 
 
@@ -467,6 +468,7 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
             temperature=request.temperature,
             max_tokens=request.max_tokens,
             attachments=[item.model_dump() for item in request.attachments],
+            thinking_enabled=request.thinking_enabled,
         ):
             yield f"{json.dumps(item, ensure_ascii=False)}\n".encode()
 

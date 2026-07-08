@@ -136,6 +136,7 @@ type StoredChatSettings = {
   chatSideTab?: ChatSideTab;
   chatHeight?: number;
   maxTokens?: number;
+  thinkingEnabled?: boolean;
 };
 
 type ConversationItem = {
@@ -1209,6 +1210,7 @@ export default function CommandCenter() {
   const [chatBusy, setChatBusy] = useState(false);
   const [chatTicker, setChatTicker] = useState(Date.now());
   const [chatFiles, setChatFiles] = useState<File[]>([]);
+  const [thinkingEnabled, setThinkingEnabled] = useState(true);
   const [dispatcherBusy, setDispatcherBusy] = useState(false);
   const [cleanupBusy, setCleanupBusy] = useState(false);
   const [activeOperation, setActiveOperation] = useState<ActiveOperation | null>(null);
@@ -1403,6 +1405,7 @@ export default function CommandCenter() {
     setChatSideTab(normalizeChatSideTab(settings.chatSideTab));
     setChatHeight(clampChatHeight(settings.chatHeight ?? DEFAULT_CHAT_HEIGHT));
     setMaxTokens(clampMaxTokens(settings.maxTokens ?? 512));
+    setThinkingEnabled(settings.thinkingEnabled ?? true);
     const storedWindows = readStoredChatWindows();
     setChatWindows(storedWindows.windows);
     setActiveChatWindowId(storedWindows.activeId);
@@ -1441,9 +1444,9 @@ export default function CommandCenter() {
     if (!storageReady) return;
     localStorage.setItem(
       CHAT_SETTINGS_KEY,
-      JSON.stringify({ activeTab, chatSideTab, chatHeight, maxTokens })
+      JSON.stringify({ activeTab, chatSideTab, chatHeight, maxTokens, thinkingEnabled })
     );
-  }, [activeTab, chatSideTab, chatHeight, maxTokens, storageReady]);
+  }, [activeTab, chatSideTab, chatHeight, maxTokens, thinkingEnabled, storageReady]);
 
   useEffect(() => {
     const node = transcriptRef.current;
@@ -1782,7 +1785,8 @@ export default function CommandCenter() {
           conversation_id: previousConversationId,
           max_tokens: maxTokens,
           mode: "auto",
-          attachments
+          attachments,
+          thinking_enabled: thinkingEnabled
         },
         (item) => {
           if (item.type === "meta" && item.conversation_id) {
@@ -3261,6 +3265,16 @@ export default function CommandCenter() {
                   onClick={() => chatFileInputRef.current?.click()}
                 >
                   <Paperclip size={16} />
+                </button>
+                <button
+                  className={`thinkingButton ${thinkingEnabled ? "active" : "off"}`}
+                  type="button"
+                  title={thinkingEnabled ? "Мышление модели включено" : "Мышление модели выключено"}
+                  aria-label={thinkingEnabled ? "Выключить мышление модели" : "Включить мышление модели"}
+                  aria-pressed={thinkingEnabled}
+                  onClick={() => setThinkingEnabled((value) => !value)}
+                >
+                  <Brain size={16} />
                 </button>
                 <input
                   aria-label="Максимум токенов"

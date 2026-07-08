@@ -66,6 +66,7 @@ class LLMRouter:
         *,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        thinking_enabled: bool = True,
     ) -> LLMResult:
         if not self.settings.llm_enabled:
             return LLMResult(ok=False, content="", error="LLM router is disabled")
@@ -80,6 +81,8 @@ class LLMRouter:
             "max_tokens": self.settings.llm_max_tokens if max_tokens is None else max_tokens,
             "stream": False,
         }
+        if not thinking_enabled:
+            body["chat_template_kwargs"] = {"enable_thinking": False}
         try:
             timeout = httpx.Timeout(self.settings.llm_timeout_sec, connect=10.0)
             async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
@@ -104,6 +107,7 @@ class LLMRouter:
         *,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        thinking_enabled: bool = True,
     ) -> AsyncIterator[LLMStreamChunk]:
         if not self.settings.llm_enabled:
             yield LLMStreamChunk(kind="error", error="LLM router is disabled")
@@ -119,6 +123,8 @@ class LLMRouter:
             "max_tokens": self.settings.llm_max_tokens if max_tokens is None else max_tokens,
             "stream": True,
         }
+        if not thinking_enabled:
+            body["chat_template_kwargs"] = {"enable_thinking": False}
         try:
             timeout = httpx.Timeout(self.settings.llm_timeout_sec, connect=10.0)
             async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client, client.stream(

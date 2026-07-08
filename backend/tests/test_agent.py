@@ -220,6 +220,56 @@ def test_agent_passes_chat_attachments_to_llm_context(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_agent_can_disable_model_thinking(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "1")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    captured = {}
+
+    class CapturingThinkingLLM:
+        async def complete(
+            self,
+            messages,
+            *,
+            temperature=None,
+            max_tokens=None,
+            thinking_enabled=True,
+        ):
+            captured["messages"] = messages
+            captured["thinking_enabled"] = thinking_enabled
+            return type(
+                "Result",
+                (),
+                {"ok": True, "content": "<think>hidden</think>final answer", "error": None},
+            )()
+
+    agent = AgentRuntime(
+        settings=settings,
+        storage=storage,
+        llm=CapturingThinkingLLM(),
+        bus=EventBus(),
+    )
+
+    response = asyncio.run(
+        agent.chat("hello", mode="chat", thinking_enabled=False)
+    )
+    user_message = next(
+        item for item in storage.recent_messages(response.conversation_id, limit=4)
+        if item["role"] == "user"
+    )
+    rendered_prompt = "\n".join(item["content"] for item in captured["messages"])
+
+    assert captured["thinking_enabled"] is False
+    assert "Thinking output is disabled" in rendered_prompt
+    assert response.answer == "final answer"
+    assert "hidden" not in response.answer
+    assert user_message["metadata"]["thinking_enabled"] is False
+    storage.close()
+
+
 def test_agent_opens_wiki_without_false_refusal(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
@@ -2023,6 +2073,24 @@ class FakeTaggedStreamingLLM:
         yield LLMStreamChunk(kind="delta", content="готово без служебного префикса")
 
 
+class FakeThinkingStreamingLLM:
+    def __init__(self) -> None:
+        self.thinking_enabled: bool | None = None
+
+    async def stream_complete(
+        self,
+        messages,
+        *,
+        temperature=None,
+        max_tokens=None,
+        thinking_enabled=True,
+    ):
+        self.thinking_enabled = thinking_enabled
+        yield LLMStreamChunk(kind="delta", content="<think>hidden")
+        yield LLMStreamChunk(kind="delta", content=" reasoning</think>")
+        yield LLMStreamChunk(kind="delta", content="visible")
+
+
 def test_agent_cleans_service_prefixes_from_streamed_answer(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "1")
@@ -2043,6 +2111,32 @@ def test_agent_cleans_service_prefixes_from_streamed_answer(monkeypatch, tmp_pat
     assert "Важное уточнение" not in done["answer"]
     assert "$\\rightarrow$" not in done["answer"]
     assert done["answer"] == "готово без служебного префикса"
+
+
+def test_agent_filters_thinking_blocks_from_stream(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "1")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    llm = FakeThinkingStreamingLLM()
+    agent = AgentRuntime(
+        settings=settings,
+        storage=storage,
+        llm=llm,
+        bus=EventBus(),
+    )
+
+    items = asyncio.run(_collect(agent.stream_chat("check", mode="chat", thinking_enabled=False)))
+    deltas = "".join(item["content"] for item in items if item["type"] == "delta")
+    done = next(item for item in items if item["type"] == "done")
+
+    assert llm.thinking_enabled is False
+    assert deltas == "visible"
+    assert done["answer"] == "visible"
+    assert "hidden" not in deltas
+    storage.close()
 
 
 async def _collect(stream):

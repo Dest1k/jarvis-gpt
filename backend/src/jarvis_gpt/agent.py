@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import re
 import time
@@ -74,6 +75,14 @@ Capability contract:
   Пиши сразу человеческий ответ."""
 
 
+THINKING_DISABLED_PROMPT = (
+    "Thinking output is disabled for this chat turn. Do not print hidden reasoning, "
+    "chain-of-thought, analysis sections, or <think>...</think> blocks. Give the final "
+    "answer directly in Russian; include concise checks, commands, facts and assumptions "
+    "when useful, but keep internal deliberation private."
+)
+
+
 MISSION_MARKERS = (
     "мисси",
     "mission",
@@ -135,11 +144,13 @@ def _chat_message_metadata(
     mode: str,
     temperature: float | None,
     attachments: list[dict[str, Any]],
+    thinking_enabled: bool,
 ) -> dict[str, Any]:
     metadata: dict[str, Any] = {
         "max_tokens": max_tokens,
         "mode": mode,
         "temperature": temperature,
+        "thinking_enabled": thinking_enabled,
     }
     if attachments:
         metadata["attachments"] = attachments
@@ -182,6 +193,61 @@ def _merge_file_hits(*groups: list[dict[str, Any]], limit: int = 8) -> list[dict
     return merged
 
 
+def _supports_keyword(callable_obj: Any, keyword: str) -> bool:
+    try:
+        signature = inspect.signature(callable_obj)
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD or name == keyword
+        for name, parameter in signature.parameters.items()
+    )
+
+
+class _ThinkBlockFilter:
+    _open_tag = "<think>"
+    _close_tag = "</think>"
+
+    def __init__(self) -> None:
+        self._buffer = ""
+        self._inside = False
+
+    def push(self, chunk: str) -> str:
+        text = f"{self._buffer}{chunk}"
+        self._buffer = ""
+        output: list[str] = []
+        position = 0
+        lowered = text.lower()
+        while position < len(text):
+            if self._inside:
+                end = lowered.find(self._close_tag, position)
+                if end < 0:
+                    self._buffer = text[-(len(self._close_tag) - 1) :]
+                    return "".join(output)
+                position = end + len(self._close_tag)
+                self._inside = False
+                continue
+            start = lowered.find(self._open_tag, position)
+            if start < 0:
+                safe_end = max(position, len(text) - (len(self._open_tag) - 1))
+                output.append(text[position:safe_end])
+                self._buffer = text[safe_end:]
+                return "".join(output)
+            output.append(text[position:start])
+            position = start + len(self._open_tag)
+            self._inside = True
+        return "".join(output)
+
+    def flush(self) -> str:
+        if self._inside:
+            self._buffer = ""
+            self._inside = False
+            return ""
+        tail = self._buffer
+        self._buffer = ""
+        return tail
+
+
 @dataclass(frozen=True)
 class IntentDecision:
     route: str
@@ -214,6 +280,7 @@ class AgentRuntime:
         temperature: float | None = None,
         max_tokens: int | None = None,
         attachments: list[dict[str, Any]] | None = None,
+        thinking_enabled: bool = True,
     ) -> ChatResponse:
         started_at = time.perf_counter()
         attachments = _normalize_chat_attachments(attachments)
@@ -243,6 +310,7 @@ class AgentRuntime:
                 mode=mode,
                 temperature=temperature,
                 attachments=attachments,
+                thinking_enabled=thinking_enabled,
             ),
         )
         await self._compact_conversation_memory(context.conversation_id)
@@ -306,7 +374,11 @@ class AgentRuntime:
                 duration_ms=duration_ms,
             )
 
-        llm_messages = self._build_llm_messages(context, context_message)
+        llm_messages = self._build_llm_messages(
+            context,
+            context_message,
+            thinking_enabled=thinking_enabled,
+        )
         events.append(
             ChatEvent(
                 type="tool_call",
@@ -316,10 +388,11 @@ class AgentRuntime:
             )
         )
         await self._emit(events[-1])
-        result = await self.llm.complete(
+        result = await self._complete_llm(
             llm_messages,
             temperature=temperature,
             max_tokens=max_tokens,
+            thinking_enabled=thinking_enabled,
         )
         if result.ok and result.content:
             answer = _clean_assistant_answer(result.content)
@@ -367,6 +440,7 @@ class AgentRuntime:
         temperature: float | None = None,
         max_tokens: int | None = None,
         attachments: list[dict[str, Any]] | None = None,
+        thinking_enabled: bool = True,
     ) -> AsyncIterator[dict[str, Any]]:
         started_at = time.perf_counter()
         attachments = _normalize_chat_attachments(attachments)
@@ -398,6 +472,7 @@ class AgentRuntime:
                 mode=mode,
                 temperature=temperature,
                 attachments=attachments,
+                thinking_enabled=thinking_enabled,
             ),
         )
         await self._compact_conversation_memory(context.conversation_id)
@@ -470,7 +545,11 @@ class AgentRuntime:
             }
             return
 
-        llm_messages = self._build_llm_messages(context, context_message)
+        llm_messages = self._build_llm_messages(
+            context,
+            context_message,
+            thinking_enabled=thinking_enabled,
+        )
         events.append(
             ChatEvent(
                 type="tool_call",
@@ -488,17 +567,27 @@ class AgentRuntime:
 
         answer_parts: list[str] = []
         stream_error: str | None = None
-        async for chunk in self.llm.stream_complete(
+        think_filter = _ThinkBlockFilter() if not thinking_enabled else None
+        async for chunk in self._stream_llm(
             llm_messages,
             temperature=temperature,
             max_tokens=max_tokens,
+            thinking_enabled=thinking_enabled,
         ):
             if chunk.kind == "delta" and chunk.content:
-                answer_parts.append(chunk.content)
-                yield {"type": "delta", "content": chunk.content}
+                content = think_filter.push(chunk.content) if think_filter else chunk.content
+                if not content:
+                    continue
+                answer_parts.append(content)
+                yield {"type": "delta", "content": content}
             elif chunk.kind == "error":
                 stream_error = chunk.error
                 break
+        if think_filter:
+            tail = think_filter.flush()
+            if tail:
+                answer_parts.append(tail)
+                yield {"type": "delta", "content": tail}
 
         if answer_parts:
             answer = _clean_assistant_answer("".join(answer_parts).strip())
@@ -1072,7 +1161,39 @@ class AgentRuntime:
             hits.extend(self.storage.list_file_chunks(file_id, limit=3))
         return hits
 
-    def _build_llm_messages(self, context: AgentContext, message: str) -> list[dict[str, str]]:
+    async def _complete_llm(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float | None,
+        max_tokens: int | None,
+        thinking_enabled: bool,
+    ) -> Any:
+        kwargs: dict[str, Any] = {"temperature": temperature, "max_tokens": max_tokens}
+        if _supports_keyword(self.llm.complete, "thinking_enabled"):
+            kwargs["thinking_enabled"] = thinking_enabled
+        return await self.llm.complete(messages, **kwargs)
+
+    def _stream_llm(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float | None,
+        max_tokens: int | None,
+        thinking_enabled: bool,
+    ) -> AsyncIterator[Any]:
+        kwargs: dict[str, Any] = {"temperature": temperature, "max_tokens": max_tokens}
+        if _supports_keyword(self.llm.stream_complete, "thinking_enabled"):
+            kwargs["thinking_enabled"] = thinking_enabled
+        return self.llm.stream_complete(messages, **kwargs)
+
+    def _build_llm_messages(
+        self,
+        context: AgentContext,
+        message: str,
+        *,
+        thinking_enabled: bool = True,
+    ) -> list[dict[str, str]]:
         memory_block = ""
         if context.memory_hits:
             lines = [
@@ -1106,6 +1227,8 @@ class AgentRuntime:
         operator_prompt = self._operator_prompt()
         if operator_prompt:
             messages.append({"role": "system", "content": operator_prompt})
+        if not thinking_enabled:
+            messages.append({"role": "system", "content": THINKING_DISABLED_PROMPT})
         if memory_block:
             messages.append({"role": "system", "content": memory_block})
         if file_block:
@@ -1577,6 +1700,7 @@ def _clean_memory_summary(content: str) -> str:
 
 
 def _clean_assistant_answer(text: str) -> str:
+    text = re.sub(r"(?is)<think\b[^>]*>.*?</think>", "", text)
     cleaned = re.sub(
         r"(?im)^\s*(?:\$\s*\\(?:rightarrow|to)\s*\$|\\(?:rightarrow|to)|→|->|⇒)?"
         r"\s*(?:\*\*)?(?:важное\s+уточнение|уточнение|important\s+note)\s*:?(?:\*\*)?\s*",

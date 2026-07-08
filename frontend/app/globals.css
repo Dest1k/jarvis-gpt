@@ -849,7 +849,8 @@ h3 {
 .chatPanel .chatWindowTab,
 .chatPanel .tokenInput,
 .chatPanel .voiceButton,
-.chatPanel .attachButton {
+.chatPanel .attachButton,
+.chatPanel .thinkingButton {
   border-color: var(--chat-line);
   background: var(--chat-surface);
   color: var(--chat-muted);
@@ -860,10 +861,18 @@ h3 {
 .chatPanel .chatWindowTab:hover,
 .chatPanel .voiceButton:hover,
 .chatPanel .voiceButton.active,
-.chatPanel .attachButton:hover {
+.chatPanel .attachButton:hover,
+.chatPanel .thinkingButton:hover,
+.chatPanel .thinkingButton.active {
   border-color: var(--chat-accent);
   background: rgba(64, 215, 196, 0.13);
   color: var(--chat-accent);
+}
+
+.chatPanel .thinkingButton.off {
+  border-color: #45343a;
+  background: #21181c;
+  color: #bd8793;
 }
 
 .chatWindowBar {
@@ -1127,7 +1136,8 @@ h3 {
   box-shadow: 0 0 0 3px rgba(64, 215, 196, 0.16);
 }
 
-.attachButton {
+.attachButton,
+.thinkingButton {
   display: grid;
   place-items: center;
   width: 48px;
