@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import inspect
+import ipaddress
 import math
+import socket
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlparse
+
+import httpx
 
 from .config import JarvisSettings
 from .diagnostics import run_diagnostics
@@ -283,6 +288,17 @@ class ToolRegistry:
         )
         self.add(
             ToolSpec(
+                name="web.fetch",
+                description=(
+                    "Fetch text from a public HTTP(S) URL with private-network SSRF guards."
+                ),
+                category="web",
+                input_schema={"url": "Public http(s) URL", "max_chars": "Maximum text characters"},
+                handler=_web_fetch,
+            )
+        )
+        self.add(
+            ToolSpec(
                 name="mission.brief",
                 description="Produce a deterministic execution brief for a mission task.",
                 category="mission",
@@ -518,6 +534,77 @@ def _files_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     )
 
 
+async def _web_fetch(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    raw_url = str(args.get("url") or "").strip()
+    max_chars = _int_arg(args.get("max_chars"), default=6000, minimum=256, maximum=20000)
+    try:
+        current_url = _validate_public_http_url(raw_url)
+    except ValueError as exc:
+        return ToolRunResponse(tool="web.fetch", ok=False, summary=str(exc))
+
+    redirects: list[dict[str, Any]] = []
+    headers = {"User-Agent": "JARVIS-GPT/0.1"}
+    timeout = httpx.Timeout(20.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
+            for _ in range(6):
+                async with client.stream(
+                    "GET",
+                    current_url,
+                    headers=headers,
+                    follow_redirects=False,
+                ) as response:
+                    location = response.headers.get("location")
+                    if response.status_code in {301, 302, 303, 307, 308} and location:
+                        next_url = str(httpx.URL(current_url).join(location))
+                        redirects.append(
+                            {
+                                "from": current_url,
+                                "to": next_url,
+                                "status_code": response.status_code,
+                            }
+                        )
+                        try:
+                            current_url = _validate_public_http_url(next_url)
+                        except ValueError as exc:
+                            return ToolRunResponse(
+                                tool="web.fetch",
+                                ok=False,
+                                summary=f"Blocked redirect target: {exc}",
+                                data={"redirects": redirects},
+                            )
+                        continue
+
+                    text, truncated = await _read_limited_response_text(response, max_chars)
+                    return ToolRunResponse(
+                        tool="web.fetch",
+                        ok=True,
+                        summary=f"Fetched URL with HTTP {response.status_code}.",
+                        data={
+                            "url": current_url,
+                            "status_code": response.status_code,
+                            "content_type": response.headers.get("content-type"),
+                            "text": text,
+                            "truncated": truncated,
+                            "redirects": redirects,
+                        },
+                    )
+    except httpx.HTTPError as exc:
+        return ToolRunResponse(
+            tool="web.fetch",
+            ok=False,
+            summary=f"HTTP request failed: {exc}",
+            data={"url": current_url, "redirects": redirects},
+        )
+
+    return ToolRunResponse(
+        tool="web.fetch",
+        ok=False,
+        summary="Too many redirects.",
+        data={"url": current_url, "redirects": redirects},
+    )
+
+
 def _mission_brief(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     goal = str(args.get("goal") or "").strip()
     task_title = str(args.get("task_title") or "").strip()
@@ -619,6 +706,79 @@ def _resolve_allowed_path(settings: JarvisSettings, raw_path: str) -> Path:
             continue
     roots_text = ", ".join(str(root) for root in roots)
     raise ValueError(f"Path is outside allowed roots: {roots_text}")
+
+
+def _validate_public_http_url(raw_url: str) -> str:
+    if not raw_url:
+        raise ValueError("URL is required.")
+    parsed = urlparse(raw_url)
+    if parsed.scheme.lower() not in {"http", "https"}:
+        raise ValueError("Only http and https URLs are supported.")
+    if not parsed.hostname:
+        raise ValueError("URL host is required.")
+    if _hostname_is_private(parsed.hostname):
+        raise ValueError("URL host must resolve only to public addresses.")
+    return parsed.geturl()
+
+
+def _hostname_is_private(hostname: str) -> bool:
+    try:
+        resolved = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        raise ValueError(f"Could not resolve URL host: {hostname}") from exc
+    if not resolved:
+        raise ValueError(f"Could not resolve URL host: {hostname}")
+
+    for item in resolved:
+        address = item[4][0]
+        ip = ipaddress.ip_address(address)
+        if (
+            not ip.is_global
+            or ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            return True
+    return False
+
+
+async def _read_limited_response_text(
+    response: httpx.Response,
+    max_chars: int,
+) -> tuple[str, bool]:
+    byte_limit = max(4096, min(1_000_000, max_chars * 4))
+    content = bytearray()
+    truncated = False
+    async for chunk in response.aiter_bytes():
+        remaining = byte_limit - len(content)
+        if remaining <= 0:
+            truncated = True
+            break
+        if len(chunk) > remaining:
+            content.extend(chunk[:remaining])
+            truncated = True
+            break
+        content.extend(chunk)
+
+    encoding = _charset_from_content_type(response.headers.get("content-type")) or "utf-8"
+    text = bytes(content).decode(encoding, errors="replace")
+    if len(text) > max_chars:
+        text = text[:max_chars]
+        truncated = True
+    return text, truncated
+
+
+def _charset_from_content_type(content_type: str | None) -> str | None:
+    if not content_type:
+        return None
+    for item in content_type.split(";"):
+        key, separator, value = item.strip().partition("=")
+        if separator and key.lower() == "charset" and value:
+            return value.strip("\"' ")
+    return None
 
 
 def _recommended_action(task_title: str) -> str:

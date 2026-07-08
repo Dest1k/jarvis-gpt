@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 
+import httpx
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
 from jarvis_gpt.llm import LLMRouter
 from jarvis_gpt.storage import JarvisStorage
@@ -77,4 +78,75 @@ def test_host_bridge_execute_requires_token(monkeypatch, tmp_path):
     assert "requires approval" in blocked.summary
     assert result.ok is False
     assert "token is missing" in result.summary
+    storage.close()
+
+
+def test_web_fetch_blocks_private_addresses(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    info = {tool.name: tool for tool in tools.list()}
+    result = asyncio.run(tools.run("web.fetch", {"url": "http://127.0.0.1:8000/"}))
+
+    assert info["web.fetch"].danger_level == "safe"
+    assert result.ok is False
+    assert "public addresses" in result.summary
+    storage.close()
+
+
+def test_web_fetch_reads_public_text(monkeypatch, tmp_path):
+    class FakeResponse:
+        status_code = 200
+        headers = {"content-type": "text/plain; charset=utf-8"}
+
+        async def aiter_bytes(self):
+            yield b"hello "
+            yield b"world"
+
+    class FakeStream:
+        async def __aenter__(self):
+            return FakeResponse()
+
+        async def __aexit__(self, _exc_type, _exc, _traceback):
+            return None
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, _exc_type, _exc, _traceback):
+            return None
+
+        def stream(self, method, url, *, headers, follow_redirects):
+            assert method == "GET"
+            assert url == "https://example.com/"
+            assert headers["User-Agent"] == "JARVIS-GPT/0.1"
+            assert follow_redirects is False
+            assert self.kwargs["trust_env"] is False
+            return FakeStream()
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr("jarvis_gpt.tools._hostname_is_private", lambda _hostname: False)
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    result = asyncio.run(tools.run("web.fetch", {"url": "https://example.com/"}))
+
+    assert result.ok is True
+    assert result.data["status_code"] == 200
+    assert result.data["text"] == "hello world"
+    assert result.data["truncated"] is False
     storage.close()

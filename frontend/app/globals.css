@@ -495,7 +495,8 @@ h3 {
 .memoryForm button,
 .fileForm button,
 .fileSearchForm button,
-.hostCommandForm button {
+.hostCommandForm button,
+.webFetchForm button {
   display: grid;
   place-items: center;
   width: 28px;
@@ -511,7 +512,8 @@ h3 {
 .memoryForm button:hover,
 .fileForm button:hover,
 .fileSearchForm button:hover,
-.hostCommandForm button:hover {
+.hostCommandForm button:hover,
+.webFetchForm button:hover {
   border-color: var(--teal);
   color: var(--teal);
 }
@@ -805,10 +807,61 @@ h3 {
   background: var(--surface-2);
 }
 
+.webFetchResult {
+  margin: 8px 12px 0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 10px;
+  background: #ffffff;
+}
+
+.webFetchResult.warn {
+  border-color: rgba(188, 80, 64, 0.38);
+}
+
+.webFetchResult div {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 6px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.webFetchResult svg {
+  color: var(--teal);
+}
+
+.webFetchResult strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.webFetchResult span {
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: var(--surface-2);
+}
+
+.webFetchResult p {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 5;
+}
+
 .memoryForm,
 .fileForm,
 .fileSearchForm,
-.hostCommandForm {
+.hostCommandForm,
+.webFetchForm {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 32px;
   gap: 8px;
@@ -826,7 +879,8 @@ h3 {
 .memoryForm input,
 .fileForm input,
 .fileSearchForm input,
-.hostCommandForm input {
+.hostCommandForm input,
+.webFetchForm input {
   min-width: 0;
   height: 32px;
   border: 1px solid var(--line);
@@ -840,7 +894,8 @@ h3 {
 .memoryForm input:focus,
 .fileForm input:focus,
 .fileSearchForm input:focus,
-.hostCommandForm input:focus {
+.hostCommandForm input:focus,
+.webFetchForm input:focus {
   border-color: var(--teal);
   box-shadow: 0 0 0 3px rgba(13, 118, 111, 0.12);
 }

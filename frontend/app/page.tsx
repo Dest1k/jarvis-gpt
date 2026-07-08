@@ -8,8 +8,9 @@ import {
   Cpu,
   Database,
   FileText,
-  History,
   Gauge,
+  Globe,
+  History,
   Loader2,
   Mic,
   MicOff,
@@ -253,6 +254,13 @@ type ToolInfo = {
   danger_level: "safe" | "review" | "danger";
 };
 
+type ToolRunResult = {
+  tool: string;
+  ok: boolean;
+  summary: string;
+  data: Record<string, unknown>;
+};
+
 type MissionExecution = {
   mission: Mission;
   task: MissionTask | null;
@@ -401,6 +409,8 @@ export default function CommandCenter() {
   const [memoryDraft, setMemoryDraft] = useState("");
   const [fileQuery, setFileQuery] = useState("");
   const [hostCommandDraft, setHostCommandDraft] = useState("");
+  const [webUrlDraft, setWebUrlDraft] = useState("");
+  const [webFetchResult, setWebFetchResult] = useState<ToolRunResult | null>(null);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [maxTokens, setMaxTokens] = useState(512);
@@ -917,6 +927,40 @@ export default function CommandCenter() {
     }
   }
 
+  async function runWebFetch(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const url = webUrlDraft.trim();
+    if (!url || busy) return;
+    setBusy(true);
+    try {
+      const result = await api<ToolRunResult>("/api/tools/web.fetch/run", {
+        method: "POST",
+        body: JSON.stringify({
+          arguments: { url, max_chars: 3000 }
+        })
+      });
+      const text = typeof result.data.text === "string" ? result.data.text : "";
+      setWebFetchResult(result);
+      setLines((current) => [
+        ...current,
+        {
+          id: crypto.randomUUID(),
+          role: "system",
+          content: [result.summary, text.slice(0, 900)].filter(Boolean).join("\n")
+        }
+      ]);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Web fetch failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const webFetchText = typeof webFetchResult?.data.text === "string" ? webFetchResult.data.text : "";
+  const webFetchStatus =
+    typeof webFetchResult?.data.status_code === "number" ? webFetchResult.data.status_code : null;
+
   return (
     <main className="shell">
       <aside className="rail" aria-label="Навигация">
@@ -1343,6 +1387,32 @@ export default function CommandCenter() {
               <h2>Инструменты</h2>
               <span>{tools.length}</span>
             </div>
+            <form className="webFetchForm" onSubmit={runWebFetch}>
+              <input
+                aria-label="Web URL"
+                value={webUrlDraft}
+                onChange={(event) => setWebUrlDraft(event.target.value)}
+                placeholder="https://example.com"
+              />
+              <button
+                type="submit"
+                disabled={busy || !webUrlDraft.trim()}
+                title="Fetch"
+                aria-label="Fetch"
+              >
+                <Globe size={15} />
+              </button>
+            </form>
+            {webFetchResult && (
+              <article className={`webFetchResult ${webFetchResult.ok ? "ok" : "warn"}`}>
+                <div>
+                  <Globe size={14} />
+                  <strong>{webFetchResult.summary}</strong>
+                  <span>{webFetchStatus ?? webFetchResult.tool}</span>
+                </div>
+                <p>{webFetchText || webFetchResult.summary}</p>
+              </article>
+            )}
             <div className="toolList">
               {tools.slice(0, 8).map((tool) => (
                 <div className="toolRow" key={tool.name}>
