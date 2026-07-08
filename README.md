@@ -6,7 +6,7 @@
 
 - FastAPI backend с `/health`, `/api/status`, `/api/models`, `/api/chat`, `/api/chat/stream`, `/api/missions`, `/api/memory`, `/api/files`, `/api/approvals`, `/api/audit`, `/api/diagnostics`.
 - Offline-first агент: сохраняет диалоги, создаёт mission plans и деградирует корректно, если локальная LLM не поднята.
-- Safe tools runtime: диагностика, статус, память, публичный web fetch с SSRF-защитой, Docker ps/logs для Jarvis-контейнеров, файловое чтение в разрешённых корнях, approval-gated sandbox write, token-auth host bridge и execution brief для миссий.
+- Safe tools runtime: диагностика, статус, память, публичный web fetch с SSRF-защитой, approval-gated browser open, Docker ps/logs для Jarvis-контейнеров, файловое чтение в разрешённых корнях, approval-gated sandbox write, token-auth host bridge и execution brief для миссий.
 - File ingestion: загрузка текстовых файлов, хранение в `D:\jarvis\data\jarvis-gpt\files`, chunk search и audit trail.
 - Model catalog: активные профили знают реальные Gemma 4 веса в `D:\jarvis\data\models`.
 - HITL approvals: опасные действия оформляются как durable approval gates, а не выполняются молча.
@@ -138,6 +138,7 @@ docker compose --profile llm up -d dispatcher
 - Safe tools include `web.fetch` for public HTTP(S) context with private-network and redirect guards.
 - Safe tools include read-only `docker.ps` and restricted `docker.logs` for Jarvis container diagnostics.
 - Dispatcher status/logs are tools, while dispatcher start/stop are approval-gated tool actions.
+- `browser.open` can open validated HTTP(S) URLs through the host bridge after approval.
 - `filesystem.write_text` is sandboxed to the repository or `D:\jarvis` and requires approval.
 - Memory and file retrieval now return relevance scores, matched terms, and clipped snippets for mission context.
 - Autonomous learning skips duplicate lessons and reports the skipped count in tick results.
@@ -149,7 +150,7 @@ docker compose --profile llm up -d dispatcher
 ## Линия развития
 
 1. Подключить полноценный OpenAI-compatible Gemma dispatcher.
-2. Расширить tools runtime: browser automation и richer Docker policy.
+2. Расширить tools runtime: richer browser automation policy и richer Docker policy.
 3. Усилить cognitive core: feedback loops, task scheduling и richer retrieval ingestion.
 4. Добавить HITL-gates для опасных действий.
 5. Довести PWA/offline-слой и локальные browser tools после стабилизации голосового ввода.

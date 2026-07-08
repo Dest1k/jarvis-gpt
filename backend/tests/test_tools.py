@@ -122,6 +122,51 @@ def test_host_bridge_execute_requires_token(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_browser_open_is_validated_and_gated(monkeypatch, tmp_path):
+    class FakeBridgeClient:
+        def __init__(self, _settings):
+            pass
+
+        async def execute(self, *, command, cwd=None, timeout_sec=30):
+            assert cwd is None
+            assert timeout_sec == 10
+            assert command == "Start-Process -FilePath 'https://example.com/path?q=1'"
+            return {"ok": True, "summary": "opened", "data": {"command": command}}
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr("jarvis_gpt.tools.HostBridgeClient", FakeBridgeClient)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    blocked = asyncio.run(tools.run("browser.open", {"url": "https://example.com/path?q=1"}))
+    invalid = asyncio.run(
+        tools.run(
+            "browser.open",
+            {"url": "file:///C:/Windows/win.ini"},
+            allow_danger=True,
+        )
+    )
+    opened = asyncio.run(
+        tools.run(
+            "browser.open",
+            {"url": "https://example.com/path?q=1"},
+            allow_danger=True,
+        )
+    )
+
+    assert blocked.ok is False
+    assert "requires approval" in blocked.summary
+    assert invalid.ok is False
+    assert "http and https" in invalid.summary
+    assert opened.ok is True
+    assert opened.data["url"] == "https://example.com/path?q=1"
+    storage.close()
+
+
 def test_web_fetch_blocks_private_addresses(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")

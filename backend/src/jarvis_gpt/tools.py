@@ -291,6 +291,16 @@ class ToolRegistry:
         )
         self.add(
             ToolSpec(
+                name="browser.open",
+                description="Open a validated HTTP(S) URL through the native host browser.",
+                category="browser",
+                input_schema={"url": "HTTP(S) URL to open"},
+                handler=_browser_open,
+                danger_level="review",
+            )
+        )
+        self.add(
+            ToolSpec(
                 name="approval.request",
                 description="Create a human approval gate for a risky or irreversible action.",
                 category="safety",
@@ -608,6 +618,22 @@ async def _host_bridge_execute(ctx: ToolContext, args: dict[str, Any]) -> ToolRu
         ok=bool(result.get("ok")),
         summary=str(result.get("summary") or "Host bridge command finished."),
         data=data,
+    )
+
+
+async def _browser_open(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    try:
+        url = _validate_browser_url(str(args.get("url") or ""))
+    except ValueError as exc:
+        return ToolRunResponse(tool="browser.open", ok=False, summary=str(exc))
+    command = f"Start-Process -FilePath {_powershell_quote(url)}"
+    result = await HostBridgeClient(ctx.settings).execute(command=command, timeout_sec=10)
+    data = result.get("data") if isinstance(result.get("data"), dict) else result
+    return ToolRunResponse(
+        tool="browser.open",
+        ok=bool(result.get("ok")),
+        summary=str(result.get("summary") or "Browser open requested."),
+        data={"url": url, "bridge": data},
     )
 
 
@@ -1011,6 +1037,26 @@ def _is_allowed_docker_container(container: str) -> bool:
         or lowered.startswith("jarvis_")
         or "jarvis-gpt" in lowered
     )
+
+
+def _validate_browser_url(raw_url: str) -> str:
+    raw_url = raw_url.strip()
+    if not raw_url:
+        raise ValueError("URL is required.")
+    if any(char in raw_url for char in ("\r", "\n", "\0")):
+        raise ValueError("URL contains invalid control characters.")
+    if len(raw_url) > 2048:
+        raise ValueError("URL is too long.")
+    parsed = urlparse(raw_url)
+    if parsed.scheme.lower() not in {"http", "https"}:
+        raise ValueError("Only http and https URLs can be opened.")
+    if not parsed.hostname:
+        raise ValueError("URL host is required.")
+    return parsed.geturl()
+
+
+def _powershell_quote(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
 
 
 def _validate_public_http_url(raw_url: str) -> str:
