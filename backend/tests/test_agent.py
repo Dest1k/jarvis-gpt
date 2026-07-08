@@ -7,7 +7,12 @@ from jarvis_gpt.agent import AgentRuntime
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
 from jarvis_gpt.event_bus import EventBus
 from jarvis_gpt.llm import LLMRouter, LLMStreamChunk
+from jarvis_gpt.models import ToolRunResponse
 from jarvis_gpt.storage import JarvisStorage
+
+
+def _tool_response(tool: str, ok: bool, summary: str, data: dict):
+    return ToolRunResponse(tool=tool, ok=ok, summary=summary, data=data)
 
 
 def _agent_with_native_capture(monkeypatch, tmp_path):
@@ -768,16 +773,9 @@ def test_agent_routes_wmi_requests_to_native_layer(monkeypatch, tmp_path):
     storage.close()
 
 
-def test_agent_opens_google_search(monkeypatch, tmp_path):
+def test_agent_researches_google_style_query(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
-    captured = {}
-
-    async def fake_execute(self, command, cwd=None, timeout_sec=30):
-        captured["command"] = command
-        return {"ok": True, "summary": "opened", "data": {"command": command}}
-
-    monkeypatch.setattr("jarvis_gpt.tools.HostBridgeClient.execute", fake_execute)
     settings = load_settings()
     ensure_runtime_dirs(settings)
     storage = JarvisStorage(settings.database_path)
@@ -789,10 +787,179 @@ def test_agent_opens_google_search(monkeypatch, tmp_path):
         bus=EventBus(),
     )
 
+    async def fake_run(name, arguments=None, **kwargs):
+        if name == "web.search":
+            return _tool_response(
+                name,
+                True,
+                "Web search returned 1 result(s).",
+                {
+                    "results": [
+                        {
+                            "title": "Linux open ports",
+                            "url": "https://example.com/linux-ports",
+                            "snippet": "ss -tulpen shows open ports",
+                        }
+                    ]
+                },
+            )
+        if name == "web.fetch":
+            return _tool_response(
+                name,
+                True,
+                "Fetched URL with HTTP 200.",
+                {"url": arguments["url"], "text": "ss -tulpen shows open ports"},
+            )
+        raise AssertionError(f"unexpected tool {name}")
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+
     response = asyncio.run(agent.chat("загугли как проверить открытые порты linux"))
 
-    assert "google.com/search" in response.answer
-    assert "google.com/search" in captured["command"]
+    assert "Источники" in response.answer
+    assert "https://example.com/linux-ports" in response.answer
+    assert "ss -tulpen" in response.answer
+    storage.close()
+
+
+def test_agent_researches_current_ticket_request(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    agent = AgentRuntime(
+        settings=settings,
+        storage=storage,
+        llm=LLMRouter(settings),
+        bus=EventBus(),
+    )
+    captured = {}
+
+    async def fake_run(name, arguments=None, **kwargs):
+        captured.setdefault("tools", []).append((name, arguments or {}))
+        if name == "web.search":
+            captured["query"] = arguments["query"]
+            return _tool_response(
+                name,
+                True,
+                "Web search returned 2 result(s).",
+                {
+                    "results": [
+                        {
+                            "title": "Авиабилеты Екатеринбург Москва",
+                            "url": "https://example.com/avia",
+                            "snippet": "Екатеринбург Москва от 12 500 ₽ вылет 14:20",
+                        },
+                        {
+                            "title": "ЖД билеты Екатеринбург Москва",
+                            "url": "https://example.com/train",
+                            "snippet": "поезд 18:45 от 4 500 руб.",
+                        },
+                    ]
+                },
+            )
+        if name == "web.fetch":
+            return _tool_response(
+                name,
+                True,
+                "Fetched URL with HTTP 200.",
+                {
+                    "url": arguments["url"],
+                    "text": "Екатеринбург Москва от 12 500 ₽ вылет 14:20",
+                },
+            )
+        raise AssertionError(f"unexpected tool {name}")
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+
+    response = asyncio.run(
+        agent.chat("дай мне пример реального билета из екатеринбурга в москву на послезавтра")
+    )
+
+    assert captured["tools"][0][0] == "web.search"
+    assert "билеты цена наличие расписание" in captured["query"]
+    assert "Источники" in response.answer
+    assert "12 500" in response.answer
+    assert "выдум" not in response.answer.lower()
+    storage.close()
+
+
+def test_agent_researches_public_osint_self_lookup(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    agent = AgentRuntime(
+        settings=settings,
+        storage=storage,
+        llm=LLMRouter(settings),
+        bus=EventBus(),
+    )
+
+    async def fake_run(name, arguments=None, **kwargs):
+        if name == "web.search":
+            assert "OSINT" in arguments["query"]
+            return _tool_response(
+                name,
+                True,
+                "Web search returned 1 result(s).",
+                {
+                    "results": [
+                        {
+                            "title": "Public profile",
+                            "url": "https://example.com/dest1k",
+                            "snippet": "public account",
+                        }
+                    ]
+                },
+            )
+        if name == "web.fetch":
+            return _tool_response(
+                name,
+                True,
+                "Fetched URL with HTTP 200.",
+                {"url": arguments["url"], "text": "public account profile"},
+            )
+        raise AssertionError(f"unexpected tool {name}")
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+
+    response = asyncio.run(agent.chat("найди меня в интернете по аккаунту Dest1k"))
+
+    assert "Источники" in response.answer
+    assert "https://example.com/dest1k" in response.answer
+    assert "OSINT-рамка" in response.answer
+    assert "не буду помогать" in response.answer
+    assert "не могу" not in response.answer.lower()
+    storage.close()
+
+
+def test_agent_does_not_web_search_local_docker_request(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+
+    class FakeLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None):
+            return type("Result", (), {"ok": True, "content": "локальный ответ", "error": None})()
+
+    agent = AgentRuntime(settings=settings, storage=storage, llm=FakeLLM(), bus=EventBus())
+
+    async def fake_run(name, arguments=None, **kwargs):
+        raise AssertionError(f"unexpected tool {name}")
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+
+    response = asyncio.run(agent.chat("проверь логи docker jarvis"))
+
+    assert response.answer == "локальный ответ"
     storage.close()
 
 

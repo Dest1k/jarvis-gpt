@@ -4,6 +4,7 @@ import re
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -52,6 +53,10 @@ Capability contract:
   Опасные или необратимые действия оформляй через approval/tool gate, а не отказывайся целиком.
 - Для web/OSINT работай только с публичными источниками, структурируй найденное, сохраняй ссылки,
   помечай confidence и не выдавай предположения за факты.
+- Если запрос требует актуальной информации из интернета: билеты, цены, расписания, новости,
+  наличие, курсы, погоду или "послезавтра/сегодня/завтра", сначала используй web.search/web.fetch.
+  Не пиши "запускаю поиск" и не имитируй результаты. Если поиск или сайт не отдал данные,
+  прямо скажи, что именно не подтверждено, и дай проверяемые ссылки.
 - Не используй декоративные служебные префиксы и pseudo-tags вроде
   "$\\rightarrow$ **Важное уточнение:**".
   Пиши сразу человеческий ответ."""
@@ -468,21 +473,6 @@ class AgentRuntime:
         message: str,
         context: AgentContext | None = None,
     ) -> DirectAction | None:
-        url = _browser_url_from_message(message)
-        if url is not None:
-            result = await self.tools.run("browser.open", {"url": url}, allow_danger=True)
-            event = ChatEvent(
-                type="tool_call",
-                title="browser.open",
-                content=result.summary,
-                payload={"tool": result.tool, "ok": result.ok, "url": url},
-            )
-            verb = "Открыл" if result.ok else "Не смог открыть"
-            return DirectAction(
-                answer=f"{verb} вкладку: {url}\n\n{result.summary}",
-                events=[event],
-            )
-
         history_text = ""
         if context is not None:
             history_text = "\n".join(
@@ -581,7 +571,79 @@ class AgentRuntime:
                 events=[event],
             )
 
+        research_query = _web_research_query_from_message(message)
+        if research_query is not None:
+            return await self._run_web_research(message, research_query)
+
+        url = _browser_url_from_message(message)
+        if url is not None:
+            result = await self.tools.run("browser.open", {"url": url}, allow_danger=True)
+            event = ChatEvent(
+                type="tool_call",
+                title="browser.open",
+                content=result.summary,
+                payload={"tool": result.tool, "ok": result.ok, "url": url},
+            )
+            verb = "Открыл" if result.ok else "Не смог открыть"
+            return DirectAction(
+                answer=f"{verb} вкладку: {url}\n\n{result.summary}",
+                events=[event],
+            )
+
         return None
+
+    async def _run_web_research(self, message: str, query: str) -> DirectAction:
+        search = await self.tools.run("web.search", {"query": query, "limit": 6})
+        events = [
+            ChatEvent(
+                type="tool_call",
+                title="web.search",
+                content=search.summary,
+                payload={"tool": search.tool, "ok": search.ok, "query": query},
+            )
+        ]
+        if not search.ok:
+            return DirectAction(
+                answer=(
+                    "Не смог выполнить веб-поиск, поэтому не буду выдумывать результат.\n\n"
+                    f"Запрос: `{query}`\nПричина: {search.summary}"
+                ),
+                events=events,
+            )
+
+        results = [
+            item
+            for item in search.data.get("results", [])
+            if isinstance(item, dict) and item.get("url")
+        ][:6]
+        fetches: list[ToolRunResponse] = []
+        for item in results[:3]:
+            fetched = await self.tools.run(
+                "web.fetch",
+                {"url": item["url"], "max_chars": 5000},
+            )
+            fetches.append(fetched)
+            events.append(
+                ChatEvent(
+                    type="tool_call",
+                    title="web.fetch",
+                    content=fetched.summary,
+                    payload={
+                        "tool": fetched.tool,
+                        "ok": fetched.ok,
+                        "url": item["url"],
+                    },
+                )
+            )
+        return DirectAction(
+            answer=_format_web_research_answer(
+                message=message,
+                query=query,
+                results=results,
+                fetches=fetches,
+            ),
+            events=events,
+        )
 
     def _prepare_context(self, message: str, conversation_id: str | None) -> AgentContext:
         if conversation_id is None:
@@ -860,6 +922,290 @@ def _task_notes_from_result(result: ToolRunResponse) -> str:
         action_text = f"\nRecommended action: {action}" if action else ""
         return f"{result.summary}{action_text}"
     return f"Blocked by tool result: {result.summary}"
+
+
+def _web_research_query_from_message(message: str) -> str | None:
+    normalized = message.lower()
+    explicit_open = _contains_any(
+        normalized,
+        ("открой", "открыть", "open", "новой вклад", "новую вклад", "в браузере"),
+    )
+    search_verbs = ("найди", "поищи", "узнай", "проверь")
+    explicit_web_markers = (
+        "гугл",
+        "загугли",
+        "погугли",
+        "интернет",
+        "в сети",
+        "сайт",
+        "источник",
+        "ссылк",
+    )
+    live_data_markers = (
+        "реальн",
+        "актуаль",
+        "сейчас",
+        "сегодня",
+        "завтра",
+        "послезавтра",
+        "цена",
+        "стоимость",
+        "билет",
+        "рейс",
+        "поезд",
+        "расписание",
+        "наличие",
+        "новости",
+        "курс",
+        "котиров",
+        "погода",
+    )
+    osint_markers = (
+        "человек",
+        "люди",
+        "персон",
+        "фио",
+        "номер",
+        "телефон",
+        "аккаунт",
+        "ник",
+        "username",
+        "соцсет",
+        "telegram",
+        "телеграм",
+        "email",
+        "почт",
+        "домен",
+        "ip",
+        "whois",
+        "dns",
+        "база",
+        "бд",
+        "утеч",
+        "leak",
+        "breach",
+        "внешн",
+        "публичн",
+        "osint",
+    )
+    if explicit_open and not (
+        _contains_any(normalized, search_verbs)
+        or _contains_any(normalized, live_data_markers)
+        or _looks_like_osint_query(normalized)
+    ):
+        return None
+    if not (
+        _contains_any(normalized, explicit_web_markers)
+        or _contains_any(normalized, live_data_markers)
+        or (
+            _contains_any(normalized, osint_markers)
+            and not _looks_like_local_query(normalized)
+        )
+        or (
+            _contains_any(normalized, search_verbs)
+            and not _looks_like_local_query(normalized)
+        )
+    ):
+        return None
+
+    query = re.sub(r"https?://\S+", "", message, flags=re.IGNORECASE)
+    query = re.sub(r"\s+", " ", query).strip(" ,.;:")
+    if not query:
+        return None
+    resolved_date = _relative_date_for_message(normalized)
+    if resolved_date:
+        query = f"{query} {resolved_date.isoformat()}"
+    if _looks_like_travel_query(normalized):
+        query = f"{query} билеты цена наличие расписание официальный агрегатор"
+    if _looks_like_osint_query(normalized):
+        query = f"{query} публичные источники OSINT"
+    return query[:300]
+
+
+def _looks_like_local_query(normalized: str) -> bool:
+    return _contains_any(
+        normalized,
+        (
+            "лог",
+            "docker",
+            "докер",
+            "контейнер",
+            "процесс",
+            "служб",
+            "файл",
+            "папк",
+            "директор",
+            "диск",
+            "консол",
+            "терминал",
+            "powershell",
+            "cmd",
+            "windows",
+            "wmi",
+            "winapi",
+            "gpu",
+            "vram",
+            "jarvis",
+            "репозит",
+            "проект",
+        ),
+    )
+
+
+def _looks_like_osint_query(normalized: str) -> bool:
+    return _contains_any(
+        normalized,
+        (
+            "человек",
+            "люди",
+            "фио",
+            "номер",
+            "телефон",
+            "аккаунт",
+            "ник",
+            "username",
+            "email",
+            "почт",
+            "домен",
+            "whois",
+            "dns",
+            "утеч",
+            "leak",
+            "breach",
+            "osint",
+        ),
+    )
+
+
+def _relative_date_for_message(normalized: str) -> date | None:
+    today = date.today()
+    if "послезавтра" in normalized:
+        return today + timedelta(days=2)
+    if "завтра" in normalized:
+        return today + timedelta(days=1)
+    if "сегодня" in normalized:
+        return today
+    return None
+
+
+def _looks_like_travel_query(normalized: str) -> bool:
+    return _contains_any(
+        normalized,
+        (
+            "билет",
+            "рейс",
+            "авиа",
+            "самолет",
+            "самолёт",
+            "поезд",
+            "ржд",
+            "аэропорт",
+            "вылет",
+            "прилет",
+            "прилёт",
+            "маршрут",
+        ),
+    )
+
+
+def _format_web_research_answer(
+    *,
+    message: str,
+    query: str,
+    results: list[dict[str, Any]],
+    fetches: list[ToolRunResponse],
+) -> str:
+    normalized = message.lower()
+    date_note = _relative_date_for_message(normalized)
+    lines = ["Проверил веб-поиск."]
+    if date_note:
+        lines.append(f"Дата из запроса: {date_note.isoformat()}.")
+    lines.append(f"Поисковый запрос: `{query}`.")
+    if not results:
+        lines.append(
+            "\nНичего подтверждённого не нашёл. "
+            "Придумывать билет, цену или расписание не буду."
+        )
+        return "\n".join(lines)
+
+    evidence = _research_evidence(results, fetches)
+    travel = _looks_like_travel_query(normalized)
+    if travel:
+        facts = _extract_travel_facts(evidence)
+        if facts:
+            lines.append("\nЧто удалось вытащить из найденных страниц/сниппетов:")
+            if facts["prices"]:
+                lines.append(f"- цены/тарифы: {', '.join(facts['prices'][:5])}")
+            if facts["times"]:
+                lines.append(f"- время в материалах: {', '.join(facts['times'][:8])}")
+            lines.append(
+                "- это не бронь и не гарантия наличия: финальную карточку билета "
+                "нужно подтверждать на сайте продавца."
+            )
+        else:
+            lines.append(
+                "\nПоиск нашёл источники по маршруту, но статические страницы "
+                "не отдали точную карточку билета с ценой/временем. Не выдумываю."
+            )
+
+    lines.append("\nИсточники:")
+    for index, item in enumerate(evidence[:6], start=1):
+        snippet = f" — {item['snippet']}" if item.get("snippet") else ""
+        lines.append(f"{index}. {item['title']}: {item['url']}{snippet}")
+    if travel:
+        lines.append(
+            "\nПрактичный следующий шаг: открыть 1-2 источника из списка "
+            "и выбрать конкретный рейс/поезд в живой выдаче."
+        )
+    if _looks_like_osint_query(normalized):
+        lines.append(
+            "\nOSINT-рамка: использовал только публичные источники. "
+            "Я могу структурировать найденное, "
+            "но не буду помогать со взломом, обходом доступа, доксом или преследованием людей."
+        )
+    return "\n".join(lines)
+
+
+def _research_evidence(
+    results: list[dict[str, Any]],
+    fetches: list[ToolRunResponse],
+) -> list[dict[str, str]]:
+    fetched_by_url = {
+        str(item.data.get("url") or ""): str(item.data.get("text") or "")
+        for item in fetches
+        if item.ok and isinstance(item.data, dict)
+    }
+    evidence: list[dict[str, str]] = []
+    for result in results:
+        url = str(result.get("url") or "")
+        fetched_text = fetched_by_url.get(url, "")
+        snippet = str(result.get("snippet") or "")
+        if fetched_text:
+            snippet = _short_value(fetched_text, 240)
+        evidence.append(
+            {
+                "title": str(result.get("title") or url),
+                "url": url,
+                "snippet": snippet,
+            }
+        )
+    return evidence
+
+
+def _extract_travel_facts(evidence: list[dict[str, str]]) -> dict[str, list[str]]:
+    text = " ".join(item.get("snippet", "") for item in evidence)
+    prices = _dedupe(
+        [
+            " ".join(match.split())
+            for match in re.findall(
+                r"(?:от\s*)?\d[\d\s]{2,}\s*(?:₽|руб\.?|rub)",
+                text,
+                flags=re.IGNORECASE,
+            )
+        ]
+    )
+    times = _dedupe(re.findall(r"\b(?:[01]?\d|2[0-3])[:.][0-5]\d\b", text))
+    return {"prices": prices, "times": times}
 
 
 def _browser_url_from_message(message: str) -> str | None:

@@ -10,9 +10,10 @@ import socket
 import subprocess
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from html import unescape
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
 import httpx
 
@@ -413,6 +414,17 @@ class ToolRegistry:
                 category="memory",
                 input_schema={"query": "Text query", "limit": "Maximum chunk hits"},
                 handler=_files_search,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="web.search",
+                description=(
+                    "Search the public web and return result titles, URLs and snippets."
+                ),
+                category="web",
+                input_schema={"query": "Search query", "limit": "Maximum results"},
+                handler=_web_search,
             )
         )
         self.add(
@@ -906,6 +918,44 @@ def _files_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
         ok=True,
         summary=f"File search returned {len(hits)} chunk(s).",
         data={"hits": hits, "query": query, "limit": limit},
+    )
+
+
+async def _web_search(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    query = " ".join(str(args.get("query") or "").split())
+    limit = _int_arg(args.get("limit"), default=6, minimum=1, maximum=12)
+    if not query:
+        return ToolRunResponse(tool="web.search", ok=False, summary="Search query is required.")
+    if len(query) > 300:
+        query = query[:300].rstrip()
+
+    url = f"https://duckduckgo.com/html/?q={quote_plus(query)}"
+    headers = {
+        "User-Agent": "JARVIS-GPT/0.1",
+        "Accept": "text/html,application/xhtml+xml",
+    }
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(20.0),
+            follow_redirects=True,
+            trust_env=False,
+        ) as client:
+            response = await client.get(url, headers=headers)
+            response.raise_for_status()
+    except httpx.HTTPError as exc:
+        return ToolRunResponse(
+            tool="web.search",
+            ok=False,
+            summary=f"Search request failed: {exc}",
+            data={"query": query, "url": url},
+        )
+
+    results = _parse_duckduckgo_results(response.text, limit=limit)
+    return ToolRunResponse(
+        tool="web.search",
+        ok=True,
+        summary=f"Web search returned {len(results)} result(s).",
+        data={"query": query, "results": results, "source": "duckduckgo_html"},
     )
 
 
@@ -1755,6 +1805,70 @@ def _validate_public_http_url(raw_url: str) -> str:
     return parsed.geturl()
 
 
+def _parse_duckduckgo_results(html: str, *, limit: int) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    pattern = re.compile(
+        r'<a[^>]+class="[^"]*\bresult__a\b[^"]*"[^>]+href="(?P<href>[^"]+)"[^>]*>'
+        r"(?P<title>.*?)</a>",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    for match in pattern.finditer(html):
+        url = _unwrap_duckduckgo_url(unescape(match.group("href")))
+        title = _html_to_text(match.group("title"))
+        if not url or not title or url in seen:
+            continue
+        if urlparse(url).scheme not in {"http", "https"}:
+            continue
+        snippet = _snippet_after_result(html, match.end())
+        results.append(
+            {
+                "title": title,
+                "url": url,
+                "snippet": snippet,
+                "rank": len(results) + 1,
+            }
+        )
+        seen.add(url)
+        if len(results) >= limit:
+            break
+    return results
+
+
+def _unwrap_duckduckgo_url(raw_url: str) -> str:
+    parsed = urlparse(raw_url)
+    if parsed.netloc.endswith("duckduckgo.com") and parsed.path.startswith("/l/"):
+        target = parse_qs(parsed.query).get("uddg", [""])[0]
+        return unquote(target)
+    return raw_url
+
+
+def _snippet_after_result(html: str, offset: int) -> str:
+    tail = html[offset : offset + 3000]
+    match = re.search(
+        r'<a[^>]+class="[^"]*\bresult__snippet\b[^"]*"[^>]*>(?P<snippet>.*?)</a>',
+        tail,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        match = re.search(
+            r'<div[^>]+class="[^"]*\bresult__snippet\b[^"]*"[^>]*>(?P<snippet>.*?)</div>',
+            tail,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+    return _html_to_text(match.group("snippet")) if match else ""
+
+
+def _html_to_text(value: str) -> str:
+    without_scripts = re.sub(
+        r"(?is)<(script|style|noscript)[^>]*>.*?</\1>",
+        " ",
+        value,
+    )
+    without_tags = re.sub(r"(?s)<[^>]+>", " ", without_scripts)
+    return " ".join(unescape(without_tags).split())
+
+
 def _hostname_is_private(hostname: str) -> bool:
     try:
         resolved = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
@@ -1799,6 +1913,9 @@ async def _read_limited_response_text(
 
     encoding = _charset_from_content_type(response.headers.get("content-type")) or "utf-8"
     text = bytes(content).decode(encoding, errors="replace")
+    content_type = response.headers.get("content-type", "").lower()
+    if "html" in content_type or "<html" in text[:500].lower():
+        text = _html_to_text(text)
     if len(text) > max_chars:
         text = text[:max_chars]
         truncated = True

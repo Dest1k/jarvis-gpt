@@ -394,6 +394,58 @@ def test_web_fetch_reads_public_text(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_web_search_parses_public_results(monkeypatch, tmp_path):
+    class FakeResponse:
+        text = """
+        <html>
+          <a
+            class="result__a"
+            href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fprofile"
+          >Example Profile</a>
+          <a class="result__snippet">Public profile snippet</a>
+          <a class="result__a" href="https://example.org/news">Example News</a>
+          <div class="result__snippet">News snippet</div>
+        </html>
+        """
+
+        def raise_for_status(self):
+            return None
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, _exc_type, _exc, _traceback):
+            return None
+
+        async def get(self, url, *, headers):
+            assert "duckduckgo.com/html/" in url
+            assert "JARVIS-GPT" in headers["User-Agent"]
+            assert self.kwargs["trust_env"] is False
+            return FakeResponse()
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    result = asyncio.run(tools.run("web.search", {"query": "Dest1k OSINT", "limit": 2}))
+
+    assert result.ok is True
+    assert result.data["results"][0]["url"] == "https://example.com/profile"
+    assert result.data["results"][0]["title"] == "Example Profile"
+    assert result.data["results"][0]["snippet"] == "Public profile snippet"
+    assert result.data["results"][1]["url"] == "https://example.org/news"
+    storage.close()
+
+
 def test_docker_ps_parses_compact_container_list(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")

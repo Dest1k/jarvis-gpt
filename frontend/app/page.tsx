@@ -717,7 +717,7 @@ function readStoredChatWindows(): { windows: ChatWindow[]; activeId: string } {
       .slice(0, 8)
       .map((item) => ({
         ...item,
-        title: item.title || "Чат",
+        title: normalizeChatTitle(item.title),
         input: item.input || "",
         conversationId: item.conversationId ?? null,
         lines:
@@ -794,10 +794,35 @@ function communicationStyleLabel(value: string | null | undefined) {
   return labels[value ?? ""] ?? value ?? "кратко";
 }
 
+function isThrowawayChatTitle(value: string) {
+  const normalized = value
+    .toLowerCase()
+    .replace(/[?!.,;:]+$/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return [
+    /^как мы до (?:всего )?этого дошли$/,
+    /^(?:а )?что это(?: тут)? такое$/,
+    /^что это$/,
+    /^проверка(?: связи)?$/,
+    /^на связи$/,
+    /^есть связь$/,
+    /^а теперь$/,
+    /^а сейчас$/,
+    /^сейчас$/
+  ].some((pattern) => pattern.test(normalized));
+}
+
+function normalizeChatTitle(value: string | null | undefined) {
+  const cleaned = (value ?? "").replace(/\s+/g, " ").trim();
+  if (!cleaned || isThrowawayChatTitle(cleaned)) return "Новый чат";
+  return cleaned.slice(0, 42) + (cleaned.length > 42 ? "..." : "");
+}
+
 function titleFromMessage(message: string) {
   const cleaned = message.replace(/\s+/g, " ").trim();
-  if (!cleaned) return "Чат";
-  return cleaned.slice(0, 42) + (cleaned.length > 42 ? "..." : "");
+  if (!cleaned || isThrowawayChatTitle(cleaned)) return "Новый чат";
+  return normalizeChatTitle(cleaned);
 }
 
 function cleanAssistantText(content: string) {
