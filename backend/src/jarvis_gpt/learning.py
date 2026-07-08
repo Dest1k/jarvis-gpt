@@ -15,7 +15,11 @@ class LearningEngine:
         approvals = self.storage.list_approvals(limit=limit)
         lessons = self._derive_lessons(audit=audit, tool_runs=tool_runs, approvals=approvals)
         saved = []
+        skipped_duplicates = 0
         for lesson in lessons:
+            if self._lesson_exists(lesson["content"]):
+                skipped_duplicates += 1
+                continue
             saved.append(
                 self.storage.add_memory(
                     content=lesson["content"],
@@ -27,17 +31,29 @@ class LearningEngine:
         self.storage.add_event(
             kind="learning.tick",
             title=f"Learning tick saved {len(saved)} lesson(s)",
-            payload={"saved": len(saved), "examined": len(audit) + len(tool_runs) + len(approvals)},
+            payload={
+                "saved": len(saved),
+                "skipped_duplicates": skipped_duplicates,
+                "examined": len(audit) + len(tool_runs) + len(approvals),
+            },
         )
         return {
             "saved": saved,
             "lesson_count": len(saved),
+            "skipped_duplicates": skipped_duplicates,
             "examined": {
                 "audit": len(audit),
                 "tool_runs": len(tool_runs),
                 "approvals": len(approvals),
             },
         }
+
+    def _lesson_exists(self, content: str) -> bool:
+        existing = self.storage.search_memory(content[:180], limit=20)
+        return any(
+            item.get("namespace") == "learning" and item.get("content") == content
+            for item in existing
+        )
 
     def _derive_lessons(
         self,

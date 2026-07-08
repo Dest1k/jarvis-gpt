@@ -13,6 +13,7 @@
 - Telemetry/performance: CPU/RAM/disk/GPU/Docker snapshots, performance profile и host bridge status.
 - Self-learning tick: аудит, tool runs и approvals превращаются в долговременные lessons.
 - Retrieval adds normalized relevance, matched terms and snippets for memory/file context.
+- Learning tick deduplicates repeated lessons before writing long-term memory.
 - Autonomous supervisor: безопасный фоновой цикл собирает telemetry и запускает learning tick.
 - Исполнение следующего шага mission plan с прогрессом задач и журналом tool runs.
 - SQLite WAL-хранилище в `D:\jarvis\data\jarvis-gpt\state\jarvis.sqlite3`.
@@ -137,6 +138,7 @@ docker compose --profile llm up -d dispatcher
 - Safe tools include `web.fetch` for public HTTP(S) context with private-network and redirect guards.
 - Safe tools include read-only `docker.ps` and restricted `docker.logs` for Jarvis container diagnostics.
 - Memory and file retrieval now return relevance scores, matched terms, and clipped snippets for mission context.
+- Autonomous learning skips duplicate lessons and reports the skipped count in tick results.
 - Autonomous supervisor persists telemetry, learning lessons, and health snapshots on separate intervals.
 - Mission planner enriches plans with domain-specific UI, LLM, Docker/GPU, host bridge and performance steps.
 - HITL gates now have a whitelisted executor: approved gates can run dispatcher, diagnostics, learning, telemetry, memory, or registered tool actions.

@@ -30,6 +30,29 @@ def test_learning_tick_saves_lessons_from_pending_approval(monkeypatch, tmp_path
     storage.close()
 
 
+def test_learning_tick_deduplicates_lessons(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    storage.create_approval(
+        title="Repeatable host action",
+        description="Needs review",
+        requested_action="host.exec",
+        risk="danger",
+    )
+    engine = LearningEngine(storage)
+
+    first = engine.tick(limit=10)
+    second = engine.tick(limit=10)
+
+    assert first["lesson_count"] >= 1
+    assert second["lesson_count"] == 0
+    assert second["skipped_duplicates"] >= 1
+    storage.close()
+
+
 def test_telemetry_performance_plan_and_host_bridge_status(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
     settings = load_settings("gemma4-turbo")
@@ -60,6 +83,7 @@ def test_supervisor_status_reflects_autonomy_settings(monkeypatch, tmp_path):
     assert status["enabled"] is False
     assert "telemetry.persist" in status["capabilities"]
     assert "health.persist" in status["capabilities"]
+    assert "learning.deduplicate" in status["capabilities"]
     assert status["health_interval_sec"] == 300
     storage.close()
 

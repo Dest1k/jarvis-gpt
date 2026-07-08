@@ -81,6 +81,7 @@ class RuntimeSupervisor:
                 "telemetry.persist",
                 "health.persist",
                 "learning.tick",
+                "learning.deduplicate",
                 "audit.observe",
                 "approval.respect",
             ],
