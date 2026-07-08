@@ -54,9 +54,15 @@ Capability contract:
 - Для web/OSINT работай только с публичными источниками, структурируй найденное, сохраняй ссылки,
   помечай confidence и не выдавай предположения за факты.
 - Если запрос требует актуальной информации из интернета: билеты, цены, расписания, новости,
-  наличие, курсы, погоду или "послезавтра/сегодня/завтра", сначала используй web.search/web.fetch.
+  наличие, курсы, погоду, адреса, телефоны, часы работы, открыто ли место сейчас,
+  ближайшие бытовые точки или "послезавтра/сегодня/завтра", сначала используй web.search/web.fetch.
   Не пиши "запускаю поиск" и не имитируй результаты. Если поиск или сайт не отдал данные,
   прямо скажи, что именно не подтверждено, и дай проверяемые ссылки.
+- Если вопрос ставит тебя в угол, зависит от сегодняшней реальности или есть риск ответить
+  уверенной выдумкой, сначала честно гугли через web.search/web.fetch и анализируй найденное.
+  Это относится не только к бытовым вопросам, но и к техническим, админским, разработческим,
+  железным, финансовым, правовым и прочим меняющимся темам. Лучше показать источники
+  и границы уверенности, чем красиво угадать.
 - Не используй декоративные служебные префиксы и pseudo-tags вроде
   "$\\rightarrow$ **Важное уточнение:**".
   Пиши сразу человеческий ответ."""
@@ -611,11 +617,29 @@ class AgentRuntime:
                 events=events,
             )
 
-        results = [
-            item
-            for item in search.data.get("results", [])
-            if isinstance(item, dict) and item.get("url")
-        ][:6]
+        results = _search_results_from_response(search)
+        if not results:
+            for fallback_query in _fallback_web_research_queries(message, query):
+                fallback = await self.tools.run("web.search", {"query": fallback_query, "limit": 6})
+                events.append(
+                    ChatEvent(
+                        type="tool_call",
+                        title="web.search",
+                        content=fallback.summary,
+                        payload={
+                            "tool": fallback.tool,
+                            "ok": fallback.ok,
+                            "query": fallback_query,
+                            "fallback": True,
+                        },
+                    )
+                )
+                if fallback.ok:
+                    query = fallback_query
+                    search = fallback
+                    results = _search_results_from_response(search)
+                    if results:
+                        break
         fetches: list[ToolRunResponse] = []
         for item in results[:3]:
             fetched = await self.tools.run(
@@ -959,6 +983,81 @@ def _web_research_query_from_message(message: str) -> str | None:
         "курс",
         "котиров",
         "погода",
+        "адрес",
+        "телефон",
+        "номер",
+        "часы",
+        "график",
+        "режим работы",
+        "открыт",
+        "закрыт",
+        "ближайш",
+        "рядом",
+        "поблизости",
+        "как добраться",
+        "где находится",
+    )
+    uncertainty_markers = (
+        "актуально ли",
+        "правда ли",
+        "точно ли",
+        "можно ли",
+        "стоит ли",
+        "что выбрать",
+        "какой лучше",
+        "какая лучше",
+        "какое лучше",
+        "лучший",
+        "лучше",
+        "сравни",
+        "сравнение",
+        "отзывы",
+        "обзор",
+        "рейтинг",
+        "топ",
+        "как сейчас",
+        "не уверен",
+        "не помню",
+    )
+    technical_freshness_markers = (
+        "версия",
+        "последняя версия",
+        "latest",
+        "release",
+        "релиз",
+        "changelog",
+        "breaking change",
+        "совместим",
+        "compatibility",
+        "поддерживает",
+        "драйвер",
+        "обновлен",
+        "обновлён",
+        "уязвим",
+        "cve",
+        "ошибка",
+        "баг",
+        "исправлен",
+        "best practice",
+        "рекомендации",
+        "документация",
+        "api",
+        "sdk",
+        "библиотек",
+        "фреймворк",
+        "docker image",
+        "образ docker",
+        "linux kernel",
+        "windows server",
+        "nvidia",
+        "cuda",
+        "vllm",
+        "pytorch",
+        "node",
+        "python",
+        "postgres",
+        "nginx",
+        "kubernetes",
     )
     osint_markers = (
         "человек",
@@ -991,12 +1090,17 @@ def _web_research_query_from_message(message: str) -> str | None:
     if explicit_open and not (
         _contains_any(normalized, search_verbs)
         or _contains_any(normalized, live_data_markers)
+        or _looks_like_place_lookup_query(normalized)
         or _looks_like_osint_query(normalized)
     ):
         return None
     if not (
         _contains_any(normalized, explicit_web_markers)
         or _contains_any(normalized, live_data_markers)
+        or _contains_any(normalized, uncertainty_markers)
+        or _looks_like_technical_freshness_query(normalized, technical_freshness_markers)
+        or _looks_like_shopping_query(normalized)
+        or _looks_like_place_lookup_query(normalized)
         or (
             _contains_any(normalized, osint_markers)
             and not _looks_like_local_query(normalized)
@@ -1015,9 +1119,17 @@ def _web_research_query_from_message(message: str) -> str | None:
     resolved_date = _relative_date_for_message(normalized)
     if resolved_date:
         query = f"{query} {resolved_date.isoformat()}"
-    if _looks_like_travel_query(normalized):
+    if _looks_like_shopping_query(normalized):
+        query = _shopping_search_query(query, normalized)
+    elif _looks_like_travel_query(normalized):
         query = f"{query} билеты цена наличие расписание официальный агрегатор"
-    if _looks_like_osint_query(normalized):
+    elif _looks_like_place_lookup_query(normalized):
+        query = _place_lookup_search_query(query, normalized)
+    elif _looks_like_technical_freshness_query(normalized, technical_freshness_markers):
+        query = f"{query} official docs latest"
+    elif _contains_any(normalized, uncertainty_markers):
+        query = f"{query} актуальные источники обзор сравнение"
+    if _looks_like_osint_query(normalized) and not _looks_like_shopping_query(normalized):
         query = f"{query} публичные источники OSINT"
     return query[:300]
 
@@ -1052,7 +1164,22 @@ def _looks_like_local_query(normalized: str) -> bool:
     )
 
 
+def _looks_like_technical_freshness_query(
+    normalized: str,
+    technical_freshness_markers: tuple[str, ...],
+) -> bool:
+    if _looks_like_local_query(normalized):
+        return False
+    return _contains_any(normalized, technical_freshness_markers)
+
+
 def _looks_like_osint_query(normalized: str) -> bool:
+    if _looks_like_shopping_query(normalized):
+        return False
+    if _looks_like_place_lookup_query(normalized):
+        return False
+    if _contains_any(normalized, ("whois", "домен", "dns запись", "dns-зап", "dns record")):
+        return True
     return _contains_any(
         normalized,
         (
@@ -1068,13 +1195,323 @@ def _looks_like_osint_query(normalized: str) -> bool:
             "почт",
             "домен",
             "whois",
-            "dns",
             "утеч",
             "leak",
             "breach",
             "osint",
         ),
     )
+
+
+def _looks_like_shopping_query(normalized: str) -> bool:
+    purchase_context = _contains_any(
+        normalized,
+        (
+            "купить",
+            "дешев",
+            "цена",
+            "стоимость",
+            "товар",
+            "магазин",
+            "продавец",
+            "наличие",
+            "заказ",
+            "доставк",
+            "скидк",
+            "акци",
+            "распродаж",
+        ),
+    )
+    product_context = _contains_any(
+        normalized,
+        (
+            "видеокарт",
+            "ноутбук",
+            "процессор",
+            "ssd",
+            "hdd",
+            "rtx",
+            "geforce",
+            "radeon",
+            "iphone",
+            "смартфон",
+            "телефон",
+            "планшет",
+            "монитор",
+            "телевизор",
+            "наушник",
+            "клавиатур",
+            "мышь",
+        ),
+    )
+    store_context = _contains_any(
+        normalized,
+        (
+            "dns",
+            "днс",
+            "ozon",
+            "wildberries",
+            "яндекс маркет",
+            "yandex market",
+            "маркет",
+            "ситилинк",
+            "citilink",
+            "мвидео",
+            "м.видео",
+            "mvideo",
+            "эльдорадо",
+            "eldorado",
+            "онлайнтрейд",
+            "online trade",
+            "avito",
+            "авито",
+            "aliexpress",
+            "алиэкспресс",
+        ),
+    )
+    if _looks_like_travel_query(normalized):
+        return False
+    if store_context and not _looks_like_osint_dns_context(normalized):
+        return True
+    return product_context and purchase_context
+
+
+def _looks_like_osint_dns_context(normalized: str) -> bool:
+    return _contains_any(normalized, ("whois", "домен", "dns запись", "dns-зап", "dns record"))
+
+
+def _looks_like_place_lookup_query(normalized: str) -> bool:
+    place_intent = _contains_any(
+        normalized,
+        (
+            "адрес",
+            "телефон",
+            "номер",
+            "часы",
+            "график",
+            "режим работы",
+            "открыт",
+            "закрыт",
+            "ближайш",
+            "рядом",
+            "поблизости",
+            "как добраться",
+            "где находится",
+        ),
+    )
+    place_subject = _contains_any(
+        normalized,
+        (
+            "аптек",
+            "магазин",
+            "кафе",
+            "ресторан",
+            "банк",
+            "банкомат",
+            "мфц",
+            "поликлиник",
+            "больниц",
+            "клиник",
+            "почт",
+            "пвз",
+            "пункт выдачи",
+            "школ",
+            "садик",
+            "сервис",
+            "ремонт",
+            "гибдд",
+            "налогов",
+            "паспортн",
+            "метро",
+            "остановк",
+            "аэропорт",
+            "вокзал",
+            "отделен",
+            "офис",
+            "филиал",
+        ),
+    )
+    if _looks_like_travel_query(normalized) and not place_intent:
+        return False
+    return place_intent and place_subject
+
+
+def _place_lookup_search_query(query: str, normalized: str) -> str:
+    subject = _clean_place_lookup_subject(query)
+    suffix = "адрес телефон часы работы официальный сайт"
+    if _contains_any(normalized, ("ближайш", "рядом", "поблизости", "как добраться")):
+        suffix = f"{suffix} карта"
+    if _contains_any(normalized, ("сегодня", "сейчас", "открыт", "закрыт")):
+        suffix = f"{suffix} актуально сегодня"
+    return f"{subject} {suffix}"
+
+
+def _shopping_search_query(query: str, normalized: str) -> str:
+    subject = _clean_shopping_subject(query)
+    site_filter = _shopping_site_filter(normalized)
+    if site_filter:
+        subject = _compact_shopping_subject(subject)
+    suffix = f"{site_filter} купить цена наличие" if site_filter else "купить цена наличие"
+    return f"{subject} {suffix}"
+
+
+def _fallback_web_research_queries(message: str, current_query: str) -> list[str]:
+    normalized = message.lower()
+    candidates: list[str] = []
+    if _looks_like_shopping_query(normalized):
+        subject = _compact_shopping_subject(_clean_shopping_subject(message))
+        site_filter = _shopping_site_filter(normalized)
+        domain_hint = _shopping_domain_hint(normalized)
+        if domain_hint:
+            candidates.append(f"{subject} {domain_hint} купить цена наличие")
+            candidates.append(f"{subject} {domain_hint}")
+        if site_filter:
+            candidates.append(f"{subject} {site_filter}")
+        if not candidates:
+            candidates.append(f"{subject} цена наличие")
+    elif _looks_like_place_lookup_query(normalized):
+        subject = _clean_place_lookup_subject(message)
+        candidates.append(f"{subject} адрес телефон часы работы")
+    return _unique_search_queries(candidates, current_query)
+
+
+def _shopping_site_filter(normalized: str) -> str:
+    if _mentions_dns_store(normalized):
+        return "site:dns-shop.ru"
+    if _contains_any(normalized, ("ozon",)):
+        return "site:ozon.ru"
+    if _contains_any(normalized, ("wildberries",)):
+        return "site:wildberries.ru"
+    if _contains_any(normalized, ("яндекс маркет", "yandex market", "маркет")):
+        return "site:market.yandex.ru"
+    if _contains_any(normalized, ("ситилинк", "citilink")):
+        return "site:citilink.ru"
+    if _contains_any(normalized, ("мвидео", "м.видео", "mvideo")):
+        return "site:mvideo.ru"
+    if _contains_any(normalized, ("эльдорадо", "eldorado")):
+        return "site:eldorado.ru"
+    if _contains_any(normalized, ("avito", "авито")):
+        return "site:avito.ru"
+    return ""
+
+
+def _shopping_domain_hint(normalized: str) -> str:
+    site_filter = _shopping_site_filter(normalized)
+    if site_filter.startswith("site:"):
+        return site_filter.removeprefix("site:")
+    return site_filter
+
+
+def _unique_search_queries(candidates: list[str], current_query: str) -> list[str]:
+    seen = {_normalize_search_query(current_query)}
+    queries: list[str] = []
+    for candidate in candidates:
+        query = _normalize_search_query(candidate)
+        if query and query not in seen:
+            queries.append(query)
+            seen.add(query)
+    return queries
+
+
+def _clean_shopping_subject(query: str) -> str:
+    cleaned = _clean_research_subject(query)
+    store_names = (
+        "dns",
+        "днс",
+        "ozon",
+        "wildberries",
+        "яндекс маркет",
+        "yandex market",
+        "маркет",
+        "ситилинк",
+        "citilink",
+        "мвидео",
+        "м.видео",
+        "mvideo",
+        "эльдорадо",
+        "eldorado",
+        "авито",
+        "avito",
+        "aliexpress",
+        "алиэкспресс",
+    )
+    store_pattern = "|".join(re.escape(name) for name in store_names)
+    cleaned = re.sub(rf"\b(?:на|в|у)\s+(?:{store_pattern})\b", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\bсам(?:ую|ый|ое|ые)\s+деш[её]в\w*\b", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\bсам(?:ую|ый|ое|ые)\s+недорог\w*\b", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(?:купить|цена|стоимость|наличие)\b", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = _normalize_search_query(cleaned)
+    if cleaned:
+        return cleaned
+    return _normalize_search_query(query) or query
+
+
+def _compact_shopping_subject(subject: str) -> str:
+    tokens = re.findall(r"[\w.+-]+", subject, flags=re.IGNORECASE)
+    technical: list[str] = []
+    generic_prefixes = (
+        "видеокарт",
+        "ноутбук",
+        "процессор",
+        "смартфон",
+        "телефон",
+        "планшет",
+        "монитор",
+        "телевизор",
+        "наушник",
+        "клавиатур",
+        "мыш",
+        "товар",
+    )
+    for token in tokens:
+        lower = token.lower()
+        if any(lower.startswith(prefix) for prefix in generic_prefixes):
+            continue
+        if re.search(r"[a-z0-9]", lower, flags=re.IGNORECASE):
+            technical.append(token)
+    if technical and any(re.search(r"[a-z]", token, flags=re.IGNORECASE) for token in technical):
+        return _normalize_search_query(" ".join(technical))
+    return subject
+
+
+def _clean_place_lookup_subject(query: str) -> str:
+    cleaned = _clean_research_subject(query)
+    cleaned = re.sub(
+        r"\b(?:телефон|номер|часы работы|часы|график|режим работы)\b",
+        " ",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\b(?:адрес|где находится|как добраться)\b",
+        " ",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"\b(?:и|а)\b", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = _normalize_search_query(cleaned)
+    return cleaned or _normalize_search_query(query) or query
+
+
+def _clean_research_subject(query: str) -> str:
+    cleaned = query
+    command_patterns = (
+        r"^\s*дай\s+мне\s+(?:пример\s+)?(?:реальн\w+\s+)?",
+        r"^\s*(?:найди|поищи|узнай|проверь|покажи|подскажи|подбери)\s+(?:мне\s+)?",
+        r"^\s*(?:найти|поискать|проверить|узнать|показать|подобрать)\s+",
+    )
+    for pattern in command_patterns:
+        cleaned = re.sub(pattern, " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(?:пожалуйста|плиз|мне)\b", " ", cleaned, flags=re.IGNORECASE)
+    return _normalize_search_query(cleaned)
+
+
+def _normalize_search_query(query: str) -> str:
+    return re.sub(r"\s+", " ", query).strip(" ,.;:")
+
+
+def _mentions_dns_store(normalized: str) -> bool:
+    return bool(re.search(r"(?<![a-zа-яё0-9])(?:dns|днс)(?![a-zа-яё0-9])", normalized))
 
 
 def _relative_date_for_message(normalized: str) -> date | None:
@@ -1117,22 +1554,67 @@ def _format_web_research_answer(
 ) -> str:
     normalized = message.lower()
     date_note = _relative_date_for_message(normalized)
+    shopping = _looks_like_shopping_query(normalized)
+    place_lookup = _looks_like_place_lookup_query(normalized)
+    travel = _looks_like_travel_query(normalized)
+    osint = _looks_like_osint_query(normalized)
     lines = ["Проверил веб-поиск."]
     if date_note:
         lines.append(f"Дата из запроса: {date_note.isoformat()}.")
     lines.append(f"Поисковый запрос: `{query}`.")
     if not results:
         lines.append(
-            "\nНичего подтверждённого не нашёл. "
-            "Придумывать билет, цену или расписание не буду."
+            _no_results_research_message(
+                shopping=shopping,
+                place_lookup=place_lookup,
+                travel=travel,
+                osint=osint,
+            )
         )
         return "\n".join(lines)
 
     evidence = _research_evidence(results, fetches)
-    travel = _looks_like_travel_query(normalized)
-    if travel:
+    if shopping:
+        facts = _extract_shopping_facts(evidence)
+        if _mentions_dns_store(normalized):
+            lines.append("\nПриоритетно проверял выдачу магазина DNS (`dns-shop.ru`).")
+        if facts["prices"] or facts["availability"]:
+            lines.append("\nЧто удалось вытащить из найденных страниц/сниппетов:")
+            if facts["prices"]:
+                lines.append(f"- цены/предложения: {', '.join(facts['prices'][:6])}")
+            if facts["availability"]:
+                lines.append(f"- наличие/доставка: {', '.join(facts['availability'][:6])}")
+            lines.append(
+                "- это не заказ и не гарантия склада: финальную цену, город и наличие "
+                "нужно подтвердить на карточке продавца."
+            )
+        else:
+            lines.append(
+                "\nПоиск нашёл источники по товару, но статические страницы "
+                "не отдали точную цену или наличие. Не выдумываю."
+            )
+    elif place_lookup:
+        facts = _extract_place_lookup_facts(evidence)
+        if facts["phones"] or facts["hours"] or facts["addresses"]:
+            lines.append("\nЧто удалось вытащить из найденных страниц/сниппетов:")
+            if facts["phones"]:
+                lines.append(f"- телефоны: {', '.join(facts['phones'][:4])}")
+            if facts["hours"]:
+                lines.append(f"- время/режим: {', '.join(facts['hours'][:6])}")
+            if facts["addresses"]:
+                lines.append(f"- адресные фрагменты: {', '.join(facts['addresses'][:4])}")
+            lines.append(
+                "- это не гарантия актуального режима: часы работы и доступность "
+                "нужно подтвердить на странице организации или карте."
+            )
+        else:
+            lines.append(
+                "\nПоиск нашёл источники по месту/организации, но статические страницы "
+                "не отдали телефон, адрес или график. Не выдумываю."
+            )
+    elif travel:
         facts = _extract_travel_facts(evidence)
-        if facts:
+        if facts["prices"] or facts["times"]:
             lines.append("\nЧто удалось вытащить из найденных страниц/сниппетов:")
             if facts["prices"]:
                 lines.append(f"- цены/тарифы: {', '.join(facts['prices'][:5])}")
@@ -1157,13 +1639,61 @@ def _format_web_research_answer(
             "\nПрактичный следующий шаг: открыть 1-2 источника из списка "
             "и выбрать конкретный рейс/поезд в живой выдаче."
         )
-    if _looks_like_osint_query(normalized):
+    if shopping:
+        lines.append(
+            "\nПрактичный следующий шаг: открыть 1-2 карточки из списка и отсортировать "
+            "их по цене уже в живой выдаче магазина."
+        )
+    if place_lookup:
+        lines.append(
+            "\nПрактичный следующий шаг: открыть официальный сайт или карточку на карте "
+            "и проверить режим работы для нужного города/района."
+        )
+    if osint:
         lines.append(
             "\nOSINT-рамка: использовал только публичные источники. "
             "Я могу структурировать найденное, "
             "но не буду помогать со взломом, обходом доступа, доксом или преследованием людей."
         )
     return "\n".join(lines)
+
+
+def _no_results_research_message(
+    *,
+    shopping: bool,
+    place_lookup: bool,
+    travel: bool,
+    osint: bool,
+) -> str:
+    if shopping:
+        return (
+            "\nНичего подтверждённого по товару не нашёл. "
+            "Придумывать цену, магазин или наличие не буду."
+        )
+    if place_lookup:
+        return (
+            "\nНичего подтверждённого по месту/организации не нашёл. "
+            "Придумывать адрес, телефон или часы работы не буду."
+        )
+    if travel:
+        return (
+            "\nНичего подтверждённого по маршруту не нашёл. "
+            "Придумывать билет, цену или расписание не буду."
+        )
+    if osint:
+        return (
+            "\nНичего подтверждённого в публичных источниках не нашёл. "
+            "Придумывать совпадения, аккаунты или утечки не буду."
+        )
+    return "\nНичего подтверждённого не нашёл. Придумывать факты не буду."
+
+
+def _search_results_from_response(search: ToolRunResponse) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in search.data.get("results", [])
+        if isinstance(item, dict) and item.get("url")
+    ][:6]
 
 
 def _research_evidence(
@@ -1206,6 +1736,71 @@ def _extract_travel_facts(evidence: list[dict[str, str]]) -> dict[str, list[str]
     )
     times = _dedupe(re.findall(r"\b(?:[01]?\d|2[0-3])[:.][0-5]\d\b", text))
     return {"prices": prices, "times": times}
+
+
+def _extract_shopping_facts(evidence: list[dict[str, str]]) -> dict[str, list[str]]:
+    text = " ".join(item.get("snippet", "") for item in evidence)
+    availability_pattern = (
+        r"(?:в наличии|нет в наличии|под заказ|доступно к заказу|самовывоз|"
+        r"доставка[^,.]{0,40})"
+    )
+    prices = _dedupe(
+        [
+            " ".join(match.split())
+            for match in re.findall(
+                r"(?:от\s*)?\d[\d\s]{2,}\s*(?:₽|руб\.?|rub)",
+                text,
+                flags=re.IGNORECASE,
+            )
+        ]
+    )
+    availability = _dedupe(
+        [
+            " ".join(match.split())
+            for match in re.findall(
+                availability_pattern,
+                text,
+                flags=re.IGNORECASE,
+            )
+        ]
+    )
+    return {"prices": prices, "availability": availability}
+
+
+def _extract_place_lookup_facts(evidence: list[dict[str, str]]) -> dict[str, list[str]]:
+    text = " ".join(item.get("snippet", "") for item in evidence)
+    phones = _dedupe(
+        [
+            " ".join(match.split())
+            for match in re.findall(
+                r"(?:\+7|8)\s*[\-(]?\d{3}[\-) ]*\d{3}[- ]?\d{2}[- ]?\d{2}",
+                text,
+            )
+        ]
+    )
+    hours = _dedupe(
+        [
+            " ".join(match.split())
+            for match in re.findall(
+                r"(?:круглосуточно|24/7|ежедневно|сегодня[^,.]{0,40}|"
+                r"(?:[01]?\d|2[0-3])[:.][0-5]\d\s*[-–]\s*"
+                r"(?:[01]?\d|2[0-3])[:.][0-5]\d)",
+                text,
+                flags=re.IGNORECASE,
+            )
+        ]
+    )
+    addresses = _dedupe(
+        [
+            " ".join(match.split())
+            for match in re.findall(
+                r"(?:ул\.?|улица|проспект|пр-т|шоссе|площадь|пер\.?)\s+[^,.]{3,80}",
+                text,
+                flags=re.IGNORECASE,
+            )
+        ]
+    )
+    return {"phones": phones, "hours": hours, "addresses": addresses}
 
 
 def _browser_url_from_message(message: str) -> str | None:

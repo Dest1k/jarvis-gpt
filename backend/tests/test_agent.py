@@ -38,6 +38,22 @@ def _agent_with_native_capture(monkeypatch, tmp_path):
     return agent, storage, captured
 
 
+def _agent_without_llm(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    agent = AgentRuntime(
+        settings=settings,
+        storage=storage,
+        llm=LLMRouter(settings),
+        bus=EventBus(),
+    )
+    return agent, storage
+
+
 def test_agent_creates_mission_from_large_goal(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
@@ -935,6 +951,365 @@ def test_agent_researches_public_osint_self_lookup(monkeypatch, tmp_path):
     assert "OSINT-рамка" in response.answer
     assert "не буду помогать" in response.answer
     assert "не могу" not in response.answer.lower()
+    storage.close()
+
+
+def test_agent_researches_dns_shop_product_without_osint_suffix(monkeypatch, tmp_path):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    captured = {}
+
+    async def fake_run(name, arguments=None, **kwargs):
+        captured.setdefault("tools", []).append((name, arguments or {}))
+        if name == "web.search":
+            captured["query"] = arguments["query"]
+            return _tool_response(
+                name,
+                True,
+                "Web search returned 1 result(s).",
+                {
+                    "results": [
+                        {
+                            "title": "RTX 5090 в DNS",
+                            "url": "https://www.dns-shop.ru/product/rtx-5090",
+                            "snippet": "GeForce RTX 5090 399 999 ₽ В наличии",
+                        }
+                    ]
+                },
+            )
+        if name == "web.fetch":
+            return _tool_response(
+                name,
+                True,
+                "Fetched URL with HTTP 200.",
+                {
+                    "url": arguments["url"],
+                    "text": "GeForce RTX 5090 399 999 ₽ В наличии, доставка завтра",
+                },
+            )
+        raise AssertionError(f"unexpected tool {name}")
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+
+    response = asyncio.run(agent.chat("найди мне самую дешёвую видеокарту rtx 5090 на dns"))
+
+    assert captured["tools"][0][0] == "web.search"
+    assert "site:dns-shop.ru" in captured["query"]
+    assert captured["query"].startswith("rtx 5090")
+    assert "найди" not in captured["query"]
+    assert "OSINT" not in captured["query"]
+    assert "399 999" in response.answer
+    assert "https://www.dns-shop.ru/product/rtx-5090" in response.answer
+    assert "Приоритетно проверял выдачу магазина DNS" in response.answer
+    assert "билет" not in response.answer.lower()
+    assert "OSINT-рамка" not in response.answer
+    storage.close()
+
+
+def test_agent_keeps_dns_records_in_osint_context(monkeypatch, tmp_path):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    captured = {}
+
+    async def fake_run(name, arguments=None, **kwargs):
+        if name == "web.search":
+            captured["query"] = arguments["query"]
+            return _tool_response(
+                name,
+                True,
+                "Web search returned 1 result(s).",
+                {
+                    "results": [
+                        {
+                            "title": "example.com DNS records",
+                            "url": "https://example.net/dns/example.com",
+                            "snippet": "A 93.184.216.34 MX example.com",
+                        }
+                    ]
+                },
+            )
+        if name == "web.fetch":
+            return _tool_response(
+                name,
+                True,
+                "Fetched URL with HTTP 200.",
+                {"url": arguments["url"], "text": "A 93.184.216.34 MX example.com"},
+            )
+        raise AssertionError(f"unexpected tool {name}")
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+
+    response = asyncio.run(agent.chat("проверь DNS записи домена example.com"))
+
+    assert "OSINT" in captured["query"]
+    assert "site:dns-shop.ru" not in captured["query"]
+    assert "example.com DNS records" in response.answer
+    assert "OSINT-рамка" in response.answer
+    storage.close()
+
+
+def test_agent_retries_shopping_search_with_short_query(monkeypatch, tmp_path):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    searches = []
+
+    async def fake_run(name, arguments=None, **kwargs):
+        if name == "web.search":
+            searches.append(arguments["query"])
+            if len(searches) == 1:
+                return _tool_response(
+                    name,
+                    True,
+                    "Web search returned 0 result(s).",
+                    {"results": []},
+                )
+            return _tool_response(
+                name,
+                True,
+                "Web search returned 1 result(s).",
+                {
+                    "results": [
+                        {
+                            "title": "RTX 5090 DNS",
+                            "url": "https://www.dns-shop.ru/catalog/recipe/rtx-5090/",
+                            "snippet": "Видеокарты RTX 5090 в DNS",
+                        }
+                    ]
+                },
+            )
+        if name == "web.fetch":
+            return _tool_response(
+                name,
+                True,
+                "Fetched URL with HTTP 200.",
+                {"url": arguments["url"], "text": "Видеокарты RTX 5090 в DNS"},
+            )
+        raise AssertionError(f"unexpected tool {name}")
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+
+    response = asyncio.run(agent.chat("найди мне самую дешёвую видеокарту rtx 5090 на dns"))
+
+    assert len(searches) == 2
+    assert searches[0] == "rtx 5090 site:dns-shop.ru купить цена наличие"
+    assert searches[1] == "rtx 5090 dns-shop.ru купить цена наличие"
+    assert "https://www.dns-shop.ru/catalog/recipe/rtx-5090/" in response.answer
+    storage.close()
+
+
+def test_agent_researches_marketplace_product_without_osint(monkeypatch, tmp_path):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    captured = {}
+
+    async def fake_run(name, arguments=None, **kwargs):
+        if name == "web.search":
+            captured["query"] = arguments["query"]
+            return _tool_response(
+                name,
+                True,
+                "Web search returned 1 result(s).",
+                {
+                    "results": [
+                        {
+                            "title": "iPhone 16 на Ozon",
+                            "url": "https://www.ozon.ru/product/iphone-16",
+                            "snippet": "iPhone 16 от 89 990 ₽ доступно к заказу",
+                        }
+                    ]
+                },
+            )
+        if name == "web.fetch":
+            return _tool_response(
+                name,
+                True,
+                "Fetched URL with HTTP 200.",
+                {
+                    "url": arguments["url"],
+                    "text": "iPhone 16 от 89 990 ₽ доступно к заказу",
+                },
+            )
+        raise AssertionError(f"unexpected tool {name}")
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+
+    response = asyncio.run(agent.chat("найди самый дешевый iphone 16 на ozon"))
+
+    assert "site:ozon.ru" in captured["query"]
+    assert captured["query"].startswith("iphone 16")
+    assert "OSINT" not in captured["query"]
+    assert "89 990" in response.answer
+    assert "доступно к заказу" in response.answer
+    assert "билет" not in response.answer.lower()
+    storage.close()
+
+
+def test_agent_researches_nearby_pharmacy_as_place_lookup(monkeypatch, tmp_path):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    captured = {}
+
+    async def fake_run(name, arguments=None, **kwargs):
+        if name == "web.search":
+            captured["query"] = arguments["query"]
+            return _tool_response(
+                name,
+                True,
+                "Web search returned 1 result(s).",
+                {
+                    "results": [
+                        {
+                            "title": "Круглосуточная аптека",
+                            "url": "https://example.com/pharmacy",
+                            "snippet": (
+                                "Аптека, улица Ленина 10, круглосуточно, "
+                                "+7 (343) 123-45-67"
+                            ),
+                        }
+                    ]
+                },
+            )
+        if name == "web.fetch":
+            return _tool_response(
+                name,
+                True,
+                "Fetched URL with HTTP 200.",
+                {
+                    "url": arguments["url"],
+                    "text": "Аптека, улица Ленина 10, круглосуточно, +7 (343) 123-45-67",
+                },
+            )
+        raise AssertionError(f"unexpected tool {name}")
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+
+    response = asyncio.run(agent.chat("найди ближайшую круглосуточную аптеку"))
+
+    assert "адрес телефон часы работы официальный сайт карта" in captured["query"]
+    assert "OSINT" not in captured["query"]
+    assert "+7 (343) 123-45-67" in response.answer
+    assert "круглосуточно" in response.answer
+    assert "улица Ленина 10" in response.answer
+    assert "билет" not in response.answer.lower()
+    storage.close()
+
+
+def test_agent_researches_public_office_phone_without_osint(monkeypatch, tmp_path):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    captured = {}
+
+    async def fake_run(name, arguments=None, **kwargs):
+        if name == "web.search":
+            captured["query"] = arguments["query"]
+            return _tool_response(
+                name,
+                True,
+                "Web search returned 1 result(s).",
+                {
+                    "results": [
+                        {
+                            "title": "МФЦ Ленинградская 10",
+                            "url": "https://example.com/mfc",
+                            "snippet": "МФЦ, улица Ленинградская 10, 09:00-18:00, 8 800 100-00-00",
+                        }
+                    ]
+                },
+            )
+        if name == "web.fetch":
+            return _tool_response(
+                name,
+                True,
+                "Fetched URL with HTTP 200.",
+                {
+                    "url": arguments["url"],
+                    "text": "МФЦ, улица Ленинградская 10, 09:00-18:00, 8 800 100-00-00",
+                },
+            )
+        raise AssertionError(f"unexpected tool {name}")
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+
+    response = asyncio.run(agent.chat("узнай телефон и часы работы МФЦ на Ленинградской 10"))
+
+    assert "адрес телефон часы работы официальный сайт" in captured["query"]
+    assert "OSINT" not in captured["query"]
+    assert "8 800 100-00-00" in response.answer
+    assert "09:00-18:00" in response.answer
+    assert "OSINT-рамка" not in response.answer
+    storage.close()
+
+
+def test_agent_researches_uncertain_everyday_choice(monkeypatch, tmp_path):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    captured = {}
+
+    async def fake_run(name, arguments=None, **kwargs):
+        if name == "web.search":
+            captured["query"] = arguments["query"]
+            return _tool_response(
+                name,
+                True,
+                "Web search returned 1 result(s).",
+                {
+                    "results": [
+                        {
+                            "title": "Лучшие роутеры 2026",
+                            "url": "https://example.com/router-review",
+                            "snippet": "обзор и сравнение актуальных моделей",
+                        }
+                    ]
+                },
+            )
+        if name == "web.fetch":
+            return _tool_response(
+                name,
+                True,
+                "Fetched URL with HTTP 200.",
+                {"url": arguments["url"], "text": "обзор и сравнение актуальных моделей"},
+            )
+        raise AssertionError(f"unexpected tool {name}")
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+
+    response = asyncio.run(agent.chat("какой роутер лучше выбрать сейчас для квартиры"))
+
+    assert "актуальные источники обзор сравнение" in captured["query"]
+    assert "Источники" in response.answer
+    assert "https://example.com/router-review" in response.answer
+    storage.close()
+
+
+def test_agent_researches_technical_freshness_question(monkeypatch, tmp_path):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    captured = {}
+
+    async def fake_run(name, arguments=None, **kwargs):
+        if name == "web.search":
+            captured["query"] = arguments["query"]
+            return _tool_response(
+                name,
+                True,
+                "Web search returned 1 result(s).",
+                {
+                    "results": [
+                        {
+                            "title": "vLLM docs",
+                            "url": "https://docs.vllm.ai/",
+                            "snippet": "latest vLLM documentation",
+                        }
+                    ]
+                },
+            )
+        if name == "web.fetch":
+            return _tool_response(
+                name,
+                True,
+                "Fetched URL with HTTP 200.",
+                {"url": arguments["url"], "text": "latest vLLM documentation"},
+            )
+        raise AssertionError(f"unexpected tool {name}")
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+
+    response = asyncio.run(agent.chat("какая последняя версия vLLM и что поменялось"))
+
+    assert "official docs latest" in captured["query"]
+    assert "https://docs.vllm.ai/" in response.answer
     storage.close()
 
 
