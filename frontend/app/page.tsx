@@ -213,6 +213,9 @@ type DispatcherStatus = {
 type DispatcherAction = {
   ok: boolean;
   summary: string;
+  stdout?: string;
+  stderr?: string;
+  command?: string[];
   status: DispatcherStatus;
 };
 
@@ -668,7 +671,7 @@ export default function CommandCenter() {
     }
   }
 
-  async function runDispatcherAction(action: "start" | "stop") {
+  async function runDispatcherAction(action: "start" | "stop" | "logs") {
     if (dispatcherBusy) return;
     setDispatcherBusy(true);
     try {
@@ -682,7 +685,7 @@ export default function CommandCenter() {
         {
           id: crypto.randomUUID(),
           role: "system",
-          content: result.summary
+          content: [result.summary, result.stdout || result.stderr].filter(Boolean).join("\n")
         }
       ]);
       await refresh();
@@ -1241,6 +1244,15 @@ export default function CommandCenter() {
                       onClick={() => runDispatcherAction("stop")}
                     >
                       <Square size={14} />
+                    </button>
+                    <button
+                      type="button"
+                      title="Dispatcher logs"
+                      aria-label="Dispatcher logs"
+                      disabled={dispatcherBusy || !dispatcher.container_status?.exists}
+                      onClick={() => runDispatcherAction("logs")}
+                    >
+                      <FileText size={14} />
                     </button>
                   </div>
                 </div>
