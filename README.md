@@ -26,6 +26,33 @@
 
 ## Быстрый старт
 
+Unified launcher with keyboard menu:
+
+```powershell
+.\jarvis.cmd
+```
+
+One-command start/stop/status:
+
+```powershell
+.\jarvis.cmd start -Profile gemma4-turbo
+.\jarvis.cmd start -Profile gemma4-mono
+.\jarvis.cmd stop
+.\jarvis.cmd restart -Profile gemma4-turbo
+.\jarvis.cmd status
+```
+
+Profile shortcuts:
+
+```powershell
+.\jarvis-turbo.cmd
+.\jarvis-mono.cmd
+.\jarvis-start.cmd -Profile gemma4-turbo
+.\jarvis-stop.cmd
+```
+
+Manual low-level startup remains available:
+
 ```powershell
 py -3.11 .\jarvis.py init
 py -3.11 .\jarvis.py diag
@@ -127,6 +154,7 @@ docker compose --profile llm up -d dispatcher
 
 ## Current readiness
 
+- Unified launcher `.\jarvis.cmd` provides keyboard-menu start/stop/restart/status/logs/doctor/open flows plus `gemma4-turbo` and `gemma4-mono` startup shortcuts.
 - OpenAI-compatible Gemma dispatcher is wired and can be started/stopped from CLI, API, and Command Center.
 - Chat supports streamed NDJSON deltas through `/api/chat/stream`; the UI renders tokens as they arrive.
 - Conversation history is durable and can be restored from Command Center after reload.
