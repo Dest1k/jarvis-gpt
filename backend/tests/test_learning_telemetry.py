@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
 from jarvis_gpt.host_bridge import HostBridgeStatus
 from jarvis_gpt.learning import LearningEngine
@@ -57,4 +59,23 @@ def test_supervisor_status_reflects_autonomy_settings(monkeypatch, tmp_path):
 
     assert status["enabled"] is False
     assert "telemetry.persist" in status["capabilities"]
+    assert "health.persist" in status["capabilities"]
+    assert status["health_interval_sec"] == 300
+    storage.close()
+
+
+def test_supervisor_records_health_snapshot(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    supervisor = RuntimeSupervisor(settings=settings, storage=storage)
+
+    asyncio.run(supervisor._record_health())
+
+    status = supervisor.status()
+    assert status["last_health_at"] is not None
+    assert storage.latest_health(limit=5)
     storage.close()

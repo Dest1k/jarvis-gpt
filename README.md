@@ -131,6 +131,7 @@ docker compose --profile llm up -d dispatcher
 - Command Center has browser voice input for the chat composer where the Web Speech API is available.
 - Command Center registers a service worker and keeps the local UI shell available after the first successful load.
 - Native host bridge now has a bundled local RPC script, token detection, CLI execution, and a `danger` tool for approved host commands.
+- Autonomous supervisor persists telemetry, learning lessons, and health snapshots on separate intervals.
 - HITL gates now have a whitelisted executor: approved gates can run dispatcher, diagnostics, learning, telemetry, memory, or registered tool actions.
 - Full local smoke covers backend tests/lint/compile, Docker Compose config, frontend audit/typecheck/build, and optional live HTTP checks.
 

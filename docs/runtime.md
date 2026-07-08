@@ -10,6 +10,7 @@
 - HITL follow-up closed: approved gates can now be executed through the whitelisted approval executor.
 - Conversation history is now durable through `/api/conversations` and can be restored in Command Center.
 - Host bridge follow-up closed: bundled `scripts/windows_rpc_bridge.py` exposes local token-auth command execution for approved host actions.
+- Autonomous supervisor now persists health snapshots on its own interval, so `/api/status` stays fresh without manual diagnostics.
 
 ## Переменные окружения
 
@@ -23,6 +24,7 @@
 | `JARVIS_LLM_ENABLED` | `1` | Включить/выключить LLM route |
 | `JARVIS_AUTONOMY_ENABLED` | `1` | Включить безопасный фоновой supervisor |
 | `JARVIS_TELEMETRY_INTERVAL_SEC` | `120` | Интервал telemetry snapshots |
+| `JARVIS_HEALTH_INTERVAL_SEC` | `300` | Интервал автономных health snapshots |
 | `JARVIS_LEARNING_INTERVAL_SEC` | `600` | Интервал autonomous learning tick |
 | `JARVIS_API_HOST` | `0.0.0.0` | Host FastAPI backend |
 | `JARVIS_API_PORT` | `8000` | Port FastAPI backend |

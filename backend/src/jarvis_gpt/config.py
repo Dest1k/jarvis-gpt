@@ -108,6 +108,7 @@ class JarvisSettings:
     llm_max_tokens: int
     autonomy_enabled: bool
     telemetry_interval_sec: int
+    health_interval_sec: int
     learning_interval_sec: int
     api_host: str
     api_port: int
@@ -148,6 +149,7 @@ class JarvisSettings:
             "autonomy": {
                 "enabled": self.autonomy_enabled,
                 "telemetry_interval_sec": self.telemetry_interval_sec,
+                "health_interval_sec": self.health_interval_sec,
                 "learning_interval_sec": self.learning_interval_sec,
             },
             "api": {"host": self.api_host, "port": self.api_port},
@@ -188,6 +190,7 @@ def load_settings(profile_name: str | None = None) -> JarvisSettings:
         llm_max_tokens=_int_env("JARVIS_LLM_MAX_TOKENS", 512),
         autonomy_enabled=_bool_env("JARVIS_AUTONOMY_ENABLED", True),
         telemetry_interval_sec=_int_env("JARVIS_TELEMETRY_INTERVAL_SEC", 120),
+        health_interval_sec=_int_env("JARVIS_HEALTH_INTERVAL_SEC", 300),
         learning_interval_sec=_int_env("JARVIS_LEARNING_INTERVAL_SEC", 600),
         api_host=os.environ.get("JARVIS_API_HOST", "0.0.0.0"),
         api_port=_int_env("JARVIS_API_PORT", 8000),

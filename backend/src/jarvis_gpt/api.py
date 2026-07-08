@@ -80,7 +80,7 @@ async def lifespan(app: FastAPI):
     telemetry = TelemetryCollector(settings)
     learning = LearningEngine(storage)
     host_bridge = HostBridgeStatus(settings)
-    supervisor = RuntimeSupervisor(settings=settings, storage=storage)
+    supervisor = RuntimeSupervisor(settings=settings, storage=storage, llm=llm)
     approval_executor = ApprovalExecutor(
         storage=storage,
         llm=llm,
