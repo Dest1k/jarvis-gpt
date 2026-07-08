@@ -23,6 +23,16 @@ def test_stream_chunk_parser_reads_done_marker():
     assert chunk.kind == "done"
 
 
+def test_stream_chunk_parser_preserves_finish_reason():
+    chunk = _stream_chunk_from_line(
+        'data: {"choices":[{"delta":{},"finish_reason":"length"}]}'
+    )
+
+    assert chunk is not None
+    assert chunk.kind == "done"
+    assert chunk.finish_reason == "length"
+
+
 def test_llm_health_ignores_proxy_environment(monkeypatch, tmp_path):
     captured: dict[str, object] = {}
 

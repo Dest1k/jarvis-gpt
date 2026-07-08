@@ -42,6 +42,7 @@ const CONFIGURED_API_URL = process.env.NEXT_PUBLIC_JARVIS_API_URL ?? "http://loc
 const CHAT_WINDOWS_KEY = "jarvis-gpt.chatWindows.v1";
 const CHAT_SETTINGS_KEY = "jarvis-gpt.chatSettings.v1";
 const DEFAULT_CHAT_HEIGHT = 620;
+const DEFAULT_MAX_TOKENS = 2048;
 const DEFAULT_CHAT_WINDOW_ID = "chat-default";
 const BOOT_MESSAGE = "Центр управления JARVIS GPT готов к подключению.";
 const LIVE_TELEMETRY_INTERVAL_MS = 1000;
@@ -743,7 +744,7 @@ function drainStreamBuffer(
 }
 
 function clampMaxTokens(value: number) {
-  if (!Number.isFinite(value)) return 512;
+  if (!Number.isFinite(value)) return DEFAULT_MAX_TOKENS;
   return Math.max(64, Math.min(8192, Math.round(value)));
 }
 
@@ -874,6 +875,11 @@ function readStoredChatSettings(): StoredChatSettings {
   } catch {
     return {};
   }
+}
+
+function storedMaxTokens(value: unknown) {
+  const tokens = clampMaxTokens(Number(value ?? DEFAULT_MAX_TOKENS));
+  return tokens === 512 ? DEFAULT_MAX_TOKENS : tokens;
 }
 
 function normalizeChatSideTab(value: unknown): ChatSideTab {
@@ -1205,7 +1211,7 @@ export default function CommandCenter() {
   const [webUrlDraft, setWebUrlDraft] = useState("");
   const [webFetchResult, setWebFetchResult] = useState<ToolRunResult | null>(null);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
-  const [maxTokens, setMaxTokens] = useState(512);
+  const [maxTokens, setMaxTokens] = useState(DEFAULT_MAX_TOKENS);
   const [busy, setBusy] = useState(false);
   const [chatBusy, setChatBusy] = useState(false);
   const [chatTicker, setChatTicker] = useState(Date.now());
@@ -1404,7 +1410,7 @@ export default function CommandCenter() {
     setActiveTab(settings.activeTab ?? "chat");
     setChatSideTab(normalizeChatSideTab(settings.chatSideTab));
     setChatHeight(clampChatHeight(settings.chatHeight ?? DEFAULT_CHAT_HEIGHT));
-    setMaxTokens(clampMaxTokens(settings.maxTokens ?? 512));
+    setMaxTokens(storedMaxTokens(settings.maxTokens));
     setThinkingEnabled(settings.thinkingEnabled ?? true);
     const storedWindows = readStoredChatWindows();
     setChatWindows(storedWindows.windows);

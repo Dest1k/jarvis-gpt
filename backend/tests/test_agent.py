@@ -2114,6 +2114,12 @@ class FakeStreamingLLM:
         yield LLMStreamChunk(kind="delta", content=" world")
 
 
+class FakeLimitedStreamingLLM:
+    async def stream_complete(self, messages, *, temperature=None, max_tokens=None):
+        yield LLMStreamChunk(kind="delta", content="Long answer")
+        yield LLMStreamChunk(kind="done", finish_reason="length")
+
+
 class FakeTaggedStreamingLLM:
     async def stream_complete(self, messages, *, temperature=None, max_tokens=None):
         yield LLMStreamChunk(kind="delta", content="$\\rightarrow$ **Важное уточнение:** ")
@@ -2158,6 +2164,30 @@ def test_agent_cleans_service_prefixes_from_streamed_answer(monkeypatch, tmp_pat
     assert "Важное уточнение" not in done["answer"]
     assert "$\\rightarrow$" not in done["answer"]
     assert done["answer"] == "готово без служебного префикса"
+
+
+def test_agent_marks_streamed_answer_stopped_by_token_limit(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "1")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    agent = AgentRuntime(
+        settings=settings,
+        storage=storage,
+        llm=FakeLimitedStreamingLLM(),
+        bus=EventBus(),
+    )
+
+    items = asyncio.run(_collect(agent.stream_chat("check", mode="chat", max_tokens=64)))
+    deltas = "".join(item["content"] for item in items if item["type"] == "delta")
+    done = next(item for item in items if item["type"] == "done")
+
+    assert "Long answer" in done["answer"]
+    assert "лимиту 64 токенов" in done["answer"]
+    assert "лимиту 64 токенов" in deltas
+    storage.close()
 
 
 def test_agent_filters_thinking_blocks_from_stream(monkeypatch, tmp_path):

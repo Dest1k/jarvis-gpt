@@ -567,6 +567,7 @@ class AgentRuntime:
 
         answer_parts: list[str] = []
         stream_error: str | None = None
+        stream_finish_reason: str | None = None
         think_filter = _ThinkBlockFilter() if not thinking_enabled else None
         async for chunk in self._stream_llm(
             llm_messages,
@@ -583,6 +584,9 @@ class AgentRuntime:
             elif chunk.kind == "error":
                 stream_error = chunk.error
                 break
+            elif chunk.kind == "done":
+                stream_finish_reason = getattr(chunk, "finish_reason", None)
+                break
         if think_filter:
             tail = think_filter.flush()
             if tail:
@@ -595,11 +599,23 @@ class AgentRuntime:
                 interruption = f"\n\n[stream interrupted: {stream_error}]"
                 answer = f"{answer}{interruption}"
                 yield {"type": "delta", "content": interruption}
+            elif stream_finish_reason == "length":
+                effective_max_tokens = max_tokens or self.settings.llm_max_tokens
+                interruption = (
+                    f"\n\n[ответ остановлен по лимиту {effective_max_tokens} токенов; "
+                    "увеличь лимит токенов или попроси продолжить]"
+                )
+                answer = f"{answer}{interruption}"
+                yield {"type": "delta", "content": interruption}
             events.append(
                 ChatEvent(
                     type="assistant_done",
                     title="Streaming answer received",
-                    payload={"source": "llm", "stream": True},
+                    payload={
+                        "source": "llm",
+                        "stream": True,
+                        "finish_reason": stream_finish_reason,
+                    },
                 )
             )
         else:

@@ -24,6 +24,7 @@ class LLMStreamChunk:
     kind: str
     content: str = ""
     error: str | None = None
+    finish_reason: str | None = None
     raw: dict[str, Any] | None = None
 
 
@@ -138,6 +139,7 @@ class LLMRouter:
                     if chunk is None:
                         continue
                     if chunk.kind == "done":
+                        yield chunk
                         return
                     yield chunk
         except Exception as exc:  # noqa: BLE001
@@ -170,6 +172,7 @@ def _stream_chunk_from_line(line: str) -> LLMStreamChunk | None:
     content = delta.get("content") or choice.get("text") or ""
     if content:
         return LLMStreamChunk(kind="delta", content=content, raw=data)
-    if choice.get("finish_reason"):
-        return LLMStreamChunk(kind="done", raw=data)
+    finish_reason = choice.get("finish_reason")
+    if finish_reason:
+        return LLMStreamChunk(kind="done", finish_reason=str(finish_reason), raw=data)
     return None
