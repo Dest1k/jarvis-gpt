@@ -15,7 +15,9 @@ param(
   [switch]$NoBridge,
   [switch]$WatchLlm,
   [switch]$BuildFrontend,
-  [switch]$DevFrontend
+  [switch]$DevFrontend,
+  [switch]$NoDockerStart,
+  [int]$DockerWaitSec = 240
 )
 
 $ErrorActionPreference = "Stop"
@@ -118,6 +120,22 @@ function Test-PortOpen {
   }
 }
 
+function Wait-PortClosed {
+  param(
+    [int]$Port,
+    [int]$TimeoutMs = 5000
+  )
+
+  $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+  while ((Get-Date) -lt $deadline) {
+    if (-not (Test-PortOpen -Port $Port)) {
+      return $true
+    }
+    Start-Sleep -Milliseconds 250
+  }
+  return -not (Test-PortOpen -Port $Port)
+}
+
 function Invoke-HttpProbe {
   param(
     [string]$Uri,
@@ -143,6 +161,118 @@ function Invoke-HttpProbe {
     }
     return @{ ok = $false; status = $statusCode; data = $null; error = $_.Exception.Message }
   }
+}
+
+function Test-DockerReady {
+  $docker = Get-Command docker -ErrorAction SilentlyContinue
+  if (-not $docker) {
+    return @{ ready = $false; available = $false; error = "Docker CLI is not available in PATH" }
+  }
+
+  try {
+    $output = @(& $docker.Source info --format "{{.ServerVersion}}" 2>&1)
+    if ($LASTEXITCODE -eq 0) {
+      return @{ ready = $true; available = $true; error = ""; version = ($output -join "`n").Trim() }
+    }
+    return @{ ready = $false; available = $true; error = (($output -join "`n").Trim()) }
+  } catch {
+    return @{ ready = $false; available = $true; error = $_.Exception.Message }
+  }
+}
+
+function Resolve-DockerDesktopPath {
+  $candidates = @()
+  if ($env:ProgramFiles) {
+    $candidates += Join-Path $env:ProgramFiles "Docker\Docker\Docker Desktop.exe"
+  }
+  if (${env:ProgramFiles(x86)}) {
+    $candidates += Join-Path ${env:ProgramFiles(x86)} "Docker\Docker\Docker Desktop.exe"
+  }
+  if ($env:LOCALAPPDATA) {
+    $candidates += Join-Path $env:LOCALAPPDATA "Docker\Docker Desktop.exe"
+  }
+
+  foreach ($candidate in $candidates) {
+    if ($candidate -and (Test-Path -LiteralPath $candidate)) {
+      return $candidate
+    }
+  }
+
+  $command = Get-Command "Docker Desktop.exe" -ErrorAction SilentlyContinue
+  if ($command) {
+    return $command.Source
+  }
+  return $null
+}
+
+function Start-DockerDesktop {
+  $desktopPath = Resolve-DockerDesktopPath
+  if (-not $desktopPath) {
+    Write-Host "Docker Desktop executable was not found." -ForegroundColor DarkYellow
+    return $false
+  }
+
+  $alreadyLaunching = Get-Process -ErrorAction SilentlyContinue |
+    Where-Object { $_.ProcessName -in @("Docker Desktop", "com.docker.backend", "Docker Desktop Installer") } |
+    Select-Object -First 1
+
+  if ($alreadyLaunching) {
+    Write-Host "Docker Desktop is already starting; waiting for the Docker API..." -ForegroundColor DarkYellow
+    return $true
+  }
+
+  Write-Host ("Starting Docker Desktop: {0}" -f $desktopPath) -ForegroundColor Yellow
+  try {
+    Start-Process -FilePath $desktopPath -WindowStyle Hidden | Out-Null
+    return $true
+  } catch {
+    Write-Host ("Could not start Docker Desktop: {0}" -f $_.Exception.Message) -ForegroundColor DarkYellow
+    return $false
+  }
+}
+
+function Ensure-DockerReady {
+  param([int]$TimeoutSec = 240)
+
+  $probe = Test-DockerReady
+  if ($probe.ready) {
+    Write-Host ("Docker API is ready ({0})." -f $probe.version) -ForegroundColor Green
+    return $true
+  }
+
+  if (-not $probe.available) {
+    Write-Host $probe.error -ForegroundColor Red
+    return $false
+  }
+
+  if ($NoDockerStart) {
+    Write-Host ("Docker API is not ready: {0}" -f $probe.error) -ForegroundColor DarkYellow
+    return $false
+  }
+
+  if (-not (Start-DockerDesktop)) {
+    return $false
+  }
+  $deadline = (Get-Date).AddSeconds([Math]::Max(1, $TimeoutSec))
+  $lastError = $probe.error
+  $lastNoticeAt = (Get-Date).AddSeconds(-30)
+
+  while ((Get-Date) -lt $deadline) {
+    Start-Sleep -Seconds 3
+    $probe = Test-DockerReady
+    if ($probe.ready) {
+      Write-Host ("Docker API is ready ({0})." -f $probe.version) -ForegroundColor Green
+      return $true
+    }
+    $lastError = $probe.error
+    if (((Get-Date) - $lastNoticeAt).TotalSeconds -ge 15) {
+      Write-Host "Waiting for Docker API..." -ForegroundColor DarkGray
+      $lastNoticeAt = Get-Date
+    }
+  }
+
+  Write-Host ("Docker API did not become ready within {0}s: {1}" -f $TimeoutSec, $lastError) -ForegroundColor Red
+  return $false
 }
 
 function Get-DispatcherContainerSnapshot {
@@ -353,16 +483,196 @@ function Stop-ProcessId {
   }
 }
 
+function Get-ProcessSnapshot {
+  try {
+    return @(Get-CimInstance Win32_Process -ErrorAction Stop)
+  } catch {
+    return @()
+  }
+}
+
+function Get-CurrentProcessFamilyIds {
+  $snapshot = Get-ProcessSnapshot
+  $ids = New-Object System.Collections.Generic.HashSet[int]
+  $current = [int]$PID
+  while ($current -gt 0 -and $ids.Add($current)) {
+    $parent = $snapshot | Where-Object { [int]$_.ProcessId -eq $current } | Select-Object -First 1
+    if (-not $parent -or -not $parent.ParentProcessId) {
+      break
+    }
+    $current = [int]$parent.ParentProcessId
+  }
+  return @($ids | ForEach-Object { [int]$_ })
+}
+
+function Get-DescendantProcessIds {
+  param(
+    [int]$RootProcessId,
+    [array]$Snapshot
+  )
+
+  $ids = @()
+  $children = @($Snapshot | Where-Object { [int]$_.ParentProcessId -eq $RootProcessId })
+  foreach ($child in $children) {
+    $childId = [int]$child.ProcessId
+    $ids += $childId
+    $ids += Get-DescendantProcessIds -RootProcessId $childId -Snapshot $Snapshot
+  }
+  return $ids
+}
+
+function Stop-ProcessTree {
+  param(
+    [int]$ProcessId,
+    [string]$Reason = "matched process",
+    [array]$Snapshot = $null,
+    [int[]]$ProtectedProcessIds = @()
+  )
+
+  if ($ProcessId -le 0 -or $ProtectedProcessIds -contains $ProcessId) {
+    return $false
+  }
+  if (-not $Snapshot) {
+    $Snapshot = Get-ProcessSnapshot
+  }
+
+  $ids = @($ProcessId)
+  $ids += Get-DescendantProcessIds -RootProcessId $ProcessId -Snapshot $Snapshot
+  $ids = @($ids | Sort-Object -Unique)
+  [array]::Reverse($ids)
+
+  $stopped = $false
+  foreach ($id in $ids) {
+    if ($ProtectedProcessIds -contains $id) {
+      continue
+    }
+    $process = Get-Process -Id $id -ErrorAction SilentlyContinue
+    if ($process) {
+      try {
+        Stop-Process -Id $id -Force -ErrorAction Stop
+        Write-Host ("Stopped pid={0} ({1})" -f $id, $Reason) -ForegroundColor Yellow
+        $stopped = $true
+      } catch {
+        if ($_.Exception.Message -notmatch "Cannot find a process") {
+          Write-Host ("Could not stop pid={0}: {1}" -f $id, $_.Exception.Message) -ForegroundColor DarkYellow
+        }
+      }
+    }
+  }
+  return $stopped
+}
+
+function Test-JarvisProcess {
+  param([object]$ProcessInfo)
+
+  $text = ("{0} {1}" -f $ProcessInfo.CommandLine, $ProcessInfo.ExecutablePath).ToLowerInvariant()
+  if ([string]::IsNullOrWhiteSpace($text)) {
+    return $false
+  }
+
+  $repoNeedle = $RepoRoot.ToLowerInvariant()
+  $frontendNeedle = $FrontendRoot.ToLowerInvariant()
+
+  if ($text.Contains($repoNeedle) -or $text.Contains($frontendNeedle)) {
+    return $true
+  }
+
+  $scriptSignatures = @(
+    "jarvis-launcher.ps1",
+    "jarvis.py",
+    "windows_rpc_bridge.py",
+    "jarvis_gpt",
+    "jarvis-gpt-command-center"
+  )
+  foreach ($signature in $scriptSignatures) {
+    if ($text.Contains($signature)) {
+      return $true
+    }
+  }
+
+  return $false
+}
+
+function Stop-JarvisProcessesBySignature {
+  $snapshot = Get-ProcessSnapshot
+  $protected = Get-CurrentProcessFamilyIds
+  $matches = @(
+    $snapshot |
+      Where-Object { [int]$_.ProcessId -gt 0 } |
+      Where-Object { $protected -notcontains [int]$_.ProcessId } |
+      Where-Object { Test-JarvisProcess -ProcessInfo $_ }
+  )
+
+  foreach ($match in $matches) {
+    Stop-ProcessTree `
+      -ProcessId ([int]$match.ProcessId) `
+      -Reason "Jarvis command line" `
+      -Snapshot $snapshot `
+      -ProtectedProcessIds $protected | Out-Null
+  }
+}
+
 function Stop-PortOwner {
-  param([int]$Port)
+  param(
+    [int]$Port,
+    [switch]$SkipDockerEngineOwner
+  )
 
   try {
     $connections = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop
   } catch {
     return
   }
+  $snapshot = Get-ProcessSnapshot
+  $protected = Get-CurrentProcessFamilyIds
   $connections | Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object {
-    Stop-ProcessId -ProcessId ([int]$_)
+    $ownerPid = [int]$_
+    $owner = $snapshot | Where-Object { [int]$_.ProcessId -eq $ownerPid } | Select-Object -First 1
+    $ownerText = ("{0} {1} {2}" -f $owner.Name, $owner.CommandLine, $owner.ExecutablePath).ToLowerInvariant()
+    if ($SkipDockerEngineOwner -and $ownerText -match "(docker desktop|com\.docker\.backend|dockerd|wslhost)") {
+      Write-Host ("Skipped Docker engine port owner pid={0} on {1}; dispatcher container is stopped separately." -f $ownerPid, $Port) -ForegroundColor DarkYellow
+      return
+    }
+    Stop-ProcessTree `
+      -ProcessId $ownerPid `
+      -Reason ("port {0}" -f $Port) `
+      -Snapshot $snapshot `
+      -ProtectedProcessIds $protected | Out-Null
+  }
+}
+
+function Stop-DispatcherRuntime {
+  $docker = Get-Command docker -ErrorAction SilentlyContinue
+  if (-not $docker) {
+    Write-Host "Docker CLI is not available; dispatcher container control skipped." -ForegroundColor DarkYellow
+    return
+  }
+
+  $probe = Test-DockerReady
+  if (-not $probe.ready) {
+    Write-Host ("Docker API is not ready; dispatcher container control skipped: {0}" -f $probe.error) -ForegroundColor DarkYellow
+    return
+  }
+
+  Write-Host "Stopping dispatcher..." -ForegroundColor Yellow
+  try {
+    Invoke-JarvisCommand -FilePath "py.exe" -Arguments @("-3.11", ".\jarvis.py", "--profile", $Profile, "dispatcher-down")
+  } catch {
+    Write-Host $_ -ForegroundColor DarkYellow
+  }
+
+  try {
+    & $docker.Source rm -f jarvis-gpt-dispatcher 2>$null | Out-Null
+  } catch {
+    Write-Host $_ -ForegroundColor DarkYellow
+  }
+  try {
+    Push-Location $RepoRoot
+    & $docker.Source compose --profile llm down --remove-orphans 2>$null | Out-Null
+  } catch {
+    Write-Host $_ -ForegroundColor DarkYellow
+  } finally {
+    Pop-Location
   }
 }
 
@@ -430,16 +740,87 @@ function Read-LauncherState {
   }
 }
 
-function Ensure-FrontendReady {
-  if (-not (Test-Path (Join-Path $FrontendRoot "node_modules"))) {
-    Write-Host "Installing frontend dependencies..." -ForegroundColor Yellow
-    Invoke-JarvisCommand -FilePath "npm.cmd" -Arguments @("ci") -WorkingDirectory $FrontendRoot
+function Get-LatestWriteTimeUtc {
+  param([string[]]$Paths)
+
+  $latest = [DateTime]::MinValue
+  foreach ($path in $Paths) {
+    if (-not (Test-Path $path)) {
+      continue
+    }
+    $item = Get-Item -LiteralPath $path -Force
+    if ($item.PSIsContainer) {
+      Get-ChildItem -LiteralPath $path -Recurse -File -Force -ErrorAction SilentlyContinue | ForEach-Object {
+        if ($_.LastWriteTimeUtc -gt $latest) {
+          $latest = $_.LastWriteTimeUtc
+        }
+      }
+    } elseif ($item.LastWriteTimeUtc -gt $latest) {
+      $latest = $item.LastWriteTimeUtc
+    }
+  }
+  return $latest
+}
+
+function Get-FrontendBuildState {
+  $buildId = Join-Path $FrontendRoot ".next\BUILD_ID"
+  if (-not (Test-Path $buildId)) {
+    return @{ stale = $true; reason = "missing .next build"; source_at = $null; build_at = $null }
   }
 
-  if ($BuildFrontend -or -not (Test-Path (Join-Path $FrontendRoot ".next"))) {
-    Write-Host "Building frontend..." -ForegroundColor Yellow
-    Invoke-JarvisCommand -FilePath "npm.cmd" -Arguments @("run", "build") -WorkingDirectory $FrontendRoot
+  $sourcePaths = @(
+    (Join-Path $FrontendRoot "app"),
+    (Join-Path $FrontendRoot "public"),
+    (Join-Path $FrontendRoot "package.json"),
+    (Join-Path $FrontendRoot "package-lock.json"),
+    (Join-Path $FrontendRoot "next.config.mjs"),
+    (Join-Path $FrontendRoot "tsconfig.json"),
+    (Join-Path $FrontendRoot ".eslintrc.json")
+  )
+  $envFiles = @(Get-ChildItem -LiteralPath $FrontendRoot -Filter ".env*" -File -Force -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+  $sourceStamp = Get-LatestWriteTimeUtc -Paths @($sourcePaths + $envFiles)
+  $buildStamp = (Get-Item -LiteralPath $buildId -Force).LastWriteTimeUtc
+
+  if ($sourceStamp -gt $buildStamp.AddSeconds(1)) {
+    return @{
+      stale = $true
+      reason = "frontend sources are newer than .next"
+      source_at = $sourceStamp
+      build_at = $buildStamp
+    }
   }
+
+  return @{
+    stale = $false
+    reason = "frontend build is current"
+    source_at = $sourceStamp
+    build_at = $buildStamp
+  }
+}
+
+function Ensure-FrontendReady {
+  $rebuilt = $false
+
+  if (-not (Test-Path (Join-Path $FrontendRoot "node_modules"))) {
+    Write-Host "Installing frontend dependencies..." -ForegroundColor Yellow
+    Invoke-JarvisCommand -FilePath "npm.cmd" -Arguments @("ci") -WorkingDirectory $FrontendRoot | Out-Host
+  }
+
+  if ($DevFrontend) {
+    return $false
+  }
+
+  $buildState = Get-FrontendBuildState
+  if ($BuildFrontend -or $buildState.stale) {
+    $reason = if ($BuildFrontend) { "requested by -BuildFrontend" } else { $buildState.reason }
+    Write-Host ("Building frontend ({0})..." -f $reason) -ForegroundColor Yellow
+    Invoke-JarvisCommand -FilePath "npm.cmd" -Arguments @("run", "build") -WorkingDirectory $FrontendRoot | Out-Host
+    $rebuilt = $true
+  } else {
+    Write-Host "Frontend build is current." -ForegroundColor DarkGray
+  }
+
+  return $rebuilt
 }
 
 function Start-JarvisStack {
@@ -453,10 +834,15 @@ function Start-JarvisStack {
   $services = @{}
 
   if (-not $NoDispatcher) {
-    Write-Host "Starting dispatcher for $Profile..." -ForegroundColor Yellow
-    Invoke-JarvisCommand -FilePath "py.exe" -Arguments @("-3.11", ".\jarvis.py", "--profile", $Profile, "dispatcher-up")
-    $services.dispatcher = @{ profile = $Profile; docker = $true }
-    Write-Host "LLM readiness monitor: .\jarvis.cmd llm -WatchLlm" -ForegroundColor Cyan
+    if (Ensure-DockerReady -TimeoutSec $DockerWaitSec) {
+      Write-Host "Starting dispatcher for $Profile..." -ForegroundColor Yellow
+      Invoke-JarvisCommand -FilePath "py.exe" -Arguments @("-3.11", ".\jarvis.py", "--profile", $Profile, "dispatcher-up")
+      $services.dispatcher = @{ profile = $Profile; docker = $true }
+      Write-Host "LLM readiness monitor: .\jarvis.cmd llm -WatchLlm" -ForegroundColor Cyan
+    } else {
+      $services.dispatcher = @{ profile = $Profile; docker = $true; skipped = "docker-not-ready" }
+      Write-Host "Dispatcher was not started because Docker is not ready. Backend and UI will still start." -ForegroundColor Red
+    }
   }
 
   if (-not $NoBridge) {
@@ -496,11 +882,19 @@ function Start-JarvisStack {
   }
 
   if (-not $NoFrontend) {
-    Ensure-FrontendReady
+    $frontendRebuilt = Ensure-FrontendReady
     if (Test-PortOpen -Port 3000) {
-      $services.frontend = @{ port = 3000; pid = Get-PortOwner -Port 3000; reused = $true }
-      Write-Host "Command Center already listening on 127.0.0.1:3000" -ForegroundColor DarkYellow
-    } else {
+      if ($frontendRebuilt) {
+        Write-Host "Restarting Command Center because the frontend build changed..." -ForegroundColor Yellow
+        Stop-PortOwner -Port 3000
+        [void](Wait-PortClosed -Port 3000)
+      } else {
+        $services.frontend = @{ port = 3000; pid = Get-PortOwner -Port 3000; reused = $true }
+        Write-Host "Command Center already listening on 127.0.0.1:3000" -ForegroundColor DarkYellow
+      }
+    }
+
+    if (-not (Test-PortOpen -Port 3000)) {
       $frontendArgs = if ($DevFrontend) {
         @("run", "dev", "--", "--hostname", "127.0.0.1")
       } else {
@@ -529,29 +923,30 @@ function Stop-JarvisStack {
   Set-JarvisEnvironment -SelectedProfile $Profile
   Write-Banner
 
+  $snapshot = Get-ProcessSnapshot
+  $protected = Get-CurrentProcessFamilyIds
   $state = Read-LauncherState
   if ($state -and $state.services) {
     foreach ($service in @("frontend", "backend", "bridge")) {
       $entry = $state.services.$service
       if ($entry -and $entry.pid) {
-        Stop-ProcessId -ProcessId ([int]$entry.pid)
-        Write-Host ("Stopped {0} pid={1}" -f $service, $entry.pid) -ForegroundColor Yellow
+        Stop-ProcessTree `
+          -ProcessId ([int]$entry.pid) `
+          -Reason ("{0} state file" -f $service) `
+          -Snapshot $snapshot `
+          -ProtectedProcessIds $protected | Out-Null
       }
     }
   }
+
+  Stop-JarvisProcessesBySignature
 
   Stop-PortOwner -Port 3000
   Stop-PortOwner -Port 8000
   Stop-PortOwner -Port 8765
 
-  if (-not $NoDispatcher) {
-    Write-Host "Stopping dispatcher..." -ForegroundColor Yellow
-    try {
-      Invoke-JarvisCommand -FilePath "py.exe" -Arguments @("-3.11", ".\jarvis.py", "--profile", $Profile, "dispatcher-down")
-    } catch {
-      Write-Host $_ -ForegroundColor DarkYellow
-    }
-  }
+  Stop-DispatcherRuntime
+  Stop-PortOwner -Port 8001 -SkipDockerEngineOwner
 
   if (Test-Path $StateFile) {
     Remove-Item -LiteralPath $StateFile -Force
