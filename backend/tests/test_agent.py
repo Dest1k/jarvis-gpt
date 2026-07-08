@@ -1483,6 +1483,122 @@ def test_agent_does_not_web_search_logic_error_request(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_semantic_router_blocks_ambiguous_reasoning_web_false_positive(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    calls = []
+
+    class RouterThenAnswerLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None):
+            calls.append(messages)
+            if len(calls) == 1:
+                return type(
+                    "Result",
+                    (),
+                    {
+                        "ok": True,
+                        "content": (
+                            '{"route":"reasoning","confidence":0.91,'
+                            '"query":"","rationale":"all facts are in the prompt"}'
+                        ),
+                        "error": None,
+                    },
+                )()
+            return type(
+                "Result",
+                (),
+                {"ok": True, "content": "Решается логически из условий.", "error": None},
+            )()
+
+    agent = AgentRuntime(
+        settings=settings,
+        storage=storage,
+        llm=RouterThenAnswerLLM(),
+        bus=EventBus(),
+    )
+
+    async def fake_run(name, arguments=None, **kwargs):
+        raise AssertionError(f"unexpected tool {name}")
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+
+    response = asyncio.run(
+        agent.chat(
+            "Сейчас есть три закрытых шлюза. Один всегда лжёт, второй всегда говорит "
+            "правду, третий отвечает случайно. Найди самый надёжный первый вопрос."
+        )
+    )
+
+    assert response.answer == "Решается логически из условий."
+    assert len(calls) == 2
+    assert "intent-router" in calls[0][0]["content"]
+    storage.close()
+
+
+def test_semantic_router_can_refine_ambiguous_web_query(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    captured = {}
+
+    class RouterLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None):
+            return type(
+                "Result",
+                (),
+                {
+                    "ok": True,
+                    "content": (
+                        '{"route":"web_research","confidence":0.88,'
+                        '"query":"Python release cycle official docs latest",'
+                        '"rationale":"current technical fact"}'
+                    ),
+                    "error": None,
+                },
+            )()
+
+    agent = AgentRuntime(settings=settings, storage=storage, llm=RouterLLM(), bus=EventBus())
+
+    async def fake_run(name, arguments=None, **kwargs):
+        if name == "web.search":
+            captured["query"] = arguments["query"]
+            return _tool_response(
+                name,
+                True,
+                "Web search returned 1 result(s).",
+                {
+                    "results": [
+                        {
+                            "title": "Python releases",
+                            "url": "https://www.python.org/downloads/",
+                            "snippet": "Latest Python release information",
+                        }
+                    ]
+                },
+            )
+        if name == "web.fetch":
+            return _tool_response(
+                name,
+                True,
+                "Fetched URL with HTTP 200.",
+                {"url": arguments["url"], "text": "Latest Python release information"},
+            )
+        raise AssertionError(f"unexpected tool {name}")
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+
+    response = asyncio.run(agent.chat("сейчас какая самая свежая версия Python?"))
+
+    assert captured["query"] == "Python release cycle official docs latest"
+    assert "https://www.python.org/downloads/" in response.answer
+    storage.close()
+
+
 def test_agent_ranks_generic_results_by_youngest(monkeypatch, tmp_path):
     agent, storage = _agent_without_llm(monkeypatch, tmp_path)
     captured = {}

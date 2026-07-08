@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import uuid
 from collections.abc import AsyncIterator
@@ -103,6 +104,14 @@ class NativeAction:
     payload: dict[str, Any]
     answer: str
     fallback: NativeAction | None = None
+
+
+@dataclass(frozen=True)
+class IntentDecision:
+    route: str
+    confidence: float = 0.0
+    query: str | None = None
+    rationale: str = ""
 
 
 class AgentRuntime:
@@ -592,6 +601,16 @@ class AgentRuntime:
 
         research_query = _web_research_query_from_message(message)
         if research_query is not None:
+            intent = await self._semantic_intent_decision(
+                message,
+                context=context,
+                heuristic_route="web_research",
+                heuristic_query=research_query,
+            )
+            if intent and intent.route in {"reasoning", "chat"} and intent.confidence >= 0.55:
+                return None
+            if intent and intent.route == "web_research" and intent.query:
+                research_query = intent.query
             return await self._run_web_research(
                 message,
                 research_query,
@@ -614,6 +633,35 @@ class AgentRuntime:
             )
 
         return None
+
+    async def _semantic_intent_decision(
+        self,
+        message: str,
+        *,
+        context: AgentContext,
+        heuristic_route: str,
+        heuristic_query: str | None = None,
+    ) -> IntentDecision | None:
+        if not _should_use_semantic_router(message, heuristic_route):
+            return None
+        recent_user_messages = [
+            item["content"]
+            for item in self.storage.recent_messages(context.conversation_id, limit=6)
+            if item.get("role") == "user"
+        ][-3:]
+        result = await self.llm.complete(
+            _intent_router_messages(
+                message=message,
+                recent_user_messages=recent_user_messages,
+                heuristic_route=heuristic_route,
+                heuristic_query=heuristic_query,
+            ),
+            temperature=0.0,
+            max_tokens=180,
+        )
+        if not result.ok or not result.content:
+            return None
+        return _parse_intent_decision(result.content)
 
     async def _run_web_research(
         self,
@@ -1160,6 +1208,122 @@ def _runtime_date_context() -> str:
             "hardware support, security status, news or anything after early 2026, "
             "use web tools first.",
         ]
+    )
+
+
+def _should_use_semantic_router(message: str, heuristic_route: str) -> bool:
+    if heuristic_route != "web_research":
+        return False
+    normalized = message.lower()
+    if _contains_any(
+        normalized,
+        (
+            "загугли",
+            "погугли",
+            "в интернете",
+            "в сети",
+            "site:",
+            "http://",
+            "https://",
+        ),
+    ):
+        return False
+    if _looks_like_shopping_query(normalized) or _looks_like_travel_query(normalized):
+        return False
+    if _looks_like_place_lookup_query(normalized) or _looks_like_osint_query(normalized):
+        return False
+    ambiguous_markers = (
+        "сейчас",
+        "текущая ситуация",
+        "твоя задача",
+        "обоснуй",
+        "исключительно",
+        "представь",
+        "допустим",
+        "сценар",
+        "дилемм",
+        "если ",
+        "самый",
+        "самая",
+        "логическ",
+        "ошибк",
+        "приоритет",
+        "выбери",
+        "распредели",
+    )
+    return len(message) > 280 or _contains_any(normalized, ambiguous_markers)
+
+
+def _intent_router_messages(
+    *,
+    message: str,
+    recent_user_messages: list[str],
+    heuristic_route: str,
+    heuristic_query: str | None,
+) -> list[dict[str, str]]:
+    today = date.today().isoformat()
+    history = "\n".join(f"- {item[:500]}" for item in recent_user_messages[:-1])
+    if not history:
+        history = "- none"
+    return [
+        {
+            "role": "system",
+            "content": (
+                "Ты компактный intent-router для локального агента Jarvis. "
+                "Верни только JSON без markdown. Поля: route, confidence, query, rationale. "
+                "route: web_research | reasoning | local_action | mission | chat.\n"
+                "web_research: нужны внешние, актуальные, проверяемые факты, цены, расписания, "
+                "версии, новости, публичные источники.\n"
+                "reasoning: пользователь дал гипотетический/ролевой/логический/этический "
+                "сценарий и просит рассуждать по условиям задачи; web не нужен.\n"
+                "local_action: надо управлять ОС/GUI/файлами/консолью.\n"
+                "mission: крупная реальная задача на несколько исполнимых шагов.\n"
+                "chat: обычный ответ без инструментов.\n"
+                "Если есть сомнение между web_research и reasoning, выбирай reasoning, "
+                "когда все необходимые факты уже заданы в сообщении. "
+                "Если выбираешь web_research, query должен быть коротким поисковым запросом."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"current_date: {today}\n"
+                f"heuristic_route: {heuristic_route}\n"
+                f"heuristic_query: {heuristic_query or ''}\n"
+                f"recent_user_messages:\n{history}\n\n"
+                f"message:\n{message[:2400]}"
+            ),
+        },
+    ]
+
+
+def _parse_intent_decision(content: str) -> IntentDecision | None:
+    text = content.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if match:
+        text = match.group(0)
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    route = str(data.get("route") or "").strip().lower()
+    allowed = {"web_research", "reasoning", "local_action", "mission", "chat"}
+    if route not in allowed:
+        return None
+    try:
+        confidence = float(data.get("confidence") or 0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    return IntentDecision(
+        route=route,
+        confidence=max(0.0, min(1.0, confidence)),
+        query=str(data.get("query") or "").strip() or None,
+        rationale=str(data.get("rationale") or "").strip(),
     )
 
 
