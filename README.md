@@ -14,6 +14,7 @@
 - Self-learning tick: аудит, tool runs и approvals превращаются в долговременные lessons.
 - Operator persona: durable structured profile (роль, домашний город, языки, стек, увлечения, текущий фокус, постоянные правила «всегда/никогда», глоссарий) читается агентом в каждом ответе.
 - Reasoning-first понимание задачи: для fuzzy web-запросов агент спрашивает модель (`_understand_intent`), которая понимает интент по смыслу и профилю оператора, а не по ключевым словам; `_looks_like_*`-эвристики остаются детерминированным офлайн-фолбэком.
+- Агентный tool-loop: на пути ответа модель сама вызывает безопасные инструменты (web.search/fetch, filesystem/docker/runtime read, ...), видит observation и продолжает до готовности; опасные инструменты уходят в HITL-approval, бюджет шагов — из autonomy policy. Протокол JSON-act поверх обычных completions, деградирует без нативного tool-calling.
 - Retrieval adds normalized relevance, matched terms and snippets for memory/file context.
 - Learning tick deduplicates repeated lessons before writing long-term memory.
 - Autonomous supervisor: безопасный фоновой цикл собирает telemetry и запускает learning tick.

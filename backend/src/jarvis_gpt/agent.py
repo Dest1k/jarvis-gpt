@@ -24,6 +24,7 @@ from .models import (
     Mission,
     MissionExecutionResponse,
     MissionTask,
+    ToolInfo,
     ToolRunResponse,
 )
 from .storage import JarvisStorage
@@ -92,6 +93,13 @@ THINKING_DISABLED_PROMPT = (
 )
 
 
+FINAL_ANSWER_PROMPT = (
+    "Лимит шагов с инструментами исчерпан. Дай финальный ответ оператору по-русски на "
+    "основе собранных observation. Не вызывай больше инструменты и не выводи JSON. Если "
+    "данных не хватило, честно скажи, что именно не подтверждено."
+)
+
+
 MISSION_MARKERS = (
     "мисси",
     "mission",
@@ -103,6 +111,12 @@ MISSION_MARKERS = (
     "переосмысл",
     "реализ",
 )
+
+# Agentic tool loop: how many tool rounds the model may take before it must
+# answer, and which safe tools are withheld from autonomous use because they
+# mutate durable state rather than gather facts.
+DEFAULT_MAX_TOOL_STEPS = 4
+AGENTIC_TOOL_DENYLIST = frozenset({"memory.save", "learning.tick", "mission.brief"})
 
 
 @dataclass
@@ -167,6 +181,16 @@ class NativeAction:
     payload: dict[str, Any]
     answer: str
     fallback: NativeAction | None = None
+
+
+@dataclass
+class _AgenticResult:
+    ok: bool
+    answer: str
+    events: list[ChatEvent]
+    finish_reason: str | None = None
+    error: str | None = None
+    used_tools: int = 0
 
 
 def _normalize_chat_attachments(attachments: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
@@ -301,6 +325,56 @@ class _ThinkBlockFilter:
         tail = self._buffer
         self._buffer = ""
         return tail
+
+
+class _ToolActionSniffer:
+    """Classify a streamed completion as a tool-call JSON or a normal answer.
+
+    The agentic protocol asks the model to emit ONLY a JSON object when it wants
+    a tool. So we watch the first meaningful character: ``{`` means a tool call
+    (suppress the stream, buffer the JSON), anything else means a normal answer
+    (emit and pass through token by token). This keeps real answers streaming
+    with no extra completion while still supporting tools. When thinking is
+    disabled we also strip ``<think>`` from the visible output.
+    """
+
+    def __init__(self, *, thinking_enabled: bool) -> None:
+        self._raw = ""
+        self._mode: str | None = None
+        self._pending = ""
+        self._think = None if thinking_enabled else _ThinkBlockFilter()
+
+    def push(self, chunk: str) -> tuple[str, str | None]:
+        self._raw += chunk
+        visible = self._think.push(chunk) if self._think else chunk
+        if self._mode == "answer":
+            return visible, "answer"
+        if self._mode == "tool":
+            return "", "tool"
+        self._pending += visible
+        stripped = self._pending.lstrip()
+        if not stripped:
+            return "", None
+        if stripped[0] == "{":
+            self._mode = "tool"
+            self._pending = ""
+            return "", "tool"
+        self._mode = "answer"
+        out = self._pending
+        self._pending = ""
+        return out, "answer"
+
+    def finish(self) -> tuple[str, str]:
+        if self._mode == "tool":
+            return "", "tool"
+        tail = self._think.flush() if self._think else ""
+        pending = self._pending
+        self._pending = ""
+        return f"{pending}{tail}", "answer"
+
+    @property
+    def raw(self) -> str:
+        return self._raw
 
 
 @dataclass(frozen=True)
@@ -453,15 +527,17 @@ class AgentRuntime:
             )
         )
         await self._emit(events[-1])
-        result = await self._complete_llm(
+        agentic = await self._agentic_answer(
             llm_messages,
+            context,
             temperature=temperature,
             max_tokens=max_tokens,
             thinking_enabled=thinking_enabled,
         )
-        if result.ok and result.content:
-            answer = _clean_assistant_answer(result.content)
-            finish_reason = _finish_reason_from_llm_result(result)
+        events.extend(agentic.events)
+        if agentic.ok and agentic.answer:
+            answer = agentic.answer
+            finish_reason = agentic.finish_reason
             if finish_reason == "length":
                 effective_max_tokens = max_tokens or self.settings.llm_max_tokens
                 answer = (
@@ -473,16 +549,20 @@ class AgentRuntime:
                 ChatEvent(
                     type="assistant_done",
                     title="Ответ получен",
-                    payload={"source": "llm", "finish_reason": finish_reason},
+                    payload={
+                        "source": "llm",
+                        "finish_reason": finish_reason,
+                        "tool_steps": agentic.used_tools,
+                    },
                 )
             )
         else:
-            answer = self._offline_answer(message, result.error)
+            answer = self._offline_answer(message, agentic.error)
             events.append(
                 ChatEvent(
                     type="assistant_done",
                     title="Offline fallback",
-                    content=result.error,
+                    content=agentic.error,
                     payload={"source": "fallback"},
                 )
             )
@@ -652,30 +732,84 @@ class AgentRuntime:
         answer_parts: list[str] = []
         stream_error: str | None = None
         stream_finish_reason: str | None = None
-        think_filter = _ThinkBlockFilter() if not thinking_enabled else None
-        async for chunk in self._stream_llm(
-            llm_messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            thinking_enabled=thinking_enabled,
-        ):
-            if chunk.kind == "delta" and chunk.content:
-                content = think_filter.push(chunk.content) if think_filter else chunk.content
-                if not content:
-                    continue
-                answer_parts.append(content)
-                yield {"type": "delta", "content": content}
-            elif chunk.kind == "error":
-                stream_error = chunk.error
-                break
-            elif chunk.kind == "done":
-                stream_finish_reason = getattr(chunk, "finish_reason", None)
-                break
-        if think_filter:
-            tail = think_filter.flush()
-            if tail:
-                answer_parts.append(tail)
-                yield {"type": "delta", "content": tail}
+        used_tools = 0
+        tools = self._autonomous_tools()
+        allowed = {info.name for info in tools}
+        messages = list(llm_messages)
+        if tools:
+            messages.append({"role": "system", "content": _tool_protocol_prompt(tools)})
+        max_steps = self._max_tool_steps() if tools else 0
+
+        for step in range(max_steps + 1):
+            force_final = bool(tools) and step == max_steps
+            sniff = bool(tools) and not force_final
+            round_messages = messages
+            if force_final:
+                round_messages = [*messages, {"role": "system", "content": FINAL_ANSWER_PROMPT}]
+            sniffer = _ToolActionSniffer(thinking_enabled=thinking_enabled) if sniff else None
+            think_filter = (
+                _ThinkBlockFilter() if (not thinking_enabled and sniffer is None) else None
+            )
+            round_error: str | None = None
+            round_finish: str | None = None
+            async for chunk in self._stream_llm(
+                round_messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                thinking_enabled=thinking_enabled,
+            ):
+                if chunk.kind == "delta" and chunk.content:
+                    if sniffer is not None:
+                        emit, mode = sniffer.push(chunk.content)
+                        if mode == "answer" and emit:
+                            answer_parts.append(emit)
+                            yield {"type": "delta", "content": emit}
+                    else:
+                        content = (
+                            think_filter.push(chunk.content) if think_filter else chunk.content
+                        )
+                        if not content:
+                            continue
+                        answer_parts.append(content)
+                        yield {"type": "delta", "content": content}
+                elif chunk.kind == "error":
+                    round_error = chunk.error
+                    break
+                elif chunk.kind == "done":
+                    round_finish = getattr(chunk, "finish_reason", None)
+                    break
+
+            if sniffer is not None:
+                tail, mode = sniffer.finish()
+                if mode == "tool" and not round_error:
+                    action = _parse_tool_action(sniffer.raw)
+                    if action is not None:
+                        observation, event = await self._run_agentic_tool(
+                            *action, allowed, context
+                        )
+                        await self._emit(event)
+                        events.append(event)
+                        yield {"type": "event", "event": event.model_dump()}
+                        used_tools += 1
+                        messages.append({"role": "assistant", "content": sniffer.raw})
+                        messages.append({"role": "user", "content": observation})
+                        continue
+                    stray = _clean_assistant_answer(sniffer.raw)
+                    if stray:
+                        answer_parts.append(stray)
+                        yield {"type": "delta", "content": stray}
+                elif tail:
+                    answer_parts.append(tail)
+                    yield {"type": "delta", "content": tail}
+            elif think_filter:
+                tail = think_filter.flush()
+                if tail:
+                    answer_parts.append(tail)
+                    yield {"type": "delta", "content": tail}
+
+            stream_error = round_error
+            stream_finish_reason = round_finish
+            break
 
         if answer_parts:
             answer = _clean_assistant_answer("".join(answer_parts).strip())
@@ -699,6 +833,7 @@ class AgentRuntime:
                         "source": "llm",
                         "stream": True,
                         "finish_reason": stream_finish_reason,
+                        "tool_steps": used_tools,
                     },
                 )
             )
@@ -1632,6 +1767,152 @@ class AgentRuntime:
         if _supports_keyword(self.llm.stream_complete, "thinking_enabled"):
             kwargs["thinking_enabled"] = thinking_enabled
         return self.llm.stream_complete(messages, **kwargs)
+
+    def _autonomous_tools(self) -> list[ToolInfo]:
+        if not self.settings.llm_enabled:
+            return []
+        policy = self.storage.get_runtime_value("experience.autonomy_policy", {})
+        if isinstance(policy, dict) and policy.get("allow_safe_tools") is False:
+            return []
+        return [
+            info
+            for info in self.tools.list()
+            if info.danger_level == "safe" and info.name not in AGENTIC_TOOL_DENYLIST
+        ]
+
+    def _max_tool_steps(self) -> int:
+        policy = self.storage.get_runtime_value("experience.autonomy_policy", {})
+        steps = DEFAULT_MAX_TOOL_STEPS
+        if isinstance(policy, dict):
+            try:
+                steps = int(policy.get("max_autonomous_steps", DEFAULT_MAX_TOOL_STEPS))
+            except (TypeError, ValueError):
+                steps = DEFAULT_MAX_TOOL_STEPS
+        return max(1, min(8, steps))
+
+    async def _run_agentic_tool(
+        self,
+        name: str,
+        args: dict[str, Any],
+        allowed: set[str],
+        context: AgentContext,
+    ) -> tuple[str, ChatEvent]:
+        if name not in allowed:
+            spec = self.tools.get(name)
+            if spec is None:
+                observation = (
+                    f"observation[{name} · error]: инструмент не существует. "
+                    f"Доступны: {', '.join(sorted(allowed))}."
+                )
+                return observation, ChatEvent(
+                    type="thought",
+                    title="Tool rejected",
+                    content=f"Unknown tool requested: {name}",
+                    payload={"tool": name},
+                )
+            gate = self.storage.create_approval(
+                title=f"Автономный запрос инструмента {name}",
+                description=(
+                    f"Модель хочет вызвать {name} ({spec.danger_level}) во время ответа "
+                    f"оператору {context.conversation_id}."
+                ),
+                requested_action="tool.run",
+                risk=spec.danger_level if spec.danger_level in {"review", "danger"} else "review",
+                payload={"tool": name, "arguments": args},
+            )
+            observation = (
+                f"observation[{name} · blocked]: инструмент требует подтверждения оператора; "
+                f"создан approval {gate['id']}. Ответь по доступным данным или предложи "
+                "оператору подтвердить этот шаг."
+            )
+            return observation, ChatEvent(
+                type="approval",
+                title=f"Approval requested: {name}",
+                content=f"Autonomous tool {name} needs operator approval.",
+                payload={"approval_id": gate["id"], "tool": name, "risk": spec.danger_level},
+            )
+        result = await self.tools.run(name, args)
+        event = ChatEvent(
+            type="tool_call",
+            title=name,
+            content=result.summary,
+            payload={"tool": name, "ok": result.ok, "autonomous": True},
+        )
+        return _tool_observation_excerpt(result), event
+
+    async def _agentic_answer(
+        self,
+        base_messages: list[dict[str, str]],
+        context: AgentContext,
+        *,
+        temperature: float | None,
+        max_tokens: int | None,
+        thinking_enabled: bool,
+    ) -> _AgenticResult:
+        tools = self._autonomous_tools()
+        events: list[ChatEvent] = []
+        if not tools:
+            result = await self._complete_llm(
+                base_messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                thinking_enabled=thinking_enabled,
+            )
+            if not result.ok or not result.content:
+                return _AgenticResult(ok=False, answer="", events=events, error=result.error)
+            return _AgenticResult(
+                ok=True,
+                answer=_clean_assistant_answer(result.content),
+                events=events,
+                finish_reason=_finish_reason_from_llm_result(result),
+            )
+
+        allowed = {info.name for info in tools}
+        messages = [*base_messages, {"role": "system", "content": _tool_protocol_prompt(tools)}]
+        used_tools = 0
+        for _step in range(self._max_tool_steps()):
+            result = await self._complete_llm(
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                thinking_enabled=thinking_enabled,
+            )
+            if not result.ok:
+                if used_tools == 0:
+                    return _AgenticResult(ok=False, answer="", events=events, error=result.error)
+                break
+            action = _parse_tool_action(result.content)
+            if action is None:
+                return _AgenticResult(
+                    ok=True,
+                    answer=_clean_assistant_answer(result.content),
+                    events=events,
+                    finish_reason=_finish_reason_from_llm_result(result),
+                    used_tools=used_tools,
+                )
+            observation, event = await self._run_agentic_tool(*action, allowed, context)
+            await self._emit(event)
+            events.append(event)
+            used_tools += 1
+            messages.append({"role": "assistant", "content": result.content})
+            messages.append({"role": "user", "content": observation})
+
+        messages.append({"role": "system", "content": FINAL_ANSWER_PROMPT})
+        result = await self._complete_llm(
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            thinking_enabled=thinking_enabled,
+        )
+        if result.ok and result.content:
+            return _AgenticResult(
+                ok=True,
+                answer=_clean_assistant_answer(result.content),
+                events=events,
+                finish_reason=_finish_reason_from_llm_result(result),
+                used_tools=used_tools,
+            )
+        return _AgenticResult(ok=False, answer="", events=events, error=result.error)
 
     def _build_llm_messages(
         self,
@@ -2676,6 +2957,82 @@ def _parse_intent_decision(content: str) -> IntentDecision | None:
         query=str(data.get("query") or "").strip() or None,
         rationale=str(data.get("rationale") or "").strip(),
     )
+
+
+def _tool_protocol_prompt(tools: list[ToolInfo]) -> str:
+    lines = [
+        "У тебя есть инструменты для сбора фактов и локальной проверки. Пользуйся ими "
+        "ТОЛЬКО если без свежих внешних данных или реального осмотра системы честный ответ "
+        "невозможен. Если можешь ответить по знаниям и контексту — отвечай сразу текстом.",
+        "Чтобы вызвать инструмент, верни РОВНО одну строку JSON и больше ничего: "
+        '{"tool": "<имя>", "arguments": { ... }}',
+        "После вызова ты получишь observation с результатом. Повторяй вызовы, пока не "
+        "соберёшь достаточно, затем дай финальный ответ обычным текстом. Не выдумывай "
+        "результаты инструментов и не показывай сырые observation оператору.",
+        "Доступные инструменты:",
+    ]
+    for tool in tools:
+        lines.append(f"- {tool.name}({_schema_hint(tool.input_schema)}): {tool.description}")
+    return "\n".join(lines)
+
+
+def _schema_hint(schema: dict[str, Any]) -> str:
+    if not isinstance(schema, dict):
+        return ""
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return ""
+    required = schema.get("required")
+    required_set = {str(item) for item in required} if isinstance(required, list) else set()
+    parts = []
+    for name in list(properties.keys())[:6]:
+        parts.append(str(name) if name in required_set else f"{name}?")
+    return ", ".join(parts)
+
+
+def _parse_tool_action(content: str) -> tuple[str, dict[str, Any]] | None:
+    """Parse a tool-call JSON emitted by the model, or None for a normal answer.
+
+    To avoid hijacking a prose answer that merely contains an example JSON, the
+    message must start with the JSON object (optionally fenced).
+    """
+
+    text = content.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text).strip()
+    if not text.startswith("{"):
+        return None
+    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if not match:
+        return None
+    try:
+        data = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    name = data.get("tool") or data.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    args = data.get("arguments")
+    if not isinstance(args, dict):
+        args = data.get("args") if isinstance(data.get("args"), dict) else {}
+    return name.strip(), args
+
+
+def _tool_observation_excerpt(result: ToolRunResponse, *, max_chars: int = 1400) -> str:
+    status = "ok" if result.ok else "error"
+    payload = ""
+    if isinstance(result.data, dict) and result.data:
+        try:
+            payload = json.dumps(result.data, ensure_ascii=False)[:max_chars]
+        except (TypeError, ValueError):
+            payload = _short_value(str(result.data), max_chars)
+    body = f"observation[{result.tool} · {status}]: {result.summary}"
+    if payload:
+        body = f"{body}\ndata: {payload}"
+    return body
 
 
 def _web_research_query_from_message(
