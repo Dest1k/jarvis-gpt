@@ -11,8 +11,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-MAX_BODY_BYTES = 32_768
-MAX_COMMAND_CHARS = 8_000
+MAX_BODY_BYTES = 65_536
+MAX_COMMAND_CHARS = 30_000
 MAX_OUTPUT_CHARS = 40_000
 
 

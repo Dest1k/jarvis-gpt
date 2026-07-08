@@ -4,6 +4,7 @@ import inspect
 import ipaddress
 import json
 import math
+import re
 import shutil
 import socket
 import subprocess
@@ -305,6 +306,26 @@ class ToolRegistry:
                     "timeout_sec": "1-120 second timeout",
                 },
                 handler=_host_bridge_execute,
+                danger_level="danger",
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="windows.native",
+                description=(
+                    "Perform native Windows actions through WMI/CIM, WinAPI window focus, "
+                    "process launch and GUI text/key input via the local host bridge."
+                ),
+                category="host",
+                input_schema={
+                    "action": (
+                        "capabilities, process.start, app.open_and_type, window.focus, "
+                        "window.list, keyboard.send or wmi.query"
+                    ),
+                    "payload": "Structured action payload",
+                    "timeout_sec": "1-120 second timeout",
+                },
+                handler=_windows_native,
                 danger_level="danger",
             )
         )
@@ -685,6 +706,43 @@ async def _host_bridge_execute(ctx: ToolContext, args: dict[str, Any]) -> ToolRu
     )
 
 
+async def _windows_native(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    action = str(args.get("action") or "capabilities").strip().lower()
+    payload = args.get("payload")
+    if not isinstance(payload, dict):
+        payload = {}
+    try:
+        command = _windows_native_command(action, payload)
+    except ValueError as exc:
+        return ToolRunResponse(tool="windows.native", ok=False, summary=str(exc))
+
+    timeout_sec = _int_arg(args.get("timeout_sec"), default=30, minimum=1, maximum=120)
+    result = await HostBridgeClient(ctx.settings).execute(
+        command=command,
+        timeout_sec=timeout_sec,
+    )
+    bridge_data = result.get("data") if isinstance(result.get("data"), dict) else result
+    stdout = bridge_data.get("stdout", "") if isinstance(bridge_data, dict) else ""
+    native = _parse_native_stdout(stdout)
+    ok = bool(result.get("ok")) and bool(native.get("ok", True))
+    summary = str(
+        native.get("summary")
+        or result.get("summary")
+        or f"Native Windows action {action} finished."
+    )
+    return ToolRunResponse(
+        tool="windows.native",
+        ok=ok,
+        summary=summary,
+        data={
+            "action": action,
+            "payload": _redact_native_payload(payload),
+            "native": native,
+            "bridge": bridge_data,
+        },
+    )
+
+
 async def _browser_open(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     policy = OperationsManager(settings=ctx.settings, storage=ctx.storage).browser_policy()
     try:
@@ -1062,6 +1120,315 @@ def _filesystem_write_text(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRes
             "size": path.stat().st_size,
         },
     )
+
+
+WINDOWS_NATIVE_ACTIONS = {
+    "capabilities",
+    "process.start",
+    "app.open_and_type",
+    "window.focus",
+    "window.list",
+    "keyboard.send",
+    "wmi.query",
+}
+
+WINDOWS_NATIVE_SCRIPT = r"""
+function Out($Ok, $Summary, $Data) {
+  [pscustomobject]@{
+    ok = $Ok
+    summary = $Summary
+    action = $Action
+    data = $Data
+  } | ConvertTo-Json -Depth 8 -Compress
+}
+
+try {
+  if ($Action -eq 'capabilities') {
+    Out $true 'Native Windows layer is available.' @{
+      wmi = $true
+      cim = $true
+      winapi = $true
+      windowFocus = $true
+      keyboard = $true
+      clipboard = $true
+      process = $true
+    }
+    exit 0
+  }
+
+  Add-Type -AssemblyName System.Windows.Forms
+  Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class JWin {
+  [DllImport("user32.dll")]
+  public static extern bool SetForegroundWindow(IntPtr hWnd);
+  [DllImport("user32.dll")]
+  public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
+}
+'@
+
+  function Val($Value, $Default) {
+    if ($null -eq $Value -or $Value -eq '') {
+      return $Default
+    }
+    return $Value
+  }
+
+  function Focus($Pid, $Name, $Title) {
+    $p = $null
+    if ($Pid) {
+      $p = Get-Process -Id $Pid -ErrorAction SilentlyContinue
+    }
+    if (-not $p -and $Name) {
+      $p = Get-Process -Name $Name -ErrorAction SilentlyContinue |
+        Where-Object { $_.MainWindowHandle -ne 0 } |
+        Select-Object -First 1
+    }
+    if (-not $p -and $Title) {
+      $p = Get-Process -ErrorAction SilentlyContinue |
+        Where-Object {
+          $_.MainWindowTitle -like "*$Title*" -and $_.MainWindowHandle -ne 0
+        } |
+        Select-Object -First 1
+    }
+    if ($p -and $p.MainWindowHandle -ne 0) {
+      [void][JWin]::ShowWindowAsync($p.MainWindowHandle, 9)
+      Start-Sleep -Milliseconds 120
+      [void][JWin]::SetForegroundWindow($p.MainWindowHandle)
+      Start-Sleep -Milliseconds 160
+      return $true
+    }
+    return $false
+  }
+
+  function SendInput($Keys, $Text) {
+    if ($Text) {
+      Set-Clipboard -Value ([string]$Text)
+      Start-Sleep -Milliseconds 80
+      [System.Windows.Forms.SendKeys]::SendWait('^v')
+      Start-Sleep -Milliseconds 80
+    }
+    if ($Keys) {
+      [System.Windows.Forms.SendKeys]::SendWait([string]$Keys)
+    }
+  }
+
+  switch ($Action) {
+    'process.start' {
+      $p = Start-Process -FilePath $Payload.executable `
+        -ArgumentList @($Payload.arguments) `
+        -PassThru
+      Out $true "Started $($Payload.executable)." @{
+        pid = $p.Id
+        processName = $p.ProcessName
+      }
+      break
+    }
+    'app.open_and_type' {
+      $p = Start-Process -FilePath $Payload.executable `
+        -ArgumentList @($Payload.arguments) `
+        -PassThru
+      Start-Sleep -Milliseconds ([int](Val $Payload.wait_ms 700))
+      $focused = Focus $p.Id $Payload.process_name $Payload.window_title
+      SendInput $Payload.keys $Payload.text
+      Out $true "Opened $($Payload.executable) and sent native input." @{
+        pid = $p.Id
+        focused = $focused
+      }
+      break
+    }
+    'window.focus' {
+      $focused = Focus `
+        $Payload.process_id `
+        $Payload.process_name `
+        $Payload.window_title
+      if ($focused) {
+        $summary = 'Window focused through WinAPI.'
+      } else {
+        $summary = 'Window was not found.'
+      }
+      Out $focused $summary @{ focused = $focused }
+      break
+    }
+    'keyboard.send' {
+      $focused = Focus `
+        $Payload.process_id `
+        $Payload.process_name `
+        $Payload.window_title
+      SendInput $Payload.keys $Payload.text
+      Out $true 'Native keyboard input sent.' @{ focused = $focused }
+      break
+    }
+    'window.list' {
+      $items = Get-Process -ErrorAction SilentlyContinue |
+        Where-Object { $_.MainWindowHandle -ne 0 } |
+        Select-Object -First ([int](Val $Payload.limit 50)) `
+          Id, ProcessName, MainWindowTitle
+      Out $true "Listed $(@($items).Count) visible window(s)." @{
+        windows = $items
+      }
+      break
+    }
+    'wmi.query' {
+      $limit = [int](Val $Payload.limit 20)
+      $props = @($Payload.properties)
+      $base = @{
+        Namespace = $Payload.namespace
+        ClassName = $Payload.class_name
+      }
+      if ($Payload.filter) {
+        $base.Filter = $Payload.filter
+      }
+      $q = Get-CimInstance @base | Select-Object -First $limit
+      if ($props.Count -gt 0) {
+        $q = $q | Select-Object -Property $props
+      }
+      Out $true "WMI/CIM query returned $(@($q).Count) item(s)." @{
+        items = $q
+        className = $Payload.class_name
+        namespace = $Payload.namespace
+      }
+      break
+    }
+    default {
+      throw "Unsupported native action: $Action"
+    }
+  }
+} catch {
+  Out $false $_.Exception.Message @{ error = $_.Exception.Message }
+  exit 1
+}
+"""
+
+
+def _windows_native_command(action: str, payload: dict[str, Any]) -> str:
+    if action not in WINDOWS_NATIVE_ACTIONS:
+        allowed = ", ".join(sorted(WINDOWS_NATIVE_ACTIONS))
+        raise ValueError(f"Unsupported native action: {action}. Allowed: {allowed}.")
+    clean_payload = _validate_native_payload(action, payload)
+    payload_json = json.dumps(clean_payload, ensure_ascii=False, default=str)
+    return "\n".join(
+        [
+            "$ErrorActionPreference='Stop'",
+            f"$Action={_powershell_quote(action)}",
+            f"$Payload={_powershell_quote(payload_json)} | ConvertFrom-Json",
+            WINDOWS_NATIVE_SCRIPT.strip(),
+        ]
+    )
+
+
+def _validate_native_payload(action: str, payload: dict[str, Any]) -> dict[str, Any]:
+    clean = dict(payload)
+    if action in {"process.start", "app.open_and_type"}:
+        executable = _native_string(clean.get("executable"), "executable", max_length=260)
+        clean["executable"] = executable
+        clean["arguments"] = _native_string(
+            clean.get("arguments", ""),
+            "arguments",
+            max_length=1000,
+        )
+    if action == "app.open_and_type":
+        clean["keys"] = _native_string(clean.get("keys", ""), "keys", max_length=1000)
+        clean["text"] = _native_string(clean.get("text", ""), "text", max_length=4000)
+        clean["process_name"] = _native_string(
+            clean.get("process_name", ""),
+            "process_name",
+            max_length=120,
+        )
+        clean["window_title"] = _native_string(
+            clean.get("window_title", ""),
+            "window_title",
+            max_length=200,
+        )
+        clean["wait_ms"] = _int_arg(clean.get("wait_ms"), default=700, minimum=0, maximum=5000)
+    if action in {"window.focus", "keyboard.send"}:
+        clean["process_id"] = _int_arg(
+            clean.get("process_id"),
+            default=0,
+            minimum=0,
+            maximum=999999,
+        )
+        clean["process_name"] = _native_string(
+            clean.get("process_name", ""),
+            "process_name",
+            max_length=120,
+        )
+        clean["window_title"] = _native_string(
+            clean.get("window_title", ""),
+            "window_title",
+            max_length=200,
+        )
+    if action == "keyboard.send":
+        clean["keys"] = _native_string(clean.get("keys", ""), "keys", max_length=1000)
+        clean["text"] = _native_string(clean.get("text", ""), "text", max_length=4000)
+        if not clean["keys"] and not clean["text"]:
+            raise ValueError("keyboard.send requires keys or text.")
+    if action == "window.list":
+        clean["limit"] = _int_arg(clean.get("limit"), default=50, minimum=1, maximum=200)
+    if action == "wmi.query":
+        clean = _validate_wmi_payload(clean)
+    return clean
+
+
+def _validate_wmi_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    namespace = _native_string(payload.get("namespace", "root\\cimv2"), "namespace", max_length=120)
+    class_name = _native_string(payload.get("class_name"), "class_name", max_length=120)
+    if not re.fullmatch(r"[A-Za-z0-9_\\]+", namespace):
+        raise ValueError("WMI namespace contains unsupported characters.")
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", class_name):
+        raise ValueError("WMI class name contains unsupported characters.")
+    raw_properties = payload.get("properties") or []
+    if isinstance(raw_properties, str):
+        raw_properties = [item.strip() for item in raw_properties.split(",") if item.strip()]
+    if not isinstance(raw_properties, list):
+        raise ValueError("WMI properties must be a list or comma-separated string.")
+    properties = []
+    for item in raw_properties[:40]:
+        prop = _native_string(item, "property", max_length=80)
+        if prop and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", prop):
+            raise ValueError("WMI property contains unsupported characters.")
+        if prop:
+            properties.append(prop)
+    filter_text = _native_string(payload.get("filter", ""), "filter", max_length=500)
+    return {
+        "namespace": namespace,
+        "class_name": class_name,
+        "properties": properties,
+        "filter": filter_text,
+        "limit": _int_arg(payload.get("limit"), default=20, minimum=1, maximum=200),
+    }
+
+
+def _native_string(value: Any, field: str, *, max_length: int) -> str:
+    text = str(value or "").strip()
+    if any(char in text for char in ("\r", "\n", "\0")):
+        raise ValueError(f"{field} contains unsupported control characters.")
+    if len(text) > max_length:
+        raise ValueError(f"{field} is too long.")
+    return text
+
+
+def _parse_native_stdout(stdout: str) -> dict[str, Any]:
+    for line in reversed(stdout.splitlines()):
+        candidate = line.strip()
+        if not candidate.startswith("{"):
+            continue
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _redact_native_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    redacted = dict(payload)
+    for key in ("text", "keys"):
+        value = redacted.get(key)
+        if isinstance(value, str) and len(value) > 120:
+            redacted[key] = f"{value[:120]}..."
+    return redacted
 
 
 def _resolve_allowed_path(settings: JarvisSettings, raw_path: str) -> Path:

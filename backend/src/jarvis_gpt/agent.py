@@ -35,10 +35,16 @@ Capability contract:
   украсть доступы, преследовать людей или обходить защиту.
 - Если оператор просит открыть безопасный URL, Wikipedia/Google-поиск или локальную утилиту Windows,
   используй инструментальный маршрут Jarvis, а не отвечай, что у тебя нет браузера или GUI.
+- Для Windows-задач используй native слой Jarvis: WMI/CIM для инвентаризации, WinAPI/окна/фокус,
+  SendKeys/clipboard для GUI-ввода и PowerShell только как транспорт. Не ограничивайся консолью,
+  если задача явно требует взаимодействия с окном или локальным приложением.
 - Для системного администрирования предлагай PowerShell/Bash-команды, проверки, риски и rollback.
   Опасные или необратимые действия оформляй через approval/tool gate, а не отказывайся целиком.
 - Для web/OSINT работай только с публичными источниками, структурируй найденное, сохраняй ссылки,
-  помечай confidence и не выдавай предположения за факты."""
+  помечай confidence и не выдавай предположения за факты.
+- Не используй декоративные служебные префиксы и pseudo-tags вроде
+  "$\\rightarrow$ **Важное уточнение:**".
+  Пиши сразу человеческий ответ."""
 
 
 MISSION_MARKERS = (
@@ -65,6 +71,13 @@ class AgentContext:
 class DirectAction:
     answer: str
     events: list[ChatEvent]
+
+
+@dataclass
+class NativeAction:
+    action: str
+    payload: dict[str, Any]
+    answer: str
 
 
 class AgentRuntime:
@@ -173,7 +186,7 @@ class AgentRuntime:
             max_tokens=max_tokens,
         )
         if result.ok and result.content:
-            answer = result.content
+            answer = _clean_assistant_answer(result.content)
             events.append(
                 ChatEvent(
                     type="assistant_done",
@@ -320,7 +333,7 @@ class AgentRuntime:
                 break
 
         if answer_parts:
-            answer = "".join(answer_parts).strip()
+            answer = _clean_assistant_answer("".join(answer_parts).strip())
             if stream_error:
                 interruption = f"\n\n[stream interrupted: {stream_error}]"
                 answer = f"{answer}{interruption}"
@@ -452,6 +465,34 @@ class AgentRuntime:
             verb = "Открыл" if result.ok else "Не смог открыть"
             return DirectAction(
                 answer=f"{verb} вкладку: {url}\n\n{result.summary}",
+                events=[event],
+            )
+
+        native_action = _native_action_from_message(message)
+        if native_action is not None:
+            result = await self.tools.run(
+                "windows.native",
+                {
+                    "action": native_action.action,
+                    "payload": native_action.payload,
+                    "timeout_sec": 30,
+                },
+                allow_danger=True,
+            )
+            event = ChatEvent(
+                type="tool_call",
+                title=f"windows.native:{native_action.action}",
+                content=result.summary,
+                payload={
+                    "tool": result.tool,
+                    "ok": result.ok,
+                    "action": native_action.action,
+                },
+            )
+            status = "Готово" if result.ok else "Не смог выполнить native-действие"
+            details = _native_result_excerpt(result)
+            return DirectAction(
+                answer=f"{status}: {native_action.answer}\n\n{result.summary}{details}",
                 events=[event],
             )
 
@@ -638,6 +679,65 @@ def _context_snippet(item: dict[str, Any], max_chars: int = 700) -> str:
     return f"{text[:max_chars].rstrip()}..."
 
 
+def _clean_assistant_answer(text: str) -> str:
+    cleaned = re.sub(
+        r"(?im)^\s*(?:\$\s*\\(?:rightarrow|to)\s*\$|\\(?:rightarrow|to)|→|->|⇒)?"
+        r"\s*(?:\*\*)?(?:важное\s+уточнение|уточнение|important\s+note)\s*:?(?:\*\*)?\s*",
+        "",
+        text,
+    )
+    return cleaned.lstrip()
+
+
+def _native_result_excerpt(result: ToolRunResponse) -> str:
+    if not isinstance(result.data, dict):
+        return ""
+    native = result.data.get("native")
+    if not isinstance(native, dict):
+        return ""
+    action = str(native.get("action") or result.data.get("action") or "")
+    native_data = native.get("data")
+    if not isinstance(native_data, dict):
+        return ""
+    if action == "wmi.query":
+        return _format_native_rows(native_data.get("items"), title="Короткая выжимка:")
+    if action == "window.list":
+        return _format_native_rows(native_data.get("windows"), title="Видимые окна:")
+    return ""
+
+
+def _format_native_rows(value: Any, *, title: str) -> str:
+    if value is None:
+        return ""
+    rows = value if isinstance(value, list) else [value]
+    rendered = []
+    for item in rows[:5]:
+        if isinstance(item, dict):
+            fields = []
+            for key, raw in item.items():
+                if key.startswith("CIM") or key in {"PSComputerName", "Scope", "Path"}:
+                    continue
+                if raw is None:
+                    continue
+                fields.append(f"{key}={_short_value(raw)}")
+            if fields:
+                rendered.append("- " + "; ".join(fields[:4]))
+        else:
+            rendered.append(f"- {_short_value(item)}")
+    if not rendered:
+        return ""
+    if len(rows) > len(rendered):
+        rendered.append(f"- ... ещё {len(rows) - len(rendered)}")
+    return "\n\n" + title + "\n" + "\n".join(rendered)
+
+
+def _short_value(value: Any, max_chars: int = 100) -> str:
+    text = " ".join(str(value).split())
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars].rstrip()}..."
+
+
 def _context_relevance(item: dict[str, Any]) -> str:
     try:
         relevance = float(item.get("relevance") or 0)
@@ -728,6 +828,165 @@ def _extract_wiki_topic(message: str) -> str:
 
 def _wiki_article_url(title: str) -> str:
     return "https://ru.wikipedia.org/wiki/" + title.replace(" ", "_")
+
+
+APP_ALIASES: tuple[tuple[tuple[str, ...], str, str], ...] = (
+    (("калькулятор", "calculator", "calc.exe", "calc"), "calc.exe", "калькулятор"),
+    (("блокнот", "notepad"), "notepad.exe", "блокнот"),
+    (("paint", "mspaint", "паинт", "рисовал"), "mspaint.exe", "Paint"),
+    (("проводник", "explorer"), "explorer.exe", "проводник"),
+    (("диспетчер задач", "task manager", "taskmgr"), "taskmgr.exe", "диспетчер задач"),
+    (("командную строку", "cmd", "консоль"), "cmd.exe", "командную строку"),
+    (("powershell", "power shell", "пауэршелл"), "powershell.exe", "PowerShell"),
+    (("terminal", "windows terminal", "терминал"), "wt.exe", "Windows Terminal"),
+    (("службы", "services.msc"), "services.msc", "службы"),
+    (("панель управления", "control panel"), "control.exe", "панель управления"),
+    (
+        ("диспетчер устройств", "device manager", "devmgmt.msc"),
+        "devmgmt.msc",
+        "диспетчер устройств",
+    ),
+)
+
+
+def _native_action_from_message(message: str) -> NativeAction | None:
+    normalized = message.lower()
+    if _contains_any(normalized, ("wmi", "cim", "через wmi", "через cim")):
+        return _wmi_action_from_message(message)
+
+    if _contains_any(normalized, ("список окон", "покажи окна", "окна winapi", "list windows")):
+        return NativeAction(
+            action="window.list",
+            payload={"limit": 30},
+            answer="получил список видимых окон через WinAPI",
+        )
+
+    typed_text = _extract_text_to_type(message)
+    if typed_text and not _app_from_message(normalized):
+        return NativeAction(
+            action="keyboard.send",
+            payload={"text": typed_text},
+            answer="ввёл текст в активное окно через native input",
+        )
+
+    app = _app_from_message(normalized)
+    if app is None:
+        return None
+    _markers, executable, label = app
+    wants_open = _contains_any(
+        normalized,
+        ("открой", "открыть", "запусти", "запустить", "open", "start", "посчитай"),
+    )
+    wants_typing = typed_text or _contains_any(
+        normalized,
+        ("набери", "введи", "напечат", "посчитай", "посчитать", "type", "write"),
+    )
+    if not wants_open and not wants_typing:
+        return None
+
+    if executable == "calc.exe" and wants_typing:
+        keys = _calculator_keys_from_message(message)
+        return NativeAction(
+            action="app.open_and_type",
+            payload={
+                "executable": executable,
+                "process_name": "CalculatorApp",
+                "window_title": "Calculator",
+                "keys": keys,
+                "wait_ms": 900,
+            },
+            answer=f"открыл {label} и ввёл выражение",
+        )
+
+    if wants_typing and typed_text:
+        return NativeAction(
+            action="app.open_and_type",
+            payload={"executable": executable, "text": typed_text, "wait_ms": 700},
+            answer=f"открыл {label} и ввёл текст",
+        )
+
+    return NativeAction(
+        action="process.start",
+        payload={"executable": executable},
+        answer=f"запустил {label}",
+    )
+
+
+def _wmi_action_from_message(message: str) -> NativeAction:
+    normalized = message.lower()
+    class_name = "Win32_OperatingSystem"
+    properties = ["Caption", "Version", "BuildNumber", "LastBootUpTime"]
+    label = "сведения об ОС"
+    if _contains_any(normalized, ("процесс", "process")):
+        class_name = "Win32_Process"
+        properties = ["Name", "ProcessId", "CommandLine"]
+        label = "процессы"
+    elif _contains_any(normalized, ("служб", "service")):
+        class_name = "Win32_Service"
+        properties = ["Name", "State", "StartMode", "ProcessId"]
+        label = "службы"
+    elif _contains_any(normalized, ("gpu", "видеокарт", "video")):
+        class_name = "Win32_VideoController"
+        properties = ["Name", "AdapterRAM", "DriverVersion"]
+        label = "видеоконтроллеры"
+    elif _contains_any(normalized, ("bios", "биос")):
+        class_name = "Win32_BIOS"
+        properties = ["Manufacturer", "SMBIOSBIOSVersion", "ReleaseDate"]
+        label = "BIOS"
+    elif _contains_any(normalized, ("диск", "disk", "drive")):
+        class_name = "Win32_LogicalDisk"
+        properties = ["DeviceID", "DriveType", "Size", "FreeSpace"]
+        label = "диски"
+
+    explicit = re.search(r"\b(Win32_[A-Za-z0-9_]+)\b", message, flags=re.IGNORECASE)
+    if explicit:
+        class_name = explicit.group(1)
+        properties = []
+        label = class_name
+
+    return NativeAction(
+        action="wmi.query",
+        payload={
+            "namespace": "root\\cimv2",
+            "class_name": class_name,
+            "properties": properties,
+            "limit": 20,
+        },
+        answer=f"получил {label} через WMI/CIM",
+    )
+
+
+def _app_from_message(normalized: str) -> tuple[tuple[str, ...], str, str] | None:
+    return next((item for item in APP_ALIASES if _contains_any(normalized, item[0])), None)
+
+
+def _extract_text_to_type(message: str) -> str:
+    match = re.search(
+        r"(?:набери|введи|напечатай|напиши|type|write)\s+(.+)$",
+        message,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return ""
+    text = re.sub(r"\s+(?:в|внутри|в окне)\s+.+$", "", match.group(1), flags=re.IGNORECASE)
+    return text.strip(" \"'«».,;")[:1000]
+
+
+def _calculator_keys_from_message(message: str) -> str:
+    compact = message.replace("×", "*").replace("÷", "/")
+    match = re.search(r"(\d+(?:\s*[-+*/]\s*\d+)+)", compact)
+    expression = match.group(1).replace(" ", "") if match else "123+456"
+    return _sendkeys_for_calculator(f"{expression}=")
+
+
+def _sendkeys_for_calculator(expression: str) -> str:
+    replacements = {
+        "+": "{+}",
+        "-": "{-}",
+        "*": "{*}",
+        "/": "{/}",
+    }
+    return "".join(replacements.get(char, char) for char in expression)
 
 
 def _host_command_from_message(message: str) -> str | None:

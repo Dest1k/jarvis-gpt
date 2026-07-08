@@ -146,10 +146,86 @@ def test_agent_opens_calculator_with_host_bridge(monkeypatch, tmp_path):
     )
 
     response = asyncio.run(agent.chat("открой калькулятор и набери в нём что-нибудь"))
+    runs = storage.list_tool_runs()
 
-    assert "Start-Process calc.exe" in captured["command"]
-    assert "SendKeys" in captured["command"]
-    assert "Выполнил локальную команду" in response.answer
+    assert "app.open_and_type" in captured["command"]
+    assert "calc.exe" in captured["command"]
+    assert "123{+}456=" in captured["command"]
+    assert runs[0]["tool"] == "windows.native"
+    assert "Готово" in response.answer
+    storage.close()
+
+
+def test_agent_types_into_general_windows_app(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    captured = {}
+
+    async def fake_execute(self, command, cwd=None, timeout_sec=30):
+        captured["command"] = command
+        return {"ok": True, "summary": "native input", "data": {"command": command}}
+
+    monkeypatch.setattr("jarvis_gpt.tools.HostBridgeClient.execute", fake_execute)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    agent = AgentRuntime(
+        settings=settings,
+        storage=storage,
+        llm=LLMRouter(settings),
+        bus=EventBus(),
+    )
+
+    response = asyncio.run(agent.chat("открой блокнот и напиши Jarvis online"))
+    runs = storage.list_tool_runs()
+
+    assert "app.open_and_type" in captured["command"]
+    assert "notepad.exe" in captured["command"]
+    assert "Jarvis online" in captured["command"]
+    assert runs[0]["tool"] == "windows.native"
+    assert "Готово" in response.answer
+    storage.close()
+
+
+def test_agent_routes_wmi_requests_to_native_layer(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    captured = {}
+
+    async def fake_execute(self, command, cwd=None, timeout_sec=30):
+        captured["command"] = command
+        return {
+            "ok": True,
+            "summary": "wmi ok",
+            "data": {
+                "stdout": (
+                    '{"ok":true,"summary":"WMI/CIM query returned 1 item(s).",'
+                    '"data":{"items":[{"Name":"python.exe"}]}}'
+                )
+            },
+        }
+
+    monkeypatch.setattr("jarvis_gpt.tools.HostBridgeClient.execute", fake_execute)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    agent = AgentRuntime(
+        settings=settings,
+        storage=storage,
+        llm=LLMRouter(settings),
+        bus=EventBus(),
+    )
+
+    response = asyncio.run(agent.chat("покажи процессы через WMI"))
+    runs = storage.list_tool_runs()
+
+    assert "wmi.query" in captured["command"]
+    assert "Win32_Process" in captured["command"]
+    assert runs[0]["tool"] == "windows.native"
+    assert "WMI/CIM query returned" in response.answer
+    assert "python.exe" in response.answer
     storage.close()
 
 
@@ -250,6 +326,34 @@ class FakeStreamingLLM:
         self.max_tokens = max_tokens
         yield LLMStreamChunk(kind="delta", content="Hello")
         yield LLMStreamChunk(kind="delta", content=" world")
+
+
+class FakeTaggedStreamingLLM:
+    async def stream_complete(self, messages, *, temperature=None, max_tokens=None):
+        yield LLMStreamChunk(kind="delta", content="$\\rightarrow$ **Важное уточнение:** ")
+        yield LLMStreamChunk(kind="delta", content="готово без служебного префикса")
+
+
+def test_agent_cleans_service_prefixes_from_streamed_answer(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "1")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    agent = AgentRuntime(
+        settings=settings,
+        storage=storage,
+        llm=FakeTaggedStreamingLLM(),
+        bus=EventBus(),
+    )
+
+    items = asyncio.run(_collect(agent.stream_chat("проверка", mode="chat")))
+    done = next(item for item in items if item["type"] == "done")
+
+    assert "Важное уточнение" not in done["answer"]
+    assert "$\\rightarrow$" not in done["answer"]
+    assert done["answer"] == "готово без служебного префикса"
 
 
 async def _collect(stream):

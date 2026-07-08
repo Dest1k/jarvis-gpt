@@ -35,6 +35,14 @@ class HostBridgeStatus:
             "bundled_script_path": str(bundled_script_path),
             "script_available": script_path.exists(),
             "start_command": f"python {script_path} --port {BRIDGE_PORT}",
+            "native_capabilities": [
+                "wmi.query",
+                "process.start",
+                "window.list",
+                "window.focus",
+                "keyboard.send",
+                "app.open_and_type",
+            ],
         }
 
 

@@ -122,6 +122,74 @@ def test_host_bridge_execute_requires_token(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_windows_native_is_gated_and_uses_winapi_wmi(monkeypatch, tmp_path):
+    class FakeBridgeClient:
+        def __init__(self, _settings):
+            pass
+
+        async def execute(self, *, command, cwd=None, timeout_sec=30):
+            assert cwd is None
+            assert timeout_sec == 30
+            assert "SetForegroundWindow" in command
+            assert "Get-CimInstance" in command
+            assert "Win32_Process" in command
+            return {
+                "ok": True,
+                "summary": "native ok",
+                "data": {
+                    "stdout": (
+                        '{"ok":true,"summary":"WMI/CIM query returned 1 item(s).",'
+                        '"data":{"items":[{"Name":"python.exe"}]}}'
+                    )
+                },
+            }
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr("jarvis_gpt.tools.HostBridgeClient", FakeBridgeClient)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    info = {tool.name: tool for tool in tools.list()}
+    blocked = asyncio.run(
+        tools.run(
+            "windows.native",
+            {
+                "action": "wmi.query",
+                "payload": {
+                    "namespace": "root\\cimv2",
+                    "class_name": "Win32_Process",
+                    "properties": ["Name"],
+                },
+            },
+        )
+    )
+    queried = asyncio.run(
+        tools.run(
+            "windows.native",
+            {
+                "action": "wmi.query",
+                "payload": {
+                    "namespace": "root\\cimv2",
+                    "class_name": "Win32_Process",
+                    "properties": ["Name"],
+                },
+            },
+            allow_danger=True,
+        )
+    )
+
+    assert info["windows.native"].danger_level == "danger"
+    assert blocked.ok is False
+    assert "requires approval" in blocked.summary
+    assert queried.ok is True
+    assert queried.summary == "WMI/CIM query returned 1 item(s)."
+    storage.close()
+
+
 def test_browser_open_is_validated_and_gated(monkeypatch, tmp_path):
     class FakeBridgeClient:
         def __init__(self, _settings):

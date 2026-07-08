@@ -217,6 +217,7 @@ class HostBridgeResponse(BaseModel):
     bundled_script_path: str | None = None
     script_available: bool
     start_command: str
+    native_capabilities: list[str] = Field(default_factory=list)
 
 
 class AutonomyStatusResponse(BaseModel):

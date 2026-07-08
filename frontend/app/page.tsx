@@ -267,6 +267,7 @@ type HostBridgeStatus = {
   token_available: boolean;
   script_available: boolean;
   start_command: string;
+  native_capabilities?: string[];
 };
 
 type AutonomyStatus = {
@@ -623,6 +624,15 @@ function titleFromMessage(message: string) {
   return cleaned.slice(0, 42) + (cleaned.length > 42 ? "..." : "");
 }
 
+function cleanAssistantText(content: string) {
+  return content
+    .replace(
+      /^\s*(?:\$\s*\\(?:rightarrow|to)\s*\$|\\(?:rightarrow|to)|→|->|⇒)?\s*(?:\*\*)?(?:важное\s+уточнение|уточнение|important\s+note)\s*:?(?:\*\*)?\s*/i,
+      ""
+    )
+    .trimStart();
+}
+
 export default function CommandCenter() {
   const [status, setStatus] = useState<RuntimeStatus | null>(null);
   const [conversations, setConversations] = useState<ConversationItem[]>([]);
@@ -687,6 +697,7 @@ export default function CommandCenter() {
   const [error, setError] = useState<string | null>(null);
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const voiceBaseInputRef = useRef("");
+  const transcriptRef = useRef<HTMLDivElement | null>(null);
 
   const activeChatWindow = useMemo(
     () => chatWindows.find((window) => window.id === activeChatWindowId) ?? chatWindows[0],
@@ -695,6 +706,7 @@ export default function CommandCenter() {
   const input = activeChatWindow?.input ?? "";
   const conversationId = activeChatWindow?.conversationId ?? null;
   const lines = activeChatWindow?.lines ?? bootLines();
+  const latestLine = lines[lines.length - 1];
 
   const updateChatWindow = useCallback((id: string, updater: (window: ChatWindow) => ChatWindow) => {
     setChatWindows((current) => current.map((window) => (window.id === id ? updater(window) : window)));
@@ -856,6 +868,15 @@ export default function CommandCenter() {
       JSON.stringify({ activeTab, chatHeight, maxTokens })
     );
   }, [activeTab, chatHeight, maxTokens]);
+
+  useEffect(() => {
+    const node = transcriptRef.current;
+    if (!node) return;
+    const frame = window.requestAnimationFrame(() => {
+      node.scrollTo({ top: node.scrollHeight, behavior: "smooth" });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [activeChatWindowId, lines.length, latestLine?.content]);
 
   useEffect(() => {
     const compactWindows = chatWindows.slice(0, 8).map((window) => ({
@@ -1879,11 +1900,11 @@ export default function CommandCenter() {
                 </div>
               ))}
             </div>
-            <div className="transcript">
+            <div className="transcript" ref={transcriptRef}>
               {lines.map((line, index) => (
                 <article className={`bubble ${line.role}`} key={line.id ?? `${line.role}-${index}`}>
                   <span>{line.role}</span>
-                  <p>{line.content}</p>
+                  <p>{line.role === "assistant" ? cleanAssistantText(line.content) : line.content}</p>
                 </article>
               ))}
             </div>
@@ -2277,7 +2298,10 @@ export default function CommandCenter() {
                 <Server size={14} />
                 <strong>Host bridge</strong>
                 <span>{hostBridge?.port_open ? "online" : "offline"}</span>
-                <small>{hostBridge?.token_available ? "token" : "no token"}</small>
+                <small>
+                  {hostBridge?.token_available ? "token" : "no token"} ·{" "}
+                  {hostBridge?.native_capabilities?.length ?? 0} native
+                </small>
               </div>
               <form className="hostCommandForm" onSubmit={requestHostCommandApproval}>
                 <input
