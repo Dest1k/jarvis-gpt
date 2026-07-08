@@ -3,7 +3,7 @@ param(
   [string]$Action = "status",
   [string]$HomePath = "D:\jarvis",
   [string]$ModelRoot = "D:\jarvis\data\models",
-  [string]$Profile = "gemma4-mono"
+  [string]$Profile = "gemma4-turbo"
 )
 
 $ErrorActionPreference = "Stop"

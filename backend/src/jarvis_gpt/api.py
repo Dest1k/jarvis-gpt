@@ -35,6 +35,7 @@ from .models import (
     ChatRequest,
     ChatResponse,
     DiagnosticsResponse,
+    DispatcherActionResponse,
     DispatcherStatusResponse,
     FileChunkHit,
     FileIngestResponse,
@@ -155,6 +156,25 @@ async def models() -> ModelCatalogResponse:
 @app.get("/api/dispatcher", response_model=DispatcherStatusResponse)
 async def dispatcher() -> DispatcherStatusResponse:
     return app.state.dispatcher.status()
+
+
+@app.post("/api/dispatcher/{action}", response_model=DispatcherActionResponse)
+async def dispatcher_action(action: str) -> DispatcherActionResponse:
+    action_map = {"start": "up", "stop": "down", "logs": "logs"}
+    compose_action = action_map.get(action)
+    if compose_action is None:
+        raise HTTPException(status_code=400, detail="Unsupported dispatcher action")
+    result = app.state.dispatcher.run_compose(compose_action)
+    status_snapshot = app.state.dispatcher.status()
+    await app.state.bus.publish(
+        {
+            "channel": "dispatcher",
+            "action": action,
+            "ok": result["ok"],
+            "status": status_snapshot["container_status"],
+        }
+    )
+    return DispatcherActionResponse.model_validate({**result, "status": status_snapshot})
 
 
 @app.get("/api/telemetry", response_model=TelemetryResponse)

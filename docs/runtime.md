@@ -64,6 +64,8 @@ GET  /health
 GET  /api/status
 GET  /api/models
 GET  /api/dispatcher
+POST /api/dispatcher/start
+POST /api/dispatcher/stop
 GET  /api/telemetry
 GET  /api/host-bridge
 GET  /api/autonomy

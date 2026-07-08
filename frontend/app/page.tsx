@@ -20,6 +20,7 @@ import {
   Server,
   ShieldAlert,
   Sparkles,
+  Square,
   Zap,
   Upload,
   Wrench
@@ -183,6 +184,12 @@ type DispatcherStatus = {
   container_status?: { exists?: boolean; status?: string } | null;
 };
 
+type DispatcherAction = {
+  ok: boolean;
+  summary: string;
+  status: DispatcherStatus;
+};
+
 type TelemetrySnapshot = {
   ts: string;
   host: { hostname: string; platform: string; cpu_count: number };
@@ -330,6 +337,7 @@ export default function CommandCenter() {
   ]);
   const [busy, setBusy] = useState(false);
   const [chatBusy, setChatBusy] = useState(false);
+  const [dispatcherBusy, setDispatcherBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
@@ -478,6 +486,31 @@ export default function CommandCenter() {
       setError(err instanceof Error ? err.message : "Диагностика не ответила");
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function runDispatcherAction(action: "start" | "stop") {
+    if (dispatcherBusy) return;
+    setDispatcherBusy(true);
+    try {
+      const result = await api<DispatcherAction>(`/api/dispatcher/${action}`, {
+        method: "POST",
+        body: "{}"
+      });
+      setDispatcher(result.status);
+      setLines((current) => [
+        ...current,
+        {
+          id: crypto.randomUUID(),
+          role: "system",
+          content: result.summary
+        }
+      ]);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Dispatcher action failed");
+    } finally {
+      setDispatcherBusy(false);
     }
   }
 
@@ -908,6 +941,26 @@ export default function CommandCenter() {
                   <strong>{dispatcher.model}</strong>
                   <span>{dispatcher.port_open ? "online" : "offline"}</span>
                   <small>{dispatcher.container_status?.status ?? "port 8001"}</small>
+                  <div className="dispatcherControls">
+                    <button
+                      type="button"
+                      title="Start dispatcher"
+                      aria-label="Start dispatcher"
+                      disabled={dispatcherBusy || dispatcher.port_open}
+                      onClick={() => runDispatcherAction("start")}
+                    >
+                      {dispatcherBusy ? <Loader2 className="spin" size={14} /> : <Play size={14} />}
+                    </button>
+                    <button
+                      type="button"
+                      title="Stop dispatcher"
+                      aria-label="Stop dispatcher"
+                      disabled={dispatcherBusy || !dispatcher.container_status?.exists}
+                      onClick={() => runDispatcherAction("stop")}
+                    >
+                      <Square size={14} />
+                    </button>
+                  </div>
                 </div>
               )}
               {modelCatalog ? (

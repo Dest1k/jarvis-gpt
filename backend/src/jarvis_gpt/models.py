@@ -155,6 +155,16 @@ class DispatcherStatusResponse(BaseModel):
     env: dict[str, str]
 
 
+class DispatcherActionResponse(BaseModel):
+    ok: bool
+    summary: str
+    returncode: int | None = None
+    stdout: str = ""
+    stderr: str = ""
+    command: list[str] = Field(default_factory=list)
+    status: DispatcherStatusResponse
+
+
 class TelemetryResponse(BaseModel):
     ts: str
     host: dict[str, Any]

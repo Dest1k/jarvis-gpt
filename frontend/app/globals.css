@@ -638,6 +638,10 @@ h3 {
   font-size: 12px;
 }
 
+.dispatcherRow {
+  grid-template-columns: 18px minmax(0, 1fr) auto minmax(64px, 96px) auto;
+}
+
 .modelRow svg,
 .dispatcherRow svg,
 .resourceRow svg,
@@ -683,6 +687,28 @@ h3 {
   text-align: right;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.dispatcherControls {
+  display: flex;
+  gap: 4px;
+  justify-content: flex-end;
+}
+
+.dispatcherControls button {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--graphite);
+}
+
+.dispatcherControls button:hover {
+  border-color: var(--teal);
+  color: var(--teal);
 }
 
 .resourceRow {
