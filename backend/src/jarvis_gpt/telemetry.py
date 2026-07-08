@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import ctypes
 import json
 import os
@@ -7,6 +8,8 @@ import platform
 import shutil
 import socket
 import subprocess
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +20,11 @@ from .storage import utc_now
 class TelemetryCollector:
     def __init__(self, settings: JarvisSettings) -> None:
         self.settings = settings
+        self._cache_lock = threading.Lock()
+        self._gpu_cache: dict[str, Any] | None = None
+        self._gpu_cache_at = 0.0
+        self._docker_cache: dict[str, Any] | None = None
+        self._docker_cache_at = 0.0
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -28,10 +36,71 @@ class TelemetryCollector:
             },
             "memory": _memory_snapshot(),
             "disks": self._disk_snapshot(),
-            "gpu": _nvidia_snapshot(),
-            "docker": _docker_snapshot(),
+            "gpu": self.gpu_snapshot(max_age_sec=0.75),
+            "docker": self.docker_snapshot(max_age_sec=5.0),
             "performance": self.performance_plan(),
         }
+
+    def live_snapshot(self) -> dict[str, Any]:
+        return {
+            "ts": utc_now(),
+            "host": {
+                "hostname": socket.gethostname(),
+                "platform": platform.platform(),
+                "cpu_count": os.cpu_count() or 0,
+            },
+            "memory": _memory_snapshot(),
+            "disks": [],
+            "gpu": self.gpu_snapshot(max_age_sec=0.75),
+            "docker": self.docker_snapshot(max_age_sec=30.0, allow_probe=False),
+            "performance": self.performance_plan(),
+        }
+
+    def gpu_snapshot(self, *, max_age_sec: float = 0.75) -> dict[str, Any]:
+        return self._cached_probe(
+            attr="_gpu_cache",
+            at_attr="_gpu_cache_at",
+            max_age_sec=max_age_sec,
+            probe=_nvidia_snapshot,
+        )
+
+    def docker_snapshot(
+        self,
+        *,
+        max_age_sec: float = 5.0,
+        allow_probe: bool = True,
+    ) -> dict[str, Any]:
+        if not allow_probe:
+            with self._cache_lock:
+                if self._docker_cache is not None:
+                    return copy.deepcopy(self._docker_cache)
+            return {"available": False, "containers": [], "deferred": True}
+        return self._cached_probe(
+            attr="_docker_cache",
+            at_attr="_docker_cache_at",
+            max_age_sec=max_age_sec,
+            probe=_docker_snapshot,
+        )
+
+    def _cached_probe(
+        self,
+        *,
+        attr: str,
+        at_attr: str,
+        max_age_sec: float,
+        probe: Any,
+    ) -> dict[str, Any]:
+        now = time.monotonic()
+        with self._cache_lock:
+            cached = getattr(self, attr)
+            cached_at = float(getattr(self, at_attr))
+            if cached is not None and now - cached_at < max_age_sec:
+                return copy.deepcopy(cached)
+        fresh = probe()
+        with self._cache_lock:
+            setattr(self, attr, copy.deepcopy(fresh))
+            setattr(self, at_attr, time.monotonic())
+        return fresh
 
     def performance_plan(self) -> dict[str, Any]:
         profile = self.settings.profile

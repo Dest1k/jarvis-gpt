@@ -39,6 +39,9 @@ const API_URL = process.env.NEXT_PUBLIC_JARVIS_API_URL ?? "http://localhost:8000
 const CHAT_WINDOWS_KEY = "jarvis-gpt.chatWindows.v1";
 const CHAT_SETTINGS_KEY = "jarvis-gpt.chatSettings.v1";
 const DEFAULT_CHAT_HEIGHT = 680;
+const LIVE_TELEMETRY_INTERVAL_MS = 1000;
+const BACKGROUND_TELEMETRY_INTERVAL_MS = 3000;
+const VITAL_STATUS_INTERVAL_MS = 3000;
 
 type RuntimeStatus = {
   settings: {
@@ -698,6 +701,8 @@ export default function CommandCenter() {
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const voiceBaseInputRef = useRef("");
   const transcriptRef = useRef<HTMLDivElement | null>(null);
+  const vitalsRequestInFlightRef = useRef(false);
+  const telemetryRequestInFlightRef = useRef(false);
 
   const activeChatWindow = useMemo(
     () => chatWindows.find((window) => window.id === activeChatWindowId) ?? chatWindows[0],
@@ -834,20 +839,34 @@ export default function CommandCenter() {
   }, []);
 
   const refreshVitals = useCallback(async () => {
+    if (vitalsRequestInFlightRef.current) return;
+    vitalsRequestInFlightRef.current = true;
     try {
-      const [statusData, dispatcherData, telemetryData] = await Promise.all([
+      const [statusData, dispatcherData] = await Promise.all([
         api<RuntimeStatus>("/api/status"),
-        api<DispatcherStatus>("/api/dispatcher"),
-        api<TelemetrySnapshot>("/api/telemetry")
+        api<DispatcherStatus>("/api/dispatcher")
       ]);
       setStatus(statusData);
       setDispatcher(dispatcherData);
-      setTelemetry(telemetryData);
       if (statusData.health.length) {
         setDiagnostics(statusData.health);
       }
     } catch {
       // The full refresh path owns the visible error state; vitals polling stays quiet.
+    } finally {
+      vitalsRequestInFlightRef.current = false;
+    }
+  }, []);
+
+  const refreshLiveTelemetry = useCallback(async () => {
+    if (telemetryRequestInFlightRef.current) return;
+    telemetryRequestInFlightRef.current = true;
+    try {
+      setTelemetry(await api<TelemetrySnapshot>("/api/telemetry/live"));
+    } catch {
+      // Keep the last known snapshot on transient GPU/driver hiccups.
+    } finally {
+      telemetryRequestInFlightRef.current = false;
     }
   }, []);
 
@@ -858,9 +877,30 @@ export default function CommandCenter() {
   useEffect(() => {
     const interval = window.setInterval(() => {
       void refreshVitals();
-    }, 3000);
+    }, VITAL_STATUS_INTERVAL_MS);
     return () => window.clearInterval(interval);
   }, [refreshVitals]);
+
+  useEffect(() => {
+    let stopped = false;
+    let timer: number | undefined;
+    const poll = () => {
+      if (stopped) return;
+      void refreshLiveTelemetry();
+      const delay =
+        document.visibilityState === "visible"
+          ? LIVE_TELEMETRY_INTERVAL_MS
+          : BACKGROUND_TELEMETRY_INTERVAL_MS;
+      timer = window.setTimeout(poll, delay);
+    };
+    poll();
+    return () => {
+      stopped = true;
+      if (timer !== undefined) {
+        window.clearTimeout(timer);
+      }
+    };
+  }, [refreshLiveTelemetry]);
 
   useEffect(() => {
     localStorage.setItem(

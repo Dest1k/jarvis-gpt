@@ -217,9 +217,14 @@ async def dispatcher_action(action: str) -> DispatcherActionResponse:
 
 @app.get("/api/telemetry", response_model=TelemetryResponse)
 async def telemetry() -> TelemetryResponse:
-    snapshot = app.state.telemetry.snapshot()
+    snapshot = await asyncio.to_thread(app.state.telemetry.snapshot)
     app.state.storage.record_telemetry(snapshot)
     return snapshot
+
+
+@app.get("/api/telemetry/live", response_model=TelemetryResponse)
+async def telemetry_live() -> TelemetryResponse:
+    return await asyncio.to_thread(app.state.telemetry.live_snapshot)
 
 
 @app.post("/api/learning/tick", response_model=LearningTickResponse)

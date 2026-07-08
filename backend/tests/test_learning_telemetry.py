@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 
+import jarvis_gpt.telemetry as telemetry_module
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
 from jarvis_gpt.host_bridge import HostBridgeStatus
 from jarvis_gpt.learning import LearningEngine
@@ -68,6 +69,37 @@ def test_telemetry_performance_plan_and_host_bridge_status(monkeypatch, tmp_path
     assert bridge["bundled_script_path"].replace("\\", "/").endswith(
         "scripts/windows_rpc_bridge.py"
     )
+
+
+def test_live_telemetry_reuses_fast_gpu_cache(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    settings = load_settings("gemma4-turbo")
+    ensure_runtime_dirs(settings)
+    calls = {"gpu": 0}
+
+    def fake_gpu_snapshot():
+        calls["gpu"] += 1
+        return {
+            "available": True,
+            "gpus": [
+                {
+                    "name": "Fake GPU",
+                    "memory_used_ratio": 0.25,
+                    "utilization_gpu": 42,
+                }
+            ],
+        }
+
+    monkeypatch.setattr(telemetry_module, "_nvidia_snapshot", fake_gpu_snapshot)
+    collector = TelemetryCollector(settings)
+
+    first = collector.live_snapshot()
+    second = collector.live_snapshot()
+
+    assert calls["gpu"] == 1
+    assert first["gpu"]["gpus"][0]["utilization_gpu"] == 42
+    assert second["gpu"]["gpus"][0]["memory_used_ratio"] == 0.25
+    assert second["docker"]["deferred"] is True
 
 
 def test_supervisor_status_reflects_autonomy_settings(monkeypatch, tmp_path):
