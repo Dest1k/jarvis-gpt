@@ -43,6 +43,9 @@ Capability contract:
 - Если оператор просит сделать действие "в консоли", "в браузере", "в калькуляторе", "в блокноте",
   "в окне" или в конкретном приложении, сначала открой/активируй эту среду и выполняй действие там.
   Не заменяй это текстовым примером команды, если доступен инструментальный маршрут.
+- Если запрос явно нацелен на консоль, не отвечай markdown-блоком с PowerShell.
+  Используй console target guard: открой PowerShell/Terminal, выполни распознанный рецепт
+  или команду там, а если команда неоднозначна, покажи диагностическое сообщение в самой консоли.
 - Если оператор просит посмотреть на экран его глазами, сделать скриншот, понять что видно в окне
   или проверить визуальное состояние, используй native screen capture и анализируй снимок/окна.
 - Для системного администрирования предлагай PowerShell/Bash-команды, проверки, риски и rollback.
@@ -931,6 +934,10 @@ def _native_action_from_message(
             answer="открыл консоль с топ-10 процессов по CPU",
         )
 
+    console_guard = _console_target_guard_action(message, history_text)
+    if console_guard is not None:
+        return console_guard
+
     if _contains_any(normalized, ("wmi", "cim", "через wmi", "через cim")):
         return _wmi_action_from_message(message)
 
@@ -1227,6 +1234,268 @@ def _largest_file_scan_script(drive: str) -> str:
         "Write-Host 'Файлы не найдены или доступ ко всем каталогам запрещён.' -ForegroundColor Red "
         "}"
     )
+
+
+def _console_target_guard_action(message: str, history_text: str = "") -> NativeAction | None:
+    normalized = message.lower()
+    if not _wants_console_target(normalized):
+        return None
+    if _is_plain_console_open_request(normalized):
+        return None
+
+    explicit_command = _extract_explicit_console_command(message)
+    if explicit_command:
+        script = _console_command_script(explicit_command)
+        return NativeAction(
+            action="process.start",
+            payload={
+                "executable": "powershell.exe",
+                "arguments": _powershell_noexit_arguments(script),
+            },
+            answer="открыл PowerShell и выполнил распознанную команду в консоли",
+        )
+
+    combined = f"{normalized}\n{history_text.lower()}"
+    if _mentions_network_info(combined):
+        script = _network_info_script()
+        return NativeAction(
+            action="process.start",
+            payload={
+                "executable": "powershell.exe",
+                "arguments": _powershell_noexit_arguments(script),
+            },
+            answer="открыл PowerShell и вывел сетевую диагностику в консоли",
+        )
+
+    script = _console_guard_fallback_script(message)
+    return NativeAction(
+        action="process.start",
+        payload={
+            "executable": "powershell.exe",
+            "arguments": _powershell_noexit_arguments(script),
+        },
+        answer="открыл PowerShell с диагностикой console target guard",
+    )
+
+
+def _is_plain_console_open_request(normalized: str) -> bool:
+    wants_open = _contains_any(
+        normalized,
+        ("открой", "открыть", "запусти", "запустить", "open", "start"),
+    )
+    if not wants_open:
+        return False
+    task_markers = (
+        "выполни",
+        "сделай",
+        "покажи",
+        "выведи",
+        "найди",
+        "провер",
+        "диагност",
+        "информац",
+        "сведен",
+        "скан",
+        "топ",
+        "top",
+        "процесс",
+        "сет",
+        "ip",
+        "dns",
+        "wmi",
+        "cim",
+        "список",
+        "настрой",
+    )
+    return not _contains_any(normalized, task_markers)
+
+
+def _extract_explicit_console_command(message: str) -> str:
+    fenced = re.search(r"```(?:[a-zA-Z0-9_-]+)?\s*(.*?)```", message, flags=re.DOTALL)
+    if fenced:
+        command = _compact_shell_command(fenced.group(1))
+        if _looks_like_shell_command(command):
+            return command
+
+    for quoted in re.finditer(r"`([^`\r\n]{2,1800})`", message):
+        command = _compact_shell_command(quoted.group(1))
+        if _looks_like_shell_command(command):
+            return command
+
+    markers = r"(?:консол\w*|powershell|power shell|пауэршелл|терминал\w*|terminal|cmd)"
+    patterns = (
+        rf"(?:выполни|запусти|введи|набери)\s+(?:в\s+)?{markers}\s+(.+)$",
+        rf"(?:выполни|запусти|введи|набери)\s+(.+?)\s+(?:в\s+)?{markers}\s*$",
+        rf"(?:в\s+)?{markers}\s*[:\-]\s*(.+)$",
+        rf"(?:в\s+)?{markers}\s+(.+)$",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, message, flags=re.IGNORECASE)
+        if not match:
+            continue
+        command = _compact_shell_command(match.group(1).strip(" \"'«».,;"))
+        if _looks_like_shell_command(command):
+            return command
+    return ""
+
+
+def _compact_shell_command(command: str) -> str:
+    lines = [line.strip() for line in command.replace("\r", "\n").split("\n") if line.strip()]
+    return "; ".join(lines)[:1800]
+
+
+def _looks_like_shell_command(command: str) -> bool:
+    stripped = command.strip()
+    if not stripped:
+        return False
+    lowered = stripped.lower()
+    first = re.split(r"\s+", lowered, maxsplit=1)[0].strip("&.")
+    prefixes = (
+        "$",
+        "cd",
+        "choco",
+        "cmd",
+        "curl",
+        "dir",
+        "dism",
+        "docker",
+        "git",
+        "get-",
+        "gwmi",
+        "hostname",
+        "ipconfig",
+        "invoke-",
+        "ls",
+        "net",
+        "netstat",
+        "new-",
+        "node",
+        "npm",
+        "nslookup",
+        "ping",
+        "pnpm",
+        "powershell",
+        "pwsh",
+        "py",
+        "python",
+        "reg",
+        "remove-",
+        "resolve-",
+        "restart-",
+        "route",
+        "sc",
+        "set-",
+        "sfc",
+        "start-",
+        "stop-",
+        "systeminfo",
+        "taskkill",
+        "tasklist",
+        "test-",
+        "tracert",
+        "where",
+        "where-object",
+        "whoami",
+        "winget",
+        "write-",
+        "wsl",
+    )
+    if first.endswith((".exe", ".bat", ".cmd", ".ps1")):
+        return True
+    has_command_prefix = any(
+        first.startswith(prefix) for prefix in prefixes if prefix.endswith("-")
+    )
+    if first in prefixes or has_command_prefix:
+        return True
+    has_cyrillic = bool(re.search(r"[а-яё]", lowered))
+    if re.search(r"[|;&<>]", stripped) and not has_cyrillic:
+        return True
+    return bool(re.search(r"\s[-/][A-Za-z?]", stripped) and not has_cyrillic)
+
+
+def _mentions_network_info(text: str) -> bool:
+    has_network_word = _contains_any(
+        text,
+        (
+            "network",
+            "netadapter",
+            "netipconfiguration",
+            "ipconfig",
+            "dns",
+            "сет",
+            "интернет",
+            "адаптер",
+            "ip адрес",
+            "айпи",
+            "шлюз",
+            "маршрут",
+        ),
+    )
+    if not has_network_word:
+        return False
+    return _contains_any(
+        text,
+        (
+            "диагност",
+            "информац",
+            "настрой",
+            "покажи",
+            "выведи",
+            "проверь",
+            "сведен",
+            "ipconfig",
+            "dns",
+            "сет",
+            "интернет",
+        ),
+    )
+
+
+def _console_command_script(command: str) -> str:
+    quoted = _ps_single_quoted(command)
+    return (
+        "$ErrorActionPreference='Continue'; "
+        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
+        "Write-Host '--- JARVIS CONSOLE TARGET ---' -ForegroundColor Cyan; "
+        f"Write-Host ('Command: ' + {quoted}) -ForegroundColor DarkGray; "
+        f"{command}"
+    )
+
+
+def _network_info_script() -> str:
+    return (
+        "$ErrorActionPreference='Continue'; "
+        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
+        "Write-Host '--- NETWORK DIAGNOSTICS ---' -ForegroundColor Cyan; "
+        "Write-Host '--- IPCONFIG ---' -ForegroundColor DarkCyan; "
+        "ipconfig /all; "
+        "Write-Host '--- ADAPTERS ---' -ForegroundColor DarkCyan; "
+        "Get-NetAdapter | Select-Object Name,Status,LinkSpeed,MacAddress | Format-Table -AutoSize; "
+        "Write-Host '--- IP CONFIGURATION ---' -ForegroundColor DarkCyan; "
+        "Get-NetIPConfiguration | Format-List; "
+        "Write-Host '--- DNS CLIENT ---' -ForegroundColor DarkCyan; "
+        "Get-DnsClientServerAddress | Format-Table -AutoSize"
+    )
+
+
+def _console_guard_fallback_script(message: str) -> str:
+    request = _ps_single_quoted(message.strip()[:600])
+    return (
+        "$ErrorActionPreference='Continue'; "
+        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
+        "Write-Host '--- JARVIS CONSOLE TARGET GUARD ---' -ForegroundColor Yellow; "
+        "Write-Host 'Запрос явно нацелен на консоль, поэтому я не отвечаю "
+        "примером команды в чате.'; "
+        f"Write-Host ('Запрос: ' + {request}) -ForegroundColor DarkGray; "
+        "Write-Host 'Команда или готовый рецепт не распознаны однозначно.' "
+        "-ForegroundColor Yellow; "
+        "Write-Host 'Сформулируйте конкретную команду в обратных кавычках "
+        "или назовите тип диагностики.'"
+    )
+
+
+def _ps_single_quoted(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
 
 
 def _powershell_noexit_arguments(script: str) -> str:

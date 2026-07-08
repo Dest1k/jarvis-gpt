@@ -9,6 +9,29 @@ from jarvis_gpt.llm import LLMRouter, LLMStreamChunk
 from jarvis_gpt.storage import JarvisStorage
 
 
+def _agent_with_native_capture(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    captured = {}
+
+    async def fake_execute(self, command, cwd=None, timeout_sec=30):
+        captured["command"] = command
+        return {"ok": True, "summary": "executed", "data": {"command": command}}
+
+    monkeypatch.setattr("jarvis_gpt.tools.HostBridgeClient.execute", fake_execute)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    agent = AgentRuntime(
+        settings=settings,
+        storage=storage,
+        llm=LLMRouter(settings),
+        bus=EventBus(),
+    )
+    return agent, storage, captured
+
+
 def test_agent_creates_mission_from_large_goal(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
@@ -372,6 +395,90 @@ def test_agent_understands_largest_file_console_followup(monkeypatch, tmp_path):
     assert "powershell.exe" in captured["command"]
     assert "Get-ChildItem" in captured["command"]
     assert "C:\\" in captured["command"]
+    assert runs[0]["tool"] == "windows.native"
+    assert "PowerShell" in response.answer
+    storage.close()
+
+
+def test_agent_runs_explicit_console_command_in_console(monkeypatch, tmp_path):
+    agent, storage, captured = _agent_with_native_capture(monkeypatch, tmp_path)
+
+    response = asyncio.run(agent.chat("выполни в консоли `ipconfig /all`"))
+    runs = storage.list_tool_runs()
+
+    assert "process.start" in captured["command"]
+    assert "powershell.exe" in captured["command"]
+    assert "JARVIS CONSOLE TARGET" in captured["command"]
+    assert "ipconfig /all" in captured["command"]
+    assert runs[0]["tool"] == "windows.native"
+    assert "PowerShell" in response.answer
+    storage.close()
+
+
+def test_agent_runs_explicit_powershell_verb_command(monkeypatch, tmp_path):
+    agent, storage, captured = _agent_with_native_capture(monkeypatch, tmp_path)
+
+    response = asyncio.run(agent.chat("выполни в консоли `Write-Host JarvisConsoleGuardOk`"))
+    runs = storage.list_tool_runs()
+
+    assert "process.start" in captured["command"]
+    assert "powershell.exe" in captured["command"]
+    assert "JARVIS CONSOLE TARGET" in captured["command"]
+    assert "JARVIS CONSOLE TARGET GUARD" not in captured["command"]
+    assert "Write-Host JarvisConsoleGuardOk" in captured["command"]
+    assert runs[0]["tool"] == "windows.native"
+    assert "PowerShell" in response.answer
+    storage.close()
+
+
+def test_agent_runs_network_console_recipe(monkeypatch, tmp_path):
+    agent, storage, captured = _agent_with_native_capture(monkeypatch, tmp_path)
+
+    response = asyncio.run(agent.chat("открой в консоли диагностику сети"))
+    runs = storage.list_tool_runs()
+
+    assert "process.start" in captured["command"]
+    assert "powershell.exe" in captured["command"]
+    assert "NETWORK DIAGNOSTICS" in captured["command"]
+    assert "ipconfig /all" in captured["command"]
+    assert "Get-NetAdapter" in captured["command"]
+    assert "JARVIS CONSOLE TARGET GUARD" not in captured["command"]
+    assert runs[0]["tool"] == "windows.native"
+    assert "PowerShell" in response.answer
+    storage.close()
+
+
+def test_agent_uses_console_guard_for_unknown_console_targets(monkeypatch, tmp_path):
+    agent, storage, captured = _agent_with_native_capture(monkeypatch, tmp_path)
+
+    response = asyncio.run(agent.chat("открой в консоли загадочную проверку состояния"))
+    runs = storage.list_tool_runs()
+
+    assert "process.start" in captured["command"]
+    assert "powershell.exe" in captured["command"]
+    assert "JARVIS CONSOLE TARGET GUARD" in captured["command"]
+    assert "примером команды в чате" in captured["command"]
+    assert runs[0]["tool"] == "windows.native"
+    assert "PowerShell" in response.answer
+    storage.close()
+
+
+def test_agent_understands_network_console_followup(monkeypatch, tmp_path):
+    agent, storage, captured = _agent_with_native_capture(monkeypatch, tmp_path)
+    conversation_id = storage.create_conversation("network info")
+    storage.add_message(
+        conversation_id=conversation_id,
+        role="user",
+        content="покажи сетевые настройки",
+    )
+
+    response = asyncio.run(agent.chat("теперь именно в консоли", conversation_id))
+    runs = storage.list_tool_runs()
+
+    assert "process.start" in captured["command"]
+    assert "powershell.exe" in captured["command"]
+    assert "NETWORK DIAGNOSTICS" in captured["command"]
+    assert "Get-NetIPConfiguration" in captured["command"]
     assert runs[0]["tool"] == "windows.native"
     assert "PowerShell" in response.answer
     storage.close()
