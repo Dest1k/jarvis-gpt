@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 from jarvis_gpt.agent import AgentRuntime
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
@@ -397,6 +398,138 @@ def test_agent_understands_largest_file_console_followup(monkeypatch, tmp_path):
     assert "C:\\" in captured["command"]
     assert runs[0]["tool"] == "windows.native"
     assert "PowerShell" in response.answer
+    storage.close()
+
+
+def test_agent_sends_followup_command_to_same_console(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    commands = []
+
+    def native_stdout(action, summary, data=None, ok=True):
+        return json.dumps(
+            {"ok": ok, "summary": summary, "action": action, "data": data or {}},
+            ensure_ascii=False,
+        )
+
+    async def fake_execute(self, command, cwd=None, timeout_sec=30):
+        commands.append(command)
+        if "$Action='process.start'" in command:
+            return {
+                "ok": True,
+                "summary": "executed",
+                "data": {
+                    "stdout": native_stdout(
+                        "process.start",
+                        "Started cmd.exe.",
+                        {"pid": 4242, "processName": "cmd"},
+                    )
+                },
+            }
+        return {
+            "ok": True,
+            "summary": "executed",
+            "data": {
+                "stdout": native_stdout(
+                    "keyboard.send",
+                    "Native keyboard input sent.",
+                    {"focused": True},
+                )
+            },
+        }
+
+    monkeypatch.setattr("jarvis_gpt.tools.HostBridgeClient.execute", fake_execute)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    agent = AgentRuntime(
+        settings=settings,
+        storage=storage,
+        llm=LLMRouter(settings),
+        bus=EventBus(),
+    )
+
+    first = asyncio.run(agent.chat("открой что-нибудь в консоли"))
+    response = asyncio.run(
+        agent.chat("а теперь в этой же косоли дай мне инфу о системе", first.conversation_id)
+    )
+    runs = storage.list_tool_runs()
+
+    assert len(commands) == 2
+    assert "$Action='process.start'" in commands[0]
+    assert "cmd.exe" in commands[0]
+    assert "$Action='keyboard.send'" in commands[1]
+    assert '"process_id": 4242' in commands[1] or '"process_id":4242' in commands[1]
+    assert "systeminfo" in commands[1]
+    assert "{ENTER}" in commands[1]
+    assert runs[-1]["tool"] == "windows.native"
+    assert "уже открытую консоль" in response.answer
+    storage.close()
+
+
+def test_agent_falls_back_when_same_console_focus_fails(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    commands = []
+
+    def native_stdout(action, summary, data=None, ok=True):
+        return json.dumps(
+            {"ok": ok, "summary": summary, "action": action, "data": data or {}},
+            ensure_ascii=False,
+        )
+
+    async def fake_execute(self, command, cwd=None, timeout_sec=30):
+        commands.append(command)
+        if "$Action='keyboard.send'" in command:
+            return {
+                "ok": True,
+                "summary": "executed",
+                "data": {
+                    "stdout": native_stdout(
+                        "keyboard.send",
+                        "Target window was not focused; native input was not sent.",
+                        {"focused": False},
+                        ok=False,
+                    )
+                },
+            }
+        return {
+            "ok": True,
+            "summary": "executed",
+            "data": {
+                "stdout": native_stdout(
+                    "process.start",
+                    "Started cmd.exe.",
+                    {"pid": 4242, "processName": "cmd"},
+                )
+            },
+        }
+
+    monkeypatch.setattr("jarvis_gpt.tools.HostBridgeClient.execute", fake_execute)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    agent = AgentRuntime(
+        settings=settings,
+        storage=storage,
+        llm=LLMRouter(settings),
+        bus=EventBus(),
+    )
+
+    first = asyncio.run(agent.chat("открой что-нибудь в консоли"))
+    response = asyncio.run(
+        agent.chat("а теперь в этой же консоли дай мне инфу о системе", first.conversation_id)
+    )
+
+    assert len(commands) == 3
+    assert "$Action='keyboard.send'" in commands[1]
+    assert "$Action='process.start'" in commands[2]
+    assert "cmd.exe" in commands[2]
+    assert "/k systeminfo" in commands[2]
+    assert "Первичная попытка" in response.answer
+    assert "открыл новую cmd" in response.answer
     storage.close()
 
 

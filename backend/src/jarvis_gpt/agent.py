@@ -88,6 +88,7 @@ class NativeAction:
     action: str
     payload: dict[str, Any]
     answer: str
+    fallback: NativeAction | None = None
 
 
 class AgentRuntime:
@@ -256,7 +257,7 @@ class AgentRuntime:
             metadata={"max_tokens": max_tokens, "mode": mode, "temperature": temperature},
         )
 
-        direct_action = await self._try_direct_action(message)
+        direct_action = await self._try_direct_action(message, context)
         if direct_action is not None:
             for event in direct_action.events:
                 events.append(event)
@@ -489,7 +490,15 @@ class AgentRuntime:
                 for item in self.storage.recent_messages(context.conversation_id, limit=8)
                 if item["role"] == "user"
             )
-        native_action = _native_action_from_message(message, self.settings, history_text)
+        active_console = None
+        if context is not None:
+            active_console = self._active_console_target(context.conversation_id)
+        native_action = _native_action_from_message(
+            message,
+            self.settings,
+            history_text,
+            active_console,
+        )
         if native_action is not None:
             result = await self.tools.run(
                 "windows.native",
@@ -500,21 +509,57 @@ class AgentRuntime:
                 },
                 allow_danger=True,
             )
-            event = ChatEvent(
-                type="tool_call",
-                title=f"windows.native:{native_action.action}",
-                content=result.summary,
-                payload={
-                    "tool": result.tool,
-                    "ok": result.ok,
-                    "action": native_action.action,
-                },
-            )
+            events = [
+                ChatEvent(
+                    type="tool_call",
+                    title=f"windows.native:{native_action.action}",
+                    content=result.summary,
+                    payload={
+                        "tool": result.tool,
+                        "ok": result.ok,
+                        "action": native_action.action,
+                    },
+                )
+            ]
+            answer_action = native_action
+            fallback_note = ""
+            if not result.ok and native_action.fallback is not None:
+                failed_summary = result.summary
+                fallback = native_action.fallback
+                result = await self.tools.run(
+                    "windows.native",
+                    {
+                        "action": fallback.action,
+                        "payload": fallback.payload,
+                        "timeout_sec": 30,
+                    },
+                    allow_danger=True,
+                )
+                events.append(
+                    ChatEvent(
+                        type="tool_call",
+                        title=f"windows.native:{fallback.action}",
+                        content=result.summary,
+                        payload={
+                            "tool": result.tool,
+                            "ok": result.ok,
+                            "action": fallback.action,
+                            "fallback_for": native_action.action,
+                        },
+                    )
+                )
+                answer_action = fallback
+                fallback_note = f"\n\nПервичная попытка: {failed_summary}"
+            if context is not None:
+                self._remember_console_target(context.conversation_id, answer_action, result)
             status = "Готово" if result.ok else "Не смог выполнить native-действие"
             details = _native_result_excerpt(result)
             return DirectAction(
-                answer=f"{status}: {native_action.answer}\n\n{result.summary}{details}",
-                events=[event],
+                answer=(
+                    f"{status}: {answer_action.answer}\n\n"
+                    f"{result.summary}{fallback_note}{details}"
+                ),
+                events=events,
             )
 
         command = _host_command_from_message(message)
@@ -606,6 +651,21 @@ class AgentRuntime:
                 f"- style_rule: {style_rules.get(style, style_rules['concise'])}",
             ]
         )
+
+    def _active_console_target(self, conversation_id: str) -> dict[str, Any] | None:
+        value = self.storage.get_runtime_value(_console_target_key(conversation_id), None)
+        return value if isinstance(value, dict) else None
+
+    def _remember_console_target(
+        self,
+        conversation_id: str,
+        action: NativeAction,
+        result: ToolRunResponse,
+    ) -> None:
+        target = _console_target_from_result(action, result)
+        if target is None:
+            return
+        self.storage.set_runtime_value(_console_target_key(conversation_id), target)
 
     @staticmethod
     def _looks_like_mission(message: str) -> bool:
@@ -905,11 +965,16 @@ def _native_action_from_message(
     message: str,
     settings: JarvisSettings | None = None,
     history_text: str = "",
+    active_console: dict[str, Any] | None = None,
 ) -> NativeAction | None:
     normalized = message.lower()
     screen_capture = _screen_capture_action(normalized, settings)
     if screen_capture is not None:
         return screen_capture
+
+    same_console = _same_console_action(message, history_text, active_console)
+    if same_console is not None:
+        return same_console
 
     system_info_console = _system_info_console_action(message, history_text)
     if system_info_console is not None:
@@ -1127,7 +1192,7 @@ def _mentions_system_info(text: str) -> bool:
         return True
     return _contains_any(text, ("систем",)) and _contains_any(
         text,
-        ("информац", "сведен", "сводк", "характерист", "спецификац", "конфигурац"),
+        ("информац", "инфу", "сведен", "сводк", "характерист", "спецификац", "конфигурац"),
     )
 
 
@@ -1234,6 +1299,254 @@ def _largest_file_scan_script(drive: str) -> str:
         "Write-Host 'Файлы не найдены или доступ ко всем каталогам запрещён.' -ForegroundColor Red "
         "}"
     )
+
+
+def _same_console_action(
+    message: str,
+    history_text: str,
+    active_console: dict[str, Any] | None,
+) -> NativeAction | None:
+    if not active_console:
+        return None
+    normalized = message.lower()
+    if not _wants_existing_console_target(normalized):
+        return None
+
+    shell = _console_shell_from_target(active_console)
+    command = _existing_console_command(message, history_text, shell)
+    payload = _console_keyboard_payload(active_console, command)
+    fallback = _console_process_fallback(command, shell)
+    return NativeAction(
+        action="keyboard.send",
+        payload=payload,
+        answer="отправил команду в уже открытую консоль",
+        fallback=fallback,
+    )
+
+
+def _wants_existing_console_target(normalized: str) -> bool:
+    same_target = _contains_any(
+        normalized,
+        (
+            "этой же",
+            "той же",
+            "эту же",
+            "ту же",
+            "в этой",
+            "в той",
+            "там же",
+            "туда же",
+            "сюда же",
+            "в ней",
+            "в него",
+            "текущ",
+            "уже открыт",
+            "same console",
+            "same terminal",
+        ),
+    )
+    console_word = _contains_any(
+        normalized,
+        (
+            "консол",
+            "косол",
+            "терминал",
+            "terminal",
+            "powershell",
+            "cmd",
+            "командн",
+        ),
+    )
+    if same_target and (console_word or _contains_any(normalized, ("там же", "туда же"))):
+        return True
+    return _contains_any(normalized, ("теперь", "сейчас", "следом")) and _wants_console_target(
+        normalized
+    )
+
+
+def _existing_console_command(message: str, history_text: str, shell: str) -> str:
+    explicit = _extract_explicit_console_command(message)
+    if explicit:
+        return explicit
+
+    normalized = message.lower()
+    combined = f"{normalized}\n{history_text.lower()}"
+    if _mentions_system_info(combined):
+        return _system_info_existing_console_command(shell)
+    if _mentions_network_info(combined):
+        return _network_existing_console_command(shell)
+    if _mentions_largest_file(combined):
+        drive = _drive_from_largest_file_request(message, history_text)
+        return _shell_command_for_existing_console(_largest_file_scan_script(drive), shell)
+    if _mentions_top_processes(combined):
+        script = (
+            "Get-Process | Sort-Object CPU -Descending | "
+            "Select-Object -First 10 Name,Id,CPU,WorkingSet | Format-Table -AutoSize"
+        )
+        return _shell_command_for_existing_console(script, shell)
+    return _same_console_guard_command(message, shell)
+
+
+def _system_info_existing_console_command(shell: str) -> str:
+    if shell == "cmd":
+        return "systeminfo"
+    return _system_info_script()
+
+
+def _network_existing_console_command(shell: str) -> str:
+    if shell == "cmd":
+        return "ipconfig /all"
+    return _network_info_script()
+
+
+def _shell_command_for_existing_console(script: str, shell: str) -> str:
+    if shell == "cmd":
+        return _powershell_invocation_for_cmd(script)
+    return script
+
+
+def _powershell_invocation_for_cmd(script: str) -> str:
+    escaped = script.replace('"', '`"')
+    return f'powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "{escaped}"'
+
+
+def _same_console_guard_command(message: str, shell: str) -> str:
+    text = (
+        "Jarvis: запрос нацелен на эту же консоль, "
+        "но команда или готовый рецепт не распознаны."
+    )
+    if shell == "cmd":
+        return f"echo {text}"
+    return f"Write-Host {_ps_single_quoted(text)} -ForegroundColor Yellow"
+
+
+def _console_keyboard_payload(target: dict[str, Any], command: str) -> dict[str, Any]:
+    return {
+        "process_id": _int_or_zero(target.get("pid")),
+        "process_name": str(target.get("process_name") or ""),
+        "window_title": str(target.get("window_title") or ""),
+        "text": command,
+        "keys": "{ENTER}",
+    }
+
+
+def _console_process_fallback(command: str, shell: str) -> NativeAction:
+    if shell == "cmd":
+        return NativeAction(
+            action="process.start",
+            payload={"executable": "cmd.exe", "arguments": f"/k {command}"},
+            answer="не смог сфокусировать прежнюю консоль, открыл новую cmd и выполнил команду",
+        )
+    return NativeAction(
+        action="process.start",
+        payload={
+            "executable": "powershell.exe",
+            "arguments": _powershell_noexit_arguments(command),
+        },
+        answer=(
+            "не смог сфокусировать прежнюю консоль, "
+            "открыл новый PowerShell и выполнил команду"
+        ),
+    )
+
+
+def _console_target_key(conversation_id: str) -> str:
+    return f"ui.target.console.{conversation_id}"
+
+
+def _console_target_from_result(
+    action: NativeAction,
+    result: ToolRunResponse,
+) -> dict[str, Any] | None:
+    if not result.ok:
+        return None
+    payload = action.payload
+    if action.action == "keyboard.send" and _payload_targets_console(payload):
+        shell = _console_shell_from_target(payload)
+        return {
+            "pid": _int_or_zero(payload.get("process_id")),
+            "process_name": str(payload.get("process_name") or ""),
+            "window_title": str(payload.get("window_title") or ""),
+            "executable": "",
+            "shell": shell,
+        }
+    if action.action not in {"process.start", "app.open_and_type"}:
+        return None
+
+    executable = str(payload.get("executable") or "")
+    if not _is_console_executable(executable):
+        return None
+    native_data = _native_result_data(result)
+    process_name = str(native_data.get("processName") or native_data.get("ProcessName") or "")
+    hints = _native_focus_hint(executable)
+    if not process_name:
+        process_name = str(hints.get("process_name") or Path(executable).stem)
+    shell = _console_shell_from_executable(executable, process_name)
+    return {
+        "pid": _int_or_zero(native_data.get("pid") or native_data.get("Id")),
+        "process_name": str(hints.get("process_name") or process_name),
+        "window_title": str(hints.get("window_title") or ""),
+        "executable": executable,
+        "shell": shell,
+    }
+
+
+def _native_result_data(result: ToolRunResponse) -> dict[str, Any]:
+    if not isinstance(result.data, dict):
+        return {}
+    native = result.data.get("native")
+    if not isinstance(native, dict):
+        return {}
+    data = native.get("data")
+    return data if isinstance(data, dict) else {}
+
+
+def _payload_targets_console(payload: dict[str, Any]) -> bool:
+    text = " ".join(
+        str(payload.get(key) or "").lower()
+        for key in ("process_name", "window_title", "executable")
+    )
+    return _contains_any(
+        text,
+        ("cmd", "powershell", "pwsh", "windowsterminal", "terminal", "команд", "терминал"),
+    )
+
+
+def _is_console_executable(executable: str) -> bool:
+    name = Path(executable).name.lower()
+    return name in {"cmd.exe", "powershell.exe", "pwsh.exe", "wt.exe"}
+
+
+def _console_shell_from_target(target: dict[str, Any]) -> str:
+    shell = str(target.get("shell") or "").lower()
+    if shell in {"cmd", "powershell", "terminal"}:
+        return "powershell" if shell == "terminal" else shell
+    executable = str(target.get("executable") or "")
+    process_name = str(target.get("process_name") or "")
+    return _console_shell_from_executable(executable, process_name)
+
+
+def _console_shell_from_executable(executable: str, process_name: str = "") -> str:
+    text = f"{Path(executable).name} {process_name}".lower()
+    if "cmd" in text:
+        return "cmd"
+    return "powershell"
+
+
+def _int_or_zero(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _mentions_top_processes(text: str) -> bool:
+    wants_processes = _contains_any(text, ("процесс", "process"))
+    wants_top = bool(re.search(r"\btop\s*10\b", text)) or _contains_any(
+        text,
+        ("топ 10", "топ-10", "top-10"),
+    )
+    return wants_processes and wants_top
 
 
 def _console_target_guard_action(message: str, history_text: str = "") -> NativeAction | None:
