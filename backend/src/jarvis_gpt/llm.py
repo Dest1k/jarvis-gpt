@@ -41,7 +41,7 @@ class LLMRouter:
                 "local": local,
             }
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
                 response = await client.get(f"{self.settings.llm_base_url}/models")
                 response.raise_for_status()
             data = response.json()
@@ -82,7 +82,7 @@ class LLMRouter:
         }
         try:
             timeout = httpx.Timeout(self.settings.llm_timeout_sec, connect=10.0)
-            async with httpx.AsyncClient(timeout=timeout) as client:
+            async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
                 response = await client.post(
                     f"{self.settings.llm_base_url}/chat/completions",
                     json=body,
@@ -121,7 +121,7 @@ class LLMRouter:
         }
         try:
             timeout = httpx.Timeout(self.settings.llm_timeout_sec, connect=10.0)
-            async with httpx.AsyncClient(timeout=timeout) as client, client.stream(
+            async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client, client.stream(
                 "POST",
                 f"{self.settings.llm_base_url}/chat/completions",
                 json=body,
