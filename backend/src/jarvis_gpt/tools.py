@@ -1165,6 +1165,18 @@ public static class JWin {
   public static extern bool SetForegroundWindow(IntPtr hWnd);
   [DllImport("user32.dll")]
   public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
+  [DllImport("user32.dll")]
+  public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")]
+  public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+  [DllImport("kernel32.dll")]
+  public static extern uint GetCurrentThreadId();
+  [DllImport("user32.dll")]
+  public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+  [DllImport("user32.dll")]
+  public static extern bool BringWindowToTop(IntPtr hWnd);
+  [DllImport("user32.dll")]
+  public static extern IntPtr SetFocus(IntPtr hWnd);
 }
 '@
 
@@ -1175,31 +1187,123 @@ public static class JWin {
     return $Value
   }
 
-  function Focus($Pid, $Name, $Title) {
-    $p = $null
-    if ($Pid) {
-      $p = Get-Process -Id $Pid -ErrorAction SilentlyContinue
+  function SplitTargets($Value) {
+    if ($null -eq $Value -or [string]$Value -eq '') {
+      return @()
     }
-    if (-not $p -and $Name) {
-      $p = Get-Process -Name $Name -ErrorAction SilentlyContinue |
-        Where-Object { $_.MainWindowHandle -ne 0 } |
-        Select-Object -First 1
+    return @(([string]$Value -split '\|') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+  }
+
+  function ForegroundPid() {
+    $foreground = [JWin]::GetForegroundWindow()
+    if ($foreground -eq [IntPtr]::Zero) {
+      return 0
     }
-    if (-not $p -and $Title) {
-      $p = Get-Process -ErrorAction SilentlyContinue |
-        Where-Object {
-          $_.MainWindowTitle -like "*$Title*" -and $_.MainWindowHandle -ne 0
-        } |
-        Select-Object -First 1
+    $foregroundPid = 0
+    [void][JWin]::GetWindowThreadProcessId($foreground, [ref]$foregroundPid)
+    return [int]$foregroundPid
+  }
+
+  function IsForeground($Process) {
+    if (-not $Process) {
+      return $false
     }
-    if ($p -and $p.MainWindowHandle -ne 0) {
-      [void][JWin]::ShowWindowAsync($p.MainWindowHandle, 9)
+    return (ForegroundPid) -eq [int]$Process.Id
+  }
+
+  function TryActivate($Process, $Title) {
+    if (-not $Process -or $Process.MainWindowHandle -eq 0) {
+      return $false
+    }
+    $targetPid = 0
+    $targetThread = [JWin]::GetWindowThreadProcessId($Process.MainWindowHandle, [ref]$targetPid)
+    $foregroundPid = 0
+    $foregroundThread = [JWin]::GetWindowThreadProcessId(
+      [JWin]::GetForegroundWindow(),
+      [ref]$foregroundPid
+    )
+    $currentThread = [JWin]::GetCurrentThreadId()
+    if ($foregroundThread -ne 0) {
+      [void][JWin]::AttachThreadInput($currentThread, $foregroundThread, $true)
+    }
+    if ($targetThread -ne 0) {
+      [void][JWin]::AttachThreadInput($currentThread, $targetThread, $true)
+    }
+    try {
+      [void][JWin]::ShowWindowAsync($Process.MainWindowHandle, 9)
       Start-Sleep -Milliseconds 120
-      [void][JWin]::SetForegroundWindow($p.MainWindowHandle)
-      Start-Sleep -Milliseconds 160
+      [void][JWin]::BringWindowToTop($Process.MainWindowHandle)
+      [void][JWin]::SetForegroundWindow($Process.MainWindowHandle)
+      [void][JWin]::SetFocus($Process.MainWindowHandle)
+    } finally {
+      if ($targetThread -ne 0) {
+        [void][JWin]::AttachThreadInput($currentThread, $targetThread, $false)
+      }
+      if ($foregroundThread -ne 0) {
+        [void][JWin]::AttachThreadInput($currentThread, $foregroundThread, $false)
+      }
+    }
+    Start-Sleep -Milliseconds 220
+    if (IsForeground $Process) {
       return $true
     }
+    try {
+      $shell = New-Object -ComObject WScript.Shell
+      [void]$shell.AppActivate([int]$Process.Id)
+      Start-Sleep -Milliseconds 160
+      if (IsForeground $Process) {
+        return $true
+      }
+      foreach ($targetTitle in (SplitTargets $Title)) {
+        [void]$shell.AppActivate($targetTitle)
+        Start-Sleep -Milliseconds 160
+        if (IsForeground $Process) {
+          return $true
+        }
+      }
+    } catch {
+      return $false
+    }
     return $false
+  }
+
+  function Focus($TargetPid, $Name, $Title) {
+    $p = $null
+    for ($attempt = 0; $attempt -lt 12; $attempt++) {
+      if ($TargetPid) {
+        $candidate = Get-Process -Id $TargetPid -ErrorAction SilentlyContinue
+        if ($candidate -and $candidate.MainWindowHandle -ne 0) {
+          $p = $candidate
+        }
+      }
+      if (-not $p) {
+        foreach ($targetTitle in (SplitTargets $Title)) {
+          $p = Get-Process -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.MainWindowTitle -like "*$targetTitle*" -and $_.MainWindowHandle -ne 0
+            } |
+            Select-Object -First 1
+          if ($p) {
+            break
+          }
+        }
+      }
+      if (-not $p) {
+        foreach ($targetName in (SplitTargets $Name)) {
+          $p = Get-Process -Name $targetName -ErrorAction SilentlyContinue |
+            Where-Object { $_.MainWindowHandle -ne 0 } |
+            Select-Object -First 1
+          if ($p) {
+            break
+          }
+        }
+      }
+      if ($p -and $p.MainWindowHandle -ne 0) {
+        break
+      }
+      Start-Sleep -Milliseconds 250
+    }
+    return (TryActivate $p $Title)
   }
 
   function SendInput($Keys, $Text) {
@@ -1214,11 +1318,28 @@ public static class JWin {
     }
   }
 
+  function HasExplicitTarget($Payload) {
+    return [bool](
+      $Payload.process_id -or
+      $Payload.process_name -or
+      $Payload.window_title
+    )
+  }
+
+  function StartNativeProcess($Executable, $Arguments) {
+    $parameters = @{
+      FilePath = $Executable
+      PassThru = $true
+    }
+    if ($null -ne $Arguments -and [string]$Arguments -ne '') {
+      $parameters.ArgumentList = [string]$Arguments
+    }
+    return Start-Process @parameters
+  }
+
   switch ($Action) {
     'process.start' {
-      $p = Start-Process -FilePath $Payload.executable `
-        -ArgumentList @($Payload.arguments) `
-        -PassThru
+      $p = StartNativeProcess $Payload.executable $Payload.arguments
       Out $true "Started $($Payload.executable)." @{
         pid = $p.Id
         processName = $p.ProcessName
@@ -1226,11 +1347,16 @@ public static class JWin {
       break
     }
     'app.open_and_type' {
-      $p = Start-Process -FilePath $Payload.executable `
-        -ArgumentList @($Payload.arguments) `
-        -PassThru
+      $p = StartNativeProcess $Payload.executable $Payload.arguments
       Start-Sleep -Milliseconds ([int](Val $Payload.wait_ms 700))
       $focused = Focus $p.Id $Payload.process_name $Payload.window_title
+      if (-not $focused) {
+        Out $false "Target window was not focused; native input was not sent." @{
+          pid = $p.Id
+          focused = $focused
+        }
+        break
+      }
       SendInput $Payload.keys $Payload.text
       Out $true "Opened $($Payload.executable) and sent native input." @{
         pid = $p.Id
@@ -1252,10 +1378,20 @@ public static class JWin {
       break
     }
     'keyboard.send' {
-      $focused = Focus `
-        $Payload.process_id `
-        $Payload.process_name `
-        $Payload.window_title
+      $hasTarget = HasExplicitTarget $Payload
+      $focused = $false
+      if ($hasTarget) {
+        $focused = Focus `
+          $Payload.process_id `
+          $Payload.process_name `
+          $Payload.window_title
+        if (-not $focused) {
+          Out $false 'Target window was not focused; native input was not sent.' @{
+            focused = $focused
+          }
+          break
+        }
+      }
       SendInput $Payload.keys $Payload.text
       Out $true 'Native keyboard input sent.' @{ focused = $focused }
       break
@@ -1310,6 +1446,9 @@ def _windows_native_command(action: str, payload: dict[str, Any]) -> str:
     payload_json = json.dumps(clean_payload, ensure_ascii=False, default=str)
     return "\n".join(
         [
+            "$utf8=New-Object System.Text.UTF8Encoding -ArgumentList $false",
+            "[Console]::OutputEncoding=$utf8",
+            "$OutputEncoding=$utf8",
             "$ErrorActionPreference='Stop'",
             f"$Action={_powershell_quote(action)}",
             f"$Payload={_powershell_quote(payload_json)} | ConvertFrom-Json",

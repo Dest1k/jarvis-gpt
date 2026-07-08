@@ -7,7 +7,7 @@ import httpx
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
 from jarvis_gpt.llm import LLMRouter
 from jarvis_gpt.storage import JarvisStorage
-from jarvis_gpt.tools import ToolRegistry
+from jarvis_gpt.tools import ToolRegistry, _windows_native_command
 
 
 def test_tool_registry_runs_memory_tools(monkeypatch, tmp_path):
@@ -188,6 +188,40 @@ def test_windows_native_is_gated_and_uses_winapi_wmi(monkeypatch, tmp_path):
     assert queried.ok is True
     assert queried.summary == "WMI/CIM query returned 1 item(s)."
     storage.close()
+
+
+def test_windows_native_process_start_omits_empty_argument_list():
+    command = _windows_native_command("process.start", {"executable": "calc.exe"})
+
+    assert "[Console]::OutputEncoding=$utf8" in command
+    assert "$OutputEncoding=$utf8" in command
+    assert "function StartNativeProcess" in command
+    assert "function Focus($TargetPid" in command
+    assert "function ForegroundPid" in command
+    assert "function TryActivate" in command
+    assert "AttachThreadInput" in command
+    assert "BringWindowToTop" in command
+    assert "function SplitTargets" in command
+    assert "function HasExplicitTarget" in command
+    assert "function Focus($Pid" not in command
+    assert "WScript.Shell" in command
+    assert "Target window was not focused; native input was not sent." in command
+    assert "Start-Process @parameters" in command
+    assert "-ArgumentList @($Payload.arguments)" not in command
+
+
+def test_windows_native_process_start_preserves_nonempty_arguments():
+    command = _windows_native_command(
+        "process.start",
+        {
+            "executable": "powershell.exe",
+            "arguments": '-NoExit -Command "Get-Process | Select-Object -First 10"',
+        },
+    )
+
+    assert "powershell.exe" in command
+    assert "Get-Process | Select-Object -First 10" in command
+    assert "$parameters.ArgumentList = [string]$Arguments" in command
 
 
 def test_browser_open_is_validated_and_gated(monkeypatch, tmp_path):

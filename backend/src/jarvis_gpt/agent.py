@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import re
+import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -468,7 +470,7 @@ class AgentRuntime:
                 events=[event],
             )
 
-        native_action = _native_action_from_message(message)
+        native_action = _native_action_from_message(message, self.settings)
         if native_action is not None:
             result = await self.tools.run(
                 "windows.native",
@@ -849,8 +851,26 @@ APP_ALIASES: tuple[tuple[tuple[str, ...], str, str], ...] = (
 )
 
 
-def _native_action_from_message(message: str) -> NativeAction | None:
+def _native_action_from_message(
+    message: str,
+    settings: JarvisSettings | None = None,
+) -> NativeAction | None:
     normalized = message.lower()
+    if _wants_top_process_console(normalized):
+        return NativeAction(
+            action="process.start",
+            payload={
+                "executable": "powershell.exe",
+                "arguments": (
+                    "-NoExit -Command "
+                    '"Get-Process | Sort-Object CPU -Descending | '
+                    "Select-Object -First 10 Name,Id,CPU,WorkingSet | "
+                    'Format-Table -AutoSize"'
+                ),
+            },
+            answer="открыл консоль с топ-10 процессов по CPU",
+        )
+
     if _contains_any(normalized, ("wmi", "cim", "через wmi", "через cim")):
         return _wmi_action_from_message(message)
 
@@ -886,22 +906,33 @@ def _native_action_from_message(message: str) -> NativeAction | None:
 
     if executable == "calc.exe" and wants_typing:
         keys = _calculator_keys_from_message(message)
+        payload = {
+            "executable": "explorer.exe",
+            "arguments": r"shell:AppsFolder\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App",
+            "keys": keys,
+            "wait_ms": 1800,
+        }
+        payload.update(_native_focus_hint(executable))
         return NativeAction(
             action="app.open_and_type",
-            payload={
-                "executable": executable,
-                "process_name": "CalculatorApp",
-                "window_title": "Calculator",
-                "keys": keys,
-                "wait_ms": 900,
-            },
+            payload=payload,
             answer=f"открыл {label} и ввёл выражение",
         )
 
     if wants_typing and typed_text:
+        payload = {
+            "executable": executable,
+            "text": typed_text,
+            "wait_ms": 900,
+        }
+        payload.update(_native_focus_hint(executable))
+        if executable == "notepad.exe" and settings is not None:
+            scratch_path = _notepad_scratch_file(settings)
+            payload["arguments"] = f'"{scratch_path}"'
+            payload["window_title"] = Path(scratch_path).name
         return NativeAction(
             action="app.open_and_type",
-            payload={"executable": executable, "text": typed_text, "wait_ms": 700},
+            payload=payload,
             answer=f"открыл {label} и ввёл текст",
         )
 
@@ -960,6 +991,44 @@ def _app_from_message(normalized: str) -> tuple[tuple[str, ...], str, str] | Non
     return next((item for item in APP_ALIASES if _contains_any(normalized, item[0])), None)
 
 
+def _native_focus_hint(executable: str) -> dict[str, str]:
+    hints = {
+        "calc.exe": {
+            "process_name": "CalculatorApp",
+            "window_title": "Calculator|Калькулятор",
+        },
+        "notepad.exe": {
+            "process_name": "notepad",
+            "window_title": "Notepad|Блокнот",
+        },
+        "mspaint.exe": {
+            "process_name": "mspaint",
+            "window_title": "Paint",
+        },
+        "cmd.exe": {
+            "process_name": "cmd",
+            "window_title": "Command Prompt|Командная строка",
+        },
+        "powershell.exe": {
+            "process_name": "powershell",
+            "window_title": "Windows PowerShell|PowerShell",
+        },
+        "wt.exe": {
+            "process_name": "WindowsTerminal",
+            "window_title": "Windows PowerShell|PowerShell|Terminal|Терминал",
+        },
+    }
+    return dict(hints.get(executable.lower(), {}))
+
+
+def _notepad_scratch_file(settings: JarvisSettings) -> Path:
+    scratch_dir = settings.data_dir / "scratch"
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+    path = scratch_dir / f"notepad-{uuid.uuid4().hex[:10]}.txt"
+    path.write_text("", encoding="utf-8")
+    return path
+
+
 def _extract_text_to_type(message: str) -> str:
     match = re.search(
         r"(?:набери|введи|напечатай|напиши|type|write)\s+(.+)$",
@@ -973,7 +1042,14 @@ def _extract_text_to_type(message: str) -> str:
 
 
 def _calculator_keys_from_message(message: str) -> str:
-    compact = message.replace("×", "*").replace("÷", "/")
+    compact = (
+        message.replace("×", "*")
+        .replace("÷", "/")
+        .replace("х", "*")
+        .replace("Х", "*")
+        .replace("x", "*")
+        .replace("X", "*")
+    )
     match = re.search(r"(\d+(?:\s*[-+*/]\s*\d+)+)", compact)
     expression = match.group(1).replace(" ", "") if match else "123+456"
     return _sendkeys_for_calculator(f"{expression}=")
@@ -1007,6 +1083,23 @@ def _host_command_from_message(message: str) -> str | None:
 
 def _contains_any(text: str, markers: tuple[str, ...]) -> bool:
     return any(marker in text for marker in markers)
+
+
+def _wants_top_process_console(normalized: str) -> bool:
+    wants_console = _contains_any(
+        normalized,
+        ("консоль", "командную строку", "cmd", "powershell", "terminal", "терминал"),
+    )
+    wants_processes = _contains_any(normalized, ("процесс", "process"))
+    wants_top = bool(re.search(r"\btop\s*10\b", normalized)) or _contains_any(
+        normalized,
+        ("топ 10", "топ-10", "top-10"),
+    )
+    wants_open = _contains_any(
+        normalized,
+        ("открой", "открыть", "запусти", "запустить", "open", "start"),
+    )
+    return wants_console and wants_processes and wants_top and wants_open
 
 
 def _dedupe(items: list[str]) -> list[str]:

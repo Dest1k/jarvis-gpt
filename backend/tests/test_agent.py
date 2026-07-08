@@ -149,8 +149,77 @@ def test_agent_opens_calculator_with_host_bridge(monkeypatch, tmp_path):
     runs = storage.list_tool_runs()
 
     assert "app.open_and_type" in captured["command"]
-    assert "calc.exe" in captured["command"]
+    assert "explorer.exe" in captured["command"]
+    assert "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App" in captured["command"]
     assert "123{+}456=" in captured["command"]
+    assert runs[0]["tool"] == "windows.native"
+    assert "Готово" in response.answer
+    storage.close()
+
+
+def test_agent_calculator_understands_russian_multiply_sign(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    captured = {}
+
+    async def fake_execute(self, command, cwd=None, timeout_sec=30):
+        captured["command"] = command
+        return {"ok": True, "summary": "executed", "data": {"command": command}}
+
+    monkeypatch.setattr("jarvis_gpt.tools.HostBridgeClient.execute", fake_execute)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    agent = AgentRuntime(
+        settings=settings,
+        storage=storage,
+        llm=LLMRouter(settings),
+        bus=EventBus(),
+    )
+
+    response = asyncio.run(agent.chat("открой калькулятор и посчитай там 10х10"))
+    runs = storage.list_tool_runs()
+
+    assert "app.open_and_type" in captured["command"]
+    assert "explorer.exe" in captured["command"]
+    assert "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App" in captured["command"]
+    assert "10{*}10=" in captured["command"]
+    assert "Calculator|Калькулятор" in captured["command"]
+    assert runs[0]["tool"] == "windows.native"
+    assert "Готово" in response.answer
+    storage.close()
+
+
+def test_agent_opens_console_with_top_processes(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    captured = {}
+
+    async def fake_execute(self, command, cwd=None, timeout_sec=30):
+        captured["command"] = command
+        return {"ok": True, "summary": "executed", "data": {"command": command}}
+
+    monkeypatch.setattr("jarvis_gpt.tools.HostBridgeClient.execute", fake_execute)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    agent = AgentRuntime(
+        settings=settings,
+        storage=storage,
+        llm=LLMRouter(settings),
+        bus=EventBus(),
+    )
+
+    response = asyncio.run(agent.chat("открой мне консоль с топ 10 процессов"))
+    runs = storage.list_tool_runs()
+
+    assert "process.start" in captured["command"]
+    assert "powershell.exe" in captured["command"]
+    assert "Get-Process" in captured["command"]
+    assert "Select-Object -First 10" in captured["command"]
+    assert "Sort-Object CPU -Descending" in captured["command"]
     assert runs[0]["tool"] == "windows.native"
     assert "Готово" in response.answer
     storage.close()
@@ -183,6 +252,9 @@ def test_agent_types_into_general_windows_app(monkeypatch, tmp_path):
     assert "app.open_and_type" in captured["command"]
     assert "notepad.exe" in captured["command"]
     assert "Jarvis online" in captured["command"]
+    assert "scratch" in captured["command"]
+    assert "notepad-" in captured["command"]
+    assert ".txt" in captured["command"]
     assert runs[0]["tool"] == "windows.native"
     assert "Готово" in response.answer
     storage.close()

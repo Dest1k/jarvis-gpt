@@ -119,16 +119,7 @@ def execute_command(payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
     started = time.monotonic()
     try:
         completed = subprocess.run(
-            [
-                powershell,
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                command,
-            ],
+            powershell_command(powershell, command),
             cwd=str(cwd_path) if cwd_path else None,
             capture_output=True,
             encoding="utf-8",
@@ -160,6 +151,18 @@ def execute_command(payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
 
 def powershell_path() -> str | None:
     return shutil.which("powershell.exe") or shutil.which("pwsh")
+
+
+def powershell_command(powershell: str, command: str) -> list[str]:
+    executable = Path(powershell).name.lower()
+    args = [powershell, "-NoLogo", "-NoProfile"]
+    if executable == "powershell.exe":
+        args.append("-STA")
+        args.extend(["-ExecutionPolicy", "Bypass"])
+    else:
+        args.append("-NonInteractive")
+    args.extend(["-Command", command])
+    return args
 
 
 def trim_output(value: str | bytes | None) -> str:
