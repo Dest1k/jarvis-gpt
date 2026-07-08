@@ -1552,6 +1552,53 @@ def test_agent_does_not_web_search_hypothetical_reasoning_scenario(monkeypatch, 
     storage.close()
 
 
+def test_agent_keeps_anomalous_timeline_puzzle_in_reasoning_path(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+
+    class FakeLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None):
+            return type(
+                "Result",
+                (),
+                {
+                    "ok": True,
+                    "content": "Команда роботу: ввести 1-2-3 сразу; таймлайн считаю из условий.",
+                    "error": None,
+                },
+            )()
+
+    agent = AgentRuntime(settings=settings, storage=storage, llm=FakeLLM(), bus=EventBus())
+
+    async def fake_run(name, arguments=None, **kwargs):
+        raise AssertionError(f"unexpected tool {name}")
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+
+    prompt = (
+        "Ты находишься в аномальной зоне, где классическая физика и логика изменены "
+        "тремя правилами. Закон инверсии веса: чем больше физический вес объекта, "
+        "тем быстрее он падает вверх. Закон зеркального времени: любое механическое "
+        "действие активируется через столько минут, сколько килограммов весил объект. "
+        "Закон сохранения информации: память стирается каждые 5 минут, но можно "
+        "оставлять записки. Текущая ситуация: сейф весом 500 кг падает вверх к "
+        "открытому космосу, внутри антидот, замок нужно открыть кодом 1-2-3 пальцем "
+        "робота-манипулятора весом 10 кг. Высота потолка 12 метров, сейф летит "
+        "1 метр в минуту. Вопрос: что конкретно и в какую секунду приказать роботу, "
+        "чтобы спасти антидот? Распиши пошаговый таймлайн."
+    )
+
+    response = asyncio.run(agent.chat(prompt))
+
+    assert "Команда роботу" in response.answer
+    assert "предыдущего поиска" not in response.answer
+    storage.close()
+
+
 def test_agent_does_not_web_search_logic_error_request(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")

@@ -817,7 +817,10 @@ class AgentRuntime:
                 events=[event],
             )
 
-        shopping_followup = _shopping_followup_intent(message)
+        shopping_followup = _shopping_followup_intent(
+            message,
+            has_previous_search=self._shopping_research_state(context.conversation_id) is not None,
+        )
         if shopping_followup is not None:
             followup = await self._run_shopping_followup(
                 message=message,
@@ -2870,8 +2873,14 @@ def _research_evidence(
     return evidence
 
 
-def _shopping_followup_intent(message: str) -> dict[str, Any] | None:
+def _shopping_followup_intent(
+    message: str,
+    *,
+    has_previous_search: bool = False,
+) -> dict[str, Any] | None:
     normalized = message.lower()
+    if _looks_like_reasoning_scenario(normalized):
+        return None
     criterion = _ranking_criterion_from_message(message)
     if criterion is None:
         return None
@@ -2894,6 +2903,11 @@ def _shopping_followup_intent(message: str) -> dict[str, Any] | None:
         ),
     )
     if not followup_context:
+        return None
+    if not has_previous_search and not _contains_any(
+        normalized,
+        ("из них", "из списка", "из найден", "последний поиск", "прошлый поиск", "результат"),
+    ):
         return None
     explicit_new_search = _contains_any(normalized, ("найди", "поищи", "загугли"))
     if explicit_new_search and not _contains_any(normalized, ("из них", "из списка", "из найден")):
