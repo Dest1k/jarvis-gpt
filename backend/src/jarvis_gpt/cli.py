@@ -13,7 +13,7 @@ from .config import PROFILES, ensure_runtime_dirs, load_settings
 from .diagnostics import run_diagnostics
 from .dispatcher import DispatcherManager
 from .event_bus import EventBus
-from .host_bridge import HostBridgeStatus
+from .host_bridge import HostBridgeClient, HostBridgeStatus
 from .ingest import FileIngestor
 from .learning import LearningEngine
 from .llm import LLMRouter
@@ -173,6 +173,22 @@ def cmd_host_bridge(args: argparse.Namespace) -> None:
     storage.close()
 
 
+def cmd_host_bridge_exec(args: argparse.Namespace) -> None:
+    async def run() -> None:
+        settings, storage, _llm, _agent = _runtime(args.profile)
+        result = await HostBridgeClient(settings).execute(
+            command=args.command,
+            cwd=args.cwd,
+            timeout_sec=args.timeout,
+        )
+        _print_json(result)
+        storage.close()
+        if not result.get("ok"):
+            raise SystemExit(1)
+
+    asyncio.run(run())
+
+
 def cmd_autonomy(args: argparse.Namespace) -> None:
     settings, storage, _llm, _agent = _runtime(args.profile)
     _print_json(RuntimeSupervisor(settings=settings, storage=storage).status())
@@ -271,7 +287,7 @@ def cmd_tool_run(args: argparse.Namespace) -> None:
         _settings, storage, _llm, agent = _runtime(args.profile)
         arguments = _json_argument(args.arguments)
         arguments.update(_set_arguments(args.sets))
-        response = await agent.tools.run(args.name, arguments)
+        response = await agent.tools.run(args.name, arguments, allow_danger=args.allow_danger)
         _print_json(response.model_dump())
         storage.close()
 
@@ -361,6 +377,15 @@ def build_parser() -> argparse.ArgumentParser:
     host_bridge_parser = sub.add_parser("host-bridge", help="Show native host bridge status")
     host_bridge_parser.set_defaults(func=cmd_host_bridge)
 
+    host_bridge_exec_parser = sub.add_parser(
+        "host-bridge-exec",
+        help="Execute a token-authenticated command through the native host bridge",
+    )
+    host_bridge_exec_parser.add_argument("command")
+    host_bridge_exec_parser.add_argument("--cwd", default=None)
+    host_bridge_exec_parser.add_argument("--timeout", type=int, default=30)
+    host_bridge_exec_parser.set_defaults(func=cmd_host_bridge_exec)
+
     autonomy_parser = sub.add_parser("autonomy", help="Show autonomous supervisor settings")
     autonomy_parser.set_defaults(func=cmd_autonomy)
 
@@ -427,6 +452,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help="Set one argument as key=value. Can be repeated.",
     )
+    tool_run_parser.add_argument("--allow-danger", action="store_true")
     tool_run_parser.set_defaults(func=cmd_tool_run)
 
     mission_next_parser = sub.add_parser("mission-next", help="Execute next pending mission task")

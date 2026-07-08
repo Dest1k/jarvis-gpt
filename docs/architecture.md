@@ -21,7 +21,7 @@ Agent Runtime
   |-- HITL approval gates
   |-- telemetry and learning tick
   |-- autonomous supervisor
-  |-- host bridge status
+  |-- host bridge status and gated execution
   |-- task lifecycle
   |-- diagnostics
   |-- event stream
@@ -49,7 +49,7 @@ External host runtime
 - SQLite достаточно для одиночного локального ядра и легко мигрирует дальше.
 - UI видит явные состояния: success, warn, error, mission, event.
 - LLM является заменяемым маршрутом, а не фундаментом всей системы.
-- Опасные действия не входят в safe tools layer; shell/host control появятся только через HITL-gates.
+- Опасные действия не входят в safe tools layer; shell/host control идёт через token-auth host bridge и HITL-gates.
 - Файлы попадают в runtime-хранилище через upload/CLI, а агент читает только индексированные чанки через safe tools.
 - Audit log фиксирует изменения памяти, миссий, task lifecycle, tool runs и ingestion.
 - Профили `gemma4-mono` и `gemma4-turbo` указывают на реальные каталоги весов в `D:\jarvis\data\models`; backend не хранит веса в репозитории.

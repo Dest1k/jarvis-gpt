@@ -20,8 +20,14 @@ def main() -> int:
 
     checks = [
         run("backend tests", [sys.executable, "-m", "pytest"]),
-        run("backend lint", [sys.executable, "-m", "ruff", "check", "backend/src", "backend/tests"]),
-        run("backend compile", [sys.executable, "-m", "compileall", "backend/src", "backend/tests"]),
+        run(
+            "backend lint",
+            [sys.executable, "-m", "ruff", "check", "backend/src", "backend/tests"],
+        ),
+        run(
+            "backend compile",
+            [sys.executable, "-m", "compileall", "backend/src", "backend/tests"],
+        ),
         run(
             "docker compose config",
             ["docker", "compose", "--profile", "llm", "config"],

@@ -206,6 +206,8 @@ class HostBridgeResponse(BaseModel):
     token_path: str | None = None
     token_available: bool
     script_path: str
+    deployed_script_path: str | None = None
+    bundled_script_path: str | None = None
     script_available: bool
     start_command: str
 
@@ -277,6 +279,7 @@ class ToolInfo(BaseModel):
 
 class ToolRunRequest(BaseModel):
     arguments: dict[str, Any] = Field(default_factory=dict)
+    allow_danger: bool = False
 
 
 class ToolRunResponse(BaseModel):

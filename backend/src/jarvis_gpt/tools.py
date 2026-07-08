@@ -9,7 +9,7 @@ from typing import Any, Literal
 
 from .config import JarvisSettings
 from .diagnostics import run_diagnostics
-from .host_bridge import HostBridgeStatus
+from .host_bridge import HostBridgeClient, HostBridgeStatus
 from .learning import LearningEngine
 from .llm import LLMRouter
 from .model_catalog import ModelCatalog
@@ -76,6 +76,7 @@ class ToolRegistry:
         *,
         mission_id: str | None = None,
         task_id: str | None = None,
+        allow_danger: bool = False,
     ) -> ToolRunResponse:
         spec = self.get(name)
         args = arguments or {}
@@ -85,6 +86,20 @@ class ToolRegistry:
                 ok=False,
                 summary=f"Tool {name!r} is not registered.",
                 data={"available": [tool.name for tool in self.list()]},
+            )
+        elif spec.danger_level != "safe" and not allow_danger:
+            response = ToolRunResponse(
+                tool=name,
+                ok=False,
+                summary=(
+                    f"Tool {name!r} requires approval or explicit danger override "
+                    f"({spec.danger_level})."
+                ),
+                data={
+                    "danger_level": spec.danger_level,
+                    "approval_action": "tool.run",
+                    "approval_payload": {"tool": name, "arguments": args},
+                },
             )
         else:
             context = ToolContext(
@@ -190,6 +205,23 @@ class ToolRegistry:
                 category="host",
                 input_schema={},
                 handler=_host_bridge_status,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="host.bridge.execute",
+                description=(
+                    "Execute a token-authenticated PowerShell command through the "
+                    "local host bridge."
+                ),
+                category="host",
+                input_schema={
+                    "command": "PowerShell command",
+                    "cwd": "Optional working directory",
+                    "timeout_sec": "1-120 second timeout",
+                },
+                handler=_host_bridge_execute,
+                danger_level="danger",
             )
         )
         self.add(
@@ -366,6 +398,22 @@ def _host_bridge_status(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunRespo
         if status["script_available"]
         else "Host bridge script is missing.",
         data=status,
+    )
+
+
+async def _host_bridge_execute(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    timeout_sec = _int_arg(args.get("timeout_sec"), default=30, minimum=1, maximum=120)
+    result = await HostBridgeClient(ctx.settings).execute(
+        command=str(args.get("command") or ""),
+        cwd=str(args["cwd"]) if args.get("cwd") else None,
+        timeout_sec=timeout_sec,
+    )
+    data = result.get("data") if isinstance(result.get("data"), dict) else result
+    return ToolRunResponse(
+        tool="host.bridge.execute",
+        ok=bool(result.get("ok")),
+        summary=str(result.get("summary") or "Host bridge command finished."),
+        data=data,
     )
 
 

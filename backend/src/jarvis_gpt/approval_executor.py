@@ -166,7 +166,7 @@ class ApprovalExecutor:
                     summary=f"Tool {tool_name!r} is not registered.",
                     data={"tool": tool_name},
                 )
-            response = await self.tools.run(tool_name, arguments)
+            response = await self.tools.run(tool_name, arguments, allow_danger=True)
             return ApprovalExecution(
                 ok=response.ok,
                 summary=response.summary,

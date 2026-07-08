@@ -39,6 +39,10 @@ def test_telemetry_performance_plan_and_host_bridge_status(monkeypatch, tmp_path
     assert plan["profile"] == "gemma4-turbo"
     assert plan["recommended_dispatcher"]["model_path"].endswith("gemma4-26b-a4b-nvfp4")
     assert bridge["port"] == 8765
+    assert bridge["script_available"] is True
+    assert bridge["bundled_script_path"].replace("\\", "/").endswith(
+        "scripts/windows_rpc_bridge.py"
+    )
 
 
 def test_supervisor_status_reflects_autonomy_settings(monkeypatch, tmp_path):

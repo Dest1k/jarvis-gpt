@@ -6,7 +6,7 @@
 
 - FastAPI backend с `/health`, `/api/status`, `/api/models`, `/api/chat`, `/api/chat/stream`, `/api/missions`, `/api/memory`, `/api/files`, `/api/approvals`, `/api/audit`, `/api/diagnostics`.
 - Offline-first агент: сохраняет диалоги, создаёт mission plans и деградирует корректно, если локальная LLM не поднята.
-- Safe tools runtime: диагностика, статус, память, файловое чтение в разрешённых корнях и execution brief для миссий.
+- Safe tools runtime: диагностика, статус, память, файловое чтение в разрешённых корнях, token-auth host bridge и execution brief для миссий.
 - File ingestion: загрузка текстовых файлов, хранение в `D:\jarvis\data\jarvis-gpt\files`, chunk search и audit trail.
 - Model catalog: активные профили знают реальные Gemma 4 веса в `D:\jarvis\data\models`.
 - HITL approvals: опасные действия оформляются как durable approval gates, а не выполняются молча.
@@ -85,6 +85,8 @@ py -3.11 .\jarvis.py dispatcher-status
 .\scripts\dispatcher.ps1 up
 py -3.11 .\jarvis.py telemetry --persist
 py -3.11 .\jarvis.py host-bridge
+py -3.11 .\scripts\windows_rpc_bridge.py
+py -3.11 .\jarvis.py host-bridge-exec "Get-Date"
 py -3.11 .\jarvis.py autonomy
 py -3.11 .\jarvis.py learning-tick
 py -3.11 .\jarvis.py tool-run memory.search --set query=runtime --set limit=5
@@ -128,13 +130,14 @@ docker compose --profile llm up -d dispatcher
 - Conversation history is durable and can be restored from Command Center after reload.
 - Command Center has browser voice input for the chat composer where the Web Speech API is available.
 - Command Center registers a service worker and keeps the local UI shell available after the first successful load.
+- Native host bridge now has a bundled local RPC script, token detection, CLI execution, and a `danger` tool for approved host commands.
 - HITL gates now have a whitelisted executor: approved gates can run dispatcher, diagnostics, learning, telemetry, memory, or registered tool actions.
 - Full local smoke covers backend tests/lint/compile, Docker Compose config, frontend audit/typecheck/build, and optional live HTTP checks.
 
 ## Линия развития
 
 1. Подключить полноценный OpenAI-compatible Gemma dispatcher.
-2. Расширить tools runtime: host bridge, sandbox, browser, web, Docker.
+2. Расширить tools runtime: sandbox, browser, web, Docker.
 3. Развернуть cognitive core: richer project tasks, retrieval ranking, health snapshots.
 4. Добавить HITL-gates для опасных действий.
 5. Довести PWA/offline-слой и локальные browser/web tools после стабилизации голосового ввода.

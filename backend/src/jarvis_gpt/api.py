@@ -446,7 +446,11 @@ async def list_tools() -> list[ToolInfo]:
 
 @app.post("/api/tools/{tool_name}/run", response_model=ToolRunResponse)
 async def run_tool(tool_name: str, request: ToolRunRequest) -> ToolRunResponse:
-    return await app.state.agent.tools.run(tool_name, request.arguments)
+    return await app.state.agent.tools.run(
+        tool_name,
+        request.arguments,
+        allow_danger=request.allow_danger,
+    )
 
 
 @app.get("/api/tool-runs")

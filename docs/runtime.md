@@ -9,6 +9,7 @@
 - Follow-up closed: `/api/chat/stream` now streams NDJSON deltas and the default generation budget is 512 tokens.
 - HITL follow-up closed: approved gates can now be executed through the whitelisted approval executor.
 - Conversation history is now durable through `/api/conversations` and can be restored in Command Center.
+- Host bridge follow-up closed: bundled `scripts/windows_rpc_bridge.py` exposes local token-auth command execution for approved host actions.
 
 ## Переменные окружения
 
@@ -41,6 +42,8 @@ py -3.11 .\jarvis.py dispatcher-up
 py -3.11 .\jarvis.py dispatcher-down
 py -3.11 .\jarvis.py telemetry --persist
 py -3.11 .\jarvis.py host-bridge
+py -3.11 .\scripts\windows_rpc_bridge.py
+py -3.11 .\jarvis.py host-bridge-exec "Get-Date"
 py -3.11 .\jarvis.py autonomy
 py -3.11 .\jarvis.py learning-tick
 py -3.11 .\jarvis.py diag
@@ -98,6 +101,21 @@ GET  /api/tool-runs
 POST /api/diagnostics
 WS   /ws/events
 ```
+
+## Host Bridge
+
+`scripts/windows_rpc_bridge.py` is a local-only bridge for Windows host actions. It binds to `127.0.0.1:8765`, creates or reads `D:\jarvis\.jarvis\bridge.token`, exposes unauthenticated `/health`, and requires `Authorization: Bearer <token>` for `/execute`.
+
+The normal safe path is:
+
+```powershell
+py -3.11 .\scripts\windows_rpc_bridge.py
+py -3.11 .\jarvis.py approval-request "Host command" "Run approved local command" --action tool.run --risk danger --payload "{\"tool\":\"host.bridge.execute\",\"arguments\":{\"command\":\"Get-Date\"}}"
+py -3.11 .\jarvis.py approval-update <approval_id> --status approved
+py -3.11 .\jarvis.py approval-execute <approval_id>
+```
+
+For manual diagnostics, `host-bridge-exec` calls the same token-auth bridge directly.
 
 ## Storage
 
