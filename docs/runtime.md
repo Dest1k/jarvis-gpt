@@ -1,5 +1,15 @@
 # Runtime
 
+## 2026-07-08 handoff — real mission executor (track 3/3)
+
+Для оператора и второй модели. Трек 3 из 3: `execute_next_mission_step` был заглушкой — гонял `mission.brief` (текстовую рекомендацию), а не работу. «Миссии» были планами, которые ничего не делали. Размер модели это не лечит: исполнитель был пустым.
+
+- `agent._execute_mission_step_agentic(mission, task)`: шаг миссии теперь исполняется через агентный tool-loop (`_agentic_answer`) — модель реально вызывает безопасные инструменты (собрать данные, проверить систему, прочитать файлы), опасные становятся approval-гейтами, внутренние tool-runs пишутся в аудит → у миссии появляется настоящий след исполнения. Результат синтезируется в `ToolRunResponse(tool="mission.execute_next", ok, summary=отчёт, data={tool_steps, autonomous})`. Промпт — `MISSION_EXECUTOR_PROMPT` (исполняй шаг, не пиши план).
+- Ветвление в `execute_next_mission_step`: при `llm_enabled` — агентное исполнение; при выключенном LLM — прежний `mission.brief` (офлайн-контракт и тест `test_agent_executes_next_mission_step` сохранены, `runs[0]=="mission.brief"`).
+- Тест: `test_mission_step_executes_with_tools_when_llm_enabled` (в `test_agentic_loop.py`). Полный прогон — 144 pass, ruff clean.
+- Итог трёх треков: (1) у модели появились руки (tool-loop), (2) память стала находить релевантное при перефразировании (гибридный retrieval), (3) миссии реально исполняются. Все три — про архитектуру, а не про веса модели.
+- На будущее: авто-цепочка шагов миссии (сейчас один шаг за вызов execute-next), UI-прогресс исполнения в реальном времени, и связка mission-executor с operator-approval потоком в Command Center.
+
 ## 2026-07-08 handoff — hybrid semantic memory (track 2/3)
 
 Для оператора и второй модели. Трек 2 из 3: retrieval был чисто лексическим (FTS5 BM25 + LIKE) — перефразированные/иначе склонённые записи не находились, и модель не получала контекст, который «должна была вспомнить». Размер модели это не лечит: retrieval — отдельная подсистема.

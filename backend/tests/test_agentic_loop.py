@@ -184,6 +184,44 @@ def test_agentic_stream_suppresses_tool_json_and_streams_answer(monkeypatch, tmp
     storage.close()
 
 
+def test_mission_step_executes_with_tools_when_llm_enabled(monkeypatch, tmp_path):
+    class MissionToolThenReportLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, messages, *, temperature=None, max_tokens=None, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return _result('{"tool": "runtime.status", "arguments": {}}')
+            return _result("Шаг выполнен: проверил статус рантайма. Осталось: ничего.")
+
+    llm = MissionToolThenReportLLM()
+    agent, storage = _agent(monkeypatch, tmp_path, llm)
+    captured = {}
+
+    async def fake_run(name, arguments=None, **kwargs):
+        captured["tool"] = name
+        return type(
+            "R",
+            (),
+            {"tool": name, "ok": True, "summary": "runtime ok", "data": {"profile": "turbo"}},
+        )()
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+    mission = agent.create_mission("Проверить рантайм и отчитаться")
+
+    response = asyncio.run(agent.execute_next_mission_step(mission["id"]))
+
+    assert response.result.ok is True
+    assert response.task is not None
+    assert response.task.status == "done"
+    assert response.result.data["tool_steps"] == 1
+    assert response.result.data["autonomous"] is True
+    assert "Шаг выполнен" in response.result.summary
+    assert captured["tool"] == "runtime.status"
+    storage.close()
+
+
 def test_agentic_stream_plain_answer_has_no_regression(monkeypatch, tmp_path):
     class PlainStreamLLM:
         async def stream_complete(self, messages, *, temperature=None, max_tokens=None, **kwargs):

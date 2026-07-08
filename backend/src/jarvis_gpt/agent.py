@@ -105,6 +105,16 @@ FINAL_ANSWER_PROMPT = (
 )
 
 
+MISSION_EXECUTOR_PROMPT = (
+    "Ты исполняешь ОДИН шаг миссии как автономный агент, а не пишешь план. Используй "
+    "доступные инструменты, чтобы реально продвинуть шаг: собери данные, проверь систему, "
+    "прочитай файлы, посмотри статус. Не выдумывай результаты — опирайся на observation "
+    "инструментов. Опасные действия автономно недоступны и станут approval-гейтом; в этом "
+    "случае честно скажи, что шаг требует подтверждения оператора. В конце дай краткий "
+    "отчёт по-русски: что фактически сделано, что подтверждено инструментами и что осталось."
+)
+
+
 MISSION_MARKERS = (
     "мисси",
     "mission",
@@ -922,12 +932,15 @@ class AgentRuntime:
             )
 
         running_task = self.storage.update_mission_task(task["id"], status="running")
-        result = await self.tools.run(
-            "mission.brief",
-            {"goal": mission["goal"], "task_title": task["title"]},
-            mission_id=mission_id,
-            task_id=task["id"],
-        )
+        if self.settings.llm_enabled:
+            result = await self._execute_mission_step_agentic(mission, task)
+        else:
+            result = await self.tools.run(
+                "mission.brief",
+                {"goal": mission["goal"], "task_title": task["title"]},
+                mission_id=mission_id,
+                task_id=task["id"],
+            )
         notes = _task_notes_from_result(result)
         final_status = "done" if result.ok else "blocked"
         updated_task = self.storage.update_mission_task(
@@ -955,6 +968,64 @@ class AgentRuntime:
             mission=Mission.model_validate(refreshed),
             task=MissionTask.model_validate(updated_task or running_task or task),
             result=result,
+        )
+
+    async def _execute_mission_step_agentic(
+        self,
+        mission: dict[str, Any],
+        task: dict[str, Any],
+    ) -> ToolRunResponse:
+        """Run one mission step for real through the agentic tool loop.
+
+        Instead of returning a static brief, the model actually uses safe tools
+        (gather facts, inspect the system, read files) to advance the step, and
+        dangerous actions become approval gates. The inner tool runs are recorded
+        by the tool registry, so the mission gets a genuine execution trail.
+        """
+
+        base_messages = [
+            {"role": "system", "content": MISSION_EXECUTOR_PROMPT},
+            {"role": "system", "content": _runtime_date_context()},
+        ]
+        persona_prompt = self._persona_prompt()
+        if persona_prompt:
+            base_messages.append({"role": "system", "content": persona_prompt})
+        base_messages.append(
+            {
+                "role": "user",
+                "content": (
+                    f"Цель миссии: {mission['goal']}\n"
+                    f"Текущий шаг: {task['title']}\n"
+                    "Выполни этот шаг с помощью инструментов и кратко отчитайся: что сделано, "
+                    "что подтверждено инструментами и что осталось для следующего шага."
+                ),
+            }
+        )
+        mission_context = AgentContext(
+            conversation_id=f"mission:{mission['id']}",
+            memory_hits=[],
+            file_hits=[],
+        )
+        agentic = await self._agentic_answer(
+            base_messages,
+            mission_context,
+            temperature=0.2,
+            max_tokens=None,
+            thinking_enabled=False,
+        )
+        summary = agentic.answer.strip() if agentic.answer else ""
+        if not summary:
+            summary = agentic.error or "Шаг не удалось выполнить: модель не вернула результат."
+        return ToolRunResponse(
+            tool="mission.execute_next",
+            ok=agentic.ok and bool(agentic.answer),
+            summary=summary[:2000],
+            data={
+                "mission_id": mission["id"],
+                "task_id": task["id"],
+                "tool_steps": agentic.used_tools,
+                "autonomous": True,
+            },
         )
 
     async def _try_direct_action(
