@@ -234,6 +234,20 @@ type ModelCatalog = {
   };
 };
 
+type DispatcherRuntime = {
+  source?: string;
+  model_path?: string;
+  model_id?: string;
+  served_model_name?: string;
+  enforce_eager?: boolean;
+  max_model_len?: number | null;
+  gpu_memory_utilization?: number | null;
+  kv_cache_dtype?: string;
+  max_num_seqs?: number | null;
+  cpu_offload_gb?: number | null;
+  swap_space_gb?: number | null;
+};
+
 type DispatcherStatus = {
   service: string;
   container: string;
@@ -243,6 +257,9 @@ type DispatcherStatus = {
   base_url: string;
   model: string;
   active_model: ModelArtifact;
+  desired_model?: ModelArtifact | null;
+  runtime?: DispatcherRuntime | null;
+  desired_runtime?: DispatcherRuntime;
   container_status?: { exists?: boolean; status?: string } | null;
 };
 
@@ -964,6 +981,13 @@ export default function CommandCenter() {
   );
   const llmReady = llmCheck?.status === "ok";
   const dispatcherPhase = dispatcher?.container_status?.status ?? (dispatcher?.port_open ? "port open" : "offline");
+  const dispatcherRuntime = dispatcher?.runtime ?? dispatcher?.desired_runtime;
+  const dispatcherModelId = dispatcherRuntime?.model_id || modelCatalog?.active_model.id || status?.settings.llm.model || "disabled";
+  const dispatcherMode = dispatcherRuntime
+    ? dispatcherRuntime.enforce_eager
+      ? "eager"
+      : "cuda graph"
+    : "unknown";
   const primaryGpu = telemetry?.gpu.gpus?.[0];
   const gpuUtilization = Math.round(primaryGpu?.utilization_gpu ?? 0);
   const vramUsage = ratioPercent(primaryGpu?.memory_used_ratio);
@@ -1811,7 +1835,7 @@ export default function CommandCenter() {
               <span>LLM</span>
               <strong>{llmStatusText}</strong>
             </div>
-            <small>{dispatcher?.port_open ? "8001" : "off"}</small>
+            <small>{dispatcher?.port_open ? dispatcherMode : "off"}</small>
           </article>
           <article className={`livePill ${telemetry?.gpu.available ? "ready" : "offline"}`}>
             <Zap size={17} />
@@ -1860,7 +1884,7 @@ export default function CommandCenter() {
           <StatusTile
             icon={<Sparkles size={19} />}
             label="LLM"
-            value={modelCatalog?.active_model.id ?? status?.settings.llm.model ?? "disabled"}
+            value={dispatcherModelId}
             tone={status?.settings.llm.enabled ? "ok" : "warn"}
           />
           <StatusTile
@@ -2253,8 +2277,8 @@ export default function CommandCenter() {
               {dispatcher && (
                 <div className={`dispatcherRow ${dispatcher.port_open ? "online" : ""}`}>
                   <Server size={14} />
-                  <strong>{dispatcher.model}</strong>
-                  <span>{dispatcher.port_open ? "online" : "offline"}</span>
+                  <strong>{dispatcherRuntime?.model_id ?? dispatcher.model}</strong>
+                  <span>{dispatcher.port_open ? dispatcherMode : "offline"}</span>
                   <small>{dispatcher.container_status?.status ?? "port 8001"}</small>
                   <div className="dispatcherControls">
                     <button

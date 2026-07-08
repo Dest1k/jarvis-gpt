@@ -57,21 +57,28 @@ class RuntimeProfile:
     gpu_memory_utilization: float
     kv_cache_dtype: str
     max_num_seqs: int
+    cpu_offload_gb: int
+    swap_space_gb: int
 
 
 PROFILES: dict[str, RuntimeProfile] = {
     "gemma4-mono": RuntimeProfile(
         name="gemma4-mono",
         title="Gemma 4 Mono",
-        description="Stable Gemma 4 31B IT NVFP4 profile for cold starts and reliable execution.",
+        description=(
+            "Quality Gemma 4 31B IT NVFP4 profile with CPU offload "
+            "and conservative concurrency."
+        ),
         model_dir_name="gemma4-31b-it-nvfp4",
         eager_mode=True,
         max_steps=12,
         temperature=0.15,
-        max_model_len=32768,
-        gpu_memory_utilization=0.86,
+        max_model_len=16384,
+        gpu_memory_utilization=0.94,
         kv_cache_dtype="fp8",
-        max_num_seqs=16,
+        max_num_seqs=4,
+        cpu_offload_gb=8,
+        swap_space_gb=8,
     ),
     "gemma4-turbo": RuntimeProfile(
         name="gemma4-turbo",
@@ -85,6 +92,8 @@ PROFILES: dict[str, RuntimeProfile] = {
         gpu_memory_utilization=0.82,
         kv_cache_dtype="fp8",
         max_num_seqs=16,
+        cpu_offload_gb=0,
+        swap_space_gb=0,
     ),
 }
 
@@ -127,6 +136,8 @@ class JarvisSettings:
                 "gpu_memory_utilization": self.profile.gpu_memory_utilization,
                 "kv_cache_dtype": self.profile.kv_cache_dtype,
                 "max_num_seqs": self.profile.max_num_seqs,
+                "cpu_offload_gb": self.profile.cpu_offload_gb,
+                "swap_space_gb": self.profile.swap_space_gb,
             },
             "paths": {
                 "data": str(self.data_dir),

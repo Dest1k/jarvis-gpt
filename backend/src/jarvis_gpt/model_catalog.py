@@ -94,6 +94,16 @@ class ModelCatalog:
                 "JARVIS_QWEN_SAFETENSORS_LOAD_STRATEGY": "prefetch",
                 "JARVIS_QWEN_MAX_NUM_SEQS": str(profile.max_num_seqs),
                 "JARVIS_QWEN_ENFORCE_EAGER": "--enforce-eager" if profile.eager_mode else "",
+                "JARVIS_QWEN_CPU_OFFLOAD_ARGS": (
+                    f"--cpu-offload-gb {profile.cpu_offload_gb}"
+                    if profile.cpu_offload_gb > 0
+                    else ""
+                ),
+                "JARVIS_QWEN_SWAP_SPACE_ARGS": (
+                    f"--swap-space {profile.swap_space_gb}"
+                    if profile.swap_space_gb > 0
+                    else ""
+                ),
                 "JARVIS_ENABLE_UITARS": "0",
             },
         }

@@ -112,6 +112,8 @@ class TelemetryCollector:
             "kv_cache_dtype": profile.kv_cache_dtype,
             "max_num_seqs": profile.max_num_seqs,
             "eager_mode": profile.eager_mode,
+            "cpu_offload_gb": profile.cpu_offload_gb,
+            "swap_space_gb": profile.swap_space_gb,
             "recommended_dispatcher": {
                 "port": 8001,
                 "image": os.environ.get("JARVIS_VLLM_IMAGE", "vllm/vllm-openai:nightly"),

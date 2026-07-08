@@ -173,6 +173,9 @@ class DispatcherStatusResponse(BaseModel):
     base_url: str
     model: str
     active_model: dict[str, Any]
+    desired_model: dict[str, Any] | None = None
+    runtime: dict[str, Any] | None = None
+    desired_runtime: dict[str, Any] = Field(default_factory=dict)
     compose: list[str]
     container_status: dict[str, Any] | None = None
     env: dict[str, str]

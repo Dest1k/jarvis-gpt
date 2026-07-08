@@ -1,6 +1,6 @@
 param(
   [string]$HomePath = "D:\jarvis",
-  [string]$Profile = "gemma4-mono"
+  [string]$Profile = "gemma4-turbo"
 )
 
 $ErrorActionPreference = "Stop"
