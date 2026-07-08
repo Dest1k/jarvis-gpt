@@ -146,6 +146,13 @@ type ApprovalItem = {
   result: Record<string, unknown>;
 };
 
+type ApprovalExecution = {
+  approval: ApprovalItem;
+  ok: boolean;
+  summary: string;
+  data: Record<string, unknown>;
+};
+
 type ModelArtifact = {
   id: string;
   path: string;
@@ -661,6 +668,32 @@ export default function CommandCenter() {
     }
   }
 
+  async function executeApproval(approvalId: string) {
+    setBusy(true);
+    try {
+      const result = await api<ApprovalExecution>(`/api/approvals/${approvalId}/execute`, {
+        method: "POST",
+        body: "{}"
+      });
+      setApprovals((current) =>
+        current.map((approval) => (approval.id === approvalId ? result.approval : approval))
+      );
+      setLines((current) => [
+        ...current,
+        {
+          id: crypto.randomUUID(),
+          role: "system",
+          content: result.summary
+        }
+      ]);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Approval execution failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function runLearningTick() {
     setBusy(true);
     try {
@@ -909,6 +942,15 @@ export default function CommandCenter() {
                         onClick={() => updateApprovalStatus(approval.id, "rejected")}
                       >
                         <ShieldAlert size={14} />
+                      </button>
+                      <button
+                        type="button"
+                        title="Execute"
+                        aria-label="Execute"
+                        disabled={busy || approval.status !== "approved"}
+                        onClick={() => executeApproval(approval.id)}
+                      >
+                        <Play size={14} />
                       </button>
                     </div>
                   </article>

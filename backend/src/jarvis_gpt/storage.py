@@ -897,6 +897,26 @@ class JarvisStorage:
             for row in rows
         ]
 
+    def get_approval(self, approval_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self.connect().execute(
+                """
+                SELECT
+                    id, created_at, updated_at, status, risk, title, description,
+                    requested_action, payload, result
+                FROM approvals
+                WHERE id = ?
+                """,
+                (approval_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            **dict(row),
+            "payload": _loads(row["payload"], {}),
+            "result": _loads(row["result"], {}),
+        }
+
     def update_approval(
         self,
         approval_id: str,

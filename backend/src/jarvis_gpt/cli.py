@@ -8,6 +8,7 @@ from typing import Any
 import uvicorn
 
 from .agent import AgentRuntime
+from .approval_executor import ApprovalExecutor
 from .config import PROFILES, ensure_runtime_dirs, load_settings
 from .diagnostics import run_diagnostics
 from .dispatcher import DispatcherManager
@@ -239,6 +240,32 @@ def cmd_approval_update(args: argparse.Namespace) -> None:
     storage.close()
 
 
+def cmd_approval_execute(args: argparse.Namespace) -> None:
+    async def run() -> None:
+        settings, storage, llm, agent = _runtime(args.profile)
+        executor = ApprovalExecutor(
+            storage=storage,
+            llm=llm,
+            dispatcher=DispatcherManager(settings),
+            tools=agent.tools,
+        )
+        result = await executor.execute(args.id)
+        _print_json(
+            {
+                "ok": result.ok,
+                "summary": result.summary,
+                "data": result.data,
+                "approval": result.approval,
+                "status_code": result.status_code,
+            }
+        )
+        storage.close()
+        if result.status_code >= 400:
+            raise SystemExit(1)
+
+    asyncio.run(run())
+
+
 def cmd_tool_run(args: argparse.Namespace) -> None:
     async def run() -> None:
         _settings, storage, _llm, agent = _runtime(args.profile)
@@ -378,6 +405,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     approval_update_parser.add_argument("--result", default="{}")
     approval_update_parser.set_defaults(func=cmd_approval_update)
+
+    approval_execute_parser = sub.add_parser(
+        "approval-execute",
+        help="Execute an approved HITL gate through the gated executor",
+    )
+    approval_execute_parser.add_argument("id")
+    approval_execute_parser.set_defaults(func=cmd_approval_execute)
 
     tool_run_parser = sub.add_parser("tool-run", help="Run a registered safe tool")
     tool_run_parser.add_argument("name")

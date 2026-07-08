@@ -243,6 +243,13 @@ class ApprovalItem(BaseModel):
     result: dict[str, Any] = Field(default_factory=dict)
 
 
+class ApprovalExecutionResponse(BaseModel):
+    approval: ApprovalItem
+    ok: bool
+    summary: str
+    data: dict[str, Any] = Field(default_factory=dict)
+
+
 class ToolInfo(BaseModel):
     name: str
     description: str

@@ -17,6 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 from .agent import AgentRuntime
+from .approval_executor import ApprovalExecutor
 from .config import ensure_runtime_dirs, load_settings
 from .diagnostics import run_diagnostics
 from .dispatcher import DispatcherManager
@@ -28,6 +29,7 @@ from .llm import LLMRouter
 from .model_catalog import ModelCatalog
 from .models import (
     ApprovalCreateRequest,
+    ApprovalExecutionResponse,
     ApprovalItem,
     ApprovalUpdateRequest,
     AuditEntry,
@@ -77,6 +79,12 @@ async def lifespan(app: FastAPI):
     learning = LearningEngine(storage)
     host_bridge = HostBridgeStatus(settings)
     supervisor = RuntimeSupervisor(settings=settings, storage=storage)
+    approval_executor = ApprovalExecutor(
+        storage=storage,
+        llm=llm,
+        dispatcher=dispatcher,
+        tools=agent.tools,
+    )
 
     app.state.settings = settings
     app.state.storage = storage
@@ -90,6 +98,7 @@ async def lifespan(app: FastAPI):
     app.state.learning = learning
     app.state.host_bridge = host_bridge
     app.state.supervisor = supervisor
+    app.state.approval_executor = approval_executor
     storage.add_event(kind="runtime.start", title="JARVIS GPT backend started")
     await supervisor.start()
     try:
@@ -380,6 +389,34 @@ async def update_approval(
         {"channel": "approvals", "approval_id": approval_id, "status": request.status}
     )
     return updated
+
+
+@app.post("/api/approvals/{approval_id}/execute", response_model=ApprovalExecutionResponse)
+async def execute_approval(approval_id: str) -> ApprovalExecutionResponse:
+    result = await app.state.approval_executor.execute(approval_id)
+    if result.status_code == 404:
+        raise HTTPException(status_code=404, detail=result.summary)
+    if result.status_code == 409:
+        raise HTTPException(status_code=409, detail=result.summary)
+    if result.status_code == 400:
+        raise HTTPException(status_code=400, detail=result.summary)
+    if result.approval is None:
+        raise HTTPException(status_code=500, detail="Approval execution did not return state")
+    await app.state.bus.publish(
+        {
+            "channel": "approvals",
+            "approval_id": approval_id,
+            "status": result.approval["status"],
+            "executed": True,
+            "ok": result.ok,
+        }
+    )
+    return ApprovalExecutionResponse(
+        approval=ApprovalItem.model_validate(result.approval),
+        ok=result.ok,
+        summary=result.summary,
+        data=result.data,
+    )
 
 
 @app.get("/api/tools", response_model=list[ToolInfo])

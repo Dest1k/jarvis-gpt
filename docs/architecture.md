@@ -54,7 +54,7 @@ External host runtime
 - Audit log фиксирует изменения памяти, миссий, task lifecycle, tool runs и ingestion.
 - Профили `gemma4-mono` и `gemma4-turbo` указывают на реальные каталоги весов в `D:\jarvis\data\models`; backend не хранит веса в репозитории.
 - Dispatcher вынесен в отдельный Compose profile `llm`, чтобы Command Center можно было запускать без случайной загрузки тяжёлых весов в VRAM.
-- Любое действие с риском выше safe должно сначала стать approval gate; выполнение после approve будет добавляться отдельным gated executor.
+- Любое действие с риском выше safe должно сначала стать approval gate; выполнение после approve проходит через отдельный whitelisted gated executor.
 - Self-learning пока идёт через explicit `learning.tick`: он добывает lessons из audit/tool/approval истории и пишет их в долговременную память.
 - Autonomous supervisor безопасно выполняет только наблюдение: telemetry snapshots и learning tick по расписанию; действия с риском остаются через approvals.
 - Performance слой разделяет лёгкий backend и тяжёлый dispatcher; GPU утилизируется vLLM-профилем, а backend собирает telemetry без удержания весов.

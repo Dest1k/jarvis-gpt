@@ -7,6 +7,7 @@
 - Dispatcher stability flags are pinned for Docker Desktop on Windows: `VLLM_USE_V2_MODEL_RUNNER=0`, `VLLM_WEIGHT_OFFLOADING_DISABLE_UVA=1`, `JARVIS_QWEN_TOKENIZER_MODE=slow`, `JARVIS_QWEN_SAFETENSORS_LOAD_STRATEGY=prefetch`.
 - Verified tonight: backend `pytest`, `ruff`, frontend `typecheck`, frontend `build`.
 - Follow-up closed: `/api/chat/stream` now streams NDJSON deltas and the default generation budget is 512 tokens.
+- HITL follow-up closed: approved gates can now be executed through the whitelisted approval executor.
 
 ## Переменные окружения
 
@@ -52,6 +53,7 @@ py -3.11 .\jarvis.py audit
 py -3.11 .\jarvis.py approvals
 py -3.11 .\jarvis.py approval-request "Host action" "Needs review" --risk danger
 py -3.11 .\jarvis.py approval-update <approval_id> --status approved
+py -3.11 .\jarvis.py approval-execute <approval_id>
 py -3.11 .\jarvis.py mission-next <mission_id>
 py -3.11 .\jarvis.py serve --reload
 .\scripts\doctor.ps1
@@ -86,6 +88,7 @@ GET  /api/audit
 GET  /api/approvals
 POST /api/approvals
 PATCH /api/approvals/{approval_id}
+POST /api/approvals/{approval_id}/execute
 GET  /api/tools
 POST /api/tools/{tool_name}/run
 GET  /api/tool-runs
