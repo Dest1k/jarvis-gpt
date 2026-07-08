@@ -6,7 +6,7 @@
 - `gemma4-31b-it-nvfp4` remains in the catalog, but it currently exhausts available KV cache memory at the 32k context target after loading the weights.
 - Dispatcher stability flags are pinned for Docker Desktop on Windows: `VLLM_USE_V2_MODEL_RUNNER=0`, `VLLM_WEIGHT_OFFLOADING_DISABLE_UVA=1`, `JARVIS_QWEN_TOKENIZER_MODE=slow`, `JARVIS_QWEN_SAFETENSORS_LOAD_STRATEGY=prefetch`.
 - Verified tonight: backend `pytest`, `ruff`, frontend `typecheck`, frontend `build`.
-- First follow-up: tune `/api/chat` for lower-latency local inference, likely streaming plus smaller default generation budgets.
+- Follow-up closed: `/api/chat/stream` now streams NDJSON deltas and the default generation budget is 512 tokens.
 
 ## Переменные окружения
 
@@ -69,6 +69,7 @@ GET  /api/host-bridge
 GET  /api/autonomy
 POST /api/learning/tick
 POST /api/chat
+POST /api/chat/stream
 GET  /api/missions
 POST /api/missions
 POST /api/missions/{mission_id}/execute-next

@@ -34,7 +34,13 @@ type RuntimeStatus = {
     home: string;
     profile: { name: string; title: string; description: string; eager_mode: boolean };
     paths: Record<string, string>;
-    llm: { enabled: boolean; base_url: string; model: string };
+    llm: {
+      enabled: boolean;
+      base_url: string;
+      model: string;
+      max_tokens?: number;
+      timeout_sec?: number;
+    };
   };
   counters: Record<string, number>;
   health: DiagnosticCheck[];
@@ -75,6 +81,7 @@ type Mission = {
 };
 
 type ChatLine = {
+  id?: string;
   role: "user" | "assistant" | "system";
   content: string;
 };
@@ -221,6 +228,14 @@ type MissionExecution = {
   };
 };
 
+type ChatStreamItem = {
+  type: "meta" | "event" | "delta" | "done" | "error";
+  content?: string;
+  conversation_id?: string;
+  answer?: string;
+  error?: string;
+};
+
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_URL}${path}`, {
     ...init,
@@ -233,6 +248,56 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
     throw new Error(`${response.status} ${response.statusText}`);
   }
   return response.json() as Promise<T>;
+}
+
+async function streamApi(
+  path: string,
+  body: Record<string, unknown>,
+  onItem: (item: ChatStreamItem) => void
+) {
+  const response = await fetch(`${API_URL}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  if (!response.ok) {
+    throw new Error(`${response.status} ${response.statusText}`);
+  }
+  if (!response.body) {
+    throw new Error("Streaming response has no body");
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    buffer = drainStreamBuffer(buffer, onItem);
+  }
+  buffer += decoder.decode();
+  drainStreamBuffer(`${buffer}\n`, onItem);
+}
+
+function drainStreamBuffer(
+  buffer: string,
+  onItem: (item: ChatStreamItem) => void
+) {
+  const lines = buffer.split("\n");
+  const rest = lines.pop() ?? "";
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    onItem(JSON.parse(trimmed) as ChatStreamItem);
+  }
+  return rest;
+}
+
+function clampMaxTokens(value: number) {
+  if (!Number.isFinite(value)) return 512;
+  return Math.max(64, Math.min(8192, Math.round(value)));
 }
 
 export default function CommandCenter() {
@@ -255,13 +320,16 @@ export default function CommandCenter() {
   const [fileQuery, setFileQuery] = useState("");
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [conversationId, setConversationId] = useState<string | null>(null);
+  const [maxTokens, setMaxTokens] = useState(512);
   const [lines, setLines] = useState<ChatLine[]>([
     {
+      id: "system-boot",
       role: "system",
       content: "JARVIS GPT Command Center готов к подключению."
     }
   ]);
   const [busy, setBusy] = useState(false);
+  const [chatBusy, setChatBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
@@ -323,36 +391,77 @@ export default function CommandCenter() {
   async function sendChat(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const message = input.trim();
-    if (!message || busy) return;
-    setBusy(true);
+    if (!message || chatBusy) return;
+    const userId = crypto.randomUUID();
+    const assistantId = crypto.randomUUID();
+    let receivedDelta = false;
+    setChatBusy(true);
     setInput("");
-    setLines((current) => [...current, { role: "user", content: message }]);
+    setLines((current) => [
+      ...current,
+      { id: userId, role: "user", content: message },
+      { id: assistantId, role: "assistant", content: "" }
+    ]);
     try {
-      const response = await api<{
-        conversation_id: string;
-        answer: string;
-        mission_id?: string;
-      }>("/api/chat", {
-        method: "POST",
-        body: JSON.stringify({
+      await streamApi(
+        "/api/chat/stream",
+        {
           message,
           conversation_id: conversationId,
+          max_tokens: maxTokens,
           mode: "auto"
-        })
-      });
-      setConversationId(response.conversation_id);
-      setLines((current) => [...current, { role: "assistant", content: response.answer }]);
+        },
+        (item) => {
+          if (item.type === "meta" && item.conversation_id) {
+            setConversationId(item.conversation_id);
+          }
+          if (item.type === "delta" && item.content) {
+            receivedDelta = true;
+            setLines((current) =>
+              current.map((line) =>
+                line.id === assistantId
+                  ? { ...line, content: `${line.content}${item.content}` }
+                  : line
+              )
+            );
+          }
+          if (item.type === "done") {
+            if (item.conversation_id) {
+              setConversationId(item.conversation_id);
+            }
+            if (!receivedDelta && item.answer) {
+              setLines((current) =>
+                current.map((line) =>
+                  line.id === assistantId ? { ...line, content: item.answer ?? "" } : line
+                )
+              );
+            }
+          }
+          if (item.type === "error") {
+            setLines((current) =>
+              current.map((line) =>
+                line.id === assistantId
+                  ? { ...line, content: item.error ?? "Streaming error" }
+                  : line
+              )
+            );
+          }
+        }
+      );
       await refresh();
     } catch (err) {
-      setLines((current) => [
-        ...current,
-        {
-          role: "assistant",
-          content: err instanceof Error ? `Backend error: ${err.message}` : "Backend error"
-        }
-      ]);
+      setLines((current) =>
+        current.map((line) =>
+          line.id === assistantId
+            ? {
+                ...line,
+                content: err instanceof Error ? `Backend error: ${err.message}` : "Backend error"
+              }
+            : line
+        )
+      );
     } finally {
-      setBusy(false);
+      setChatBusy(false);
     }
   }
 
@@ -636,7 +745,7 @@ export default function CommandCenter() {
             </div>
             <div className="transcript">
               {lines.map((line, index) => (
-                <article className={`bubble ${line.role}`} key={`${line.role}-${index}`}>
+                <article className={`bubble ${line.role}`} key={line.id ?? `${line.role}-${index}`}>
                   <span>{line.role}</span>
                   <p>{line.content}</p>
                 </article>
@@ -650,9 +759,21 @@ export default function CommandCenter() {
                 placeholder="JARVIS, оформи это как mission plan..."
                 rows={3}
               />
-              <button className="sendButton" type="submit" disabled={busy || !input.trim()}>
-                {busy ? <Loader2 className="spin" size={19} /> : <Send size={19} />}
-              </button>
+              <div className="composerSide">
+                <input
+                  aria-label="Max tokens"
+                  className="tokenInput"
+                  min={64}
+                  max={8192}
+                  step={64}
+                  type="number"
+                  value={maxTokens}
+                  onChange={(event) => setMaxTokens(clampMaxTokens(Number(event.target.value)))}
+                />
+                <button className="sendButton" type="submit" disabled={chatBusy || !input.trim()}>
+                  {chatBusy ? <Loader2 className="spin" size={19} /> : <Send size={19} />}
+                </button>
+              </div>
             </form>
           </section>
 

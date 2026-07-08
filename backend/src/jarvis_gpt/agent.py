@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -66,6 +67,8 @@ class AgentRuntime:
         message: str,
         conversation_id: str | None = None,
         mode: str = "auto",
+        temperature: float | None = None,
+        max_tokens: int | None = None,
     ) -> ChatResponse:
         context = self._prepare_context(message, conversation_id)
         events: list[ChatEvent] = [
@@ -82,7 +85,7 @@ class AgentRuntime:
             conversation_id=context.conversation_id,
             role="user",
             content=message,
-            metadata={"mode": mode},
+            metadata={"max_tokens": max_tokens, "mode": mode, "temperature": temperature},
         )
 
         forced_mission = mode == "mission"
@@ -125,7 +128,11 @@ class AgentRuntime:
             )
         )
         await self._emit(events[-1])
-        result = await self.llm.complete(llm_messages)
+        result = await self.llm.complete(
+            llm_messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
         if result.ok and result.content:
             answer = result.content
             events.append(
@@ -158,6 +165,139 @@ class AgentRuntime:
             answer=answer,
             events=events,
         )
+
+    async def stream_chat(
+        self,
+        message: str,
+        conversation_id: str | None = None,
+        mode: str = "auto",
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        context = self._prepare_context(message, conversation_id)
+        events: list[ChatEvent] = [
+            ChatEvent(
+                type="thought",
+                title="Accepted task",
+                content="Selecting chat, agent, or mission route.",
+                payload={"profile": self.settings.profile.name},
+            )
+        ]
+        await self._emit(events[-1])
+        yield {"type": "meta", "conversation_id": context.conversation_id}
+        yield {"type": "event", "event": events[-1].model_dump()}
+
+        self.storage.add_message(
+            conversation_id=context.conversation_id,
+            role="user",
+            content=message,
+            metadata={"max_tokens": max_tokens, "mode": mode, "temperature": temperature},
+        )
+
+        forced_mission = mode == "mission"
+        if forced_mission or (mode == "auto" and self._looks_like_mission(message)):
+            mission = self.create_mission(message)
+            answer = self._mission_answer(mission)
+            events.append(
+                ChatEvent(
+                    type="mission",
+                    title="Mission plan created",
+                    content=mission["title"],
+                    payload={"mission_id": mission["id"], "tasks": len(mission["tasks"])},
+                )
+            )
+            await self._emit(events[-1])
+            yield {"type": "event", "event": events[-1].model_dump()}
+            yield {"type": "delta", "content": answer}
+            message_id = self.storage.add_message(
+                conversation_id=context.conversation_id,
+                role="assistant",
+                content=answer,
+                metadata={
+                    "mission_id": mission["id"],
+                    "events": [event.model_dump() for event in events],
+                },
+            )
+            yield {
+                "type": "done",
+                "answer": answer,
+                "conversation_id": context.conversation_id,
+                "events": [event.model_dump() for event in events],
+                "message_id": message_id,
+                "mission_id": mission["id"],
+            }
+            return
+
+        llm_messages = self._build_llm_messages(context, message)
+        events.append(
+            ChatEvent(
+                type="tool_call",
+                title="LLM router",
+                content=f"{self.settings.llm_model} via {self.settings.llm_base_url}",
+                payload={
+                    "enabled": self.settings.llm_enabled,
+                    "max_tokens": max_tokens or self.settings.llm_max_tokens,
+                    "stream": True,
+                },
+            )
+        )
+        await self._emit(events[-1])
+        yield {"type": "event", "event": events[-1].model_dump()}
+
+        answer_parts: list[str] = []
+        stream_error: str | None = None
+        async for chunk in self.llm.stream_complete(
+            llm_messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        ):
+            if chunk.kind == "delta" and chunk.content:
+                answer_parts.append(chunk.content)
+                yield {"type": "delta", "content": chunk.content}
+            elif chunk.kind == "error":
+                stream_error = chunk.error
+                break
+
+        if answer_parts:
+            answer = "".join(answer_parts).strip()
+            if stream_error:
+                interruption = f"\n\n[stream interrupted: {stream_error}]"
+                answer = f"{answer}{interruption}"
+                yield {"type": "delta", "content": interruption}
+            events.append(
+                ChatEvent(
+                    type="assistant_done",
+                    title="Streaming answer received",
+                    payload={"source": "llm", "stream": True},
+                )
+            )
+        else:
+            answer = self._offline_answer(message, stream_error)
+            yield {"type": "delta", "content": answer}
+            events.append(
+                ChatEvent(
+                    type="assistant_done",
+                    title="Offline fallback",
+                    content=stream_error,
+                    payload={"source": "fallback", "stream": True},
+                )
+            )
+
+        await self._emit(events[-1])
+        yield {"type": "event", "event": events[-1].model_dump()}
+        message_id = self.storage.add_message(
+            conversation_id=context.conversation_id,
+            role="assistant",
+            content=answer,
+            metadata={"events": [event.model_dump() for event in events]},
+        )
+        yield {
+            "type": "done",
+            "answer": answer,
+            "conversation_id": context.conversation_id,
+            "events": [event.model_dump() for event in events],
+            "message_id": message_id,
+        }
 
     def create_mission(self, goal: str, title: str | None = None) -> dict[str, Any]:
         mission_title = title or self._title_from_goal(goal)

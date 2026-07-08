@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -13,6 +14,7 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 
 from .agent import AgentRuntime
 from .config import ensure_runtime_dirs, load_settings
@@ -185,7 +187,24 @@ async def chat(request: ChatRequest) -> ChatResponse:
         request.message,
         conversation_id=request.conversation_id,
         mode=request.mode,
+        temperature=request.temperature,
+        max_tokens=request.max_tokens,
     )
+
+
+@app.post("/api/chat/stream")
+async def chat_stream(request: ChatRequest) -> StreamingResponse:
+    async def lines():
+        async for item in app.state.agent.stream_chat(
+            request.message,
+            conversation_id=request.conversation_id,
+            mode=request.mode,
+            temperature=request.temperature,
+            max_tokens=request.max_tokens,
+        ):
+            yield f"{json.dumps(item, ensure_ascii=False)}\n".encode()
+
+    return StreamingResponse(lines(), media_type="application/x-ndjson")
 
 
 @app.get("/api/missions", response_model=list[Mission])

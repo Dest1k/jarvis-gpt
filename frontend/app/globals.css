@@ -328,8 +328,9 @@ h3 {
 
 .composer {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 48px;
+  grid-template-columns: minmax(0, 1fr) 64px;
   gap: 10px;
+  align-items: end;
   padding: 14px;
   border-top: 1px solid var(--line);
 }
@@ -347,6 +348,29 @@ h3 {
 }
 
 .composer textarea:focus {
+  border-color: var(--teal);
+  box-shadow: 0 0 0 3px rgba(13, 118, 111, 0.12);
+}
+
+.composerSide {
+  display: grid;
+  gap: 8px;
+  justify-items: center;
+}
+
+.tokenInput {
+  width: 64px;
+  height: 32px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #ffffff;
+  color: var(--ink);
+  font-size: 12px;
+  text-align: center;
+  outline: none;
+}
+
+.tokenInput:focus {
   border-color: var(--teal);
   box-shadow: 0 0 0 3px rgba(13, 118, 111, 0.12);
 }

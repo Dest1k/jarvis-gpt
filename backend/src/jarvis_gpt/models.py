@@ -16,6 +16,8 @@ class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=20000)
     conversation_id: str | None = None
     mode: Literal["auto", "chat", "mission"] = "auto"
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0)
+    max_tokens: int | None = Field(default=None, ge=1, le=8192)
 
 
 class ChatEvent(BaseModel):
