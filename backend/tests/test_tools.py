@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import httpx
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
@@ -149,4 +150,55 @@ def test_web_fetch_reads_public_text(monkeypatch, tmp_path):
     assert result.data["status_code"] == 200
     assert result.data["text"] == "hello world"
     assert result.data["truncated"] is False
+    storage.close()
+
+
+def test_docker_ps_parses_compact_container_list(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr(
+        "jarvis_gpt.tools.shutil.which",
+        lambda command: "docker.exe" if command == "docker" else None,
+    )
+
+    def fake_run(command, **kwargs):
+        assert command[:3] == ["docker.exe", "ps", "-a"]
+        assert kwargs["timeout"] == 10
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                '{"ID":"abc","Names":"jarvis-gpt-dispatcher","Image":"vllm",'
+                '"Status":"Up 2 minutes","State":"running","Ports":"127.0.0.1:8001"}\n'
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr("jarvis_gpt.tools.subprocess.run", fake_run)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    result = asyncio.run(tools.run("docker.ps", {}))
+
+    assert result.ok is True
+    assert result.data["containers"][0]["name"] == "jarvis-gpt-dispatcher"
+    assert result.data["containers"][0]["state"] == "running"
+    storage.close()
+
+
+def test_docker_logs_restricts_non_jarvis_containers(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    result = asyncio.run(tools.run("docker.logs", {"container": "postgres"}))
+
+    assert result.ok is False
+    assert "restricted" in result.summary
     storage.close()

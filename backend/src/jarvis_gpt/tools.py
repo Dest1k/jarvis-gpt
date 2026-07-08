@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import inspect
 import ipaddress
+import json
 import math
+import shutil
 import socket
+import subprocess
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -190,6 +193,24 @@ class ToolRegistry:
                 category="runtime",
                 input_schema={"persist": "Store snapshot in SQLite"},
                 handler=_telemetry_snapshot,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="docker.ps",
+                description="List Docker containers in a compact, read-only form.",
+                category="docker",
+                input_schema={"all": "Include stopped containers", "limit": "Maximum rows"},
+                handler=_docker_ps,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="docker.logs",
+                description="Read a small tail from an allowed Jarvis Docker container.",
+                category="docker",
+                input_schema={"container": "Jarvis container name", "tail": "Maximum log lines"},
+                handler=_docker_logs,
             )
         )
         self.add(
@@ -389,6 +410,66 @@ def _telemetry_snapshot(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
         ok=True,
         summary=f"Telemetry collected: {gpu_count} GPU(s) visible.",
         data=snapshot,
+    )
+
+
+def _docker_ps(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    limit = _int_arg(args.get("limit"), default=30, minimum=1, maximum=200)
+    include_all = bool(args.get("all", True))
+    command = ["ps", "--format", "{{json .}}"]
+    if include_all:
+        command.insert(1, "-a")
+    result = _run_docker(command, timeout=10)
+    if not result["ok"]:
+        return ToolRunResponse(
+            tool="docker.ps",
+            ok=False,
+            summary=result["summary"],
+            data=result,
+        )
+    containers = _parse_docker_ps(result["stdout"])[:limit]
+    return ToolRunResponse(
+        tool="docker.ps",
+        ok=True,
+        summary=f"Listed {len(containers)} Docker container(s).",
+        data={
+            "containers": containers,
+            "limit": limit,
+            "all": include_all,
+            "command": result["command"],
+        },
+    )
+
+
+def _docker_logs(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    container = str(args.get("container") or "jarvis-gpt-dispatcher").strip()
+    if not _is_allowed_docker_container(container):
+        return ToolRunResponse(
+            tool="docker.logs",
+            ok=False,
+            summary="Docker logs are restricted to Jarvis containers.",
+            data={"container": container},
+        )
+    tail = _int_arg(args.get("tail"), default=80, minimum=1, maximum=500)
+    result = _run_docker(["logs", "--tail", str(tail), container], timeout=20)
+    if not result["ok"]:
+        return ToolRunResponse(
+            tool="docker.logs",
+            ok=False,
+            summary=result["summary"],
+            data=result,
+        )
+    return ToolRunResponse(
+        tool="docker.logs",
+        ok=True,
+        summary=f"Read {tail} Docker log line(s) from {container}.",
+        data={
+            "container": container,
+            "tail": tail,
+            "stdout": result["stdout"],
+            "stderr": result["stderr"],
+            "command": result["command"],
+        },
     )
 
 
@@ -706,6 +787,76 @@ def _resolve_allowed_path(settings: JarvisSettings, raw_path: str) -> Path:
             continue
     roots_text = ", ".join(str(root) for root in roots)
     raise ValueError(f"Path is outside allowed roots: {roots_text}")
+
+
+def _run_docker(args: list[str], *, timeout: int) -> dict[str, Any]:
+    docker = shutil.which("docker")
+    if docker is None:
+        return {
+            "ok": False,
+            "summary": "Docker is not available in PATH.",
+            "stdout": "",
+            "stderr": "docker not found",
+            "command": ["docker", *args],
+            "returncode": None,
+        }
+    command = [docker, *args]
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False,
+            "summary": f"Docker command failed: {exc}",
+            "stdout": "",
+            "stderr": str(exc),
+            "command": command,
+            "returncode": None,
+        }
+    return {
+        "ok": result.returncode == 0,
+        "summary": f"Docker exited with {result.returncode}.",
+        "stdout": result.stdout.strip(),
+        "stderr": result.stderr.strip(),
+        "command": command,
+        "returncode": result.returncode,
+    }
+
+
+def _parse_docker_ps(stdout: str) -> list[dict[str, Any]]:
+    containers: list[dict[str, Any]] = []
+    for line in stdout.splitlines():
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        containers.append(
+            {
+                "id": item.get("ID"),
+                "name": item.get("Names"),
+                "image": item.get("Image"),
+                "status": item.get("Status"),
+                "state": item.get("State"),
+                "ports": item.get("Ports"),
+                "created_at": item.get("CreatedAt"),
+            }
+        )
+    return containers
+
+
+def _is_allowed_docker_container(container: str) -> bool:
+    lowered = container.lower()
+    return bool(container) and (
+        lowered == "jarvis-gpt-dispatcher"
+        or lowered.startswith("jarvis-")
+        or lowered.startswith("jarvis_")
+        or "jarvis-gpt" in lowered
+    )
 
 
 def _validate_public_http_url(raw_url: str) -> str:

@@ -6,7 +6,7 @@
 
 - FastAPI backend с `/health`, `/api/status`, `/api/models`, `/api/chat`, `/api/chat/stream`, `/api/missions`, `/api/memory`, `/api/files`, `/api/approvals`, `/api/audit`, `/api/diagnostics`.
 - Offline-first агент: сохраняет диалоги, создаёт mission plans и деградирует корректно, если локальная LLM не поднята.
-- Safe tools runtime: диагностика, статус, память, публичный web fetch с SSRF-защитой, файловое чтение в разрешённых корнях, token-auth host bridge и execution brief для миссий.
+- Safe tools runtime: диагностика, статус, память, публичный web fetch с SSRF-защитой, Docker ps/logs для Jarvis-контейнеров, файловое чтение в разрешённых корнях, token-auth host bridge и execution brief для миссий.
 - File ingestion: загрузка текстовых файлов, хранение в `D:\jarvis\data\jarvis-gpt\files`, chunk search и audit trail.
 - Model catalog: активные профили знают реальные Gemma 4 веса в `D:\jarvis\data\models`.
 - HITL approvals: опасные действия оформляются как durable approval gates, а не выполняются молча.
@@ -134,6 +134,7 @@ docker compose --profile llm up -d dispatcher
 - Command Center can create host-command approval gates and execute them after approval.
 - Native host bridge now has a bundled local RPC script, token detection, CLI execution, and a `danger` tool for approved host commands.
 - Safe tools include `web.fetch` for public HTTP(S) context with private-network and redirect guards.
+- Safe tools include read-only `docker.ps` and restricted `docker.logs` for Jarvis container diagnostics.
 - Autonomous supervisor persists telemetry, learning lessons, and health snapshots on separate intervals.
 - Mission planner enriches plans with domain-specific UI, LLM, Docker/GPU, host bridge and performance steps.
 - HITL gates now have a whitelisted executor: approved gates can run dispatcher, diagnostics, learning, telemetry, memory, or registered tool actions.
