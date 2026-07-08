@@ -1,7 +1,9 @@
 {
   "name": "JARVIS GPT Command Center",
   "short_name": "JARVIS GPT",
+  "id": "/",
   "start_url": "/",
+  "scope": "/",
   "display": "standalone",
   "background_color": "#edf1ef",
   "theme_color": "#202725",
@@ -9,7 +11,8 @@
     {
       "src": "/icon.svg",
       "sizes": "128x128",
-      "type": "image/svg+xml"
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
     }
   ]
 }

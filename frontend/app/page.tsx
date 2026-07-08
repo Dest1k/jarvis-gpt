@@ -475,6 +475,11 @@ export default function CommandCenter() {
   }, []);
 
   useEffect(() => {
+    if (!("serviceWorker" in navigator) || !window.isSecureContext) return;
+    navigator.serviceWorker.register("/sw.js").catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
     return () => {
       const recognition = recognitionRef.current;
       if (!recognition) return;
