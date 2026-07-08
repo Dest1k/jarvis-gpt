@@ -6,14 +6,16 @@ services:
     restart: unless-stopped
     ipc: host
     command: >
-      --model ${JARVIS_QWEN_MODEL_PATH:-/models/gemma4-31b-it-nvfp4}
+      --model ${JARVIS_QWEN_MODEL_PATH:-/models/gemma4-26b-a4b-nvfp4}
       --served-model-name ${JARVIS_QWEN_MODEL_NAME:-dispatcher}
       --dtype ${JARVIS_QWEN_DTYPE:-auto}
       ${JARVIS_QWEN_QUANT_ARGS:-}
-      ${JARVIS_QWEN_ENFORCE_EAGER:---enforce-eager}
+      ${JARVIS_QWEN_ENFORCE_EAGER:-}
       --max-model-len ${JARVIS_QWEN_MAX_LEN:-32768}
-      --gpu-memory-utilization ${JARVIS_QWEN_GPU_UTIL:-0.86}
+      --gpu-memory-utilization ${JARVIS_QWEN_GPU_UTIL:-0.82}
       --kv-cache-dtype ${JARVIS_QWEN_KV_DTYPE:-fp8}
+      --tokenizer-mode ${JARVIS_QWEN_TOKENIZER_MODE:-slow}
+      --safetensors-load-strategy ${JARVIS_QWEN_SAFETENSORS_LOAD_STRATEGY:-prefetch}
       --enable-prefix-caching
       --max-num-seqs ${JARVIS_QWEN_MAX_NUM_SEQS:-16}
       ${JARVIS_QWEN_EXTRA_ARGS:-}
@@ -21,6 +23,8 @@ services:
       --port 8001
     environment:
       HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
+      VLLM_USE_V2_MODEL_RUNNER: ${VLLM_USE_V2_MODEL_RUNNER:-0}
+      VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: ${VLLM_WEIGHT_OFFLOADING_DISABLE_UVA:-1}
       VLLM_WORKER_MULTIPROC_METHOD: spawn
       NVIDIA_VISIBLE_DEVICES: "0"
       CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-0}
@@ -60,7 +64,7 @@ services:
       context: ./backend
     environment:
       JARVIS_HOME: /runtime
-      JARVIS_PROFILE: ${JARVIS_PROFILE:-gemma4-mono}
+      JARVIS_PROFILE: ${JARVIS_PROFILE:-gemma4-turbo}
       JARVIS_LLM_BASE_URL: ${JARVIS_LLM_BASE_URL:-http://host.docker.internal:8001/v1}
       JARVIS_LLM_MODEL: ${JARVIS_LLM_MODEL:-dispatcher}
       JARVIS_LLM_ENABLED: ${JARVIS_LLM_ENABLED:-1}

@@ -13,6 +13,26 @@ def _bool_env(name: str, default: bool) -> bool:
     return raw.strip().lower() not in {"0", "false", "no", "off", ""}
 
 
+def _float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
 def default_home() -> Path:
     raw = os.environ.get("JARVIS_HOME")
     if raw:
@@ -84,6 +104,8 @@ class JarvisSettings:
     llm_base_url: str
     llm_model: str
     llm_enabled: bool
+    llm_timeout_sec: float
+    llm_max_tokens: int
     autonomy_enabled: bool
     telemetry_interval_sec: int
     learning_interval_sec: int
@@ -120,6 +142,8 @@ class JarvisSettings:
                 "enabled": self.llm_enabled,
                 "base_url": self.llm_base_url,
                 "model": self.llm_model,
+                "timeout_sec": self.llm_timeout_sec,
+                "max_tokens": self.llm_max_tokens,
             },
             "autonomy": {
                 "enabled": self.autonomy_enabled,
@@ -132,7 +156,7 @@ class JarvisSettings:
 
 def load_settings(profile_name: str | None = None) -> JarvisSettings:
     home = default_home()
-    selected_name = profile_name or os.environ.get("JARVIS_PROFILE", "gemma4-mono")
+    selected_name = profile_name or os.environ.get("JARVIS_PROFILE", "gemma4-turbo")
     profile = PROFILES.get(selected_name)
     if profile is None:
         valid = ", ".join(sorted(PROFILES))
@@ -160,11 +184,13 @@ def load_settings(profile_name: str | None = None) -> JarvisSettings:
         llm_base_url=os.environ.get("JARVIS_LLM_BASE_URL", "http://localhost:8001/v1").rstrip("/"),
         llm_model=os.environ.get("JARVIS_LLM_MODEL", "dispatcher"),
         llm_enabled=_bool_env("JARVIS_LLM_ENABLED", True),
+        llm_timeout_sec=_float_env("JARVIS_LLM_TIMEOUT_SEC", 240.0),
+        llm_max_tokens=_int_env("JARVIS_LLM_MAX_TOKENS", 800),
         autonomy_enabled=_bool_env("JARVIS_AUTONOMY_ENABLED", True),
-        telemetry_interval_sec=int(os.environ.get("JARVIS_TELEMETRY_INTERVAL_SEC", "120")),
-        learning_interval_sec=int(os.environ.get("JARVIS_LEARNING_INTERVAL_SEC", "600")),
+        telemetry_interval_sec=_int_env("JARVIS_TELEMETRY_INTERVAL_SEC", 120),
+        learning_interval_sec=_int_env("JARVIS_LEARNING_INTERVAL_SEC", 600),
         api_host=os.environ.get("JARVIS_API_HOST", "0.0.0.0"),
-        api_port=int(os.environ.get("JARVIS_API_PORT", "8000")),
+        api_port=_int_env("JARVIS_API_PORT", 8000),
     )
 
 

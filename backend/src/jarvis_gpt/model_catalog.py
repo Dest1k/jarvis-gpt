@@ -90,6 +90,8 @@ class ModelCatalog:
                 "JARVIS_QWEN_GPU_UTIL": str(profile.gpu_memory_utilization),
                 "JARVIS_QWEN_MAX_LEN": str(profile.max_model_len),
                 "JARVIS_QWEN_KV_DTYPE": profile.kv_cache_dtype,
+                "JARVIS_QWEN_TOKENIZER_MODE": "slow",
+                "JARVIS_QWEN_SAFETENSORS_LOAD_STRATEGY": "prefetch",
                 "JARVIS_QWEN_MAX_NUM_SEQS": str(profile.max_num_seqs),
                 "JARVIS_QWEN_ENFORCE_EAGER": "--enforce-eager" if profile.eager_mode else "",
                 "JARVIS_ENABLE_UITARS": "0",

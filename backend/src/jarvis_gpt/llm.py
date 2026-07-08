@@ -31,7 +31,7 @@ class LLMRouter:
                 "local": local,
             }
         try:
-            async with httpx.AsyncClient(timeout=3.0) as client:
+            async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.get(f"{self.settings.llm_base_url}/models")
                 response.raise_for_status()
             data = response.json()
@@ -55,7 +55,7 @@ class LLMRouter:
         messages: list[dict[str, str]],
         *,
         temperature: float | None = None,
-        max_tokens: int = 1200,
+        max_tokens: int | None = None,
     ) -> LLMResult:
         if not self.settings.llm_enabled:
             return LLMResult(ok=False, content="", error="LLM router is disabled")
@@ -67,11 +67,12 @@ class LLMRouter:
             "model": self.settings.llm_model,
             "messages": messages,
             "temperature": request_temperature,
-            "max_tokens": max_tokens,
+            "max_tokens": self.settings.llm_max_tokens if max_tokens is None else max_tokens,
             "stream": False,
         }
         try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
+            timeout = httpx.Timeout(self.settings.llm_timeout_sec, connect=10.0)
+            async with httpx.AsyncClient(timeout=timeout) as client:
                 response = await client.post(
                     f"{self.settings.llm_base_url}/chat/completions",
                     json=body,

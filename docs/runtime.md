@@ -1,11 +1,19 @@
 # Runtime
 
+## 2026-07-08 handoff
+
+- Default runtime is now `gemma4-turbo` / `gemma4-26b-a4b-nvfp4`.
+- `gemma4-31b-it-nvfp4` remains in the catalog, but it currently exhausts available KV cache memory at the 32k context target after loading the weights.
+- Dispatcher stability flags are pinned for Docker Desktop on Windows: `VLLM_USE_V2_MODEL_RUNNER=0`, `VLLM_WEIGHT_OFFLOADING_DISABLE_UVA=1`, `JARVIS_QWEN_TOKENIZER_MODE=slow`, `JARVIS_QWEN_SAFETENSORS_LOAD_STRATEGY=prefetch`.
+- Verified tonight: backend `pytest`, `ruff`, frontend `typecheck`, frontend `build`.
+- First follow-up: tune `/api/chat` for lower-latency local inference, likely streaming plus smaller default generation budgets.
+
 ## Переменные окружения
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `JARVIS_HOME` | `D:\jarvis` | Внешний runtime root для моделей, кэша, БД и логов |
-| `JARVIS_PROFILE` | `gemma4-mono` | Активный профиль |
+| `JARVIS_PROFILE` | `gemma4-turbo` | Активный профиль |
 | `JARVIS_MODEL_ROOT` | `D:\jarvis\data\models` если существует, иначе `D:\jarvis\models` | Root локальных моделей |
 | `JARVIS_LLM_BASE_URL` | `http://localhost:8001/v1` | OpenAI-compatible endpoint |
 | `JARVIS_LLM_MODEL` | `dispatcher` | Имя модели для chat completions |

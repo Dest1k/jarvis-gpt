@@ -25,8 +25,8 @@ def test_agent_creates_mission_from_large_goal(monkeypatch, tmp_path):
 
     response = asyncio.run(
         agent.chat(
-            "Сделай проект с нуля: полностью переосмысли архитектуру, реализуй runtime, память, "
-            "диагностику, web интерфейс и mission plan для локального Jarvis.",
+            "Сделай проект с нуля: полностью переосмысли архитектуру, реализуй runtime, "
+            "память, диагностику, web интерфейс и mission plan для локального Jarvis.",
             mode="auto",
         )
     )

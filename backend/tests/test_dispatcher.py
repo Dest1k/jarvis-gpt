@@ -18,5 +18,9 @@ def test_dispatcher_manager_builds_compose_environment(monkeypatch, tmp_path):
 
     assert env["JARVIS_QWEN_MODEL_PATH"] == "/models/gemma4-31b-it-nvfp4"
     assert env["JARVIS_QWEN_MODEL_NAME"] == "dispatcher"
+    assert env["VLLM_USE_V2_MODEL_RUNNER"] == "0"
+    assert env["VLLM_WEIGHT_OFFLOADING_DISABLE_UVA"] == "1"
+    assert env["JARVIS_QWEN_TOKENIZER_MODE"] == "slow"
+    assert env["JARVIS_QWEN_SAFETENSORS_LOAD_STRATEGY"] == "prefetch"
     assert manager.compose_command("up")[-2:] == ["-d", "dispatcher"]
     assert status["active_model"]["id"] == "gemma4-31b-it-nvfp4"

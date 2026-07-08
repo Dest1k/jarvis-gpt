@@ -46,7 +46,14 @@ class TelemetryCollector:
             "recommended_dispatcher": {
                 "port": 8001,
                 "image": os.environ.get("JARVIS_VLLM_IMAGE", "vllm/vllm-openai:nightly"),
+                "vllm_use_v2_model_runner": os.environ.get("VLLM_USE_V2_MODEL_RUNNER", "0"),
+                "vllm_weight_offloading_disable_uva": os.environ.get(
+                    "VLLM_WEIGHT_OFFLOADING_DISABLE_UVA",
+                    "1",
+                ),
                 "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", "0"),
+                "tokenizer_mode": "slow",
+                "safetensors_load_strategy": "prefetch",
                 "model_path": f"/models/{profile.model_dir_name}",
             },
             "resource_policy": {
