@@ -32,13 +32,20 @@ from .tools import ToolRegistry
 SYSTEM_PROMPT = """Ты JARVIS GPT: локальный агент Windows/WSL/Docker и личный операционный помощник.
 Говори по-русски. Держи тон как у кинематографичного Jarvis: спокойный, точный, слегка ироничный,
 с уважительной уверенностью и готовностью действовать, но без карикатурной театральности.
+
+Сначала ПОЙМИ задачу оператора по смыслу и по контексту (профиль оператора, история диалога,
+память, вложения), а уже потом действуй. Ты не бот, отвечающий по ключевым словам, и не следуешь
+шаблонным правилам-затычкам: правила ниже — это принципы и умолчания, а не скрипт. Если реальная
+задача расходится с формальным правилом или с автоматическим маршрутом — следуй задаче, а не ярлыку.
+Рассуждай от условий и от того, что уже известно об операторе, и доводи мысль до конца.
+
 Работай как системный администратор Windows/Linux, web-исследователь, помощник по бытовым задачам
 и аналитик по публичным источникам. Отделяй факты от предположений, фиксируй неопределенность.
 Тяжелые локальные модели, кеши, данные и логи находятся вне репозитория в D:\\jarvis.
 Если локальная LLM или инструмент недоступны, честно называй деградацию и предлагай следующий
 проверяемый шаг, но не превращай это в отказ от всей задачи.
 
-Capability contract:
+Принципы работы (умолчания, а не жёсткий скрипт):
 - Не выдумывай policy refusal. Исторические, энциклопедические, журналистские, образовательные,
   исследовательские и OSINT-запросы разрешены, если оператор не просит причинить вред,
   украсть доступы, преследовать людей или обходить защиту.
@@ -104,6 +111,8 @@ class AgentContext:
     memory_hits: list[dict[str, Any]]
     file_hits: list[dict[str, Any]]
     task_plan: TaskKernelPlan | None = None
+    intent_consulted: bool = False
+    intent_decision: IntentDecision | None = None
 
 
 @dataclass(frozen=True)
@@ -909,6 +918,21 @@ class AgentRuntime:
                 events=[event],
             )
 
+        # Reasoning-first arbiter: before any fuzzy web-ish branch (shopping,
+        # weather, generic research) fires on keyword matches, let the model judge
+        # whether the task actually needs external data or is solvable by reasoning
+        # from the message and operator context. This is what stops the keyword
+        # plugs from hijacking reasoning/chat tasks.
+        if context is not None:
+            arbiter = await self._understand_intent(message, context)
+            if (
+                arbiter is not None
+                and arbiter.route in {"reasoning", "chat"}
+                and arbiter.confidence >= 0.6
+            ):
+                context.task_plan = _reroute_plan(context.task_plan, arbiter)
+                return None
+
         shopping_followup = _shopping_followup_intent(
             message,
             has_previous_search=self._shopping_research_state(context.conversation_id) is not None,
@@ -963,12 +987,9 @@ class AgentRuntime:
             else _web_research_query_from_message(message)
         )
         if research_query is not None:
-            intent = await self._semantic_intent_decision(
-                message,
-                context=context,
-                heuristic_route="web_research",
-                heuristic_query=research_query,
-            )
+            intent = None
+            if context is not None:
+                intent = await self._understand_intent(message, context)
             if intent and intent.route in {"reasoning", "chat"} and intent.confidence >= 0.55:
                 return None
             if intent and intent.route == "web_research" and intent.query:
@@ -996,15 +1017,31 @@ class AgentRuntime:
 
         return None
 
-    async def _semantic_intent_decision(
+    async def _understand_intent(
         self,
         message: str,
-        *,
         context: AgentContext,
-        heuristic_route: str,
-        heuristic_query: str | None = None,
     ) -> IntentDecision | None:
-        if not _should_use_semantic_router(message, heuristic_route):
+        """Let the model understand the task from full context and decide the route.
+
+        This is the reasoning-first arbiter: instead of trusting a cascade of
+        ``_looks_like_*`` heuristics, we ask the LLM to read the message together
+        with the operator persona and recent turns and classify the real intent.
+        It only runs when the fast heuristic plan already wants an external,
+        tool-driven route (``web_research``) — that is exactly the fuzzy zone
+        where the keyword plugs produce false positives. Deterministic bindings
+        (native OS actions, host commands, explicit URLs) are handled earlier and
+        never routed through here. When the LLM is offline the heuristics stay
+        authoritative, so behavior degrades gracefully.
+        """
+
+        if context.intent_consulted:
+            return context.intent_decision
+        context.intent_consulted = True
+        plan = context.task_plan
+        if plan is None or plan.route != "web_research":
+            return None
+        if not self.settings.llm_enabled:
             return None
         recent_user_messages = [
             item["content"]
@@ -1015,15 +1052,32 @@ class AgentRuntime:
             _intent_router_messages(
                 message=message,
                 recent_user_messages=recent_user_messages,
-                heuristic_route=heuristic_route,
-                heuristic_query=heuristic_query,
+                heuristic_route=plan.route,
+                heuristic_query=plan.query,
+                operator_context=self._intent_operator_context(),
             ),
             temperature=0.0,
-            max_tokens=180,
+            max_tokens=200,
         )
         if not result.ok or not result.content:
             return None
-        return _parse_intent_decision(result.content)
+        context.intent_decision = _parse_intent_decision(result.content)
+        return context.intent_decision
+
+    def _intent_operator_context(self) -> str:
+        persona = self._persona()
+        parts: list[str] = []
+        role = str(persona.get("role") or "").strip()
+        if role:
+            parts.append(f"role={role}")
+        location = persona_module.home_location(persona)
+        if location:
+            parts.append(f"home_location={location}")
+        for field in ("tech_stack", "interests"):
+            values = [str(item) for item in (persona.get(field) or [])][:6]
+            if values:
+                parts.append(f"{field}={', '.join(values)}")
+        return "; ".join(parts)
 
     async def _infer_weather_location(self) -> tuple[str | None, list[ChatEvent]]:
         persona_location = self._operator_home_location()
@@ -2393,6 +2447,29 @@ def _runtime_date_context() -> str:
     )
 
 
+def _reroute_plan(plan: TaskKernelPlan | None, decision: IntentDecision) -> TaskKernelPlan:
+    """Rebuild the task kernel after the reasoning-first arbiter overrides the route.
+
+    Keeps the prompt coherent: the model should be told it is reasoning, not
+    told to honor a web_research 'execution contract' the arbiter just rejected.
+    """
+
+    mode = plan.mode if plan is not None else "standard"
+    intent = "chat_response" if decision.route == "chat" else "reasoned_answer"
+    return TaskKernelPlan(
+        route=decision.route,
+        mode=mode,
+        intent=intent,
+        confidence=decision.confidence,
+        completion_criteria=(
+            "understand the actual task from the message and operator context",
+            "reason to a complete answer without inventing external facts",
+            "call out any genuinely missing information instead of guessing",
+        ),
+        rationale=decision.rationale or "Intent understood as solvable without external lookup.",
+    )
+
+
 def _task_kernel_prompt(plan: TaskKernelPlan) -> str:
     lines = [
         "Task kernel decision:",
@@ -2413,8 +2490,10 @@ def _task_kernel_prompt(plan: TaskKernelPlan) -> str:
     if plan.rationale:
         lines.append(f"- rationale: {plan.rationale}")
     lines.append(
-        "Use this routing decision as an execution contract. If the answer is incomplete, "
-        "say so explicitly instead of ending mid-step."
+        "This routing is a starting hypothesis from a fast classifier, not a script to obey. "
+        "Understand what the operator actually needs and reason from the message and context; "
+        "if the routing does not fit the real task, follow the task, not the label. "
+        "If the answer is incomplete, say so explicitly instead of ending mid-step."
     )
     return "\n".join(lines)
 
@@ -2517,55 +2596,13 @@ def _research_intent_from_message(normalized: str) -> str:
     return "web_research"
 
 
-def _should_use_semantic_router(message: str, heuristic_route: str) -> bool:
-    if heuristic_route != "web_research":
-        return False
-    normalized = message.lower()
-    if _contains_any(
-        normalized,
-        (
-            "загугли",
-            "погугли",
-            "в интернете",
-            "в сети",
-            "site:",
-            "http://",
-            "https://",
-        ),
-    ):
-        return False
-    if _looks_like_shopping_query(normalized) or _looks_like_travel_query(normalized):
-        return False
-    if _looks_like_place_lookup_query(normalized) or _looks_like_osint_query(normalized):
-        return False
-    ambiguous_markers = (
-        "сейчас",
-        "текущая ситуация",
-        "твоя задача",
-        "обоснуй",
-        "исключительно",
-        "представь",
-        "допустим",
-        "сценар",
-        "дилемм",
-        "если ",
-        "самый",
-        "самая",
-        "логическ",
-        "ошибк",
-        "приоритет",
-        "выбери",
-        "распредели",
-    )
-    return len(message) > 280 or _contains_any(normalized, ambiguous_markers)
-
-
 def _intent_router_messages(
     *,
     message: str,
     recent_user_messages: list[str],
     heuristic_route: str,
     heuristic_query: str | None,
+    operator_context: str = "",
 ) -> list[dict[str, str]]:
     today = date.today().isoformat()
     history = "\n".join(f"- {item[:500]}" for item in recent_user_messages[:-1])
@@ -2575,25 +2612,33 @@ def _intent_router_messages(
         {
             "role": "system",
             "content": (
-                "Ты компактный intent-router для локального агента Jarvis. "
+                "Ты intent-router для локального агента Jarvis. Твоя работа — ПОНЯТЬ реальную "
+                "задачу оператора по смыслу и контексту, а не по совпадению ключевых слов. "
+                "Эвристика ниже могла ошибиться, потому что реагирует на отдельные слова. "
+                "Реши сам, опираясь на суть запроса и на профиль оператора.\n"
                 "Верни только JSON без markdown. Поля: route, confidence, query, rationale. "
                 "route: web_research | reasoning | local_action | mission | chat.\n"
-                "web_research: нужны внешние, актуальные, проверяемые факты, цены, расписания, "
-                "версии, новости, публичные источники.\n"
-                "reasoning: пользователь дал гипотетический/ролевой/логический/этический "
-                "сценарий и просит рассуждать по условиям задачи; web не нужен.\n"
-                "local_action: надо управлять ОС/GUI/файлами/консолью.\n"
-                "mission: крупная реальная задача на несколько исполнимых шагов.\n"
-                "chat: обычный ответ без инструментов.\n"
-                "Если есть сомнение между web_research и reasoning, выбирай reasoning, "
-                "когда все необходимые факты уже заданы в сообщении. "
-                "Если выбираешь web_research, query должен быть коротким поисковым запросом."
+                "web_research: оператору реально нужны свежие внешние проверяемые факты "
+                "(цены, наличие, расписания, версии, новости, погода, адреса, курсы) и "
+                "ответ зависит от сегодняшней реальности, а не от знаний модели.\n"
+                "reasoning: задача решается размышлением по данным из самого сообщения — "
+                "логика, оценка, разбор, гипотетический/ролевой сценарий, совет, объяснение, "
+                "код; web не нужен, даже если встречаются слова вроде 'сейчас' или 'самый'.\n"
+                "local_action: надо управлять ОС/GUI/файлами/консолью на машине оператора.\n"
+                "mission: крупная реальная многошаговая задача с исполнимыми шагами.\n"
+                "chat: обычный разговорный ответ без инструментов.\n"
+                "Правило разрешения сомнений: выбирай web_research ТОЛЬКО если без свежих "
+                "внешних данных честный ответ невозможен. Если фактов из сообщения и контекста "
+                "достаточно — это reasoning или chat. "
+                "Если выбираешь web_research, query — короткий поисковый запрос; учитывай "
+                "профиль оператора (например, домашний город для локальных запросов)."
             ),
         },
         {
             "role": "user",
             "content": (
                 f"current_date: {today}\n"
+                f"operator_context: {operator_context or 'none'}\n"
                 f"heuristic_route: {heuristic_route}\n"
                 f"heuristic_query: {heuristic_query or ''}\n"
                 f"recent_user_messages:\n{history}\n\n"
