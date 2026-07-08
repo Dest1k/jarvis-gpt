@@ -130,6 +130,7 @@ docker compose --profile llm up -d dispatcher
 - Conversation history is durable and can be restored from Command Center after reload.
 - Command Center has browser voice input for the chat composer where the Web Speech API is available.
 - Command Center registers a service worker and keeps the local UI shell available after the first successful load.
+- Command Center can create host-command approval gates and execute them after approval.
 - Native host bridge now has a bundled local RPC script, token detection, CLI execution, and a `danger` tool for approved host commands.
 - Autonomous supervisor persists telemetry, learning lessons, and health snapshots on separate intervals.
 - Mission planner enriches plans with domain-specific UI, LLM, Docker/GPU, host bridge and performance steps.

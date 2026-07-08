@@ -23,6 +23,7 @@ import {
   ShieldAlert,
   Sparkles,
   Square,
+  Terminal,
   Zap,
   Upload,
   Wrench
@@ -396,6 +397,7 @@ export default function CommandCenter() {
   const [voiceInterim, setVoiceInterim] = useState("");
   const [memoryDraft, setMemoryDraft] = useState("");
   const [fileQuery, setFileQuery] = useState("");
+  const [hostCommandDraft, setHostCommandDraft] = useState("");
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [maxTokens, setMaxTokens] = useState(512);
@@ -883,6 +885,35 @@ export default function CommandCenter() {
     }
   }
 
+  async function requestHostCommandApproval(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const command = hostCommandDraft.trim();
+    if (!command || busy) return;
+    setBusy(true);
+    try {
+      const approval = await api<ApprovalItem>("/api/approvals", {
+        method: "POST",
+        body: JSON.stringify({
+          title: "Host command",
+          description: command,
+          requested_action: "tool.run",
+          risk: "danger",
+          payload: {
+            tool: "host.bridge.execute",
+            arguments: { command }
+          }
+        })
+      });
+      setHostCommandDraft("");
+      setApprovals((current) => [approval, ...current].slice(0, 8));
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Host command approval failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <main className="shell">
       <aside className="rail" aria-label="Навигация">
@@ -1263,6 +1294,22 @@ export default function CommandCenter() {
                 <span>{hostBridge?.port_open ? "online" : "offline"}</span>
                 <small>{hostBridge?.token_available ? "token" : "no token"}</small>
               </div>
+              <form className="hostCommandForm" onSubmit={requestHostCommandApproval}>
+                <input
+                  aria-label="Host command"
+                  value={hostCommandDraft}
+                  onChange={(event) => setHostCommandDraft(event.target.value)}
+                  placeholder="Get-Date"
+                />
+                <button
+                  type="submit"
+                  disabled={busy || !hostCommandDraft.trim()}
+                  title="Request approval"
+                  aria-label="Request approval"
+                >
+                  <Terminal size={15} />
+                </button>
+              </form>
               <div className={`bridgeRow ${autonomy?.enabled ? "online" : ""}`}>
                 <Brain size={14} />
                 <strong>Autonomy</strong>

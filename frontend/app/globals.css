@@ -494,7 +494,8 @@ h3 {
 .approvalControls button,
 .memoryForm button,
 .fileForm button,
-.fileSearchForm button {
+.fileSearchForm button,
+.hostCommandForm button {
   display: grid;
   place-items: center;
   width: 28px;
@@ -509,7 +510,8 @@ h3 {
 .approvalControls button:hover,
 .memoryForm button:hover,
 .fileForm button:hover,
-.fileSearchForm button:hover {
+.fileSearchForm button:hover,
+.hostCommandForm button:hover {
   border-color: var(--teal);
   color: var(--teal);
 }
@@ -805,7 +807,8 @@ h3 {
 
 .memoryForm,
 .fileForm,
-.fileSearchForm {
+.fileSearchForm,
+.hostCommandForm {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 32px;
   gap: 8px;
@@ -816,9 +819,14 @@ h3 {
   padding-top: 8px;
 }
 
+.hostCommandForm {
+  padding: 0;
+}
+
 .memoryForm input,
 .fileForm input,
-.fileSearchForm input {
+.fileSearchForm input,
+.hostCommandForm input {
   min-width: 0;
   height: 32px;
   border: 1px solid var(--line);
@@ -831,7 +839,8 @@ h3 {
 
 .memoryForm input:focus,
 .fileForm input:focus,
-.fileSearchForm input:focus {
+.fileSearchForm input:focus,
+.hostCommandForm input:focus {
   border-color: var(--teal);
   box-shadow: 0 0 0 3px rgba(13, 118, 111, 0.12);
 }
