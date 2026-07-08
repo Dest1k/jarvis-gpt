@@ -36,12 +36,12 @@ import {
   X
 } from "lucide-react";
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { KeyboardEvent, PointerEvent as ReactPointerEvent, ReactNode } from "react";
+import type { CSSProperties, KeyboardEvent, PointerEvent as ReactPointerEvent, ReactNode } from "react";
 
 const CONFIGURED_API_URL = process.env.NEXT_PUBLIC_JARVIS_API_URL ?? "http://localhost:8000";
 const CHAT_WINDOWS_KEY = "jarvis-gpt.chatWindows.v1";
 const CHAT_SETTINGS_KEY = "jarvis-gpt.chatSettings.v1";
-const DEFAULT_CHAT_HEIGHT = 680;
+const DEFAULT_CHAT_HEIGHT = 620;
 const DEFAULT_CHAT_WINDOW_ID = "chat-default";
 const BOOT_MESSAGE = "Центр управления JARVIS GPT готов к подключению.";
 const LIVE_TELEMETRY_INTERVAL_MS = 1000;
@@ -882,7 +882,7 @@ function normalizeChatSideTab(value: unknown): ChatSideTab {
 
 function clampChatHeight(value: number) {
   if (!Number.isFinite(value)) return DEFAULT_CHAT_HEIGHT;
-  return Math.max(460, Math.min(1200, Math.round(value)));
+  return Math.max(460, Math.min(760, Math.round(value)));
 }
 
 function compactText(value: string | null | undefined, maxLength = 72) {
@@ -3122,7 +3122,7 @@ export default function CommandCenter() {
             className="chatPanel"
             id="dialog"
             aria-label="Диалог"
-            style={{ height: `clamp(380px, min(${chatHeight}px, calc(100vh - 320px)), ${chatHeight}px)` }}
+            style={{ "--chat-target-height": `${chatHeight}px` } as CSSProperties}
           >
             <div className="panelHeader chatHeader">
               <h2>Диалог</h2>

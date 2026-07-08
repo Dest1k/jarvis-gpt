@@ -1,15 +1,16 @@
 :root {
-  --bg: #edf1ef;
-  --surface: #fbfcfb;
-  --surface-2: #f5f7f4;
-  --ink: #19201f;
-  --muted: #66716d;
-  --line: #d7dfda;
-  --teal: #0d766f;
-  --teal-2: #d9f0ec;
-  --amber: #b7791f;
-  --coral: #b74335;
-  --graphite: #2f3634;
+  --bg: #0b100f;
+  --surface: #141d1a;
+  --surface-2: #1a2522;
+  --control: #0f1715;
+  --ink: #eef6f2;
+  --muted: #93a49e;
+  --line: #293933;
+  --teal: #28c7b7;
+  --teal-2: rgba(40, 199, 183, 0.16);
+  --amber: #e1ad52;
+  --coral: #e07364;
+  --graphite: #bac9c3;
   --radius: 8px;
 }
 
@@ -21,7 +22,10 @@ html,
 body {
   min-height: 100%;
   margin: 0;
-  background: var(--bg);
+  background:
+    linear-gradient(180deg, rgba(40, 199, 183, 0.07), rgba(40, 199, 183, 0) 260px),
+    linear-gradient(180deg, #0b100f 0%, #0e1513 46%, #101816 100%);
+  background-attachment: fixed;
   color: var(--ink);
   font-size: 13px;
   line-height: 1.42;
@@ -59,8 +63,8 @@ button:disabled {
   gap: 12px;
   height: 100vh;
   padding: 18px 12px;
-  background: #202725;
-  border-right: 1px solid #111614;
+  background: #101715;
+  border-right: 1px solid #1f2c28;
 }
 
 .rail,
@@ -98,8 +102,8 @@ button:disabled {
 .railButton:focus-visible,
 .railButton.active {
   color: #ffffff;
-  border-color: #3b4743;
-  background: #2b3431;
+  border-color: #3b504a;
+  background: #17221f;
   outline: none;
 }
 
@@ -114,6 +118,9 @@ button:disabled {
   gap: 18px;
   min-width: 0;
   padding: 24px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.025), rgba(255, 255, 255, 0) 360px),
+    var(--bg);
 }
 
 .topbar {
@@ -169,7 +176,7 @@ h3 {
   padding: 8px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  background: rgba(251, 252, 251, 0.96);
+  background: rgba(15, 23, 21, 0.92);
   backdrop-filter: blur(10px);
 }
 
@@ -182,7 +189,7 @@ h3 {
   padding: 8px 10px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  background: #ffffff;
+  background: var(--surface);
 }
 
 .livePill svg {
@@ -276,9 +283,9 @@ h3 {
   gap: 10px;
   min-height: 44px;
   padding: 10px 12px;
-  border: 1px solid #e3b3aa;
+  border: 1px solid rgba(224, 115, 100, 0.4);
   border-radius: var(--radius);
-  background: #fff4f1;
+  background: rgba(224, 115, 100, 0.12);
   color: var(--coral);
 }
 
@@ -317,7 +324,7 @@ h3 {
 
 .statusTile.warn div {
   color: var(--amber);
-  background: #fbedd4;
+  background: rgba(225, 173, 82, 0.15);
 }
 
 .statusTile.neutral div {
@@ -368,9 +375,9 @@ h3 {
   position: sticky;
   top: 18px;
   grid-template-rows: auto auto minmax(0, 1fr) auto 14px;
-  height: clamp(500px, calc(100vh - 260px), 680px);
+  height: clamp(460px, min(var(--chat-target-height, 620px), calc(100vh - 360px)), 760px);
   min-height: 460px;
-  max-height: 1200px;
+  max-height: 760px;
   overflow: hidden;
 }
 
@@ -449,7 +456,7 @@ h3 {
   padding: 0 8px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  background: #ffffff;
+  background: var(--surface);
   color: var(--muted);
   font-size: 12px;
   cursor: pointer;
@@ -500,15 +507,15 @@ h3 {
   padding: 12px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  background: #ffffff;
+  background: var(--surface);
 }
 
 .vitalHero.ok {
-  border-color: #b7d8d1;
+  border-color: rgba(40, 199, 183, 0.36);
 }
 
 .vitalHero.warn {
-  border-color: #e7c98f;
+  border-color: rgba(225, 173, 82, 0.42);
 }
 
 .vitalHero svg {
@@ -612,7 +619,7 @@ h3 {
   padding: 6px 4px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  background: #ffffff;
+  background: var(--surface);
   color: var(--muted);
 }
 
@@ -670,13 +677,13 @@ h3 {
 
 .bubble.user {
   align-self: flex-end;
-  border-color: #b7d8d1;
-  background: #e9f7f4;
+  border-color: rgba(40, 199, 183, 0.36);
+  background: var(--teal-2);
 }
 
 .bubble.assistant {
   align-self: flex-start;
-  background: #ffffff;
+  background: var(--surface);
 }
 
 .bubble.system {
@@ -723,21 +730,22 @@ h3 {
 
 .composer {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 64px;
-  gap: 10px;
-  align-items: end;
-  padding: 14px;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 9px;
+  align-items: stretch;
+  padding: 12px;
   border-top: 1px solid var(--line);
 }
 
 .composer textarea {
   width: 100%;
-  min-height: 72px;
+  min-height: 76px;
+  max-height: 160px;
   resize: vertical;
   border: 1px solid var(--line);
   border-radius: var(--radius);
   padding: 11px 12px;
-  background: #ffffff;
+  background: var(--control);
   color: var(--ink);
   outline: none;
 }
@@ -748,17 +756,19 @@ h3 {
 }
 
 .composerSide {
-  display: grid;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
   gap: 8px;
-  justify-items: center;
 }
 
 .tokenInput {
-  width: 64px;
-  height: 32px;
+  width: 70px;
+  height: 36px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  background: #ffffff;
+  background: var(--control);
   color: var(--ink);
   font-size: 12px;
   text-align: center;
@@ -773,7 +783,7 @@ h3 {
 .voiceButton {
   display: grid;
   place-items: center;
-  width: 48px;
+  width: 42px;
   height: 36px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
@@ -792,8 +802,9 @@ h3 {
   display: grid;
   place-items: center;
   width: 48px;
-  height: 48px;
-  align-self: end;
+  height: 36px;
+  align-self: center;
+  margin-left: auto;
   border: 1px solid var(--teal);
   border-radius: var(--radius);
   background: var(--teal);
@@ -817,22 +828,24 @@ h3 {
 }
 
 .chatPanel {
-  --chat-bg: #11171b;
-  --chat-surface: #172026;
-  --chat-surface-2: #1d2930;
-  --chat-line: #314047;
-  --chat-text: #edf6f3;
-  --chat-muted: #9cafaa;
-  --chat-accent: #40d7c4;
+  --chat-bg: #0c1210;
+  --chat-surface: #121d1a;
+  --chat-surface-2: #1a2924;
+  --chat-line: #28433d;
+  --chat-text: #edf8f4;
+  --chat-muted: #91a7a0;
+  --chat-accent: var(--teal);
   border-color: var(--chat-line);
-  background: var(--chat-bg);
+  background:
+    linear-gradient(180deg, rgba(40, 199, 183, 0.05), rgba(40, 199, 183, 0) 220px),
+    var(--chat-bg);
   color: var(--chat-text);
-  min-height: 380px;
+  min-height: 460px;
 }
 
 .chatPanel .panelHeader {
   border-bottom-color: var(--chat-line);
-  background: #131b20;
+  background: #0f1815;
 }
 
 .chatPanel .panelHeader h2,
@@ -877,7 +890,7 @@ h3 {
 
 .chatWindowBar {
   border-bottom-color: var(--chat-line);
-  background: #10161a;
+  background: #0e1513;
 }
 
 .transcript {
@@ -1086,9 +1099,8 @@ h3 {
 }
 
 .composer {
-  grid-template-columns: minmax(0, 1fr) 64px;
   border-top-color: var(--chat-line);
-  background: #10161a;
+  background: #0e1513;
 }
 
 .composerMain {
@@ -1140,8 +1152,8 @@ h3 {
 .thinkingButton {
   display: grid;
   place-items: center;
-  width: 48px;
-  height: 32px;
+  width: 42px;
+  height: 36px;
   border: 1px solid var(--chat-line);
   border-radius: var(--radius);
 }
@@ -1152,7 +1164,7 @@ h3 {
 
 .chatResizeHandle {
   border-top-color: var(--chat-line);
-  background: #10161a;
+  background: #0e1513;
   color: var(--chat-muted);
 }
 
@@ -1169,7 +1181,7 @@ h3 {
 .missionItem {
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  background: #ffffff;
+  background: var(--surface);
 }
 
 .missionTitle {
@@ -1296,7 +1308,7 @@ h3 {
   border: 1px solid var(--line);
   border-radius: var(--radius);
   padding: 10px;
-  background: #ffffff;
+  background: var(--surface);
   color: var(--muted);
   font-size: 12px;
 }
@@ -1450,7 +1462,7 @@ h3 {
   border: 1px solid var(--line);
   border-radius: var(--radius);
   padding: 10px;
-  background: #ffffff;
+  background: var(--surface);
   color: var(--muted);
   font-size: 12px;
 }
@@ -1508,7 +1520,7 @@ h3 {
   min-height: 32px;
   border: 0;
   border-right: 1px solid var(--line);
-  background: #ffffff;
+  background: var(--surface);
   color: var(--muted);
   font-size: 12px;
 }
@@ -1614,7 +1626,7 @@ h3 {
   border: 1px solid var(--line);
   border-radius: var(--radius);
   padding: 0 9px;
-  background: #ffffff;
+  background: var(--surface);
   color: var(--muted);
   font-size: 12px;
   text-align: left;
@@ -1640,7 +1652,7 @@ h3 {
   border: 1px solid rgba(13, 118, 111, 0.32);
   border-radius: var(--radius);
   padding: 10px;
-  background: #ffffff;
+  background: var(--surface);
   color: var(--muted);
   font-size: 12px;
 }
@@ -1700,7 +1712,7 @@ h3 {
   border: 1px solid var(--line);
   border-radius: var(--radius);
   padding: 8px 10px;
-  background: #ffffff;
+  background: var(--surface);
   color: var(--muted);
   font-size: 12px;
 }
@@ -1932,7 +1944,7 @@ h3 {
   border: 1px solid var(--line);
   border-radius: var(--radius);
   padding: 0 9px;
-  background: #ffffff;
+  background: var(--surface);
   color: var(--muted);
   font-size: 12px;
   text-align: left;
@@ -2087,7 +2099,7 @@ h3 {
   border: 1px solid var(--line);
   border-radius: var(--radius);
   padding: 10px;
-  background: #ffffff;
+  background: var(--surface);
 }
 
 .webFetchResult.warn {
@@ -2176,7 +2188,7 @@ h3 {
   border: 1px solid var(--line);
   border-radius: var(--radius);
   padding: 0 10px;
-  background: #ffffff;
+  background: var(--control);
   color: var(--ink);
   outline: none;
 }
@@ -2206,7 +2218,7 @@ h3 {
   padding: 10px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  background: #ffffff;
+  background: var(--surface);
 }
 
 .vaultHeader {
@@ -2264,7 +2276,7 @@ h3 {
   border: 1px solid var(--line);
   border-radius: var(--radius);
   padding: 10px;
-  background: #ffffff;
+  background: var(--surface);
 }
 
 .memoryRow strong {
@@ -2336,7 +2348,7 @@ h3 {
   border: 1px solid var(--line);
   border-radius: var(--radius);
   padding: 10px;
-  background: #ffffff;
+  background: var(--surface);
 }
 
 .fileMatch div {
@@ -2467,8 +2479,9 @@ h3 {
 
   .chatPanel {
     position: static;
-    height: auto;
-    min-height: 0;
+    height: min(720px, max(520px, calc(100vh - 220px)));
+    min-height: 520px;
+    max-height: none;
   }
 }
 
@@ -2488,7 +2501,7 @@ h3 {
     min-width: 0;
     overflow-x: auto;
     border-right: 0;
-    border-bottom: 1px solid #111614;
+    border-bottom: 1px solid #1f2c28;
   }
 
   .brandMark {
@@ -2520,6 +2533,8 @@ h3 {
 
   .chatPanel {
     grid-template-rows: auto auto minmax(300px, 1fr) auto 14px;
+    height: min(680px, max(520px, calc(100vh - 160px)));
+    min-height: 520px;
   }
 
   .transcript {

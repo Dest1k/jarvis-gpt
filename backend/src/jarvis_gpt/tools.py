@@ -11,7 +11,7 @@ import subprocess
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from html import unescape
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Literal
 from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
@@ -1673,6 +1673,9 @@ def _resolve_allowed_path(settings: JarvisSettings, raw_path: str) -> Path:
     if not raw_path:
         raise ValueError("Path is required.")
     candidate = Path(raw_path)
+    windows_candidate = PureWindowsPath(raw_path)
+    if not candidate.is_absolute() and windows_candidate.drive:
+        raise ValueError("Windows-style absolute paths are outside allowed roots.")
     if not candidate.is_absolute():
         candidate = Path.cwd() / candidate
     candidate = candidate.resolve(strict=False)

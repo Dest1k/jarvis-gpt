@@ -8,7 +8,7 @@ import shutil
 import subprocess
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 MAX_BODY_BYTES = 65_536
@@ -154,7 +154,7 @@ def powershell_path() -> str | None:
 
 
 def powershell_command(powershell: str, command: str) -> list[str]:
-    executable = Path(powershell).name.lower()
+    executable = PureWindowsPath(powershell).name.lower() or Path(powershell).name.lower()
     args = [powershell, "-NoLogo", "-NoProfile"]
     if executable == "powershell.exe":
         args.append("-STA")

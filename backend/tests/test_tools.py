@@ -48,9 +48,14 @@ def test_filesystem_tool_stays_inside_allowed_roots(monkeypatch, tmp_path):
     tools = ToolRegistry(settings, storage, LLMRouter(settings))
 
     denied = asyncio.run(tools.run("filesystem.read_text", {"path": "C:/Windows/win.ini"}))
+    denied_backslash = asyncio.run(
+        tools.run("filesystem.read_text", {"path": r"C:\Windows\win.ini"})
+    )
 
     assert denied.ok is False
     assert "outside allowed roots" in denied.summary
+    assert denied_backslash.ok is False
+    assert "outside allowed roots" in denied_backslash.summary
     storage.close()
 
 
