@@ -83,11 +83,17 @@ button:disabled {
 }
 
 .railButton:hover,
-.railButton:focus-visible {
+.railButton:focus-visible,
+.railButton.active {
   color: #ffffff;
   border-color: #3b4743;
   background: #2b3431;
   outline: none;
+}
+
+.railButton.active {
+  border-color: var(--teal);
+  background: var(--teal);
 }
 
 .workspace {
@@ -241,6 +247,7 @@ h3 {
 
 .mainGrid {
   display: grid;
+  align-items: start;
   grid-template-columns: minmax(360px, 1.35fr) minmax(320px, 0.75fr);
   gap: 16px;
   min-height: 0;
@@ -256,12 +263,17 @@ h3 {
 
 .chatPanel {
   display: grid;
-  grid-template-rows: auto minmax(360px, 1fr) auto;
+  position: sticky;
+  top: 18px;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  height: clamp(500px, calc(100vh - 260px), 680px);
+  overflow: hidden;
 }
 
 .opsPanel {
   display: flex;
   flex-direction: column;
+  min-height: 480px;
   padding-bottom: 12px;
 }
 
@@ -284,6 +296,78 @@ h3 {
   border-top: 1px solid var(--line);
 }
 
+.vitalsPanel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+}
+
+.vitalHero {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #ffffff;
+}
+
+.vitalHero.ok {
+  border-color: #b7d8d1;
+}
+
+.vitalHero.warn {
+  border-color: #e7c98f;
+}
+
+.vitalHero svg {
+  color: var(--teal);
+}
+
+.vitalHero strong,
+.vitalGrid strong {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vitalHero p {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.vitalHero > span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.vitalGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.vitalGrid div {
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+
+.vitalGrid span {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
 .chatPanel,
 .panelHeader[id] {
   scroll-margin-top: 18px;
@@ -293,8 +377,7 @@ h3 {
   display: flex;
   flex-direction: column;
   gap: 12px;
-  min-height: 360px;
-  max-height: calc(100vh - 360px);
+  min-height: 0;
   overflow: auto;
   padding: 16px;
 }
@@ -1425,6 +1508,12 @@ h3 {
   .mainGrid {
     grid-template-columns: 1fr;
   }
+
+  .chatPanel {
+    position: static;
+    height: auto;
+    min-height: 0;
+  }
 }
 
 @media (max-width: 720px) {
@@ -1473,6 +1562,7 @@ h3 {
   }
 
   .transcript {
+    min-height: 300px;
     max-height: none;
   }
 

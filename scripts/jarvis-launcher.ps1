@@ -1,6 +1,6 @@
 param(
   [Parameter(Position = 0)]
-  [ValidateSet("menu", "start", "stop", "restart", "status", "logs", "doctor", "open")]
+  [ValidateSet("menu", "start", "stop", "restart", "status", "llm", "logs", "doctor", "open")]
   [string]$Action = "menu",
 
   [ValidateSet("gemma4-turbo", "gemma4-mono")]
@@ -13,6 +13,7 @@ param(
   [switch]$NoBackend,
   [switch]$NoFrontend,
   [switch]$NoBridge,
+  [switch]$WatchLlm,
   [switch]$BuildFrontend,
   [switch]$DevFrontend
 )
@@ -114,6 +115,229 @@ function Test-PortOpen {
     return $false
   } finally {
     $client.Close()
+  }
+}
+
+function Invoke-HttpProbe {
+  param(
+    [string]$Uri,
+    [int]$TimeoutSec = 3,
+    [switch]$Json
+  )
+
+  try {
+    if ($Json) {
+      $data = Invoke-RestMethod -Uri $Uri -Method Get -TimeoutSec $TimeoutSec
+      return @{ ok = $true; status = 200; data = $data; error = "" }
+    }
+    $response = Invoke-WebRequest -UseBasicParsing -Uri $Uri -Method Get -TimeoutSec $TimeoutSec
+    return @{ ok = $true; status = [int]$response.StatusCode; data = $response.Content; error = "" }
+  } catch {
+    $statusCode = $null
+    if ($_.Exception.Response) {
+      try {
+        $statusCode = [int]$_.Exception.Response.StatusCode
+      } catch {
+        $statusCode = $null
+      }
+    }
+    return @{ ok = $false; status = $statusCode; data = $null; error = $_.Exception.Message }
+  }
+}
+
+function Get-DispatcherContainerSnapshot {
+  $docker = Get-Command docker -ErrorAction SilentlyContinue
+  if (-not $docker) {
+    return @{
+      docker_available = $false
+      exists = $false
+      running = $false
+      state = "missing"
+      status = "Docker is not available in PATH"
+      image = ""
+    }
+  }
+
+  try {
+    $line = & $docker.Source ps -a --filter "name=jarvis-gpt-dispatcher" --format "{{json .}}" 2>$null |
+      Select-Object -First 1
+    if (-not $line) {
+      return @{
+        docker_available = $true
+        exists = $false
+        running = $false
+        state = "missing"
+        status = "container not found"
+        image = ""
+      }
+    }
+    $container = $line | ConvertFrom-Json
+    $state = [string]$container.State
+    return @{
+      docker_available = $true
+      exists = $true
+      running = $state -eq "running"
+      state = $state
+      status = [string]$container.Status
+      image = [string]$container.Image
+      id = [string]$container.ID
+    }
+  } catch {
+    return @{
+      docker_available = $true
+      exists = $false
+      running = $false
+      state = "error"
+      status = $_.Exception.Message
+      image = ""
+    }
+  }
+}
+
+function Get-DispatcherLogSignals {
+  $docker = Get-Command docker -ErrorAction SilentlyContinue
+  if (-not $docker) {
+    return @()
+  }
+  try {
+    $lines = @(& $docker.Source logs --tail 120 jarvis-gpt-dispatcher 2>&1)
+    $signals = $lines | Where-Object {
+      $_ -match "(?i)(error|traceback|out of memory|ready|running|startup|loading|loaded|engine|model|cuda|graph|kv cache|served|uvicorn|api server)"
+    } | Select-Object -Last 8
+    if ($signals.Count -gt 0) {
+      return @($signals)
+    }
+    return @($lines | Select-Object -Last 6)
+  } catch {
+    return @($_.Exception.Message)
+  }
+}
+
+function Get-LlmReadiness {
+  Set-JarvisEnvironment -SelectedProfile $Profile
+
+  $container = Get-DispatcherContainerSnapshot
+  $portOpen = Test-PortOpen -Port 8001
+  $health = Invoke-HttpProbe -Uri "http://127.0.0.1:8001/health" -TimeoutSec 2
+  $models = Invoke-HttpProbe -Uri "http://127.0.0.1:8001/v1/models" -TimeoutSec 4 -Json
+  $servedModels = @()
+  if ($models.ok -and $models.data -and $models.data.data) {
+    $servedModels = @($models.data.data | ForEach-Object { [string]$_.id })
+  }
+
+  $phase = "offline"
+  $ready = $false
+  if (-not $container.docker_available) {
+    $phase = "docker-missing"
+  } elseif (-not $container.exists) {
+    $phase = "container-missing"
+  } elseif ($container.state -match "(?i)restarting") {
+    $phase = "restarting"
+  } elseif (-not $container.running) {
+    $phase = "container-stopped"
+  } elseif ($servedModels.Count -gt 0) {
+    $phase = "ready"
+    $ready = $true
+  } elseif ($portOpen -and $health.ok) {
+    $phase = "http-warming"
+  } elseif ($portOpen) {
+    $phase = "port-open-loading"
+  } else {
+    $phase = "loading"
+  }
+
+  return [ordered]@{
+    ready = $ready
+    phase = $phase
+    profile = $Profile
+    endpoint = "http://127.0.0.1:8001/v1"
+    container = $container
+    port_open = $portOpen
+    health_ok = [bool]$health.ok
+    health_status = $health.status
+    health_error = $health.error
+    models_ok = [bool]$models.ok
+    models_status = $models.status
+    models_error = $models.error
+    served_models = $servedModels
+    log_signals = Get-DispatcherLogSignals
+    checked_at = (Get-Date).ToString("HH:mm:ss")
+  }
+}
+
+function Write-LlmReadinessBlock {
+  param([hashtable]$Readiness)
+
+  $phase = [string]$Readiness.phase
+  $color = switch ($phase) {
+    "ready" { "Green" }
+    "http-warming" { "Yellow" }
+    "port-open-loading" { "Yellow" }
+    "loading" { "Yellow" }
+    "restarting" { "Red" }
+    "container-stopped" { "Red" }
+    default { "DarkYellow" }
+  }
+  $readyText = if ($Readiness.ready) { "READY" } else { "NOT READY" }
+
+  Write-Host "+--------------------------------------------------------------+" -ForegroundColor DarkCyan
+  Write-Host "|                         LLM READINESS                        |" -ForegroundColor Cyan
+  Write-Host "+--------------------------------------------------------------+" -ForegroundColor DarkCyan
+  Write-Host ("| State:   {0,-10} Phase: {1,-28} At: {2}" -f $readyText, $phase, $Readiness.checked_at) -ForegroundColor $color
+  Write-Host ("| Profile: {0,-18} Endpoint: {1}" -f $Readiness.profile, $Readiness.endpoint)
+  Write-Host ("| Docker:  {0,-10} Container: {1}" -f $Readiness.container.state, $Readiness.container.status)
+  Write-Host ("| Port:    {0,-10} /health: {1,-8} /v1/models: {2}" -f $Readiness.port_open, $Readiness.health_ok, $Readiness.models_ok)
+  if ($Readiness.served_models.Count -gt 0) {
+    Write-Host ("| Served:  {0}" -f ($Readiness.served_models -join ", ")) -ForegroundColor Green
+  } elseif ($Readiness.models_error) {
+    Write-Host ("| Models:  {0}" -f $Readiness.models_error) -ForegroundColor DarkYellow
+  }
+  Write-Host "+--------------------------------------------------------------+" -ForegroundColor DarkCyan
+  if ($Readiness.log_signals.Count -gt 0) {
+    Write-Host "Recent dispatcher load signals:" -ForegroundColor DarkGray
+    foreach ($line in $Readiness.log_signals) {
+      $text = ([string]$line).Trim()
+      if ($text.Length -gt 150) {
+        $text = $text.Substring(0, 150) + "..."
+      }
+      $lineColor = if ($text -match "(?i)(error|traceback|out of memory|failed)") { "Red" } else { "DarkGray" }
+      Write-Host ("  {0}" -f $text) -ForegroundColor $lineColor
+    }
+  }
+}
+
+function Test-WatchExitKey {
+  try {
+    if (-not $Host.UI.RawUI.KeyAvailable) {
+      return $false
+    }
+    $key = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    return $key.VirtualKeyCode -in @(27, 81)
+  } catch {
+    return $false
+  }
+}
+
+function Show-LlmReadiness {
+  param([switch]$Watch)
+
+  if (-not $Watch) {
+    Write-Banner
+    Write-LlmReadinessBlock -Readiness (Get-LlmReadiness)
+    return
+  }
+
+  while ($true) {
+    Write-Banner
+    Write-LlmReadinessBlock -Readiness (Get-LlmReadiness)
+    Write-Host ""
+    Write-Host "Refreshing every 5 seconds. Press Q or Esc to stop watching." -ForegroundColor DarkGray
+    for ($index = 0; $index -lt 5; $index += 1) {
+      Start-Sleep -Seconds 1
+      if (Test-WatchExitKey) {
+        return
+      }
+    }
   }
 }
 
@@ -232,6 +456,7 @@ function Start-JarvisStack {
     Write-Host "Starting dispatcher for $Profile..." -ForegroundColor Yellow
     Invoke-JarvisCommand -FilePath "py.exe" -Arguments @("-3.11", ".\jarvis.py", "--profile", $Profile, "dispatcher-up")
     $services.dispatcher = @{ profile = $Profile; docker = $true }
+    Write-Host "LLM readiness monitor: .\jarvis.cmd llm -WatchLlm" -ForegroundColor Cyan
   }
 
   if (-not $NoBridge) {
@@ -363,6 +588,8 @@ function Show-JarvisStatus {
   Show-ServiceRow -Name "Dispatcher" -Port 8001 -Url "http://127.0.0.1:8001/v1"
   Write-Host "+----------------+----------+-------------+----------------------------+" -ForegroundColor DarkCyan
   Write-Host ""
+  Write-LlmReadinessBlock -Readiness (Get-LlmReadiness)
+  Write-Host ""
   Write-Host ("State file: {0}" -f $StateFile) -ForegroundColor DarkGray
   Write-Host ("Logs:       {0}" -f $LogDir) -ForegroundColor DarkGray
 }
@@ -405,6 +632,7 @@ function Invoke-Menu {
     @{ Label = "Stop stack"; Value = "stop"; Hint = "stop UI/backend/bridge/dispatcher" },
     @{ Label = "Restart stack"; Value = "restart"; Hint = "stop then start" },
     @{ Label = "Status"; Value = "status"; Hint = "show service ports" },
+    @{ Label = "LLM readiness"; Value = "llm"; Hint = "watch real model startup" },
     @{ Label = "Logs"; Value = "logs"; Hint = "tail local logs" },
     @{ Label = "Doctor"; Value = "doctor"; Hint = "run full smoke checks" },
     @{ Label = "Open UI"; Value = "open"; Hint = "open Command Center" },
@@ -448,6 +676,7 @@ function Invoke-Menu {
     "stop" { Stop-JarvisStack }
     "restart" { Stop-JarvisStack; Start-JarvisStack }
     "status" { Show-JarvisStatus }
+    "llm" { Show-LlmReadiness -Watch }
     "logs" { Show-Logs }
     "doctor" { Invoke-Doctor }
     "open" { Open-CommandCenter }
@@ -465,6 +694,7 @@ switch ($Action) {
   "stop" { Stop-JarvisStack }
   "restart" { Stop-JarvisStack; Start-JarvisStack }
   "status" { Show-JarvisStatus }
+  "llm" { Show-LlmReadiness -Watch:$WatchLlm }
   "logs" { Show-Logs }
   "doctor" { Invoke-Doctor }
   "open" { Open-CommandCenter }

@@ -30,7 +30,7 @@ import {
   Wrench
 } from "lucide-react";
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { ReactNode } from "react";
+import type { KeyboardEvent, ReactNode } from "react";
 
 const API_URL = process.env.NEXT_PUBLIC_JARVIS_API_URL ?? "http://localhost:8000";
 
@@ -368,6 +368,16 @@ type DirectoryIngestResult = {
   files_failed: number;
 };
 
+type CommandTab =
+  | "chat"
+  | "runtime"
+  | "models"
+  | "memory"
+  | "files"
+  | "diagnostics"
+  | "resources"
+  | "audit";
+
 type ToolInfo = {
   name: string;
   description: string;
@@ -540,6 +550,7 @@ export default function CommandCenter() {
   const [routineRun, setRoutineRun] = useState<RoutineRun | null>(null);
   const [directoryDraft, setDirectoryDraft] = useState("D:\\jarvis");
   const [directoryIngest, setDirectoryIngest] = useState<DirectoryIngestResult | null>(null);
+  const [activeTab, setActiveTab] = useState<CommandTab>("chat");
   const [approvals, setApprovals] = useState<ApprovalItem[]>([]);
   const [input, setInput] = useState("");
   const [voiceAvailable, setVoiceAvailable] = useState(false);
@@ -682,6 +693,22 @@ export default function CommandCenter() {
       ),
     [approvals]
   );
+  const llmCheck = useMemo(
+    () => diagnostics.find((check) => check.name === "llm.router"),
+    [diagnostics]
+  );
+  const llmReady = llmCheck?.status === "ok";
+  const dispatcherPhase = dispatcher?.container_status?.status ?? (dispatcher?.port_open ? "port open" : "offline");
+  const activeTabTitle: Record<CommandTab, string> = {
+    chat: "Command Hub",
+    runtime: "Runtime",
+    models: "Models",
+    memory: "Memory",
+    files: "Files",
+    diagnostics: "Diagnostics",
+    resources: "Resources",
+    audit: "Audit"
+  };
 
   function startVoiceInput() {
     const Recognition = speechRecognitionConstructor();
@@ -742,8 +769,7 @@ export default function CommandCenter() {
     setVoiceInterim("");
   }
 
-  async function sendChat(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
+  async function submitChat() {
     const message = input.trim();
     if (!message || chatBusy) return;
     const userId = crypto.randomUUID();
@@ -817,6 +843,19 @@ export default function CommandCenter() {
     } finally {
       setChatBusy(false);
     }
+  }
+
+  async function sendChat(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    await submitChat();
+  }
+
+  function handleComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) {
+      return;
+    }
+    event.preventDefault();
+    void submitChat();
   }
 
   async function loadConversation(id: string) {
@@ -1335,41 +1374,64 @@ export default function CommandCenter() {
   const webFetchStatus =
     typeof webFetchResult?.data.status_code === "number" ? webFetchResult.data.status_code : null;
 
-  function scrollToSection(sectionId: string) {
-    document.getElementById(sectionId)?.scrollIntoView({
-      behavior: "smooth",
-      block: "start"
-    });
-  }
-
   return (
     <main className="shell">
       <aside className="rail" aria-label="Навигация">
         <div className="brandMark">
           <Brain size={22} />
         </div>
-        <IconButton label="Диалог" targetId="dialog" onSelect={scrollToSection}>
+        <IconButton active={activeTab === "chat"} label="Диалог" tab="chat" onSelect={setActiveTab}>
           <MessageSquare size={20} />
         </IconButton>
-        <IconButton label="Runtime" targetId="runtime" onSelect={scrollToSection}>
+        <IconButton
+          active={activeTab === "runtime"}
+          label="Runtime"
+          tab="runtime"
+          onSelect={setActiveTab}
+        >
           <Server size={20} />
         </IconButton>
-        <IconButton label="Модели" targetId="models" onSelect={scrollToSection}>
+        <IconButton
+          active={activeTab === "models"}
+          label="Модели"
+          tab="models"
+          onSelect={setActiveTab}
+        >
           <Cpu size={20} />
         </IconButton>
-        <IconButton label="Память" targetId="memory" onSelect={scrollToSection}>
+        <IconButton
+          active={activeTab === "memory"}
+          label="Память"
+          tab="memory"
+          onSelect={setActiveTab}
+        >
           <Database size={20} />
         </IconButton>
-        <IconButton label="Файлы" targetId="files" onSelect={scrollToSection}>
+        <IconButton
+          active={activeTab === "files"}
+          label="Файлы"
+          tab="files"
+          onSelect={setActiveTab}
+        >
           <FileText size={20} />
         </IconButton>
-        <IconButton label="Диагностика" targetId="health" onSelect={scrollToSection}>
+        <IconButton
+          active={activeTab === "diagnostics"}
+          label="Диагностика"
+          tab="diagnostics"
+          onSelect={setActiveTab}
+        >
           <Activity size={20} />
         </IconButton>
-        <IconButton label="Ресурсы" targetId="resources" onSelect={scrollToSection}>
+        <IconButton
+          active={activeTab === "resources"}
+          label="Ресурсы"
+          tab="resources"
+          onSelect={setActiveTab}
+        >
           <Gauge size={20} />
         </IconButton>
-        <IconButton label="Audit" targetId="audit" onSelect={scrollToSection}>
+        <IconButton active={activeTab === "audit"} label="Audit" tab="audit" onSelect={setActiveTab}>
           <History size={20} />
         </IconButton>
       </aside>
@@ -1451,6 +1513,7 @@ export default function CommandCenter() {
                 aria-label="Сообщение"
                 value={input}
                 onChange={(event) => setInput(event.target.value)}
+                onKeyDown={handleComposerKeyDown}
                 placeholder="JARVIS, оформи это как mission plan..."
                 rows={3}
               />
@@ -1485,7 +1548,46 @@ export default function CommandCenter() {
             </form>
           </section>
 
-          <section className="opsPanel" aria-label="Операции">
+          <section className="opsPanel" aria-label={activeTabTitle[activeTab]}>
+            {activeTab === "chat" && (
+              <>
+                <div className="panelHeader">
+                  <h2>Command Hub</h2>
+                  <span>{llmReady ? "ready" : "loading"}</span>
+                </div>
+                <div className="vitalsPanel">
+                  <article className={`vitalHero ${llmReady ? "ok" : "warn"}`}>
+                    <Sparkles size={18} />
+                    <div>
+                      <strong>{llmReady ? "LLM ready" : "LLM warming"}</strong>
+                      <p>{llmCheck?.message ?? dispatcherPhase}</p>
+                    </div>
+                    <span>{dispatcher?.port_open ? "8001" : "off"}</span>
+                  </article>
+                  <div className="vitalGrid">
+                    <div>
+                      <span>Backend</span>
+                      <strong>{status ? "online" : "offline"}</strong>
+                    </div>
+                    <div>
+                      <span>Bridge</span>
+                      <strong>{hostBridge?.port_open ? "online" : "offline"}</strong>
+                    </div>
+                    <div>
+                      <span>Dispatcher</span>
+                      <strong>{dispatcherPhase}</strong>
+                    </div>
+                    <div>
+                      <span>GPU</span>
+                      <strong>{telemetry?.gpu.available ? "online" : "offline"}</strong>
+                    </div>
+                  </div>
+                </div>
+              </>
+            )}
+
+            {(activeTab === "chat" || activeTab === "runtime") && (
+              <>
             <div className="panelHeader">
               <h2>Миссии</h2>
               <span>{missions.length}</span>
@@ -1647,8 +1749,12 @@ export default function CommandCenter() {
                 ))
               )}
             </div>
+              </>
+            )}
 
-            <div className="panelHeader lower" id="health">
+            {(activeTab === "chat" || activeTab === "diagnostics" || activeTab === "runtime") && (
+              <>
+            <div className={`panelHeader ${activeTab === "chat" ? "lower" : ""}`} id="health">
               <h2>Health</h2>
               <span>{diagnostics.length}</span>
             </div>
@@ -1685,8 +1791,12 @@ export default function CommandCenter() {
                 </article>
               )}
             </div>
+              </>
+            )}
 
-            <div className="panelHeader lower" id="models">
+            {(activeTab === "models" || activeTab === "runtime") && (
+              <>
+            <div className={`panelHeader ${activeTab === "runtime" ? "lower" : ""}`} id="models">
               <h2>Модели</h2>
               <span>{modelCatalog?.models.length ?? 0}</span>
             </div>
@@ -1741,8 +1851,12 @@ export default function CommandCenter() {
                 <div className="emptyState compact">Model catalog offline</div>
               )}
             </div>
+              </>
+            )}
 
-            <div className="panelHeader lower" id="resources">
+            {(activeTab === "resources" || activeTab === "runtime") && (
+              <>
+            <div className={`panelHeader ${activeTab === "runtime" ? "lower" : ""}`} id="resources">
               <h2>Ресурсы</h2>
               <span>{telemetry?.host.cpu_count ?? 0} CPU</span>
             </div>
@@ -1809,8 +1923,12 @@ export default function CommandCenter() {
                 <span>Learning tick</span>
               </button>
             </div>
+              </>
+            )}
 
-            <div className="panelHeader lower">
+            {(activeTab === "diagnostics" || activeTab === "runtime") && (
+              <>
+            <div className={`panelHeader ${activeTab === "runtime" ? "lower" : ""}`}>
               <h2>Autonomy Policy</h2>
               <span>{autonomyPolicy?.max_autonomous_steps ?? 0} steps</span>
             </div>
@@ -2039,8 +2157,12 @@ export default function CommandCenter() {
                 </div>
               ))}
             </div>
+              </>
+            )}
 
-            <div className="panelHeader lower" id="files">
+            {activeTab === "files" && (
+              <>
+            <div className="panelHeader" id="files">
               <h2>Файлы</h2>
               <span>{files.length}</span>
             </div>
@@ -2112,8 +2234,12 @@ export default function CommandCenter() {
                 ))}
               </div>
             )}
+              </>
+            )}
 
-            <div className="panelHeader lower">
+            {activeTab === "memory" && (
+              <>
+            <div className="panelHeader">
               <h2>Preferences</h2>
               <span>{preferences?.communication_style ?? "concise"}</span>
             </div>
@@ -2187,8 +2313,12 @@ export default function CommandCenter() {
                 </article>
               ))}
             </div>
+              </>
+            )}
 
-            <div className="panelHeader lower" id="audit">
+            {activeTab === "audit" && (
+              <>
+            <div className="panelHeader" id="audit">
               <h2>Audit</h2>
               <span>{audit.length}</span>
             </div>
@@ -2202,6 +2332,8 @@ export default function CommandCenter() {
                 </div>
               ))}
             </div>
+              </>
+            )}
           </section>
         </section>
 
@@ -2215,24 +2347,26 @@ export default function CommandCenter() {
 }
 
 function IconButton({
+  active,
   children,
   label,
-  targetId,
+  tab,
   onSelect
 }: {
+  active: boolean;
   children: ReactNode;
   label: string;
-  targetId: string;
-  onSelect: (targetId: string) => void;
+  tab: CommandTab;
+  onSelect: (tab: CommandTab) => void;
 }) {
   return (
     <button
-      className="railButton"
+      className={`railButton ${active ? "active" : ""}`}
       type="button"
       title={label}
       aria-label={label}
-      aria-controls={targetId}
-      onClick={() => onSelect(targetId)}
+      aria-pressed={active}
+      onClick={() => onSelect(tab)}
     >
       {children}
     </button>

@@ -40,6 +40,8 @@ One-command start/stop/status:
 .\jarvis.cmd stop
 .\jarvis.cmd restart -Profile gemma4-turbo
 .\jarvis.cmd status
+.\jarvis.cmd llm
+.\jarvis.cmd llm -WatchLlm
 ```
 
 Profile shortcuts:
