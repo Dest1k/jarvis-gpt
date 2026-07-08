@@ -33,6 +33,31 @@ def test_storage_persists_mission(tmp_path):
     storage.close()
 
 
+def test_storage_lists_conversations_and_messages(tmp_path):
+    storage = JarvisStorage(tmp_path / "state" / "jarvis.sqlite3")
+    storage.initialize()
+    conversation_id = storage.create_conversation("History")
+    user_id = storage.add_message(
+        conversation_id=conversation_id,
+        role="user",
+        content="remember this",
+    )
+    assistant_id = storage.add_message(
+        conversation_id=conversation_id,
+        role="assistant",
+        content="remembered",
+    )
+
+    conversations = storage.list_conversations()
+    messages = storage.list_messages(conversation_id)
+
+    assert conversations[0]["id"] == conversation_id
+    assert conversations[0]["message_count"] == 2
+    assert [message["id"] for message in messages] == [user_id, assistant_id]
+    assert storage.get_conversation(conversation_id)["title"] == "History"
+    storage.close()
+
+
 def test_storage_updates_task_progress_and_searches_memory(tmp_path):
     storage = JarvisStorage(tmp_path / "state" / "jarvis.sqlite3")
     storage.initialize()

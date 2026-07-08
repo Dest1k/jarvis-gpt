@@ -36,6 +36,7 @@ from .models import (
     AutonomyStatusResponse,
     ChatRequest,
     ChatResponse,
+    ConversationItem,
     DiagnosticsResponse,
     DispatcherActionResponse,
     DispatcherStatusResponse,
@@ -46,6 +47,7 @@ from .models import (
     LearningTickResponse,
     MemoryCreateRequest,
     MemoryItem,
+    MessageItem,
     Mission,
     MissionCreateRequest,
     MissionExecutionResponse,
@@ -234,6 +236,24 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
             yield f"{json.dumps(item, ensure_ascii=False)}\n".encode()
 
     return StreamingResponse(lines(), media_type="application/x-ndjson")
+
+
+@app.get("/api/conversations", response_model=list[ConversationItem])
+async def list_conversations(
+    limit: int = Query(default=25, ge=1, le=100),
+) -> list[ConversationItem]:
+    return app.state.storage.list_conversations(limit=limit)
+
+
+@app.get("/api/conversations/{conversation_id}/messages", response_model=list[MessageItem])
+async def list_conversation_messages(
+    conversation_id: str,
+    limit: int = Query(default=100, ge=1, le=500),
+) -> list[MessageItem]:
+    messages = app.state.storage.list_messages(conversation_id, limit=limit)
+    if not messages and app.state.storage.get_conversation(conversation_id) is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return messages
 
 
 @app.get("/api/missions", response_model=list[Mission])

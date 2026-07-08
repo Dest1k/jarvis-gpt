@@ -87,6 +87,22 @@ type ChatLine = {
   content: string;
 };
 
+type ConversationItem = {
+  id: string;
+  title: string;
+  created_at: string;
+  updated_at: string;
+  message_count: number;
+};
+
+type MessageItem = {
+  id: string;
+  conversation_id: string;
+  role: "user" | "assistant" | "system";
+  content: string;
+  created_at: string;
+};
+
 type MemoryItem = {
   id: string;
   namespace: string;
@@ -316,6 +332,7 @@ function clampMaxTokens(value: number) {
 
 export default function CommandCenter() {
   const [status, setStatus] = useState<RuntimeStatus | null>(null);
+  const [conversations, setConversations] = useState<ConversationItem[]>([]);
   const [missions, setMissions] = useState<Mission[]>([]);
   const [diagnostics, setDiagnostics] = useState<DiagnosticCheck[]>([]);
   const [tools, setTools] = useState<ToolInfo[]>([]);
@@ -352,6 +369,7 @@ export default function CommandCenter() {
       setError(null);
       const [
         statusData,
+        conversationData,
         missionData,
         toolData,
         memoryData,
@@ -365,6 +383,7 @@ export default function CommandCenter() {
         approvalData
       ] = await Promise.all([
           api<RuntimeStatus>("/api/status"),
+          api<ConversationItem[]>("/api/conversations?limit=8"),
           api<Mission[]>("/api/missions"),
           api<ToolInfo[]>("/api/tools"),
           api<MemoryItem[]>("/api/memory?limit=8"),
@@ -378,6 +397,7 @@ export default function CommandCenter() {
           api<ApprovalItem[]>("/api/approvals?limit=8")
         ]);
       setStatus(statusData);
+      setConversations(conversationData);
       setMissions(missionData);
       setTools(toolData);
       setMemories(memoryData);
@@ -477,6 +497,27 @@ export default function CommandCenter() {
       );
     } finally {
       setChatBusy(false);
+    }
+  }
+
+  async function loadConversation(id: string) {
+    setBusy(true);
+    try {
+      const messages = await api<MessageItem[]>(`/api/conversations/${id}/messages?limit=120`);
+      setConversationId(id);
+      setLines(
+        messages
+          .filter((message) => ["user", "assistant", "system"].includes(message.role))
+          .map((message) => ({
+            id: message.id,
+            role: message.role,
+            content: message.content
+          }))
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Conversation load failed");
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -959,7 +1000,33 @@ export default function CommandCenter() {
             </div>
 
             <div className="panelHeader lower">
-              <h2>Здоровье</h2>
+              <h2>Dialog History</h2>
+              <span>{conversations.length}</span>
+            </div>
+            <div className="conversationList">
+              {conversations.length === 0 ? (
+                <div className="emptyState compact">No saved dialogs</div>
+              ) : (
+                conversations.slice(0, 8).map((conversation) => (
+                  <button
+                    className={`conversationRow ${
+                      conversation.id === conversationId ? "active" : ""
+                    }`}
+                    disabled={busy}
+                    key={conversation.id}
+                    onClick={() => loadConversation(conversation.id)}
+                    type="button"
+                  >
+                    <MessageSquare size={14} />
+                    <strong>{conversation.title}</strong>
+                    <span>{conversation.message_count}</span>
+                  </button>
+                ))
+              )}
+            </div>
+
+            <div className="panelHeader lower">
+              <h2>Health</h2>
               <span>{diagnostics.length}</span>
             </div>
             <div className="healthList">

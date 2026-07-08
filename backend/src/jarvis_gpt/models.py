@@ -35,6 +35,23 @@ class ChatResponse(BaseModel):
     mission_id: str | None = None
 
 
+class ConversationItem(BaseModel):
+    id: str
+    title: str
+    created_at: str
+    updated_at: str
+    message_count: int
+
+
+class MessageItem(BaseModel):
+    id: str
+    conversation_id: str
+    role: str
+    content: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: str
+
+
 class MissionCreateRequest(BaseModel):
     goal: str = Field(min_length=1, max_length=20000)
     title: str | None = Field(default=None, max_length=240)

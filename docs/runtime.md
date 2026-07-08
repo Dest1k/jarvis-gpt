@@ -8,6 +8,7 @@
 - Verified tonight: backend `pytest`, `ruff`, frontend `typecheck`, frontend `build`.
 - Follow-up closed: `/api/chat/stream` now streams NDJSON deltas and the default generation budget is 512 tokens.
 - HITL follow-up closed: approved gates can now be executed through the whitelisted approval executor.
+- Conversation history is now durable through `/api/conversations` and can be restored in Command Center.
 
 ## Переменные окружения
 
@@ -74,6 +75,8 @@ GET  /api/autonomy
 POST /api/learning/tick
 POST /api/chat
 POST /api/chat/stream
+GET  /api/conversations
+GET  /api/conversations/{conversation_id}/messages
 GET  /api/missions
 POST /api/missions
 POST /api/missions/{mission_id}/execute-next

@@ -216,6 +216,62 @@ class JarvisStorage:
             conn.commit()
         return mid
 
+    def list_conversations(self, limit: int = 50) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self.connect().execute(
+                """
+                SELECT
+                    c.id,
+                    c.title,
+                    c.created_at,
+                    c.updated_at,
+                    COUNT(m.id) AS message_count
+                FROM conversations c
+                LEFT JOIN messages m ON m.conversation_id = c.id
+                GROUP BY c.id
+                ORDER BY c.updated_at DESC, c.rowid DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_conversation(self, conversation_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self.connect().execute(
+                """
+                SELECT
+                    c.id,
+                    c.title,
+                    c.created_at,
+                    c.updated_at,
+                    COUNT(m.id) AS message_count
+                FROM conversations c
+                LEFT JOIN messages m ON m.conversation_id = c.id
+                WHERE c.id = ?
+                GROUP BY c.id
+                """,
+                (conversation_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_messages(self, conversation_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self.connect().execute(
+                """
+                SELECT id, conversation_id, role, content, metadata, created_at
+                FROM messages
+                WHERE conversation_id = ?
+                ORDER BY created_at ASC, rowid ASC
+                LIMIT ?
+                """,
+                (conversation_id, limit),
+            ).fetchall()
+        return [
+            {**dict(row), "metadata": _loads(row["metadata"], {})}
+            for row in rows
+        ]
+
     def recent_messages(self, conversation_id: str, limit: int = 20) -> list[dict[str, Any]]:
         with self._lock:
             rows = self.connect().execute(

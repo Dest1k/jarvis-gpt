@@ -609,6 +609,7 @@ h3 {
 .memoryList,
 .fileList,
 .fileMatches,
+.conversationList,
 .auditList {
   display: flex;
   flex-direction: column;
@@ -623,6 +624,46 @@ h3 {
   align-items: center;
   color: var(--muted);
   font-size: 12px;
+}
+
+.conversationRow {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  min-height: 34px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 0 9px;
+  background: #ffffff;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: left;
+}
+
+.conversationRow:hover,
+.conversationRow.active {
+  border-color: var(--teal);
+  color: var(--teal);
+}
+
+.conversationRow strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink);
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.conversationRow span {
+  display: grid;
+  place-items: center;
+  min-width: 24px;
+  height: 22px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--graphite);
 }
 
 .modelRow,
