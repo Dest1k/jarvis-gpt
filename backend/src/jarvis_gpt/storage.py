@@ -972,7 +972,11 @@ class JarvisStorage:
                     status, error, chunk_count, created_at, updated_at
                 FROM files
                 WHERE sha256 = ?
-                ORDER BY created_at ASC, rowid ASC
+                ORDER BY
+                    CASE WHEN status = 'indexed' THEN 0 ELSE 1 END,
+                    CASE WHEN mime_type = 'application/octet-stream' THEN 1 ELSE 0 END,
+                    created_at ASC,
+                    rowid ASC
                 LIMIT 1
                 """,
                 (sha256,),

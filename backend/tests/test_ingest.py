@@ -56,3 +56,32 @@ def test_file_ingestor_indexes_directory_with_limits(monkeypatch, tmp_path):
     assert result["files_failed"] == 0
     assert hits
     storage.close()
+
+
+def test_file_lookup_prefers_specific_mime_for_duplicate_hash(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    sha256 = "a" * 64
+
+    storage.create_file_record(
+        name="unknown.md",
+        stored_path=tmp_path / "unknown.md",
+        sha256=sha256,
+        size=10,
+        mime_type="application/octet-stream",
+        status="indexed",
+    )
+    preferred = storage.create_file_record(
+        name="known.md",
+        stored_path=tmp_path / "known.md",
+        sha256=sha256,
+        size=10,
+        mime_type="text/markdown",
+        status="indexed",
+    )
+
+    assert storage.get_file_by_sha256(sha256)["id"] == preferred["id"]
+    storage.close()
