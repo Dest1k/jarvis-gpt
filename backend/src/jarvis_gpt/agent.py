@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import os
 import re
 import time
 import uuid
@@ -846,6 +847,41 @@ class AgentRuntime:
             if followup is not None:
                 return followup
 
+        weather_events: list[ChatEvent] = []
+        inferred_weather_location: str | None = None
+        if (
+            _looks_like_weather_query(message.lower())
+            and not _weather_location_from_message(message)
+        ):
+            inferred_weather_location, weather_events = await self._infer_weather_location()
+            if inferred_weather_location:
+                research_query = _web_research_query_from_message(
+                    message,
+                    weather_location=inferred_weather_location,
+                )
+                if research_query is not None:
+                    action = await self._run_web_research(
+                        message,
+                        research_query,
+                        conversation_id=context.conversation_id,
+                    )
+                    action.events = [*weather_events, *action.events]
+                    return action
+
+        weather_clarification = _weather_location_clarification(message)
+        if weather_clarification is not None:
+            return DirectAction(
+                answer=weather_clarification,
+                events=[
+                    *weather_events,
+                    ChatEvent(
+                        type="thought",
+                        title="Weather location needed",
+                        content="Weather lookup needs an explicit city or place.",
+                    )
+                ],
+            )
+
         research_query = _web_research_query_from_message(message)
         if research_query is not None:
             intent = await self._semantic_intent_decision(
@@ -909,6 +945,61 @@ class AgentRuntime:
         if not result.ok or not result.content:
             return None
         return _parse_intent_decision(result.content)
+
+    async def _infer_weather_location(self) -> tuple[str | None, list[ChatEvent]]:
+        configured = _normalize_search_query(os.environ.get("JARVIS_DEFAULT_CITY", ""))
+        if configured:
+            return configured, [
+                ChatEvent(
+                    type="thought",
+                    title="Weather location inferred",
+                    content=f"Using JARVIS_DEFAULT_CITY={configured}.",
+                    payload={"source": "env", "location": configured},
+                )
+            ]
+
+        cached = self.storage.get_runtime_value("weather.inferred_location", {})
+        if isinstance(cached, dict):
+            cached_location = str(cached.get("location") or "").strip()
+            cached_ts = float(cached.get("ts") or 0)
+            if cached_location and time.time() - cached_ts < 24 * 60 * 60:
+                return cached_location, [
+                    ChatEvent(
+                        type="thought",
+                        title="Weather location inferred",
+                        content=f"Using cached approximate location: {cached_location}.",
+                        payload={"source": "cache", "location": cached_location},
+                    )
+                ]
+
+        fetched = await self.tools.run(
+            "web.fetch",
+            {"url": "https://ipapi.co/json/", "max_chars": 2000},
+        )
+        events = [
+            ChatEvent(
+                type="tool_call",
+                title="weather.ip_geolocation",
+                content=fetched.summary,
+                payload={"tool": fetched.tool, "ok": fetched.ok, "url": "https://ipapi.co/json/"},
+            )
+        ]
+        location = _weather_location_from_geo_text(str(fetched.data.get("text") or ""))
+        if location:
+            self.storage.set_runtime_value(
+                "weather.inferred_location",
+                {"location": location, "ts": time.time()},
+            )
+            events.append(
+                ChatEvent(
+                    type="thought",
+                    title="Weather location inferred",
+                    content=f"Approximate location from public IP: {location}.",
+                    payload={"source": "ip", "location": location},
+                )
+            )
+            return location, events
+        return None, events
 
     async def _run_web_research(
         self,
@@ -1952,7 +2043,11 @@ def _parse_intent_decision(content: str) -> IntentDecision | None:
     )
 
 
-def _web_research_query_from_message(message: str) -> str | None:
+def _web_research_query_from_message(
+    message: str,
+    *,
+    weather_location: str | None = None,
+) -> str | None:
     normalized = message.lower()
     explicit_open = _contains_any(
         normalized,
@@ -2130,6 +2225,11 @@ def _web_research_query_from_message(message: str) -> str | None:
     query = re.sub(r"\s+", " ", query).strip(" ,.;:")
     if not query:
         return None
+    if _looks_like_weather_query(normalized):
+        location = _weather_location_from_message(message) or weather_location
+        if not location:
+            return None
+        return _weather_search_query(message, normalized, location=location)[:300]
     resolved_date = _relative_date_for_message(normalized)
     if resolved_date:
         query = f"{query} {resolved_date.isoformat()}"
@@ -2476,6 +2576,94 @@ def _looks_like_place_lookup_query(normalized: str) -> bool:
     if _looks_like_travel_query(normalized) and not place_intent:
         return False
     return place_intent and place_subject
+
+
+def _looks_like_weather_query(normalized: str) -> bool:
+    return _contains_any(
+        normalized,
+        (
+            "погода",
+            "прогноз погоды",
+            "температура",
+            "осадки",
+            "дождь",
+            "снег",
+            "ветер",
+            "шторм",
+            "гроза",
+        ),
+    )
+
+
+def _weather_location_clarification(message: str) -> str | None:
+    normalized = message.lower()
+    if not _looks_like_weather_query(normalized):
+        return None
+    if _weather_location_from_message(message):
+        return None
+    date_note = _relative_date_for_message(normalized)
+    date_suffix = f" на {date_note.isoformat()}" if date_note else ""
+    return f"Для какого города или места посмотреть погоду{date_suffix}?"
+
+
+def _weather_location_from_message(message: str) -> str | None:
+    patterns = (
+        r"(?:погода|прогноз погоды|температура).*?\b(?:в|во|для)\s+([a-zа-яё][a-zа-яё .-]{1,80})",
+        r"\b(?:в|во|для)\s+([a-zа-яё][a-zа-яё .-]{1,80}).*?(?:погода|прогноз|температура)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, message, flags=re.IGNORECASE)
+        if not match:
+            continue
+        location = _trim_weather_location(match.group(1))
+        if location:
+            return location
+    return None
+
+
+def _trim_weather_location(value: str) -> str:
+    location = re.split(
+        r"\b(?:на|сегодня|завтра|послезавтра|сейчас|какая|какой|какое|будет|погода|прогноз|температура)\b",
+        value,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+    location = _normalize_search_query(location)
+    if location.lower() in {"завтра", "сегодня", "послезавтра", "сейчас"}:
+        return ""
+    return location
+
+
+def _weather_search_query(
+    query: str,
+    normalized: str,
+    *,
+    location: str | None = None,
+) -> str:
+    location = location or _weather_location_from_message(query) or _normalize_search_query(query)
+    date_note = _relative_date_for_message(normalized)
+    date_part = f" {date_note.isoformat()}" if date_note else ""
+    return f"погода {location}{date_part} прогноз"
+
+
+def _weather_location_from_geo_text(text: str) -> str | None:
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    city = _normalize_search_query(str(data.get("city") or ""))
+    if not city:
+        return None
+    region = _normalize_search_query(str(data.get("region") or data.get("region_name") or ""))
+    country = _normalize_search_query(str(data.get("country_name") or data.get("country") or ""))
+    parts = [city]
+    if region and region.lower() != city.lower():
+        parts.append(region)
+    if country and country.lower() not in {part.lower() for part in parts}:
+        parts.append(country)
+    return ", ".join(parts[:3])
 
 
 def _place_lookup_search_query(query: str, normalized: str) -> str:

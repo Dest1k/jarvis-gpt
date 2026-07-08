@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import date, timedelta
 
 from jarvis_gpt.agent import AgentRuntime
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
@@ -1465,6 +1466,83 @@ def test_agent_researches_public_office_phone_without_osint(monkeypatch, tmp_pat
     assert "8 800 100-00-00" in response.answer
     assert "09:00-18:00" in response.answer
     assert "OSINT-рамка" not in response.answer
+    storage.close()
+
+
+def test_agent_infers_weather_city_from_public_ip(monkeypatch, tmp_path):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    calls = []
+
+    async def fake_run(name, arguments=None, **kwargs):
+        calls.append((name, arguments or {}))
+        if name == "web.fetch" and arguments["url"] == "https://ipapi.co/json/":
+            return _tool_response(
+                name,
+                True,
+                "Fetched URL with HTTP 200.",
+                {
+                    "text": json.dumps(
+                        {
+                            "city": "Донецк",
+                            "region": "Донецкая область",
+                            "country_name": "Россия",
+                        },
+                        ensure_ascii=False,
+                    )
+                },
+            )
+        if name == "web.search":
+            return _tool_response(
+                name,
+                True,
+                "Web search returned 1 result(s).",
+                {
+                    "results": [
+                        {
+                            "title": "Погода в Донецке",
+                            "url": "https://example.com/weather",
+                            "snippet": "Донецк завтра +24, без осадков",
+                        }
+                    ]
+                },
+            )
+        if name == "web.fetch":
+            return _tool_response(
+                name,
+                True,
+                "Fetched URL with HTTP 200.",
+                {"url": arguments["url"], "text": "Донецк завтра +24, без осадков"},
+            )
+        raise AssertionError(f"unexpected tool {name}")
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+
+    response = asyncio.run(agent.chat("ладно, хорошо, какая погода на завтра?"))
+
+    search_call = next(call for call in calls if call[0] == "web.search")
+    assert search_call[1]["query"].startswith("погода Донецк")
+    assert "ладно" not in search_call[1]["query"]
+    assert (date.today() + timedelta(days=1)).isoformat() in search_call[1]["query"]
+    assert "https://example.com/weather" in response.answer
+    storage.close()
+
+
+def test_agent_asks_weather_city_when_ip_location_unavailable(monkeypatch, tmp_path):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    calls = []
+
+    async def fake_run(name, arguments=None, **kwargs):
+        calls.append((name, arguments or {}))
+        if name == "web.fetch" and arguments["url"] == "https://ipapi.co/json/":
+            return _tool_response(name, True, "Fetched URL with HTTP 200.", {"text": "{}"})
+        raise AssertionError(f"unexpected tool {name}")
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+
+    response = asyncio.run(agent.chat("какая погода на завтра?"))
+
+    assert "Для какого города" in response.answer
+    assert not any(call[0] == "web.search" for call in calls)
     storage.close()
 
 
