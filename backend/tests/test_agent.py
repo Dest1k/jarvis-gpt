@@ -225,6 +225,80 @@ def test_agent_opens_console_with_top_processes(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_agent_opens_system_info_in_console(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    captured = {}
+
+    async def fake_execute(self, command, cwd=None, timeout_sec=30):
+        captured["command"] = command
+        return {"ok": True, "summary": "executed", "data": {"command": command}}
+
+    monkeypatch.setattr("jarvis_gpt.tools.HostBridgeClient.execute", fake_execute)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    agent = AgentRuntime(
+        settings=settings,
+        storage=storage,
+        llm=LLMRouter(settings),
+        bus=EventBus(),
+    )
+
+    response = asyncio.run(agent.chat("открой мне в консоли информацию о системе"))
+    runs = storage.list_tool_runs()
+
+    assert "process.start" in captured["command"]
+    assert "powershell.exe" in captured["command"]
+    assert "-NoExit" in captured["command"]
+    assert "Get-ComputerInfo" in captured["command"]
+    assert "Win32_Processor" in captured["command"]
+    assert "Win32_LogicalDisk" in captured["command"]
+    assert runs[0]["tool"] == "windows.native"
+    assert "Готово" in response.answer
+    storage.close()
+
+
+def test_agent_understands_system_info_console_followup(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    captured = {}
+
+    async def fake_execute(self, command, cwd=None, timeout_sec=30):
+        captured["command"] = command
+        return {"ok": True, "summary": "executed", "data": {"command": command}}
+
+    monkeypatch.setattr("jarvis_gpt.tools.HostBridgeClient.execute", fake_execute)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    conversation_id = storage.create_conversation("system info")
+    storage.add_message(
+        conversation_id=conversation_id,
+        role="user",
+        content="открой мне информацию о системе",
+    )
+    agent = AgentRuntime(
+        settings=settings,
+        storage=storage,
+        llm=LLMRouter(settings),
+        bus=EventBus(),
+    )
+
+    response = asyncio.run(agent.chat("так ты именно в консоли открой", conversation_id))
+    runs = storage.list_tool_runs()
+
+    assert "process.start" in captured["command"]
+    assert "powershell.exe" in captured["command"]
+    assert "Get-ComputerInfo" in captured["command"]
+    assert "Win32_VideoController" in captured["command"]
+    assert runs[0]["tool"] == "windows.native"
+    assert "PowerShell" in response.answer
+    storage.close()
+
+
 def test_agent_runs_largest_file_scan_in_console(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")

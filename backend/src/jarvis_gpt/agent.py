@@ -885,7 +885,7 @@ APP_ALIASES: tuple[tuple[tuple[str, ...], str, str], ...] = (
     (("vscode", "vs code", "visual studio code"), "Code.exe", "Visual Studio Code"),
     (("telegram", "телеграм"), "Telegram.exe", "Telegram"),
     (("диспетчер задач", "task manager", "taskmgr"), "taskmgr.exe", "диспетчер задач"),
-    (("командную строку", "cmd", "консоль"), "cmd.exe", "командную строку"),
+    (("командную строку", "командной строк", "cmd", "консол"), "cmd.exe", "командную строку"),
     (("powershell", "power shell", "пауэршелл"), "powershell.exe", "PowerShell"),
     (("terminal", "windows terminal", "терминал"), "wt.exe", "Windows Terminal"),
     (("службы", "services.msc"), "services.msc", "службы"),
@@ -907,6 +907,10 @@ def _native_action_from_message(
     screen_capture = _screen_capture_action(normalized, settings)
     if screen_capture is not None:
         return screen_capture
+
+    system_info_console = _system_info_console_action(message, history_text)
+    if system_info_console is not None:
+        return system_info_console
 
     largest_file_console = _largest_file_console_action(message, history_text)
     if largest_file_console is not None:
@@ -1083,22 +1087,71 @@ def _screen_capture_file(settings: JarvisSettings) -> Path:
     return screenshot_dir / f"screen-{uuid.uuid4().hex[:12]}.png"
 
 
+def _system_info_console_action(message: str, history_text: str = "") -> NativeAction | None:
+    normalized = message.lower()
+    history = history_text.lower()
+    wants_console = _wants_console_target(normalized)
+    current_mentions_system = _mentions_system_info(normalized)
+    followup_mentions_console = wants_console and _contains_any(
+        normalized,
+        ("именно", "туда", "там", "открой", "запусти", "сделай", "вывод"),
+    )
+    if not current_mentions_system and not (
+        followup_mentions_console and _mentions_system_info(history)
+    ):
+        return None
+    if not wants_console and not _contains_any(normalized, ("открой", "запусти", "сделай")):
+        return None
+
+    return NativeAction(
+        action="process.start",
+        payload={
+            "executable": "powershell.exe",
+            "arguments": _powershell_noexit_arguments(_system_info_script()),
+        },
+        answer="открыл PowerShell и вывел информацию о системе",
+    )
+
+
+def _mentions_system_info(text: str) -> bool:
+    if _contains_any(text, ("system information", "systeminfo", "computerinfo")):
+        return True
+    if _contains_any(text, ("о системе", "про систему")):
+        return True
+    return _contains_any(text, ("систем",)) and _contains_any(
+        text,
+        ("информац", "сведен", "сводк", "характерист", "спецификац", "конфигурац"),
+    )
+
+
+def _system_info_script() -> str:
+    return (
+        "$ErrorActionPreference='SilentlyContinue'; "
+        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
+        "Write-Host '--- SYSTEM INFORMATION ---' -ForegroundColor Cyan; "
+        "Get-ComputerInfo | Select-Object OsName,OsVersion,OsArchitecture,CsName,"
+        "CsManufacturer,CsModel,CsProcessors,CsTotalPhysicalMemory | Format-List; "
+        "Write-Host '--- CPU ---' -ForegroundColor Cyan; "
+        "Get-CimInstance Win32_Processor | Select-Object Name,NumberOfCores,"
+        "NumberOfLogicalProcessors,MaxClockSpeed | Format-List; "
+        "Write-Host '--- MEMORY ---' -ForegroundColor Cyan; "
+        "Get-CimInstance Win32_PhysicalMemory | Measure-Object Capacity -Sum | "
+        "ForEach-Object { Write-Host ('Total RAM: {0:n2} GB' -f ($_.Sum / 1GB)) }; "
+        "Write-Host '--- DISKS ---' -ForegroundColor Cyan; "
+        "Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | "
+        "Select-Object DeviceID,@{Name='SizeGB';Expression={[math]::Round($_.Size/1GB,2)}},"
+        "@{Name='FreeGB';Expression={[math]::Round($_.FreeSpace/1GB,2)}} | "
+        "Format-Table -AutoSize; "
+        "Write-Host '--- GPU ---' -ForegroundColor Cyan; "
+        "Get-CimInstance Win32_VideoController | Select-Object Name,DriverVersion | "
+        "Format-Table -AutoSize"
+    )
+
+
 def _largest_file_console_action(message: str, history_text: str = "") -> NativeAction | None:
     normalized = message.lower()
     history = history_text.lower()
-    wants_console = _contains_any(
-        normalized,
-        (
-            "в консоли",
-            "консоль",
-            "powershell",
-            "power shell",
-            "терминал",
-            "командной строк",
-            "вывод там же",
-            "там же",
-        ),
-    )
+    wants_console = _wants_console_target(normalized)
     current_mentions_largest = _mentions_largest_file(normalized)
     followup_mentions_scan = _contains_any(
         normalized,
@@ -1279,11 +1332,27 @@ def _contains_any(text: str, markers: tuple[str, ...]) -> bool:
     return any(marker in text for marker in markers)
 
 
-def _wants_top_process_console(normalized: str) -> bool:
-    wants_console = _contains_any(
+def _wants_console_target(normalized: str) -> bool:
+    return _contains_any(
         normalized,
-        ("консоль", "командную строку", "cmd", "powershell", "terminal", "терминал"),
+        (
+            "в консоли",
+            "консол",
+            "powershell",
+            "power shell",
+            "пауэршелл",
+            "терминал",
+            "terminal",
+            "командн",
+            "cmd",
+            "вывод там же",
+            "там же",
+        ),
     )
+
+
+def _wants_top_process_console(normalized: str) -> bool:
+    wants_console = _wants_console_target(normalized)
     wants_processes = _contains_any(normalized, ("процесс", "process"))
     wants_top = bool(re.search(r"\btop\s*10\b", normalized)) or _contains_any(
         normalized,
