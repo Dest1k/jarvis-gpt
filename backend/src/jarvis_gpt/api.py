@@ -417,6 +417,15 @@ async def list_conversation_messages(
     return messages
 
 
+@app.delete("/api/conversations/{conversation_id}")
+async def delete_conversation(conversation_id: str) -> dict[str, bool]:
+    deleted = app.state.storage.delete_conversation(conversation_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    await app.state.bus.publish({"channel": "conversations", "deleted": conversation_id})
+    return {"ok": True}
+
+
 @app.get("/api/missions", response_model=list[Mission])
 async def list_missions(limit: int = Query(default=50, ge=1, le=200)) -> list[Mission]:
     return app.state.storage.list_missions(limit=limit)

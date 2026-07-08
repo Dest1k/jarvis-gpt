@@ -10,11 +10,13 @@ import {
   FileText,
   Gauge,
   Globe,
+  GripHorizontal,
   History,
   Loader2,
   Mic,
   MicOff,
   MessageSquare,
+  Plus,
   Play,
   RefreshCw,
   Save,
@@ -25,14 +27,18 @@ import {
   Sparkles,
   Square,
   Terminal,
+  Trash2,
   Zap,
   Upload,
   Wrench
 } from "lucide-react";
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { KeyboardEvent, ReactNode } from "react";
+import type { KeyboardEvent, PointerEvent as ReactPointerEvent, ReactNode } from "react";
 
 const API_URL = process.env.NEXT_PUBLIC_JARVIS_API_URL ?? "http://localhost:8000";
+const CHAT_WINDOWS_KEY = "jarvis-gpt.chatWindows.v1";
+const CHAT_SETTINGS_KEY = "jarvis-gpt.chatSettings.v1";
+const DEFAULT_CHAT_HEIGHT = 680;
 
 type RuntimeStatus = {
   settings: {
@@ -89,6 +95,26 @@ type ChatLine = {
   id?: string;
   role: "user" | "assistant" | "system";
   content: string;
+};
+
+type ChatWindow = {
+  id: string;
+  title: string;
+  conversationId: string | null;
+  input: string;
+  lines: ChatLine[];
+  createdAt: number;
+};
+
+type StoredChatWindows = {
+  activeId?: string;
+  windows?: ChatWindow[];
+};
+
+type StoredChatSettings = {
+  activeTab?: CommandTab;
+  chatHeight?: number;
+  maxTokens?: number;
 };
 
 type ConversationItem = {
@@ -517,6 +543,86 @@ function speechRecognitionConstructor() {
   return speechWindow.SpeechRecognition ?? speechWindow.webkitSpeechRecognition ?? null;
 }
 
+function bootLines(): ChatLine[] {
+  return [
+    {
+      id: "system-boot",
+      role: "system",
+      content: "JARVIS GPT Command Center готов к подключению."
+    }
+  ];
+}
+
+function randomId(prefix: string) {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return `${prefix}-${crypto.randomUUID()}`;
+  }
+  return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function createChatWindow(title = "Новый чат"): ChatWindow {
+  return {
+    id: randomId("chat"),
+    title,
+    conversationId: null,
+    input: "",
+    lines: bootLines(),
+    createdAt: Date.now()
+  };
+}
+
+function readStoredChatWindows(): { windows: ChatWindow[]; activeId: string } {
+  const fallback = createChatWindow();
+  if (typeof window === "undefined") {
+    return { windows: [fallback], activeId: fallback.id };
+  }
+  try {
+    const parsed = JSON.parse(localStorage.getItem(CHAT_WINDOWS_KEY) || "{}") as StoredChatWindows;
+    const windows = (parsed.windows ?? [])
+      .filter((item) => item && typeof item.id === "string")
+      .slice(0, 8)
+      .map((item) => ({
+        ...item,
+        title: item.title || "Чат",
+        input: item.input || "",
+        conversationId: item.conversationId ?? null,
+        lines: Array.isArray(item.lines) && item.lines.length ? item.lines : bootLines(),
+        createdAt: Number(item.createdAt) || Date.now()
+      }));
+    if (windows.length) {
+      return {
+        windows,
+        activeId: windows.some((item) => item.id === parsed.activeId)
+          ? String(parsed.activeId)
+          : windows[0].id
+      };
+    }
+  } catch {
+    return { windows: [fallback], activeId: fallback.id };
+  }
+  return { windows: [fallback], activeId: fallback.id };
+}
+
+function readStoredChatSettings(): StoredChatSettings {
+  if (typeof window === "undefined") return {};
+  try {
+    return JSON.parse(localStorage.getItem(CHAT_SETTINGS_KEY) || "{}") as StoredChatSettings;
+  } catch {
+    return {};
+  }
+}
+
+function clampChatHeight(value: number) {
+  if (!Number.isFinite(value)) return DEFAULT_CHAT_HEIGHT;
+  return Math.max(460, Math.min(1200, Math.round(value)));
+}
+
+function titleFromMessage(message: string) {
+  const cleaned = message.replace(/\s+/g, " ").trim();
+  if (!cleaned) return "Чат";
+  return cleaned.slice(0, 42) + (cleaned.length > 42 ? "..." : "");
+}
+
 export default function CommandCenter() {
   const [status, setStatus] = useState<RuntimeStatus | null>(null);
   const [conversations, setConversations] = useState<ConversationItem[]>([]);
@@ -550,9 +656,19 @@ export default function CommandCenter() {
   const [routineRun, setRoutineRun] = useState<RoutineRun | null>(null);
   const [directoryDraft, setDirectoryDraft] = useState("D:\\jarvis");
   const [directoryIngest, setDirectoryIngest] = useState<DirectoryIngestResult | null>(null);
-  const [activeTab, setActiveTab] = useState<CommandTab>("chat");
+  const [activeTab, setActiveTab] = useState<CommandTab>(() => {
+    const stored = readStoredChatSettings().activeTab;
+    return stored ?? "chat";
+  });
+  const [chatHeight, setChatHeight] = useState(() =>
+    clampChatHeight(readStoredChatSettings().chatHeight ?? DEFAULT_CHAT_HEIGHT)
+  );
+  const [{ windows: initialChatWindows, activeId: initialChatWindowId }] = useState(
+    readStoredChatWindows
+  );
+  const [chatWindows, setChatWindows] = useState<ChatWindow[]>(initialChatWindows);
+  const [activeChatWindowId, setActiveChatWindowId] = useState(initialChatWindowId);
   const [approvals, setApprovals] = useState<ApprovalItem[]>([]);
-  const [input, setInput] = useState("");
   const [voiceAvailable, setVoiceAvailable] = useState(false);
   const [voiceState, setVoiceState] = useState<VoiceState>("idle");
   const [voiceInterim, setVoiceInterim] = useState("");
@@ -562,21 +678,66 @@ export default function CommandCenter() {
   const [webUrlDraft, setWebUrlDraft] = useState("");
   const [webFetchResult, setWebFetchResult] = useState<ToolRunResult | null>(null);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
-  const [conversationId, setConversationId] = useState<string | null>(null);
-  const [maxTokens, setMaxTokens] = useState(512);
-  const [lines, setLines] = useState<ChatLine[]>([
-    {
-      id: "system-boot",
-      role: "system",
-      content: "JARVIS GPT Command Center готов к подключению."
-    }
-  ]);
+  const [maxTokens, setMaxTokens] = useState(() =>
+    clampMaxTokens(readStoredChatSettings().maxTokens ?? 512)
+  );
   const [busy, setBusy] = useState(false);
   const [chatBusy, setChatBusy] = useState(false);
   const [dispatcherBusy, setDispatcherBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const voiceBaseInputRef = useRef("");
+
+  const activeChatWindow = useMemo(
+    () => chatWindows.find((window) => window.id === activeChatWindowId) ?? chatWindows[0],
+    [activeChatWindowId, chatWindows]
+  );
+  const input = activeChatWindow?.input ?? "";
+  const conversationId = activeChatWindow?.conversationId ?? null;
+  const lines = activeChatWindow?.lines ?? bootLines();
+
+  const updateChatWindow = useCallback((id: string, updater: (window: ChatWindow) => ChatWindow) => {
+    setChatWindows((current) => current.map((window) => (window.id === id ? updater(window) : window)));
+  }, []);
+
+  const updateActiveChatWindow = useCallback(
+    (updater: (window: ChatWindow) => ChatWindow) => {
+      setChatWindows((current) => {
+        const activeId = current.some((window) => window.id === activeChatWindowId)
+          ? activeChatWindowId
+          : current[0]?.id;
+        return current.map((window) => (window.id === activeId ? updater(window) : window));
+      });
+    },
+    [activeChatWindowId]
+  );
+
+  const setInput = useCallback(
+    (value: string | ((current: string) => string)) => {
+      updateActiveChatWindow((window) => ({
+        ...window,
+        input: typeof value === "function" ? value(window.input) : value
+      }));
+    },
+    [updateActiveChatWindow]
+  );
+
+  const setConversationId = useCallback(
+    (value: string | null) => {
+      updateActiveChatWindow((window) => ({ ...window, conversationId: value }));
+    },
+    [updateActiveChatWindow]
+  );
+
+  const setLines = useCallback(
+    (value: ChatLine[] | ((current: ChatLine[]) => ChatLine[])) => {
+      updateActiveChatWindow((window) => ({
+        ...window,
+        lines: typeof value === "function" ? value(window.lines) : value
+      }));
+    },
+    [updateActiveChatWindow]
+  );
 
   const refresh = useCallback(async () => {
     try {
@@ -660,9 +821,52 @@ export default function CommandCenter() {
     }
   }, []);
 
+  const refreshVitals = useCallback(async () => {
+    try {
+      const [statusData, dispatcherData, telemetryData] = await Promise.all([
+        api<RuntimeStatus>("/api/status"),
+        api<DispatcherStatus>("/api/dispatcher"),
+        api<TelemetrySnapshot>("/api/telemetry")
+      ]);
+      setStatus(statusData);
+      setDispatcher(dispatcherData);
+      setTelemetry(telemetryData);
+      if (statusData.health.length) {
+        setDiagnostics(statusData.health);
+      }
+    } catch {
+      // The full refresh path owns the visible error state; vitals polling stays quiet.
+    }
+  }, []);
+
   useEffect(() => {
     refresh();
   }, [refresh]);
+
+  useEffect(() => {
+    const interval = window.setInterval(() => {
+      void refreshVitals();
+    }, 3000);
+    return () => window.clearInterval(interval);
+  }, [refreshVitals]);
+
+  useEffect(() => {
+    localStorage.setItem(
+      CHAT_SETTINGS_KEY,
+      JSON.stringify({ activeTab, chatHeight, maxTokens })
+    );
+  }, [activeTab, chatHeight, maxTokens]);
+
+  useEffect(() => {
+    const compactWindows = chatWindows.slice(0, 8).map((window) => ({
+      ...window,
+      lines: window.lines.slice(-120)
+    }));
+    localStorage.setItem(
+      CHAT_WINDOWS_KEY,
+      JSON.stringify({ activeId: activeChatWindowId, windows: compactWindows })
+    );
+  }, [activeChatWindowId, chatWindows]);
 
   useEffect(() => {
     setVoiceAvailable(Boolean(speechRecognitionConstructor()));
@@ -699,6 +903,15 @@ export default function CommandCenter() {
   );
   const llmReady = llmCheck?.status === "ok";
   const dispatcherPhase = dispatcher?.container_status?.status ?? (dispatcher?.port_open ? "port open" : "offline");
+  const primaryGpu = telemetry?.gpu.gpus?.[0];
+  const gpuUtilization = Math.round(primaryGpu?.utilization_gpu ?? 0);
+  const vramUsage = ratioPercent(primaryGpu?.memory_used_ratio);
+  const llmState = llmReady ? "ready" : dispatcher?.port_open ? "loading" : "offline";
+  const llmStatusText = llmReady
+    ? "LLM ready"
+    : dispatcher?.port_open
+      ? dispatcherPhase
+      : "LLM offline";
   const activeTabTitle: Record<CommandTab, string> = {
     chat: "Command Hub",
     runtime: "Runtime",
@@ -771,67 +984,83 @@ export default function CommandCenter() {
 
   async function submitChat() {
     const message = input.trim();
-    if (!message || chatBusy) return;
-    const userId = crypto.randomUUID();
-    const assistantId = crypto.randomUUID();
+    const chatWindowId = activeChatWindow?.id;
+    if (!message || chatBusy || !chatWindowId) return;
+    const previousConversationId = activeChatWindow.conversationId;
+    const userId = randomId("msg");
+    const assistantId = randomId("msg");
     let receivedDelta = false;
     setChatBusy(true);
-    setInput("");
-    setLines((current) => [
-      ...current,
-      { id: userId, role: "user", content: message },
-      { id: assistantId, role: "assistant", content: "" }
-    ]);
+    updateChatWindow(chatWindowId, (window) => ({
+      ...window,
+      title: window.title === "Новый чат" || window.title === "Чат"
+        ? titleFromMessage(message)
+        : window.title,
+      input: "",
+      lines: [
+        ...window.lines,
+        { id: userId, role: "user", content: message },
+        { id: assistantId, role: "assistant", content: "" }
+      ]
+    }));
     try {
       await streamApi(
         "/api/chat/stream",
         {
           message,
-          conversation_id: conversationId,
+          conversation_id: previousConversationId,
           max_tokens: maxTokens,
           mode: "auto"
         },
         (item) => {
           if (item.type === "meta" && item.conversation_id) {
-            setConversationId(item.conversation_id);
+            updateChatWindow(chatWindowId, (window) => ({
+              ...window,
+              conversationId: item.conversation_id ?? window.conversationId
+            }));
           }
           if (item.type === "delta" && item.content) {
             receivedDelta = true;
-            setLines((current) =>
-              current.map((line) =>
-                line.id === assistantId
-                  ? { ...line, content: `${line.content}${item.content}` }
-                  : line
+            updateChatWindow(chatWindowId, (window) => ({
+              ...window,
+              lines: window.lines.map((line) =>
+                line.id === assistantId ? { ...line, content: `${line.content}${item.content}` } : line
               )
-            );
+            }));
           }
           if (item.type === "done") {
             if (item.conversation_id) {
-              setConversationId(item.conversation_id);
+              updateChatWindow(chatWindowId, (window) => ({
+                ...window,
+                conversationId: item.conversation_id ?? window.conversationId
+              }));
             }
             if (!receivedDelta && item.answer) {
-              setLines((current) =>
-                current.map((line) =>
+              updateChatWindow(chatWindowId, (window) => ({
+                ...window,
+                lines: window.lines.map((line) =>
                   line.id === assistantId ? { ...line, content: item.answer ?? "" } : line
                 )
-              );
+              }));
             }
           }
           if (item.type === "error") {
-            setLines((current) =>
-              current.map((line) =>
+            updateChatWindow(chatWindowId, (window) => ({
+              ...window,
+              lines: window.lines.map((line) =>
                 line.id === assistantId
                   ? { ...line, content: item.error ?? "Streaming error" }
                   : line
               )
-            );
+            }));
           }
         }
       );
       await refresh();
     } catch (err) {
-      setLines((current) =>
-        current.map((line) =>
+      updateChatWindow(chatWindowId, (window) => ({
+        ...window,
+        lines: window.lines.map((line) =>
           line.id === assistantId
             ? {
                 ...line,
@@ -839,7 +1068,7 @@ export default function CommandCenter() {
               }
             : line
         )
-      );
+      }));
     } finally {
       setChatBusy(false);
     }
@@ -858,11 +1087,71 @@ export default function CommandCenter() {
     void submitChat();
   }
 
+  function newChatWindow() {
+    const window = createChatWindow();
+    setChatWindows((current) => [window, ...current].slice(0, 8));
+    setActiveChatWindowId(window.id);
+  }
+
+  function closeChatWindow(id: string) {
+    setChatWindows((current) => {
+      if (current.length <= 1) {
+        const replacement = createChatWindow();
+        setActiveChatWindowId(replacement.id);
+        return [replacement];
+      }
+      const next = current.filter((window) => window.id !== id);
+      if (id === activeChatWindowId) {
+        setActiveChatWindowId(next[0]?.id ?? current[0].id);
+      }
+      return next;
+    });
+  }
+
+  async function clearCurrentChat() {
+    if (!activeChatWindow) return;
+    const clearedWindow = {
+      ...activeChatWindow,
+      title: "Новый чат",
+      conversationId: null,
+      input: "",
+      lines: bootLines()
+    };
+    const idToDelete = activeChatWindow.conversationId;
+    updateChatWindow(activeChatWindow.id, () => clearedWindow);
+    if (!idToDelete) return;
+    try {
+      await api<{ ok: boolean }>(`/api/conversations/${idToDelete}`, { method: "DELETE" });
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Conversation clear failed");
+    }
+  }
+
+  function beginChatResize(event: ReactPointerEvent<HTMLDivElement>) {
+    const startY = event.clientY;
+    const startHeight = chatHeight;
+    const onMove = (moveEvent: PointerEvent) => {
+      setChatHeight(clampChatHeight(startHeight + moveEvent.clientY - startY));
+    };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp, { once: true });
+  }
+
   async function loadConversation(id: string) {
     setBusy(true);
     try {
       const messages = await api<MessageItem[]>(`/api/conversations/${id}/messages?limit=120`);
+      const conversation = conversations.find((item) => item.id === id);
       setConversationId(id);
+      updateActiveChatWindow((window) => ({
+        ...window,
+        title: conversation?.title ? conversation.title.slice(0, 42) : window.title
+      }));
       setLines(
         messages
           .filter((message) => ["user", "assistant", "system"].includes(message.role))
@@ -1454,6 +1743,45 @@ export default function CommandCenter() {
           </div>
         </header>
 
+        <section className="realtimeStrip" aria-label="Live runtime indicators">
+          <article className={`livePill ${llmState}`}>
+            <Sparkles size={17} />
+            <div>
+              <span>LLM</span>
+              <strong>{llmStatusText}</strong>
+            </div>
+            <small>{dispatcher?.port_open ? "8001" : "off"}</small>
+          </article>
+          <article className={`livePill ${telemetry?.gpu.available ? "ready" : "offline"}`}>
+            <Zap size={17} />
+            <div>
+              <span>GPU</span>
+              <strong>{telemetry?.gpu.available ? `${gpuUtilization}%` : "offline"}</strong>
+            </div>
+            <div className="liveMeter" aria-label="GPU utilization">
+              <span style={{ width: `${telemetry?.gpu.available ? gpuUtilization : 0}%` }} />
+            </div>
+          </article>
+          <article className={`livePill ${telemetry?.gpu.available ? "ready" : "offline"}`}>
+            <Gauge size={17} />
+            <div>
+              <span>VRAM</span>
+              <strong>{telemetry?.gpu.available ? `${vramUsage}%` : "offline"}</strong>
+            </div>
+            <div className="liveMeter" aria-label="VRAM usage">
+              <span style={{ width: `${telemetry?.gpu.available ? vramUsage : 0}%` }} />
+            </div>
+          </article>
+          <article className={`livePill ${dispatcher?.port_open ? "ready" : "offline"}`}>
+            <Server size={17} />
+            <div>
+              <span>Dispatcher</span>
+              <strong>{dispatcherPhase}</strong>
+            </div>
+            <small>{dispatcher?.container_status?.exists ? "docker" : "none"}</small>
+          </article>
+        </section>
+
         {error && (
           <div className="notice" role="status">
             <ShieldAlert size={18} />
@@ -1495,10 +1823,61 @@ export default function CommandCenter() {
         </section>
 
         <section className="mainGrid">
-          <section className="chatPanel" id="dialog" aria-label="Диалог">
-            <div className="panelHeader">
+          <section
+            className="chatPanel"
+            id="dialog"
+            aria-label="Диалог"
+            style={{ height: chatHeight }}
+          >
+            <div className="panelHeader chatHeader">
               <h2>Диалог</h2>
-              <span>{conversationId ? "active" : "new"}</span>
+              <div className="chatHeaderActions">
+                <span>{conversationId ? "active" : "new"}</span>
+                <button type="button" title="Новое окно" aria-label="Новое окно" onClick={newChatWindow}>
+                  <Plus size={15} />
+                </button>
+                <button
+                  type="button"
+                  title="Очистить текущий чат"
+                  aria-label="Очистить текущий чат"
+                  onClick={clearCurrentChat}
+                >
+                  <Trash2 size={15} />
+                </button>
+              </div>
+            </div>
+            <div className="chatWindowBar" role="tablist" aria-label="Окна чата">
+              {chatWindows.map((window, index) => (
+                <div
+                  className={`chatWindowTab ${window.id === activeChatWindowId ? "active" : ""}`}
+                  key={window.id}
+                  onClick={() => setActiveChatWindowId(window.id)}
+                  role="tab"
+                  tabIndex={0}
+                  aria-selected={window.id === activeChatWindowId}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      setActiveChatWindowId(window.id);
+                    }
+                  }}
+                >
+                  <MessageSquare size={13} />
+                  <span>{window.title || `Чат ${index + 1}`}</span>
+                  {chatWindows.length > 1 && (
+                    <button
+                      type="button"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        closeChatWindow(window.id);
+                      }}
+                      aria-label="Закрыть окно"
+                    >
+                      ×
+                    </button>
+                  )}
+                </div>
+              ))}
             </div>
             <div className="transcript">
               {lines.map((line, index) => (
@@ -1546,6 +1925,15 @@ export default function CommandCenter() {
                 </button>
               </div>
             </form>
+            <div
+              className="chatResizeHandle"
+              onPointerDown={beginChatResize}
+              role="separator"
+              aria-orientation="horizontal"
+              aria-label="Изменить высоту чата"
+            >
+              <GripHorizontal size={16} />
+            </div>
           </section>
 
           <section className="opsPanel" aria-label={activeTabTitle[activeTab]}>

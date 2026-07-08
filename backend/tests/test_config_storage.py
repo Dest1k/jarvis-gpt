@@ -58,6 +58,22 @@ def test_storage_lists_conversations_and_messages(tmp_path):
     storage.close()
 
 
+def test_storage_deletes_conversation_and_messages(tmp_path):
+    storage = JarvisStorage(tmp_path / "state" / "jarvis.sqlite3")
+    storage.initialize()
+    conversation_id = storage.create_conversation("Temporary")
+    storage.add_message(conversation_id=conversation_id, role="user", content="clear me")
+    storage.add_message(conversation_id=conversation_id, role="assistant", content="cleared")
+
+    deleted = storage.delete_conversation(conversation_id)
+
+    assert deleted is True
+    assert storage.get_conversation(conversation_id) is None
+    assert storage.list_messages(conversation_id) == []
+    assert storage.delete_conversation(conversation_id) is False
+    storage.close()
+
+
 def test_storage_updates_task_progress_and_searches_memory(tmp_path):
     storage = JarvisStorage(tmp_path / "state" / "jarvis.sqlite3")
     storage.initialize()

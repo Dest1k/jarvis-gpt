@@ -95,6 +95,92 @@ def test_agent_streams_chat_response(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_agent_opens_wiki_without_false_refusal(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+
+    async def fake_execute(self, command, cwd=None, timeout_sec=30):
+        return {"ok": True, "summary": "opened", "data": {"command": command}}
+
+    monkeypatch.setattr("jarvis_gpt.tools.HostBridgeClient.execute", fake_execute)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    agent = AgentRuntime(
+        settings=settings,
+        storage=storage,
+        llm=LLMRouter(settings),
+        bus=EventBus(),
+    )
+
+    response = asyncio.run(agent.chat("открой статью про Гитлера на вики в новой вкладке"))
+    runs = storage.list_tool_runs()
+
+    assert "ru.wikipedia.org" in response.answer
+    assert "Адольф_Гитлер" in response.answer
+    assert runs[0]["tool"] == "browser.open"
+    assert runs[0]["ok"] is True
+    storage.close()
+
+
+def test_agent_opens_calculator_with_host_bridge(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    captured = {}
+
+    async def fake_execute(self, command, cwd=None, timeout_sec=30):
+        captured["command"] = command
+        return {"ok": True, "summary": "executed", "data": {"command": command}}
+
+    monkeypatch.setattr("jarvis_gpt.tools.HostBridgeClient.execute", fake_execute)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    agent = AgentRuntime(
+        settings=settings,
+        storage=storage,
+        llm=LLMRouter(settings),
+        bus=EventBus(),
+    )
+
+    response = asyncio.run(agent.chat("открой калькулятор и набери в нём что-нибудь"))
+
+    assert "Start-Process calc.exe" in captured["command"]
+    assert "SendKeys" in captured["command"]
+    assert "Выполнил локальную команду" in response.answer
+    storage.close()
+
+
+def test_agent_opens_google_search(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    captured = {}
+
+    async def fake_execute(self, command, cwd=None, timeout_sec=30):
+        captured["command"] = command
+        return {"ok": True, "summary": "opened", "data": {"command": command}}
+
+    monkeypatch.setattr("jarvis_gpt.tools.HostBridgeClient.execute", fake_execute)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    agent = AgentRuntime(
+        settings=settings,
+        storage=storage,
+        llm=LLMRouter(settings),
+        bus=EventBus(),
+    )
+
+    response = asyncio.run(agent.chat("загугли как проверить открытые порты linux"))
+
+    assert "google.com/search" in response.answer
+    assert "google.com/search" in captured["command"]
+    storage.close()
+
+
 def test_agent_context_includes_relevance_snippets(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")

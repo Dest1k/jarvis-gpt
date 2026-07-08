@@ -406,6 +406,20 @@ class JarvisStorage:
             ).fetchone()
         return dict(row) if row else None
 
+    def delete_conversation(self, conversation_id: str) -> bool:
+        with self._lock:
+            conn = self.connect()
+            existing = conn.execute(
+                "SELECT id FROM conversations WHERE id = ?",
+                (conversation_id,),
+            ).fetchone()
+            if existing is None:
+                return False
+            conn.execute("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
+            conn.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
+            conn.commit()
+        return True
+
     def list_messages(self, conversation_id: str, limit: int = 100) -> list[dict[str, Any]]:
         with self._lock:
             rows = self.connect().execute(
