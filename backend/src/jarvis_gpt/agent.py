@@ -102,6 +102,47 @@ class AgentContext:
     conversation_id: str
     memory_hits: list[dict[str, Any]]
     file_hits: list[dict[str, Any]]
+    task_plan: TaskKernelPlan | None = None
+
+
+@dataclass(frozen=True)
+class TaskKernelPlan:
+    route: str
+    mode: str
+    intent: str
+    confidence: float
+    query: str | None = None
+    tools: tuple[str, ...] = ()
+    completion_criteria: tuple[str, ...] = ()
+    needs_clarification: bool = False
+    clarification: str | None = None
+    rationale: str = ""
+
+    def payload(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "route": self.route,
+            "mode": self.mode,
+            "intent": self.intent,
+            "confidence": round(max(0.0, min(1.0, self.confidence)), 3),
+            "tools": list(self.tools),
+            "completion_criteria": list(self.completion_criteria),
+            "needs_clarification": self.needs_clarification,
+        }
+        if self.query:
+            payload["query"] = self.query
+        if self.clarification:
+            payload["clarification"] = self.clarification
+        if self.rationale:
+            payload["rationale"] = self.rationale
+        return payload
+
+    def summary(self) -> str:
+        parts = [f"{self.route}/{self.intent}", f"mode={self.mode}"]
+        if self.query:
+            parts.append(f"query={self.query}")
+        if self.needs_clarification:
+            parts.append("clarification_needed")
+        return "; ".join(parts)
 
 
 @dataclass
@@ -146,6 +187,7 @@ def _chat_message_metadata(
     temperature: float | None,
     attachments: list[dict[str, Any]],
     thinking_enabled: bool,
+    task_plan: TaskKernelPlan | None = None,
 ) -> dict[str, Any]:
     metadata: dict[str, Any] = {
         "max_tokens": max_tokens,
@@ -153,6 +195,8 @@ def _chat_message_metadata(
         "temperature": temperature,
         "thinking_enabled": thinking_enabled,
     }
+    if task_plan is not None:
+        metadata["task_kernel"] = task_plan.payload()
     if attachments:
         metadata["attachments"] = attachments
     return metadata
@@ -292,6 +336,13 @@ class AgentRuntime:
                 self._attached_file_hits(attachments),
                 context.file_hits,
             )
+        task_plan = self._plan_task(
+            context_message,
+            context,
+            mode=mode,
+            attachments=attachments,
+        )
+        context.task_plan = task_plan
         events: list[ChatEvent] = [
             ChatEvent(
                 type="thought",
@@ -300,6 +351,8 @@ class AgentRuntime:
                 payload={"profile": self.settings.profile.name},
             )
         ]
+        await self._emit(events[-1])
+        events.append(self._task_kernel_event(task_plan, context.conversation_id))
         await self._emit(events[-1])
 
         self.storage.add_message(
@@ -312,6 +365,7 @@ class AgentRuntime:
                 temperature=temperature,
                 attachments=attachments,
                 thinking_enabled=thinking_enabled,
+                task_plan=task_plan,
             ),
         )
         await self._compact_conversation_memory(context.conversation_id)
@@ -343,7 +397,7 @@ class AgentRuntime:
             )
 
         forced_mission = mode == "mission"
-        if forced_mission or (mode == "auto" and self._looks_like_mission(message)):
+        if forced_mission or task_plan.route == "mission":
             mission = self.create_mission(message)
             answer = self._mission_answer(mission)
             events.append(
@@ -397,11 +451,19 @@ class AgentRuntime:
         )
         if result.ok and result.content:
             answer = _clean_assistant_answer(result.content)
+            finish_reason = _finish_reason_from_llm_result(result)
+            if finish_reason == "length":
+                effective_max_tokens = max_tokens or self.settings.llm_max_tokens
+                answer = (
+                    f"{answer}\n\n"
+                    f"[ответ остановлен по лимиту {effective_max_tokens} токенов; "
+                    "увеличь лимит токенов или попроси продолжить]"
+                )
             events.append(
                 ChatEvent(
                     type="assistant_done",
                     title="Ответ получен",
-                    payload={"source": "llm"},
+                    payload={"source": "llm", "finish_reason": finish_reason},
                 )
             )
         else:
@@ -452,6 +514,13 @@ class AgentRuntime:
                 self._attached_file_hits(attachments),
                 context.file_hits,
             )
+        task_plan = self._plan_task(
+            context_message,
+            context,
+            mode=mode,
+            attachments=attachments,
+        )
+        context.task_plan = task_plan
         events: list[ChatEvent] = [
             ChatEvent(
                 type="thought",
@@ -462,6 +531,9 @@ class AgentRuntime:
         ]
         await self._emit(events[-1])
         yield {"type": "meta", "conversation_id": context.conversation_id}
+        yield {"type": "event", "event": events[-1].model_dump()}
+        events.append(self._task_kernel_event(task_plan, context.conversation_id))
+        await self._emit(events[-1])
         yield {"type": "event", "event": events[-1].model_dump()}
 
         self.storage.add_message(
@@ -474,6 +546,7 @@ class AgentRuntime:
                 temperature=temperature,
                 attachments=attachments,
                 thinking_enabled=thinking_enabled,
+                task_plan=task_plan,
             ),
         )
         await self._compact_conversation_memory(context.conversation_id)
@@ -510,7 +583,7 @@ class AgentRuntime:
             return
 
         forced_mission = mode == "mission"
-        if forced_mission or (mode == "auto" and self._looks_like_mission(message)):
+        if forced_mission or task_plan.route == "mission":
             mission = self.create_mission(message)
             answer = self._mission_answer(mission)
             events.append(
@@ -736,6 +809,7 @@ class AgentRuntime:
         message: str,
         context: AgentContext | None = None,
     ) -> DirectAction | None:
+        task_plan = context.task_plan if context is not None else None
         history_text = ""
         if context is not None:
             history_text = "\n".join(
@@ -882,7 +956,11 @@ class AgentRuntime:
                 ],
             )
 
-        research_query = _web_research_query_from_message(message)
+        research_query = (
+            task_plan.query
+            if task_plan is not None and task_plan.route == "web_research" and task_plan.query
+            else _web_research_query_from_message(message)
+        )
         if research_query is not None:
             intent = await self._semantic_intent_decision(
                 message,
@@ -1250,6 +1328,198 @@ class AgentRuntime:
             )
         return DirectAction(answer=f"{answer}\n\n{result.summary}", events=[event])
 
+    def _plan_task(
+        self,
+        message: str,
+        context: AgentContext,
+        *,
+        mode: str,
+        attachments: list[dict[str, Any]],
+    ) -> TaskKernelPlan:
+        normalized = message.lower()
+        task_mode = _task_mode_from_message(
+            normalized,
+            requested_mode=mode,
+            preferences=self.storage.get_runtime_value("experience.preferences", {}),
+        )
+
+        if mode == "mission" or (mode == "auto" and self._looks_like_mission(message)):
+            return TaskKernelPlan(
+                route="mission",
+                mode=task_mode,
+                intent="multi_step_project",
+                confidence=0.9,
+                tools=("mission.create",),
+                completion_criteria=(
+                    "create an executable mission plan",
+                    "persist the plan in local runtime storage",
+                    "return the next runnable step",
+                ),
+                rationale="Explicit mission mode or a large implementation goal.",
+            )
+
+        history_text = "\n".join(
+            item["content"]
+            for item in self.storage.recent_messages(context.conversation_id, limit=8)
+            if item["role"] == "user"
+        )
+        active_console = self._active_console_target(context.conversation_id)
+        native_action = _native_action_from_message(
+            message,
+            self.settings,
+            history_text,
+            active_console,
+        )
+        if native_action is not None:
+            return TaskKernelPlan(
+                route="local_action",
+                mode=task_mode,
+                intent=f"native:{native_action.action}",
+                confidence=0.92,
+                tools=("windows.native",),
+                completion_criteria=(
+                    "execute the requested local/native action",
+                    "record the tool result",
+                    "return only the operational outcome",
+                ),
+                rationale="The request maps to a supported Windows/native action.",
+            )
+
+        host_command = _host_command_from_message(message)
+        if host_command is not None:
+            return TaskKernelPlan(
+                route="local_action",
+                mode=task_mode,
+                intent="host_command",
+                confidence=0.88,
+                query=host_command,
+                tools=("host.bridge.execute",),
+                completion_criteria=(
+                    "run the recognized host command",
+                    "preserve stdout/stderr in the tool log",
+                    "report success or failure without inventing output",
+                ),
+                rationale="The request contains an explicit command for the local console.",
+            )
+
+        if _looks_like_weather_query(normalized):
+            location = _weather_location_from_message(message)
+            query = _web_research_query_from_message(
+                message,
+                weather_location=location,
+            )
+            return TaskKernelPlan(
+                route="web_research",
+                mode=task_mode,
+                intent="weather_forecast",
+                confidence=0.9,
+                query=query,
+                tools=("web.fetch", "web.search") if not query else ("web.search", "web.fetch"),
+                completion_criteria=(
+                    "resolve the forecast date",
+                    "infer or ask for a city when it is missing",
+                    "use weather sources instead of generic search snippets",
+                ),
+                rationale="Weather depends on current external data and location.",
+            )
+
+        research_query = _web_research_query_from_message(message)
+        if research_query is not None:
+            return TaskKernelPlan(
+                route="web_research",
+                mode=task_mode,
+                intent=_research_intent_from_message(normalized),
+                confidence=0.82,
+                query=research_query,
+                tools=("web.search", "web.fetch"),
+                completion_criteria=(
+                    "search current public sources",
+                    "fetch the best available results",
+                    "separate confirmed facts from uncertainty",
+                ),
+                rationale="The request needs current, verifiable, or source-backed data.",
+            )
+
+        url = _browser_url_from_message(message)
+        if url is not None:
+            return TaskKernelPlan(
+                route="local_action",
+                mode=task_mode,
+                intent="browser.open",
+                confidence=0.86,
+                query=url,
+                tools=("browser.open",),
+                completion_criteria=("open the requested URL", "report the tool outcome"),
+                rationale="The request targets a concrete browser URL.",
+            )
+
+        if attachments:
+            return TaskKernelPlan(
+                route="reasoning",
+                mode=task_mode,
+                intent="attached_file_context",
+                confidence=0.78,
+                tools=("file_context",),
+                completion_criteria=(
+                    "use indexed attachment context when relevant",
+                    "ask for missing file content only if indexing is insufficient",
+                ),
+                rationale="The turn includes uploaded file context.",
+            )
+
+        if _looks_like_reasoning_scenario(normalized) or _looks_like_self_contained_reasoning(
+            normalized
+        ):
+            return TaskKernelPlan(
+                route="reasoning",
+                mode=task_mode,
+                intent="logic_or_hypothetical",
+                confidence=0.86,
+                completion_criteria=(
+                    "reason from the facts supplied by the operator",
+                    "avoid web/search follow-up false positives",
+                    "produce a complete final answer",
+                ),
+                rationale="The prompt is a self-contained reasoning scenario.",
+            )
+
+        if _looks_like_local_query(normalized):
+            return TaskKernelPlan(
+                route="reasoning",
+                mode=task_mode,
+                intent="local_admin_advice",
+                confidence=0.66,
+                tools=("runtime_context",),
+                completion_criteria=(
+                    "use known local runtime context",
+                    "suggest concrete checks or safe commands",
+                    "do not claim a command was run unless a tool ran",
+                ),
+                rationale="The request is about the local machine or Jarvis environment.",
+            )
+
+        return TaskKernelPlan(
+            route="chat",
+            mode=task_mode,
+            intent="general_chat",
+            confidence=0.58,
+            completion_criteria=("answer directly", "keep the operator preference in mind"),
+            rationale="No tool or specialized route is required.",
+        )
+
+    def _task_kernel_event(self, plan: TaskKernelPlan, conversation_id: str) -> ChatEvent:
+        return ChatEvent(
+            type="task_kernel",
+            title="Task kernel",
+            content=plan.summary(),
+            payload={
+                **plan.payload(),
+                "profile": self.settings.profile.name,
+                "model": self.settings.llm_model,
+                "conversation_id": conversation_id,
+            },
+        )
+
     def _prepare_context(self, message: str, conversation_id: str | None) -> AgentContext:
         if conversation_id is None:
             conversation_id = self.storage.create_conversation(self._title_from_goal(message))
@@ -1334,9 +1604,14 @@ class AgentRuntime:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "system", "content": _runtime_date_context()},
         ]
+        if context.task_plan is not None:
+            messages.append({"role": "system", "content": _task_kernel_prompt(context.task_plan)})
         operator_prompt = self._operator_prompt()
         if operator_prompt:
             messages.append({"role": "system", "content": operator_prompt})
+        operator_profile = self._operator_profile_context()
+        if operator_profile:
+            messages.append({"role": "system", "content": operator_profile})
         if not thinking_enabled:
             messages.append({"role": "system", "content": THINKING_DISABLED_PROMPT})
         if memory_block:
@@ -1354,7 +1629,9 @@ class AgentRuntime:
         message: str,
         context: AgentContext,
     ) -> list[ChatEvent]:
-        candidates = _explicit_memory_candidates(message)
+        candidates = _dedupe_memory_candidates(
+            [*_explicit_memory_candidates(message), *_implicit_operator_memory_candidates(message)]
+        )
         if not candidates:
             return []
         saved: list[dict[str, Any]] = []
@@ -1498,6 +1775,40 @@ class AgentRuntime:
             ]
         )
 
+    def _operator_profile_context(self) -> str:
+        preferences = self.storage.get_runtime_value("experience.preferences", {})
+        if not isinstance(preferences, dict):
+            preferences = {}
+        lines = [
+            "Typed operator/environment memory:",
+            f"- jarvis_home: {self.settings.home}",
+            f"- active_profile: {self.settings.profile.name}",
+            f"- model_root: {self.settings.model_root}",
+            f"- llm_endpoint: {self.settings.llm_base_url}",
+        ]
+        working_roots = preferences.get("working_roots")
+        if isinstance(working_roots, list) and working_roots:
+            roots = [str(item) for item in working_roots[:6] if str(item).strip()]
+            if roots:
+                lines.append(f"- working_roots: {', '.join(roots)}")
+        default_city = _normalize_search_query(os.environ.get("JARVIS_DEFAULT_CITY", ""))
+        if default_city:
+            lines.append(f"- default_weather_city: {default_city}")
+        cached_weather = self.storage.get_runtime_value("weather.inferred_location", {})
+        if isinstance(cached_weather, dict) and cached_weather.get("location"):
+            lines.append(f"- cached_weather_location: {cached_weather['location']}")
+
+        profile_items: list[str] = []
+        for namespace in ("profile", "preferences", "instructions", "environment"):
+            for item in self.storage.search_memory(None, limit=3, namespaces=[namespace]):
+                content = " ".join(str(item.get("content") or "").split())
+                if content:
+                    profile_items.append(f"- {namespace}: {_short_value(content, 240)}")
+        if profile_items:
+            lines.append("Durable typed notes:")
+            lines.extend(profile_items[:10])
+        return "\n".join(lines)
+
     def _active_console_target(self, conversation_id: str) -> dict[str, Any] | None:
         value = self.storage.get_runtime_value(_console_target_key(conversation_id), None)
         return value if isinstance(value, dict) else None
@@ -1516,7 +1827,9 @@ class AgentRuntime:
     @staticmethod
     def _looks_like_mission(message: str) -> bool:
         normalized = message.lower()
-        if _looks_like_reasoning_scenario(normalized):
+        if _looks_like_reasoning_scenario(normalized) or _looks_like_self_contained_reasoning(
+            normalized
+        ):
             return False
         if "mission plan" in normalized:
             return True
@@ -1716,6 +2029,111 @@ def _explicit_memory_candidates(message: str) -> list[dict[str, Any]]:
     return candidates
 
 
+def _implicit_operator_memory_candidates(message: str) -> list[dict[str, Any]]:
+    cleaned = " ".join(message.split()).strip()
+    if len(cleaned) < 6 or len(cleaned) > 2000:
+        return []
+    normalized = cleaned.casefold()
+    candidates: list[dict[str, Any]] = []
+
+    if (
+        _contains_any(normalized, ("push", "пуш", "запуш"))
+        and "main" in normalized
+        and _contains_any(normalized, ("local", "локаль", "работ", "изменени"))
+    ):
+        candidates.append(
+            {
+                "content": (
+                    "Operator instruction: when Jarvis changes the local project, "
+                    "run verification and push the result to main."
+                ),
+                "namespace": "instructions",
+                "tags": ["operator", "git", "workflow"],
+                "importance": 0.92,
+            }
+        )
+
+    if _contains_any(
+        normalized,
+        (
+            "quiet mode",
+            "silent mode",
+            "режим тишины",
+            "не шуми",
+            "молча",
+            "докладывайся только",
+            "по завершению",
+        ),
+    ):
+        candidates.append(
+            {
+                "content": (
+                    "Operator preference: keep progress chatter minimal; report mainly "
+                    "when a task is complete or blocked."
+                ),
+                "namespace": "preferences",
+                "tags": ["operator", "communication"],
+                "importance": 0.86,
+            }
+        )
+
+    paths = _stable_windows_paths(cleaned)
+    if paths and _contains_any(
+        normalized,
+        (
+            "path",
+            "folder",
+            "workspace",
+            "work",
+            "local",
+            "рабоч",
+            "локаль",
+            "папк",
+            "путь",
+            "лежит",
+            "проект",
+        ),
+    ):
+        candidates.append(
+            {
+                "content": f"Operator environment/path note: {', '.join(paths[:6])}",
+                "namespace": "environment",
+                "tags": ["operator", "path"],
+                "importance": 0.84,
+            }
+        )
+    return candidates
+
+
+def _dedupe_memory_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for candidate in candidates:
+        namespace = str(candidate.get("namespace") or "core")
+        content = _normalize_search_query(str(candidate.get("content") or ""))
+        key = (namespace, content.casefold())
+        if not content or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(candidate)
+    return deduped
+
+
+def _stable_windows_paths(text: str) -> list[str]:
+    paths: list[str] = []
+    seen: set[str] = set()
+    for match in re.findall(r"(?i)\b[a-z]:[\\/][^\s,;\"'<>|]+", text):
+        path = match.rstrip(".")
+        key = path.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        paths.append(path[:260])
+        if len(paths) >= 8:
+            break
+    return paths
+
+
 def _memory_content_from_match(message: str, value: str, namespace: str) -> str:
     value = value.strip(" .,:;\"'«»")
     if len(value) < 3:
@@ -1818,6 +2236,20 @@ def _clean_assistant_answer(text: str) -> str:
         text,
     )
     return cleaned.lstrip()
+
+
+def _finish_reason_from_llm_result(result: Any) -> str | None:
+    raw = getattr(result, "raw", None)
+    if not isinstance(raw, dict):
+        return None
+    choices = raw.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+    first = choices[0]
+    if not isinstance(first, dict):
+        return None
+    finish_reason = first.get("finish_reason")
+    return str(finish_reason) if finish_reason else None
 
 
 def _native_result_excerpt(result: ToolRunResponse) -> str:
@@ -1925,6 +2357,130 @@ def _runtime_date_context() -> str:
             "use web tools first.",
         ]
     )
+
+
+def _task_kernel_prompt(plan: TaskKernelPlan) -> str:
+    lines = [
+        "Task kernel decision:",
+        f"- route: {plan.route}",
+        f"- intent: {plan.intent}",
+        f"- mode: {plan.mode}",
+        f"- confidence: {plan.confidence:.2f}",
+    ]
+    if plan.query:
+        lines.append(f"- normalized_query_or_command: {plan.query}")
+    if plan.tools:
+        lines.append(f"- expected_tools: {', '.join(plan.tools)}")
+    if plan.completion_criteria:
+        lines.append("- completion_criteria:")
+        lines.extend(f"  - {item}" for item in plan.completion_criteria[:6])
+    if plan.needs_clarification and plan.clarification:
+        lines.append(f"- clarification_required: {plan.clarification}")
+    if plan.rationale:
+        lines.append(f"- rationale: {plan.rationale}")
+    lines.append(
+        "Use this routing decision as an execution contract. If the answer is incomplete, "
+        "say so explicitly instead of ending mid-step."
+    )
+    return "\n".join(lines)
+
+
+def _task_mode_from_message(
+    normalized: str,
+    *,
+    requested_mode: str,
+    preferences: Any,
+) -> str:
+    if requested_mode == "mission":
+        return "mission"
+    if _contains_any(
+        normalized,
+        (
+            "тихий режим",
+            "в режиме тишины",
+            "не шуми",
+            "молча",
+            "только по завершению",
+            "докладывайся только",
+        ),
+    ):
+        return "quiet"
+    if _contains_any(
+        normalized,
+        (
+            "код",
+            "репозитор",
+            "тест",
+            "pytest",
+            "npm",
+            "typecheck",
+            "commit",
+            "push",
+            "main",
+            "pr",
+        ),
+    ):
+        return "code"
+    if _contains_any(
+        normalized,
+        (
+            "админ",
+            "docker",
+            "gpu",
+            "vram",
+            "windows",
+            "powershell",
+            "служб",
+            "процесс",
+            "лог",
+            "диагност",
+        ),
+    ):
+        return "admin"
+    if _contains_any(
+        normalized,
+        (
+            "найди",
+            "поищи",
+            "загугли",
+            "исслед",
+            "источник",
+            "сравни",
+        ),
+    ):
+        return "research"
+    if isinstance(preferences, dict):
+        style = str(preferences.get("communication_style") or "").strip().lower()
+        if style == "concise":
+            return "concise"
+    return "chat"
+
+
+def _research_intent_from_message(normalized: str) -> str:
+    if _looks_like_shopping_query(normalized):
+        return "shopping_research"
+    if _looks_like_travel_query(normalized):
+        return "travel_research"
+    if _looks_like_place_lookup_query(normalized):
+        return "place_lookup"
+    if _looks_like_osint_query(normalized):
+        return "public_osint"
+    if _looks_like_technical_freshness_query(
+        normalized,
+        (
+            "latest",
+            "release",
+            "api",
+            "sdk",
+            "docker",
+            "cuda",
+            "vllm",
+            "python",
+            "node",
+        ),
+    ):
+        return "technical_freshness"
+    return "web_research"
 
 
 def _should_use_semantic_router(message: str, heuristic_route: str) -> bool:
@@ -2191,7 +2747,9 @@ def _web_research_query_from_message(
         "публичн",
         "osint",
     )
-    if _looks_like_reasoning_scenario(normalized):
+    if _looks_like_reasoning_scenario(normalized) or _looks_like_self_contained_reasoning(
+        normalized
+    ):
         return None
     if explicit_open and not (
         _contains_any(normalized, search_verbs)
@@ -2319,6 +2877,67 @@ def _looks_like_reasoning_scenario(normalized: str) -> bool:
     if scenario_score and reasoning_score:
         return True
     return fictional_score >= 2 and (scenario_score or reasoning_score)
+
+
+def _looks_like_self_contained_reasoning(normalized: str) -> bool:
+    explicit_web_intent = _contains_any(
+        normalized,
+        (
+            "загугли",
+            "погугли",
+            "в интернете",
+            "в сети",
+            "сайт",
+            "ссылка",
+            "источник",
+            "актуальные источники",
+            "реальная цена",
+            "реальное наличие",
+        ),
+    )
+    if explicit_web_intent:
+        return False
+    scenario_score = sum(
+        1
+        for marker in (
+            "представь",
+            "гипотет",
+            "сценар",
+            "дилемм",
+            "мысленный эксперимент",
+            "аномальн",
+            "текущая ситуация",
+            "твоя задача",
+            "ты находишься",
+            "если ",
+            "roleplay",
+        )
+        if marker in normalized
+    )
+    reasoning_score = sum(
+        1
+        for marker in (
+            "обоснуй",
+            "логич",
+            "решение",
+            "распиши",
+            "пошаг",
+            "таймлайн",
+            "что конкретно",
+            "в какую секунду",
+            "найди ошибку",
+            "приоритет",
+            "как поступить",
+            "logic",
+            "reason",
+            "decision",
+            "timeline",
+            "step by step",
+            "what should",
+        )
+        if marker in normalized
+    )
+    return scenario_score > 0 and reasoning_score > 0
 
 
 def _looks_like_local_query(normalized: str) -> bool:
@@ -3083,7 +3702,9 @@ def _shopping_followup_intent(
     has_previous_search: bool = False,
 ) -> dict[str, Any] | None:
     normalized = message.lower()
-    if _looks_like_reasoning_scenario(normalized):
+    if _looks_like_reasoning_scenario(normalized) or _looks_like_self_contained_reasoning(
+        normalized
+    ):
         return None
     criterion = _ranking_criterion_from_message(message)
     if criterion is None:

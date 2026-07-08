@@ -195,6 +195,39 @@ async def status() -> StatusResponse:
     )
 
 
+@app.get("/api/agent/trace/{conversation_id}")
+async def agent_trace(conversation_id: str) -> dict[str, Any]:
+    conversation = app.state.storage.get_conversation(conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    messages = app.state.storage.recent_messages(conversation_id, limit=40)
+    turns = []
+    for item in messages:
+        metadata = item.get("metadata") or {}
+        events = metadata.get("events") if isinstance(metadata, dict) else None
+        task_kernel = metadata.get("task_kernel") if isinstance(metadata, dict) else None
+        turns.append(
+            {
+                "role": item.get("role"),
+                "created_at": item.get("created_at"),
+                "task_kernel": task_kernel if isinstance(task_kernel, dict) else None,
+                "events": events if isinstance(events, list) else [],
+                "duration_ms": metadata.get("duration_ms") if isinstance(metadata, dict) else None,
+            }
+        )
+    recent_kernel_events = [
+        event
+        for event in app.state.storage.list_events(limit=60)
+        if event.get("kind") == "agent.task_kernel"
+        and (event.get("payload") or {}).get("conversation_id") in {None, conversation_id}
+    ]
+    return {
+        "conversation": conversation,
+        "turns": turns,
+        "recent_task_kernel_events": recent_kernel_events[:10],
+    }
+
+
 @app.get("/api/models", response_model=ModelCatalogResponse)
 async def models() -> ModelCatalogResponse:
     return app.state.model_hub.inventory()

@@ -1677,6 +1677,120 @@ def test_agent_keeps_anomalous_timeline_puzzle_in_reasoning_path(monkeypatch, tm
     storage.close()
 
 
+def test_task_kernel_records_reasoning_route_in_prompt_and_metadata(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    captured = {}
+
+    class FakeLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None):
+            captured["messages"] = messages
+            return type("Result", (), {"ok": True, "content": "logic answer", "error": None})()
+
+    agent = AgentRuntime(settings=settings, storage=storage, llm=FakeLLM(), bus=EventBus())
+
+    async def fake_run(name, arguments=None, **kwargs):
+        raise AssertionError(f"unexpected tool {name}")
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+
+    response = asyncio.run(
+        agent.chat(
+            "Roleplay a hypothetical scenario: reason logically and provide the decision."
+        )
+    )
+
+    user_message = next(
+        item for item in storage.recent_messages(response.conversation_id, limit=4)
+        if item["role"] == "user"
+    )
+    rendered_prompt = "\n".join(item["content"] for item in captured["messages"])
+
+    assert user_message["metadata"]["task_kernel"]["route"] == "reasoning"
+    assert user_message["metadata"]["task_kernel"]["intent"] == "logic_or_hypothetical"
+    assert any(event.type == "task_kernel" for event in response.events)
+    assert "Task kernel decision" in rendered_prompt
+    assert "route: reasoning" in rendered_prompt
+    storage.close()
+
+
+def test_operator_profile_context_includes_typed_memory_and_working_roots(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    storage.set_runtime_value(
+        "experience.preferences",
+        {
+            "operator_name": "Admin",
+            "communication_style": "concise",
+            "working_roots": [r"D:\jarvis", r"D:\jarvis-gpt"],
+        },
+    )
+    storage.add_memory(
+        content="Operator instruction: when work is local, push to main after tests.",
+        namespace="instructions",
+        tags=["operator", "git"],
+        importance=0.9,
+    )
+    captured = {}
+
+    class FakeLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None):
+            captured["messages"] = messages
+            return type("Result", (), {"ok": True, "content": "ok", "error": None})()
+
+    agent = AgentRuntime(settings=settings, storage=storage, llm=FakeLLM(), bus=EventBus())
+
+    response = asyncio.run(agent.chat("РєРѕСЂРѕС‚РєРѕ РїСЂРѕРІРµСЂСЊ Jarvis", mode="chat"))
+    rendered_prompt = "\n".join(item["content"] for item in captured["messages"])
+
+    assert response.answer == "ok"
+    assert "Typed operator/environment memory" in rendered_prompt
+    assert r"D:\jarvis-gpt" in rendered_prompt
+    assert "push to main" in rendered_prompt
+    storage.close()
+
+
+def test_agent_captures_implicit_operator_workflow_memory(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+
+    class FakeLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None):
+            return type("Result", (), {"ok": True, "content": "ok", "error": None})()
+
+    agent = AgentRuntime(settings=settings, storage=storage, llm=FakeLLM(), bus=EventBus())
+
+    response = asyncio.run(
+        agent.chat(
+            r"work locally in D:\jarvis-gpt, then push to main; quiet mode please",
+            mode="chat",
+        )
+    )
+
+    instructions = storage.search_memory("push to main", limit=5, namespaces=["instructions"])
+    preferences = storage.search_memory("progress chatter", limit=5, namespaces=["preferences"])
+    environment = storage.search_memory("D:\\jarvis-gpt", limit=5, namespaces=["environment"])
+
+    assert response.answer == "ok"
+    assert instructions
+    assert preferences
+    assert environment
+    assert any(event.type == "memory" for event in response.events)
+    storage.close()
+
+
 def test_agent_does_not_web_search_logic_error_request(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
@@ -2179,6 +2293,49 @@ def test_agent_context_includes_operator_preferences(monkeypatch, tmp_path):
     assert "operator_name: Alex" in rendered
     assert "communication_style: detailed" in rendered
     assert "quiet_hours: 23:00-08:00" in rendered
+    storage.close()
+
+
+def test_agent_marks_non_streamed_answer_stopped_by_token_limit(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "1")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+
+    class FakeLengthLLM:
+        async def complete(
+            self,
+            messages,
+            *,
+            temperature=None,
+            max_tokens=None,
+            thinking_enabled=True,
+        ):
+            return type(
+                "Result",
+                (),
+                {
+                    "ok": True,
+                    "content": "Partial answer",
+                    "error": None,
+                    "raw": {"choices": [{"finish_reason": "length"}]},
+                },
+            )()
+
+    agent = AgentRuntime(
+        settings=settings,
+        storage=storage,
+        llm=FakeLengthLLM(),
+        bus=EventBus(),
+    )
+
+    response = asyncio.run(agent.chat("hello", mode="chat", max_tokens=123))
+
+    assert "Partial answer" in response.answer
+    assert "123" in response.answer
+    assert response.events[-1].payload["finish_reason"] == "length"
     storage.close()
 
 

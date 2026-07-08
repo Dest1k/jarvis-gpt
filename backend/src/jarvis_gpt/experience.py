@@ -15,7 +15,7 @@ DEFAULT_PREFERENCES: dict[str, Any] = {
     "voice_reply": False,
     "preferred_profile": "gemma4-turbo",
     "quiet_hours": "",
-    "working_roots": [r"D:\jarvis"],
+    "working_roots": [r"D:\jarvis", r"D:\jarvis-gpt"],
 }
 
 DEFAULT_AUTONOMY_POLICY: dict[str, Any] = {
