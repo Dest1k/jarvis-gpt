@@ -63,6 +63,9 @@ Capability contract:
   Это относится не только к бытовым вопросам, но и к техническим, админским, разработческим,
   железным, финансовым, правовым и прочим меняющимся темам. Лучше показать источники
   и границы уверенности, чем красиво угадать.
+- Всегда держи в уме текущую дату из runtime context. Если тема могла измениться после
+  начала 2026 года или пользователь спрашивает про 2026+ / "сейчас" / свежую версию,
+  не опирайся только на встроенные знания модели: сначала проверь источники.
 - Не используй декоративные служебные префиксы и pseudo-tags вроде
   "$\\rightarrow$ **Важное уточнение:**".
   Пиши сразу человеческий ответ."""
@@ -700,7 +703,10 @@ class AgentRuntime:
             file_block = "Индексированные файлы, которые могут быть полезны:\n" + "\n".join(lines)
 
         recent = self.storage.recent_messages(context.conversation_id, limit=12)
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": _runtime_date_context()},
+        ]
         operator_prompt = self._operator_prompt()
         if operator_prompt:
             messages.append({"role": "system", "content": operator_prompt})
@@ -948,6 +954,21 @@ def _task_notes_from_result(result: ToolRunResponse) -> str:
     return f"Blocked by tool result: {result.summary}"
 
 
+def _runtime_date_context() -> str:
+    today = date.today()
+    return "\n".join(
+        [
+            "Runtime date context:",
+            f"- current_date: {today.isoformat()}",
+            "- user_timezone: Europe/Moscow",
+            "- practical_knowledge_horizon: treat model knowledge after early 2026 as uncertain.",
+            "- if the answer depends on current versions, prices, schedules, laws, releases, "
+            "hardware support, security status, news or anything after early 2026, "
+            "use web tools first.",
+        ]
+    )
+
+
 def _web_research_query_from_message(message: str) -> str | None:
     normalized = message.lower()
     explicit_open = _contains_any(
@@ -1090,6 +1111,7 @@ def _web_research_query_from_message(message: str) -> str | None:
     if explicit_open and not (
         _contains_any(normalized, search_verbs)
         or _contains_any(normalized, live_data_markers)
+        or _mentions_post_knowledge_horizon(normalized)
         or _looks_like_place_lookup_query(normalized)
         or _looks_like_osint_query(normalized)
     ):
@@ -1098,6 +1120,7 @@ def _web_research_query_from_message(message: str) -> str | None:
         _contains_any(normalized, explicit_web_markers)
         or _contains_any(normalized, live_data_markers)
         or _contains_any(normalized, uncertainty_markers)
+        or _mentions_post_knowledge_horizon(normalized)
         or _looks_like_technical_freshness_query(normalized, technical_freshness_markers)
         or _looks_like_shopping_query(normalized)
         or _looks_like_place_lookup_query(normalized)
@@ -1127,6 +1150,8 @@ def _web_research_query_from_message(message: str) -> str | None:
         query = _place_lookup_search_query(query, normalized)
     elif _looks_like_technical_freshness_query(normalized, technical_freshness_markers):
         query = f"{query} official docs latest"
+    elif _mentions_post_knowledge_horizon(normalized):
+        query = f"{query} актуальные источники 2026"
     elif _contains_any(normalized, uncertainty_markers):
         query = f"{query} актуальные источники обзор сравнение"
     if _looks_like_osint_query(normalized) and not _looks_like_shopping_query(normalized):
@@ -1168,9 +1193,64 @@ def _looks_like_technical_freshness_query(
     normalized: str,
     technical_freshness_markers: tuple[str, ...],
 ) -> bool:
-    if _looks_like_local_query(normalized):
+    if _looks_like_local_runtime_query(normalized):
         return False
     return _contains_any(normalized, technical_freshness_markers)
+
+
+def _looks_like_local_runtime_query(normalized: str) -> bool:
+    if re.search(r"\bлог(?:и|ов|ами|ах)?\b", normalized):
+        return True
+    return _contains_any(
+        normalized,
+        (
+            "контейнер",
+            "процесс",
+            "служб",
+            "файл",
+            "папк",
+            "директор",
+            "диск",
+            "консол",
+            "терминал",
+            "powershell",
+            "cmd",
+            "wmi",
+            "winapi",
+            "gpu",
+            "vram",
+            "jarvis",
+            "репозит",
+            "проект",
+            "у меня",
+            "на моей",
+            "на моём",
+            "локальн",
+        ),
+    )
+
+
+def _mentions_post_knowledge_horizon(normalized: str) -> bool:
+    if _looks_like_local_runtime_query(normalized):
+        return False
+    if _contains_any(
+        normalized,
+        (
+            "в этом году",
+            "в текущем году",
+            "на текущий момент",
+            "по состоянию на",
+            "после 2026",
+            "с 2026",
+            "с начала 2026",
+            "новое сейчас",
+            "новые сейчас",
+            "свежие данные",
+        ),
+    ):
+        return True
+    years = [int(match) for match in re.findall(r"\b20\d{2}\b", normalized)]
+    return any(year >= 2026 for year in years)
 
 
 def _looks_like_osint_query(normalized: str) -> bool:

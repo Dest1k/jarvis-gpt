@@ -140,6 +140,33 @@ def test_agent_streams_chat_response(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_agent_includes_runtime_date_context(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    captured = {}
+
+    class CapturingLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None):
+            captured["messages"] = messages
+            return type("Result", (), {"ok": True, "content": "готово", "error": None})()
+
+    agent = AgentRuntime(settings=settings, storage=storage, llm=CapturingLLM(), bus=EventBus())
+
+    response = asyncio.run(agent.chat("коротко представься", mode="chat"))
+
+    system_messages = [item["content"] for item in captured["messages"] if item["role"] == "system"]
+    date_context = "\n".join(system_messages)
+    assert response.answer == "готово"
+    assert "Runtime date context" in date_context
+    assert "current_date:" in date_context
+    assert "early 2026" in date_context
+    storage.close()
+
+
 def test_agent_opens_wiki_without_false_refusal(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
@@ -1313,6 +1340,48 @@ def test_agent_researches_technical_freshness_question(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_agent_researches_post_2026_question(monkeypatch, tmp_path):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    captured = {}
+
+    async def fake_run(name, arguments=None, **kwargs):
+        if name == "web.search":
+            captured["query"] = arguments["query"]
+            return _tool_response(
+                name,
+                True,
+                "Web search returned 1 result(s).",
+                {
+                    "results": [
+                        {
+                            "title": "Изменения 2026",
+                            "url": "https://example.com/changes-2026",
+                            "snippet": "актуальная сводка изменений за 2026 год",
+                        }
+                    ]
+                },
+            )
+        if name == "web.fetch":
+            return _tool_response(
+                name,
+                True,
+                "Fetched URL with HTTP 200.",
+                {
+                    "url": arguments["url"],
+                    "text": "актуальная сводка изменений за 2026 год",
+                },
+            )
+        raise AssertionError(f"unexpected tool {name}")
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+
+    response = asyncio.run(agent.chat("что поменялось в налогах в 2026 году"))
+
+    assert "актуальные источники 2026" in captured["query"]
+    assert "https://example.com/changes-2026" in response.answer
+    storage.close()
+
+
 def test_agent_does_not_web_search_local_docker_request(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
@@ -1333,6 +1402,31 @@ def test_agent_does_not_web_search_local_docker_request(monkeypatch, tmp_path):
     monkeypatch.setattr(agent.tools, "run", fake_run)
 
     response = asyncio.run(agent.chat("проверь логи docker jarvis"))
+
+    assert response.answer == "локальный ответ"
+    storage.close()
+
+
+def test_agent_keeps_post_2026_local_logs_local(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+
+    class FakeLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None):
+            return type("Result", (), {"ok": True, "content": "локальный ответ", "error": None})()
+
+    agent = AgentRuntime(settings=settings, storage=storage, llm=FakeLLM(), bus=EventBus())
+
+    async def fake_run(name, arguments=None, **kwargs):
+        raise AssertionError(f"unexpected tool {name}")
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+
+    response = asyncio.run(agent.chat("проверь логи docker за 2026 год"))
 
     assert response.answer == "локальный ответ"
     storage.close()
