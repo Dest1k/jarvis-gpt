@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import mimetypes
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -70,6 +71,53 @@ class FileIngestor:
             stored = self._store_stream(path.name, stream)
         return self._index_stored_file(stored, source_path=path)
 
+    def ingest_directory(self, root_path: str | Path, *, max_files: int = 50) -> dict[str, Any]:
+        root = _resolve_allowed_ingest_root(self.settings, root_path)
+        if not root.exists() or not root.is_dir():
+            raise FileNotFoundError(f"Directory does not exist: {root}")
+        max_files = max(1, min(500, int(max_files)))
+        results: list[dict[str, Any]] = []
+        errors: list[dict[str, str]] = []
+        files_seen = 0
+        for dirpath, dirnames, filenames in os.walk(root):
+            current = Path(dirpath)
+            dirnames[:] = [
+                name
+                for name in dirnames
+                if not _should_skip_directory(self.settings, current / name)
+            ]
+            for filename in sorted(filenames, key=str.lower):
+                if len(results) >= max_files:
+                    break
+                path = current / filename
+                if not _looks_indexable_path(path):
+                    continue
+                files_seen += 1
+                try:
+                    results.append(self.ingest_path(path))
+                except Exception as exc:  # noqa: BLE001
+                    errors.append({"path": str(path), "error": str(exc)})
+            if len(results) >= max_files:
+                break
+        self.storage.add_event(
+            kind="file.ingest_directory",
+            title=f"Directory ingested: {root}",
+            payload={
+                "root": str(root),
+                "files_seen": files_seen,
+                "files_indexed": len(results),
+                "files_failed": len(errors),
+            },
+        )
+        return {
+            "root": str(root),
+            "files_seen": files_seen,
+            "files_indexed": len(results),
+            "files_failed": len(errors),
+            "results": results,
+            "errors": errors,
+        }
+
     def ingest_upload(self, filename: str, stream: BinaryIO) -> dict[str, Any]:
         stored = self._store_stream(filename, stream)
         return self._index_stored_file(stored, source_path=None)
@@ -116,6 +164,23 @@ class FileIngestor:
         *,
         source_path: Path | None,
     ) -> dict[str, Any]:
+        existing = self.storage.get_file_by_sha256(stored.sha256)
+        if existing is not None:
+            if Path(existing["stored_path"]).resolve(strict=False) != stored.path.resolve(
+                strict=False
+            ):
+                stored.path.unlink(missing_ok=True)
+            self.storage.add_event(
+                kind="file.ingest.deduplicated",
+                title=f"File already indexed: {existing['name']}",
+                payload={"file_id": existing["id"], "sha256": stored.sha256},
+            )
+            return {
+                "file": existing,
+                "chunks_indexed": int(existing.get("chunk_count") or 0),
+                "deduplicated": True,
+            }
+
         chunks: list[str] = []
         status = "stored"
         error: str | None = None
@@ -178,6 +243,49 @@ def _is_text_file(stored: StoredFile) -> bool:
         or stored.mime_type.startswith("text/")
         or stored.mime_type in TEXT_MIME_TYPES
     )
+
+
+def _looks_indexable_path(path: Path) -> bool:
+    suffix = path.suffix.lower()
+    if suffix in TEXT_EXTENSIONS or suffix in EXTENSION_MIME_TYPES:
+        return True
+    mime_type = mimetypes.guess_type(path.name)[0] or ""
+    return mime_type.startswith("text/") or mime_type in TEXT_MIME_TYPES
+
+
+def _resolve_allowed_ingest_root(settings: JarvisSettings, raw_path: str | Path) -> Path:
+    candidate = Path(raw_path).expanduser()
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+    candidate = candidate.resolve(strict=False)
+    roots = [Path.cwd().resolve(strict=False), settings.home.resolve(strict=False)]
+    for root in roots:
+        try:
+            candidate.relative_to(root)
+            return candidate
+        except ValueError:
+            continue
+    roots_text = ", ".join(str(root) for root in roots)
+    raise ValueError(f"Directory is outside allowed roots: {roots_text}")
+
+
+def _should_skip_directory(settings: JarvisSettings, path: Path) -> bool:
+    candidate = path.resolve(strict=False)
+    skip_roots = [
+        settings.cache_dir,
+        settings.log_dir,
+        settings.model_root,
+        settings.docker_dir,
+        settings.state_dir,
+        settings.data_dir / "files",
+    ]
+    for root in skip_roots:
+        try:
+            candidate.relative_to(root.resolve(strict=False))
+            return True
+        except ValueError:
+            continue
+    return path.name in {".git", ".next", "node_modules", "__pycache__", ".pytest_cache"}
 
 
 def _chunk_text(

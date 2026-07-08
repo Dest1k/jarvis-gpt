@@ -497,7 +497,9 @@ h3 {
 .fileSearchForm button,
 .hostCommandForm button,
 .webFetchForm button,
-.preferencesForm button {
+.preferencesForm button,
+.directoryForm button,
+.jobRow button {
   display: grid;
   place-items: center;
   width: 28px;
@@ -515,7 +517,9 @@ h3 {
 .fileSearchForm button:hover,
 .hostCommandForm button:hover,
 .webFetchForm button:hover,
-.preferencesForm button:hover {
+.preferencesForm button:hover,
+.directoryForm button:hover,
+.jobRow button:hover {
   border-color: var(--teal);
   color: var(--teal);
 }
@@ -630,7 +634,10 @@ h3 {
 .briefingPanel,
 .selfHealPanel,
 .policyPanel,
-.benchmarkPanel {
+.benchmarkPanel,
+.jobsPanel,
+.routinePanel,
+.dockerPanel {
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -790,6 +797,122 @@ h3 {
 .benchmarkReport {
   display: grid;
   gap: 8px;
+}
+
+.quickActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.jobRow,
+.dockerRow {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto 32px;
+  gap: 8px;
+  align-items: center;
+  min-height: 34px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.dockerRow {
+  grid-template-columns: 18px minmax(0, 1fr) auto minmax(64px, 0.8fr);
+}
+
+.jobRow svg,
+.dockerRow svg {
+  color: var(--graphite);
+}
+
+.jobRow.done svg,
+.dockerRow.allowed svg {
+  color: var(--teal);
+}
+
+.jobRow strong,
+.dockerRow strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.jobRow span,
+.dockerRow span {
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: var(--surface-2);
+}
+
+.dockerRow small {
+  min-width: 0;
+  overflow: hidden;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.routineRow {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  min-height: 34px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 0 9px;
+  background: #ffffff;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: left;
+}
+
+.routineRow:hover {
+  border-color: var(--teal);
+  color: var(--teal);
+}
+
+.routineRow strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.routineResult,
+.directoryResult {
+  display: grid;
+  gap: 5px;
+  border: 1px solid rgba(13, 118, 111, 0.32);
+  border-radius: var(--radius);
+  padding: 10px;
+  background: #ffffff;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.routineResult.warn {
+  border-color: rgba(183, 121, 31, 0.45);
+}
+
+.routineResult strong,
+.directoryResult strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.routineResult p {
+  display: -webkit-box;
+  overflow: hidden;
+  line-height: 1.45;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
 }
 
 .toolList,
@@ -1028,7 +1151,8 @@ h3 {
 .fileForm,
 .fileSearchForm,
 .hostCommandForm,
-.webFetchForm {
+.webFetchForm,
+.directoryForm {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 32px;
   gap: 8px;
@@ -1046,6 +1170,10 @@ h3 {
   padding-top: 8px;
 }
 
+.directoryForm {
+  padding-top: 8px;
+}
+
 .hostCommandForm {
   padding: 0;
 }
@@ -1055,6 +1183,7 @@ h3 {
 .fileSearchForm input,
 .hostCommandForm input,
 .webFetchForm input,
+.directoryForm input,
 .preferencesForm input,
 .preferencesForm select {
   min-width: 0;
@@ -1072,6 +1201,7 @@ h3 {
 .fileSearchForm input:focus,
 .hostCommandForm input:focus,
 .webFetchForm input:focus,
+.directoryForm input:focus,
 .preferencesForm input:focus,
 .preferencesForm select:focus {
   border-color: var(--teal);

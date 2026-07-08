@@ -35,17 +35,28 @@ from .models import (
     ApprovalItem,
     ApprovalUpdateRequest,
     AuditEntry,
+    AutonomyJobCreateRequest,
+    AutonomyJobResponse,
+    AutonomyJobRunResponse,
+    AutonomyJobUpdateRequest,
     AutonomyPolicyResponse,
     AutonomyPolicyUpdateRequest,
     AutonomyStatusResponse,
     BenchmarkResponse,
+    BrowserPolicyResponse,
+    BrowserPolicyUpdateRequest,
     ChatRequest,
     ChatResponse,
     ConversationItem,
     DailyBriefingResponse,
     DiagnosticsResponse,
+    DirectoryIngestRequest,
+    DirectoryIngestResponse,
     DispatcherActionResponse,
     DispatcherStatusResponse,
+    DockerContainersResponse,
+    DockerPolicyResponse,
+    DockerPolicyUpdateRequest,
     FileChunkHit,
     FileIngestResponse,
     FileItem,
@@ -60,6 +71,8 @@ from .models import (
     MissionTask,
     MissionTaskUpdateRequest,
     ModelCatalogResponse,
+    RoutineResponse,
+    RoutineRunResponse,
     RuntimePreferencesResponse,
     RuntimePreferencesUpdateRequest,
     SelfHealResponse,
@@ -69,6 +82,7 @@ from .models import (
     ToolRunRequest,
     ToolRunResponse,
 )
+from .operations import OperationsManager
 from .storage import JarvisStorage
 from .supervisor import RuntimeSupervisor
 from .telemetry import TelemetryCollector
@@ -90,6 +104,7 @@ async def lifespan(app: FastAPI):
     learning = LearningEngine(storage)
     host_bridge = HostBridgeStatus(settings)
     experience = ExperienceManager(settings=settings, storage=storage)
+    operations = OperationsManager(settings=settings, storage=storage)
     supervisor = RuntimeSupervisor(settings=settings, storage=storage, llm=llm)
     approval_executor = ApprovalExecutor(
         storage=storage,
@@ -110,6 +125,7 @@ async def lifespan(app: FastAPI):
     app.state.learning = learning
     app.state.host_bridge = host_bridge
     app.state.experience = experience
+    app.state.operations = operations
     app.state.supervisor = supervisor
     app.state.approval_executor = approval_executor
     storage.add_event(kind="runtime.start", title="JARVIS GPT backend started")
@@ -251,6 +267,106 @@ async def update_autonomy_policy(
     return updated
 
 
+@app.get("/api/browser/policy", response_model=BrowserPolicyResponse)
+async def browser_policy() -> BrowserPolicyResponse:
+    return app.state.operations.browser_policy()
+
+
+@app.patch("/api/browser/policy", response_model=BrowserPolicyResponse)
+async def update_browser_policy(request: BrowserPolicyUpdateRequest) -> BrowserPolicyResponse:
+    updated = app.state.operations.update_browser_policy(request.model_dump(exclude_none=True))
+    await app.state.bus.publish({"channel": "browser.policy", "mode": updated["mode"]})
+    return updated
+
+
+@app.get("/api/docker/policy", response_model=DockerPolicyResponse)
+async def docker_policy() -> DockerPolicyResponse:
+    return app.state.operations.docker_policy()
+
+
+@app.patch("/api/docker/policy", response_model=DockerPolicyResponse)
+async def update_docker_policy(request: DockerPolicyUpdateRequest) -> DockerPolicyResponse:
+    updated = app.state.operations.update_docker_policy(request.model_dump(exclude_none=True))
+    await app.state.bus.publish(
+        {"channel": "docker.policy", "max_log_tail": updated["max_log_tail"]}
+    )
+    return updated
+
+
+@app.get("/api/docker/containers", response_model=DockerContainersResponse)
+async def docker_containers() -> DockerContainersResponse:
+    return await asyncio.to_thread(app.state.operations.docker_containers)
+
+
+@app.get("/api/autonomy/jobs", response_model=list[AutonomyJobResponse])
+async def autonomy_jobs() -> list[AutonomyJobResponse]:
+    return app.state.operations.list_jobs()
+
+
+@app.post("/api/autonomy/jobs", response_model=AutonomyJobResponse)
+async def create_autonomy_job(request: AutonomyJobCreateRequest) -> AutonomyJobResponse:
+    job = app.state.operations.create_job(request.model_dump())
+    await app.state.bus.publish(
+        {"channel": "autonomy.jobs", "action": "created", "job_id": job["id"]}
+    )
+    return job
+
+
+@app.patch("/api/autonomy/jobs/{job_id}", response_model=AutonomyJobResponse)
+async def update_autonomy_job(
+    job_id: str,
+    request: AutonomyJobUpdateRequest,
+) -> AutonomyJobResponse:
+    job = app.state.operations.update_job(job_id, request.model_dump(exclude_none=True))
+    if job is None:
+        raise HTTPException(status_code=404, detail="Autonomy job not found")
+    await app.state.bus.publish({"channel": "autonomy.jobs", "action": "updated", "job_id": job_id})
+    return job
+
+
+@app.post("/api/autonomy/jobs/{job_id}/run", response_model=AutonomyJobRunResponse)
+async def run_autonomy_job(job_id: str) -> AutonomyJobRunResponse:
+    job = next((item for item in app.state.operations.list_jobs() if item["id"] == job_id), None)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Autonomy job not found")
+    if job["status"] != "enabled":
+        raise HTTPException(status_code=409, detail=f"Autonomy job is {job['status']}")
+    result = await _run_operation_kind(job["kind"], job.get("payload") or {})
+    updated = app.state.operations.mark_job_run(job_id, result)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Autonomy job not found")
+    await app.state.bus.publish(
+        {"channel": "autonomy.jobs", "action": "run", "job_id": job_id, "ok": result["ok"]}
+    )
+    return {"job": updated, **result}
+
+
+@app.get("/api/routines", response_model=list[RoutineResponse])
+async def routines() -> list[RoutineResponse]:
+    return app.state.operations.routines()
+
+
+@app.post("/api/routines/{routine_id}/run", response_model=RoutineRunResponse)
+async def run_routine(routine_id: str) -> RoutineRunResponse:
+    routine = next(
+        (item for item in app.state.operations.routines() if item["id"] == routine_id),
+        None,
+    )
+    if routine is None:
+        raise HTTPException(status_code=404, detail="Routine not found")
+    results = [await _run_operation_kind(step, {}) for step in routine["steps"]]
+    ok = all(item["ok"] for item in results)
+    response = {
+        "routine": routine,
+        "ok": ok,
+        "summary": f"Routine {routine['title']} finished with {len(results)} step(s).",
+        "results": results,
+    }
+    app.state.operations.record_routine_run(routine, response)
+    await app.state.bus.publish({"channel": "routines", "routine_id": routine_id, "ok": ok})
+    return response
+
+
 @app.get("/api/briefing", response_model=DailyBriefingResponse)
 async def briefing() -> DailyBriefingResponse:
     dispatcher_status = await asyncio.to_thread(app.state.dispatcher.status)
@@ -385,6 +501,27 @@ async def upload_file(file: UploadFile = File(...)) -> FileIngestResponse:
             "event": "uploaded",
             "file_id": result["file"]["id"],
             "chunks_indexed": result["chunks_indexed"],
+        }
+    )
+    return result
+
+
+@app.post("/api/files/ingest-directory", response_model=DirectoryIngestResponse)
+async def ingest_directory(request: DirectoryIngestRequest) -> DirectoryIngestResponse:
+    try:
+        result = await asyncio.to_thread(
+            app.state.ingestor.ingest_directory,
+            request.path,
+            max_files=request.max_files,
+        )
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await app.state.bus.publish(
+        {
+            "channel": "files",
+            "event": "directory_ingested",
+            "root": result["root"],
+            "files_indexed": result["files_indexed"],
         }
     )
     return result
@@ -546,6 +683,61 @@ async def benchmark() -> BenchmarkResponse:
         {"channel": "benchmark", "summary": report["summary"], "profile": report["profile"]}
     )
     return report
+
+
+async def _run_operation_kind(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
+    if kind == "briefing":
+        dispatcher_status = await asyncio.to_thread(app.state.dispatcher.status)
+        report = app.state.experience.daily_briefing(dispatcher_status=dispatcher_status)
+        return {"ok": True, "summary": report["headline"], "data": report}
+    if kind == "diagnostics":
+        result = await run_diagnostics(
+            settings=app.state.settings,
+            storage=app.state.storage,
+            llm=app.state.llm,
+        )
+        warn_count = sum(1 for check in result.checks if check.status == "warn")
+        error_count = sum(1 for check in result.checks if check.status == "error")
+        return {
+            "ok": result.ok,
+            "summary": f"Diagnostics: {error_count} error(s), {warn_count} warning(s).",
+            "data": result.model_dump(),
+        }
+    if kind == "learning.tick":
+        limit = int(payload.get("limit") or 20)
+        result = app.state.learning.tick(limit=max(5, min(100, limit)))
+        return {
+            "ok": True,
+            "summary": f"Learning tick saved {result['lesson_count']} lesson(s).",
+            "data": result,
+        }
+    if kind == "self_heal":
+        diagnostics_result = await run_diagnostics(
+            settings=app.state.settings,
+            storage=app.state.storage,
+            llm=app.state.llm,
+        )
+        telemetry_snapshot = await asyncio.to_thread(app.state.telemetry.snapshot)
+        app.state.storage.record_telemetry(telemetry_snapshot)
+        dispatcher_status = await asyncio.to_thread(app.state.dispatcher.status)
+        report = app.state.experience.self_heal_report(
+            checks=diagnostics_result.checks,
+            telemetry_snapshot=telemetry_snapshot,
+            dispatcher_status=dispatcher_status,
+        )
+        return {"ok": bool(report["ok"]), "summary": report["summary"], "data": report}
+    if kind == "benchmark":
+        report = await app.state.experience.run_benchmark(
+            llm=app.state.llm,
+            telemetry=app.state.telemetry,
+            dispatcher=app.state.dispatcher,
+        )
+        return {"ok": True, "summary": report["summary"], "data": report}
+    return {
+        "ok": False,
+        "summary": f"Unsupported operation kind: {kind}",
+        "data": {"kind": kind},
+    }
 
 
 @app.websocket("/ws/events")

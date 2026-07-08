@@ -18,11 +18,14 @@ def test_file_ingestor_indexes_text_and_records_audit(monkeypatch, tmp_path):
     )
 
     result = FileIngestor(settings=settings, storage=storage).ingest_path(source)
+    duplicate = FileIngestor(settings=settings, storage=storage).ingest_path(source)
     hits = storage.search_file_chunks("architecture mission", limit=5)
     audit = storage.list_audit(target_type="file", target_id=result["file"]["id"])
 
     assert result["file"]["status"] == "indexed"
     assert result["chunks_indexed"] == 1
+    assert duplicate["file"]["id"] == result["file"]["id"]
+    assert duplicate["deduplicated"] is True
     assert storage.counters()["files"] == 1
     assert hits
     assert hits[0]["file_id"] == result["file"]["id"]
@@ -30,4 +33,26 @@ def test_file_ingestor_indexes_text_and_records_audit(monkeypatch, tmp_path):
     assert hits[0]["matched_terms"] == ["architecture", "mission"]
     assert "architecture notes" in hits[0]["snippet"]
     assert audit[0]["action"] == "file.ingest"
+    storage.close()
+
+
+def test_file_ingestor_indexes_directory_with_limits(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    root = settings.home / "docs"
+    root.mkdir(parents=True)
+    (root / "a.md").write_text("Jarvis directory ingestion alpha.", encoding="utf-8")
+    (root / "b.txt").write_text("Jarvis directory ingestion beta.", encoding="utf-8")
+    (root / "skip.bin").write_bytes(b"\x00\x01")
+
+    result = FileIngestor(settings=settings, storage=storage).ingest_directory(root, max_files=1)
+    hits = storage.search_file_chunks("directory ingestion", limit=5)
+
+    assert result["root"] == str(root)
+    assert result["files_indexed"] == 1
+    assert result["files_failed"] == 0
+    assert hits
     storage.close()

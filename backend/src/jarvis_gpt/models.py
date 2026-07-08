@@ -413,6 +413,113 @@ class BenchmarkResponse(BaseModel):
     history: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class BrowserPolicyResponse(BaseModel):
+    mode: Literal["approval-only", "local-safe", "locked"]
+    allow_localhost: bool
+    allowed_hosts: list[str] = Field(default_factory=list)
+    blocked_schemes: list[str] = Field(default_factory=list)
+    require_approval_for_external: bool
+    max_urls_per_action: int
+
+
+class BrowserPolicyUpdateRequest(BaseModel):
+    mode: Literal["approval-only", "local-safe", "locked"] | None = None
+    allow_localhost: bool | None = None
+    allowed_hosts: list[str] | None = None
+    blocked_schemes: list[str] | None = None
+    require_approval_for_external: bool | None = None
+    max_urls_per_action: int | None = Field(default=None, ge=1, le=20)
+
+
+class DockerPolicyResponse(BaseModel):
+    allowed_prefixes: list[str] = Field(default_factory=list)
+    allowed_containers: list[str] = Field(default_factory=list)
+    max_log_tail: int
+    include_stopped: bool
+
+
+class DockerPolicyUpdateRequest(BaseModel):
+    allowed_prefixes: list[str] | None = None
+    allowed_containers: list[str] | None = None
+    max_log_tail: int | None = Field(default=None, ge=10, le=1000)
+    include_stopped: bool | None = None
+
+
+class DockerContainersResponse(BaseModel):
+    ok: bool
+    summary: str
+    policy: DockerPolicyResponse
+    containers: list[dict[str, Any]] = Field(default_factory=list)
+    command: list[str] = Field(default_factory=list)
+    error: str | None = None
+
+
+class AutonomyJobCreateRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=120)
+    kind: Literal["diagnostics", "learning.tick", "self_heal", "benchmark"] = "diagnostics"
+    cadence: str = Field(default="manual", max_length=80)
+    budget: dict[str, int] = Field(default_factory=dict)
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class AutonomyJobUpdateRequest(BaseModel):
+    title: str | None = Field(default=None, max_length=120)
+    status: Literal["enabled", "paused", "done"] | None = None
+    cadence: str | None = Field(default=None, max_length=80)
+    budget: dict[str, int] | None = None
+    payload: dict[str, Any] | None = None
+
+
+class AutonomyJobResponse(BaseModel):
+    id: str
+    title: str
+    kind: str
+    status: str
+    cadence: str
+    budget: dict[str, int] = Field(default_factory=dict)
+    payload: dict[str, Any] = Field(default_factory=dict)
+    run_count: int
+    created_at: str
+    updated_at: str
+    last_run_at: str | None = None
+    last_result: dict[str, Any] = Field(default_factory=dict)
+
+
+class AutonomyJobRunResponse(BaseModel):
+    job: AutonomyJobResponse
+    ok: bool
+    summary: str
+    data: dict[str, Any] = Field(default_factory=dict)
+
+
+class RoutineResponse(BaseModel):
+    id: str
+    title: str
+    description: str
+    steps: list[str] = Field(default_factory=list)
+
+
+class RoutineRunResponse(BaseModel):
+    routine: RoutineResponse
+    ok: bool
+    summary: str
+    results: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class DirectoryIngestRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=1000)
+    max_files: int = Field(default=50, ge=1, le=500)
+
+
+class DirectoryIngestResponse(BaseModel):
+    root: str
+    files_seen: int
+    files_indexed: int
+    files_failed: int
+    results: list[FileIngestResponse] = Field(default_factory=list)
+    errors: list[dict[str, str]] = Field(default_factory=list)
+
+
 class StatusResponse(BaseModel):
     settings: dict[str, Any]
     counters: dict[str, int]

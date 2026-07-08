@@ -23,6 +23,7 @@ from .learning import LearningEngine
 from .llm import LLMRouter
 from .model_catalog import ModelCatalog
 from .models import ToolInfo, ToolRunResponse
+from .operations import OperationsManager, docker_container_allowed
 from .storage import JarvisStorage
 from .telemetry import TelemetryCollector
 
@@ -216,6 +217,24 @@ class ToolRegistry:
         )
         self.add(
             ToolSpec(
+                name="docker.policy",
+                description="Return the current Jarvis Docker safety policy.",
+                category="docker",
+                input_schema={},
+                handler=_docker_policy,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="docker.containers",
+                description="List Docker containers annotated by the Jarvis Docker policy.",
+                category="docker",
+                input_schema={},
+                handler=_docker_containers,
+            )
+        )
+        self.add(
+            ToolSpec(
                 name="dispatcher.status",
                 description="Inspect the OpenAI-compatible model dispatcher and Docker container.",
                 category="docker",
@@ -296,6 +315,25 @@ class ToolRegistry:
                 category="browser",
                 input_schema={"url": "HTTP(S) URL to open"},
                 handler=_browser_open,
+                danger_level="review",
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="browser.policy",
+                description="Return the current browser automation policy.",
+                category="browser",
+                input_schema={},
+                handler=_browser_policy,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="browser.open_many",
+                description="Open multiple validated HTTP(S) URLs through the native host browser.",
+                category="browser",
+                input_schema={"urls": "List of HTTP(S) URLs to open"},
+                handler=_browser_open_many,
                 danger_level="review",
             )
         )
@@ -508,14 +546,20 @@ def _docker_ps(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
 
 def _docker_logs(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     container = str(args.get("container") or "jarvis-gpt-dispatcher").strip()
-    if not _is_allowed_docker_container(container):
+    policy = OperationsManager(settings=_ctx.settings, storage=_ctx.storage).docker_policy()
+    if not _is_allowed_docker_container(container, policy):
         return ToolRunResponse(
             tool="docker.logs",
             ok=False,
             summary="Docker logs are restricted to Jarvis containers.",
             data={"container": container},
         )
-    tail = _int_arg(args.get("tail"), default=80, minimum=1, maximum=500)
+    tail = _int_arg(
+        args.get("tail"),
+        default=80,
+        minimum=1,
+        maximum=int(policy["max_log_tail"]),
+    )
     result = _run_docker(["logs", "--tail", str(tail), container], timeout=20)
     if not result["ok"]:
         return ToolRunResponse(
@@ -535,6 +579,26 @@ def _docker_logs(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
             "stderr": result["stderr"],
             "command": result["command"],
         },
+    )
+
+
+def _docker_policy(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunResponse:
+    policy = OperationsManager(settings=ctx.settings, storage=ctx.storage).docker_policy()
+    return ToolRunResponse(
+        tool="docker.policy",
+        ok=True,
+        summary="Docker policy loaded.",
+        data={"policy": policy},
+    )
+
+
+def _docker_containers(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunResponse:
+    data = OperationsManager(settings=ctx.settings, storage=ctx.storage).docker_containers()
+    return ToolRunResponse(
+        tool="docker.containers",
+        ok=bool(data["ok"]),
+        summary=str(data["summary"]),
+        data=data,
     )
 
 
@@ -622,8 +686,9 @@ async def _host_bridge_execute(ctx: ToolContext, args: dict[str, Any]) -> ToolRu
 
 
 async def _browser_open(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    policy = OperationsManager(settings=ctx.settings, storage=ctx.storage).browser_policy()
     try:
-        url = _validate_browser_url(str(args.get("url") or ""))
+        url = _validate_browser_url(str(args.get("url") or ""), policy=policy)
     except ValueError as exc:
         return ToolRunResponse(tool="browser.open", ok=False, summary=str(exc))
     command = f"Start-Process -FilePath {_powershell_quote(url)}"
@@ -634,6 +699,54 @@ async def _browser_open(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
         ok=bool(result.get("ok")),
         summary=str(result.get("summary") or "Browser open requested."),
         data={"url": url, "bridge": data},
+    )
+
+
+def _browser_policy(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunResponse:
+    policy = OperationsManager(settings=ctx.settings, storage=ctx.storage).browser_policy()
+    return ToolRunResponse(
+        tool="browser.policy",
+        ok=True,
+        summary="Browser automation policy loaded.",
+        data={"policy": policy},
+    )
+
+
+async def _browser_open_many(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    policy = OperationsManager(settings=ctx.settings, storage=ctx.storage).browser_policy()
+    raw_urls = args.get("urls")
+    if isinstance(raw_urls, str):
+        raw_urls = [item.strip() for item in raw_urls.splitlines() if item.strip()]
+    if not isinstance(raw_urls, list):
+        return ToolRunResponse(
+            tool="browser.open_many",
+            ok=False,
+            summary="A list of URLs is required.",
+        )
+    limit = int(policy["max_urls_per_action"])
+    urls = []
+    for item in raw_urls[:limit]:
+        try:
+            urls.append(_validate_browser_url(str(item), policy=policy))
+        except ValueError as exc:
+            return ToolRunResponse(
+                tool="browser.open_many",
+                ok=False,
+                summary=str(exc),
+                data={"url": str(item)},
+            )
+    if not urls:
+        return ToolRunResponse(tool="browser.open_many", ok=False, summary="No URLs provided.")
+    commands = "; ".join(
+        f"Start-Process -FilePath {_powershell_quote(url)}" for url in urls
+    )
+    result = await HostBridgeClient(ctx.settings).execute(command=commands, timeout_sec=20)
+    data = result.get("data") if isinstance(result.get("data"), dict) else result
+    return ToolRunResponse(
+        tool="browser.open_many",
+        ok=bool(result.get("ok")),
+        summary=str(result.get("summary") or f"Requested {len(urls)} browser tab(s)."),
+        data={"urls": urls, "bridge": data},
     )
 
 
@@ -1029,7 +1142,9 @@ def _parse_docker_ps(stdout: str) -> list[dict[str, Any]]:
     return containers
 
 
-def _is_allowed_docker_container(container: str) -> bool:
+def _is_allowed_docker_container(container: str, policy: dict[str, Any] | None = None) -> bool:
+    if policy is not None:
+        return docker_container_allowed(policy, container)
     lowered = container.lower()
     return bool(container) and (
         lowered == "jarvis-gpt-dispatcher"
@@ -1039,7 +1154,7 @@ def _is_allowed_docker_container(container: str) -> bool:
     )
 
 
-def _validate_browser_url(raw_url: str) -> str:
+def _validate_browser_url(raw_url: str, policy: dict[str, Any] | None = None) -> str:
     raw_url = raw_url.strip()
     if not raw_url:
         raise ValueError("URL is required.")
@@ -1050,8 +1165,21 @@ def _validate_browser_url(raw_url: str) -> str:
     parsed = urlparse(raw_url)
     if parsed.scheme.lower() not in {"http", "https"}:
         raise ValueError("Only http and https URLs can be opened.")
+    blocked_schemes = set(policy.get("blocked_schemes", [])) if policy else set()
+    if parsed.scheme.lower() in blocked_schemes:
+        raise ValueError(f"URL scheme is blocked by browser policy: {parsed.scheme}")
     if not parsed.hostname:
         raise ValueError("URL host is required.")
+    if policy:
+        if policy.get("mode") == "locked":
+            raise ValueError("Browser automation policy is locked.")
+        host = parsed.hostname.lower()
+        allowed_hosts = {str(item).lower() for item in policy.get("allowed_hosts", [])}
+        is_local = host in {"localhost", "127.0.0.1", "::1"}
+        if policy.get("mode") == "local-safe" and host not in allowed_hosts:
+            raise ValueError("Browser policy only allows configured local hosts.")
+        if is_local and not policy.get("allow_localhost", True):
+            raise ValueError("Browser policy blocks localhost URLs.")
     return parsed.geturl()
 
 

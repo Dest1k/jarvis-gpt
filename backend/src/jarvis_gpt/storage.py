@@ -963,6 +963,22 @@ class JarvisStorage:
             ).fetchone()
         return dict(row) if row else None
 
+    def get_file_by_sha256(self, sha256: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self.connect().execute(
+                """
+                SELECT
+                    id, name, source_path, stored_path, mime_type, size, sha256,
+                    status, error, chunk_count, created_at, updated_at
+                FROM files
+                WHERE sha256 = ?
+                ORDER BY created_at ASC, rowid ASC
+                LIMIT 1
+                """,
+                (sha256,),
+            ).fetchone()
+        return dict(row) if row else None
+
     def search_file_chunks(self, query: str, limit: int = 20) -> list[dict[str, Any]]:
         if query and self._file_fts_available:
             match = _fts_query(query)

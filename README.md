@@ -159,6 +159,11 @@ docker compose --profile llm up -d dispatcher
 - Command Center exposes briefing, autonomy policy modes, self-heal suggestions, benchmark telemetry and operator communication preferences.
 - Self-heal scans diagnostics/resources/dispatcher state and proposes safe or approval-gated actions without silently mutating host state.
 - Performance benchmark records storage, telemetry, dispatcher and LLM health latency with resource-guard recommendations.
+- Browser automation has a persisted policy plus approved multi-tab opening for repeat workflows.
+- Docker operations have a persisted Jarvis-container policy and fleet view with allowed/blocked annotations.
+- Autonomy jobs can be created, budgeted and run manually from API and Command Center.
+- Reusable operator routines run briefing, diagnostics, self-heal, benchmark and learning workflows.
+- Directory ingestion indexes larger local text/code trees from allowed roots with file limits.
 - OpenAI-compatible Gemma dispatcher is wired and can be started/stopped from CLI, API, and Command Center.
 - Chat supports streamed NDJSON deltas through `/api/chat/stream`; the UI renders tokens as they arrive.
 - Conversation history is durable and can be restored from Command Center after reload.
@@ -179,10 +184,10 @@ docker compose --profile llm up -d dispatcher
 - HITL gates now have a whitelisted executor: approved gates can run dispatcher, diagnostics, learning, telemetry, memory, or registered tool actions.
 - Full local smoke covers backend tests/lint/compile, Docker Compose config, frontend audit/typecheck/build, and optional live HTTP checks.
 
-## Post-ready extensions
+## Closed extension tracks
 
-1. Richer browser automation policy beyond approved URL opening.
-2. Richer Docker policy for multi-container Jarvis deployments.
-3. Deeper autonomous task scheduling with explicit operator budgets.
-4. Larger retrieval ingestion pipelines for documents and codebases.
-5. More Command Center workflows for repeated operator routines.
+- Richer browser automation policy beyond approved URL opening.
+- Richer Docker policy for multi-container Jarvis deployments.
+- Deeper autonomous task scheduling with explicit operator budgets.
+- Larger retrieval ingestion pipelines for documents and codebases.
+- More Command Center workflows for repeated operator routines.

@@ -167,6 +167,47 @@ def test_browser_open_is_validated_and_gated(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_browser_policy_and_open_many(monkeypatch, tmp_path):
+    class FakeBridgeClient:
+        def __init__(self, _settings):
+            pass
+
+        async def execute(self, *, command, cwd=None, timeout_sec=30):
+            assert cwd is None
+            assert timeout_sec == 20
+            assert "https://example.com/a" in command
+            assert "https://example.com/b" in command
+            return {"ok": True, "summary": "opened many", "data": {"command": command}}
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr("jarvis_gpt.tools.HostBridgeClient", FakeBridgeClient)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    policy = asyncio.run(tools.run("browser.policy", {}))
+    blocked = asyncio.run(
+        tools.run("browser.open_many", {"urls": ["https://example.com/a"]})
+    )
+    opened = asyncio.run(
+        tools.run(
+            "browser.open_many",
+            {"urls": ["https://example.com/a", "https://example.com/b"]},
+            allow_danger=True,
+        )
+    )
+
+    assert policy.ok is True
+    assert blocked.ok is False
+    assert "requires approval" in blocked.summary
+    assert opened.ok is True
+    assert opened.data["urls"] == ["https://example.com/a", "https://example.com/b"]
+    storage.close()
+
+
 def test_web_fetch_blocks_private_addresses(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
@@ -245,6 +286,10 @@ def test_docker_ps_parses_compact_container_list(monkeypatch, tmp_path):
         "jarvis_gpt.tools.shutil.which",
         lambda command: "docker.exe" if command == "docker" else None,
     )
+    monkeypatch.setattr(
+        "jarvis_gpt.operations.shutil.which",
+        lambda command: "docker.exe" if command == "docker" else None,
+    )
 
     def fake_run(command, **kwargs):
         assert command[:3] == ["docker.exe", "ps", "-a"]
@@ -259,6 +304,7 @@ def test_docker_ps_parses_compact_container_list(monkeypatch, tmp_path):
         )
 
     monkeypatch.setattr("jarvis_gpt.tools.subprocess.run", fake_run)
+    monkeypatch.setattr("jarvis_gpt.operations.subprocess.run", fake_run)
     settings = load_settings()
     ensure_runtime_dirs(settings)
     storage = JarvisStorage(settings.database_path)
@@ -266,10 +312,15 @@ def test_docker_ps_parses_compact_container_list(monkeypatch, tmp_path):
     tools = ToolRegistry(settings, storage, LLMRouter(settings))
 
     result = asyncio.run(tools.run("docker.ps", {}))
+    fleet = asyncio.run(tools.run("docker.containers", {}))
+    policy = asyncio.run(tools.run("docker.policy", {}))
 
     assert result.ok is True
     assert result.data["containers"][0]["name"] == "jarvis-gpt-dispatcher"
     assert result.data["containers"][0]["state"] == "running"
+    assert fleet.ok is True
+    assert fleet.data["containers"][0]["allowed"] is True
+    assert policy.data["policy"]["max_log_tail"] >= 10
     storage.close()
 
 

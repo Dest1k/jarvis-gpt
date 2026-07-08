@@ -311,6 +311,63 @@ type BenchmarkReport = {
   history: { ts?: string; summary?: string; total_ms?: number; llm_ok?: boolean }[];
 };
 
+type BrowserPolicy = {
+  mode: "approval-only" | "local-safe" | "locked";
+  allow_localhost: boolean;
+  allowed_hosts: string[];
+  blocked_schemes: string[];
+  require_approval_for_external: boolean;
+  max_urls_per_action: number;
+};
+
+type DockerPolicy = {
+  allowed_prefixes: string[];
+  allowed_containers: string[];
+  max_log_tail: number;
+  include_stopped: boolean;
+};
+
+type DockerContainers = {
+  ok: boolean;
+  summary: string;
+  policy: DockerPolicy;
+  containers: { name?: string; status?: string; image?: string; allowed?: boolean }[];
+  error?: string | null;
+};
+
+type AutonomyJob = {
+  id: string;
+  title: string;
+  kind: "diagnostics" | "learning.tick" | "self_heal" | "benchmark";
+  status: "enabled" | "paused" | "done";
+  cadence: string;
+  budget: { max_runs?: number; max_minutes?: number };
+  run_count: number;
+  last_run_at?: string | null;
+  last_result?: Record<string, unknown>;
+};
+
+type Routine = {
+  id: string;
+  title: string;
+  description: string;
+  steps: string[];
+};
+
+type RoutineRun = {
+  routine: Routine;
+  ok: boolean;
+  summary: string;
+  results: { ok: boolean; summary: string }[];
+};
+
+type DirectoryIngestResult = {
+  root: string;
+  files_seen: number;
+  files_indexed: number;
+  files_failed: number;
+};
+
 type ToolInfo = {
   name: string;
   description: string;
@@ -475,6 +532,14 @@ export default function CommandCenter() {
   const [briefing, setBriefing] = useState<DailyBriefing | null>(null);
   const [selfHealReport, setSelfHealReport] = useState<SelfHealReport | null>(null);
   const [benchmarkReport, setBenchmarkReport] = useState<BenchmarkReport | null>(null);
+  const [browserPolicy, setBrowserPolicy] = useState<BrowserPolicy | null>(null);
+  const [dockerPolicy, setDockerPolicy] = useState<DockerPolicy | null>(null);
+  const [dockerContainers, setDockerContainers] = useState<DockerContainers | null>(null);
+  const [autonomyJobs, setAutonomyJobs] = useState<AutonomyJob[]>([]);
+  const [routines, setRoutines] = useState<Routine[]>([]);
+  const [routineRun, setRoutineRun] = useState<RoutineRun | null>(null);
+  const [directoryDraft, setDirectoryDraft] = useState("D:\\jarvis");
+  const [directoryIngest, setDirectoryIngest] = useState<DirectoryIngestResult | null>(null);
   const [approvals, setApprovals] = useState<ApprovalItem[]>([]);
   const [input, setInput] = useState("");
   const [voiceAvailable, setVoiceAvailable] = useState(false);
@@ -521,6 +586,11 @@ export default function CommandCenter() {
         preferencesData,
         autonomyPolicyData,
         briefingData,
+        browserPolicyData,
+        dockerPolicyData,
+        dockerContainersData,
+        autonomyJobData,
+        routineData,
         approvalData
       ] = await Promise.all([
           api<RuntimeStatus>("/api/status"),
@@ -538,6 +608,11 @@ export default function CommandCenter() {
           api<RuntimePreferences>("/api/preferences"),
           api<AutonomyPolicy>("/api/autonomy/policy"),
           api<DailyBriefing>("/api/briefing"),
+          api<BrowserPolicy>("/api/browser/policy"),
+          api<DockerPolicy>("/api/docker/policy"),
+          api<DockerContainers>("/api/docker/containers"),
+          api<AutonomyJob[]>("/api/autonomy/jobs"),
+          api<Routine[]>("/api/routines"),
           api<ApprovalItem[]>("/api/approvals?limit=8")
         ]);
       setStatus(statusData);
@@ -560,6 +635,11 @@ export default function CommandCenter() {
       });
       setAutonomyPolicy(autonomyPolicyData);
       setBriefing(briefingData);
+      setBrowserPolicy(browserPolicyData);
+      setDockerPolicy(dockerPolicyData);
+      setDockerContainers(dockerContainersData);
+      setAutonomyJobs(autonomyJobData);
+      setRoutines(routineData);
       setApprovals(approvalData);
       if (statusData.health.length) {
         setDiagnostics(statusData.health);
@@ -595,6 +675,13 @@ export default function CommandCenter() {
   }, []);
 
   const counters = useMemo(() => status?.counters ?? {}, [status]);
+  const activeApprovals = useMemo(
+    () =>
+      approvals.filter(
+        (approval) => approval.status === "pending" || approval.status === "approved"
+      ),
+    [approvals]
+  );
 
   function startVoiceInput() {
     const Recognition = speechRecognitionConstructor();
@@ -842,6 +929,127 @@ export default function CommandCenter() {
       await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Preferences save failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function updateBrowserPolicyMode(mode: BrowserPolicy["mode"]) {
+    setBusy(true);
+    try {
+      const updated = await api<BrowserPolicy>("/api/browser/policy", {
+        method: "PATCH",
+        body: JSON.stringify({ mode })
+      });
+      setBrowserPolicy(updated);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Browser policy update failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function updateDockerTail(maxLogTail: number) {
+    setBusy(true);
+    try {
+      const updated = await api<DockerPolicy>("/api/docker/policy", {
+        method: "PATCH",
+        body: JSON.stringify({ max_log_tail: maxLogTail })
+      });
+      setDockerPolicy(updated);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Docker policy update failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function createAutonomyJob(kind: AutonomyJob["kind"]) {
+    setBusy(true);
+    try {
+      const created = await api<AutonomyJob>("/api/autonomy/jobs", {
+        method: "POST",
+        body: JSON.stringify({
+          title: kind,
+          kind,
+          cadence: "manual",
+          budget: { max_runs: 3, max_minutes: 10 }
+        })
+      });
+      setAutonomyJobs((current) => [created, ...current].slice(0, 10));
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Autonomy job create failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function runAutonomyJob(jobId: string) {
+    setBusy(true);
+    try {
+      const result = await api<{ job: AutonomyJob; summary: string }>(
+        `/api/autonomy/jobs/${jobId}/run`,
+        { method: "POST", body: "{}" }
+      );
+      setAutonomyJobs((current) =>
+        current.map((job) => (job.id === result.job.id ? result.job : job))
+      );
+      setLines((current) => [
+        ...current,
+        { role: "system", content: `Autonomy job: ${result.summary}` }
+      ]);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Autonomy job run failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function runRoutine(routineId: string) {
+    setBusy(true);
+    try {
+      const result = await api<RoutineRun>(`/api/routines/${routineId}/run`, {
+        method: "POST",
+        body: "{}"
+      });
+      setRoutineRun(result);
+      setLines((current) => [
+        ...current,
+        { role: "system", content: `Routine: ${result.summary}` }
+      ]);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Routine run failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function ingestDirectory(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const path = directoryDraft.trim();
+    if (!path || busy) return;
+    setBusy(true);
+    try {
+      const result = await api<DirectoryIngestResult>("/api/files/ingest-directory", {
+        method: "POST",
+        body: JSON.stringify({ path, max_files: 80 })
+      });
+      setDirectoryIngest(result);
+      setLines((current) => [
+        ...current,
+        {
+          role: "system",
+          content: `Directory ingest: ${result.files_indexed}/${result.files_seen} indexed`
+        }
+      ]);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Directory ingest failed");
     } finally {
       setBusy(false);
     }
@@ -1337,13 +1545,13 @@ export default function CommandCenter() {
 
             <div className="panelHeader lower">
               <h2>Approvals</h2>
-              <span>{approvals.filter((approval) => approval.status === "pending").length}</span>
+              <span>{activeApprovals.length}</span>
             </div>
             <div className="approvalList">
-              {approvals.length === 0 ? (
+              {activeApprovals.length === 0 ? (
                 <div className="emptyState compact">No pending gates</div>
               ) : (
-                approvals.slice(0, 5).map((approval) => (
+                activeApprovals.slice(0, 5).map((approval) => (
                   <article className={`approvalRow ${approval.status}`} key={approval.id}>
                     <ShieldAlert size={15} />
                     <div>
@@ -1627,6 +1835,71 @@ export default function CommandCenter() {
             </div>
 
             <div className="panelHeader lower">
+              <h2>Autonomy Jobs</h2>
+              <span>{autonomyJobs.length}</span>
+            </div>
+            <div className="jobsPanel">
+              <div className="quickActions">
+                {(["diagnostics", "self_heal", "benchmark"] as AutonomyJob["kind"][]).map(
+                  (kind) => (
+                    <button
+                      className="iconText compact"
+                      disabled={busy}
+                      key={kind}
+                      onClick={() => createAutonomyJob(kind)}
+                      type="button"
+                    >
+                      <Brain size={14} />
+                      <span>{kind}</span>
+                    </button>
+                  )
+                )}
+              </div>
+              {autonomyJobs.slice(0, 4).map((job) => (
+                <div className={`jobRow ${job.status}`} key={job.id}>
+                  <Brain size={14} />
+                  <strong>{job.title}</strong>
+                  <span>{job.run_count}/{job.budget.max_runs ?? 1}</span>
+                  <button
+                    type="button"
+                    disabled={busy || job.status !== "enabled"}
+                    title="Run job"
+                    aria-label="Run job"
+                    onClick={() => runAutonomyJob(job.id)}
+                  >
+                    <Play size={14} />
+                  </button>
+                </div>
+              ))}
+            </div>
+
+            <div className="panelHeader lower">
+              <h2>Routines</h2>
+              <span>{routines.length}</span>
+            </div>
+            <div className="routinePanel">
+              {routines.map((routine) => (
+                <button
+                  className="routineRow"
+                  disabled={busy}
+                  key={routine.id}
+                  onClick={() => runRoutine(routine.id)}
+                  type="button"
+                >
+                  <Play size={14} />
+                  <strong>{routine.title}</strong>
+                  <span>{routine.steps.length}</span>
+                </button>
+              ))}
+              {routineRun && (
+                <article className={`routineResult ${routineRun.ok ? "ok" : "warn"}`}>
+                  <strong>{routineRun.summary}</strong>
+                  <p>{routineRun.results.map((item) => item.summary).join(" | ")}</p>
+                </article>
+              )}
+            </div>
+
+            <div className="panelHeader lower">
               <h2>Performance</h2>
               <span>
                 {typeof benchmarkReport?.metrics.total_ms === "number"
@@ -1659,6 +1932,65 @@ export default function CommandCenter() {
                   ))}
                 </article>
               )}
+            </div>
+
+            <div className="panelHeader lower">
+              <h2>Browser Policy</h2>
+              <span>{browserPolicy?.mode ?? "..."}</span>
+            </div>
+            <div className="policyPanel">
+              <div className="segmentedControl" role="group" aria-label="Browser policy mode">
+                {(["approval-only", "local-safe", "locked"] as BrowserPolicy["mode"][]).map(
+                  (mode) => (
+                    <button
+                      className={browserPolicy?.mode === mode ? "active" : ""}
+                      disabled={busy}
+                      key={mode}
+                      onClick={() => updateBrowserPolicyMode(mode)}
+                      type="button"
+                    >
+                      {mode}
+                    </button>
+                  )
+                )}
+              </div>
+              <div className="policyFlags">
+                <span className={browserPolicy?.allow_localhost ? "on" : ""}>localhost</span>
+                <span>{browserPolicy?.max_urls_per_action ?? 0} tabs</span>
+                <span>{browserPolicy?.allowed_hosts.slice(0, 2).join(", ")}</span>
+              </div>
+            </div>
+
+            <div className="panelHeader lower">
+              <h2>Docker Fleet</h2>
+              <span>{dockerContainers?.containers.length ?? 0}</span>
+            </div>
+            <div className="dockerPanel">
+              <div className="policyFlags">
+                <button
+                  className="iconText compact"
+                  type="button"
+                  disabled={busy}
+                  onClick={() =>
+                    updateDockerTail(Math.min((dockerPolicy?.max_log_tail ?? 200) + 50, 1000))
+                  }
+                >
+                  <FileText size={14} />
+                  <span>{dockerPolicy?.max_log_tail ?? 200} logs</span>
+                </button>
+                <span>{dockerPolicy?.allowed_prefixes.slice(0, 2).join(", ")}</span>
+              </div>
+              {(dockerContainers?.containers ?? []).slice(0, 4).map((container) => (
+                <div
+                  className={`dockerRow ${container.allowed ? "allowed" : ""}`}
+                  key={container.name}
+                >
+                  <Server size={14} />
+                  <strong>{container.name}</strong>
+                  <span>{container.allowed ? "allowed" : "blocked"}</span>
+                  <small>{container.status ?? container.image}</small>
+                </div>
+              ))}
             </div>
 
             <div className="panelHeader lower">
@@ -1726,6 +2058,30 @@ export default function CommandCenter() {
                 <Search size={15} />
               </button>
             </form>
+            <form className="directoryForm" onSubmit={ingestDirectory}>
+              <input
+                value={directoryDraft}
+                onChange={(event) => setDirectoryDraft(event.target.value)}
+                placeholder="D:\\jarvis"
+                aria-label="Directory to ingest"
+              />
+              <button
+                type="submit"
+                disabled={busy || !directoryDraft.trim()}
+                title="Index directory"
+                aria-label="Index directory"
+              >
+                <Database size={15} />
+              </button>
+            </form>
+            {directoryIngest && (
+              <article className="directoryResult">
+                <strong>{directoryIngest.root}</strong>
+                <span>
+                  {directoryIngest.files_indexed}/{directoryIngest.files_seen} indexed
+                </span>
+              </article>
+            )}
             <div className="fileList">
               {files.slice(0, 5).map((file) => (
                 <div className={`fileRow ${file.status}`} key={file.id}>
