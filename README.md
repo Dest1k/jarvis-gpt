@@ -147,10 +147,10 @@ docker compose --profile llm up -d dispatcher
 - HITL gates now have a whitelisted executor: approved gates can run dispatcher, diagnostics, learning, telemetry, memory, or registered tool actions.
 - Full local smoke covers backend tests/lint/compile, Docker Compose config, frontend audit/typecheck/build, and optional live HTTP checks.
 
-## Линия развития
+## Post-ready extensions
 
-1. Подключить полноценный OpenAI-compatible Gemma dispatcher.
-2. Расширить tools runtime: richer browser automation policy и richer Docker policy.
-3. Усилить cognitive core: feedback loops, task scheduling и richer retrieval ingestion.
-4. Добавить HITL-gates для опасных действий.
-5. Довести PWA/offline-слой и локальные browser tools после стабилизации голосового ввода.
+1. Richer browser automation policy beyond approved URL opening.
+2. Richer Docker policy for multi-container Jarvis deployments.
+3. Deeper autonomous task scheduling with explicit operator budgets.
+4. Larger retrieval ingestion pipelines for documents and codebases.
+5. More Command Center workflows for repeated operator routines.
