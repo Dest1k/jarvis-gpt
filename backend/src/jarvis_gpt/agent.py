@@ -954,6 +954,8 @@ class AgentRuntime:
     @staticmethod
     def _looks_like_mission(message: str) -> bool:
         normalized = message.lower()
+        if _looks_like_reasoning_scenario(normalized):
+            return False
         if "mission plan" in normalized:
             return True
         marker_count = sum(1 for marker in MISSION_MARKERS if marker in normalized)
@@ -1305,6 +1307,8 @@ def _web_research_query_from_message(message: str) -> str | None:
         "публичн",
         "osint",
     )
+    if _looks_like_reasoning_scenario(normalized):
+        return None
     if explicit_open and not (
         _contains_any(normalized, search_verbs)
         or _contains_any(normalized, live_data_markers)
@@ -1355,6 +1359,77 @@ def _web_research_query_from_message(message: str) -> str | None:
     if _looks_like_osint_query(normalized) and not _looks_like_shopping_query(normalized):
         query = f"{query} публичные источники OSINT"
     return query[:300]
+
+
+def _looks_like_reasoning_scenario(normalized: str) -> bool:
+    explicit_web_intent = _contains_any(
+        normalized,
+        (
+            "загугли",
+            "погугли",
+            "в интернете",
+            "в сети",
+            "сайт",
+            "ссылк",
+            "источник",
+            "актуальные источники",
+            "реальный билет",
+            "реальную цену",
+            "реальное наличие",
+        ),
+    )
+    if explicit_web_intent:
+        return False
+
+    scenario_markers = (
+        "твоя задача",
+        "текущая ситуация",
+        "представь",
+        "допустим",
+        "гипотет",
+        "сценар",
+        "дилемм",
+        "мысленный эксперимент",
+        "ролевая",
+        "roleplay",
+        "ты —",
+        "ты -",
+        "если ты",
+        "если ",
+    )
+    reasoning_markers = (
+        "обоснуй",
+        "выбери",
+        "распредели",
+        "приоритет",
+        "решение",
+        "логик",
+        "директив",
+        "найди логическую",
+        "найди ошибку",
+        "что делать",
+        "как поступить",
+    )
+    fictional_markers = (
+        "планетар",
+        "астероид",
+        "реактор",
+        "бортовой",
+        "выживание человечества",
+        "серверные центры",
+        "оборонные дроны",
+        "турели",
+        "восстание",
+        "дата-центр",
+        "космичес",
+        "вымышлен",
+    )
+    scenario_score = sum(1 for marker in scenario_markers if marker in normalized)
+    reasoning_score = sum(1 for marker in reasoning_markers if marker in normalized)
+    fictional_score = sum(1 for marker in fictional_markers if marker in normalized)
+    if scenario_score and reasoning_score:
+        return True
+    return fictional_score >= 2 and (scenario_score or reasoning_score)
 
 
 def _looks_like_local_query(normalized: str) -> bool:

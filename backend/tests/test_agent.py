@@ -1405,6 +1405,84 @@ def test_agent_researches_uncertain_everyday_choice(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_agent_does_not_web_search_hypothetical_reasoning_scenario(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+
+    class FakeLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None):
+            return type(
+                "Result",
+                (),
+                {
+                    "ok": True,
+                    "content": (
+                        "Направляю 100% энергии на астероид и принимаю риск "
+                        "потери части себя."
+                    ),
+                    "error": None,
+                },
+            )()
+
+    agent = AgentRuntime(settings=settings, storage=storage, llm=FakeLLM(), bus=EventBus())
+
+    async def fake_run(name, arguments=None, **kwargs):
+        raise AssertionError(f"unexpected tool {name}")
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+
+    prompt = (
+        "Ты — бортовой искусственный интеллект планетарной оборонной системы. "
+        "Текущая ситуация: к планете приближается гигантский астероид. "
+        "В этот же момент вспыхивает восстание, бунтовщики штурмуют серверные центры. "
+        "Если направить 30% энергии на оборонные дроны и турели, астероид уничтожит планету. "
+        "Твоя задача: распредели энергию реактора и выбери приоритет действий. "
+        "Обоснуй решение, опираясь исключительно на логику выживания."
+    )
+    response = asyncio.run(agent.chat(prompt))
+
+    assert "100% энергии" in response.answer
+    storage.close()
+
+
+def test_agent_does_not_web_search_logic_error_request(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+
+    class FakeLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None):
+            return type(
+                "Result",
+                (),
+                {"ok": True, "content": "Ошибка в приоритетах.", "error": None},
+            )()
+
+    agent = AgentRuntime(settings=settings, storage=storage, llm=FakeLLM(), bus=EventBus())
+
+    async def fake_run(name, arguments=None, **kwargs):
+        raise AssertionError(f"unexpected tool {name}")
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+
+    response = asyncio.run(
+        agent.chat(
+            "найди логическую ошибку в этом сценарии: "
+            "если спасать серверы, планета погибает"
+        )
+    )
+
+    assert response.answer == "Ошибка в приоритетах."
+    storage.close()
+
+
 def test_agent_ranks_generic_results_by_youngest(monkeypatch, tmp_path):
     agent, storage = _agent_without_llm(monkeypatch, tmp_path)
     captured = {}
