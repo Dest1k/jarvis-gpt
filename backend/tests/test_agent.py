@@ -1121,6 +1121,110 @@ def test_agent_retries_shopping_search_with_short_query(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_agent_expands_bare_gpu_model_for_dns_shop(monkeypatch, tmp_path):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    captured = {}
+
+    async def fake_run(name, arguments=None, **kwargs):
+        if name == "web.search":
+            captured["query"] = arguments["query"]
+            return _tool_response(
+                name,
+                True,
+                "Web search returned 1 result(s).",
+                {
+                    "results": [
+                        {
+                            "title": "RTX 5090 DNS",
+                            "url": "https://www.dns-shop.ru/product/rtx-5090",
+                            "snippet": "RTX 5090 в DNS",
+                        }
+                    ]
+                },
+            )
+        if name == "web.fetch":
+            return _tool_response(
+                name,
+                True,
+                "Fetched URL with HTTP 200.",
+                {"url": arguments["url"], "text": "RTX 5090 в DNS"},
+            )
+        raise AssertionError(f"unexpected tool {name}")
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+
+    response = asyncio.run(agent.chat("найди мне самую дешёвую 5090 в днс"))
+
+    assert captured["query"].startswith("rtx 5090 site:dns-shop.ru")
+    assert "https://www.dns-shop.ru/product/rtx-5090" in response.answer
+    storage.close()
+
+
+def test_agent_sorts_previous_shopping_results_and_opens_cheapest(monkeypatch, tmp_path):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    calls = []
+
+    async def fake_run(name, arguments=None, **kwargs):
+        calls.append((name, arguments or {}))
+        if name == "web.search":
+            return _tool_response(
+                name,
+                True,
+                "Web search returned 2 result(s).",
+                {
+                    "results": [
+                        {
+                            "title": "RTX 5090 Expensive",
+                            "url": "https://shop.example/expensive",
+                            "snippet": "RTX 5090 499 000 ₽ в наличии",
+                        },
+                        {
+                            "title": "RTX 5090 Cheap",
+                            "url": "https://shop.example/cheap",
+                            "snippet": "RTX 5090 399 000 ₽ в наличии",
+                        },
+                    ]
+                },
+            )
+        if name == "web.fetch":
+            return _tool_response(
+                name,
+                True,
+                "Fetched URL with HTTP 200.",
+                {
+                    "url": arguments["url"],
+                    "text": "товар "
+                    + ("399 000 ₽" if "cheap" in arguments["url"] else "499 000 ₽"),
+                },
+            )
+        if name == "browser.open":
+            return _tool_response(
+                name,
+                True,
+                "Browser open requested.",
+                {"url": arguments["url"]},
+            )
+        raise AssertionError(f"unexpected tool {name}")
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+
+    first = asyncio.run(agent.chat("найди мне самую дешёвую 5090 в днс"))
+    response = asyncio.run(
+        agent.chat(
+            "а ты сам не можешь отсортировать и выдать мне? а лучше - открыть самую дешёвую",
+            first.conversation_id,
+        )
+    )
+
+    search_calls = [call for call in calls if call[0] == "web.search"]
+    open_calls = [call for call in calls if call[0] == "browser.open"]
+    assert len(search_calls) == 1
+    assert open_calls[-1][1]["url"] == "https://shop.example/cheap"
+    assert "399 000" in response.answer
+    assert "https://shop.example/cheap" in response.answer
+    storage.close()
+
+
 def test_agent_researches_marketplace_product_without_osint(monkeypatch, tmp_path):
     agent, storage = _agent_without_llm(monkeypatch, tmp_path)
     captured = {}
@@ -1298,6 +1402,54 @@ def test_agent_researches_uncertain_everyday_choice(monkeypatch, tmp_path):
     assert "актуальные источники обзор сравнение" in captured["query"]
     assert "Источники" in response.answer
     assert "https://example.com/router-review" in response.answer
+    storage.close()
+
+
+def test_agent_ranks_generic_results_by_youngest(monkeypatch, tmp_path):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    captured = {}
+
+    async def fake_run(name, arguments=None, **kwargs):
+        if name == "web.search":
+            captured["query"] = arguments["query"]
+            return _tool_response(
+                name,
+                True,
+                "Web search returned 2 result(s).",
+                {
+                    "results": [
+                        {
+                            "title": "Candidate A",
+                            "url": "https://example.com/a",
+                            "snippet": "участнику 31 год",
+                        },
+                        {
+                            "title": "Candidate B",
+                            "url": "https://example.com/b",
+                            "snippet": "участнику 24 года",
+                        },
+                    ]
+                },
+            )
+        if name == "web.fetch":
+            return _tool_response(
+                name,
+                True,
+                "Fetched URL with HTTP 200.",
+                {
+                    "url": arguments["url"],
+                    "text": "24 года" if arguments["url"].endswith("/b") else "31 год",
+                },
+            )
+        raise AssertionError(f"unexpected tool {name}")
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+
+    response = asyncio.run(agent.chat("кто самый молодой участник списка сейчас"))
+
+    assert "актуальные источники обзор сравнение" in captured["query"]
+    assert "самый молодой" in response.answer
+    assert response.answer.index("Candidate B") < response.answer.index("Candidate A")
     storage.close()
 
 

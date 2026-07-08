@@ -580,9 +580,23 @@ class AgentRuntime:
                 events=[event],
             )
 
+        shopping_followup = _shopping_followup_intent(message)
+        if shopping_followup is not None:
+            followup = await self._run_shopping_followup(
+                message=message,
+                conversation_id=context.conversation_id,
+                intent=shopping_followup,
+            )
+            if followup is not None:
+                return followup
+
         research_query = _web_research_query_from_message(message)
         if research_query is not None:
-            return await self._run_web_research(message, research_query)
+            return await self._run_web_research(
+                message,
+                research_query,
+                conversation_id=context.conversation_id,
+            )
 
         url = _browser_url_from_message(message)
         if url is not None:
@@ -601,7 +615,13 @@ class AgentRuntime:
 
         return None
 
-    async def _run_web_research(self, message: str, query: str) -> DirectAction:
+    async def _run_web_research(
+        self,
+        message: str,
+        query: str,
+        *,
+        conversation_id: str | None = None,
+    ) -> DirectAction:
         search = await self.tools.run("web.search", {"query": query, "limit": 6})
         events = [
             ChatEvent(
@@ -662,15 +682,187 @@ class AgentRuntime:
                     },
                 )
             )
-        return DirectAction(
-            answer=_format_web_research_answer(
-                message=message,
-                query=query,
-                results=results,
-                fetches=fetches,
-            ),
-            events=events,
+        answer = _format_web_research_answer(
+            message=message,
+            query=query,
+            results=results,
+            fetches=fetches,
         )
+        normalized = message.lower()
+        if conversation_id and results:
+            evidence = _research_evidence(results, fetches)
+            candidates = _shopping_candidates_from_evidence(evidence)
+            criterion = _ranking_criterion_from_message(message)
+            self._remember_shopping_research(
+                conversation_id=conversation_id,
+                query=query,
+                candidates=candidates,
+            )
+            if _shopping_open_requested(normalized) and candidates:
+                open_action = await self._open_shopping_candidate(
+                    candidates,
+                    criterion=criterion or "price_asc",
+                    require_metric=bool(criterion),
+                )
+                events.extend(open_action.events)
+                answer = f"{answer}\n\n{open_action.answer}"
+        return DirectAction(answer=answer, events=events)
+
+    async def _run_shopping_followup(
+        self,
+        *,
+        message: str,
+        conversation_id: str,
+        intent: dict[str, bool],
+    ) -> DirectAction | None:
+        state = self._shopping_research_state(conversation_id)
+        if state is None:
+            return DirectAction(
+                answer=(
+                    "Не вижу предыдущего поиска в этом диалоге. "
+                    "Повтори объект и критерий, и я найду, отсортирую по подтверждённым "
+                    "признакам и при необходимости открою лучший вариант."
+                ),
+                events=[
+                    ChatEvent(
+                        type="tool_call",
+                        title="shopping.followup",
+                        content="No previous shopping research state.",
+                        payload={"ok": False},
+                    )
+                ],
+            )
+
+        candidates = state.get("candidates", [])
+        if not isinstance(candidates, list) or not candidates:
+            return DirectAction(
+                answer="В последнем поиске нет ссылок, которые можно отсортировать.",
+                events=[
+                    ChatEvent(
+                        type="tool_call",
+                        title="shopping.followup",
+                        content="Previous shopping state has no candidates.",
+                        payload={"ok": False},
+                    )
+                ],
+            )
+
+        criterion = str(intent.get("criterion") or "price_asc")
+        sorted_candidates = _sort_shopping_candidates(candidates, criterion=criterion)
+        lines = [f"Взял последний поиск: `{state.get('query', 'выдача')}`."]
+        ranked = [
+            item for item in sorted_candidates if _candidate_metric(item, criterion) is not None
+        ]
+        events = [
+            ChatEvent(
+                type="tool_call",
+                title="shopping.followup",
+                content="Reused previous shopping research state.",
+                payload={
+                    "ok": True,
+                    "candidates": len(candidates),
+                    "ranked": len(ranked),
+                    "intent": intent,
+                },
+            )
+        ]
+        if ranked:
+            lines.append(
+                f"\nОтсортировал по критерию: {_ranking_criterion_label(criterion)}."
+            )
+            for index, item in enumerate(ranked[:6], start=1):
+                lines.append(
+                    f"{index}. {_shopping_candidate_label(item)} — {item['url']}"
+                )
+        else:
+            lines.append(
+                "\nПодтверждённого признака для сортировки в сохранённой выдаче не вижу, "
+                "поэтому честно не могу назвать победителя."
+            )
+            lines.append("Найденные релевантные ссылки:")
+            for index, item in enumerate(sorted_candidates[:6], start=1):
+                lines.append(f"{index}. {item.get('title') or item.get('url')}: {item['url']}")
+
+        if intent.get("open"):
+            open_action = await self._open_shopping_candidate(
+                sorted_candidates,
+                criterion=criterion,
+                require_metric=bool(ranked),
+            )
+            events.extend(open_action.events)
+            lines.append(f"\n{open_action.answer}")
+
+        return DirectAction(answer="\n".join(lines), events=events)
+
+    def _remember_shopping_research(
+        self,
+        *,
+        conversation_id: str,
+        query: str,
+        candidates: list[dict[str, Any]],
+    ) -> None:
+        self.storage.set_runtime_value(
+            _shopping_research_key(conversation_id),
+            {
+                "query": query,
+                "candidates": candidates,
+                "updated_at": date.today().isoformat(),
+            },
+        )
+
+    def _shopping_research_state(self, conversation_id: str) -> dict[str, Any] | None:
+        value = self.storage.get_runtime_value(_shopping_research_key(conversation_id), None)
+        if isinstance(value, dict) and isinstance(value.get("candidates"), list):
+            return value
+        return _shopping_state_from_recent_messages(
+            self.storage.recent_messages(conversation_id, limit=10)
+        )
+
+    async def _open_shopping_candidate(
+        self,
+        candidates: list[dict[str, Any]],
+        *,
+        criterion: str = "price_asc",
+        require_metric: bool,
+    ) -> DirectAction:
+        candidate = _best_shopping_candidate(
+            candidates,
+            criterion=criterion,
+            require_metric=require_metric,
+        )
+        if candidate is None:
+            return DirectAction(
+                answer="Открывать нечего: в последней выдаче нет подходящих URL.",
+                events=[],
+            )
+        result = await self.tools.run(
+            "browser.open",
+            {"url": candidate["url"]},
+            allow_danger=True,
+        )
+        event = ChatEvent(
+            type="tool_call",
+            title="browser.open",
+            content=result.summary,
+            payload={"tool": result.tool, "ok": result.ok, "url": candidate["url"]},
+        )
+        metric = _candidate_metric(candidate, criterion)
+        if metric is not None:
+            answer = (
+                f"Открыл вариант по критерию «{_ranking_criterion_label(criterion)}»: "
+                f"{_shopping_candidate_label(candidate)}."
+            )
+        else:
+            missing_metric = (
+                "Цена не подтверждена"
+                if criterion in {"price_asc", "price_desc"}
+                else "Признак для выбранного критерия не подтверждён"
+            )
+            answer = (
+                f"{missing_metric}, поэтому не называю это победителем. "
+                f"Открыл самую релевантную найденную ссылку: {candidate['url']}."
+            )
+        return DirectAction(answer=f"{answer}\n\n{result.summary}", events=[event])
 
     def _prepare_context(self, message: str, conversation_id: str | None) -> AgentContext:
         if conversation_id is None:
@@ -1036,6 +1228,11 @@ def _web_research_query_from_message(message: str) -> str | None:
         "обзор",
         "рейтинг",
         "топ",
+        "самый",
+        "самая",
+        "самое",
+        "самые",
+        "наиболее",
         "как сейчас",
         "не уверен",
         "не помню",
@@ -1112,6 +1309,7 @@ def _web_research_query_from_message(message: str) -> str | None:
         _contains_any(normalized, search_verbs)
         or _contains_any(normalized, live_data_markers)
         or _mentions_post_knowledge_horizon(normalized)
+        or _looks_like_shopping_query(normalized)
         or _looks_like_place_lookup_query(normalized)
         or _looks_like_osint_query(normalized)
     ):
@@ -1549,6 +1747,8 @@ def _compact_shopping_subject(subject: str) -> str:
             continue
         if re.search(r"[a-z0-9]", lower, flags=re.IGNORECASE):
             technical.append(token)
+    if len(technical) == 1 and re.fullmatch(r"(?:30|40|50)\d0", technical[0]):
+        return f"rtx {technical[0]}"
     if technical and any(re.search(r"[a-z]", token, flags=re.IGNORECASE) for token in technical):
         return _normalize_search_query(" ".join(technical))
     return subject
@@ -1710,6 +1910,29 @@ def _format_web_research_answer(
                 "не отдали точную карточку билета с ценой/временем. Не выдумываю."
             )
 
+    ranking_criterion = _ranking_criterion_from_message(message)
+    if ranking_criterion and not (shopping or travel):
+        candidates = _sort_shopping_candidates(
+            _shopping_candidates_from_evidence(evidence),
+            criterion=ranking_criterion,
+        )
+        ranked = [
+            item for item in candidates if _candidate_metric(item, ranking_criterion) is not None
+        ]
+        if ranked:
+            lines.append(
+                f"\nПредварительно отсортировал по критерию: "
+                f"{_ranking_criterion_label(ranking_criterion)}."
+            )
+            for index, item in enumerate(ranked[:5], start=1):
+                lines.append(f"{index}. {_shopping_candidate_label(item)} — {item['url']}")
+        else:
+            lines.append(
+                "\nЯ понял, что нужен выбор по критерию "
+                f"«{_ranking_criterion_label(ranking_criterion)}», но в статических "
+                "сниппетах не нашёл подтверждённого числового признака для честной сортировки."
+            )
+
     lines.append("\nИсточники:")
     for index, item in enumerate(evidence[:6], start=1):
         snippet = f" — {item['snippet']}" if item.get("snippet") else ""
@@ -1802,9 +2025,222 @@ def _research_evidence(
     return evidence
 
 
-def _extract_travel_facts(evidence: list[dict[str, str]]) -> dict[str, list[str]]:
-    text = " ".join(item.get("snippet", "") for item in evidence)
-    prices = _dedupe(
+def _shopping_followup_intent(message: str) -> dict[str, Any] | None:
+    normalized = message.lower()
+    criterion = _ranking_criterion_from_message(message)
+    if criterion is None:
+        return None
+    followup_context = _contains_any(
+        normalized,
+        (
+            "отсорт",
+            "выдай",
+            "вывед",
+            "покажи",
+            "открой",
+            "можешь",
+            "сам не",
+            "из них",
+            "из списка",
+            "из найден",
+            "а лучше",
+            "тогда",
+            "выбери",
+        ),
+    )
+    if not followup_context:
+        return None
+    explicit_new_search = _contains_any(normalized, ("найди", "поищи", "загугли"))
+    if explicit_new_search and not _contains_any(normalized, ("из них", "из списка", "из найден")):
+        return None
+    return {
+        "criterion": criterion,
+        "open": _shopping_open_requested(normalized),
+        "sort": True,
+    }
+
+
+def _ranking_criterion_from_message(message: str) -> str | None:
+    normalized = message.lower()
+    if _contains_any(normalized, ("дешев", "дешёв", "бюджет", "недорог", "минимальн")):
+        return "price_asc"
+    if _contains_any(normalized, ("дорог", "премиальн", "максимальн")):
+        return "price_desc"
+    if _contains_any(normalized, ("молод", "юный", "юная")):
+        return "age_asc"
+    if _contains_any(normalized, ("старейш", "старш", "самый стар", "самая стар")):
+        return "age_desc"
+    if _contains_any(normalized, ("мощн", "производительн", "сильн")):
+        return "power_desc"
+    if _contains_any(normalized, ("быстр", "скорост")):
+        return "speed_desc"
+    if _contains_any(normalized, ("лёгк", "легк", "компакт", "маленьк", "мини")):
+        return "size_asc"
+    if _contains_any(normalized, ("крупн", "больш", "тяжел", "тяжёл")):
+        return "size_desc"
+    if _contains_any(normalized, ("новейш", "самый новый", "самая новая", "свеж", "последн")):
+        return "date_desc"
+    if _contains_any(normalized, ("популяр", "рейтинг", "лучший", "лучш")):
+        return "rating_desc"
+    return None
+
+
+def _shopping_open_requested(normalized: str) -> bool:
+    return _contains_any(normalized, ("открой", "открыть", "вклад", "браузер", "перейди"))
+
+
+def _shopping_candidates_from_evidence(evidence: list[dict[str, str]]) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for rank, item in enumerate(evidence, start=1):
+        url = str(item.get("url") or "")
+        if not url:
+            continue
+        title = str(item.get("title") or url)
+        snippet = str(item.get("snippet") or "")
+        text = f"{title} {snippet}"
+        price_texts = _extract_price_texts(text)
+        number = _extract_generic_number(text)
+        candidate = {
+            "title": title,
+            "url": url,
+            "snippet": snippet,
+            "rank": rank,
+            "price": price_texts[0] if price_texts else None,
+            "price_value": _price_value(price_texts[0]) if price_texts else None,
+            "age_value": _extract_age_value(text),
+            "year_value": _extract_year_value(text),
+            "number_value": number[0] if number else None,
+            "number_label": number[1] if number else None,
+            "rating_value": _extract_rating_value(text),
+        }
+        candidates.append(candidate)
+    return candidates
+
+
+def _sort_shopping_candidates(
+    candidates: list[dict[str, Any]],
+    *,
+    criterion: str = "price_asc",
+) -> list[dict[str, Any]]:
+    return sorted(candidates, key=lambda item: _candidate_sort_key(item, criterion))
+
+
+def _candidate_sort_key(item: dict[str, Any], criterion: str) -> tuple[int, float, int]:
+    rank = int(item.get("rank") or 999)
+    if criterion == "price_desc":
+        value = item.get("price_value")
+        return (0, -float(value), rank) if value is not None else (1, 0.0, rank)
+    if criterion == "age_asc":
+        age = item.get("age_value")
+        if age is not None:
+            return (0, float(age), rank)
+        year = item.get("year_value")
+        return (0, -float(year), rank) if year is not None else (1, 0.0, rank)
+    if criterion == "age_desc":
+        age = item.get("age_value")
+        if age is not None:
+            return (0, -float(age), rank)
+        year = item.get("year_value")
+        return (0, float(year), rank) if year is not None else (1, 0.0, rank)
+    if criterion in {"power_desc", "speed_desc", "size_desc", "date_desc", "rating_desc"}:
+        metric = _candidate_metric(item, criterion)
+        return (0, -float(metric), rank) if metric is not None else (1, 0.0, rank)
+    if criterion == "size_asc":
+        metric = _candidate_metric(item, criterion)
+        return (0, float(metric), rank) if metric is not None else (1, 0.0, rank)
+    value = item.get("price_value")
+    return (0, float(value), rank) if value is not None else (1, 0.0, rank)
+
+
+def _candidate_metric(item: dict[str, Any], criterion: str) -> float | None:
+    if criterion in {"price_asc", "price_desc"}:
+        return _float_or_none(item.get("price_value"))
+    if criterion in {"age_asc", "age_desc"}:
+        return _float_or_none(item.get("age_value") or item.get("year_value"))
+    if criterion == "date_desc":
+        return _float_or_none(item.get("year_value"))
+    if criterion == "rating_desc":
+        return _float_or_none(item.get("rating_value"))
+    return _float_or_none(item.get("number_value"))
+
+
+def _best_shopping_candidate(
+    candidates: list[dict[str, Any]],
+    *,
+    criterion: str,
+    require_metric: bool,
+) -> dict[str, Any] | None:
+    for candidate in _sort_shopping_candidates(candidates, criterion=criterion):
+        if not candidate.get("url"):
+            continue
+        if require_metric and _candidate_metric(candidate, criterion) is None:
+            continue
+        return candidate
+    return None
+
+
+def _shopping_candidate_label(item: dict[str, Any]) -> str:
+    parts = [str(item.get("title") or item.get("url") or "кандидат")]
+    if item.get("price"):
+        parts.append(str(item["price"]))
+    if item.get("age_value") is not None:
+        parts.append(f"{item['age_value']} лет")
+    if item.get("year_value") is not None:
+        parts.append(str(item["year_value"]))
+    if item.get("number_label"):
+        parts.append(str(item["number_label"]))
+    if item.get("rating_value") is not None:
+        parts.append(f"рейтинг {item['rating_value']}")
+    return " · ".join(parts)
+
+
+def _ranking_criterion_label(criterion: str) -> str:
+    return {
+        "price_asc": "минимальная цена",
+        "price_desc": "максимальная цена",
+        "age_asc": "самый молодой / минимальный возраст",
+        "age_desc": "самый старший / максимальный возраст",
+        "power_desc": "максимальная мощность/производительность",
+        "speed_desc": "максимальная скорость",
+        "size_asc": "минимальный размер/вес",
+        "size_desc": "максимальный размер/вес",
+        "date_desc": "самое новое / свежая дата",
+        "rating_desc": "максимальный рейтинг/популярность",
+    }.get(criterion, criterion)
+
+
+def _shopping_research_key(conversation_id: str) -> str:
+    return f"research.last_ranked.{conversation_id}"
+
+
+def _shopping_state_from_recent_messages(messages: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for message in reversed(messages):
+        if message.get("role") != "assistant":
+            continue
+        content = str(message.get("content") or "")
+        candidates = _shopping_candidates_from_answer(content)
+        if candidates:
+            return {"query": "последняя выдача из диалога", "candidates": candidates}
+    return None
+
+
+def _shopping_candidates_from_answer(content: str) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    pattern = re.compile(r"(?m)^\s*(\d+)\.\s*(.*?):\s*(https?://\S+)(?:\s+—\s*(.*))?$")
+    for match in pattern.finditer(content):
+        title = match.group(2).strip()
+        url = match.group(3).rstrip(").,;")
+        snippet = (match.group(4) or "").strip()
+        candidates.extend(
+            _shopping_candidates_from_evidence(
+                [{"title": title, "url": url, "snippet": snippet}]
+            )
+        )
+    return candidates
+
+
+def _extract_price_texts(text: str) -> list[str]:
+    return _dedupe(
         [
             " ".join(match.split())
             for match in re.findall(
@@ -1814,6 +2250,59 @@ def _extract_travel_facts(evidence: list[dict[str, str]]) -> dict[str, list[str]
             )
         ]
     )
+
+
+def _price_value(price: str) -> float | None:
+    digits = re.sub(r"[^\d]", "", price)
+    return float(digits) if digits else None
+
+
+def _extract_age_value(text: str) -> float | None:
+    values = [
+        float(match)
+        for match in re.findall(r"\b(\d{1,3})\s*(?:год(?:а|ов)?|лет)\b", text, re.IGNORECASE)
+    ]
+    return min(values) if values else None
+
+
+def _extract_year_value(text: str) -> float | None:
+    years = [int(match) for match in re.findall(r"\b(19\d{2}|20\d{2})\b", text)]
+    current_year = date.today().year + 1
+    valid = [year for year in years if 1900 <= year <= current_year]
+    return float(max(valid)) if valid else None
+
+
+def _extract_generic_number(text: str) -> tuple[float, str] | None:
+    pattern = (
+        r"\b(\d+(?:[,.]\d+)?)\s*"
+        r"(вт|w|квт|kw|tflops|tops|гб|gb|мгц|mhz|ггц|ghz|"
+        r"кг|kg|г|мм|mm|см|cm|м|m|л\.с\.|hp)\b"
+    )
+    matches = []
+    for value, unit in re.findall(pattern, text, flags=re.IGNORECASE):
+        parsed = _float_or_none(value.replace(",", "."))
+        if parsed is not None:
+            matches.append((parsed, f"{value} {unit}"))
+    if not matches:
+        return None
+    return max(matches, key=lambda item: item[0])
+
+
+def _extract_rating_value(text: str) -> float | None:
+    match = re.search(r"(?:рейтинг|rating)\s*[:\-]?\s*(\d(?:[,.]\d)?)", text, re.IGNORECASE)
+    return _float_or_none(match.group(1).replace(",", ".")) if match else None
+
+
+def _float_or_none(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_travel_facts(evidence: list[dict[str, str]]) -> dict[str, list[str]]:
+    text = " ".join(item.get("snippet", "") for item in evidence)
+    prices = _extract_price_texts(text)
     times = _dedupe(re.findall(r"\b(?:[01]?\d|2[0-3])[:.][0-5]\d\b", text))
     return {"prices": prices, "times": times}
 
@@ -1824,16 +2313,7 @@ def _extract_shopping_facts(evidence: list[dict[str, str]]) -> dict[str, list[st
         r"(?:в наличии|нет в наличии|под заказ|доступно к заказу|самовывоз|"
         r"доставка[^,.]{0,40})"
     )
-    prices = _dedupe(
-        [
-            " ".join(match.split())
-            for match in re.findall(
-                r"(?:от\s*)?\d[\d\s]{2,}\s*(?:₽|руб\.?|rub)",
-                text,
-                flags=re.IGNORECASE,
-            )
-        ]
-    )
+    prices = _extract_price_texts(text)
     availability = _dedupe(
         [
             " ".join(match.split())
