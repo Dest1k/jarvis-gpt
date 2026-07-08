@@ -1356,6 +1356,28 @@ class JarvisStorage:
             ).fetchone()
         return dict(row) if row else None
 
+    def list_file_chunks(self, file_id: str, limit: int = 5) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self.connect().execute(
+                """
+                SELECT
+                    f.id AS file_id,
+                    f.name AS file_name,
+                    c.id AS chunk_id,
+                    c.position,
+                    c.content,
+                    c.created_at,
+                    NULL AS rank
+                FROM file_chunks c
+                JOIN files f ON f.id = c.file_id
+                WHERE c.file_id = ?
+                ORDER BY c.position ASC
+                LIMIT ?
+                """,
+                (file_id, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def search_file_chunks(self, query: str, limit: int = 20) -> list[dict[str, Any]]:
         if query and self._file_fts_available:
             match = _fts_query(query)

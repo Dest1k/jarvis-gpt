@@ -167,6 +167,59 @@ def test_agent_includes_runtime_date_context(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_agent_passes_chat_attachments_to_llm_context(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    captured = {}
+
+    stored_path = tmp_path / "brief.txt"
+    stored_path.write_text("alpha attached content", encoding="utf-8")
+    file_record = storage.create_file_record(
+        name="brief.txt",
+        stored_path=stored_path,
+        sha256="abc",
+        size=stored_path.stat().st_size,
+        mime_type="text/plain",
+        status="indexed",
+        chunk_count=1,
+    )
+    storage.add_file_chunks(file_record["id"], ["alpha attached content from upload"])
+
+    class CapturingLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None):
+            captured["messages"] = messages
+            return type("Result", (), {"ok": True, "content": "done", "error": None})()
+
+    agent = AgentRuntime(settings=settings, storage=storage, llm=CapturingLLM(), bus=EventBus())
+    attachments = [
+        {
+            "id": file_record["id"],
+            "name": file_record["name"],
+            "mime_type": file_record["mime_type"],
+            "size": file_record["size"],
+        }
+    ]
+
+    response = asyncio.run(
+        agent.chat("разбери вложение", mode="chat", attachments=attachments)
+    )
+
+    stored_messages = storage.recent_messages(response.conversation_id, limit=4)
+    user_message = next(item for item in stored_messages if item["role"] == "user")
+    rendered_prompt = "\n".join(item["content"] for item in captured["messages"])
+
+    assert user_message["content"] == "разбери вложение"
+    assert user_message["metadata"]["attachments"][0]["id"] == file_record["id"]
+    assert "Attached files already uploaded" in rendered_prompt
+    assert "brief.txt" in rendered_prompt
+    assert "alpha attached content from upload" in rendered_prompt
+    storage.close()
+
+
 def test_agent_opens_wiki_without_false_refusal(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")

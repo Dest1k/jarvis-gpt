@@ -108,6 +108,80 @@ class NativeAction:
     fallback: NativeAction | None = None
 
 
+def _normalize_chat_attachments(attachments: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for item in attachments or []:
+        if not isinstance(item, dict):
+            continue
+        file_id = str(item.get("id") or "").strip()
+        name = str(item.get("name") or "").strip()
+        if not file_id or not name:
+            continue
+        normalized.append(
+            {
+                "id": file_id[:120],
+                "name": name[:500],
+                "mime_type": str(item.get("mime_type") or "")[:200] or None,
+                "size": item.get("size") if isinstance(item.get("size"), int) else None,
+                "url": str(item.get("url") or "")[:1000] or None,
+            }
+        )
+    return normalized[:8]
+
+
+def _chat_message_metadata(
+    *,
+    max_tokens: int | None,
+    mode: str,
+    temperature: float | None,
+    attachments: list[dict[str, Any]],
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "max_tokens": max_tokens,
+        "mode": mode,
+        "temperature": temperature,
+    }
+    if attachments:
+        metadata["attachments"] = attachments
+    return metadata
+
+
+def _message_with_attachments(message: str, attachments: list[dict[str, Any]]) -> str:
+    if not attachments:
+        return message
+    lines = [
+        message.strip(),
+        "",
+        (
+            "Attached files already uploaded to Jarvis storage. "
+            "Use indexed file context or file tools when content is needed:"
+        ),
+    ]
+    for item in attachments:
+        details = [f"id={item['id']}", f"name={item['name']}"]
+        if item.get("mime_type"):
+            details.append(f"type={item['mime_type']}")
+        if isinstance(item.get("size"), int):
+            details.append(f"size={item['size']} bytes")
+        lines.append(f"- {'; '.join(details)}")
+    return "\n".join(lines)
+
+
+def _merge_file_hits(*groups: list[dict[str, Any]], limit: int = 8) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for group in groups:
+        for item in group:
+            key = str(item.get("chunk_id") or f"{item.get('file_id')}:{item.get('position')}")
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+            if len(merged) >= limit:
+                return merged
+    return merged
+
+
 @dataclass(frozen=True)
 class IntentDecision:
     route: str
@@ -139,9 +213,17 @@ class AgentRuntime:
         mode: str = "auto",
         temperature: float | None = None,
         max_tokens: int | None = None,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> ChatResponse:
         started_at = time.perf_counter()
-        context = self._prepare_context(message, conversation_id)
+        attachments = _normalize_chat_attachments(attachments)
+        context_message = _message_with_attachments(message, attachments)
+        context = self._prepare_context(context_message, conversation_id)
+        if attachments:
+            context.file_hits = _merge_file_hits(
+                self._attached_file_hits(attachments),
+                context.file_hits,
+            )
         events: list[ChatEvent] = [
             ChatEvent(
                 type="thought",
@@ -156,7 +238,12 @@ class AgentRuntime:
             conversation_id=context.conversation_id,
             role="user",
             content=message,
-            metadata={"max_tokens": max_tokens, "mode": mode, "temperature": temperature},
+            metadata=_chat_message_metadata(
+                max_tokens=max_tokens,
+                mode=mode,
+                temperature=temperature,
+                attachments=attachments,
+            ),
         )
         await self._compact_conversation_memory(context.conversation_id)
         for event in self._capture_explicit_memories(message, context):
@@ -219,7 +306,7 @@ class AgentRuntime:
                 duration_ms=duration_ms,
             )
 
-        llm_messages = self._build_llm_messages(context, message)
+        llm_messages = self._build_llm_messages(context, context_message)
         events.append(
             ChatEvent(
                 type="tool_call",
@@ -279,9 +366,17 @@ class AgentRuntime:
         mode: str = "auto",
         temperature: float | None = None,
         max_tokens: int | None = None,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         started_at = time.perf_counter()
-        context = self._prepare_context(message, conversation_id)
+        attachments = _normalize_chat_attachments(attachments)
+        context_message = _message_with_attachments(message, attachments)
+        context = self._prepare_context(context_message, conversation_id)
+        if attachments:
+            context.file_hits = _merge_file_hits(
+                self._attached_file_hits(attachments),
+                context.file_hits,
+            )
         events: list[ChatEvent] = [
             ChatEvent(
                 type="thought",
@@ -298,7 +393,12 @@ class AgentRuntime:
             conversation_id=context.conversation_id,
             role="user",
             content=message,
-            metadata={"max_tokens": max_tokens, "mode": mode, "temperature": temperature},
+            metadata=_chat_message_metadata(
+                max_tokens=max_tokens,
+                mode=mode,
+                temperature=temperature,
+                attachments=attachments,
+            ),
         )
         await self._compact_conversation_memory(context.conversation_id)
         for event in self._capture_explicit_memories(message, context):
@@ -370,7 +470,7 @@ class AgentRuntime:
             }
             return
 
-        llm_messages = self._build_llm_messages(context, message)
+        llm_messages = self._build_llm_messages(context, context_message)
         events.append(
             ChatEvent(
                 type="tool_call",
@@ -962,6 +1062,15 @@ class AgentRuntime:
             memory_hits=memory_hits,
             file_hits=file_hits,
         )
+
+    def _attached_file_hits(self, attachments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        hits: list[dict[str, Any]] = []
+        for item in attachments[:4]:
+            file_id = item.get("id")
+            if not isinstance(file_id, str) or not file_id:
+                continue
+            hits.extend(self.storage.list_file_chunks(file_id, limit=3))
+        return hits
 
     def _build_llm_messages(self, context: AgentContext, message: str) -> list[dict[str, str]]:
         memory_block = ""

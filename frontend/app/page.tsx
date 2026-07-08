@@ -17,6 +17,7 @@ import {
   Mic,
   MicOff,
   MessageSquare,
+  Paperclip,
   Plus,
   Play,
   RefreshCw,
@@ -31,7 +32,8 @@ import {
   Trash2,
   Zap,
   Upload,
-  Wrench
+  Wrench,
+  X
 } from "lucide-react";
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { KeyboardEvent, PointerEvent as ReactPointerEvent, ReactNode } from "react";
@@ -97,10 +99,19 @@ type Mission = {
   tasks: MissionTask[];
 };
 
+type ChatAttachment = {
+  id: string;
+  name: string;
+  mime_type?: string | null;
+  size?: number | null;
+  url?: string | null;
+};
+
 type ChatLine = {
   id?: string;
   role: "user" | "assistant" | "system";
   content: string;
+  attachments?: ChatAttachment[];
   durationMs?: number | null;
   pending?: boolean;
   startedAt?: number | null;
@@ -669,6 +680,53 @@ function apiUrl() {
   }
 }
 
+function fileItemToAttachment(file: FileItem): ChatAttachment {
+  return {
+    id: file.id,
+    name: file.name,
+    mime_type: file.mime_type,
+    size: file.size,
+    url: `/api/files/${encodeURIComponent(file.id)}/download`
+  };
+}
+
+function normalizeChatAttachment(value: unknown): ChatAttachment | null {
+  if (!value || typeof value !== "object") return null;
+  const item = value as Record<string, unknown>;
+  const id = typeof item.id === "string" ? item.id.trim() : "";
+  const name = typeof item.name === "string" ? item.name.trim() : "";
+  if (!id || !name) return null;
+  return {
+    id,
+    name,
+    mime_type: typeof item.mime_type === "string" ? item.mime_type : null,
+    size: typeof item.size === "number" && Number.isFinite(item.size) ? item.size : null,
+    url: typeof item.url === "string" ? item.url : null
+  };
+}
+
+function normalizeChatAttachments(value: unknown): ChatAttachment[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => normalizeChatAttachment(item))
+    .filter((item): item is ChatAttachment => item !== null)
+    .slice(0, 8);
+}
+
+function attachmentsFromMetadata(metadata?: Record<string, unknown>): ChatAttachment[] {
+  return normalizeChatAttachments(metadata?.attachments);
+}
+
+function attachmentHref(attachment: ChatAttachment) {
+  if (attachment.url) {
+    if (attachment.url.startsWith("/")) {
+      return `${apiUrl()}${attachment.url}`;
+    }
+    return attachment.url;
+  }
+  return `${apiUrl()}/api/files/${encodeURIComponent(attachment.id)}/download`;
+}
+
 function drainStreamBuffer(
   buffer: string,
   onItem: (item: ChatStreamItem) => void
@@ -738,11 +796,13 @@ function createInitialChatWindow(): ChatWindow {
 
 function normalizeStoredLine(line: ChatLine): ChatLine {
   const durationMs = coerceDurationMs(line.durationMs);
+  const attachments = normalizeChatAttachments(line.attachments);
   if (line.id === "system-boot" && line.content.includes("Command Center")) {
-    return { ...line, content: BOOT_MESSAGE, durationMs, pending: false, startedAt: null };
+    return { ...line, content: BOOT_MESSAGE, attachments, durationMs, pending: false, startedAt: null };
   }
   return {
     ...line,
+    attachments,
     durationMs,
     pending: false,
     startedAt: null
@@ -900,6 +960,193 @@ function cleanAssistantText(content: string) {
     .trimStart();
 }
 
+type RichBlock =
+  | { type: "paragraph"; text: string }
+  | { type: "heading"; level: number; text: string }
+  | { type: "list"; items: string[] }
+  | { type: "code"; language: string; code: string };
+
+const CONSOLE_LANGUAGES = new Set([
+  "bash",
+  "bat",
+  "cmd",
+  "console",
+  "log",
+  "powershell",
+  "ps1",
+  "pwsh",
+  "sh",
+  "shell",
+  "terminal",
+  "zsh"
+]);
+
+function parseRichBlocks(content: string): RichBlock[] {
+  const blocks: RichBlock[] = [];
+  const fencePattern = /```([^\n`]*)\n?([\s\S]*?)```/g;
+  let cursor = 0;
+  let match: RegExpExecArray | null;
+  while ((match = fencePattern.exec(content)) !== null) {
+    blocks.push(...parseTextBlocks(content.slice(cursor, match.index)));
+    blocks.push({
+      type: "code",
+      language: match[1].trim(),
+      code: match[2].replace(/\n$/, "")
+    });
+    cursor = match.index + match[0].length;
+  }
+  blocks.push(...parseTextBlocks(content.slice(cursor)));
+  return blocks;
+}
+
+function parseTextBlocks(content: string): RichBlock[] {
+  const blocks: RichBlock[] = [];
+  const paragraph: string[] = [];
+  let listItems: string[] = [];
+
+  const flushParagraph = () => {
+    if (!paragraph.length) return;
+    blocks.push({ type: "paragraph", text: paragraph.join("\n").trimEnd() });
+    paragraph.length = 0;
+  };
+  const flushList = () => {
+    if (!listItems.length) return;
+    blocks.push({ type: "list", items: listItems });
+    listItems = [];
+  };
+
+  for (const line of content.replace(/\r\n/g, "\n").split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      flushParagraph();
+      flushList();
+      continue;
+    }
+    const heading = trimmed.match(/^(#{1,4})\s+(.+)$/);
+    if (heading) {
+      flushParagraph();
+      flushList();
+      blocks.push({ type: "heading", level: heading[1].length, text: heading[2] });
+      continue;
+    }
+    const listItem = line.match(/^\s*(?:[-*•]\s+|\d+\.\s+)(.+)$/);
+    if (listItem) {
+      flushParagraph();
+      listItems.push(listItem[1]);
+      continue;
+    }
+    flushList();
+    paragraph.push(line);
+  }
+  flushParagraph();
+  flushList();
+  return blocks;
+}
+
+function renderRichMessage(content: string, role: ChatLine["role"]) {
+  const cleaned = role === "assistant" ? cleanAssistantText(content) : content;
+  const blocks = parseRichBlocks(cleaned);
+  if (!blocks.length) {
+    return <div className="richMessage empty" />;
+  }
+  return (
+    <div className="richMessage">
+      {blocks.map((block, index) => renderRichBlock(block, `block-${index}`))}
+    </div>
+  );
+}
+
+function renderRichBlock(block: RichBlock, key: string): ReactNode {
+  if (block.type === "heading") {
+    return (
+      <div className={`richHeading level${block.level}`} key={key}>
+        {renderRichInline(block.text, key)}
+      </div>
+    );
+  }
+  if (block.type === "list") {
+    return (
+      <ul className="richList" key={key}>
+        {block.items.map((item, index) => (
+          <li key={`${key}-item-${index}`}>{renderRichInlineWithBreaks(item, `${key}-item-${index}`)}</li>
+        ))}
+      </ul>
+    );
+  }
+  if (block.type === "code") {
+    const language = block.language || "code";
+    const consoleBlock = isConsoleCodeBlock(language, block.code);
+    return (
+      <div className={`richCodeBlock ${consoleBlock ? "console" : "code"}`} key={key}>
+        <div className="richCodeHeader">
+          <Terminal size={13} />
+          <span>{consoleBlock ? "console" : language}</span>
+        </div>
+        <pre>
+          <code>{block.code}</code>
+        </pre>
+      </div>
+    );
+  }
+  return (
+    <p className="richParagraph" key={key}>
+      {renderRichInlineWithBreaks(block.text, key)}
+    </p>
+  );
+}
+
+function renderRichInlineWithBreaks(text: string, key: string): ReactNode[] {
+  return text.split("\n").flatMap((line, index) =>
+    index === 0
+      ? renderRichInline(line, `${key}-line-${index}`)
+      : [<br key={`${key}-br-${index}`} />, ...renderRichInline(line, `${key}-line-${index}`)]
+  );
+}
+
+function renderRichInline(text: string, key: string): ReactNode[] {
+  const nodes: ReactNode[] = [];
+  const tokenPattern = /(\[[^\]]+\]\(https?:\/\/[^\s)]+\)|https?:\/\/[^\s<)]+|`[^`\n]+`|\*\*[\s\S]+?\*\*)/g;
+  let cursor = 0;
+  let index = 0;
+  let match: RegExpExecArray | null;
+  while ((match = tokenPattern.exec(text)) !== null) {
+    if (match.index > cursor) {
+      nodes.push(text.slice(cursor, match.index));
+    }
+    const token = match[0];
+    if (token.startsWith("**") && token.endsWith("**")) {
+      nodes.push(
+        <strong key={`${key}-strong-${index}`}>
+          {renderRichInline(token.slice(2, -2), `${key}-strong-${index}`)}
+        </strong>
+      );
+    } else if (token.startsWith("`") && token.endsWith("`")) {
+      nodes.push(<code key={`${key}-code-${index}`}>{token.slice(1, -1)}</code>);
+    } else {
+      const markdownLink = token.match(/^\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)$/);
+      const href = markdownLink ? markdownLink[2] : token;
+      const label = markdownLink ? markdownLink[1] : token;
+      nodes.push(
+        <a href={href} key={`${key}-link-${index}`} rel="noreferrer" target="_blank">
+          {label}
+        </a>
+      );
+    }
+    cursor = match.index + token.length;
+    index += 1;
+  }
+  if (cursor < text.length) {
+    nodes.push(text.slice(cursor));
+  }
+  return nodes;
+}
+
+function isConsoleCodeBlock(language: string, code: string) {
+  const normalized = language.trim().toLowerCase();
+  if (CONSOLE_LANGUAGES.has(normalized)) return true;
+  return /(^|\n)\s*(PS\s+[A-Z]:\\[^>]*>|[A-Z]:\\[^>]*>|[$#>]\s+)/i.test(code);
+}
+
 export default function CommandCenter() {
   const [status, setStatus] = useState<RuntimeStatus | null>(null);
   const [conversations, setConversations] = useState<ConversationItem[]>([]);
@@ -961,6 +1208,7 @@ export default function CommandCenter() {
   const [busy, setBusy] = useState(false);
   const [chatBusy, setChatBusy] = useState(false);
   const [chatTicker, setChatTicker] = useState(Date.now());
+  const [chatFiles, setChatFiles] = useState<File[]>([]);
   const [dispatcherBusy, setDispatcherBusy] = useState(false);
   const [cleanupBusy, setCleanupBusy] = useState(false);
   const [activeOperation, setActiveOperation] = useState<ActiveOperation | null>(null);
@@ -968,6 +1216,7 @@ export default function CommandCenter() {
   const [error, setError] = useState<string | null>(null);
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const voiceBaseInputRef = useRef("");
+  const chatFileInputRef = useRef<HTMLInputElement | null>(null);
   const transcriptRef = useRef<HTMLDivElement | null>(null);
   const vitalsRequestInFlightRef = useRef(false);
   const telemetryRequestInFlightRef = useRef(false);
@@ -1428,16 +1677,72 @@ export default function CommandCenter() {
     setVoiceInterim("");
   }
 
+  function addChatFiles(fileList: FileList | null) {
+    const nextFiles = Array.from(fileList ?? []);
+    if (!nextFiles.length) return;
+    setChatFiles((current) => {
+      const merged = [...current];
+      for (const file of nextFiles) {
+        const key = `${file.name}:${file.size}:${file.lastModified}`;
+        const exists = merged.some((item) => `${item.name}:${item.size}:${item.lastModified}` === key);
+        if (!exists) merged.push(file);
+      }
+      return merged.slice(0, 8);
+    });
+  }
+
+  function removeChatFile(index: number) {
+    setChatFiles((current) => current.filter((_, itemIndex) => itemIndex !== index));
+  }
+
+  async function uploadChatFiles(filesToUpload: File[]): Promise<ChatAttachment[]> {
+    const uploaded: ChatAttachment[] = [];
+    for (const file of filesToUpload) {
+      const formData = new FormData();
+      formData.append("file", file);
+      const response = await fetch(`${apiUrl()}/api/files/upload`, {
+        method: "POST",
+        body: formData
+      });
+      if (!response.ok) {
+        throw new Error(`${file.name}: ${response.status} ${response.statusText}`);
+      }
+      const result = (await response.json()) as { file: FileItem; chunks_indexed: number };
+      uploaded.push(fileItemToAttachment(result.file));
+      setFiles((current) => {
+        const withoutDuplicate = current.filter((item) => item.id !== result.file.id);
+        return [result.file, ...withoutDuplicate].slice(0, 8);
+      });
+    }
+    return uploaded;
+  }
+
+  function downloadChatMessage(line: ChatLine, index: number) {
+    if (typeof window === "undefined") return;
+    const content = line.role === "assistant" ? cleanAssistantText(line.content) : line.content;
+    const blob = new Blob([content], { type: "text/markdown;charset=utf-8" });
+    const url = window.URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `jarvis-response-${index + 1}.md`;
+    anchor.click();
+    window.URL.revokeObjectURL(url);
+  }
+
   async function submitChat() {
-    const message = input.trim();
+    const typedMessage = input.trim();
+    const filesToSend = chatFiles;
     const chatWindowId = activeChatWindow?.id;
-    if (!message || chatBusy || !chatWindowId) return;
+    if ((!typedMessage && filesToSend.length === 0) || chatBusy || !chatWindowId) return;
     const previousConversationId = activeChatWindow.conversationId;
-    const userId = randomId("msg");
-    const assistantId = randomId("msg");
-    const assistantStartedAt = Date.now();
+    let assistantId: string | null = null;
+    let assistantStartedAt = Date.now();
     let receivedDelta = false;
     setChatBusy(true);
+    let attachments: ChatAttachment[] = [];
+    const message = typedMessage || "Проанализируй вложенные файлы.";
+    const userId = randomId("msg");
+    assistantId = randomId("msg");
     updateChatWindow(chatWindowId, (window) => ({
       ...window,
       title: window.title === "Новый чат" || window.title === "Чат"
@@ -1446,7 +1751,7 @@ export default function CommandCenter() {
       input: "",
       lines: [
         ...window.lines,
-        { id: userId, role: "user", content: message },
+        { id: userId, role: "user", content: message, attachments },
         {
           id: assistantId,
           role: "assistant",
@@ -1457,13 +1762,27 @@ export default function CommandCenter() {
       ]
     }));
     try {
+      if (filesToSend.length) {
+        setActiveOperation({
+          title: "Загрузка вложений",
+          detail: filesToSend.map((file) => file.name).join(", ")
+        });
+        attachments = await uploadChatFiles(filesToSend);
+        setChatFiles([]);
+        updateChatWindow(chatWindowId, (window) => ({
+          ...window,
+          lines: window.lines.map((line) => (line.id === userId ? { ...line, attachments } : line))
+        }));
+        setActiveOperation(null);
+      }
       await streamApi(
         "/api/chat/stream",
         {
           message,
           conversation_id: previousConversationId,
           max_tokens: maxTokens,
-          mode: "auto"
+          mode: "auto",
+          attachments
         },
         (item) => {
           if (item.type === "meta" && item.conversation_id) {
@@ -1542,6 +1861,7 @@ export default function CommandCenter() {
       }));
     } finally {
       setChatBusy(false);
+      setActiveOperation(null);
     }
   }
 
@@ -1634,6 +1954,7 @@ export default function CommandCenter() {
             id: message.id,
             role: message.role,
             content: message.content,
+            attachments: attachmentsFromMetadata(message.metadata),
             durationMs: coerceDurationMs(message.metadata?.duration_ms),
             pending: false,
             startedAt: null
@@ -2797,7 +3118,7 @@ export default function CommandCenter() {
             className="chatPanel"
             id="dialog"
             aria-label="Диалог"
-            style={{ height: chatHeight }}
+            style={{ height: `clamp(380px, min(${chatHeight}px, calc(100vh - 320px)), ${chatHeight}px)` }}
           >
             <div className="panelHeader chatHeader">
               <h2>Диалог</h2>
@@ -2856,18 +3177,62 @@ export default function CommandCenter() {
                   <article className={`bubble ${line.role}`} key={line.id ?? `${line.role}-${index}`}>
                     <div className="bubbleMeta">
                       <span>{line.role}</span>
-                      {durationLabel && (
-                        <time className="bubbleTimer" dateTime={`PT${Math.max(0, coerceDurationMs(line.durationMs) ?? 0) / 1000}S`}>
-                          {durationLabel}
-                        </time>
-                      )}
+                      <div className="bubbleMetaRight">
+                        {durationLabel && (
+                          <time className="bubbleTimer" dateTime={`PT${Math.max(0, coerceDurationMs(line.durationMs) ?? 0) / 1000}S`}>
+                            {durationLabel}
+                          </time>
+                        )}
+                        {line.role === "assistant" && line.content.trim() && !line.pending && (
+                          <button
+                            className="bubbleAction"
+                            type="button"
+                            title="Скачать ответ как Markdown"
+                            aria-label="Скачать ответ как Markdown"
+                            onClick={() => downloadChatMessage(line, index)}
+                          >
+                            <Download size={13} />
+                          </button>
+                        )}
+                      </div>
                     </div>
-                    <p>{line.role === "assistant" ? cleanAssistantText(line.content) : line.content}</p>
+                    {renderRichMessage(line.content, line.role)}
+                    {line.attachments && line.attachments.length > 0 && (
+                      <div className="bubbleAttachments">
+                        {line.attachments.map((attachment) => (
+                          <a href={attachmentHref(attachment)} key={attachment.id} rel="noreferrer" target="_blank">
+                            <FileText size={13} />
+                            <span>{attachment.name}</span>
+                            {typeof attachment.size === "number" && <small>{formatBytes(attachment.size)}</small>}
+                          </a>
+                        ))}
+                      </div>
+                    )}
                   </article>
                 );
               })}
             </div>
             <form className="composer" onSubmit={sendChat}>
+              <div className="composerMain">
+                {chatFiles.length > 0 && (
+                  <div className="composerAttachments">
+                    {chatFiles.map((file, index) => (
+                      <span className="composerAttachment" key={`${file.name}-${file.size}-${file.lastModified}`}>
+                        <FileText size={13} />
+                        <span>{file.name}</span>
+                        <small>{formatBytes(file.size)}</small>
+                        <button
+                          type="button"
+                          title="Убрать файл"
+                          aria-label="Убрать файл"
+                          onClick={() => removeChatFile(index)}
+                        >
+                          <X size={12} />
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+                )}
               <textarea
                 aria-label="Сообщение"
                 value={input}
@@ -2876,7 +3241,27 @@ export default function CommandCenter() {
                 placeholder="JARVIS, оформи это как mission plan..."
                 rows={3}
               />
+              </div>
               <div className="composerSide">
+                <input
+                  ref={chatFileInputRef}
+                  className="srOnly"
+                  type="file"
+                  multiple
+                  onChange={(event) => {
+                    addChatFiles(event.target.files);
+                    event.currentTarget.value = "";
+                  }}
+                />
+                <button
+                  className="attachButton"
+                  type="button"
+                  title="Прикрепить файл"
+                  aria-label="Прикрепить файл"
+                  onClick={() => chatFileInputRef.current?.click()}
+                >
+                  <Paperclip size={16} />
+                </button>
                 <input
                   aria-label="Максимум токенов"
                   className="tokenInput"
@@ -2900,7 +3285,7 @@ export default function CommandCenter() {
                 <span className="srOnly" aria-live="polite">
                   {voiceState === "listening" ? voiceInterim || "Слушаю" : ""}
                 </span>
-                <button className="sendButton" type="submit" disabled={chatBusy || !input.trim()}>
+                <button className="sendButton" type="submit" disabled={chatBusy || (!input.trim() && chatFiles.length === 0)}>
                   {chatBusy ? <Loader2 className="spin" size={19} /> : <Send size={19} />}
                 </button>
               </div>

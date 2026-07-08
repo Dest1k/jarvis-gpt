@@ -12,12 +12,21 @@ class ApiEnvelope(BaseModel):
     error: str | None = None
 
 
+class ChatAttachment(BaseModel):
+    id: str = Field(min_length=1, max_length=120)
+    name: str = Field(min_length=1, max_length=500)
+    mime_type: str | None = Field(default=None, max_length=200)
+    size: int | None = Field(default=None, ge=0)
+    url: str | None = Field(default=None, max_length=1000)
+
+
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=20000)
     conversation_id: str | None = None
     mode: Literal["auto", "chat", "mission"] = "auto"
     temperature: float | None = Field(default=None, ge=0.0, le=2.0)
     max_tokens: int | None = Field(default=None, ge=1, le=8192)
+    attachments: list[ChatAttachment] = Field(default_factory=list, max_length=8)
 
 
 class ChatEvent(BaseModel):

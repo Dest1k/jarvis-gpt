@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 from fastapi import (
@@ -15,7 +16,7 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 
 from .agent import AgentRuntime
 from .approval_executor import ApprovalExecutor
@@ -452,6 +453,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
         mode=request.mode,
         temperature=request.temperature,
         max_tokens=request.max_tokens,
+        attachments=[item.model_dump() for item in request.attachments],
     )
 
 
@@ -464,6 +466,7 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
             mode=request.mode,
             temperature=request.temperature,
             max_tokens=request.max_tokens,
+            attachments=[item.model_dump() for item in request.attachments],
         ):
             yield f"{json.dumps(item, ensure_ascii=False)}\n".encode()
 
@@ -618,6 +621,17 @@ async def search_files(
     limit: int = Query(default=12, ge=1, le=50),
 ) -> list[FileChunkHit]:
     return app.state.storage.search_file_chunks(q, limit=limit)
+
+
+@app.get("/api/files/{file_id}/download")
+async def download_file(file_id: str) -> FileResponse:
+    item = app.state.storage.get_file(file_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="File not found")
+    path = Path(item["stored_path"])
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail="Stored file not found")
+    return FileResponse(path, filename=item["name"], media_type=item["mime_type"])
 
 
 @app.get("/api/files/{file_id}", response_model=FileItem)
