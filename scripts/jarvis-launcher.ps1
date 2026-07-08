@@ -14,6 +14,7 @@ param(
   [switch]$NoFrontend,
   [switch]$NoBridge,
   [switch]$Lan,
+  [switch]$LocalOnly,
   [switch]$WatchLlm,
   [switch]$BuildFrontend,
   [switch]$DevFrontend,
@@ -29,7 +30,7 @@ $LogDir = Join-Path $HomePath "logs\jarvis-gpt"
 $StateDir = Join-Path $HomePath "data\jarvis-gpt\state"
 $StateFile = Join-Path $StateDir "launcher-state.json"
 $BridgeTokenFile = Join-Path $HomePath ".jarvis\bridge.token"
-$script:LanMode = [bool]($Lan -or $Action -eq "lan")
+$script:LanMode = [bool]($Lan -or -not $LocalOnly)
 
 function Get-LanIPv4 {
   try {
@@ -1254,8 +1255,7 @@ function Open-CommandCenter {
 
 function Invoke-Menu {
   $main = @(
-    @{ Label = "Start full stack"; Value = "start"; Hint = "dispatcher + bridge + backend + UI" },
-    @{ Label = "Start LAN mode"; Value = "lan"; Hint = "UI/API on local network, bridge stays local" },
+    @{ Label = "Start full stack"; Value = "start"; Hint = "LAN default: dispatcher + bridge + backend + UI" },
     @{ Label = "Stop stack"; Value = "stop"; Hint = "stop UI/backend/bridge/dispatcher" },
     @{ Label = "Restart stack"; Value = "restart"; Hint = "stop then start" },
     @{ Label = "Status"; Value = "status"; Hint = "show service ports" },

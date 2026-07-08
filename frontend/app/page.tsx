@@ -2952,15 +2952,17 @@ export default function CommandCenter() {
                       {modelSearchResult.items.map((model) => (
                         <article className={`remoteModelRow ${fitTone(model.fit)}`} key={model.id}>
                           <Database size={15} />
-                          <div>
+                          <div className="remoteModelInfo">
                             <strong>{model.id}</strong>
                             <p>{model.pipeline_tag ?? model.tags.slice(0, 3).join(", ")}</p>
+                            <div className="remoteModelMeta">
+                              <span className={`fitPill ${fitTone(model.fit)}`}>{fitSummary(model.fit)}</span>
+                              <small>{formatBytes(model.size_bytes)} · {model.downloadable_files} файлов</small>
+                            </div>
                             {model.fit.warnings.slice(0, 1).map((warning) => (
                               <small key={warning}>{warning}</small>
                             ))}
                           </div>
-                          <span>{fitSummary(model.fit)}</span>
-                          <small>{formatBytes(model.size_bytes)} · {model.downloadable_files} файлов</small>
                           <button
                             type="button"
                             disabled={busy || model.downloadable_files === 0}

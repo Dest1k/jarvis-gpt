@@ -1427,7 +1427,39 @@ h3 {
 }
 
 .remoteModelRow {
-  grid-template-columns: 18px minmax(0, 1fr) minmax(118px, 0.5fr) minmax(86px, 0.4fr) 32px;
+  grid-template-columns: 18px minmax(0, 1fr) 32px;
+  align-items: start;
+}
+
+.remoteModelInfo {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.remoteModelMeta {
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px 6px;
+  margin-top: 3px;
+}
+
+.remoteModelMeta small {
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+.remoteModelRow .fitPill {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.remoteModelRow button {
+  align-self: center;
 }
 
 .remoteModelRow p,
@@ -1453,7 +1485,6 @@ h3 {
   border-color: rgba(193, 82, 75, 0.45);
 }
 
-.remoteModelRow > span,
 .fitPill,
 .downloadRow > span,
 .cleanupStrip > span {
