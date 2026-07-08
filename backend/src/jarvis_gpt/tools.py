@@ -345,6 +345,22 @@ class ToolRegistry:
                 handler=_filesystem_read_text,
             )
         )
+        self.add(
+            ToolSpec(
+                name="filesystem.write_text",
+                description=(
+                    "Write or append text below the repository or JARVIS_HOME after approval."
+                ),
+                category="filesystem",
+                input_schema={
+                    "path": "Path to write",
+                    "content": "UTF-8 text content",
+                    "mode": "overwrite or append",
+                },
+                handler=_filesystem_write_text,
+                danger_level="review",
+            )
+        )
 
 
 def _runtime_status(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunResponse:
@@ -768,6 +784,63 @@ def _filesystem_read_text(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResp
         ok=True,
         summary=f"Read {len(content)} character(s).",
         data={"path": str(path), "content": content, "truncated": path.stat().st_size > max_chars},
+    )
+
+
+def _filesystem_write_text(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    try:
+        path = _resolve_allowed_path(ctx.settings, str(args.get("path") or ""))
+    except ValueError as exc:
+        return ToolRunResponse(tool="filesystem.write_text", ok=False, summary=str(exc))
+    content = str(args.get("content") or "")
+    if not content:
+        return ToolRunResponse(
+            tool="filesystem.write_text",
+            ok=False,
+            summary="Content is required.",
+            data={"path": str(path)},
+        )
+    if len(content) > 200_000:
+        return ToolRunResponse(
+            tool="filesystem.write_text",
+            ok=False,
+            summary="Content is too large for the sandboxed write tool.",
+            data={"path": str(path), "chars": len(content), "max_chars": 200_000},
+        )
+    mode = str(args.get("mode") or "overwrite").strip().lower()
+    if mode not in {"overwrite", "append"}:
+        return ToolRunResponse(
+            tool="filesystem.write_text",
+            ok=False,
+            summary="Mode must be 'overwrite' or 'append'.",
+            data={"path": str(path), "mode": mode},
+        )
+    if path.exists() and path.is_dir():
+        return ToolRunResponse(
+            tool="filesystem.write_text",
+            ok=False,
+            summary=f"Path is a directory: {path}",
+            data={"path": str(path)},
+        )
+
+    previous_size = path.stat().st_size if path.exists() else 0
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if mode == "append":
+        with path.open("a", encoding="utf-8", newline="") as handle:
+            handle.write(content)
+    else:
+        path.write_text(content, encoding="utf-8", newline="")
+    return ToolRunResponse(
+        tool="filesystem.write_text",
+        ok=True,
+        summary=f"Wrote {len(content)} character(s) to sandboxed path.",
+        data={
+            "path": str(path),
+            "mode": mode,
+            "chars": len(content),
+            "previous_size": previous_size,
+            "size": path.stat().st_size,
+        },
     )
 
 
