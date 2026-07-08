@@ -26,5 +26,8 @@ def test_file_ingestor_indexes_text_and_records_audit(monkeypatch, tmp_path):
     assert storage.counters()["files"] == 1
     assert hits
     assert hits[0]["file_id"] == result["file"]["id"]
+    assert hits[0]["relevance"] > 0
+    assert hits[0]["matched_terms"] == ["architecture", "mission"]
+    assert "architecture notes" in hits[0]["snippet"]
     assert audit[0]["action"] == "file.ingest"
     storage.close()

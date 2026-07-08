@@ -32,11 +32,101 @@ def _loads(data: str | None, default: Any) -> Any:
         return default
 
 
+def _query_terms(query: str | None, *, limit: int = 12) -> list[str]:
+    if not query:
+        return []
+    terms: list[str] = []
+    seen: set[str] = set()
+    for token in re.findall(r"[\w-]+", query, flags=re.UNICODE):
+        clean = token.replace('"', "").replace("'", "").strip()
+        normalized = clean.casefold()
+        if not clean or normalized in seen:
+            continue
+        terms.append(clean)
+        seen.add(normalized)
+        if len(terms) >= limit:
+            break
+    return terms
+
+
 def _fts_query(query: str) -> str:
-    tokens = re.findall(r"[\w-]+", query, flags=re.UNICODE)
-    clean = [token.replace('"', "").replace("'", "") for token in tokens[:8]]
-    clean = [token for token in clean if token]
-    return " OR ".join(f'"{token}"' for token in clean)
+    return " OR ".join(f'"{term}"' for term in _query_terms(query, limit=8))
+
+
+def _decorate_memory_hit(row: dict[str, Any], query: str | None) -> dict[str, Any]:
+    tags = _loads(row.get("tags"), [])
+    terms = _query_terms(query)
+    searchable = " ".join(
+        [
+            str(row.get("namespace") or ""),
+            str(row.get("content") or ""),
+            " ".join(str(tag) for tag in tags),
+        ]
+    )
+    matched = _matched_terms(searchable, terms)
+    row["tags"] = tags
+    row["matched_terms"] = matched
+    row["snippet"] = _snippet(str(row.get("content") or ""), matched or terms)
+    row["relevance"] = _relevance(
+        row.get("rank"),
+        matched_terms=matched,
+        query_terms=terms,
+        importance=float(row.get("importance") or 0),
+    )
+    return row
+
+
+def _decorate_file_hit(row: dict[str, Any], query: str | None) -> dict[str, Any]:
+    terms = _query_terms(query)
+    searchable = " ".join([str(row.get("file_name") or ""), str(row.get("content") or "")])
+    matched = _matched_terms(searchable, terms)
+    row["matched_terms"] = matched
+    row["snippet"] = _snippet(str(row.get("content") or ""), matched or terms)
+    row["relevance"] = _relevance(
+        row.get("rank"),
+        matched_terms=matched,
+        query_terms=terms,
+        importance=0,
+    )
+    return row
+
+
+def _matched_terms(text: str, terms: list[str]) -> list[str]:
+    lowered = text.casefold()
+    return [term for term in terms if term.casefold() in lowered]
+
+
+def _snippet(text: str, terms: list[str], *, max_chars: int = 260) -> str:
+    cleaned = " ".join(text.split())
+    if len(cleaned) <= max_chars:
+        return cleaned
+    lowered = cleaned.casefold()
+    positions = [lowered.find(term.casefold()) for term in terms if term]
+    positions = [position for position in positions if position >= 0]
+    center = min(positions) if positions else 0
+    start = max(0, center - max_chars // 3)
+    end = min(len(cleaned), start + max_chars)
+    start = max(0, end - max_chars)
+    prefix = "..." if start > 0 else ""
+    suffix = "..." if end < len(cleaned) else ""
+    return f"{prefix}{cleaned[start:end]}{suffix}"
+
+
+def _relevance(
+    rank: Any,
+    *,
+    matched_terms: list[str],
+    query_terms: list[str],
+    importance: float,
+) -> float:
+    try:
+        raw_rank = float(rank)
+    except (TypeError, ValueError):
+        raw_rank = 3.0
+    rank_score = 1.0 / (1.0 + max(raw_rank, 0.0))
+    coverage = len(matched_terms) / len(query_terms) if query_terms else 0.0
+    score = (rank_score * 0.55) + (coverage * 0.35) + (max(0.0, min(1.0, importance)) * 0.10)
+    return round(max(0.0, min(1.0, score)), 4)
 
 
 class JarvisStorage:
@@ -364,7 +454,7 @@ class JarvisStorage:
                             """,
                             (match, limit),
                         ).fetchall()
-                    return [{**dict(row), "tags": _loads(row["tags"], [])} for row in rows]
+                    return [_decorate_memory_hit(dict(row), query) for row in rows]
                 except sqlite3.OperationalError:
                     pass
 
@@ -385,7 +475,7 @@ class JarvisStorage:
         """
         with self._lock:
             rows = self.connect().execute(sql, params).fetchall()
-        return [{**dict(row), "tags": _loads(row["tags"], [])} for row in rows]
+        return [_decorate_memory_hit(dict(row), query) for row in rows]
 
     def create_mission(self, *, title: str, goal: str, tasks: list[str]) -> dict[str, Any]:
         now = utc_now()
@@ -837,7 +927,7 @@ class JarvisStorage:
                             """,
                             (match, limit),
                         ).fetchall()
-                    return [dict(row) for row in rows]
+                    return [_decorate_file_hit(dict(row), query) for row in rows]
                 except sqlite3.OperationalError:
                     pass
 
@@ -861,7 +951,7 @@ class JarvisStorage:
                 """,
                 (like, like, limit),
             ).fetchall()
-        return [dict(row) for row in rows]
+        return [_decorate_file_hit(dict(row), query) for row in rows]
 
     def create_approval(
         self,

@@ -12,6 +12,7 @@
 - HITL approvals: опасные действия оформляются как durable approval gates, а не выполняются молча.
 - Telemetry/performance: CPU/RAM/disk/GPU/Docker snapshots, performance profile и host bridge status.
 - Self-learning tick: аудит, tool runs и approvals превращаются в долговременные lessons.
+- Retrieval adds normalized relevance, matched terms and snippets for memory/file context.
 - Autonomous supervisor: безопасный фоновой цикл собирает telemetry и запускает learning tick.
 - Исполнение следующего шага mission plan с прогрессом задач и журналом tool runs.
 - SQLite WAL-хранилище в `D:\jarvis\data\jarvis-gpt\state\jarvis.sqlite3`.
@@ -135,6 +136,7 @@ docker compose --profile llm up -d dispatcher
 - Native host bridge now has a bundled local RPC script, token detection, CLI execution, and a `danger` tool for approved host commands.
 - Safe tools include `web.fetch` for public HTTP(S) context with private-network and redirect guards.
 - Safe tools include read-only `docker.ps` and restricted `docker.logs` for Jarvis container diagnostics.
+- Memory and file retrieval now return relevance scores, matched terms, and clipped snippets for mission context.
 - Autonomous supervisor persists telemetry, learning lessons, and health snapshots on separate intervals.
 - Mission planner enriches plans with domain-specific UI, LLM, Docker/GPU, host bridge and performance steps.
 - HITL gates now have a whitelisted executor: approved gates can run dispatcher, diagnostics, learning, telemetry, memory, or registered tool actions.
@@ -144,6 +146,6 @@ docker compose --profile llm up -d dispatcher
 
 1. Подключить полноценный OpenAI-compatible Gemma dispatcher.
 2. Расширить tools runtime: sandbox, browser automation и Docker controls.
-3. Развернуть cognitive core: richer project tasks, retrieval ranking, health snapshots.
+3. Усилить cognitive core: feedback loops, task scheduling и richer retrieval ingestion.
 4. Добавить HITL-gates для опасных действий.
 5. Довести PWA/offline-слой и локальные browser tools после стабилизации голосового ввода.

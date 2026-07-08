@@ -114,6 +114,9 @@ type MemoryItem = {
   tags: string[];
   importance: number;
   rank?: number | null;
+  relevance?: number | null;
+  snippet?: string | null;
+  matched_terms?: string[];
 };
 
 type FileItem = {
@@ -139,6 +142,9 @@ type FileChunkHit = {
   content: string;
   created_at: string;
   rank?: number | null;
+  relevance?: number | null;
+  snippet?: string | null;
+  matched_terms?: string[];
 };
 
 type AuditEntry = {
@@ -1464,9 +1470,9 @@ export default function CommandCenter() {
                   <article className="fileMatch" key={hit.chunk_id}>
                     <div>
                       <strong>{hit.file_name}</strong>
-                      <span>#{hit.position}</span>
+                      <span>{Math.round((hit.relevance ?? 0) * 100)}%</span>
                     </div>
-                    <p>{hit.content}</p>
+                    <p>{hit.snippet ?? hit.content}</p>
                   </article>
                 ))}
               </div>
@@ -1491,7 +1497,7 @@ export default function CommandCenter() {
               {memories.slice(0, 5).map((memory) => (
                 <article className="memoryRow" key={memory.id}>
                   <strong>{memory.namespace}</strong>
-                  <p>{memory.content}</p>
+                  <p>{memory.snippet ?? memory.content}</p>
                 </article>
               ))}
             </div>

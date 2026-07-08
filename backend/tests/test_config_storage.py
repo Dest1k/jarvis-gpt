@@ -82,6 +82,9 @@ def test_storage_updates_task_progress_and_searches_memory(tmp_path):
     assert refreshed is not None
     assert refreshed["progress"] == 0.5
     assert memory["id"] in {item["id"] for item in hits}
+    assert hits[0]["relevance"] > 0
+    assert hits[0]["matched_terms"] == ["SQLite", "FTS"]
+    assert "SQLite FTS" in hits[0]["snippet"]
     storage.close()
 
 
