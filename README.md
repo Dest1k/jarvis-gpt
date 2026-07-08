@@ -137,6 +137,7 @@ docker compose --profile llm up -d dispatcher
 - Native host bridge now has a bundled local RPC script, token detection, CLI execution, and a `danger` tool for approved host commands.
 - Safe tools include `web.fetch` for public HTTP(S) context with private-network and redirect guards.
 - Safe tools include read-only `docker.ps` and restricted `docker.logs` for Jarvis container diagnostics.
+- Dispatcher status/logs are tools, while dispatcher start/stop are approval-gated tool actions.
 - `filesystem.write_text` is sandboxed to the repository or `D:\jarvis` and requires approval.
 - Memory and file retrieval now return relevance scores, matched terms, and clipped snippets for mission context.
 - Autonomous learning skips duplicate lessons and reports the skipped count in tick results.
@@ -148,7 +149,7 @@ docker compose --profile llm up -d dispatcher
 ## Линия развития
 
 1. Подключить полноценный OpenAI-compatible Gemma dispatcher.
-2. Расширить tools runtime: browser automation и gated Docker actions.
+2. Расширить tools runtime: browser automation и richer Docker policy.
 3. Усилить cognitive core: feedback loops, task scheduling и richer retrieval ingestion.
 4. Добавить HITL-gates для опасных действий.
 5. Довести PWA/offline-слой и локальные browser tools после стабилизации голосового ввода.

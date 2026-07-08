@@ -17,6 +17,7 @@ import httpx
 
 from .config import JarvisSettings
 from .diagnostics import run_diagnostics
+from .dispatcher import DispatcherManager
 from .host_bridge import HostBridgeClient, HostBridgeStatus
 from .learning import LearningEngine
 from .llm import LLMRouter
@@ -211,6 +212,44 @@ class ToolRegistry:
                 category="docker",
                 input_schema={"container": "Jarvis container name", "tail": "Maximum log lines"},
                 handler=_docker_logs,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="dispatcher.status",
+                description="Inspect the OpenAI-compatible model dispatcher and Docker container.",
+                category="docker",
+                input_schema={},
+                handler=_dispatcher_status,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="dispatcher.logs",
+                description="Read a small Docker Compose log tail for the model dispatcher.",
+                category="docker",
+                input_schema={},
+                handler=_dispatcher_logs,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="dispatcher.start",
+                description="Start the model dispatcher through Docker Compose after approval.",
+                category="docker",
+                input_schema={},
+                handler=_dispatcher_start,
+                danger_level="review",
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="dispatcher.stop",
+                description="Stop the model dispatcher through Docker Compose after approval.",
+                category="docker",
+                input_schema={},
+                handler=_dispatcher_stop,
+                danger_level="review",
             )
         )
         self.add(
@@ -486,6 +525,48 @@ def _docker_logs(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
             "stderr": result["stderr"],
             "command": result["command"],
         },
+    )
+
+
+def _dispatcher_status(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunResponse:
+    status = DispatcherManager(ctx.settings).status()
+    return ToolRunResponse(
+        tool="dispatcher.status",
+        ok=bool(status.get("docker_available")),
+        summary="Dispatcher status collected."
+        if status.get("docker_available")
+        else "Docker is not available in PATH.",
+        data=status,
+    )
+
+
+def _dispatcher_logs(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunResponse:
+    result = DispatcherManager(ctx.settings).run_compose("logs")
+    return ToolRunResponse(
+        tool="dispatcher.logs",
+        ok=bool(result.get("ok")),
+        summary=str(result.get("summary") or "Dispatcher logs collected."),
+        data=result,
+    )
+
+
+def _dispatcher_start(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunResponse:
+    result = DispatcherManager(ctx.settings).run_compose("up")
+    return ToolRunResponse(
+        tool="dispatcher.start",
+        ok=bool(result.get("ok")),
+        summary=str(result.get("summary") or "Dispatcher start requested."),
+        data=result,
+    )
+
+
+def _dispatcher_stop(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunResponse:
+    result = DispatcherManager(ctx.settings).run_compose("down")
+    return ToolRunResponse(
+        tool="dispatcher.stop",
+        ok=bool(result.get("ok")),
+        summary=str(result.get("summary") or "Dispatcher stop requested."),
+        data=result,
     )
 
 

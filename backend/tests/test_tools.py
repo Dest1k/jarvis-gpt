@@ -242,3 +242,45 @@ def test_docker_logs_restricts_non_jarvis_containers(monkeypatch, tmp_path):
     assert result.ok is False
     assert "restricted" in result.summary
     storage.close()
+
+
+def test_dispatcher_tools_are_safe_or_gated(monkeypatch, tmp_path):
+    class FakeDispatcher:
+        def __init__(self, _settings):
+            pass
+
+        def status(self):
+            return {"docker_available": True, "port_open": True}
+
+        def run_compose(self, action):
+            return {
+                "ok": True,
+                "summary": f"dispatcher {action}",
+                "stdout": "ok",
+                "stderr": "",
+                "command": ["docker", "compose", action],
+            }
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr("jarvis_gpt.tools.DispatcherManager", FakeDispatcher)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    info = {tool.name: tool for tool in tools.list()}
+    status = asyncio.run(tools.run("dispatcher.status", {}))
+    logs = asyncio.run(tools.run("dispatcher.logs", {}))
+    blocked = asyncio.run(tools.run("dispatcher.start", {}))
+    started = asyncio.run(tools.run("dispatcher.start", {}, allow_danger=True))
+
+    assert info["dispatcher.start"].danger_level == "review"
+    assert status.ok is True
+    assert logs.ok is True
+    assert blocked.ok is False
+    assert "requires approval" in blocked.summary
+    assert started.ok is True
+    assert started.summary == "dispatcher up"
+    storage.close()
