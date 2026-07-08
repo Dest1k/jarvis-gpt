@@ -39,6 +39,8 @@ const API_URL = process.env.NEXT_PUBLIC_JARVIS_API_URL ?? "http://localhost:8000
 const CHAT_WINDOWS_KEY = "jarvis-gpt.chatWindows.v1";
 const CHAT_SETTINGS_KEY = "jarvis-gpt.chatSettings.v1";
 const DEFAULT_CHAT_HEIGHT = 680;
+const DEFAULT_CHAT_WINDOW_ID = "chat-default";
+const BOOT_MESSAGE = "Центр управления JARVIS GPT готов к подключению.";
 const LIVE_TELEMETRY_INTERVAL_MS = 1000;
 const BACKGROUND_TELEMETRY_INTERVAL_MS = 3000;
 const VITAL_STATUS_INTERVAL_MS = 3000;
@@ -116,6 +118,7 @@ type StoredChatWindows = {
 
 type StoredChatSettings = {
   activeTab?: CommandTab;
+  chatSideTab?: ChatSideTab;
   chatHeight?: number;
   maxTokens?: number;
 };
@@ -425,6 +428,15 @@ type CommandTab =
   | "resources"
   | "audit";
 
+const CHAT_SIDE_TABS = ["status", "missions", "approvals", "briefing", "history"] as const;
+
+type ChatSideTab = (typeof CHAT_SIDE_TABS)[number];
+
+type ActiveOperation = {
+  title: string;
+  detail?: string;
+};
+
 type ToolInfo = {
   name: string;
   description: string;
@@ -569,7 +581,7 @@ function bootLines(): ChatLine[] {
     {
       id: "system-boot",
       role: "system",
-      content: "JARVIS GPT Command Center готов к подключению."
+      content: BOOT_MESSAGE
     }
   ];
 }
@@ -592,8 +604,26 @@ function createChatWindow(title = "Новый чат"): ChatWindow {
   };
 }
 
+function createInitialChatWindow(): ChatWindow {
+  return {
+    id: DEFAULT_CHAT_WINDOW_ID,
+    title: "Новый чат",
+    conversationId: null,
+    input: "",
+    lines: bootLines(),
+    createdAt: 0
+  };
+}
+
+function normalizeStoredLine(line: ChatLine): ChatLine {
+  if (line.id === "system-boot" && line.content.includes("Command Center")) {
+    return { ...line, content: BOOT_MESSAGE };
+  }
+  return line;
+}
+
 function readStoredChatWindows(): { windows: ChatWindow[]; activeId: string } {
-  const fallback = createChatWindow();
+  const fallback = createInitialChatWindow();
   if (typeof window === "undefined") {
     return { windows: [fallback], activeId: fallback.id };
   }
@@ -607,7 +637,10 @@ function readStoredChatWindows(): { windows: ChatWindow[]; activeId: string } {
         title: item.title || "Чат",
         input: item.input || "",
         conversationId: item.conversationId ?? null,
-        lines: Array.isArray(item.lines) && item.lines.length ? item.lines : bootLines(),
+        lines:
+          Array.isArray(item.lines) && item.lines.length
+            ? item.lines.map(normalizeStoredLine)
+            : bootLines(),
         createdAt: Number(item.createdAt) || Date.now()
       }));
     if (windows.length) {
@@ -633,9 +666,49 @@ function readStoredChatSettings(): StoredChatSettings {
   }
 }
 
+function normalizeChatSideTab(value: unknown): ChatSideTab {
+  return CHAT_SIDE_TABS.includes(value as ChatSideTab) ? (value as ChatSideTab) : "status";
+}
+
 function clampChatHeight(value: number) {
   if (!Number.isFinite(value)) return DEFAULT_CHAT_HEIGHT;
   return Math.max(460, Math.min(1200, Math.round(value)));
+}
+
+function compactText(value: string | null | undefined, maxLength = 72) {
+  const cleaned = (value ?? "").replace(/\s+/g, " ").trim();
+  if (cleaned.length <= maxLength) return cleaned;
+  return `${cleaned.slice(0, maxLength - 1)}…`;
+}
+
+function runtimeStateLabel(value: string | null | undefined) {
+  const normalized = (value ?? "").toLowerCase();
+  const labels: Record<string, string> = {
+    active: "активен",
+    allowed: "разрешён",
+    blocked: "заблокирован",
+    created: "создан",
+    disabled: "выключена",
+    exited: "остановлен",
+    loading: "загрузка",
+    none: "нет",
+    offline: "офлайн",
+    online: "онлайн",
+    ready: "готово",
+    running: "работает",
+    "container-missing": "контейнер не найден",
+    "port open": "порт открыт"
+  };
+  return labels[normalized] ?? value ?? "нет данных";
+}
+
+function communicationStyleLabel(value: string | null | undefined) {
+  const labels: Record<string, string> = {
+    concise: "кратко",
+    balanced: "сбалансированно",
+    detailed: "подробно"
+  };
+  return labels[value ?? ""] ?? value ?? "кратко";
 }
 
 function titleFromMessage(message: string) {
@@ -686,18 +759,13 @@ export default function CommandCenter() {
   const [routineRun, setRoutineRun] = useState<RoutineRun | null>(null);
   const [directoryDraft, setDirectoryDraft] = useState("D:\\jarvis");
   const [directoryIngest, setDirectoryIngest] = useState<DirectoryIngestResult | null>(null);
-  const [activeTab, setActiveTab] = useState<CommandTab>(() => {
-    const stored = readStoredChatSettings().activeTab;
-    return stored ?? "chat";
-  });
-  const [chatHeight, setChatHeight] = useState(() =>
-    clampChatHeight(readStoredChatSettings().chatHeight ?? DEFAULT_CHAT_HEIGHT)
-  );
-  const [{ windows: initialChatWindows, activeId: initialChatWindowId }] = useState(
-    readStoredChatWindows
-  );
-  const [chatWindows, setChatWindows] = useState<ChatWindow[]>(initialChatWindows);
-  const [activeChatWindowId, setActiveChatWindowId] = useState(initialChatWindowId);
+  const [activeTab, setActiveTab] = useState<CommandTab>("chat");
+  const [chatSideTab, setChatSideTab] = useState<ChatSideTab>("status");
+  const [chatHeight, setChatHeight] = useState(DEFAULT_CHAT_HEIGHT);
+  const [chatWindows, setChatWindows] = useState<ChatWindow[]>(() => [
+    createInitialChatWindow()
+  ]);
+  const [activeChatWindowId, setActiveChatWindowId] = useState(DEFAULT_CHAT_WINDOW_ID);
   const [approvals, setApprovals] = useState<ApprovalItem[]>([]);
   const [voiceAvailable, setVoiceAvailable] = useState(false);
   const [voiceState, setVoiceState] = useState<VoiceState>("idle");
@@ -708,12 +776,12 @@ export default function CommandCenter() {
   const [webUrlDraft, setWebUrlDraft] = useState("");
   const [webFetchResult, setWebFetchResult] = useState<ToolRunResult | null>(null);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
-  const [maxTokens, setMaxTokens] = useState(() =>
-    clampMaxTokens(readStoredChatSettings().maxTokens ?? 512)
-  );
+  const [maxTokens, setMaxTokens] = useState(512);
   const [busy, setBusy] = useState(false);
   const [chatBusy, setChatBusy] = useState(false);
   const [dispatcherBusy, setDispatcherBusy] = useState(false);
+  const [activeOperation, setActiveOperation] = useState<ActiveOperation | null>(null);
+  const [storageReady, setStorageReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const voiceBaseInputRef = useRef("");
@@ -892,6 +960,18 @@ export default function CommandCenter() {
   }, [refresh]);
 
   useEffect(() => {
+    const settings = readStoredChatSettings();
+    setActiveTab(settings.activeTab ?? "chat");
+    setChatSideTab(normalizeChatSideTab(settings.chatSideTab));
+    setChatHeight(clampChatHeight(settings.chatHeight ?? DEFAULT_CHAT_HEIGHT));
+    setMaxTokens(clampMaxTokens(settings.maxTokens ?? 512));
+    const storedWindows = readStoredChatWindows();
+    setChatWindows(storedWindows.windows);
+    setActiveChatWindowId(storedWindows.activeId);
+    setStorageReady(true);
+  }, []);
+
+  useEffect(() => {
     const interval = window.setInterval(() => {
       void refreshVitals();
     }, VITAL_STATUS_INTERVAL_MS);
@@ -920,11 +1000,12 @@ export default function CommandCenter() {
   }, [refreshLiveTelemetry]);
 
   useEffect(() => {
+    if (!storageReady) return;
     localStorage.setItem(
       CHAT_SETTINGS_KEY,
-      JSON.stringify({ activeTab, chatHeight, maxTokens })
+      JSON.stringify({ activeTab, chatSideTab, chatHeight, maxTokens })
     );
-  }, [activeTab, chatHeight, maxTokens]);
+  }, [activeTab, chatSideTab, chatHeight, maxTokens, storageReady]);
 
   useEffect(() => {
     const node = transcriptRef.current;
@@ -936,6 +1017,7 @@ export default function CommandCenter() {
   }, [activeChatWindowId, lines.length, latestLine?.content]);
 
   useEffect(() => {
+    if (!storageReady) return;
     const compactWindows = chatWindows.slice(0, 8).map((window) => ({
       ...window,
       lines: window.lines.slice(-120)
@@ -944,7 +1026,7 @@ export default function CommandCenter() {
       CHAT_WINDOWS_KEY,
       JSON.stringify({ activeId: activeChatWindowId, windows: compactWindows })
     );
-  }, [activeChatWindowId, chatWindows]);
+  }, [activeChatWindowId, chatWindows, storageReady]);
 
   useEffect(() => {
     setVoiceAvailable(Boolean(speechRecognitionConstructor()));
@@ -992,21 +1074,104 @@ export default function CommandCenter() {
   const gpuUtilization = Math.round(primaryGpu?.utilization_gpu ?? 0);
   const vramUsage = ratioPercent(primaryGpu?.memory_used_ratio);
   const llmState = llmReady ? "ready" : dispatcher?.port_open ? "loading" : "offline";
+  const dispatcherPhaseLabel = runtimeStateLabel(dispatcherPhase);
+  const dispatcherModeLabel = dispatcherRuntime
+    ? dispatcherRuntime.enforce_eager
+      ? "eager"
+      : "CUDA graph"
+    : "нет данных";
   const llmStatusText = llmReady
-    ? "LLM ready"
+    ? "LLM готова"
     : dispatcher?.port_open
-      ? dispatcherPhase
-      : "LLM offline";
+      ? dispatcherPhaseLabel
+      : "LLM выключена";
+  const latestUserPrompt = useMemo(
+    () => [...lines].reverse().find((line) => line.role === "user")?.content ?? "",
+    [lines]
+  );
+  const modelActivity = useMemo(() => {
+    if (chatBusy) {
+      return {
+        label: "Отвечает",
+        detail: compactText(latestUserPrompt || "формирует ответ в текущем диалоге"),
+        tone: "warn" as const
+      };
+    }
+    if (dispatcherBusy) {
+      return {
+        label: "Система",
+        detail: activeOperation?.detail ?? "управление LLM dispatcher",
+        tone: "warn" as const
+      };
+    }
+    if (activeOperation) {
+      return {
+        label: activeOperation.title,
+        detail: compactText(activeOperation.detail ?? "выполняет системную операцию"),
+        tone: "warn" as const
+      };
+    }
+    if (!status?.settings.llm.enabled) {
+      return {
+        label: "Отключена",
+        detail: compactText(dispatcherModelId),
+        tone: "warn" as const
+      };
+    }
+    if (!dispatcher?.port_open) {
+      return {
+        label: "Не запущена",
+        detail: dispatcherPhaseLabel,
+        tone: "warn" as const
+      };
+    }
+    if (!llmReady) {
+      return {
+        label: "Прогревается",
+        detail: dispatcherPhaseLabel,
+        tone: "warn" as const
+      };
+    }
+    return {
+      label: "Готова",
+      detail: "ждёт новую задачу",
+      tone: "ok" as const
+    };
+  }, [
+    activeOperation,
+    chatBusy,
+    dispatcher?.port_open,
+    dispatcherBusy,
+    dispatcherModelId,
+    dispatcherPhaseLabel,
+    latestUserPrompt,
+    llmReady,
+    status?.settings.llm.enabled
+  ]);
   const activeTabTitle: Record<CommandTab, string> = {
-    chat: "Command Hub",
-    runtime: "Runtime",
-    models: "Models",
-    memory: "Memory",
-    files: "Files",
-    diagnostics: "Diagnostics",
-    resources: "Resources",
-    audit: "Audit"
+    chat: "Диалог",
+    runtime: "Система",
+    models: "Модели",
+    memory: "Память",
+    files: "Файлы",
+    diagnostics: "Диагностика",
+    resources: "Ресурсы",
+    audit: "Аудит"
   };
+  const chatSideTabTitle: Record<ChatSideTab, string> = {
+    status: "Состояние",
+    missions: "Миссии",
+    approvals: "Допуски",
+    briefing: "Сводка",
+    history: "История"
+  };
+  const chatSideTabs: Array<{ id: ChatSideTab; label: string; badge: string }> = [
+    { id: "status", label: "Состояние", badge: llmReady ? "OK" : "..." },
+    { id: "missions", label: "Миссии", badge: `${missions.length}` },
+    { id: "approvals", label: "Допуски", badge: `${activeApprovals.length}` },
+    { id: "briefing", label: "Сводка", badge: autonomyPolicy?.mode ?? "..." },
+    { id: "history", label: "История", badge: `${conversations.length}` }
+  ];
 
   function startVoiceInput() {
     const Recognition = speechRecognitionConstructor();
@@ -1043,7 +1208,7 @@ export default function CommandCenter() {
       setVoiceState("idle");
       setVoiceInterim("");
       recognitionRef.current = null;
-      setError("Voice input stopped with an error");
+      setError("Голосовой ввод остановился с ошибкой");
     };
     recognition.onend = () => {
       setVoiceState("idle");
@@ -1056,7 +1221,7 @@ export default function CommandCenter() {
       setVoiceState("idle");
       setVoiceInterim("");
       recognitionRef.current = null;
-      setError(err instanceof Error ? err.message : "Voice input could not start");
+      setError(err instanceof Error ? err.message : "Не удалось запустить голосовой ввод");
     }
   }
 
@@ -1134,7 +1299,7 @@ export default function CommandCenter() {
               ...window,
               lines: window.lines.map((line) =>
                 line.id === assistantId
-                  ? { ...line, content: item.error ?? "Streaming error" }
+                  ? { ...line, content: item.error ?? "Ошибка потока ответа" }
                   : line
               )
             }));
@@ -1149,7 +1314,7 @@ export default function CommandCenter() {
           line.id === assistantId
             ? {
                 ...line,
-                content: err instanceof Error ? `Backend error: ${err.message}` : "Backend error"
+                content: err instanceof Error ? `Ошибка backend: ${err.message}` : "Ошибка backend"
               }
             : line
         )
@@ -1209,7 +1374,7 @@ export default function CommandCenter() {
       await api<{ ok: boolean }>(`/api/conversations/${idToDelete}`, { method: "DELETE" });
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Conversation clear failed");
+      setError(err instanceof Error ? err.message : "Не удалось очистить диалог");
     }
   }
 
@@ -1228,10 +1393,14 @@ export default function CommandCenter() {
   }
 
   async function loadConversation(id: string) {
+    const conversation = conversations.find((item) => item.id === id);
+    setActiveOperation({
+      title: "Загрузка диалога",
+      detail: conversation?.title ?? id
+    });
     setBusy(true);
     try {
       const messages = await api<MessageItem[]>(`/api/conversations/${id}/messages?limit=120`);
-      const conversation = conversations.find((item) => item.id === id);
       setConversationId(id);
       updateActiveChatWindow((window) => ({
         ...window,
@@ -1247,13 +1416,18 @@ export default function CommandCenter() {
           }))
       );
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Conversation load failed");
+      setError(err instanceof Error ? err.message : "Не удалось загрузить диалог");
     } finally {
       setBusy(false);
+      setActiveOperation(null);
     }
   }
 
   async function runDiagnostics() {
+    setActiveOperation({
+      title: "Диагностика",
+      detail: "полная проверка runtime, LLM и системных мостов"
+    });
     setBusy(true);
     try {
       const result = await api<{ checks: DiagnosticCheck[] }>("/api/diagnostics", {
@@ -1266,10 +1440,15 @@ export default function CommandCenter() {
       setError(err instanceof Error ? err.message : "Диагностика не ответила");
     } finally {
       setBusy(false);
+      setActiveOperation(null);
     }
   }
 
   async function runSelfHeal() {
+    setActiveOperation({
+      title: "Самовосстановление",
+      detail: "поиск и исправление проблем окружения"
+    });
     setBusy(true);
     try {
       const report = await api<SelfHealReport>("/api/self-heal", {
@@ -1279,17 +1458,22 @@ export default function CommandCenter() {
       setSelfHealReport(report);
       setLines((current) => [
         ...current,
-        { role: "system", content: `Self-heal: ${report.summary}` }
+        { role: "system", content: `Самовосстановление: ${report.summary}` }
       ]);
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Self-heal scan failed");
+      setError(err instanceof Error ? err.message : "Самовосстановление не завершилось");
     } finally {
       setBusy(false);
+      setActiveOperation(null);
     }
   }
 
   async function runBenchmark() {
+    setActiveOperation({
+      title: "Бенчмарк",
+      detail: "замер скорости backend, dispatcher и LLM"
+    });
     setBusy(true);
     try {
       const report = await api<BenchmarkReport>("/api/benchmark", {
@@ -1299,17 +1483,22 @@ export default function CommandCenter() {
       setBenchmarkReport(report);
       setLines((current) => [
         ...current,
-        { role: "system", content: `Benchmark: ${report.summary}` }
+        { role: "system", content: `Бенчмарк: ${report.summary}` }
       ]);
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Benchmark failed");
+      setError(err instanceof Error ? err.message : "Бенчмарк не завершился");
     } finally {
       setBusy(false);
+      setActiveOperation(null);
     }
   }
 
   async function updatePolicyMode(mode: AutonomyPolicy["mode"]) {
+    setActiveOperation({
+      title: "Политика автономии",
+      detail: `переключение режима: ${mode}`
+    });
     setBusy(true);
     try {
       const updated = await api<AutonomyPolicy>("/api/autonomy/policy", {
@@ -1319,14 +1508,19 @@ export default function CommandCenter() {
       setAutonomyPolicy(updated);
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Policy update failed");
+      setError(err instanceof Error ? err.message : "Не удалось обновить политику автономии");
     } finally {
       setBusy(false);
+      setActiveOperation(null);
     }
   }
 
   async function savePreferences(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    setActiveOperation({
+      title: "Настройки",
+      detail: "сохранение предпочтений оператора"
+    });
     setBusy(true);
     try {
       const updated = await api<RuntimePreferences>("/api/preferences", {
@@ -1341,13 +1535,18 @@ export default function CommandCenter() {
       });
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Preferences save failed");
+      setError(err instanceof Error ? err.message : "Не удалось сохранить настройки");
     } finally {
       setBusy(false);
+      setActiveOperation(null);
     }
   }
 
   async function updateBrowserPolicyMode(mode: BrowserPolicy["mode"]) {
+    setActiveOperation({
+      title: "Политика браузера",
+      detail: `переключение режима: ${mode}`
+    });
     setBusy(true);
     try {
       const updated = await api<BrowserPolicy>("/api/browser/policy", {
@@ -1357,13 +1556,18 @@ export default function CommandCenter() {
       setBrowserPolicy(updated);
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Browser policy update failed");
+      setError(err instanceof Error ? err.message : "Не удалось обновить политику браузера");
     } finally {
       setBusy(false);
+      setActiveOperation(null);
     }
   }
 
   async function updateDockerTail(maxLogTail: number) {
+    setActiveOperation({
+      title: "Docker",
+      detail: `обновление хвоста логов: ${maxLogTail}`
+    });
     setBusy(true);
     try {
       const updated = await api<DockerPolicy>("/api/docker/policy", {
@@ -1373,13 +1577,18 @@ export default function CommandCenter() {
       setDockerPolicy(updated);
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Docker policy update failed");
+      setError(err instanceof Error ? err.message : "Не удалось обновить политику Docker");
     } finally {
       setBusy(false);
+      setActiveOperation(null);
     }
   }
 
   async function createAutonomyJob(kind: AutonomyJob["kind"]) {
+    setActiveOperation({
+      title: "Автономная задача",
+      detail: `создание задачи: ${kind}`
+    });
     setBusy(true);
     try {
       const created = await api<AutonomyJob>("/api/autonomy/jobs", {
@@ -1394,13 +1603,19 @@ export default function CommandCenter() {
       setAutonomyJobs((current) => [created, ...current].slice(0, 10));
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Autonomy job create failed");
+      setError(err instanceof Error ? err.message : "Не удалось создать автономную задачу");
     } finally {
       setBusy(false);
+      setActiveOperation(null);
     }
   }
 
   async function runAutonomyJob(jobId: string) {
+    const jobTitle = autonomyJobs.find((job) => job.id === jobId)?.title ?? jobId;
+    setActiveOperation({
+      title: "Автономная задача",
+      detail: jobTitle
+    });
     setBusy(true);
     try {
       const result = await api<{ job: AutonomyJob; summary: string }>(
@@ -1412,17 +1627,23 @@ export default function CommandCenter() {
       );
       setLines((current) => [
         ...current,
-        { role: "system", content: `Autonomy job: ${result.summary}` }
+        { role: "system", content: `Автономная задача: ${result.summary}` }
       ]);
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Autonomy job run failed");
+      setError(err instanceof Error ? err.message : "Не удалось запустить автономную задачу");
     } finally {
       setBusy(false);
+      setActiveOperation(null);
     }
   }
 
   async function runRoutine(routineId: string) {
+    const routineTitle = routines.find((routine) => routine.id === routineId)?.title ?? routineId;
+    setActiveOperation({
+      title: "Сценарий",
+      detail: routineTitle
+    });
     setBusy(true);
     try {
       const result = await api<RoutineRun>(`/api/routines/${routineId}/run`, {
@@ -1432,13 +1653,14 @@ export default function CommandCenter() {
       setRoutineRun(result);
       setLines((current) => [
         ...current,
-        { role: "system", content: `Routine: ${result.summary}` }
+        { role: "system", content: `Сценарий: ${result.summary}` }
       ]);
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Routine run failed");
+      setError(err instanceof Error ? err.message : "Не удалось выполнить сценарий");
     } finally {
       setBusy(false);
+      setActiveOperation(null);
     }
   }
 
@@ -1446,6 +1668,10 @@ export default function CommandCenter() {
     event.preventDefault();
     const path = directoryDraft.trim();
     if (!path || busy) return;
+    setActiveOperation({
+      title: "Индексация папки",
+      detail: path
+    });
     setBusy(true);
     try {
       const result = await api<DirectoryIngestResult>("/api/files/ingest-directory", {
@@ -1457,19 +1683,25 @@ export default function CommandCenter() {
         ...current,
         {
           role: "system",
-          content: `Directory ingest: ${result.files_indexed}/${result.files_seen} indexed`
+          content: `Индексация папки: ${result.files_indexed}/${result.files_seen} файлов`
         }
       ]);
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Directory ingest failed");
+      setError(err instanceof Error ? err.message : "Не удалось проиндексировать папку");
     } finally {
       setBusy(false);
+      setActiveOperation(null);
     }
   }
 
   async function runDispatcherAction(action: "start" | "stop" | "logs") {
     if (dispatcherBusy) return;
+    const actionLabel = action === "start" ? "запуск" : action === "stop" ? "остановка" : "чтение логов";
+    setActiveOperation({
+      title: "LLM runtime",
+      detail: `dispatcher: ${actionLabel}`
+    });
     setDispatcherBusy(true);
     try {
       const result = await api<DispatcherAction>(`/api/dispatcher/${action}`, {
@@ -1487,13 +1719,20 @@ export default function CommandCenter() {
       ]);
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Dispatcher action failed");
+      setError(err instanceof Error ? err.message : "Действие dispatcher не выполнено");
     } finally {
       setDispatcherBusy(false);
+      setActiveOperation(null);
     }
   }
 
   async function executeNextMissionStep(missionId: string) {
+    const mission = missions.find((item) => item.id === missionId);
+    const nextTask = mission?.tasks.find((task) => task.status !== "done");
+    setActiveOperation({
+      title: "Шаг миссии",
+      detail: nextTask?.title ?? mission?.title ?? missionId
+    });
     setBusy(true);
     try {
       const response = await api<MissionExecution>(`/api/missions/${missionId}/execute-next`, {
@@ -1512,13 +1751,21 @@ export default function CommandCenter() {
       ]);
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Mission step failed");
+      setError(err instanceof Error ? err.message : "Шаг миссии не выполнен");
     } finally {
       setBusy(false);
+      setActiveOperation(null);
     }
   }
 
   async function updateTaskStatus(missionId: string, taskId: string, statusValue: string) {
+    const task = missions
+      .find((mission) => mission.id === missionId)
+      ?.tasks.find((item) => item.id === taskId);
+    setActiveOperation({
+      title: "Статус задачи",
+      detail: `${task?.title ?? taskId}: ${statusValue}`
+    });
     setBusy(true);
     try {
       const updated = await api<MissionTask>(`/api/missions/${missionId}/tasks/${taskId}`, {
@@ -1537,9 +1784,10 @@ export default function CommandCenter() {
       );
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Task update failed");
+      setError(err instanceof Error ? err.message : "Не удалось обновить задачу");
     } finally {
       setBusy(false);
+      setActiveOperation(null);
     }
   }
 
@@ -1547,6 +1795,10 @@ export default function CommandCenter() {
     event.preventDefault();
     const content = memoryDraft.trim();
     if (!content || busy) return;
+    setActiveOperation({
+      title: "Память",
+      detail: content
+    });
     setBusy(true);
     try {
       const saved = await api<MemoryItem>("/api/memory", {
@@ -1562,9 +1814,10 @@ export default function CommandCenter() {
       setMemories((current) => [saved, ...current].slice(0, 8));
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Memory save failed");
+      setError(err instanceof Error ? err.message : "Не удалось сохранить память");
     } finally {
       setBusy(false);
+      setActiveOperation(null);
     }
   }
 
@@ -1574,6 +1827,10 @@ export default function CommandCenter() {
     const form = event.currentTarget;
     const formData = new FormData();
     formData.append("file", selectedFile);
+    setActiveOperation({
+      title: "Индексация файла",
+      detail: selectedFile.name
+    });
     setBusy(true);
     try {
       const response = await fetch(`${API_URL}/api/files/upload`, {
@@ -1591,14 +1848,15 @@ export default function CommandCenter() {
         ...current,
         {
           role: "system",
-          content: `Файл загружен: ${result.file.name} (${result.chunks_indexed} chunks)`
+          content: `Файл загружен: ${result.file.name} (${result.chunks_indexed} фрагментов)`
         }
       ]);
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "File upload failed");
+      setError(err instanceof Error ? err.message : "Не удалось загрузить файл");
     } finally {
       setBusy(false);
+      setActiveOperation(null);
     }
   }
 
@@ -1609,6 +1867,10 @@ export default function CommandCenter() {
       setFileHits([]);
       return;
     }
+    setActiveOperation({
+      title: "Поиск по файлам",
+      detail: query
+    });
     setBusy(true);
     try {
       const hits = await api<FileChunkHit[]>(
@@ -1616,13 +1878,19 @@ export default function CommandCenter() {
       );
       setFileHits(hits);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "File search failed");
+      setError(err instanceof Error ? err.message : "Поиск по файлам не выполнен");
     } finally {
       setBusy(false);
+      setActiveOperation(null);
     }
   }
 
   async function updateApprovalStatus(approvalId: string, statusValue: string) {
+    const approval = approvals.find((item) => item.id === approvalId);
+    setActiveOperation({
+      title: "Согласование",
+      detail: `${approval?.title ?? approvalId}: ${statusValue}`
+    });
     setBusy(true);
     try {
       const updated = await api<ApprovalItem>(`/api/approvals/${approvalId}`, {
@@ -1634,13 +1902,19 @@ export default function CommandCenter() {
       );
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Approval update failed");
+      setError(err instanceof Error ? err.message : "Не удалось обновить допуск");
     } finally {
       setBusy(false);
+      setActiveOperation(null);
     }
   }
 
   async function executeApproval(approvalId: string) {
+    const approval = approvals.find((item) => item.id === approvalId);
+    setActiveOperation({
+      title: "Выполнение допуска",
+      detail: approval?.title ?? approvalId
+    });
     setBusy(true);
     try {
       const result = await api<ApprovalExecution>(`/api/approvals/${approvalId}/execute`, {
@@ -1660,13 +1934,18 @@ export default function CommandCenter() {
       ]);
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Approval execution failed");
+      setError(err instanceof Error ? err.message : "Не удалось выполнить допуск");
     } finally {
       setBusy(false);
+      setActiveOperation(null);
     }
   }
 
   async function runLearningTick() {
+    setActiveOperation({
+      title: "Самообучение",
+      detail: "сохранение новых уроков и наблюдений"
+    });
     setBusy(true);
     try {
       const result = await api<{ lesson_count: number }>("/api/learning/tick", {
@@ -1675,13 +1954,14 @@ export default function CommandCenter() {
       });
       setLines((current) => [
         ...current,
-        { role: "system", content: `Learning tick: ${result.lesson_count} lessons saved` }
+        { role: "system", content: `Шаг обучения: сохранено уроков ${result.lesson_count}` }
       ]);
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Learning tick failed");
+      setError(err instanceof Error ? err.message : "Шаг обучения не выполнен");
     } finally {
       setBusy(false);
+      setActiveOperation(null);
     }
   }
 
@@ -1689,12 +1969,16 @@ export default function CommandCenter() {
     event.preventDefault();
     const command = hostCommandDraft.trim();
     if (!command || busy) return;
+    setActiveOperation({
+      title: "Запрос допуска",
+      detail: command
+    });
     setBusy(true);
     try {
       const approval = await api<ApprovalItem>("/api/approvals", {
         method: "POST",
         body: JSON.stringify({
-          title: "Host command",
+          title: "Команда хоста",
           description: command,
           requested_action: "tool.run",
           risk: "danger",
@@ -1708,9 +1992,10 @@ export default function CommandCenter() {
       setApprovals((current) => [approval, ...current].slice(0, 8));
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Host command approval failed");
+      setError(err instanceof Error ? err.message : "Не удалось запросить допуск для команды");
     } finally {
       setBusy(false);
+      setActiveOperation(null);
     }
   }
 
@@ -1718,6 +2003,10 @@ export default function CommandCenter() {
     event.preventDefault();
     const url = webUrlDraft.trim();
     if (!url || busy) return;
+    setActiveOperation({
+      title: "Веб-запрос",
+      detail: url
+    });
     setBusy(true);
     try {
       const result = await api<ToolRunResult>("/api/tools/web.fetch/run", {
@@ -1738,15 +2027,238 @@ export default function CommandCenter() {
       ]);
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Web fetch failed");
+      setError(err instanceof Error ? err.message : "Веб-запрос не выполнен");
     } finally {
       setBusy(false);
+      setActiveOperation(null);
     }
   }
 
   const webFetchText = typeof webFetchResult?.data.text === "string" ? webFetchResult.data.text : "";
   const webFetchStatus =
     typeof webFetchResult?.data.status_code === "number" ? webFetchResult.data.status_code : null;
+  const vitalsPanel = (
+    <div className="vitalsPanel">
+      <article className={`vitalHero ${llmReady ? "ok" : "warn"}`}>
+        <Sparkles size={18} />
+        <div>
+          <strong>{llmReady ? "LLM готова" : "LLM прогревается"}</strong>
+          <p>{llmCheck?.message ?? dispatcherPhaseLabel}</p>
+        </div>
+        <span>{dispatcher?.port_open ? "8001" : "выкл"}</span>
+      </article>
+      <article className={`activitySummary ${modelActivity.tone}`}>
+        <Activity size={16} />
+        <div>
+          <strong>{modelActivity.label}</strong>
+          <p>{modelActivity.detail}</p>
+        </div>
+      </article>
+      <div className="vitalGrid">
+        <div>
+          <span>Backend</span>
+          <strong>{status ? "онлайн" : "офлайн"}</strong>
+        </div>
+        <div>
+          <span>Мост Windows</span>
+          <strong>{hostBridge?.port_open ? "онлайн" : "офлайн"}</strong>
+        </div>
+        <div>
+          <span>Dispatcher</span>
+          <strong>{dispatcherPhaseLabel}</strong>
+        </div>
+        <div>
+          <span>GPU</span>
+          <strong>{telemetry?.gpu.available ? "онлайн" : "офлайн"}</strong>
+        </div>
+      </div>
+    </div>
+  );
+  const missionsPanel = (
+    <div className="missionList">
+      {missions.length === 0 ? (
+        <div className="emptyState">Нет активных планов миссий</div>
+      ) : (
+        missions.slice(0, 5).map((mission) => (
+          <article className="missionItem" key={mission.id}>
+            <div className="missionTitle">
+              <CheckCircle2 size={17} />
+              <div>
+                <h3>{mission.title}</h3>
+                <div className="progressTrack" aria-label="Прогресс миссии">
+                  <span style={{ width: `${Math.round(mission.progress * 100)}%` }} />
+                </div>
+              </div>
+            </div>
+            <div className="taskList">
+              {mission.tasks.slice(0, 6).map((task) => (
+                <div className={`taskRow ${task.status}`} key={task.id}>
+                  <span>{task.position}</span>
+                  <p>{task.title}</p>
+                  <div className="taskControls">
+                    <button
+                      type="button"
+                      title="Готово"
+                      aria-label="Готово"
+                      disabled={busy || task.status === "done"}
+                      onClick={() => updateTaskStatus(mission.id, task.id, "done")}
+                    >
+                      <ClipboardCheck size={14} />
+                    </button>
+                    <button
+                      type="button"
+                      title="Заблокировано"
+                      aria-label="Заблокировано"
+                      disabled={busy || task.status === "blocked"}
+                      onClick={() => updateTaskStatus(mission.id, task.id, "blocked")}
+                    >
+                      <ShieldAlert size={14} />
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div className="missionActions">
+              <button
+                className="iconText compact"
+                type="button"
+                onClick={() => executeNextMissionStep(mission.id)}
+                disabled={busy || mission.status === "done"}
+              >
+                <Play size={15} />
+                <span>Следующий шаг</span>
+              </button>
+              <small>{Math.round(mission.progress * 100)}%</small>
+            </div>
+          </article>
+        ))
+      )}
+    </div>
+  );
+  const approvalsPanel = (
+    <div className="approvalList">
+      {activeApprovals.length === 0 ? (
+        <div className="emptyState compact">Нет ожидающих допусков</div>
+      ) : (
+        activeApprovals.slice(0, 5).map((approval) => (
+          <article className={`approvalRow ${approval.status}`} key={approval.id}>
+            <ShieldAlert size={15} />
+            <div>
+              <strong>{approval.title}</strong>
+              <p>{approval.description}</p>
+            </div>
+            <span>{approval.risk}</span>
+            <div className="approvalControls">
+              <button
+                type="button"
+                title="Одобрить"
+                aria-label="Одобрить"
+                disabled={busy || approval.status !== "pending"}
+                onClick={() => updateApprovalStatus(approval.id, "approved")}
+              >
+                <CheckCircle2 size={14} />
+              </button>
+              <button
+                type="button"
+                title="Отклонить"
+                aria-label="Отклонить"
+                disabled={busy || approval.status !== "pending"}
+                onClick={() => updateApprovalStatus(approval.id, "rejected")}
+              >
+                <ShieldAlert size={14} />
+              </button>
+              <button
+                type="button"
+                title="Выполнить"
+                aria-label="Выполнить"
+                disabled={busy || approval.status !== "approved"}
+                onClick={() => executeApproval(approval.id)}
+              >
+                <Play size={14} />
+              </button>
+            </div>
+          </article>
+        ))
+      )}
+    </div>
+  );
+  const briefingPanel = (
+    <div className="briefingPanel">
+      <div className="briefingHero">
+        <Brain size={16} />
+        <strong>{briefing?.headline ?? "Снимок runtime готовится"}</strong>
+        <span>{briefing?.operator_name ?? preferences?.operator_name ?? "оператор"}</span>
+      </div>
+      <div className="briefingList">
+        {(briefing?.focus ?? []).slice(0, 4).map((item) => (
+          <p key={item}>{item}</p>
+        ))}
+      </div>
+      <div className="briefingList suggestions">
+        {(briefing?.suggestions ?? []).slice(0, 4).map((item) => (
+          <p key={item}>{item}</p>
+        ))}
+      </div>
+    </div>
+  );
+  const historyPanel = (
+    <div className="conversationList">
+      {conversations.length === 0 ? (
+        <div className="emptyState compact">Нет сохранённых диалогов</div>
+      ) : (
+        conversations.slice(0, 8).map((conversation) => (
+          <button
+            className={`conversationRow ${conversation.id === conversationId ? "active" : ""}`}
+            disabled={busy}
+            key={conversation.id}
+            onClick={() => loadConversation(conversation.id)}
+            type="button"
+          >
+            <MessageSquare size={14} />
+            <strong>{conversation.title}</strong>
+            <span>{conversation.message_count}</span>
+          </button>
+        ))
+      )}
+    </div>
+  );
+  const healthPanel = (
+    <>
+      <div className="healthList">
+        {diagnostics.slice(0, 8).map((check) => (
+          <div className={`healthRow ${check.status}`} key={check.name}>
+            <span className="dot" />
+            <strong>{check.name}</strong>
+            <p>{check.message}</p>
+          </div>
+        ))}
+      </div>
+      <div className="selfHealPanel">
+        <button
+          className="iconText compact full"
+          type="button"
+          onClick={runSelfHeal}
+          disabled={busy}
+        >
+          {busy ? <Loader2 className="spin" size={15} /> : <Activity size={15} />}
+          <span>Самовосстановление</span>
+        </button>
+        {selfHealReport && (
+          <article className={`selfHealReport ${selfHealReport.ok ? "ok" : "warn"}`}>
+            <div>
+              <strong>{selfHealReport.summary}</strong>
+              <span>{selfHealReport.actions.length} действий</span>
+            </div>
+            {selfHealReport.actions.slice(0, 3).map((action) => (
+              <p key={action.id}>
+                {action.label}: {action.reason}
+              </p>
+            ))}
+          </article>
+        )}
+      </div>
+    </>
+  );
 
   return (
     <main className="shell">
@@ -1759,7 +2271,7 @@ export default function CommandCenter() {
         </IconButton>
         <IconButton
           active={activeTab === "runtime"}
-          label="Runtime"
+          label="Система"
           tab="runtime"
           onSelect={setActiveTab}
         >
@@ -1805,7 +2317,7 @@ export default function CommandCenter() {
         >
           <Gauge size={20} />
         </IconButton>
-        <IconButton active={activeTab === "audit"} label="Audit" tab="audit" onSelect={setActiveTab}>
+        <IconButton active={activeTab === "audit"} label="Аудит" tab="audit" onSelect={setActiveTab}>
           <History size={20} />
         </IconButton>
       </aside>
@@ -1814,7 +2326,7 @@ export default function CommandCenter() {
         <header className="topbar">
           <div>
             <p className="eyebrow">JARVIS GPT</p>
-            <h1>Command Center</h1>
+            <h1>Центр управления</h1>
           </div>
           <div className="topActions">
             <button className="iconText" type="button" onClick={refresh} disabled={busy}>
@@ -1828,22 +2340,22 @@ export default function CommandCenter() {
           </div>
         </header>
 
-        <section className="realtimeStrip" aria-label="Live runtime indicators">
+        <section className="realtimeStrip" aria-label="Живые индикаторы runtime">
           <article className={`livePill ${llmState}`}>
             <Sparkles size={17} />
             <div>
               <span>LLM</span>
               <strong>{llmStatusText}</strong>
             </div>
-            <small>{dispatcher?.port_open ? dispatcherMode : "off"}</small>
+            <small>{dispatcher?.port_open ? dispatcherModeLabel : "выкл"}</small>
           </article>
           <article className={`livePill ${telemetry?.gpu.available ? "ready" : "offline"}`}>
             <Zap size={17} />
             <div>
               <span>GPU</span>
-              <strong>{telemetry?.gpu.available ? `${gpuUtilization}%` : "offline"}</strong>
+              <strong>{telemetry?.gpu.available ? `${gpuUtilization}%` : "офлайн"}</strong>
             </div>
-            <div className="liveMeter" aria-label="GPU utilization">
+            <div className="liveMeter" aria-label="Загрузка GPU">
               <span style={{ width: `${telemetry?.gpu.available ? gpuUtilization : 0}%` }} />
             </div>
           </article>
@@ -1851,9 +2363,9 @@ export default function CommandCenter() {
             <Gauge size={17} />
             <div>
               <span>VRAM</span>
-              <strong>{telemetry?.gpu.available ? `${vramUsage}%` : "offline"}</strong>
+              <strong>{telemetry?.gpu.available ? `${vramUsage}%` : "офлайн"}</strong>
             </div>
-            <div className="liveMeter" aria-label="VRAM usage">
+            <div className="liveMeter" aria-label="Использование VRAM">
               <span style={{ width: `${telemetry?.gpu.available ? vramUsage : 0}%` }} />
             </div>
           </article>
@@ -1861,9 +2373,9 @@ export default function CommandCenter() {
             <Server size={17} />
             <div>
               <span>Dispatcher</span>
-              <strong>{dispatcherPhase}</strong>
+              <strong>{dispatcherPhaseLabel}</strong>
             </div>
-            <small>{dispatcher?.container_status?.exists ? "docker" : "none"}</small>
+            <small>{dispatcher?.container_status?.exists ? "docker" : "нет"}</small>
           </article>
         </section>
 
@@ -1874,11 +2386,11 @@ export default function CommandCenter() {
           </div>
         )}
 
-        <section className="statusGrid" id="runtime" aria-label="Сводка runtime">
+        <section className="statusGrid" id="runtime" aria-label="Сводка системы">
           <StatusTile
             icon={<Server size={19} />}
             label="Профиль"
-            value={status?.settings.profile.name ?? "offline"}
+            value={status?.settings.profile.name ?? "офлайн"}
             tone={status ? "ok" : "warn"}
           />
           <StatusTile
@@ -1900,10 +2412,11 @@ export default function CommandCenter() {
             tone="neutral"
           />
           <StatusTile
-            icon={<Gauge size={19} />}
-            label="GPU"
-            value={telemetry?.gpu.available ? `${telemetry.gpu.gpus?.length ?? 0}` : "offline"}
-            tone={telemetry?.gpu.available ? "ok" : "warn"}
+            icon={<Activity size={19} />}
+            label="Задача"
+            value={modelActivity.label}
+            detail={modelActivity.detail}
+            tone={modelActivity.tone}
           />
         </section>
 
@@ -1917,7 +2430,7 @@ export default function CommandCenter() {
             <div className="panelHeader chatHeader">
               <h2>Диалог</h2>
               <div className="chatHeaderActions">
-                <span>{conversationId ? "active" : "new"}</span>
+                <span>{conversationId ? "активен" : "новый"}</span>
                 <button type="button" title="Новое окно" aria-label="Новое окно" onClick={newChatWindow}>
                   <Plus size={15} />
                 </button>
@@ -1983,7 +2496,7 @@ export default function CommandCenter() {
               />
               <div className="composerSide">
                 <input
-                  aria-label="Max tokens"
+                  aria-label="Максимум токенов"
                   className="tokenInput"
                   min={64}
                   max={8192}
@@ -1996,14 +2509,14 @@ export default function CommandCenter() {
                   className={`voiceButton ${voiceState === "listening" ? "active" : ""}`}
                   disabled={!voiceAvailable}
                   onClick={voiceState === "listening" ? stopVoiceInput : startVoiceInput}
-                  title={voiceState === "listening" ? "Stop voice input" : "Start voice input"}
+                  title={voiceState === "listening" ? "Остановить голосовой ввод" : "Голосовой ввод"}
                   type="button"
-                  aria-label={voiceState === "listening" ? "Stop voice input" : "Start voice input"}
+                  aria-label={voiceState === "listening" ? "Остановить голосовой ввод" : "Голосовой ввод"}
                 >
                   {voiceState === "listening" ? <MicOff size={16} /> : <Mic size={16} />}
                 </button>
                 <span className="srOnly" aria-live="polite">
-                  {voiceState === "listening" ? voiceInterim || "Listening" : ""}
+                  {voiceState === "listening" ? voiceInterim || "Слушаю" : ""}
                 </span>
                 <button className="sendButton" type="submit" disabled={chatBusy || !input.trim()}>
                   {chatBusy ? <Loader2 className="spin" size={19} /> : <Send size={19} />}
@@ -2025,245 +2538,72 @@ export default function CommandCenter() {
             {activeTab === "chat" && (
               <>
                 <div className="panelHeader">
-                  <h2>Command Hub</h2>
-                  <span>{llmReady ? "ready" : "loading"}</span>
+                  <h2>Панель диалога</h2>
+                  <span>{chatSideTabTitle[chatSideTab]}</span>
                 </div>
-                <div className="vitalsPanel">
-                  <article className={`vitalHero ${llmReady ? "ok" : "warn"}`}>
-                    <Sparkles size={18} />
-                    <div>
-                      <strong>{llmReady ? "LLM ready" : "LLM warming"}</strong>
-                      <p>{llmCheck?.message ?? dispatcherPhase}</p>
-                    </div>
-                    <span>{dispatcher?.port_open ? "8001" : "off"}</span>
-                  </article>
-                  <div className="vitalGrid">
-                    <div>
-                      <span>Backend</span>
-                      <strong>{status ? "online" : "offline"}</strong>
-                    </div>
-                    <div>
-                      <span>Bridge</span>
-                      <strong>{hostBridge?.port_open ? "online" : "offline"}</strong>
-                    </div>
-                    <div>
-                      <span>Dispatcher</span>
-                      <strong>{dispatcherPhase}</strong>
-                    </div>
-                    <div>
-                      <span>GPU</span>
-                      <strong>{telemetry?.gpu.available ? "online" : "offline"}</strong>
-                    </div>
-                  </div>
-                </div>
-              </>
-            )}
-
-            {(activeTab === "chat" || activeTab === "runtime") && (
-              <>
-            <div className="panelHeader">
-              <h2>Миссии</h2>
-              <span>{missions.length}</span>
-            </div>
-            <div className="missionList">
-              {missions.length === 0 ? (
-                <div className="emptyState">Нет активных mission plans</div>
-              ) : (
-                missions.slice(0, 5).map((mission) => (
-                  <article className="missionItem" key={mission.id}>
-                    <div className="missionTitle">
-                      <CheckCircle2 size={17} />
-                      <div>
-                        <h3>{mission.title}</h3>
-                        <div className="progressTrack" aria-label="Mission progress">
-                          <span style={{ width: `${Math.round(mission.progress * 100)}%` }} />
-                        </div>
-                      </div>
-                    </div>
-                    <div className="taskList">
-                      {mission.tasks.slice(0, 6).map((task) => (
-                        <div className={`taskRow ${task.status}`} key={task.id}>
-                          <span>{task.position}</span>
-                          <p>{task.title}</p>
-                          <div className="taskControls">
-                            <button
-                              type="button"
-                              title="Done"
-                              aria-label="Done"
-                              disabled={busy || task.status === "done"}
-                              onClick={() => updateTaskStatus(mission.id, task.id, "done")}
-                            >
-                              <ClipboardCheck size={14} />
-                            </button>
-                            <button
-                              type="button"
-                              title="Blocked"
-                              aria-label="Blocked"
-                              disabled={busy || task.status === "blocked"}
-                              onClick={() => updateTaskStatus(mission.id, task.id, "blocked")}
-                            >
-                              <ShieldAlert size={14} />
-                            </button>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                    <div className="missionActions">
-                      <button
-                        className="iconText compact"
-                        type="button"
-                        onClick={() => executeNextMissionStep(mission.id)}
-                        disabled={busy || mission.status === "done"}
-                      >
-                        <Play size={15} />
-                        <span>Следующий шаг</span>
-                      </button>
-                      <small>{Math.round(mission.progress * 100)}%</small>
-                    </div>
-                  </article>
-                ))
-              )}
-            </div>
-
-            <div className="panelHeader lower">
-              <h2>Approvals</h2>
-              <span>{activeApprovals.length}</span>
-            </div>
-            <div className="approvalList">
-              {activeApprovals.length === 0 ? (
-                <div className="emptyState compact">No pending gates</div>
-              ) : (
-                activeApprovals.slice(0, 5).map((approval) => (
-                  <article className={`approvalRow ${approval.status}`} key={approval.id}>
-                    <ShieldAlert size={15} />
-                    <div>
-                      <strong>{approval.title}</strong>
-                      <p>{approval.description}</p>
-                    </div>
-                    <span>{approval.risk}</span>
-                    <div className="approvalControls">
-                      <button
-                        type="button"
-                        title="Approve"
-                        aria-label="Approve"
-                        disabled={busy || approval.status !== "pending"}
-                        onClick={() => updateApprovalStatus(approval.id, "approved")}
-                      >
-                        <CheckCircle2 size={14} />
-                      </button>
-                      <button
-                        type="button"
-                        title="Reject"
-                        aria-label="Reject"
-                        disabled={busy || approval.status !== "pending"}
-                        onClick={() => updateApprovalStatus(approval.id, "rejected")}
-                      >
-                        <ShieldAlert size={14} />
-                      </button>
-                      <button
-                        type="button"
-                        title="Execute"
-                        aria-label="Execute"
-                        disabled={busy || approval.status !== "approved"}
-                        onClick={() => executeApproval(approval.id)}
-                      >
-                        <Play size={14} />
-                      </button>
-                    </div>
-                  </article>
-                ))
-              )}
-            </div>
-
-            <div className="panelHeader lower">
-              <h2>Briefing</h2>
-              <span>{briefing?.policy_mode ?? autonomyPolicy?.mode ?? "..."}</span>
-            </div>
-            <div className="briefingPanel">
-              <div className="briefingHero">
-                <Brain size={16} />
-                <strong>{briefing?.headline ?? "Runtime snapshot pending"}</strong>
-                <span>{briefing?.operator_name ?? preferences?.operator_name ?? "operator"}</span>
-              </div>
-              <div className="briefingList">
-                {(briefing?.focus ?? []).slice(0, 4).map((item) => (
-                  <p key={item}>{item}</p>
-                ))}
-              </div>
-              <div className="briefingList suggestions">
-                {(briefing?.suggestions ?? []).slice(0, 4).map((item) => (
-                  <p key={item}>{item}</p>
-                ))}
-              </div>
-            </div>
-
-            <div className="panelHeader lower">
-              <h2>Dialog History</h2>
-              <span>{conversations.length}</span>
-            </div>
-            <div className="conversationList">
-              {conversations.length === 0 ? (
-                <div className="emptyState compact">No saved dialogs</div>
-              ) : (
-                conversations.slice(0, 8).map((conversation) => (
-                  <button
-                    className={`conversationRow ${
-                      conversation.id === conversationId ? "active" : ""
-                    }`}
-                    disabled={busy}
-                    key={conversation.id}
-                    onClick={() => loadConversation(conversation.id)}
-                    type="button"
-                  >
-                    <MessageSquare size={14} />
-                    <strong>{conversation.title}</strong>
-                    <span>{conversation.message_count}</span>
-                  </button>
-                ))
-              )}
-            </div>
-              </>
-            )}
-
-            {(activeTab === "chat" || activeTab === "diagnostics" || activeTab === "runtime") && (
-              <>
-            <div className={`panelHeader ${activeTab === "chat" ? "lower" : ""}`} id="health">
-              <h2>Health</h2>
-              <span>{diagnostics.length}</span>
-            </div>
-            <div className="healthList">
-              {diagnostics.slice(0, 8).map((check) => (
-                <div className={`healthRow ${check.status}`} key={check.name}>
-                  <span className="dot" />
-                  <strong>{check.name}</strong>
-                  <p>{check.message}</p>
-                </div>
-              ))}
-            </div>
-            <div className="selfHealPanel">
-              <button
-                className="iconText compact full"
-                type="button"
-                onClick={runSelfHeal}
-                disabled={busy}
-              >
-                {busy ? <Loader2 className="spin" size={15} /> : <Activity size={15} />}
-                <span>Self-heal scan</span>
-              </button>
-              {selfHealReport && (
-                <article className={`selfHealReport ${selfHealReport.ok ? "ok" : "warn"}`}>
-                  <div>
-                    <strong>{selfHealReport.summary}</strong>
-                    <span>{selfHealReport.actions.length} actions</span>
-                  </div>
-                  {selfHealReport.actions.slice(0, 3).map((action) => (
-                    <p key={action.id}>
-                      {action.label}: {action.reason}
-                    </p>
+                <div className="sideTabs" role="tablist" aria-label="Разделы панели диалога">
+                  {chatSideTabs.map((tab) => (
+                    <button
+                      className={chatSideTab === tab.id ? "active" : ""}
+                      key={tab.id}
+                      onClick={() => setChatSideTab(tab.id)}
+                      role="tab"
+                      type="button"
+                      aria-selected={chatSideTab === tab.id}
+                    >
+                      <span>{tab.label}</span>
+                      <strong>{tab.badge}</strong>
+                    </button>
                   ))}
-                </article>
-              )}
-            </div>
+                </div>
+                <div className="sideTabBody">
+                  {chatSideTab === "status" && (
+                    <>
+                      {vitalsPanel}
+                      <div className="panelHeader compact" id="health">
+                        <h2>Диагностика</h2>
+                        <span>{diagnostics.length}</span>
+                      </div>
+                      {healthPanel}
+                    </>
+                  )}
+                  {chatSideTab === "missions" && missionsPanel}
+                  {chatSideTab === "approvals" && approvalsPanel}
+                  {chatSideTab === "briefing" && briefingPanel}
+                  {chatSideTab === "history" && historyPanel}
+                </div>
+              </>
+            )}
+
+            {activeTab === "runtime" && (
+              <>
+                <div className="panelHeader">
+                  <h2>Миссии</h2>
+                  <span>{missions.length}</span>
+                </div>
+                {missionsPanel}
+
+                <div className="panelHeader lower">
+                  <h2>Допуски</h2>
+                  <span>{activeApprovals.length}</span>
+                </div>
+                {approvalsPanel}
+
+                <div className="panelHeader lower">
+                  <h2>Сводка</h2>
+                  <span>{briefing?.policy_mode ?? autonomyPolicy?.mode ?? "..."}</span>
+                </div>
+                {briefingPanel}
+              </>
+            )}
+
+            {(activeTab === "diagnostics" || activeTab === "runtime") && (
+              <>
+                <div className={`panelHeader ${activeTab === "runtime" ? "lower" : ""}`} id="health">
+                  <h2>Диагностика</h2>
+                  <span>{diagnostics.length}</span>
+                </div>
+                {healthPanel}
               </>
             )}
 
@@ -2278,13 +2618,13 @@ export default function CommandCenter() {
                 <div className={`dispatcherRow ${dispatcher.port_open ? "online" : ""}`}>
                   <Server size={14} />
                   <strong>{dispatcherRuntime?.model_id ?? dispatcher.model}</strong>
-                  <span>{dispatcher.port_open ? dispatcherMode : "offline"}</span>
-                  <small>{dispatcher.container_status?.status ?? "port 8001"}</small>
+                  <span>{dispatcher.port_open ? dispatcherModeLabel : "офлайн"}</span>
+                  <small>{runtimeStateLabel(dispatcher.container_status?.status ?? "port 8001")}</small>
                   <div className="dispatcherControls">
                     <button
                       type="button"
-                      title="Start dispatcher"
-                      aria-label="Start dispatcher"
+                      title="Запустить dispatcher"
+                      aria-label="Запустить dispatcher"
                       disabled={dispatcherBusy || dispatcher.port_open}
                       onClick={() => runDispatcherAction("start")}
                     >
@@ -2292,8 +2632,8 @@ export default function CommandCenter() {
                     </button>
                     <button
                       type="button"
-                      title="Stop dispatcher"
-                      aria-label="Stop dispatcher"
+                      title="Остановить dispatcher"
+                      aria-label="Остановить dispatcher"
                       disabled={dispatcherBusy || !dispatcher.container_status?.exists}
                       onClick={() => runDispatcherAction("stop")}
                     >
@@ -2301,8 +2641,8 @@ export default function CommandCenter() {
                     </button>
                     <button
                       type="button"
-                      title="Dispatcher logs"
-                      aria-label="Dispatcher logs"
+                      title="Логи dispatcher"
+                      aria-label="Логи dispatcher"
                       disabled={dispatcherBusy || !dispatcher.container_status?.exists}
                       onClick={() => runDispatcherAction("logs")}
                     >
@@ -2321,7 +2661,7 @@ export default function CommandCenter() {
                   </div>
                 ))
               ) : (
-                <div className="emptyState compact">Model catalog offline</div>
+                <div className="emptyState compact">Каталог моделей недоступен</div>
               )}
             </div>
               </>
@@ -2336,7 +2676,7 @@ export default function CommandCenter() {
             <div className="resourceList">
               <div className="resourceRow">
                 <Gauge size={14} />
-                <strong>RAM</strong>
+                <strong>ОЗУ</strong>
                 <div className="meter">
                   <span style={{ width: `${ratioPercent(telemetry?.memory.used_ratio)}%` }} />
                 </div>
@@ -2354,22 +2694,22 @@ export default function CommandCenter() {
                 </div>
                 <small>
                   {telemetry?.gpu.available
-                    ? `${Math.round(telemetry.gpu.gpus?.[0]?.utilization_gpu ?? 0)}% util`
-                    : "offline"}
+                    ? `${Math.round(telemetry.gpu.gpus?.[0]?.utilization_gpu ?? 0)}% загрузка`
+                    : "офлайн"}
                 </small>
               </div>
               <div className={`bridgeRow ${hostBridge?.port_open ? "online" : ""}`}>
                 <Server size={14} />
-                <strong>Host bridge</strong>
-                <span>{hostBridge?.port_open ? "online" : "offline"}</span>
+                <strong>Мост Windows</strong>
+                <span>{hostBridge?.port_open ? "онлайн" : "офлайн"}</span>
                 <small>
-                  {hostBridge?.token_available ? "token" : "no token"} ·{" "}
+                  {hostBridge?.token_available ? "токен есть" : "нет токена"} ·{" "}
                   {hostBridge?.native_capabilities?.length ?? 0} native
                 </small>
               </div>
               <form className="hostCommandForm" onSubmit={requestHostCommandApproval}>
                 <input
-                  aria-label="Host command"
+                  aria-label="Команда хоста"
                   value={hostCommandDraft}
                   onChange={(event) => setHostCommandDraft(event.target.value)}
                   placeholder="Get-Date"
@@ -2377,17 +2717,17 @@ export default function CommandCenter() {
                 <button
                   type="submit"
                   disabled={busy || !hostCommandDraft.trim()}
-                  title="Request approval"
-                  aria-label="Request approval"
+                  title="Запросить допуск"
+                  aria-label="Запросить допуск"
                 >
                   <Terminal size={15} />
                 </button>
               </form>
               <div className={`bridgeRow ${autonomy?.enabled ? "online" : ""}`}>
                 <Brain size={14} />
-                <strong>Autonomy</strong>
-                <span>{autonomy?.enabled ? "on" : "off"}</span>
-                <small>{autonomy?.running_tasks.length ?? 0} tasks</small>
+                <strong>Автономия</strong>
+                <span>{autonomy?.enabled ? "вкл" : "выкл"}</span>
+                <small>{autonomy?.running_tasks.length ?? 0} задач</small>
               </div>
               <button
                 className="iconText compact full"
@@ -2396,7 +2736,7 @@ export default function CommandCenter() {
                 disabled={busy}
               >
                 <Brain size={15} />
-                <span>Learning tick</span>
+                <span>Шаг обучения</span>
               </button>
             </div>
               </>
@@ -2405,11 +2745,11 @@ export default function CommandCenter() {
             {(activeTab === "diagnostics" || activeTab === "runtime") && (
               <>
             <div className={`panelHeader ${activeTab === "runtime" ? "lower" : ""}`}>
-              <h2>Autonomy Policy</h2>
-              <span>{autonomyPolicy?.max_autonomous_steps ?? 0} steps</span>
+              <h2>Политика автономии</h2>
+              <span>{autonomyPolicy?.max_autonomous_steps ?? 0} шагов</span>
             </div>
             <div className="policyPanel">
-              <div className="segmentedControl" role="group" aria-label="Autonomy policy mode">
+              <div className="segmentedControl" role="group" aria-label="Режим автономии">
                 {(["safe", "balanced", "operator"] as AutonomyPolicy["mode"][]).map((mode) => (
                   <button
                     className={autonomyPolicy?.mode === mode ? "active" : ""}
@@ -2436,7 +2776,7 @@ export default function CommandCenter() {
             </div>
 
             <div className="panelHeader lower">
-              <h2>Autonomy Jobs</h2>
+              <h2>Автономные задачи</h2>
               <span>{autonomyJobs.length}</span>
             </div>
             <div className="jobsPanel">
@@ -2448,10 +2788,10 @@ export default function CommandCenter() {
                       disabled={busy}
                       key={kind}
                       onClick={() => createAutonomyJob(kind)}
-                      type="button"
-                    >
-                      <Brain size={14} />
-                      <span>{kind}</span>
+                    type="button"
+                  >
+                    <Brain size={14} />
+                      <span>{kind === "diagnostics" ? "диагностика" : kind === "self_heal" ? "самолечение" : "бенчмарк"}</span>
                     </button>
                   )
                 )}
@@ -2464,8 +2804,8 @@ export default function CommandCenter() {
                   <button
                     type="button"
                     disabled={busy || job.status !== "enabled"}
-                    title="Run job"
-                    aria-label="Run job"
+                    title="Запустить задачу"
+                    aria-label="Запустить задачу"
                     onClick={() => runAutonomyJob(job.id)}
                   >
                     <Play size={14} />
@@ -2475,7 +2815,7 @@ export default function CommandCenter() {
             </div>
 
             <div className="panelHeader lower">
-              <h2>Routines</h2>
+              <h2>Сценарии</h2>
               <span>{routines.length}</span>
             </div>
             <div className="routinePanel">
@@ -2501,11 +2841,11 @@ export default function CommandCenter() {
             </div>
 
             <div className="panelHeader lower">
-              <h2>Performance</h2>
+              <h2>Производительность</h2>
               <span>
                 {typeof benchmarkReport?.metrics.total_ms === "number"
                   ? `${Math.round(benchmarkReport.metrics.total_ms)} ms`
-                  : "ready"}
+                  : "готово"}
               </span>
             </div>
             <div className="benchmarkPanel">
@@ -2516,7 +2856,7 @@ export default function CommandCenter() {
                 disabled={busy}
               >
                 {busy ? <Loader2 className="spin" size={15} /> : <Gauge size={15} />}
-                <span>Benchmark</span>
+                <span>Бенчмарк</span>
               </button>
               {benchmarkReport && (
                 <article className="benchmarkReport">
@@ -2525,7 +2865,7 @@ export default function CommandCenter() {
                     <span>storage {Math.round(benchmarkReport.metrics.storage_ping_ms ?? 0)} ms</span>
                     <span>LLM {Math.round(benchmarkReport.metrics.llm_health_ms ?? 0)} ms</span>
                     <span>
-                      {benchmarkReport.dispatcher.port_open ? "dispatcher on" : "dispatcher off"}
+                      {benchmarkReport.dispatcher.port_open ? "dispatcher вкл" : "dispatcher выкл"}
                     </span>
                   </div>
                   {benchmarkReport.recommendations.slice(0, 3).map((item) => (
@@ -2536,11 +2876,11 @@ export default function CommandCenter() {
             </div>
 
             <div className="panelHeader lower">
-              <h2>Browser Policy</h2>
+              <h2>Политика браузера</h2>
               <span>{browserPolicy?.mode ?? "..."}</span>
             </div>
             <div className="policyPanel">
-              <div className="segmentedControl" role="group" aria-label="Browser policy mode">
+              <div className="segmentedControl" role="group" aria-label="Режим браузера">
                 {(["approval-only", "local-safe", "locked"] as BrowserPolicy["mode"][]).map(
                   (mode) => (
                     <button
@@ -2557,13 +2897,13 @@ export default function CommandCenter() {
               </div>
               <div className="policyFlags">
                 <span className={browserPolicy?.allow_localhost ? "on" : ""}>localhost</span>
-                <span>{browserPolicy?.max_urls_per_action ?? 0} tabs</span>
+                <span>{browserPolicy?.max_urls_per_action ?? 0} вкладок</span>
                 <span>{browserPolicy?.allowed_hosts.slice(0, 2).join(", ")}</span>
               </div>
             </div>
 
             <div className="panelHeader lower">
-              <h2>Docker Fleet</h2>
+              <h2>Docker</h2>
               <span>{dockerContainers?.containers.length ?? 0}</span>
             </div>
             <div className="dockerPanel">
@@ -2577,7 +2917,7 @@ export default function CommandCenter() {
                   }
                 >
                   <FileText size={14} />
-                  <span>{dockerPolicy?.max_log_tail ?? 200} logs</span>
+                  <span>{dockerPolicy?.max_log_tail ?? 200} строк логов</span>
                 </button>
                 <span>{dockerPolicy?.allowed_prefixes.slice(0, 2).join(", ")}</span>
               </div>
@@ -2588,7 +2928,7 @@ export default function CommandCenter() {
                 >
                   <Server size={14} />
                   <strong>{container.name}</strong>
-                  <span>{container.allowed ? "allowed" : "blocked"}</span>
+                  <span>{container.allowed ? "разрешён" : "заблокирован"}</span>
                   <small>{container.status ?? container.image}</small>
                 </div>
               ))}
@@ -2608,8 +2948,8 @@ export default function CommandCenter() {
               <button
                 type="submit"
                 disabled={busy || !webUrlDraft.trim()}
-                title="Fetch"
-                aria-label="Fetch"
+                title="Загрузить"
+                aria-label="Загрузить"
               >
                 <Globe size={15} />
               </button>
@@ -2668,13 +3008,13 @@ export default function CommandCenter() {
                 value={directoryDraft}
                 onChange={(event) => setDirectoryDraft(event.target.value)}
                 placeholder="D:\\jarvis"
-                aria-label="Directory to ingest"
+                aria-label="Папка для индексации"
               />
               <button
                 type="submit"
                 disabled={busy || !directoryDraft.trim()}
-                title="Index directory"
-                aria-label="Index directory"
+                title="Индексировать папку"
+                aria-label="Индексировать папку"
               >
                 <Database size={15} />
               </button>
@@ -2683,7 +3023,7 @@ export default function CommandCenter() {
               <article className="directoryResult">
                 <strong>{directoryIngest.root}</strong>
                 <span>
-                  {directoryIngest.files_indexed}/{directoryIngest.files_seen} indexed
+                  {directoryIngest.files_indexed}/{directoryIngest.files_seen} проиндексировано
                 </span>
               </article>
             )}
@@ -2716,8 +3056,8 @@ export default function CommandCenter() {
             {activeTab === "memory" && (
               <>
             <div className="panelHeader">
-              <h2>Preferences</h2>
-              <span>{preferences?.communication_style ?? "concise"}</span>
+              <h2>Настройки</h2>
+              <span>{communicationStyleLabel(preferences?.communication_style)}</span>
             </div>
             <form className="preferencesForm" onSubmit={savePreferences}>
               <input
@@ -2728,8 +3068,8 @@ export default function CommandCenter() {
                     operator_name: event.target.value
                   }))
                 }
-                placeholder="Operator"
-                aria-label="Operator name"
+                placeholder="Оператор"
+                aria-label="Имя оператора"
               />
               <select
                 value={preferenceDraft.communication_style}
@@ -2739,11 +3079,11 @@ export default function CommandCenter() {
                     communication_style: event.target.value as RuntimePreferences["communication_style"]
                   }))
                 }
-                aria-label="Communication style"
+                aria-label="Стиль общения"
               >
-                <option value="concise">concise</option>
-                <option value="balanced">balanced</option>
-                <option value="detailed">detailed</option>
+                <option value="concise">кратко</option>
+                <option value="balanced">сбалансированно</option>
+                <option value="detailed">подробно</option>
               </select>
               <input
                 value={preferenceDraft.quiet_hours}
@@ -2753,14 +3093,14 @@ export default function CommandCenter() {
                     quiet_hours: event.target.value
                   }))
                 }
-                placeholder="quiet hours"
-                aria-label="Quiet hours"
+                placeholder="тихие часы"
+                aria-label="Тихие часы"
               />
               <button
                 type="submit"
                 disabled={busy}
-                title="Save preferences"
-                aria-label="Save preferences"
+                title="Сохранить настройки"
+                aria-label="Сохранить настройки"
               >
                 {busy ? <Loader2 className="spin" size={15} /> : <Save size={15} />}
               </button>
@@ -2795,7 +3135,7 @@ export default function CommandCenter() {
             {activeTab === "audit" && (
               <>
             <div className="panelHeader" id="audit">
-              <h2>Audit</h2>
+              <h2>Аудит</h2>
               <span>{audit.length}</span>
             </div>
             <div className="auditList">
@@ -2851,11 +3191,13 @@ function IconButton({
 
 function StatusTile({
   icon,
+  detail,
   label,
   value,
   tone
 }: {
   icon: ReactNode;
+  detail?: string;
   label: string;
   value: string;
   tone: "ok" | "warn" | "neutral";
@@ -2865,6 +3207,7 @@ function StatusTile({
       <div>{icon}</div>
       <span>{label}</span>
       <strong>{value}</strong>
+      {detail && <small>{detail}</small>}
     </article>
   );
 }

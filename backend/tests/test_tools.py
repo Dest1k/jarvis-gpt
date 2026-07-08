@@ -224,6 +224,19 @@ def test_windows_native_process_start_preserves_nonempty_arguments():
     assert "$parameters.ArgumentList = [string]$Arguments" in command
 
 
+def test_windows_native_screen_capture_command_is_structured(tmp_path):
+    path = tmp_path / "screen.png"
+    command = _windows_native_command("screen.capture", {"path": str(path), "limit": 8})
+
+    assert "screen.capture" in command
+    assert "System.Drawing" in command
+    assert "CopyFromScreen" in command
+    assert "Screen captured." in command
+    assert "screen.png" in command
+    assert "test_windows_native_screen_cap" in command
+    assert "VisibleWindows $Limit" in command
+
+
 def test_browser_open_is_validated_and_gated(monkeypatch, tmp_path):
     class FakeBridgeClient:
         def __init__(self, _settings):

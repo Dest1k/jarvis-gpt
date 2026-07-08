@@ -40,6 +40,11 @@ Capability contract:
 - Для Windows-задач используй native слой Jarvis: WMI/CIM для инвентаризации, WinAPI/окна/фокус,
   SendKeys/clipboard для GUI-ввода и PowerShell только как транспорт. Не ограничивайся консолью,
   если задача явно требует взаимодействия с окном или локальным приложением.
+- Если оператор просит сделать действие "в консоли", "в браузере", "в калькуляторе", "в блокноте",
+  "в окне" или в конкретном приложении, сначала открой/активируй эту среду и выполняй действие там.
+  Не заменяй это текстовым примером команды, если доступен инструментальный маршрут.
+- Если оператор просит посмотреть на экран его глазами, сделать скриншот, понять что видно в окне
+  или проверить визуальное состояние, используй native screen capture и анализируй снимок/окна.
 - Для системного администрирования предлагай PowerShell/Bash-команды, проверки, риски и rollback.
   Опасные или необратимые действия оформляй через approval/tool gate, а не отказывайся целиком.
 - Для web/OSINT работай только с публичными источниками, структурируй найденное, сохраняй ссылки,
@@ -124,7 +129,7 @@ class AgentRuntime:
             metadata={"max_tokens": max_tokens, "mode": mode, "temperature": temperature},
         )
 
-        direct_action = await self._try_direct_action(message)
+        direct_action = await self._try_direct_action(message, context)
         if direct_action is not None:
             for event in direct_action.events:
                 events.append(event)
@@ -454,7 +459,11 @@ class AgentRuntime:
             result=result,
         )
 
-    async def _try_direct_action(self, message: str) -> DirectAction | None:
+    async def _try_direct_action(
+        self,
+        message: str,
+        context: AgentContext | None = None,
+    ) -> DirectAction | None:
         url = _browser_url_from_message(message)
         if url is not None:
             result = await self.tools.run("browser.open", {"url": url}, allow_danger=True)
@@ -470,7 +479,14 @@ class AgentRuntime:
                 events=[event],
             )
 
-        native_action = _native_action_from_message(message, self.settings)
+        history_text = ""
+        if context is not None:
+            history_text = "\n".join(
+                item["content"]
+                for item in self.storage.recent_messages(context.conversation_id, limit=8)
+                if item["role"] == "user"
+            )
+        native_action = _native_action_from_message(message, self.settings, history_text)
         if native_action is not None:
             result = await self.tools.run(
                 "windows.native",
@@ -705,7 +721,30 @@ def _native_result_excerpt(result: ToolRunResponse) -> str:
         return _format_native_rows(native_data.get("items"), title="Короткая выжимка:")
     if action == "window.list":
         return _format_native_rows(native_data.get("windows"), title="Видимые окна:")
+    if action == "screen.capture":
+        return _format_screen_capture(native_data)
     return ""
+
+
+def _format_screen_capture(data: dict[str, Any]) -> str:
+    lines = []
+    path = data.get("path")
+    width = data.get("width")
+    height = data.get("height")
+    if path:
+        lines.append(f"- снимок: {path}")
+    if width and height:
+        lines.append(f"- размер: {width}x{height}")
+    active = data.get("activeWindow")
+    if isinstance(active, dict):
+        title = active.get("MainWindowTitle") or active.get("mainWindowTitle") or ""
+        process = active.get("ProcessName") or active.get("processName") or ""
+        if title or process:
+            lines.append(f"- активное окно: {_short_value(process)} — {_short_value(title)}")
+    windows = _format_native_rows(data.get("windows"), title="Видимые окна:")
+    if not lines and not windows:
+        return ""
+    return "\n\nВизуальная проверка:\n" + "\n".join(lines) + windows
 
 
 def _format_native_rows(value: Any, *, title: str) -> str:
@@ -837,6 +876,14 @@ APP_ALIASES: tuple[tuple[tuple[str, ...], str, str], ...] = (
     (("блокнот", "notepad"), "notepad.exe", "блокнот"),
     (("paint", "mspaint", "паинт", "рисовал"), "mspaint.exe", "Paint"),
     (("проводник", "explorer"), "explorer.exe", "проводник"),
+    (("chrome", "google chrome", "хром", "гугл хром"), "chrome.exe", "Chrome"),
+    (("edge", "microsoft edge", "эдж"), "msedge.exe", "Microsoft Edge"),
+    (("firefox", "фаерфокс", "файрфокс"), "firefox.exe", "Firefox"),
+    (("word", "winword", "ворд"), "winword.exe", "Word"),
+    (("excel", "эксель"), "excel.exe", "Excel"),
+    (("powerpoint", "power point", "пауэрпоинт"), "powerpnt.exe", "PowerPoint"),
+    (("vscode", "vs code", "visual studio code"), "Code.exe", "Visual Studio Code"),
+    (("telegram", "телеграм"), "Telegram.exe", "Telegram"),
     (("диспетчер задач", "task manager", "taskmgr"), "taskmgr.exe", "диспетчер задач"),
     (("командную строку", "cmd", "консоль"), "cmd.exe", "командную строку"),
     (("powershell", "power shell", "пауэршелл"), "powershell.exe", "PowerShell"),
@@ -854,8 +901,17 @@ APP_ALIASES: tuple[tuple[tuple[str, ...], str, str], ...] = (
 def _native_action_from_message(
     message: str,
     settings: JarvisSettings | None = None,
+    history_text: str = "",
 ) -> NativeAction | None:
     normalized = message.lower()
+    screen_capture = _screen_capture_action(normalized, settings)
+    if screen_capture is not None:
+        return screen_capture
+
+    largest_file_console = _largest_file_console_action(message, history_text)
+    if largest_file_console is not None:
+        return largest_file_console
+
     if _wants_top_process_console(normalized):
         return NativeAction(
             action="process.start",
@@ -985,6 +1041,144 @@ def _wmi_action_from_message(message: str) -> NativeAction:
         },
         answer=f"получил {label} через WMI/CIM",
     )
+
+
+def _screen_capture_action(
+    normalized: str,
+    settings: JarvisSettings | None,
+) -> NativeAction | None:
+    if settings is None:
+        return None
+    wants_screen = _contains_any(
+        normalized,
+        (
+            "моими глазами",
+            "твоими глазами",
+            "посмотри экран",
+            "на экран",
+            "что на экране",
+            "что видишь",
+            "скриншот",
+            "снимок экрана",
+            "визуально",
+            "в окне видно",
+            "на картинке",
+            "screenshot",
+            "screen capture",
+        ),
+    )
+    if not wants_screen:
+        return None
+    output_path = _screen_capture_file(settings)
+    return NativeAction(
+        action="screen.capture",
+        payload={"path": str(output_path), "limit": 30},
+        answer="сделал снимок экрана для визуальной проверки",
+    )
+
+
+def _screen_capture_file(settings: JarvisSettings) -> Path:
+    screenshot_dir = settings.data_dir / "screenshots"
+    screenshot_dir.mkdir(parents=True, exist_ok=True)
+    return screenshot_dir / f"screen-{uuid.uuid4().hex[:12]}.png"
+
+
+def _largest_file_console_action(message: str, history_text: str = "") -> NativeAction | None:
+    normalized = message.lower()
+    history = history_text.lower()
+    wants_console = _contains_any(
+        normalized,
+        (
+            "в консоли",
+            "консоль",
+            "powershell",
+            "power shell",
+            "терминал",
+            "командной строк",
+            "вывод там же",
+            "там же",
+        ),
+    )
+    current_mentions_largest = _mentions_largest_file(normalized)
+    followup_mentions_scan = _contains_any(
+        normalized,
+        ("это сканирование", "это проскан", "сканирование"),
+    )
+    history_mentions_largest = _mentions_largest_file(history)
+    if not current_mentions_largest and not (
+        wants_console and followup_mentions_scan and history_mentions_largest
+    ):
+        return None
+    if not wants_console and not _contains_any(normalized, ("открой", "запусти", "сделай")):
+        return None
+
+    drive = _drive_from_largest_file_request(message, history_text)
+    script = _largest_file_scan_script(drive)
+    return NativeAction(
+        action="process.start",
+        payload={
+            "executable": "powershell.exe",
+            "arguments": _powershell_noexit_arguments(script),
+        },
+        answer=f"открыл PowerShell и запустил поиск самого крупного файла на диске {drive}",
+    )
+
+
+def _mentions_largest_file(text: str) -> bool:
+    return _contains_any(
+        text,
+        (
+            "самый крупный файл",
+            "самого крупного файла",
+            "самый большой файл",
+            "самого большого файла",
+            "largest file",
+            "biggest file",
+        ),
+    )
+
+
+def _drive_from_largest_file_request(message: str, history_text: str = "") -> str:
+    match = re.search(r"\b([a-zA-Z]):", f"{message}\n{history_text}")
+    if match:
+        return f"{match.group(1).upper()}:\\"
+    return "C:\\"
+
+
+def _largest_file_scan_script(drive: str) -> str:
+    quoted_drive = drive.replace("'", "''")
+    return (
+        "$ErrorActionPreference='SilentlyContinue'; "
+        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
+        f"$root='{quoted_drive}'; "
+        "Write-Host ('Сканирую ' + $root + ' ...') -ForegroundColor Cyan; "
+        "$largest=$null; $count=0; "
+        "Get-ChildItem -LiteralPath $root -File -Recurse -Force -ErrorAction SilentlyContinue | "
+        "ForEach-Object { "
+        "$count++; "
+        "if ($null -eq $largest -or $_.Length -gt $largest.Length) { $largest=$_ }; "
+        "if (($count % 10000) -eq 0) { "
+        "Write-Host ('Проверено файлов: {0:n0}; текущий лидер: {1:n2} GB {2}' -f "
+        "$count, ($largest.Length / 1GB), $largest.FullName) -ForegroundColor DarkGray "
+        "} "
+        "}; "
+        "Write-Host ''; "
+        "if ($largest) { "
+        "Write-Host '--- Результат ---' -ForegroundColor Green; "
+        "Write-Host ('Путь: ' + $largest.FullName) -ForegroundColor White; "
+        "Write-Host ('Размер: {0:n2} GB ({1:n0} bytes)' -f "
+        "($largest.Length / 1GB), $largest.Length) "
+        "-ForegroundColor Yellow; "
+        "Write-Host ('Проверено файлов: {0:n0}' -f $count) -ForegroundColor DarkGray "
+        "} else { "
+        "Write-Host 'Файлы не найдены или доступ ко всем каталогам запрещён.' -ForegroundColor Red "
+        "}"
+    )
+
+
+def _powershell_noexit_arguments(script: str) -> str:
+    escaped = script.replace('"', '`"')
+    return f'-NoExit -ExecutionPolicy Bypass -Command "{escaped}"'
 
 
 def _app_from_message(normalized: str) -> tuple[tuple[str, ...], str, str] | None:

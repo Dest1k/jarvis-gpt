@@ -320,7 +320,7 @@ class ToolRegistry:
                 input_schema={
                     "action": (
                         "capabilities, process.start, app.open_and_type, window.focus, "
-                        "window.list, keyboard.send or wmi.query"
+                        "screen.capture, window.list, keyboard.send or wmi.query"
                     ),
                     "payload": "Structured action payload",
                     "timeout_sec": "1-120 second timeout",
@@ -1126,6 +1126,7 @@ WINDOWS_NATIVE_ACTIONS = {
     "capabilities",
     "process.start",
     "app.open_and_type",
+    "screen.capture",
     "window.focus",
     "window.list",
     "keyboard.send",
@@ -1152,11 +1153,13 @@ try {
       keyboard = $true
       clipboard = $true
       process = $true
+      screenshot = $true
     }
     exit 0
   }
 
   Add-Type -AssemblyName System.Windows.Forms
+  Add-Type -AssemblyName System.Drawing
   Add-Type @'
 using System;
 using System.Runtime.InteropServices;
@@ -1337,6 +1340,48 @@ public static class JWin {
     return Start-Process @parameters
   }
 
+  function VisibleWindows($Limit) {
+    return Get-Process -ErrorAction SilentlyContinue |
+      Where-Object { $_.MainWindowHandle -ne 0 } |
+      Select-Object -First ([int](Val $Limit 30)) Id, ProcessName, MainWindowTitle
+  }
+
+  function CaptureScreen($OutputPath, $Limit) {
+    $directory = Split-Path -Parent $OutputPath
+    if ($directory) {
+      New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    }
+    $bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
+    $bitmap = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
+    $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+    try {
+      $graphics.CopyFromScreen($bounds.Left, $bounds.Top, 0, 0, $bounds.Size)
+      $bitmap.Save($OutputPath, [System.Drawing.Imaging.ImageFormat]::Png)
+    } finally {
+      $graphics.Dispose()
+      $bitmap.Dispose()
+    }
+    $foreground = [JWin]::GetForegroundWindow()
+    $foregroundPid = 0
+    if ($foreground -ne [IntPtr]::Zero) {
+      [void][JWin]::GetWindowThreadProcessId($foreground, [ref]$foregroundPid)
+    }
+    $active = $null
+    if ($foregroundPid -gt 0) {
+      $active = Get-Process -Id $foregroundPid -ErrorAction SilentlyContinue |
+        Select-Object -First 1 Id, ProcessName, MainWindowTitle
+    }
+    Out $true "Screen captured." @{
+      path = $OutputPath
+      width = $bounds.Width
+      height = $bounds.Height
+      left = $bounds.Left
+      top = $bounds.Top
+      activeWindow = $active
+      windows = @(VisibleWindows $Limit)
+    }
+  }
+
   switch ($Action) {
     'process.start' {
       $p = StartNativeProcess $Payload.executable $Payload.arguments
@@ -1362,6 +1407,10 @@ public static class JWin {
         pid = $p.Id
         focused = $focused
       }
+      break
+    }
+    'screen.capture' {
+      CaptureScreen $Payload.path $Payload.limit
       break
     }
     'window.focus' {
@@ -1397,10 +1446,7 @@ public static class JWin {
       break
     }
     'window.list' {
-      $items = Get-Process -ErrorAction SilentlyContinue |
-        Where-Object { $_.MainWindowHandle -ne 0 } |
-        Select-Object -First ([int](Val $Payload.limit 50)) `
-          Id, ProcessName, MainWindowTitle
+      $items = VisibleWindows $Payload.limit
       Out $true "Listed $(@($items).Count) visible window(s)." @{
         windows = $items
       }
@@ -1465,7 +1511,7 @@ def _validate_native_payload(action: str, payload: dict[str, Any]) -> dict[str, 
         clean["arguments"] = _native_string(
             clean.get("arguments", ""),
             "arguments",
-            max_length=1000,
+            max_length=4000,
         )
     if action == "app.open_and_type":
         clean["keys"] = _native_string(clean.get("keys", ""), "keys", max_length=1000)
@@ -1505,6 +1551,9 @@ def _validate_native_payload(action: str, payload: dict[str, Any]) -> dict[str, 
             raise ValueError("keyboard.send requires keys or text.")
     if action == "window.list":
         clean["limit"] = _int_arg(clean.get("limit"), default=50, minimum=1, maximum=200)
+    if action == "screen.capture":
+        clean["path"] = _native_string(clean.get("path"), "path", max_length=500)
+        clean["limit"] = _int_arg(clean.get("limit"), default=30, minimum=1, maximum=100)
     if action == "wmi.query":
         clean = _validate_wmi_payload(clean)
     return clean
