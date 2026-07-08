@@ -375,6 +375,24 @@ h3 {
   box-shadow: 0 0 0 3px rgba(13, 118, 111, 0.12);
 }
 
+.voiceButton {
+  display: grid;
+  place-items: center;
+  width: 48px;
+  height: 36px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--graphite);
+}
+
+.voiceButton:hover,
+.voiceButton.active {
+  border-color: var(--teal);
+  background: var(--teal-2);
+  color: var(--teal);
+}
+
 .sendButton {
   display: grid;
   place-items: center;
@@ -994,6 +1012,18 @@ h3 {
   white-space: nowrap;
 }
 
+.srOnly {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 .spin {
   animation: spin 900ms linear infinite;
 }
@@ -1024,7 +1054,10 @@ h3 {
     top: 0;
     z-index: 2;
     flex-direction: row;
-    justify-content: center;
+    justify-content: flex-start;
+    max-width: 100vw;
+    min-width: 0;
+    overflow-x: auto;
     border-right: 0;
     border-bottom: 1px solid #111614;
   }

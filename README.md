@@ -126,6 +126,7 @@ docker compose --profile llm up -d dispatcher
 - OpenAI-compatible Gemma dispatcher is wired and can be started/stopped from CLI, API, and Command Center.
 - Chat supports streamed NDJSON deltas through `/api/chat/stream`; the UI renders tokens as they arrive.
 - Conversation history is durable and can be restored from Command Center after reload.
+- Command Center has browser voice input for the chat composer where the Web Speech API is available.
 - HITL gates now have a whitelisted executor: approved gates can run dispatcher, diagnostics, learning, telemetry, memory, or registered tool actions.
 - Full local smoke covers backend tests/lint/compile, Docker Compose config, frontend audit/typecheck/build, and optional live HTTP checks.
 
@@ -135,4 +136,4 @@ docker compose --profile llm up -d dispatcher
 2. Расширить tools runtime: host bridge, sandbox, browser, web, Docker.
 3. Развернуть cognitive core: richer project tasks, retrieval ranking, health snapshots.
 4. Добавить HITL-gates для опасных действий.
-5. Подключить voice/PWA слой после стабилизации текстового runtime.
+5. Довести PWA/offline-слой и локальные browser/web tools после стабилизации голосового ввода.

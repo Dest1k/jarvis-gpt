@@ -11,6 +11,8 @@ import {
   History,
   Gauge,
   Loader2,
+  Mic,
+  MicOff,
   MessageSquare,
   Play,
   RefreshCw,
@@ -25,7 +27,7 @@ import {
   Upload,
   Wrench
 } from "lucide-react";
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
 const API_URL = process.env.NEXT_PUBLIC_JARVIS_API_URL ?? "http://localhost:8000";
@@ -266,6 +268,39 @@ type ChatStreamItem = {
   error?: string;
 };
 
+type VoiceState = "idle" | "listening";
+
+type SpeechRecognitionAlternativeLike = {
+  transcript: string;
+};
+
+type SpeechRecognitionResultLike = {
+  isFinal: boolean;
+  0?: SpeechRecognitionAlternativeLike;
+};
+
+type SpeechRecognitionResultListLike = {
+  length: number;
+  [index: number]: SpeechRecognitionResultLike;
+};
+
+type SpeechRecognitionEventLike = {
+  results: SpeechRecognitionResultListLike;
+};
+
+type SpeechRecognitionLike = {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  onend: (() => void) | null;
+  onerror: (() => void) | null;
+  onresult: ((event: SpeechRecognitionEventLike) => void) | null;
+  start: () => void;
+  stop: () => void;
+};
+
+type SpeechRecognitionConstructorLike = new () => SpeechRecognitionLike;
+
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_URL}${path}`, {
     ...init,
@@ -330,6 +365,15 @@ function clampMaxTokens(value: number) {
   return Math.max(64, Math.min(8192, Math.round(value)));
 }
 
+function speechRecognitionConstructor() {
+  if (typeof window === "undefined") return null;
+  const speechWindow = window as typeof window & {
+    SpeechRecognition?: SpeechRecognitionConstructorLike;
+    webkitSpeechRecognition?: SpeechRecognitionConstructorLike;
+  };
+  return speechWindow.SpeechRecognition ?? speechWindow.webkitSpeechRecognition ?? null;
+}
+
 export default function CommandCenter() {
   const [status, setStatus] = useState<RuntimeStatus | null>(null);
   const [conversations, setConversations] = useState<ConversationItem[]>([]);
@@ -347,6 +391,9 @@ export default function CommandCenter() {
   const [autonomy, setAutonomy] = useState<AutonomyStatus | null>(null);
   const [approvals, setApprovals] = useState<ApprovalItem[]>([]);
   const [input, setInput] = useState("");
+  const [voiceAvailable, setVoiceAvailable] = useState(false);
+  const [voiceState, setVoiceState] = useState<VoiceState>("idle");
+  const [voiceInterim, setVoiceInterim] = useState("");
   const [memoryDraft, setMemoryDraft] = useState("");
   const [fileQuery, setFileQuery] = useState("");
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
@@ -363,6 +410,8 @@ export default function CommandCenter() {
   const [chatBusy, setChatBusy] = useState(false);
   const [dispatcherBusy, setDispatcherBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
+  const voiceBaseInputRef = useRef("");
 
   const refresh = useCallback(async () => {
     try {
@@ -421,7 +470,82 @@ export default function CommandCenter() {
     refresh();
   }, [refresh]);
 
+  useEffect(() => {
+    setVoiceAvailable(Boolean(speechRecognitionConstructor()));
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      const recognition = recognitionRef.current;
+      if (!recognition) return;
+      recognition.onend = null;
+      recognition.onerror = null;
+      recognition.onresult = null;
+      recognition.stop();
+      recognitionRef.current = null;
+    };
+  }, []);
+
   const counters = useMemo(() => status?.counters ?? {}, [status]);
+
+  function startVoiceInput() {
+    const Recognition = speechRecognitionConstructor();
+    if (!Recognition) {
+      setError("Voice input is not available in this browser");
+      return;
+    }
+    if (voiceState === "listening") return;
+
+    const recognition = new Recognition();
+    recognition.lang = "ru-RU";
+    recognition.continuous = false;
+    recognition.interimResults = true;
+    voiceBaseInputRef.current = input.trim();
+    recognitionRef.current = recognition;
+    setVoiceInterim("");
+    setVoiceState("listening");
+
+    recognition.onresult = (event) => {
+      let transcript = "";
+      let interim = "";
+      for (let index = 0; index < event.results.length; index += 1) {
+        const result = event.results[index];
+        const text = result[0]?.transcript ?? "";
+        transcript += text;
+        if (!result.isFinal) {
+          interim += text;
+        }
+      }
+      setVoiceInterim(interim.trim());
+      setInput([voiceBaseInputRef.current, transcript.trim()].filter(Boolean).join(" "));
+    };
+    recognition.onerror = () => {
+      setVoiceState("idle");
+      setVoiceInterim("");
+      recognitionRef.current = null;
+      setError("Voice input stopped with an error");
+    };
+    recognition.onend = () => {
+      setVoiceState("idle");
+      setVoiceInterim("");
+      recognitionRef.current = null;
+    };
+    try {
+      recognition.start();
+    } catch (err) {
+      setVoiceState("idle");
+      setVoiceInterim("");
+      recognitionRef.current = null;
+      setError(err instanceof Error ? err.message : "Voice input could not start");
+    }
+  }
+
+  function stopVoiceInput() {
+    recognitionRef.current?.stop();
+    recognitionRef.current = null;
+    setVoiceState("idle");
+    setVoiceInterim("");
+  }
 
   async function sendChat(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -877,6 +1001,19 @@ export default function CommandCenter() {
                   value={maxTokens}
                   onChange={(event) => setMaxTokens(clampMaxTokens(Number(event.target.value)))}
                 />
+                <button
+                  className={`voiceButton ${voiceState === "listening" ? "active" : ""}`}
+                  disabled={!voiceAvailable}
+                  onClick={voiceState === "listening" ? stopVoiceInput : startVoiceInput}
+                  title={voiceState === "listening" ? "Stop voice input" : "Start voice input"}
+                  type="button"
+                  aria-label={voiceState === "listening" ? "Stop voice input" : "Start voice input"}
+                >
+                  {voiceState === "listening" ? <MicOff size={16} /> : <Mic size={16} />}
+                </button>
+                <span className="srOnly" aria-live="polite">
+                  {voiceState === "listening" ? voiceInterim || "Listening" : ""}
+                </span>
                 <button className="sendButton" type="submit" disabled={chatBusy || !input.trim()}>
                   {chatBusy ? <Loader2 className="spin" size={19} /> : <Send size={19} />}
                 </button>
