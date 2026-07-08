@@ -95,6 +95,35 @@ def test_agent_streams_chat_response(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_agent_context_includes_relevance_snippets(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    storage.add_memory(
+        content="Runtime context should be clipped and scored before it reaches the model.",
+        namespace="runtime",
+        tags=["context"],
+        importance=0.8,
+    )
+    agent = AgentRuntime(
+        settings=settings,
+        storage=storage,
+        llm=LLMRouter(settings),
+        bus=EventBus(),
+    )
+
+    context = agent._prepare_context("runtime context", None)
+    messages = agent._build_llm_messages(context, "runtime context")
+    rendered = "\n".join(message["content"] for message in messages)
+
+    assert "[0." in rendered or "[1." in rendered
+    assert "Runtime context should be clipped" in rendered
+    storage.close()
+
+
 class FakeStreamingLLM:
     def __init__(self) -> None:
         self.max_tokens: int | None = None

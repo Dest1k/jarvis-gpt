@@ -392,12 +392,18 @@ class AgentRuntime:
     def _build_llm_messages(self, context: AgentContext, message: str) -> list[dict[str, str]]:
         memory_block = ""
         if context.memory_hits:
-            lines = [f"- {item['content']}" for item in context.memory_hits[:5]]
+            lines = [
+                f"- [{_context_relevance(item)}] {_context_snippet(item)}"
+                for item in context.memory_hits[:5]
+            ]
             memory_block = "Память, которая может быть полезна:\n" + "\n".join(lines)
         file_block = ""
         if context.file_hits:
             lines = [
-                f"- {item['file_name']}#{item['position']}: {item['content'][:900]}"
+                (
+                    f"- [{_context_relevance(item)}] "
+                    f"{item['file_name']}#{item['position']}: {_context_snippet(item, 900)}"
+                )
                 for item in context.file_hits[:5]
             ]
             file_block = "Индексированные файлы, которые могут быть полезны:\n" + "\n".join(lines)
@@ -497,6 +503,22 @@ class AgentRuntime:
         self.storage.add_event(kind=f"agent.{event.type}", title=event.title, payload=event.payload)
         if self.bus is not None:
             await self.bus.publish({"channel": "agent", **event.model_dump()})
+
+
+def _context_snippet(item: dict[str, Any], max_chars: int = 700) -> str:
+    value = item.get("snippet") or item.get("content") or ""
+    text = " ".join(str(value).split())
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars].rstrip()}..."
+
+
+def _context_relevance(item: dict[str, Any]) -> str:
+    try:
+        relevance = float(item.get("relevance") or 0)
+    except (TypeError, ValueError):
+        relevance = 0
+    return f"{max(0.0, min(1.0, relevance)):.2f}"
 
 
 def _task_notes_from_result(result: ToolRunResponse) -> str:
