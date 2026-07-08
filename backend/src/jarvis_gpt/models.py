@@ -153,6 +153,7 @@ class ModelArtifact(BaseModel):
     quantization: str | None = None
     metadata: dict[str, bool] = Field(default_factory=dict)
     generation: dict[str, Any] = Field(default_factory=dict)
+    fit: dict[str, Any] = Field(default_factory=dict)
 
 
 class ModelCatalogResponse(BaseModel):
@@ -161,6 +162,25 @@ class ModelCatalogResponse(BaseModel):
     active_model: ModelArtifact
     models: list[ModelArtifact]
     dispatcher: dict[str, Any]
+    vram: dict[str, Any] = Field(default_factory=dict)
+    downloads: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class ModelSearchResponse(BaseModel):
+    query: str
+    items: list[dict[str, Any]]
+    vram: dict[str, Any] = Field(default_factory=dict)
+    token_available: bool = False
+
+
+class ModelDownloadRequest(BaseModel):
+    repo_id: str = Field(min_length=3, max_length=240)
+    revision: str = Field(default="main", max_length=120)
+    workers: int = Field(default=3, ge=1, le=6)
+
+
+class ModelActivateRequest(BaseModel):
+    model_id: str = Field(min_length=1, max_length=240)
 
 
 class DispatcherStatusResponse(BaseModel):
@@ -456,6 +476,10 @@ class DockerContainersResponse(BaseModel):
     containers: list[dict[str, Any]] = Field(default_factory=list)
     command: list[str] = Field(default_factory=list)
     error: str | None = None
+
+
+class CleanupRequest(BaseModel):
+    aggressive: bool = False
 
 
 class AutonomyJobCreateRequest(BaseModel):

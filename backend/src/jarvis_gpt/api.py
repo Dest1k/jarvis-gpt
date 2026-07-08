@@ -29,6 +29,7 @@ from .ingest import FileIngestor
 from .learning import LearningEngine
 from .llm import LLMRouter
 from .model_catalog import ModelCatalog
+from .model_hub import ModelHubManager
 from .models import (
     ApprovalCreateRequest,
     ApprovalExecutionResponse,
@@ -47,6 +48,7 @@ from .models import (
     BrowserPolicyUpdateRequest,
     ChatRequest,
     ChatResponse,
+    CleanupRequest,
     ConversationItem,
     DailyBriefingResponse,
     DiagnosticsResponse,
@@ -70,7 +72,10 @@ from .models import (
     MissionExecutionResponse,
     MissionTask,
     MissionTaskUpdateRequest,
+    ModelActivateRequest,
     ModelCatalogResponse,
+    ModelDownloadRequest,
+    ModelSearchResponse,
     RoutineResponse,
     RoutineRunResponse,
     RuntimePreferencesResponse,
@@ -98,8 +103,9 @@ async def lifespan(app: FastAPI):
     bus = EventBus()
     agent = AgentRuntime(settings=settings, storage=storage, llm=llm, bus=bus)
     ingestor = FileIngestor(settings=settings, storage=storage)
-    models = ModelCatalog(settings)
-    dispatcher = DispatcherManager(settings)
+    models = ModelCatalog(settings, storage)
+    model_hub = ModelHubManager(settings=settings, storage=storage)
+    dispatcher = DispatcherManager(settings, storage=storage)
     telemetry = TelemetryCollector(settings)
     learning = LearningEngine(storage)
     host_bridge = HostBridgeStatus(settings)
@@ -120,6 +126,7 @@ async def lifespan(app: FastAPI):
     app.state.agent = agent
     app.state.ingestor = ingestor
     app.state.models = models
+    app.state.model_hub = model_hub
     app.state.dispatcher = dispatcher
     app.state.telemetry = telemetry
     app.state.learning = learning
@@ -188,7 +195,53 @@ async def status() -> StatusResponse:
 
 @app.get("/api/models", response_model=ModelCatalogResponse)
 async def models() -> ModelCatalogResponse:
-    return app.state.models.response()
+    return app.state.model_hub.inventory()
+
+
+@app.get("/api/model-hub/search", response_model=ModelSearchResponse)
+async def model_hub_search(
+    query: str = Query(min_length=1, max_length=160),
+    limit: int = Query(default=12, ge=1, le=30),
+    context_tokens: int = Query(default=8192, ge=512, le=131072),
+) -> ModelSearchResponse:
+    return app.state.model_hub.search(query, limit=limit, context_tokens=context_tokens)
+
+
+@app.get("/api/model-hub/downloads")
+async def model_downloads() -> list[dict[str, Any]]:
+    return app.state.model_hub.download_jobs()
+
+
+@app.post("/api/model-hub/download")
+async def model_download(request: ModelDownloadRequest) -> dict[str, Any]:
+    try:
+        return app.state.model_hub.start_download(
+            request.repo_id,
+            revision=request.revision,
+            workers=request.workers,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/models/activate")
+async def model_activate(request: ModelActivateRequest) -> dict[str, Any]:
+    try:
+        result = app.state.model_hub.activate_model(request.model_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await app.state.bus.publish({"channel": "models", "action": "activate", **result})
+    return result
+
+
+@app.delete("/api/models/local/{model_id}")
+async def model_delete(model_id: str) -> dict[str, Any]:
+    try:
+        result = app.state.model_hub.delete_model(model_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await app.state.bus.publish({"channel": "models", "action": "delete", **result})
+    return result
 
 
 @app.get("/api/dispatcher", response_model=DispatcherStatusResponse)
@@ -301,6 +354,18 @@ async def update_docker_policy(request: DockerPolicyUpdateRequest) -> DockerPoli
 @app.get("/api/docker/containers", response_model=DockerContainersResponse)
 async def docker_containers() -> DockerContainersResponse:
     return await asyncio.to_thread(app.state.operations.docker_containers)
+
+
+@app.post("/api/cleanup")
+async def cleanup_runtime(request: CleanupRequest) -> dict[str, Any]:
+    result = await asyncio.to_thread(
+        app.state.operations.cleanup,
+        aggressive=request.aggressive,
+    )
+    await app.state.bus.publish(
+        {"channel": "cleanup", "ok": result["ok"], "aggressive": request.aggressive}
+    )
+    return result
 
 
 @app.get("/api/autonomy/jobs", response_model=list[AutonomyJobResponse])

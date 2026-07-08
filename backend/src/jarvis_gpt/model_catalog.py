@@ -6,6 +6,9 @@ from pathlib import Path
 from typing import Any
 
 from .config import JarvisSettings
+from .storage import JarvisStorage
+
+MODEL_OVERRIDE_KEY = "models.active_override"
 
 MODEL_METADATA_FILES = (
     "config.json",
@@ -17,22 +20,30 @@ MODEL_METADATA_FILES = (
 
 
 class ModelCatalog:
-    def __init__(self, settings: JarvisSettings) -> None:
+    def __init__(self, settings: JarvisSettings, storage: JarvisStorage | None = None) -> None:
         self.settings = settings
+        self.storage = storage
 
     def response(self) -> dict[str, Any]:
         models = self.list_models()
-        active = next(
-            (item for item in models if item["id"] == self.settings.profile.model_dir_name),
-            None,
-        )
+        active_name = self.active_model_dir_name()
+        active_path = self.settings.model_root / active_name
+        active = next((item for item in models if item["id"] == active_name), None)
         return {
             "root": str(self.settings.model_root),
             "active_profile": self.settings.profile.name,
-            "active_model": active or self.describe_path(self.settings.model_dir),
+            "active_model": active or self.describe_path(active_path),
             "models": models,
             "dispatcher": self.dispatcher_config(),
         }
+
+    def active_model_dir_name(self) -> str:
+        override = ""
+        if self.storage is not None:
+            override = str(self.storage.get_runtime_value(MODEL_OVERRIDE_KEY, "") or "").strip()
+        if override and (self.settings.model_root / override).is_dir():
+            return override
+        return self.settings.profile.model_dir_name
 
     def list_models(self) -> list[dict[str, Any]]:
         root = self.settings.model_root
@@ -55,11 +66,12 @@ class ModelCatalog:
             name: (path / name).exists()
             for name in MODEL_METADATA_FILES
         }
+        active_path = self.settings.model_root / self.active_model_dir_name()
         return {
             "id": path.name,
             "path": str(path),
             "exists": path.exists(),
-            "active": path.resolve(strict=False) == self.settings.model_dir.resolve(strict=False),
+            "active": path.resolve(strict=False) == active_path.resolve(strict=False),
             "size_bytes": size_bytes,
             "shard_count": len(shards),
             "modified_at": _modified_at(path),
@@ -77,15 +89,16 @@ class ModelCatalog:
 
     def dispatcher_config(self) -> dict[str, Any]:
         profile = self.settings.profile
+        model_name = self.active_model_dir_name()
         return {
             "base_url": self.settings.llm_base_url,
             "served_model_name": self.settings.llm_model,
-            "model_path": str(self.settings.model_dir),
-            "docker_model_path": f"/models/{profile.model_dir_name}",
+            "model_path": str(self.settings.model_root / model_name),
+            "docker_model_path": f"/models/{model_name}",
             "engine": "vllm-openai",
             "env": {
                 "JARVIS_QWEN_MODEL_NAME": self.settings.llm_model,
-                "JARVIS_QWEN_MODEL_PATH": f"/models/{profile.model_dir_name}",
+                "JARVIS_QWEN_MODEL_PATH": f"/models/{model_name}",
                 "JARVIS_QWEN_DTYPE": "auto",
                 "JARVIS_QWEN_GPU_UTIL": str(profile.gpu_memory_utilization),
                 "JARVIS_QWEN_MAX_LEN": str(profile.max_model_len),

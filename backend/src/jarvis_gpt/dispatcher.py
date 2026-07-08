@@ -10,18 +10,25 @@ from typing import Any
 
 from .config import JarvisSettings
 from .model_catalog import ModelCatalog
+from .storage import JarvisStorage
 
 DISPATCHER_SERVICE = "dispatcher"
 DISPATCHER_CONTAINER = "jarvis-gpt-dispatcher"
 
 
 class DispatcherManager:
-    def __init__(self, settings: JarvisSettings, repo_root: Path | None = None) -> None:
+    def __init__(
+        self,
+        settings: JarvisSettings,
+        repo_root: Path | None = None,
+        storage: JarvisStorage | None = None,
+    ) -> None:
         self.settings = settings
         self.repo_root = repo_root or Path.cwd()
+        self.storage = storage
 
     def status(self) -> dict[str, Any]:
-        catalog = ModelCatalog(self.settings).response()
+        catalog = ModelCatalog(self.settings, self.storage).response()
         docker = shutil.which("docker")
         container = self._container_status(docker)
         desired_env = self.compose_env()
@@ -47,7 +54,7 @@ class DispatcherManager:
         }
 
     def compose_env(self) -> dict[str, str]:
-        dispatcher = ModelCatalog(self.settings).dispatcher_config()
+        dispatcher = ModelCatalog(self.settings, self.storage).dispatcher_config()
         env = {
             "JARVIS_HOST_HOME": str(self.settings.home),
             "JARVIS_MODEL_ROOT": str(self.settings.model_root),

@@ -48,3 +48,44 @@ def test_autonomy_jobs_are_budgeted(monkeypatch, tmp_path):
     assert updated["run_count"] == 1
     assert updated["status"] == "done"
     storage.close()
+
+
+def test_cleanup_removes_only_allowed_containers(monkeypatch, tmp_path):
+    manager, storage = _manager(monkeypatch, tmp_path)
+    commands = []
+
+    def fake_run_docker(args, *, timeout):
+        commands.append(args)
+        if args[:2] == ["ps", "-a"]:
+            return {
+                "ok": True,
+                "summary": "listed",
+                "stdout": (
+                    '{"ID":"1","Names":"jarvis-gpt-dispatcher","Image":"vllm",'
+                    '"Status":"Exited","State":"exited","Ports":""}\n'
+                    '{"ID":"2","Names":"postgres","Image":"postgres",'
+                    '"Status":"Running","State":"running","Ports":""}'
+                ),
+                "stderr": "",
+                "command": ["docker", *args],
+                "returncode": 0,
+            }
+        return {
+            "ok": True,
+            "summary": "ok",
+            "stdout": "",
+            "stderr": "",
+            "command": ["docker", *args],
+            "returncode": 0,
+        }
+
+    monkeypatch.setattr("jarvis_gpt.operations._run_docker", fake_run_docker)
+
+    result = manager.cleanup()
+
+    assert result["ok"] is True
+    assert ["compose", "--profile", "llm", "down", "--remove-orphans"] in commands
+    assert ["rm", "-f", "jarvis-gpt-dispatcher"] in commands
+    assert ["rm", "-f", "postgres"] not in commands
+    assert ["container", "prune", "-f"] in commands
+    storage.close()

@@ -1,6 +1,6 @@
 param(
   [Parameter(Position = 0)]
-  [ValidateSet("menu", "start", "stop", "restart", "status", "llm", "logs", "doctor", "open")]
+  [ValidateSet("menu", "start", "lan", "stop", "restart", "status", "llm", "logs", "doctor", "open")]
   [string]$Action = "menu",
 
   [ValidateSet("gemma4-turbo", "gemma4-mono")]
@@ -13,6 +13,7 @@ param(
   [switch]$NoBackend,
   [switch]$NoFrontend,
   [switch]$NoBridge,
+  [switch]$Lan,
   [switch]$WatchLlm,
   [switch]$BuildFrontend,
   [switch]$DevFrontend,
@@ -28,6 +29,60 @@ $LogDir = Join-Path $HomePath "logs\jarvis-gpt"
 $StateDir = Join-Path $HomePath "data\jarvis-gpt\state"
 $StateFile = Join-Path $StateDir "launcher-state.json"
 $BridgeTokenFile = Join-Path $HomePath ".jarvis\bridge.token"
+$script:LanMode = [bool]($Lan -or $Action -eq "lan")
+
+function Get-LanIPv4 {
+  try {
+    $candidate = Get-NetIPConfiguration |
+      Where-Object { $_.IPv4DefaultGateway -and $_.NetAdapter.Status -eq "Up" } |
+      ForEach-Object { $_.IPv4Address } |
+      Where-Object { $_ -and $_.IPAddress -and $_.IPAddress -notmatch "^(127\.|169\.254\.)" } |
+      Select-Object -First 1
+    if ($candidate) {
+      return [string]$candidate.IPAddress
+    }
+  } catch {
+  }
+
+  try {
+    $candidate = Get-NetIPAddress -AddressFamily IPv4 |
+      Where-Object {
+        $_.IPAddress -and
+        $_.IPAddress -notmatch "^(127\.|169\.254\.)" -and
+        $_.PrefixOrigin -ne "WellKnown"
+      } |
+      Sort-Object InterfaceMetric |
+      Select-Object -First 1
+    if ($candidate) {
+      return [string]$candidate.IPAddress
+    }
+  } catch {
+  }
+
+  return "127.0.0.1"
+}
+
+function Get-PublicHost {
+  if ($script:LanMode) {
+    return Get-LanIPv4
+  }
+  return "127.0.0.1"
+}
+
+function Get-BindHost {
+  if ($script:LanMode) {
+    return "0.0.0.0"
+  }
+  return "127.0.0.1"
+}
+
+function Get-BackendUrl {
+  return "http://$(Get-PublicHost):8000"
+}
+
+function Get-FrontendUrl {
+  return "http://$(Get-PublicHost):3000"
+}
 
 function Set-JarvisEnvironment {
   param([string]$SelectedProfile)
@@ -37,7 +92,7 @@ function Set-JarvisEnvironment {
   $env:JARVIS_PROFILE = $SelectedProfile
   $env:JARVIS_LLM_BASE_URL = "http://localhost:8001/v1"
   $env:JARVIS_LLM_MODEL = "dispatcher"
-  $env:NEXT_PUBLIC_JARVIS_API_URL = "http://localhost:8000"
+  $env:NEXT_PUBLIC_JARVIS_API_URL = Get-BackendUrl
 }
 
 function Ensure-LauncherFolders {
@@ -101,6 +156,65 @@ function Get-PortOwner {
     return $null
   }
   return $null
+}
+
+function Get-PortListenAddresses {
+  param([int]$Port)
+
+  try {
+    return @(
+      Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop |
+        Select-Object -ExpandProperty LocalAddress -Unique
+    )
+  } catch {
+    return @()
+  }
+}
+
+function Test-PortExposedForLan {
+  param([int]$Port)
+
+  $addresses = @(Get-PortListenAddresses -Port $Port)
+  $lanIp = Get-LanIPv4
+  return [bool](
+    $addresses -contains "0.0.0.0" -or
+    $addresses -contains "::" -or
+    $addresses -contains $lanIp
+  )
+}
+
+function Ensure-LanFirewallRules {
+  if (-not $script:LanMode) {
+    return
+  }
+
+  $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+    [Security.Principal.WindowsBuiltinRole]::Administrator
+  )
+  if (-not $isAdmin) {
+    Write-Host "Firewall rules were not changed because the launcher is not elevated." -ForegroundColor DarkYellow
+    Write-Host "If another device cannot connect, run this command as Administrator once." -ForegroundColor DarkGray
+    return
+  }
+
+  foreach ($port in @(3000, 8000)) {
+    $name = "Jarvis GPT LAN $port"
+    try {
+      $existing = Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue
+      if (-not $existing) {
+        New-NetFirewallRule `
+          -DisplayName $name `
+          -Direction Inbound `
+          -Action Allow `
+          -Protocol TCP `
+          -LocalPort $port `
+          -Profile Private `
+          -Description "Allow Jarvis GPT LAN access on TCP $port." | Out-Null
+      }
+    } catch {
+      Write-Host ("Could not create firewall rule for TCP {0}: {1}" -f $port, $_.Exception.Message) -ForegroundColor DarkYellow
+    }
+  }
 }
 
 function Test-PortOpen {
@@ -795,6 +909,10 @@ function Save-LauncherState {
   $state = [ordered]@{
     profile = $Profile
     home = $HomePath
+    lan = [bool]$script:LanMode
+    lan_ip = Get-LanIPv4
+    frontend_url = Get-FrontendUrl
+    backend_url = Get-BackendUrl
     started_at = (Get-Date).ToString("o")
     services = $Services
   }
@@ -898,8 +1016,16 @@ function Ensure-FrontendReady {
 function Start-JarvisStack {
   Ensure-LauncherFolders
   Set-JarvisEnvironment -SelectedProfile $Profile
+  Ensure-LanFirewallRules
+  $bindHost = Get-BindHost
+  $publicHost = Get-PublicHost
 
   Write-Banner
+  if ($script:LanMode) {
+    Write-Host ("LAN mode: UI http://{0}:3000, API http://{0}:8000" -f $publicHost) -ForegroundColor Cyan
+    Write-Host "Dispatcher and host bridge remain bound to localhost." -ForegroundColor DarkGray
+    Write-Host ""
+  }
   Write-Host "Preparing runtime folders..." -ForegroundColor Yellow
   Invoke-JarvisCommand -FilePath "py.exe" -Arguments @("-3.11", ".\jarvis.py", "--profile", $Profile, "init")
 
@@ -937,15 +1063,23 @@ function Start-JarvisStack {
 
   if (-not $NoBackend) {
     if (Test-PortOpen -Port 8000) {
-      $services.backend = @{ port = 8000; pid = Get-PortOwner -Port 8000; reused = $true }
-      Write-Host "Backend already listening on 127.0.0.1:8000" -ForegroundColor DarkYellow
-    } else {
+      if ($script:LanMode -and -not (Test-PortExposedForLan -Port 8000)) {
+        Write-Host "Restarting backend for LAN binding..." -ForegroundColor Yellow
+        Stop-PortOwner -Port 8000
+        [void](Wait-PortClosed -Port 8000)
+      } else {
+        $services.backend = @{ port = 8000; pid = Get-PortOwner -Port 8000; reused = $true; host = $bindHost }
+        Write-Host ("Backend already listening on {0}:8000" -f $bindHost) -ForegroundColor DarkYellow
+      }
+    }
+    if (-not (Test-PortOpen -Port 8000)) {
       $services.backend = @{
         port = 8000
+        host = $bindHost
         pid = Start-ManagedProcess `
           -Name "backend" `
           -FilePath "py.exe" `
-          -Arguments @("-3.11", ".\jarvis.py", "--profile", $Profile, "serve", "--host", "127.0.0.1", "--port", "8000") `
+          -Arguments @("-3.11", ".\jarvis.py", "--profile", $Profile, "serve", "--host", $bindHost, "--port", "8000") `
           -WorkingDirectory $RepoRoot `
           -Stdout (Join-Path $LogDir "backend.out.log") `
           -Stderr (Join-Path $LogDir "backend.err.log")
@@ -956,24 +1090,26 @@ function Start-JarvisStack {
   if (-not $NoFrontend) {
     $frontendRebuilt = Ensure-FrontendReady
     if (Test-PortOpen -Port 3000) {
-      if ($frontendRebuilt) {
-        Write-Host "Restarting Command Center because the frontend build changed..." -ForegroundColor Yellow
+      if ($frontendRebuilt -or ($script:LanMode -and -not (Test-PortExposedForLan -Port 3000))) {
+        $reason = if ($frontendRebuilt) { "the frontend build changed" } else { "LAN binding is required" }
+        Write-Host ("Restarting Command Center because {0}..." -f $reason) -ForegroundColor Yellow
         Stop-PortOwner -Port 3000
         [void](Wait-PortClosed -Port 3000)
       } else {
-        $services.frontend = @{ port = 3000; pid = Get-PortOwner -Port 3000; reused = $true }
-        Write-Host "Command Center already listening on 127.0.0.1:3000" -ForegroundColor DarkYellow
+        $services.frontend = @{ port = 3000; pid = Get-PortOwner -Port 3000; reused = $true; host = $bindHost }
+        Write-Host ("Command Center already listening on {0}:3000" -f $bindHost) -ForegroundColor DarkYellow
       }
     }
 
     if (-not (Test-PortOpen -Port 3000)) {
       $frontendArgs = if ($DevFrontend) {
-        @("run", "dev", "--", "--hostname", "127.0.0.1")
+        @("run", "dev", "--", "--hostname", $bindHost)
       } else {
-        @("run", "start", "--", "--hostname", "127.0.0.1")
+        @("run", "start", "--", "--hostname", $bindHost)
       }
       $services.frontend = @{
         port = 3000
+        host = $bindHost
         pid = Start-ManagedProcess `
           -Name "frontend" `
           -FilePath "npm.cmd" `
@@ -1043,17 +1179,40 @@ function Show-ServiceRow {
   }
 }
 
+function Get-EffectiveLanMode {
+  $state = Read-LauncherState
+  return [bool]($script:LanMode -or ($state -and $state.lan))
+}
+
+function Get-EffectivePublicHost {
+  $state = Read-LauncherState
+  if ($state -and $state.lan -and $state.lan_ip) {
+    return [string]$state.lan_ip
+  }
+  if (Get-EffectiveLanMode) {
+    return Get-LanIPv4
+  }
+  return "127.0.0.1"
+}
+
 function Show-JarvisStatus {
   Set-JarvisEnvironment -SelectedProfile $Profile
+  $statusHost = Get-EffectivePublicHost
+  $lanStatus = Get-EffectiveLanMode
   Write-Banner
   Write-Host "+----------------+----------+-------------+----------------------------+" -ForegroundColor DarkCyan
   Write-Host "| Service        | State    | Process     | URL                        |" -ForegroundColor Cyan
   Write-Host "+----------------+----------+-------------+----------------------------+" -ForegroundColor DarkCyan
-  Show-ServiceRow -Name "Backend" -Port 8000 -Url "http://127.0.0.1:8000"
-  Show-ServiceRow -Name "Frontend" -Port 3000 -Url "http://127.0.0.1:3000"
+  Show-ServiceRow -Name "Backend" -Port 8000 -Url ("http://{0}:8000" -f $statusHost)
+  Show-ServiceRow -Name "Frontend" -Port 3000 -Url ("http://{0}:3000" -f $statusHost)
   Show-ServiceRow -Name "Host bridge" -Port 8765 -Url "http://127.0.0.1:8765"
   Show-ServiceRow -Name "Dispatcher" -Port 8001 -Url "http://127.0.0.1:8001/v1"
   Write-Host "+----------------+----------+-------------+----------------------------+" -ForegroundColor DarkCyan
+  if ($lanStatus) {
+    Write-Host ("LAN access: open http://{0}:3000 from another device on the same network." -f $statusHost) -ForegroundColor Cyan
+    Write-Host "Only UI/API are exposed to LAN; dispatcher and host bridge remain localhost-only." -ForegroundColor DarkGray
+    Write-Host ""
+  }
   Write-Host ""
   Write-LlmReadinessBlock -Readiness (Get-LlmReadiness)
   Write-Host ""
@@ -1090,12 +1249,13 @@ function Invoke-Doctor {
 }
 
 function Open-CommandCenter {
-  Start-Process "http://127.0.0.1:3000"
+  Start-Process ("http://{0}:3000" -f (Get-EffectivePublicHost))
 }
 
 function Invoke-Menu {
   $main = @(
     @{ Label = "Start full stack"; Value = "start"; Hint = "dispatcher + bridge + backend + UI" },
+    @{ Label = "Start LAN mode"; Value = "lan"; Hint = "UI/API on local network, bridge stays local" },
     @{ Label = "Stop stack"; Value = "stop"; Hint = "stop UI/backend/bridge/dispatcher" },
     @{ Label = "Restart stack"; Value = "restart"; Hint = "stop then start" },
     @{ Label = "Status"; Value = "status"; Hint = "show service ports" },
@@ -1110,7 +1270,7 @@ function Invoke-Menu {
     return
   }
 
-  if ($choice.Value -in @("start", "restart")) {
+  if ($choice.Value -in @("start", "restart", "lan")) {
     $profiles = @(
       @{ Label = "gemma4-turbo"; Value = "gemma4-turbo"; Hint = "26B A4B NVFP4, fast warmed runtime" },
       @{ Label = "gemma4-mono"; Value = "gemma4-mono"; Hint = "31B IT NVFP4, stable baseline" }
@@ -1140,6 +1300,7 @@ function Invoke-Menu {
 
   switch ($choice.Value) {
     "start" { Start-JarvisStack }
+    "lan" { $script:LanMode = $true; Start-JarvisStack }
     "stop" { Stop-JarvisStack }
     "restart" { Stop-JarvisStack; Start-JarvisStack }
     "status" { Show-JarvisStatus }
@@ -1158,6 +1319,7 @@ function Invoke-Menu {
 switch ($Action) {
   "menu" { Invoke-Menu }
   "start" { Start-JarvisStack }
+  "lan" { $script:LanMode = $true; Start-JarvisStack }
   "stop" { Stop-JarvisStack }
   "restart" { Stop-JarvisStack; Start-JarvisStack }
   "status" { Show-JarvisStatus }

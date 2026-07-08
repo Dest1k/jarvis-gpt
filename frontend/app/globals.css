@@ -1319,6 +1319,209 @@ h3 {
   padding: 12px;
 }
 
+.modelBrowser {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+}
+
+.modelBudget,
+.modelSearchForm,
+.remoteModelRow,
+.downloadRow,
+.localModelRow,
+.cleanupStrip {
+  display: grid;
+  align-items: center;
+  gap: 8px;
+  min-height: 38px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 8px 10px;
+  background: #ffffff;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.modelBudget {
+  grid-template-columns: 18px minmax(0, 1fr) auto minmax(96px, 0.6fr);
+}
+
+.modelBudget svg,
+.remoteModelRow svg,
+.downloadRow svg,
+.localModelRow svg,
+.cleanupStrip svg {
+  color: var(--teal);
+}
+
+.modelBudget strong,
+.remoteModelRow strong,
+.downloadRow strong,
+.localModelRow strong,
+.cleanupStrip strong,
+.miniHeader strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.modelBudget small,
+.remoteModelRow small,
+.downloadRow small,
+.localModelRow p {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.modelSearchForm {
+  grid-template-columns: 18px minmax(0, 1fr) 86px 56px 32px;
+}
+
+.modelSearchForm input {
+  min-width: 0;
+  height: 30px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 0 8px;
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 12px;
+  outline: none;
+}
+
+.modelSearchForm input:focus {
+  border-color: var(--teal);
+}
+
+.modelSearchForm button,
+.remoteModelRow button,
+.modelActions button {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--graphite);
+}
+
+.modelSearchForm button:hover,
+.remoteModelRow button:hover,
+.modelActions button:hover {
+  border-color: var(--teal);
+  color: var(--teal);
+}
+
+.remoteModelList,
+.downloadQueue,
+.localModelList {
+  display: grid;
+  gap: 8px;
+}
+
+.remoteModelRow {
+  grid-template-columns: 18px minmax(0, 1fr) minmax(118px, 0.5fr) minmax(86px, 0.4fr) 32px;
+}
+
+.remoteModelRow p,
+.remoteModelRow small,
+.downloadRow p {
+  margin-top: 2px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.remoteModelRow.fits,
+.localModelRow.active {
+  border-color: rgba(13, 118, 111, 0.38);
+}
+
+.remoteModelRow.tight {
+  border-color: rgba(183, 121, 31, 0.45);
+}
+
+.remoteModelRow.no {
+  border-color: rgba(193, 82, 75, 0.45);
+}
+
+.remoteModelRow > span,
+.fitPill,
+.downloadRow > span,
+.cleanupStrip > span {
+  justify-self: start;
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.fitPill.fits {
+  background: var(--teal-2);
+  color: var(--teal);
+}
+
+.fitPill.tight {
+  background: rgba(183, 121, 31, 0.13);
+  color: var(--amber);
+}
+
+.fitPill.no {
+  background: rgba(193, 82, 75, 0.13);
+  color: var(--coral);
+}
+
+.miniHeader {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 2px 2px 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.miniHeader span {
+  min-width: 0;
+  overflow: hidden;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.downloadRow {
+  grid-template-columns: 18px minmax(0, 1fr) auto minmax(86px, 0.4fr);
+}
+
+.downloadRow.error {
+  border-color: rgba(193, 82, 75, 0.45);
+}
+
+.downloadRow.done {
+  border-color: rgba(13, 118, 111, 0.38);
+}
+
+.localModelRow {
+  grid-template-columns: 18px minmax(0, 1fr) auto auto;
+}
+
+.modelActions {
+  display: flex;
+  gap: 5px;
+}
+
+.cleanupStrip {
+  grid-template-columns: 18px minmax(0, 1fr) auto auto auto;
+}
+
 .toolRow {
   display: grid;
   grid-template-columns: 18px minmax(0, 1fr) auto;

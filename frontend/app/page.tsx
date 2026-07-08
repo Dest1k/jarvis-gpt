@@ -7,6 +7,7 @@ import {
   ClipboardCheck,
   Cpu,
   Database,
+  Download,
   FileText,
   Gauge,
   Globe,
@@ -35,7 +36,7 @@ import {
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { KeyboardEvent, PointerEvent as ReactPointerEvent, ReactNode } from "react";
 
-const API_URL = process.env.NEXT_PUBLIC_JARVIS_API_URL ?? "http://localhost:8000";
+const CONFIGURED_API_URL = process.env.NEXT_PUBLIC_JARVIS_API_URL ?? "http://localhost:8000";
 const CHAT_WINDOWS_KEY = "jarvis-gpt.chatWindows.v1";
 const CHAT_SETTINGS_KEY = "jarvis-gpt.chatSettings.v1";
 const DEFAULT_CHAT_HEIGHT = 680;
@@ -221,6 +222,7 @@ type ModelArtifact = {
   model_type?: string | null;
   dtype?: string | null;
   quantization?: string | null;
+  fit?: ModelFit;
 };
 
 type ModelCatalog = {
@@ -228,6 +230,8 @@ type ModelCatalog = {
   active_profile: string;
   active_model: ModelArtifact;
   models: ModelArtifact[];
+  vram?: VramBudget;
+  downloads?: ModelDownloadJob[];
   dispatcher: {
     base_url: string;
     served_model_name: string;
@@ -235,6 +239,68 @@ type ModelCatalog = {
     docker_model_path: string;
     env: Record<string, string>;
   };
+};
+
+type ModelFit = {
+  status: "fits" | "tight" | "no" | "unknown";
+  label: string;
+  confidence: "high" | "medium" | "low";
+  required_bytes: number;
+  weights_bytes: number;
+  kv_cache_bytes: number;
+  overhead_bytes: number;
+  gpu_total_bytes: number;
+  gpu_free_bytes: number;
+  context_tokens: number;
+  quant_bits: number;
+  parameters?: number | null;
+  warnings: string[];
+};
+
+type VramBudget = {
+  available: boolean;
+  name?: string;
+  total_bytes?: number;
+  used_bytes?: number;
+  free_bytes?: number;
+  error?: string;
+};
+
+type RemoteModel = {
+  id: string;
+  author?: string | null;
+  downloads: number;
+  likes: number;
+  tags: string[];
+  pipeline_tag?: string | null;
+  gated?: boolean | string | null;
+  size_bytes: number;
+  downloadable_files: number;
+  fit: ModelFit;
+};
+
+type ModelSearchResult = {
+  query: string;
+  items: RemoteModel[];
+  vram: VramBudget;
+  token_available: boolean;
+};
+
+type ModelDownloadJob = {
+  id: string;
+  repo_id: string;
+  revision: string;
+  status: "queued" | "running" | "done" | "error";
+  summary: string;
+  target: string;
+  total_files: number;
+  completed_files: number;
+  total_bytes: number;
+  downloaded_bytes: number;
+  current_file?: string;
+  error?: string;
+  workers?: number;
+  resumable?: boolean;
 };
 
 type DispatcherRuntime = {
@@ -504,7 +570,7 @@ type SpeechRecognitionLike = {
 type SpeechRecognitionConstructorLike = new () => SpeechRecognitionLike;
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${API_URL}${path}`, {
+  const response = await fetch(`${apiUrl()}${path}`, {
     ...init,
     headers: {
       "Content-Type": "application/json",
@@ -522,7 +588,7 @@ async function streamApi(
   body: Record<string, unknown>,
   onItem: (item: ChatStreamItem) => void
 ) {
-  const response = await fetch(`${API_URL}${path}`, {
+  const response = await fetch(`${apiUrl()}${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body)
@@ -546,6 +612,23 @@ async function streamApi(
   }
   buffer += decoder.decode();
   drainStreamBuffer(`${buffer}\n`, onItem);
+}
+
+function apiUrl() {
+  if (typeof window === "undefined") {
+    return CONFIGURED_API_URL.replace(/\/$/, "");
+  }
+  try {
+    const configured = new URL(CONFIGURED_API_URL);
+    const pageHost = window.location.hostname;
+    const localHosts = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
+    if (localHosts.has(configured.hostname) && !localHosts.has(pageHost)) {
+      return `${window.location.protocol}//${pageHost}:8000`;
+    }
+    return configured.toString().replace(/\/$/, "");
+  } catch {
+    return `${window.location.protocol}//${window.location.hostname}:8000`;
+  }
 }
 
 function drainStreamBuffer(
@@ -737,6 +820,12 @@ export default function CommandCenter() {
   const [fileHits, setFileHits] = useState<FileChunkHit[]>([]);
   const [audit, setAudit] = useState<AuditEntry[]>([]);
   const [modelCatalog, setModelCatalog] = useState<ModelCatalog | null>(null);
+  const [modelSearchQuery, setModelSearchQuery] = useState("gemma qwen llama nvfp4");
+  const [modelSearchResult, setModelSearchResult] = useState<ModelSearchResult | null>(null);
+  const [modelSearchBusy, setModelSearchBusy] = useState(false);
+  const [modelDownloads, setModelDownloads] = useState<ModelDownloadJob[]>([]);
+  const [modelWorkers, setModelWorkers] = useState(3);
+  const [modelContextTokens, setModelContextTokens] = useState(8192);
   const [dispatcher, setDispatcher] = useState<DispatcherStatus | null>(null);
   const [telemetry, setTelemetry] = useState<TelemetrySnapshot | null>(null);
   const [hostBridge, setHostBridge] = useState<HostBridgeStatus | null>(null);
@@ -780,6 +869,7 @@ export default function CommandCenter() {
   const [busy, setBusy] = useState(false);
   const [chatBusy, setChatBusy] = useState(false);
   const [dispatcherBusy, setDispatcherBusy] = useState(false);
+  const [cleanupBusy, setCleanupBusy] = useState(false);
   const [activeOperation, setActiveOperation] = useState<ActiveOperation | null>(null);
   const [storageReady, setStorageReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -897,6 +987,7 @@ export default function CommandCenter() {
       setFiles(fileData);
       setAudit(auditData);
       setModelCatalog(modelData);
+      setModelDownloads(modelData.downloads ?? []);
       setDispatcher(dispatcherData);
       setTelemetry(telemetryData);
       setHostBridge(hostBridgeData);
@@ -927,12 +1018,14 @@ export default function CommandCenter() {
     if (vitalsRequestInFlightRef.current) return;
     vitalsRequestInFlightRef.current = true;
     try {
-      const [statusData, dispatcherData] = await Promise.all([
+      const [statusData, dispatcherData, downloadData] = await Promise.all([
         api<RuntimeStatus>("/api/status"),
-        api<DispatcherStatus>("/api/dispatcher")
+        api<DispatcherStatus>("/api/dispatcher"),
+        api<ModelDownloadJob[]>("/api/model-hub/downloads")
       ]);
       setStatus(statusData);
       setDispatcher(dispatcherData);
+      setModelDownloads(downloadData);
       if (statusData.health.length) {
         setDiagnostics(statusData.health);
       }
@@ -1726,6 +1819,154 @@ export default function CommandCenter() {
     }
   }
 
+  async function searchModelHub(event?: FormEvent<HTMLFormElement>) {
+    event?.preventDefault();
+    const query = modelSearchQuery.trim();
+    if (!query || modelSearchBusy) return;
+    setActiveOperation({
+      title: "Браузер моделей",
+      detail: `поиск: ${query}`
+    });
+    setModelSearchBusy(true);
+    try {
+      const params = new URLSearchParams({
+        query,
+        limit: "12",
+        context_tokens: String(modelContextTokens)
+      });
+      setModelSearchResult(await api<ModelSearchResult>(`/api/model-hub/search?${params}`));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Поиск моделей не выполнен");
+    } finally {
+      setModelSearchBusy(false);
+      setActiveOperation(null);
+    }
+  }
+
+  async function downloadRemoteModel(repoId: string) {
+    setActiveOperation({
+      title: "Скачивание модели",
+      detail: repoId
+    });
+    setBusy(true);
+    try {
+      const job = await api<ModelDownloadJob>("/api/model-hub/download", {
+        method: "POST",
+        body: JSON.stringify({ repo_id: repoId, revision: "main", workers: modelWorkers })
+      });
+      setModelDownloads((current) => [job, ...current].slice(0, 20));
+      setLines((current) => [
+        ...current,
+        {
+          id: crypto.randomUUID(),
+          role: "system",
+          content: `Скачивание модели: ${repoId}, потоков: ${job.workers ?? modelWorkers}`
+        }
+      ]);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Скачивание модели не запущено");
+    } finally {
+      setBusy(false);
+      setActiveOperation(null);
+    }
+  }
+
+  async function activateAndLoadModel(modelId: string) {
+    if (dispatcherBusy) return;
+    setActiveOperation({
+      title: "Загрузка модели",
+      detail: modelId
+    });
+    setDispatcherBusy(true);
+    try {
+      const activated = await api<{ ok: boolean; summary: string }>("/api/models/activate", {
+        method: "POST",
+        body: JSON.stringify({ model_id: modelId })
+      });
+      let latestStatus: DispatcherStatus | null = null;
+      if (dispatcher?.container_status?.exists || dispatcher?.port_open) {
+        const stopped = await api<DispatcherAction>("/api/dispatcher/stop", {
+          method: "POST",
+          body: "{}"
+        });
+        latestStatus = stopped.status;
+      }
+      const started = await api<DispatcherAction>("/api/dispatcher/start", {
+        method: "POST",
+        body: "{}"
+      });
+      latestStatus = started.status;
+      setDispatcher(latestStatus);
+      setLines((current) => [
+        ...current,
+        {
+          id: crypto.randomUUID(),
+          role: "system",
+          content: `${activated.summary}\n${started.summary}`
+        }
+      ]);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Модель не загружена в dispatcher");
+    } finally {
+      setDispatcherBusy(false);
+      setActiveOperation(null);
+    }
+  }
+
+  async function deleteLocalModel(modelId: string) {
+    setActiveOperation({
+      title: "Удаление модели",
+      detail: modelId
+    });
+    setBusy(true);
+    try {
+      const result = await api<{ summary: string }>(
+        `/api/models/local/${encodeURIComponent(modelId)}`,
+        { method: "DELETE" }
+      );
+      setLines((current) => [
+        ...current,
+        { id: crypto.randomUUID(), role: "system", content: result.summary }
+      ]);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Модель не удалена");
+    } finally {
+      setBusy(false);
+      setActiveOperation(null);
+    }
+  }
+
+  async function cleanupRuntime(aggressive = false) {
+    setActiveOperation({
+      title: "Очистка runtime",
+      detail: aggressive ? "агрессивная Docker cleanup" : "безопасная Docker cleanup"
+    });
+    setCleanupBusy(true);
+    try {
+      const result = await api<{ ok: boolean; summary: string; steps: { summary: string }[] }>(
+        "/api/cleanup",
+        { method: "POST", body: JSON.stringify({ aggressive }) }
+      );
+      setLines((current) => [
+        ...current,
+        {
+          id: crypto.randomUUID(),
+          role: "system",
+          content: `${result.summary}\n${result.steps.map((step) => step.summary).join("\n")}`
+        }
+      ]);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Очистка не выполнена");
+    } finally {
+      setCleanupBusy(false);
+      setActiveOperation(null);
+    }
+  }
+
   async function executeNextMissionStep(missionId: string) {
     const mission = missions.find((item) => item.id === missionId);
     const nextTask = mission?.tasks.find((task) => task.status !== "done");
@@ -1833,7 +2074,7 @@ export default function CommandCenter() {
     });
     setBusy(true);
     try {
-      const response = await fetch(`${API_URL}/api/files/upload`, {
+      const response = await fetch(`${apiUrl()}/api/files/upload`, {
         method: "POST",
         body: formData
       });
@@ -2609,61 +2850,226 @@ export default function CommandCenter() {
 
             {(activeTab === "models" || activeTab === "runtime") && (
               <>
-            <div className={`panelHeader ${activeTab === "runtime" ? "lower" : ""}`} id="models">
-              <h2>Модели</h2>
-              <span>{modelCatalog?.models.length ?? 0}</span>
-            </div>
-            <div className="modelList">
-              {dispatcher && (
-                <div className={`dispatcherRow ${dispatcher.port_open ? "online" : ""}`}>
-                  <Server size={14} />
-                  <strong>{dispatcherRuntime?.model_id ?? dispatcher.model}</strong>
-                  <span>{dispatcher.port_open ? dispatcherModeLabel : "офлайн"}</span>
-                  <small>{runtimeStateLabel(dispatcher.container_status?.status ?? "port 8001")}</small>
-                  <div className="dispatcherControls">
+                <div className={`panelHeader ${activeTab === "runtime" ? "lower" : ""}`} id="models">
+                  <h2>Браузер моделей</h2>
+                  <span>{modelCatalog?.models.length ?? 0}</span>
+                </div>
+                <div className="modelBrowser">
+                  {dispatcher && (
+                    <div className={`dispatcherRow ${dispatcher.port_open ? "online" : ""}`}>
+                      <Server size={14} />
+                      <strong>{dispatcherRuntime?.model_id ?? dispatcher.model}</strong>
+                      <span>{dispatcher.port_open ? dispatcherModeLabel : "офлайн"}</span>
+                      <small>
+                        {runtimeStateLabel(dispatcher.container_status?.status ?? "port 8001")}
+                      </small>
+                      <div className="dispatcherControls">
+                        <button
+                          type="button"
+                          title="Запустить dispatcher"
+                          aria-label="Запустить dispatcher"
+                          disabled={dispatcherBusy || dispatcher.port_open}
+                          onClick={() => runDispatcherAction("start")}
+                        >
+                          {dispatcherBusy ? <Loader2 className="spin" size={14} /> : <Play size={14} />}
+                        </button>
+                        <button
+                          type="button"
+                          title="Остановить dispatcher"
+                          aria-label="Остановить dispatcher"
+                          disabled={dispatcherBusy || !dispatcher.container_status?.exists}
+                          onClick={() => runDispatcherAction("stop")}
+                        >
+                          <Square size={14} />
+                        </button>
+                        <button
+                          type="button"
+                          title="Логи dispatcher"
+                          aria-label="Логи dispatcher"
+                          disabled={dispatcherBusy || !dispatcher.container_status?.exists}
+                          onClick={() => runDispatcherAction("logs")}
+                        >
+                          <FileText size={14} />
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="modelBudget">
+                    <Gauge size={15} />
+                    <strong>{modelCatalog?.vram?.name ?? "GPU"}</strong>
+                    <span>
+                      {modelCatalog?.vram?.available
+                        ? `${formatBytes(modelCatalog.vram.free_bytes ?? 0)} свободно`
+                        : "VRAM недоступна"}
+                    </span>
+                    <small>
+                      {modelCatalog?.vram?.available
+                        ? `${formatBytes(modelCatalog.vram.total_bytes ?? 0)} всего`
+                        : modelCatalog?.vram?.error ?? "nvidia-smi не ответил"}
+                    </small>
+                  </div>
+
+                  <form className="modelSearchForm" onSubmit={searchModelHub}>
+                    <Search size={15} />
+                    <input
+                      aria-label="Поиск модели"
+                      value={modelSearchQuery}
+                      onChange={(event) => setModelSearchQuery(event.target.value)}
+                      placeholder="Qwen 2.5 coder 7B GGUF, Gemma NVFP4..."
+                    />
+                    <input
+                      aria-label="Контекст"
+                      min={512}
+                      max={131072}
+                      step={512}
+                      type="number"
+                      value={modelContextTokens}
+                      onChange={(event) => setModelContextTokens(Number(event.target.value))}
+                      title="Контекст для расчёта KV-cache"
+                    />
+                    <input
+                      aria-label="Потоки скачивания"
+                      min={1}
+                      max={6}
+                      type="number"
+                      value={modelWorkers}
+                      onChange={(event) => setModelWorkers(Number(event.target.value))}
+                      title="Параллельные файловые потоки"
+                    />
+                    <button
+                      type="submit"
+                      disabled={modelSearchBusy || !modelSearchQuery.trim()}
+                      title="Искать модели"
+                      aria-label="Искать модели"
+                    >
+                      {modelSearchBusy ? <Loader2 className="spin" size={15} /> : <Search size={15} />}
+                    </button>
+                  </form>
+
+                  {modelSearchResult && (
+                    <div className="remoteModelList">
+                      {modelSearchResult.items.map((model) => (
+                        <article className={`remoteModelRow ${fitTone(model.fit)}`} key={model.id}>
+                          <Database size={15} />
+                          <div>
+                            <strong>{model.id}</strong>
+                            <p>{model.pipeline_tag ?? model.tags.slice(0, 3).join(", ")}</p>
+                            {model.fit.warnings.slice(0, 1).map((warning) => (
+                              <small key={warning}>{warning}</small>
+                            ))}
+                          </div>
+                          <span>{fitSummary(model.fit)}</span>
+                          <small>{formatBytes(model.size_bytes)} · {model.downloadable_files} файлов</small>
+                          <button
+                            type="button"
+                            disabled={busy || model.downloadable_files === 0}
+                            onClick={() => downloadRemoteModel(model.id)}
+                            title="Скачать с докачкой"
+                            aria-label="Скачать модель"
+                          >
+                            <Download size={14} />
+                          </button>
+                        </article>
+                      ))}
+                    </div>
+                  )}
+
+                  {modelDownloads.length > 0 && (
+                    <div className="downloadQueue">
+                      <div className="miniHeader">
+                        <strong>Скачивание</strong>
+                        <span>{modelDownloads.length}</span>
+                      </div>
+                      {modelDownloads.slice(0, 5).map((job) => (
+                        <article className={`downloadRow ${job.status}`} key={job.id}>
+                          <Download size={14} />
+                          <div>
+                            <strong>{job.repo_id}</strong>
+                            <p>{job.summary}</p>
+                            <div className="progressTrack">
+                              <span
+                                style={{
+                                  width: `${progressPercent(job.downloaded_bytes, job.total_bytes)}%`
+                                }}
+                              />
+                            </div>
+                          </div>
+                          <span>{job.completed_files}/{job.total_files}</span>
+                          <small>{job.workers ?? 1} потока · {formatBytes(job.downloaded_bytes)}</small>
+                        </article>
+                      ))}
+                    </div>
+                  )}
+
+                  <div className="miniHeader">
+                    <strong>Локальные модели</strong>
+                    <span>{modelCatalog?.root ?? "..."}</span>
+                  </div>
+                  <div className="localModelList">
+                    {modelCatalog ? (
+                      modelCatalog.models.map((model) => (
+                        <article className={`localModelRow ${model.active ? "active" : ""}`} key={model.id}>
+                          <Cpu size={15} />
+                          <div>
+                            <strong>{model.id}</strong>
+                            <p>
+                              {model.quantization ?? model.dtype ?? model.model_type ?? "model"} ·{" "}
+                              {formatBytes(model.size_bytes)}
+                            </p>
+                          </div>
+                          <span className={`fitPill ${fitTone(model.fit)}`}>{fitSummary(model.fit)}</span>
+                          <div className="modelActions">
+                            <button
+                              type="button"
+                              title="Загрузить в dispatcher"
+                              aria-label="Загрузить модель"
+                              disabled={dispatcherBusy || !model.exists}
+                              onClick={() => activateAndLoadModel(model.id)}
+                            >
+                              {dispatcherBusy ? <Loader2 className="spin" size={14} /> : <Play size={14} />}
+                            </button>
+                            <button
+                              type="button"
+                              title="Удалить локальную модель"
+                              aria-label="Удалить модель"
+                              disabled={busy || model.active}
+                              onClick={() => deleteLocalModel(model.id)}
+                            >
+                              <Trash2 size={14} />
+                            </button>
+                          </div>
+                        </article>
+                      ))
+                    ) : (
+                      <div className="emptyState compact">Каталог моделей недоступен</div>
+                    )}
+                  </div>
+
+                  <div className="cleanupStrip">
+                    <Wrench size={15} />
+                    <strong>Очистка runtime</strong>
+                    <span>{dockerContainers?.containers.length ?? 0} контейнеров</span>
                     <button
                       type="button"
-                      title="Запустить dispatcher"
-                      aria-label="Запустить dispatcher"
-                      disabled={dispatcherBusy || dispatcher.port_open}
-                      onClick={() => runDispatcherAction("start")}
+                      className="iconText compact"
+                      disabled={cleanupBusy}
+                      onClick={() => cleanupRuntime(false)}
                     >
-                      {dispatcherBusy ? <Loader2 className="spin" size={14} /> : <Play size={14} />}
+                      {cleanupBusy ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />}
+                      <span>Безопасно</span>
                     </button>
                     <button
                       type="button"
-                      title="Остановить dispatcher"
-                      aria-label="Остановить dispatcher"
-                      disabled={dispatcherBusy || !dispatcher.container_status?.exists}
-                      onClick={() => runDispatcherAction("stop")}
+                      className="iconText compact"
+                      disabled={cleanupBusy}
+                      onClick={() => cleanupRuntime(true)}
                     >
-                      <Square size={14} />
-                    </button>
-                    <button
-                      type="button"
-                      title="Логи dispatcher"
-                      aria-label="Логи dispatcher"
-                      disabled={dispatcherBusy || !dispatcher.container_status?.exists}
-                      onClick={() => runDispatcherAction("logs")}
-                    >
-                      <FileText size={14} />
+                      <ShieldAlert size={14} />
+                      <span>Prune</span>
                     </button>
                   </div>
                 </div>
-              )}
-              {modelCatalog ? (
-                modelCatalog.models.slice(0, 5).map((model) => (
-                  <div className={`modelRow ${model.active ? "active" : ""}`} key={model.id}>
-                    <Cpu size={14} />
-                    <strong>{model.id}</strong>
-                    <span>{model.quantization ?? model.dtype ?? model.model_type ?? "model"}</span>
-                    <small>{formatBytes(model.size_bytes)}</small>
-                  </div>
-                ))
-              ) : (
-                <div className="emptyState compact">Каталог моделей недоступен</div>
-              )}
-            </div>
               </>
             )}
 
@@ -2919,6 +3325,15 @@ export default function CommandCenter() {
                   <FileText size={14} />
                   <span>{dockerPolicy?.max_log_tail ?? 200} строк логов</span>
                 </button>
+                <button
+                  className="iconText compact"
+                  type="button"
+                  disabled={cleanupBusy}
+                  onClick={() => cleanupRuntime(false)}
+                >
+                  {cleanupBusy ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />}
+                  <span>Очистить</span>
+                </button>
                 <span>{dockerPolicy?.allowed_prefixes.slice(0, 2).join(", ")}</span>
               </div>
               {(dockerContainers?.containers ?? []).slice(0, 4).map((container) => (
@@ -3155,7 +3570,7 @@ export default function CommandCenter() {
 
         <footer className="runtimeLine">
           <span>{status?.settings.home ?? "D:\\jarvis"}</span>
-          <span>{status?.settings.llm.base_url ?? API_URL}</span>
+          <span>{status?.settings.llm.base_url ?? CONFIGURED_API_URL}</span>
         </footer>
       </section>
     </main>
@@ -3215,7 +3630,23 @@ function StatusTile({
 function formatBytes(size: number) {
   if (size < 1024) return `${size} B`;
   if (size < 1024 * 1024) return `${Math.round(size / 1024)} KB`;
-  return `${(size / 1024 / 1024).toFixed(1)} MB`;
+  if (size < 1024 * 1024 * 1024) return `${(size / 1024 / 1024).toFixed(1)} MB`;
+  return `${(size / 1024 / 1024 / 1024).toFixed(1)} GB`;
+}
+
+function fitTone(fit?: ModelFit) {
+  if (!fit) return "unknown";
+  return fit.status;
+}
+
+function fitSummary(fit?: ModelFit) {
+  if (!fit) return "нет оценки";
+  return `${fit.label} · нужно ${formatBytes(fit.required_bytes)}`;
+}
+
+function progressPercent(done = 0, total = 0) {
+  if (!total) return 0;
+  return Math.max(0, Math.min(100, Math.round((done / total) * 100)));
 }
 
 function ratioPercent(value?: number | null) {

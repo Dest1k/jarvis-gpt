@@ -122,6 +122,48 @@ class OperationsManager:
             "error": result["stderr"] if not result["ok"] else None,
         }
 
+    def cleanup(self, *, aggressive: bool = False) -> dict[str, Any]:
+        policy = self.docker_policy()
+        steps = []
+        commands = [
+            ["compose", "--profile", "llm", "down", "--remove-orphans"],
+        ]
+        containers = self.docker_containers()
+        for container in containers.get("containers", []):
+            name = str(container.get("name") or "")
+            if docker_container_allowed(policy, name):
+                commands.append(["rm", "-f", name])
+        commands.append(["container", "prune", "-f"])
+        if aggressive:
+            commands.extend([["image", "prune", "-f"], ["builder", "prune", "-f"]])
+        for command in commands:
+            result = _run_docker(command, timeout=60)
+            steps.append(
+                {
+                    "ok": result["ok"],
+                    "summary": result["summary"],
+                    "command": result["command"],
+                    "stdout": result["stdout"][-4000:],
+                    "stderr": result["stderr"][-4000:],
+                    "returncode": result["returncode"],
+                }
+            )
+        ok = all(step["ok"] for step in steps)
+        self.storage.record_audit(
+            actor="operator",
+            action="runtime.cleanup",
+            target_type="runtime",
+            target_id="docker",
+            summary="Runtime cleanup completed" if ok else "Runtime cleanup had warnings",
+            after={"aggressive": aggressive, "steps": steps},
+        )
+        return {
+            "ok": ok,
+            "summary": "Очистка выполнена." if ok else "Очистка завершилась с предупреждениями.",
+            "aggressive": aggressive,
+            "steps": steps,
+        }
+
     def list_jobs(self) -> list[dict[str, Any]]:
         stored = self.storage.get_runtime_value(AUTONOMY_JOBS_KEY, [])
         return [_normalize_job(item) for item in _list(stored)]
