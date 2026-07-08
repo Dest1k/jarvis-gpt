@@ -1,5 +1,19 @@
 # Runtime
 
+## 2026-07-08 handoff — operator persona layer
+
+Для оператора и для второй модели (кто продолжит работу).
+
+- Добавлен слой **operator persona** — durable структурированный профиль оператора, который агент читает на каждом ходу. Цель: закрыть «понимание оператора» широко, а не патчить каждый юзкейс отдельной эвристикой.
+- Новый модуль `backend/src/jarvis_gpt/persona.py`: схема + нормализация (`normalize_persona`, `load_persona`), рендер системного блока (`render_system_block`), аксессоры (`home_location`, `primary_language`, `is_configured`) и `PersonaManager` (update/insight с audit + event).
+- Поля persona: `display_name, headline, role, location, timezone, languages, expertise, tech_stack, interests, current_focus, standing_instructions, glossary, notes`. Хранится в runtime_kv под ключом `experience.persona`.
+- Интеграция в `agent.py`: `_build_llm_messages` подмешивает блок persona; `_infer_weather_location` теперь СНАЧАЛА берёт `persona.location` (обобщение прежнего weather-only кэша — домашний город стал общим фактом для погоды/локальных/гео запросов); добавлены `_persona_prompt`, `_operator_home_location`.
+- API: `GET/PATCH /api/persona`, `POST /api/persona/insight` (доклеивание одного факта в list-поле, с дедупом). CLI: `persona`, `persona-set --set key=value`.
+- Command Center: в панели «Настройки» добавлена секция «Профиль оператора» (`personaForm`).
+- `experience.daily_briefing` выносит `current_focus` оператора в начало focus-списка.
+- Тесты: `backend/tests/test_persona.py` (9). Полный прогон — 131 pass, ruff clean, frontend typecheck + build clean.
+- Незакрытое/на будущее: авто-обучение persona из диалога (сейчас `add_insight` есть, но агент его из чата не вызывает — сознательно, чтобы не плодить regex-эвристики); можно добавить UI для `glossary` и `languages`, и связать persona.primary_language с языком ответа.
+
 ## 2026-07-08 handoff
 
 - Default runtime is now `gemma4-turbo` / `gemma4-26b-a4b-nvfp4`.
@@ -47,6 +61,8 @@ py -3.11 .\jarvis.py host-bridge
 py -3.11 .\scripts\windows_rpc_bridge.py
 py -3.11 .\jarvis.py host-bridge-exec "Get-Date"
 py -3.11 .\jarvis.py autonomy
+py -3.11 .\jarvis.py persona
+py -3.11 .\jarvis.py persona-set --set location=Kazan --set tech_stack=Proxmox,Debian
 py -3.11 .\jarvis.py learning-tick
 py -3.11 .\jarvis.py diag
 py -3.11 .\jarvis.py chat "JARVIS, оформи это как mission plan: ..."
@@ -77,6 +93,9 @@ POST /api/dispatcher/stop
 GET  /api/telemetry
 GET  /api/host-bridge
 GET  /api/autonomy
+GET  /api/persona
+PATCH /api/persona
+POST /api/persona/insight
 POST /api/learning/tick
 POST /api/chat
 POST /api/chat/stream

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+from . import persona as persona_module
 from .config import JarvisSettings
 from .event_bus import EventBus
 from .llm import LLMRouter
@@ -1025,6 +1026,17 @@ class AgentRuntime:
         return _parse_intent_decision(result.content)
 
     async def _infer_weather_location(self) -> tuple[str | None, list[ChatEvent]]:
+        persona_location = self._operator_home_location()
+        if persona_location:
+            return persona_location, [
+                ChatEvent(
+                    type="thought",
+                    title="Weather location inferred",
+                    content=f"Using operator persona home location: {persona_location}.",
+                    payload={"source": "persona", "location": persona_location},
+                )
+            ]
+
         configured = _normalize_search_query(os.environ.get("JARVIS_DEFAULT_CITY", ""))
         if configured:
             return configured, [
@@ -1612,6 +1624,9 @@ class AgentRuntime:
         operator_profile = self._operator_profile_context()
         if operator_profile:
             messages.append({"role": "system", "content": operator_profile})
+        persona_prompt = self._persona_prompt()
+        if persona_prompt:
+            messages.append({"role": "system", "content": persona_prompt})
         if not thinking_enabled:
             messages.append({"role": "system", "content": THINKING_DISABLED_PROMPT})
         if memory_block:
@@ -1808,6 +1823,25 @@ class AgentRuntime:
             lines.append("Durable typed notes:")
             lines.extend(profile_items[:10])
         return "\n".join(lines)
+
+    def _persona(self) -> dict[str, Any]:
+        return persona_module.load_persona(self.storage)
+
+    def _persona_prompt(self) -> str:
+        preferences = self.storage.get_runtime_value("experience.preferences", {})
+        if not isinstance(preferences, dict):
+            preferences = {}
+        persona = self._persona()
+        if not persona_module.is_configured(persona) and not persona.get("display_name"):
+            return ""
+        return persona_module.render_system_block(
+            persona,
+            settings=self.settings,
+            preferences=preferences,
+        )
+
+    def _operator_home_location(self) -> str | None:
+        return persona_module.home_location(self._persona())
 
     def _active_console_target(self, conversation_id: str) -> dict[str, Any] | None:
         value = self.storage.get_runtime_value(_console_target_key(conversation_id), None)

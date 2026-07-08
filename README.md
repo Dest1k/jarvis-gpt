@@ -12,6 +12,7 @@
 - HITL approvals: опасные действия оформляются как durable approval gates, а не выполняются молча.
 - Telemetry/performance: CPU/RAM/disk/GPU/Docker snapshots, performance profile и host bridge status.
 - Self-learning tick: аудит, tool runs и approvals превращаются в долговременные lessons.
+- Operator persona: durable structured profile (роль, домашний город, языки, стек, увлечения, текущий фокус, постоянные правила «всегда/никогда», глоссарий) читается агентом в каждом ответе.
 - Retrieval adds normalized relevance, matched terms and snippets for memory/file context.
 - Learning tick deduplicates repeated lessons before writing long-term memory.
 - Autonomous supervisor: безопасный фоновой цикл собирает telemetry и запускает learning tick.
@@ -122,6 +123,8 @@ py -3.11 .\jarvis.py host-bridge
 py -3.11 .\scripts\windows_rpc_bridge.py
 py -3.11 .\jarvis.py host-bridge-exec "Get-Date"
 py -3.11 .\jarvis.py autonomy
+py -3.11 .\jarvis.py persona
+py -3.11 .\jarvis.py persona-set --set location=Kazan --set tech_stack=Proxmox,Debian
 py -3.11 .\jarvis.py learning-tick
 py -3.11 .\jarvis.py tool-run memory.search --set query=runtime --set limit=5
 py -3.11 .\jarvis.py ingest README.md
@@ -161,6 +164,7 @@ docker compose --profile llm up -d dispatcher
 
 - Unified launcher `.\jarvis.cmd` provides keyboard-menu start/stop/restart/status/logs/doctor/open flows plus `gemma4-turbo` and `gemma4-mono` startup shortcuts.
 - Experience API persists operator preferences, autonomy policy, daily briefing, self-heal reports and benchmark history in SQLite.
+- Operator persona (`/api/persona`) is a first-class understanding layer: the agent injects it into every LLM turn, uses `location` as the generic place fallback (weather/local/geo) instead of a weather-only cache, and surfaces `current_focus` in the daily briefing. Editable from Command Center → «Профиль оператора» and via `jarvis persona` / `persona-set`.
 - Command Center exposes briefing, autonomy policy modes, self-heal suggestions, benchmark telemetry and operator communication preferences.
 - Self-heal scans diagnostics/resources/dispatcher state and proposes safe or approval-gated actions without silently mutating host state.
 - Performance benchmark records storage, telemetry, dispatcher and LLM health latency with resource-guard recommendations.

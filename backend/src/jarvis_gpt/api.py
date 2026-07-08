@@ -78,6 +78,9 @@ from .models import (
     ModelCatalogResponse,
     ModelDownloadRequest,
     ModelSearchResponse,
+    OperatorPersonaInsightRequest,
+    OperatorPersonaResponse,
+    OperatorPersonaUpdateRequest,
     RoutineResponse,
     RoutineRunResponse,
     RuntimePreferencesResponse,
@@ -90,6 +93,7 @@ from .models import (
     ToolRunResponse,
 )
 from .operations import OperationsManager
+from .persona import PersonaManager
 from .storage import JarvisStorage
 from .supervisor import RuntimeSupervisor
 from .telemetry import TelemetryCollector
@@ -112,6 +116,7 @@ async def lifespan(app: FastAPI):
     learning = LearningEngine(storage)
     host_bridge = HostBridgeStatus(settings)
     experience = ExperienceManager(settings=settings, storage=storage)
+    persona = PersonaManager(settings=settings, storage=storage)
     operations = OperationsManager(settings=settings, storage=storage)
     supervisor = RuntimeSupervisor(settings=settings, storage=storage, llm=llm)
     approval_executor = ApprovalExecutor(
@@ -134,6 +139,7 @@ async def lifespan(app: FastAPI):
     app.state.learning = learning
     app.state.host_bridge = host_bridge
     app.state.experience = experience
+    app.state.persona = persona
     app.state.operations = operations
     app.state.supervisor = supervisor
     app.state.approval_executor = approval_executor
@@ -343,6 +349,25 @@ async def update_preferences(
 ) -> RuntimePreferencesResponse:
     updated = app.state.experience.update_preferences(request.model_dump(exclude_none=True))
     await app.state.bus.publish({"channel": "preferences", "operator": updated["operator_name"]})
+    return updated
+
+
+@app.get("/api/persona", response_model=OperatorPersonaResponse)
+async def persona() -> OperatorPersonaResponse:
+    return app.state.persona.persona()
+
+
+@app.patch("/api/persona", response_model=OperatorPersonaResponse)
+async def update_persona(request: OperatorPersonaUpdateRequest) -> OperatorPersonaResponse:
+    updated = app.state.persona.update(request.model_dump(exclude_none=True))
+    await app.state.bus.publish({"channel": "persona", "role": updated.get("role")})
+    return updated
+
+
+@app.post("/api/persona/insight", response_model=OperatorPersonaResponse)
+async def add_persona_insight(request: OperatorPersonaInsightRequest) -> OperatorPersonaResponse:
+    updated = app.state.persona.add_insight(request.field, request.value, actor="operator")
+    await app.state.bus.publish({"channel": "persona", "field": request.field})
     return updated
 
 

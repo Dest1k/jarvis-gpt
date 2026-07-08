@@ -12,6 +12,7 @@ Command Center (Next.js)
 FastAPI Gateway
   |
 Agent Runtime
+  |-- operator persona (who I am)
   |-- conversation context
   |-- mission planner
   |-- safe tools registry
@@ -49,6 +50,7 @@ External host runtime
 - SQLite достаточно для одиночного локального ядра и легко мигрирует дальше.
 - UI видит явные состояния: success, warn, error, mission, event.
 - LLM является заменяемым маршрутом, а не фундаментом всей системы.
+- Operator persona — первоклассный слой понимания оператора: durable профиль (роль, домашний город, языки, стек, увлечения, текущий фокус, постоянные правила, глоссарий) читается на каждом ходу и обобщает узкие маршруты (например, домашний город закрывает погоду/локальные/гео запросы вместо отдельного weather-кэша). Это широкое поле правок вместо патча под каждый юзкейс.
 - Опасные действия не входят в safe tools layer; shell/host control идёт через token-auth host bridge и HITL-gates.
 - Файлы попадают в runtime-хранилище через upload/CLI, а агент читает только индексированные чанки через safe tools.
 - Audit log фиксирует изменения памяти, миссий, task lifecycle, tool runs и ingestion.

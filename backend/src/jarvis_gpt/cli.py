@@ -18,6 +18,7 @@ from .ingest import FileIngestor
 from .learning import LearningEngine
 from .llm import LLMRouter
 from .model_catalog import ModelCatalog
+from .persona import PersonaManager
 from .storage import JarvisStorage
 from .supervisor import RuntimeSupervisor
 from .telemetry import TelemetryCollector
@@ -192,6 +193,20 @@ def cmd_host_bridge_exec(args: argparse.Namespace) -> None:
 def cmd_autonomy(args: argparse.Namespace) -> None:
     settings, storage, _llm, _agent = _runtime(args.profile)
     _print_json(RuntimeSupervisor(settings=settings, storage=storage).status())
+    storage.close()
+
+
+def cmd_persona(args: argparse.Namespace) -> None:
+    settings, storage, _llm, _agent = _runtime(args.profile)
+    _print_json(PersonaManager(settings=settings, storage=storage).persona())
+    storage.close()
+
+
+def cmd_persona_set(args: argparse.Namespace) -> None:
+    settings, storage, _llm, _agent = _runtime(args.profile)
+    patch = _set_arguments(args.sets)
+    updated = PersonaManager(settings=settings, storage=storage).update(patch)
+    _print_json(updated)
     storage.close()
 
 
@@ -388,6 +403,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     autonomy_parser = sub.add_parser("autonomy", help="Show autonomous supervisor settings")
     autonomy_parser.set_defaults(func=cmd_autonomy)
+
+    persona_parser = sub.add_parser("persona", help="Show the durable operator persona")
+    persona_parser.set_defaults(func=cmd_persona)
+
+    persona_set_parser = sub.add_parser(
+        "persona-set",
+        help="Update persona fields, e.g. --set location=Kazan --set tech_stack=Proxmox,Debian",
+    )
+    persona_set_parser.add_argument(
+        "--set",
+        dest="sets",
+        action="append",
+        default=[],
+        help="Set one persona field as key=value (comma-separated for lists). Repeatable.",
+    )
+    persona_set_parser.set_defaults(func=cmd_persona_set)
 
     ingest_parser = sub.add_parser("ingest", help="Copy and index a local text file")
     ingest_parser.add_argument("path")

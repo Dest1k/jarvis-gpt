@@ -428,6 +428,22 @@ type RuntimePreferences = {
   working_roots: string[];
 };
 
+type OperatorPersona = {
+  display_name: string;
+  headline: string;
+  role: string;
+  location: string;
+  timezone: string;
+  languages: string[];
+  expertise: string[];
+  tech_stack: string[];
+  interests: string[];
+  current_focus: string[];
+  standing_instructions: string[];
+  glossary: Record<string, string>;
+  notes: string;
+};
+
 type AutonomyPolicy = {
   mode: "safe" | "balanced" | "operator";
   allow_safe_tools: boolean;
@@ -927,6 +943,26 @@ function communicationStyleLabel(value: string | null | undefined) {
   return labels[value ?? ""] ?? value ?? "кратко";
 }
 
+function splitList(value: string): string[] {
+  return value
+    .split(/[\n,;]+/)
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+}
+
+function personaDraftFrom(persona: OperatorPersona) {
+  return {
+    display_name: persona.display_name ?? "",
+    role: persona.role ?? "",
+    headline: persona.headline ?? "",
+    location: persona.location ?? "",
+    tech_stack: (persona.tech_stack ?? []).join(", "),
+    interests: (persona.interests ?? []).join(", "),
+    current_focus: (persona.current_focus ?? []).join(", "),
+    standing_instructions: (persona.standing_instructions ?? []).join("\n")
+  };
+}
+
 function isThrowawayChatTitle(value: string) {
   const normalized = value
     .toLowerCase()
@@ -1182,6 +1218,17 @@ export default function CommandCenter() {
     communication_style: "concise" as RuntimePreferences["communication_style"],
     quiet_hours: ""
   });
+  const [persona, setPersona] = useState<OperatorPersona | null>(null);
+  const [personaDraft, setPersonaDraft] = useState({
+    display_name: "",
+    role: "",
+    headline: "",
+    location: "",
+    tech_stack: "",
+    interests: "",
+    current_focus: "",
+    standing_instructions: ""
+  });
   const [autonomyPolicy, setAutonomyPolicy] = useState<AutonomyPolicy | null>(null);
   const [briefing, setBriefing] = useState<DailyBriefing | null>(null);
   const [selfHealReport, setSelfHealReport] = useState<SelfHealReport | null>(null);
@@ -1299,6 +1346,7 @@ export default function CommandCenter() {
         hostBridgeData,
         autonomyData,
         preferencesData,
+        personaData,
         autonomyPolicyData,
         briefingData,
         browserPolicyData,
@@ -1322,6 +1370,7 @@ export default function CommandCenter() {
           api<HostBridgeStatus>("/api/host-bridge"),
           api<AutonomyStatus>("/api/autonomy"),
           api<RuntimePreferences>("/api/preferences"),
+          api<OperatorPersona>("/api/persona"),
           api<AutonomyPolicy>("/api/autonomy/policy"),
           api<DailyBriefing>("/api/briefing"),
           api<BrowserPolicy>("/api/browser/policy"),
@@ -1351,6 +1400,8 @@ export default function CommandCenter() {
         communication_style: preferencesData.communication_style,
         quiet_hours: preferencesData.quiet_hours
       });
+      setPersona(personaData);
+      setPersonaDraft(personaDraftFrom(personaData));
       setAutonomyPolicy(autonomyPolicyData);
       setBriefing(briefingData);
       setBrowserPolicy(browserPolicyData);
@@ -2091,6 +2142,39 @@ export default function CommandCenter() {
       await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Не удалось сохранить настройки");
+    } finally {
+      setBusy(false);
+      setActiveOperation(null);
+    }
+  }
+
+  async function savePersona(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setActiveOperation({
+      title: "Профиль оператора",
+      detail: "сохранение persona"
+    });
+    setBusy(true);
+    try {
+      const payload = {
+        display_name: personaDraft.display_name,
+        role: personaDraft.role,
+        headline: personaDraft.headline,
+        location: personaDraft.location,
+        tech_stack: splitList(personaDraft.tech_stack),
+        interests: splitList(personaDraft.interests),
+        current_focus: splitList(personaDraft.current_focus),
+        standing_instructions: splitList(personaDraft.standing_instructions)
+      };
+      const updated = await api<OperatorPersona>("/api/persona", {
+        method: "PATCH",
+        body: JSON.stringify(payload)
+      });
+      setPersona(updated);
+      setPersonaDraft(personaDraftFrom(updated));
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Не удалось сохранить профиль оператора");
     } finally {
       setBusy(false);
       setActiveOperation(null);
@@ -4064,6 +4148,100 @@ export default function CommandCenter() {
                 disabled={busy}
                 title="Сохранить настройки"
                 aria-label="Сохранить настройки"
+              >
+                {busy ? <Loader2 className="spin" size={15} /> : <Save size={15} />}
+              </button>
+            </form>
+
+            <div className="panelHeader lower">
+              <h2>Профиль оператора</h2>
+              <span>{persona?.role || "не заполнен"}</span>
+            </div>
+            <p className="personaHint">
+              Кто ты, где ты, твой стек и правила. JARVIS читает это в каждом ответе, чтобы быть
+              продолжением тебя, а не универсальным ботом.
+            </p>
+            <form className="personaForm" onSubmit={savePersona}>
+              <input
+                value={personaDraft.display_name}
+                onChange={(event) =>
+                  setPersonaDraft((current) => ({ ...current, display_name: event.target.value }))
+                }
+                placeholder="Имя / позывной"
+                aria-label="Имя оператора"
+              />
+              <input
+                value={personaDraft.location}
+                onChange={(event) =>
+                  setPersonaDraft((current) => ({ ...current, location: event.target.value }))
+                }
+                placeholder="Домашний город (для погоды и локальных запросов)"
+                aria-label="Домашний город"
+              />
+              <input
+                className="full"
+                value={personaDraft.role}
+                onChange={(event) =>
+                  setPersonaDraft((current) => ({ ...current, role: event.target.value }))
+                }
+                placeholder="Роль, например: системный администратор"
+                aria-label="Роль"
+              />
+              <input
+                className="full"
+                value={personaDraft.headline}
+                onChange={(event) =>
+                  setPersonaDraft((current) => ({ ...current, headline: event.target.value }))
+                }
+                placeholder="Пара слов о себе"
+                aria-label="О себе"
+              />
+              <input
+                className="full"
+                value={personaDraft.tech_stack}
+                onChange={(event) =>
+                  setPersonaDraft((current) => ({ ...current, tech_stack: event.target.value }))
+                }
+                placeholder="Стек через запятую: Proxmox, Debian, Docker, PowerShell"
+                aria-label="Технический стек"
+              />
+              <input
+                className="full"
+                value={personaDraft.interests}
+                onChange={(event) =>
+                  setPersonaDraft((current) => ({ ...current, interests: event.target.value }))
+                }
+                placeholder="Увлечения через запятую"
+                aria-label="Увлечения"
+              />
+              <input
+                className="full"
+                value={personaDraft.current_focus}
+                onChange={(event) =>
+                  setPersonaDraft((current) => ({ ...current, current_focus: event.target.value }))
+                }
+                placeholder="Текущий фокус: проекты и задачи через запятую"
+                aria-label="Текущий фокус"
+              />
+              <textarea
+                className="full"
+                value={personaDraft.standing_instructions}
+                onChange={(event) =>
+                  setPersonaDraft((current) => ({
+                    ...current,
+                    standing_instructions: event.target.value
+                  }))
+                }
+                placeholder="Постоянные правила, по одному на строку: всегда показывай команды для Debian; никогда не выполняй rm без подтверждения"
+                aria-label="Постоянные инструкции"
+                rows={3}
+              />
+              <button
+                type="submit"
+                className="full"
+                disabled={busy}
+                title="Сохранить профиль оператора"
+                aria-label="Сохранить профиль оператора"
               >
                 {busy ? <Loader2 className="spin" size={15} /> : <Save size={15} />}
               </button>
