@@ -66,6 +66,7 @@ from .models import (
     LearningTickResponse,
     MemoryCreateRequest,
     MemoryItem,
+    MemoryVaultResponse,
     MessageItem,
     Mission,
     MissionCreateRequest,
@@ -557,6 +558,11 @@ async def add_memory(request: MemoryCreateRequest) -> MemoryItem:
         tags=request.tags,
         importance=request.importance,
     )
+
+
+@app.get("/api/memory/vault", response_model=MemoryVaultResponse)
+async def memory_vault() -> MemoryVaultResponse:
+    return app.state.storage.memory_graph()
 
 
 @app.get("/api/files", response_model=list[FileItem])

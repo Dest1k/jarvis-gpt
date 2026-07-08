@@ -1859,6 +1859,67 @@ h3 {
   font-size: 12px;
 }
 
+.memoryVault {
+  display: grid;
+  gap: 8px;
+  margin: 0 12px 10px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #ffffff;
+}
+
+.vaultHeader {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+}
+
+.vaultHeader svg {
+  color: var(--teal);
+}
+
+.vaultHeader strong,
+.vaultHeader p {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vaultHeader p {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.vaultStats,
+.vaultNodeList {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.vaultStats span,
+.vaultNodeList span {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  max-width: 100%;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.vaultNodeList span {
+  color: var(--teal);
+  background: var(--teal-2);
+}
+
 .memoryRow {
   border: 1px solid var(--line);
   border-radius: var(--radius);

@@ -137,6 +137,30 @@ def test_storage_merges_duplicate_memories_and_hybrid_search(tmp_path):
     storage.close()
 
 
+def test_storage_mirrors_memory_to_obsidian_like_vault(tmp_path):
+    storage = JarvisStorage(tmp_path / "state" / "jarvis.sqlite3")
+    storage.initialize()
+
+    memory = storage.add_memory(
+        content="Jarvis should connect [[LLM runtime]] with [[GPU telemetry]] #runtime",
+        namespace="architecture",
+        tags=["jarvis", "graph"],
+        importance=0.9,
+    )
+    graph = storage.memory_graph()
+
+    note_path = storage.memory_vault.root / "architecture" / f"{memory['id']}.md"
+    assert note_path.exists()
+    note = note_path.read_text(encoding="utf-8")
+    assert "namespace: \"architecture\"" in note
+    assert "[[LLM runtime]]" in note
+    assert graph["stats"]["notes"] == 1
+    assert any(edge["target"] == "link:LLM runtime" for edge in graph["edges"])
+    assert any(edge["target"] == "tag:runtime" for edge in graph["edges"])
+    assert memory["id"] in graph["backlinks"]["LLM runtime"]
+    storage.close()
+
+
 def test_storage_consolidates_existing_duplicate_memories(tmp_path):
     storage = JarvisStorage(tmp_path / "state" / "jarvis.sqlite3")
     storage.initialize()

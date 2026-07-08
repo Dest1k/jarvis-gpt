@@ -10,6 +10,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .memory_vault import MemoryVault
+
 _QUERY_STOPWORDS = {
     "a",
     "an",
@@ -252,6 +254,7 @@ class JarvisStorage:
         self._conn: sqlite3.Connection | None = None
         self._memory_fts_available = False
         self._file_fts_available = False
+        self.memory_vault = MemoryVault(database_path.parent.parent / "memory-vault")
 
     def connect(self) -> sqlite3.Connection:
         if self._conn is None:
@@ -273,6 +276,7 @@ class JarvisStorage:
             conn.executescript(SCHEMA)
             self._memory_fts_available = self._ensure_memory_fts(conn)
             self._file_fts_available = self._ensure_file_chunks_fts(conn)
+            self._sync_memory_vault(conn)
             conn.commit()
 
     def _ensure_memory_fts(self, conn: sqlite3.Connection) -> bool:
@@ -312,6 +316,20 @@ class JarvisStorage:
             return True
         except sqlite3.OperationalError:
             return False
+
+    def _sync_memory_vault(self, conn: sqlite3.Connection) -> None:
+        rows = conn.execute(
+            """
+            SELECT id, namespace, content, tags, importance, created_at, updated_at
+            FROM memories
+            ORDER BY updated_at DESC
+            """
+        ).fetchall()
+        memories = [
+            {**dict(row), "tags": _loads(row["tags"], [])}
+            for row in rows
+        ]
+        self.memory_vault.sync(memories)
 
     def ping(self) -> bool:
         with self._lock:
@@ -649,6 +667,7 @@ class JarvisStorage:
                     (_json(merged_tags), merged_importance, now, row["id"]),
                 )
                 self._replace_memory_fts(conn, row)
+                self.memory_vault.upsert_memory(row)
                 conn.commit()
                 self.record_audit(
                     actor="system",
@@ -671,6 +690,7 @@ class JarvisStorage:
                 {**row, "tags": _json(row["tags"])},
             )
             self._replace_memory_fts(conn, row)
+            self.memory_vault.upsert_memory(row)
             conn.commit()
         self.record_audit(
             actor="system",
@@ -864,6 +884,7 @@ class JarvisStorage:
                     if self._memory_fts_available:
                         conn.execute("DELETE FROM memories_fts WHERE id = ?", (duplicate_id,))
                     conn.execute("DELETE FROM memories WHERE id = ?", (duplicate_id,))
+                    self.memory_vault.remove_memory(str(duplicate_id))
                 removed += len(duplicate_ids)
                 merged += 1
             conn.commit()
@@ -877,6 +898,18 @@ class JarvisStorage:
                 payload={"examined": len(rows), "merged": merged, "removed": removed},
             )
         return {"examined": len(rows), "merged": merged, "removed": removed}
+
+    def memory_graph(self) -> dict[str, Any]:
+        with self._lock:
+            conn = self.connect()
+            self._sync_memory_vault(conn)
+        return self.memory_vault.graph()
+
+    def rebuild_memory_vault(self) -> dict[str, Any]:
+        with self._lock:
+            conn = self.connect()
+            self._sync_memory_vault(conn)
+        return self.memory_vault.graph()
 
     def create_mission(self, *, title: str, goal: str, tasks: list[str]) -> dict[str, Any]:
         now = utc_now()

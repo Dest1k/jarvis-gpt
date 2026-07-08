@@ -156,6 +156,38 @@ type MemoryItem = {
   matched_terms?: string[];
 };
 
+type MemoryGraphNode = {
+  id: string;
+  label: string;
+  kind: string;
+  path?: string | null;
+  namespace?: string | null;
+  tags?: string[];
+  importance?: number | null;
+  updated_at?: string | null;
+  degree?: number | null;
+};
+
+type MemoryVault = {
+  root: string;
+  notes: {
+    id?: string | null;
+    title: string;
+    path: string;
+    namespace?: string | null;
+    tags: string[];
+    links: string[];
+    importance?: number | null;
+    updated_at?: string | null;
+    content: string;
+  }[];
+  nodes: MemoryGraphNode[];
+  edges: { source: string; target: string; kind: string }[];
+  backlinks: Record<string, string[]>;
+  top_nodes: MemoryGraphNode[];
+  stats: Record<string, number>;
+};
+
 type FileItem = {
   id: string;
   name: string;
@@ -875,6 +907,7 @@ export default function CommandCenter() {
   const [diagnostics, setDiagnostics] = useState<DiagnosticCheck[]>([]);
   const [tools, setTools] = useState<ToolInfo[]>([]);
   const [memories, setMemories] = useState<MemoryItem[]>([]);
+  const [memoryVault, setMemoryVault] = useState<MemoryVault | null>(null);
   const [files, setFiles] = useState<FileItem[]>([]);
   const [fileHits, setFileHits] = useState<FileChunkHit[]>([]);
   const [audit, setAudit] = useState<AuditEntry[]>([]);
@@ -1000,6 +1033,7 @@ export default function CommandCenter() {
         missionData,
         toolData,
         memoryData,
+        memoryVaultData,
         fileData,
         auditData,
         modelData,
@@ -1022,6 +1056,7 @@ export default function CommandCenter() {
           api<Mission[]>("/api/missions"),
           api<ToolInfo[]>("/api/tools"),
           api<MemoryItem[]>("/api/memory?limit=8"),
+          api<MemoryVault>("/api/memory/vault"),
           api<FileItem[]>("/api/files?limit=8"),
           api<AuditEntry[]>("/api/audit?limit=8"),
           api<ModelCatalog>("/api/models"),
@@ -1044,6 +1079,7 @@ export default function CommandCenter() {
       setMissions(missionData);
       setTools(toolData);
       setMemories(memoryData);
+      setMemoryVault(memoryVaultData);
       setFiles(fileData);
       setAudit(auditData);
       setModelCatalog(modelData);
@@ -3643,6 +3679,29 @@ export default function CommandCenter() {
                 <Save size={15} />
               </button>
             </form>
+            {memoryVault && (
+              <div className="memoryVault">
+                <div className="vaultHeader">
+                  <Database size={16} />
+                  <div>
+                    <strong>Vault</strong>
+                    <p>{memoryVault.root}</p>
+                  </div>
+                </div>
+                <div className="vaultStats">
+                  <span>{memoryVault.stats.notes ?? 0} notes</span>
+                  <span>{memoryVault.stats.nodes ?? 0} nodes</span>
+                  <span>{memoryVault.stats.edges ?? 0} edges</span>
+                </div>
+                <div className="vaultNodeList">
+                  {memoryVault.top_nodes.slice(0, 6).map((node) => (
+                    <span key={node.id} title={node.id}>
+                      {node.label}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
             <div className="memoryList">
               {memories.slice(0, 5).map((memory) => (
                 <article className="memoryRow" key={memory.id}>

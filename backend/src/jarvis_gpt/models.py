@@ -107,6 +107,46 @@ class MemoryItem(BaseModel):
     matched_terms: list[str] = Field(default_factory=list)
 
 
+class MemoryGraphNode(BaseModel):
+    id: str
+    label: str
+    kind: str
+    path: str | None = None
+    namespace: str | None = None
+    tags: list[str] = Field(default_factory=list)
+    importance: float | None = None
+    updated_at: str | None = None
+    degree: int | None = None
+
+
+class MemoryGraphEdge(BaseModel):
+    source: str
+    target: str
+    kind: str
+
+
+class MemoryVaultNote(BaseModel):
+    id: str | None = None
+    title: str
+    path: str
+    namespace: str | None = None
+    tags: list[str] = Field(default_factory=list)
+    links: list[str] = Field(default_factory=list)
+    importance: float | None = None
+    updated_at: str | None = None
+    content: str = ""
+
+
+class MemoryVaultResponse(BaseModel):
+    root: str
+    notes: list[MemoryVaultNote]
+    nodes: list[MemoryGraphNode]
+    edges: list[MemoryGraphEdge]
+    backlinks: dict[str, list[str]] = Field(default_factory=dict)
+    top_nodes: list[MemoryGraphNode] = Field(default_factory=list)
+    stats: dict[str, int] = Field(default_factory=dict)
+
+
 class FileItem(BaseModel):
     id: str
     name: str

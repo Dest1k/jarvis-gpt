@@ -149,6 +149,7 @@ class JarvisSettings:
                 "docker": str(self.docker_dir),
                 "state": str(self.state_dir),
                 "database": str(self.database_path),
+                "memory_vault": str(self.data_dir / "memory-vault"),
             },
             "llm": {
                 "enabled": self.llm_enabled,
