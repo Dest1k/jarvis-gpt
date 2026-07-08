@@ -16,6 +16,11 @@ from urllib.parse import quote
 
 from . import persona as persona_module
 from .config import JarvisSettings
+from .embeddings import (
+    EmbeddingBackend,
+    reciprocal_rank_fusion,
+    semantic_similarity_order,
+)
 from .event_bus import EventBus
 from .llm import LLMRouter
 from .models import (
@@ -400,6 +405,7 @@ class AgentRuntime:
         self.llm = llm
         self.bus = bus
         self.tools = tools or ToolRegistry(settings, storage, llm)
+        self.embeddings = EmbeddingBackend(settings)
 
     async def chat(
         self,
@@ -420,6 +426,7 @@ class AgentRuntime:
                 self._attached_file_hits(attachments),
                 context.file_hits,
             )
+        await self._augment_semantic_memory(context, context_message)
         task_plan = self._plan_task(
             context_message,
             context,
@@ -604,6 +611,7 @@ class AgentRuntime:
                 self._attached_file_hits(attachments),
                 context.file_hits,
             )
+        await self._augment_semantic_memory(context, context_message)
         task_plan = self._plan_task(
             context_message,
             context,
@@ -1732,6 +1740,63 @@ class AgentRuntime:
             memory_hits=memory_hits,
             file_hits=file_hits,
         )
+
+    async def _augment_semantic_memory(
+        self,
+        context: AgentContext,
+        message: str,
+        *,
+        limit: int = 8,
+    ) -> None:
+        """Re-rank memory with a hybrid lexical + semantic signal.
+
+        Fuses the lexical order from ``_prepare_context`` with a semantic order
+        over a bounded candidate pool (lexical hits plus recent/important
+        memories), so paraphrased or differently-inflected memories surface even
+        when they share no keywords with the query. Degrades to the existing
+        lexical order on any failure.
+        """
+
+        query = " ".join(str(message or "").split())
+        if not query:
+            return
+        pool: dict[str, dict[str, Any]] = {}
+        for item in context.memory_hits:
+            item_id = str(item.get("id") or "")
+            if item_id:
+                pool.setdefault(item_id, item)
+        recent_pool = self.storage.search_memory(None, limit=60)
+        for item in recent_pool:
+            item_id = str(item.get("id") or "")
+            if item_id:
+                pool.setdefault(item_id, item)
+        candidates = list(pool.values())
+        if len(candidates) < 2:
+            return
+        try:
+            semantic_order = await semantic_similarity_order(
+                self.embeddings,
+                query,
+                [str(item.get("content") or "") for item in candidates],
+            )
+        except Exception:  # noqa: BLE001 - retrieval must never break a turn
+            return
+        semantic_ranking = [str(candidates[index].get("id") or "") for index in semantic_order]
+        lexical_ranking = [str(item.get("id") or "") for item in context.memory_hits]
+        fused = reciprocal_rank_fusion([lexical_ranking, semantic_ranking])
+        if not fused:
+            return
+        top_score = max(fused.values()) or 1.0
+        ranked = sorted(
+            candidates,
+            key=lambda item: fused.get(str(item.get("id") or ""), 0.0),
+            reverse=True,
+        )[:limit]
+        for item in ranked:
+            score = fused.get(str(item.get("id") or ""), 0.0)
+            item["relevance"] = round(min(1.0, score / top_score), 4)
+            item.setdefault("retrieval", "hybrid")
+        context.memory_hits = ranked
 
     def _attached_file_hits(self, attachments: list[dict[str, Any]]) -> list[dict[str, Any]]:
         hits: list[dict[str, Any]] = []

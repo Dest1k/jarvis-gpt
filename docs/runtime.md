@@ -1,5 +1,16 @@
 # Runtime
 
+## 2026-07-08 handoff — hybrid semantic memory (track 2/3)
+
+Для оператора и второй модели. Трек 2 из 3: retrieval был чисто лексическим (FTS5 BM25 + LIKE) — перефразированные/иначе склонённые записи не находились, и модель не получала контекст, который «должна была вспомнить». Размер модели это не лечит: retrieval — отдельная подсистема.
+
+- Новый модуль `backend/src/jarvis_gpt/embeddings.py`: `lexical_vector` (чистый Python: слова + символьные триграммы, L2-норма — ловит морфологию/опечатки/порядок слов, которые keyword-поиск упускает), `sparse_cosine`/`dense_cosine`, `reciprocal_rank_fusion`, `EmbeddingBackend` (опциональный OpenAI-совместимый `/embeddings`, при недоступности → None), `semantic_similarity_order` (dense при наличии, иначе lexical).
+- Интеграция в `agent.py`: `_augment_semantic_memory(context, message)` вызывается в `chat()`/`stream_chat()` сразу после `_prepare_context`. Берёт пул кандидатов (лексические хиты + недавние/важные из `search_memory(None, 60)`), считает семантический порядок и фьюзит с лексическим через RRF, переписывает `context.memory_hits` (top-8) и проставляет `relevance`/`retrieval="hybrid"`. Пул ограничен → опциональный remote-embed это ОДИН батч-запрос на ход, без персиста векторов и без изменения схемы/пути записи.
+- Деградация: пул < 2 → no-op (поэтому все прежние тесты с 1 записью памяти не меняются); любой сбой эмбеддинга → лексический порядок; всё в try/except, ход не ломается.
+- Конфиг (новые env, дефолт выключено): `JARVIS_EMBEDDINGS_ENABLED` (false), `JARVIS_EMBEDDINGS_BASE_URL` (по умолчанию = LLM base url), `JARVIS_EMBEDDINGS_MODEL` (пусто). Пока не задан model — работает чистый Python гибрид (уже лучше keyword). Для настоящей семантики укажи локальный embeddings-эндпоинт (llama.cpp/TEI/vLLM-embed).
+- Не сделано в этом треке (кандидаты на будущее): гибрид для file_chunks (сейчас только память), персист векторов для больших корпусов вместо ре-эмбеддинга пула на каждый запрос.
+- Тесты: `backend/tests/test_embeddings.py` (5). Полный прогон — 143 pass, ruff clean.
+
 ## 2026-07-08 handoff — agentic tool loop (track 1/3)
 
 Для оператора и второй модели. Часть плана «убрать узкие места, которые не лечит размер модели». Трек 1 из 3: дать модели реальные руки.
@@ -61,6 +72,9 @@
 | `JARVIS_LLM_BASE_URL` | `http://localhost:8001/v1` | OpenAI-compatible endpoint |
 | `JARVIS_LLM_MODEL` | `dispatcher` | Имя модели для chat completions |
 | `JARVIS_LLM_ENABLED` | `1` | Включить/выключить LLM route |
+| `JARVIS_EMBEDDINGS_ENABLED` | `0` | Включить remote-эмбеддинги для гибридного retrieval |
+| `JARVIS_EMBEDDINGS_BASE_URL` | `= JARVIS_LLM_BASE_URL` | OpenAI-совместимый `/embeddings` endpoint |
+| `JARVIS_EMBEDDINGS_MODEL` | `` | Имя embeddings-модели (пусто = только чистый Python гибрид) |
 | `JARVIS_AUTONOMY_ENABLED` | `1` | Включить безопасный фоновой supervisor |
 | `JARVIS_TELEMETRY_INTERVAL_SEC` | `120` | Интервал telemetry snapshots |
 | `JARVIS_HEALTH_INTERVAL_SEC` | `300` | Интервал автономных health snapshots |
