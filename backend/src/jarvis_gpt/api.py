@@ -779,6 +779,16 @@ async def run_mission(
     return await app.state.agent.run_mission(mission_id, max_steps=max_steps)
 
 
+@app.get("/api/missions/{mission_id}/report")
+async def get_mission_report(mission_id: str) -> dict[str, Any]:
+    if app.state.storage.get_mission(mission_id) is None:
+        raise HTTPException(status_code=404, detail="Mission not found")
+    record = app.state.agent.mission_report(mission_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Mission report is not ready")
+    return record
+
+
 @app.patch("/api/missions/{mission_id}/tasks/{task_id}", response_model=MissionTask)
 async def update_mission_task(
     mission_id: str,

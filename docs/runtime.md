@@ -1,5 +1,47 @@
 # Runtime
 
+## 2026-07-09 handoff - result integrity layer (self-check, mission deliverable, clarify)
+
+Для оператора и второй модели. Этот проход закрывает вторую половину тезиса
+«безупречно понять задачу → безупречно выдать результат»: раньше никто не
+проверял ответ против задачи, завершённая миссия не оставляла оператору
+итогового результата, а неоднозначная задача исполнялась по догадке.
+
+- Новый модуль `backend/src/jarvis_gpt/verification.py` — слой целостности
+  результата: строгий JSON-критик (`answer-verification-v1`), парсер вердикта,
+  промпты ремонта (полный rewrite для request/response, короткая «Поправка после
+  самопроверки» для уже отстримленного текста), детерминированный и
+  LLM-синтезированный итоговый отчёт миссии.
+- Самопроверка ответов: substantive-ответ (использовал инструменты или длиннее
+  `VERIFY_MIN_ANSWER_CHARS=400`) получает один критик-проход против задачи и
+  `completion_criteria` из task kernel, затем максимум один ремонт-раунд.
+  `chat()` может переписать ответ целиком; `stream_chat()` достримливает только
+  поправку (отстримленное не отзывается); шаг миссии переписывает отчёт до
+  записи в notes. Событие `verification` идёт в ленту/trace, вердикт — в payload
+  `assistant_done` и в `data.verification` шага миссии.
+- Деградация железная: критик не позвался/вернул мусор → вердикт None → ответ
+  стоит как есть; ремонт вернул JSON/пустоту → черновик выживает. Выключатели:
+  env `JARVIS_VERIFY_ANSWERS=0` или `experience.autonomy_policy.verify_answers=false`.
+  Короткий tool-less чат не проверяется вовсе (без лишней латентности).
+- Итоговый mission-отчёт: когда миссия достигает `done` (execute-next, run,
+  resume-after-approval — все три пути), `_maybe_finalize_mission` один раз
+  синтезирует операторский отчёт (LLM с fallback на детерминированную сводку
+  шагов), сохраняет его в память (`missions`, тег `report`), в runtime KV
+  `mission.report.{id}`, эмитит событие `mission_report` и отдаёт через
+  `MissionRunResponse.final_report` и `GET /api/missions/{id}/report`.
+- Clarify-маршрут арбитра: intent-роутер теперь может ответить
+  `route=clarify + clarification`; при confidence >= 0.65 Jarvis задаёт этот
+  один точный вопрос вместо уверенной догадки (событие `thought`/«Нужно
+  уточнение»). Порог и «не выбирай clarify, если допущение очевидно» прописаны
+  в промпте, офлайн-поведение не тронуто.
+- Тесты: `backend/tests/test_verification.py` (9): парсер вердикта, ремонт в
+  chat, pass-без-ремонта, policy opt-out, стрим-поправка, ремонт отчёта шага
+  миссии, офлайн-отчёт завершённой миссии (+идемпотентность), детерминированная
+  сводка, clarify-вопрос. Прогон — 173 pass, ruff clean, frontend clean.
+- Замечание для legacy-тестов механики цикла: они выключают самопроверку через
+  `experience.autonomy_policy.verify_answers=false`, чтобы счётчики LLM-вызовов
+  остались про механику, а не про критика.
+
 ## 2026-07-09 handoff - persona auto-learning, file fallback retrieval, mission by understanding
 
 Для оператора и второй модели. Этот проход закрывает три пункта, которые ранее
@@ -289,6 +331,7 @@ to retry from scratch.
 | `JARVIS_LLM_BASE_URL` | `http://localhost:8001/v1` | OpenAI-compatible endpoint |
 | `JARVIS_LLM_MODEL` | `dispatcher` | Имя модели для chat completions |
 | `JARVIS_LLM_ENABLED` | `1` | Включить/выключить LLM route |
+| `JARVIS_VERIFY_ANSWERS` | `1` | Самопроверка substantive-ответов и отчётов шагов миссии |
 | `JARVIS_EMBEDDINGS_ENABLED` | `0` | Включить remote-эмбеддинги для гибридного retrieval |
 | `JARVIS_EMBEDDINGS_BASE_URL` | `= JARVIS_LLM_BASE_URL` | OpenAI-совместимый `/embeddings` endpoint |
 | `JARVIS_EMBEDDINGS_MODEL` | `` | Имя embeddings-модели (пусто = только чистый Python гибрид) |
@@ -371,6 +414,7 @@ GET  /api/missions
 POST /api/missions
 POST /api/missions/{mission_id}/execute-next
 POST /api/missions/{mission_id}/run
+GET  /api/missions/{mission_id}/report
 PATCH /api/missions/{mission_id}/tasks/{task_id}
 GET  /api/memory
 POST /api/memory

@@ -115,6 +115,7 @@ class JarvisSettings:
     llm_enabled: bool
     llm_timeout_sec: float
     llm_max_tokens: int
+    verify_answers: bool
     embeddings_enabled: bool
     embeddings_base_url: str
     embeddings_model: str
@@ -161,6 +162,7 @@ class JarvisSettings:
                 "model": self.llm_model,
                 "timeout_sec": self.llm_timeout_sec,
                 "max_tokens": self.llm_max_tokens,
+                "verify_answers": self.verify_answers,
             },
             "embeddings": {
                 "enabled": self.embeddings_enabled,
@@ -210,6 +212,7 @@ def load_settings(profile_name: str | None = None) -> JarvisSettings:
         llm_enabled=_bool_env("JARVIS_LLM_ENABLED", True),
         llm_timeout_sec=_float_env("JARVIS_LLM_TIMEOUT_SEC", 240.0),
         llm_max_tokens=_int_env("JARVIS_LLM_MAX_TOKENS", 2048),
+        verify_answers=_bool_env("JARVIS_VERIFY_ANSWERS", True),
         embeddings_enabled=_bool_env("JARVIS_EMBEDDINGS_ENABLED", False),
         embeddings_base_url=os.environ.get(
             "JARVIS_EMBEDDINGS_BASE_URL",

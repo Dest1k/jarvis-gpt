@@ -22,6 +22,9 @@
 - Авто-цепочка миссий: `run_mission` / `POST /api/missions/{id}/run` / `mission-run` проходят миссию до завершения, блокировки или бюджета шагов; в Command Center кнопка «Запустить всё» показывает прогресс живьём (прогресс-бар, статусы задач, лог шагов).
 - Живые события: Command Center подписан на `/ws/events` по WebSocket — лента активности агента, живой индикатор и авто-обновление миссий/допусков без поллинга.
 - Per-answer thought trace: у каждого сохранённого ответа есть переход на `/trace/{messageId}` с визуальной цепочкой input -> runtime events -> output.
+- Result integrity: substantive-ответы проходят самопроверку против задачи и критериев готовности с одним ремонт-раундом (rewrite в чате, «Поправка после самопроверки» в стриме, переписанный отчёт шага миссии); сбой критика никогда не портит ответ. Выключается `JARVIS_VERIFY_ANSWERS=0` или policy-ключом `verify_answers`.
+- Итоговый mission-отчёт: завершённая миссия синтезирует операторский deliverable (LLM + детерминированный fallback), доступный через `final_report`, `GET /api/missions/{id}/report`, событие `mission_report` и память.
+- Clarify-маршрут: если задача действительно неоднозначна, арбитр задаёт один точный вопрос вместо уверенной догадки.
 - Retrieval adds normalized relevance, matched terms and snippets for memory/file context.
 - Learning tick deduplicates repeated lessons before writing long-term memory.
 - Autonomous supervisor: безопасный фоновой цикл собирает telemetry и запускает learning tick.

@@ -39,6 +39,8 @@ def test_agentic_loop_runs_safe_tool_then_answers(monkeypatch, tmp_path):
 
     llm = ToolThenAnswerLLM()
     agent, storage = _agent(monkeypatch, tmp_path, llm)
+    # Loop mechanics test: keep the answer self-check out of the call count.
+    storage.set_runtime_value("experience.autonomy_policy", {"verify_answers": False})
     captured = {}
 
     async def fake_run(name, arguments=None, **kwargs):
@@ -92,6 +94,8 @@ def test_agentic_loop_learns_persona_insight_from_dialogue(monkeypatch, tmp_path
 
     llm = InsightThenAnswerLLM()
     agent, storage = _agent(monkeypatch, tmp_path, llm)
+    # Persona-learning test: keep the answer self-check out of the call count.
+    storage.set_runtime_value("experience.autonomy_policy", {"verify_answers": False})
 
     response = asyncio.run(agent.chat("кстати, я перевёл домашний кластер на Proxmox"))
 
@@ -180,7 +184,10 @@ def test_agentic_loop_stops_at_step_budget(monkeypatch, tmp_path):
 
     llm = AlwaysToolLLM()
     agent, storage = _agent(monkeypatch, tmp_path, llm)
-    agent.storage.set_runtime_value("experience.autonomy_policy", {"max_autonomous_steps": 2})
+    agent.storage.set_runtime_value(
+        "experience.autonomy_policy",
+        {"max_autonomous_steps": 2, "verify_answers": False},
+    )
 
     async def fake_run(name, arguments=None, **kwargs):
         return type(

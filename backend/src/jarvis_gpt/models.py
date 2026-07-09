@@ -414,6 +414,7 @@ class MissionRunResponse(BaseModel):
     completed: bool = False
     stopped_reason: Literal["completed", "blocked", "budget", "empty"] = "completed"
     executed_steps: int = 0
+    final_report: str | None = None
 
 
 class OperatorQueueItem(BaseModel):

@@ -34,6 +34,7 @@ Agent Runtime
   |-- web evidence synthesis
   |-- per-answer observable trace
   |-- capability/current-work manifest
+  |-- result integrity (self-check, repair, mission deliverable, clarify)
   |
 LLM Router
   |
@@ -91,6 +92,22 @@ External host runtime
   reasoning-first арбитр уверенно (>= 0.7) видит в задаче реальную многошаговую
   миссию, task kernel переписывается на mission-маршрут и создаётся обычный
   persisted mission plan. Ключевые слова остаются офлайн-фолбэком.
+- Result integrity — backend-owned «definition of done»: substantive-ответ не
+  уходит оператору непроверенным. Один бюджетный критик-проход сверяет черновик
+  с задачей и completion criteria из task kernel, затем максимум один
+  ремонт-раунд (rewrite для request/response, короткая поправка для стрима,
+  переписанный отчёт для шага миссии). Сломанный критик или ремонт никогда не
+  портит хороший ответ: любой сбой означает «ответ стоит как есть». Это
+  архитектурный ответ на «модель уверенно ответила мимо задачи» — его не лечит
+  размер модели, потому что первый forward-pass себя не проверяет.
+- Миссия заканчивается результатом, а не прогресс-баром: при переходе в `done`
+  синтезируется итоговый операторский отчёт (LLM с детерминированным fallback),
+  сохраняется в память и KV, эмитится событием и отдаётся через
+  `final_report` / `GET /api/missions/{id}/report`. Отчёт идемпотентен.
+- Понимание включает право спросить: арбитр может вернуть `clarify` с одним
+  точным вопросом, и Jarvis задаёт его вместо уверенной догадки. Порог выше
+  обычного, промпт запрещает clarify при очевидном допущении — поэтому это
+  инструмент против «уверенно не то», а не источник лишних переспросов.
 - Mission approvals resume in-place: a gated mission tool stores a compact
   agentic snapshot, and the approval executor feeds the approved tool observation
   back into that same step before marking the task done/blocked.

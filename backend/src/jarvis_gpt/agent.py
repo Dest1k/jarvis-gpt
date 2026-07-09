@@ -37,8 +37,17 @@ from .models import (
     ToolRunResponse,
 )
 from .operator_queue import operator_context
-from .storage import JarvisStorage
+from .storage import JarvisStorage, utc_now
 from .tools import ToolRegistry
+from .verification import (
+    Verdict,
+    build_mission_report_messages,
+    build_repair_messages,
+    build_verification_messages,
+    deterministic_mission_report,
+    parse_verdict,
+    valid_mission_report,
+)
 
 SYSTEM_PROMPT = """Ты JARVIS GPT: локальный агент Windows/WSL/Docker и личный операционный помощник.
 Говори по-русски. Держи тон как у кинематографичного Jarvis: спокойный, точный, слегка ироничный,
@@ -169,6 +178,12 @@ AGENTIC_TOOL_DENYLIST = frozenset(
 # When lexical file search finds nothing, recent chunks are only allowed into
 # the prompt if their fuzzy-vector similarity to the query clears this bar.
 FILE_FALLBACK_MIN_RELATEDNESS = 0.1
+
+# Result integrity: substantive answers get one budgeted self-check against the
+# task and completion criteria, plus at most one repair round. Short tool-less
+# answers are exempt so trivial chat stays single-pass.
+VERIFY_MIN_ANSWER_CHARS = 400
+VERIFY_MAX_TOKENS = 350
 
 
 @dataclass
@@ -440,6 +455,7 @@ class IntentDecision:
     confidence: float = 0.0
     query: str | None = None
     rationale: str = ""
+    clarification: str | None = None
 
 
 class AgentRuntime:
@@ -601,6 +617,27 @@ class AgentRuntime:
         if agentic.ok and agentic.answer:
             answer = agentic.answer
             finish_reason = agentic.finish_reason
+            verification_payload: dict[str, Any] | None = None
+            if (
+                finish_reason != "length"
+                and not agentic.blocked_by_approval
+                and self._verification_enabled()
+                and self._answer_worth_verifying(answer, agentic.used_tools)
+            ):
+                answer, verification_events, verification_payload = (
+                    await self._verify_and_repair_answer(
+                        llm_messages,
+                        context,
+                        message,
+                        answer,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        thinking_enabled=thinking_enabled,
+                    )
+                )
+                for event in verification_events:
+                    events.append(event)
+                    await self._emit(event)
             if finish_reason == "length":
                 effective_max_tokens = max_tokens or self.settings.llm_max_tokens
                 answer = (
@@ -608,16 +645,19 @@ class AgentRuntime:
                     f"[ответ остановлен по лимиту {effective_max_tokens} токенов; "
                     "увеличь лимит токенов или попроси продолжить]"
                 )
+            done_payload: dict[str, Any] = {
+                "source": "llm",
+                "finish_reason": finish_reason,
+                "tool_steps": agentic.used_tools,
+                "continuations": agentic.continuation_count,
+            }
+            if verification_payload is not None:
+                done_payload["verification"] = verification_payload
             events.append(
                 ChatEvent(
                     type="assistant_done",
                     title="Ответ получен",
-                    payload={
-                        "source": "llm",
-                        "finish_reason": finish_reason,
-                        "tool_steps": agentic.used_tools,
-                        "continuations": agentic.continuation_count,
-                    },
+                    payload=done_payload,
                 )
             )
         else:
@@ -910,17 +950,49 @@ class AgentRuntime:
                     )
                     answer = f"{answer}{interruption}"
                     yield {"type": "delta", "content": interruption}
+            verification_payload: dict[str, Any] | None = None
+            if (
+                not stream_error
+                and stream_finish_reason != "length"
+                and self._verification_enabled()
+                and self._answer_worth_verifying(answer, used_tools)
+            ):
+                # The answer is already on the operator's screen, so a failed
+                # self-check can only append a correction addendum, never rewrite.
+                verified_answer, verification_events, verification_payload = (
+                    await self._verify_and_repair_answer(
+                        messages,
+                        context,
+                        message,
+                        answer,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        thinking_enabled=thinking_enabled,
+                        repair_mode="addendum",
+                    )
+                )
+                for event in verification_events:
+                    events.append(event)
+                    await self._emit(event)
+                    yield {"type": "event", "event": event.model_dump()}
+                if len(verified_answer) > len(answer):
+                    addition = verified_answer[len(answer):]
+                    answer = verified_answer
+                    yield {"type": "delta", "content": addition}
+            done_payload: dict[str, Any] = {
+                "source": "llm",
+                "stream": True,
+                "finish_reason": stream_finish_reason,
+                "tool_steps": used_tools,
+                "continuations": continuation_count,
+            }
+            if verification_payload is not None:
+                done_payload["verification"] = verification_payload
             events.append(
                 ChatEvent(
                     type="assistant_done",
                     title="Streaming answer received",
-                    payload={
-                        "source": "llm",
-                        "stream": True,
-                        "finish_reason": stream_finish_reason,
-                        "tool_steps": used_tools,
-                        "continuations": continuation_count,
-                    },
+                    payload=done_payload,
                 )
             )
         else:
@@ -1037,6 +1109,10 @@ class AgentRuntime:
                 payload={"mission_id": mission_id, "task_id": task["id"], "ok": result.ok},
             )
         )
+        if result.ok:
+            report_record = await self._maybe_finalize_mission(mission_id)
+            if report_record:
+                result.data["mission_report"] = report_record["report"]
         return MissionExecutionResponse(
             mission=Mission.model_validate(refreshed),
             task=MissionTask.model_validate(updated_task or running_task or task),
@@ -1083,6 +1159,11 @@ class AgentRuntime:
         completed = self.storage.next_mission_task(mission_id) is None
         if stopped_reason != "blocked":
             stopped_reason = ("completed" if steps else "empty") if completed else "budget"
+        final_report: str | None = None
+        if completed:
+            report_record = await self._maybe_finalize_mission(mission_id)
+            if report_record:
+                final_report = str(report_record.get("report") or "") or None
         await self._emit(
             ChatEvent(
                 type="mission_run",
@@ -1102,7 +1183,66 @@ class AgentRuntime:
             completed=completed,
             stopped_reason=stopped_reason,  # type: ignore[arg-type]
             executed_steps=len(steps),
+            final_report=final_report,
         )
+
+    async def _maybe_finalize_mission(self, mission_id: str) -> dict[str, Any] | None:
+        """When a mission reaches ``done``, synthesize the operator deliverable once.
+
+        The report is idempotent (stored in runtime KV), saved to mission memory
+        and announced as a ``mission_report`` event, so a finished mission ends
+        with an actual result in the operator's hands instead of a progress bar.
+        """
+
+        mission = self.storage.get_mission(mission_id)
+        if mission is None or mission.get("status") != "done":
+            return None
+        key = _mission_report_key(mission_id)
+        existing = self.storage.get_runtime_value(key, None)
+        if isinstance(existing, dict) and existing.get("report"):
+            return existing
+        report = await self._synthesize_mission_report(mission)
+        record = {"report": report, "created_at": utc_now(), "mission_id": mission_id}
+        self.storage.set_runtime_value(key, record)
+        self.storage.add_memory(
+            content=f"Mission report: {mission.get('title', '')}\n{report}",
+            namespace="missions",
+            tags=["mission", mission_id, "report"],
+            importance=0.7,
+        )
+        await self._emit(
+            ChatEvent(
+                type="mission_report",
+                title=f"Итоговый отчёт миссии: {mission.get('title', '')}"[:240],
+                content=report[:1500],
+                payload={"mission_id": mission_id},
+            )
+        )
+        return record
+
+    async def _synthesize_mission_report(self, mission: dict[str, Any]) -> str:
+        fallback = deterministic_mission_report(mission)
+        if not self.settings.llm_enabled or not hasattr(self.llm, "complete"):
+            return fallback
+        try:
+            result = await self._complete_llm(
+                build_mission_report_messages(mission),
+                temperature=0.2,
+                max_tokens=900,
+                thinking_enabled=False,
+            )
+        except Exception:  # noqa: BLE001 - the deterministic report always exists
+            return fallback
+        if not result.ok or not result.content:
+            return fallback
+        report = _clean_assistant_answer(result.content).strip()
+        if not valid_mission_report(report):
+            return fallback
+        return report
+
+    def mission_report(self, mission_id: str) -> dict[str, Any] | None:
+        record = self.storage.get_runtime_value(_mission_report_key(mission_id), None)
+        return record if isinstance(record, dict) and record.get("report") else None
 
     def _mission_run_budget(self, max_steps: int | None) -> int:
         if max_steps is not None:
@@ -1168,17 +1308,39 @@ class AgentRuntime:
         summary = agentic.answer.strip() if agentic.answer else ""
         if not summary:
             summary = agentic.error or "Шаг не удалось выполнить: модель не вернула результат."
+        step_ok = agentic.ok and bool(agentic.answer) and not agentic.blocked_by_approval
+        verification_payload: dict[str, Any] | None = None
+        if step_ok and self._verification_enabled():
+            # Mission steps are always substantive: check the report against the
+            # goal/step and allow one report rewrite before persisting notes.
+            step_task = f"Цель миссии: {mission['goal']}\nТекущий шаг: {task['title']}"
+            summary, verification_events, verification_payload = (
+                await self._verify_and_repair_answer(
+                    base_messages,
+                    mission_context,
+                    step_task,
+                    summary,
+                    temperature=0.2,
+                    max_tokens=None,
+                    thinking_enabled=False,
+                )
+            )
+            for event in verification_events:
+                await self._emit(event)
+        data: dict[str, Any] = {
+            "mission_id": mission["id"],
+            "task_id": task["id"],
+            "tool_steps": agentic.used_tools,
+            "approval_ids": list(agentic.approval_ids),
+            "autonomous": True,
+        }
+        if verification_payload is not None:
+            data["verification"] = verification_payload
         return ToolRunResponse(
             tool="mission.execute_next",
-            ok=agentic.ok and bool(agentic.answer) and not agentic.blocked_by_approval,
+            ok=step_ok,
             summary=summary[:2000],
-            data={
-                "mission_id": mission["id"],
-                "task_id": task["id"],
-                "tool_steps": agentic.used_tools,
-                "approval_ids": list(agentic.approval_ids),
-                "autonomous": True,
-            },
+            data=data,
         )
 
     async def resume_mission_after_approval(
@@ -1295,6 +1457,10 @@ class AgentRuntime:
                 },
             )
         )
+        if result.ok:
+            report_record = await self._maybe_finalize_mission(mission_id)
+            if report_record:
+                result.data["mission_report"] = report_record["report"]
         return result
 
     async def _try_direct_action(
@@ -1427,6 +1593,25 @@ class AgentRuntime:
             ):
                 context.task_plan = _mission_plan_from_intent(context.task_plan, arbiter)
                 return None
+            # Genuinely ambiguous task: ask the operator one targeted question
+            # instead of guessing and delivering a confidently wrong result.
+            if (
+                arbiter is not None
+                and arbiter.route == "clarify"
+                and arbiter.confidence >= 0.65
+                and arbiter.clarification
+            ):
+                return DirectAction(
+                    answer=arbiter.clarification,
+                    events=[
+                        ChatEvent(
+                            type="thought",
+                            title="Нужно уточнение",
+                            content=arbiter.rationale or arbiter.clarification,
+                            payload={"route": "clarify"},
+                        )
+                    ],
+                )
 
         shopping_followup = _shopping_followup_intent(
             message,
@@ -2454,6 +2639,115 @@ class AgentRuntime:
             continuation_count += 1
             finish_reason = _finish_reason_from_llm_result(result) or "stop"
         return answer, continuation_count, finish_reason
+
+    def _verification_enabled(self) -> bool:
+        """Result self-check gate: LLM route on, env switch on, policy not opted out."""
+
+        if not self.settings.llm_enabled or not hasattr(self.llm, "complete"):
+            return False
+        if not getattr(self.settings, "verify_answers", True):
+            return False
+        policy = self.storage.get_runtime_value("experience.autonomy_policy", {})
+        return not (isinstance(policy, dict) and policy.get("verify_answers") is False)
+
+    @staticmethod
+    def _answer_worth_verifying(answer: str, used_tools: int) -> bool:
+        return bool(answer) and (used_tools > 0 or len(answer) >= VERIFY_MIN_ANSWER_CHARS)
+
+    async def _verify_answer(
+        self,
+        *,
+        task: str,
+        answer: str,
+        criteria: tuple[str, ...] = (),
+        kind: str = "chat",
+    ) -> Verdict | None:
+        """One budgeted critic pass; any failure means None and the answer stands."""
+
+        try:
+            result = await self._complete_llm(
+                build_verification_messages(
+                    task=task,
+                    answer=answer,
+                    criteria=criteria,
+                    kind=kind,
+                ),
+                temperature=0.0,
+                max_tokens=VERIFY_MAX_TOKENS,
+                thinking_enabled=False,
+            )
+        except Exception:  # noqa: BLE001 - verification must never break a turn
+            return None
+        if not result.ok or not result.content:
+            return None
+        return parse_verdict(result.content)
+
+    def _verification_event(self, verdict: Verdict, *, repaired: bool = False) -> ChatEvent:
+        if verdict.verdict == "pass":
+            title = "Самопроверка пройдена"
+        else:
+            title = "Самопроверка нашла пробелы"
+        content = None
+        if verdict.missing:
+            content = "; ".join(verdict.missing)
+        return ChatEvent(
+            type="verification",
+            title=title,
+            content=content,
+            payload={**verdict.payload(), "repaired": repaired},
+        )
+
+    async def _verify_and_repair_answer(
+        self,
+        base_messages: list[dict[str, str]],
+        context: AgentContext,
+        task: str,
+        answer: str,
+        *,
+        temperature: float | None,
+        max_tokens: int | None,
+        thinking_enabled: bool,
+        repair_mode: str = "rewrite",
+    ) -> tuple[str, list[ChatEvent], dict[str, Any] | None]:
+        """Self-check the draft against the task; run at most one repair round.
+
+        ``repair_mode="rewrite"`` replaces the whole answer (request/response
+        path); ``"addendum"`` returns a short correction block instead, because a
+        streamed answer cannot be retracted. The original answer always survives
+        a broken repair.
+        """
+
+        plan = context.task_plan
+        criteria = plan.completion_criteria if plan is not None else ()
+        verdict = await self._verify_answer(task=task, answer=answer, criteria=criteria)
+        if verdict is None:
+            return answer, [], None
+        if verdict.verdict == "pass":
+            event = self._verification_event(verdict)
+            return answer, [event], event.payload
+        repaired_text = ""
+        try:
+            result = await self._complete_llm(
+                build_repair_messages(base_messages, answer, verdict, mode=repair_mode),
+                temperature=temperature,
+                max_tokens=max_tokens,
+                thinking_enabled=thinking_enabled,
+            )
+            if result.ok and result.content:
+                repaired_text = _clean_assistant_answer(result.content).strip()
+            if repaired_text.startswith(("{", "[")):
+                # A repair that came back as tool/router JSON is broken output;
+                # the draft answer must survive it.
+                repaired_text = ""
+        except Exception:  # noqa: BLE001 - a broken repair must not lose the draft
+            repaired_text = ""
+        repaired = bool(repaired_text)
+        if repaired:
+            answer = (
+                f"{answer}\n\n{repaired_text}" if repair_mode == "addendum" else repaired_text
+            )
+        event = self._verification_event(verdict, repaired=repaired)
+        return answer, [event], event.payload
 
     def _stream_llm(
         self,
@@ -3923,8 +4217,9 @@ def _intent_router_messages(
                 "задачу оператора по смыслу и контексту, а не по совпадению ключевых слов. "
                 "Эвристика ниже могла ошибиться, потому что реагирует на отдельные слова. "
                 "Реши сам, опираясь на суть запроса и на профиль оператора.\n"
-                "Верни только JSON без markdown. Поля: route, confidence, query, rationale. "
-                "route: web_research | reasoning | local_action | mission | chat.\n"
+                "Верни только JSON без markdown. Поля: route, confidence, query, "
+                "clarification, rationale. "
+                "route: web_research | reasoning | local_action | mission | chat | clarify.\n"
                 "web_research: оператору реально нужны свежие внешние проверяемые факты "
                 "(цены, наличие, расписания, версии, новости, погода, адреса, курсы) и "
                 "ответ зависит от сегодняшней реальности, а не от знаний модели.\n"
@@ -3934,6 +4229,10 @@ def _intent_router_messages(
                 "local_action: надо управлять ОС/GUI/файлами/консолью на машине оператора.\n"
                 "mission: крупная реальная многошаговая задача с исполнимыми шагами.\n"
                 "chat: обычный разговорный ответ без инструментов.\n"
+                "clarify: задача ДЕЙСТВИТЕЛЬНО неоднозначна, и один короткий вопрос оператору "
+                "радикально меняет результат; положи этот вопрос в clarification. Не выбирай "
+                "clarify, если разумное допущение очевидно из сообщения, профиля оператора "
+                "или истории — тогда действуй по допущению.\n"
                 "Правило разрешения сомнений: выбирай web_research ТОЛЬКО если без свежих "
                 "внешних данных честный ответ невозможен. Если фактов из сообщения и контекста "
                 "достаточно — это reasoning или chat. "
@@ -3970,7 +4269,7 @@ def _parse_intent_decision(content: str) -> IntentDecision | None:
     if not isinstance(data, dict):
         return None
     route = str(data.get("route") or "").strip().lower()
-    allowed = {"web_research", "reasoning", "local_action", "mission", "chat"}
+    allowed = {"web_research", "reasoning", "local_action", "mission", "chat", "clarify"}
     if route not in allowed:
         return None
     try:
@@ -3982,6 +4281,7 @@ def _parse_intent_decision(content: str) -> IntentDecision | None:
         confidence=max(0.0, min(1.0, confidence)),
         query=str(data.get("query") or "").strip() or None,
         rationale=str(data.get("rationale") or "").strip(),
+        clarification=" ".join(str(data.get("clarification") or "").split())[:400] or None,
     )
 
 
@@ -6234,6 +6534,10 @@ def _console_process_fallback(command: str, shell: str) -> NativeAction:
             "открыл новый PowerShell и выполнил команду"
         ),
     )
+
+
+def _mission_report_key(mission_id: str) -> str:
+    return f"mission.report.{mission_id}"
 
 
 def _console_target_key(conversation_id: str) -> str:

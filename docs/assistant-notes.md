@@ -9,6 +9,31 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-09 - Claude (result integrity layer)
+
+- New module `backend/src/jarvis_gpt/verification.py`: strict JSON critic
+  (`answer-verification-v1`), verdict parser, repair prompts (rewrite /
+  stream addendum), deterministic + LLM mission report.
+- Answer self-check wired into `chat()` (full rewrite allowed), `stream_chat()`
+  (addendum only — streamed text is not retractable) and
+  `_execute_mission_step_agentic` (report rewrite before notes persist).
+  Trigger: tools used or answer >= 400 chars; one critic pass + max one repair.
+  Kill switches: `JARVIS_VERIFY_ANSWERS=0` env or autonomy policy
+  `verify_answers=false`. Unparseable critic output or JSON-shaped repair
+  never damages the draft.
+- Mission deliverable: `_maybe_finalize_mission` fires on the `done` transition
+  from all three completion paths, is idempotent via KV `mission.report.{id}`,
+  saves a `missions/report` memory, emits `mission_report`, and surfaces via
+  `MissionRunResponse.final_report` + new `GET /api/missions/{id}/report`.
+- Intent arbiter gained a `clarify` route: one targeted question to the
+  operator (confidence >= 0.65) instead of a confident guess.
+- Legacy loop-mechanics tests opt out via policy `verify_answers=false` so
+  their LLM call counts stay about loop mechanics.
+- Tests: `backend/tests/test_verification.py` (9). Full run: 173 pass, ruff
+  clean, frontend typecheck + build clean.
+- Possible next steps: Command Center panel for mission reports (API is ready);
+  verification stats in operator queue; per-route verify policy.
+
 ### 2026-07-09 - Claude
 
 - Closed three follow-ups previously marked "на будущее" in runtime.md, all on
