@@ -9,6 +9,21 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-10 - Codex (API host selection hotfix)
+
+- Fixed Command Center API host selection when the UI is opened on
+  `localhost:3000` but the production build was made in LAN mode with
+  `NEXT_PUBLIC_JARVIS_API_URL=http://<lan-ip>:8000`. The browser client now
+  falls back to the current page host for loopback/LAN mismatches, including
+  the trace page.
+- Bumped the service worker cache version to `jarvis-gpt-v2` so stale static
+  chunks do not keep serving the old API target after a rebuild.
+- Backend API/WS guard now treats same-machine LAN source addresses as local
+  clients while still requiring `JARVIS_API_TOKEN` for true remote clients.
+- Verified: frontend typecheck/build, backend ruff, full backend pytest
+  (207 pass), live localhost and same-machine LAN `/api/status`, and stack
+  restart with dispatcher still READY.
+
 ### 2026-07-09 - Codex (leases, stream durability, background cognition)
 
 - Added persisted autonomy run leases. Running jobs now write

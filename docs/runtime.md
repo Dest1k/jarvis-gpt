@@ -1,5 +1,22 @@
 # Runtime
 
+## 2026-07-10 handoff - API host selection and same-machine LAN
+
+For the operator and the second model:
+
+- Command Center no longer blindly trusts a build-time LAN API URL when the
+  browser is opened on `localhost:3000`. Browser API/WS calls now resolve to
+  the current page host when a loopback page would otherwise call a private LAN
+  API, or a LAN page would otherwise call loopback.
+- The trace page uses the same API host fallback logic as the main Command
+  Center.
+- The service worker cache is bumped to `jarvis-gpt-v2` so stale frontend
+  chunks are evicted after this rebuild.
+- Backend API and `/ws/events` still require `JARVIS_API_TOKEN` for real
+  non-local clients, but a request whose source address is one of this machine's
+  own LAN interfaces is treated as local. This covers local Chrome using
+  `http://<lan-ip>:3000` without opening tokenless access to other devices.
+
 ## 2026-07-09 handoff - leases, interrupted streams, background cognition
 
 For the operator and the second model:
