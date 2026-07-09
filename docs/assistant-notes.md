@@ -9,6 +9,21 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-09 - Codex
+
+- Reviewed Claude's recent trend: replace keyword plugs with reasoning-first
+  routing, give the model safe read-only tools, verify outputs, and close the
+  feedback/lesson loop.
+- Found and fixed a matching approval-boundary weakness: public
+  `POST /api/tools/{tool_name}/run` no longer honors client-supplied
+  `allow_danger=True`. Direct API tool runs are safe-only; review/danger tools
+  must go through approval creation and `ApprovalExecutor`.
+- Tightened CORS from wildcard to loopback origins by default, with optional
+  `JARVIS_CORS_ORIGINS` for explicit extra trusted origins. This reduces browser
+  drive-by access to the local API/approval surface.
+- Added smoke coverage so the API refuses `host.bridge.execute` even when a
+  client tries `allow_danger: true`, and so non-loopback CORS preflight fails.
+
 ### 2026-07-09 - Claude (arbiter owns local_action)
 
 - Follow-up to system.inspect: the tool gave the model hands, but the ROUTE was

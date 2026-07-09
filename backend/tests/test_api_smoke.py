@@ -38,6 +38,26 @@ def test_health_and_status(client):
     assert models.status_code == 200
 
 
+def test_cors_is_loopback_only(client):
+    requested = {
+        "Access-Control-Request-Method": "POST",
+        "Access-Control-Request-Headers": "content-type",
+    }
+    allowed = client.options(
+        "/api/chat",
+        headers={**requested, "Origin": "http://localhost:3000"},
+    )
+    assert allowed.status_code == 200
+    assert allowed.headers["access-control-allow-origin"] == "http://localhost:3000"
+
+    denied = client.options(
+        "/api/chat",
+        headers={**requested, "Origin": "https://example.invalid"},
+    )
+    assert denied.status_code == 400
+    assert "access-control-allow-origin" not in denied.headers
+
+
 def test_chat_offline_and_feedback_roundtrip(client):
     response = client.post(
         "/api/chat",
@@ -143,6 +163,14 @@ def test_operator_queue_and_memory_and_tools(client):
     )
     assert denied.status_code == 200
     assert denied.json()["ok"] is False
+
+    bypass = client.post(
+        "/api/tools/host.bridge.execute/run",
+        json={"arguments": {"command": "Get-Date"}, "allow_danger": True},
+    )
+    assert bypass.status_code == 200
+    assert bypass.json()["ok"] is False
+    assert bypass.json()["data"]["approval_action"] == "tool.run"
 
 
 def test_approvals_and_persona(client):

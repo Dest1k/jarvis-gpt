@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -179,10 +180,16 @@ async def lifespan(app: FastAPI):
         storage.close()
 
 
+def _cors_origins() -> list[str]:
+    raw = os.environ.get("JARVIS_CORS_ORIGINS", "")
+    return [item.strip().rstrip("/") for item in raw.split(",") if item.strip()]
+
+
 app = FastAPI(title="JARVIS GPT", version="0.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins(),
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1024,10 +1031,12 @@ async def list_tools() -> list[ToolInfo]:
 
 @app.post("/api/tools/{tool_name}/run", response_model=ToolRunResponse)
 async def run_tool(tool_name: str, request: ToolRunRequest) -> ToolRunResponse:
+    # Public tool runs must not be an approval bypass. The dedicated
+    # ApprovalExecutor is the only API path that may pass allow_danger=True.
     return await app.state.agent.tools.run(
         tool_name,
         request.arguments,
-        allow_danger=request.allow_danger,
+        allow_danger=False,
     )
 
 

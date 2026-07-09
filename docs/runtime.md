@@ -491,6 +491,7 @@ to retry from scratch.
 | `JARVIS_HEALTH_INTERVAL_SEC` | `300` | Интервал автономных health snapshots |
 | `JARVIS_LEARNING_INTERVAL_SEC` | `600` | Интервал autonomous learning tick |
 | `JARVIS_AUTONOMY_MISSION_INTERVAL_SEC` | `120` | Background autonomy job sweep interval |
+| `JARVIS_CORS_ORIGINS` | `` | Optional comma-separated trusted non-loopback browser origins |
 | `JARVIS_API_HOST` | `0.0.0.0` | Host FastAPI backend |
 | `JARVIS_API_PORT` | `8000` | Port FastAPI backend |
 
