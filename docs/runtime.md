@@ -1,5 +1,16 @@
 # Runtime
 
+## 2026-07-08 handoff — mission auto-chaining + live progress (track 4)
+
+Для оператора и второй модели. Продолжение трека 3: раньше миссия двигалась по одному шагу за вызов, и «исполнение» было ручным кликом. Теперь миссия может пройти до конца.
+
+- Backend: `agent.run_mission(mission_id, max_steps=None)` последовательно гоняет `execute_next_mission_step` (тот самый агентный executor) до завершения миссии, заблокированного шага (например, нужен approval) или бюджета шагов. Возвращает `MissionRunResponse(mission, steps[], completed, stopped_reason ∈ completed|blocked|budget|empty, executed_steps)` и эмитит событие `mission_run`. Бюджет — из `experience.autonomy_policy.max_autonomous_steps` или явного `max_steps` (cap 24). Approval-гейты НЕ обходятся: заблокированный шаг останавливает цепочку.
+- API: `POST /api/missions/{id}/run?max_steps=`. CLI: `mission-run <id> [--max-steps N]`.
+- Офлайн детерминирован (каждый шаг — `mission.brief`), поэтому цепочка тестируется без LLM: `test_run_mission_chains_all_steps_offline`, `test_run_mission_respects_step_budget`.
+- Frontend (Command Center): кнопка «Запустить всё» в панели миссий делает клиентскую цепочку `execute-next` (через `missionsRef` для свежего состояния между await), чтобы прогресс шёл в UI ЖИВО — прогресс-бар растёт, задачи перекрашиваются в done/blocked, каждый шаг логируется в чат; выполняющаяся миссия подсвечивается, кнопка крутит спиннер. Серверный `/run` остаётся для headless. Причина клиентской цепочки: во фронте нет WS, только REST-поллинг, а per-step `execute-next` даёт живые апдейты без стрима.
+- Полный прогон — 146 pass, ruff clean, frontend typecheck + build clean.
+- На будущее: WS-подписка на `/ws/events` для полностью серверной цепочки с live-событиями; live-стрим tool-событий шага миссии в UI; интеграция approval-гейта миссии в поток approvals Command Center (сейчас блок останавливает цепочку, approval виден в панели approvals).
+
 ## 2026-07-08 handoff — real mission executor (track 3/3)
 
 Для оператора и второй модели. Трек 3 из 3: `execute_next_mission_step` был заглушкой — гонял `mission.brief` (текстовую рекомендацию), а не работу. «Миссии» были планами, которые ничего не делали. Размер модели это не лечит: исполнитель был пустым.
@@ -126,6 +137,7 @@ py -3.11 .\jarvis.py approval-request "Host action" "Needs review" --risk danger
 py -3.11 .\jarvis.py approval-update <approval_id> --status approved
 py -3.11 .\jarvis.py approval-execute <approval_id>
 py -3.11 .\jarvis.py mission-next <mission_id>
+py -3.11 .\jarvis.py mission-run <mission_id> --max-steps 8
 py -3.11 .\jarvis.py serve --reload
 .\scripts\doctor.ps1
 ```
@@ -153,6 +165,7 @@ GET  /api/conversations/{conversation_id}/messages
 GET  /api/missions
 POST /api/missions
 POST /api/missions/{mission_id}/execute-next
+POST /api/missions/{mission_id}/run
 PATCH /api/missions/{mission_id}/tasks/{task_id}
 GET  /api/memory
 POST /api/memory
