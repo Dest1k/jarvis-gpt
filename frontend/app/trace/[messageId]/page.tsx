@@ -203,7 +203,7 @@ export default function TracePage() {
           <section className="traceSignalSection">
             <div className="traceSectionHead">
               <div>
-                <p>Observable runtime trace</p>
+                <p>Наблюдаемая трасса runtime</p>
                 <h2>Как сигнал прошёл через JARVIS</h2>
               </div>
               <span>{visibleNodes.length} узлов</span>

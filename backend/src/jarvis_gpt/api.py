@@ -295,8 +295,8 @@ def _message_trace_payload(
         "nodes": nodes,
         "edges": edges,
         "disclosure": (
-            "Trace shows observable runtime stages, tools, routing and stored metadata; "
-            "it does not expose hidden chain-of-thought."
+            "Трасса показывает наблюдаемые стадии runtime, инструменты, маршрутизацию "
+            "и сохранённую metadata; скрытая chain-of-thought не раскрывается."
         ),
     }
 
