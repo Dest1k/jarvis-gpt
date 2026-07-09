@@ -10,8 +10,10 @@ import httpx
 from jarvis_gpt.browser_cdp import BrowserActionResult, BrowserPageSnapshot
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
 from jarvis_gpt.llm import LLMRouter
+from jarvis_gpt.models import ToolRunResponse
 from jarvis_gpt.storage import JarvisStorage
 from jarvis_gpt.tools import (
+    WEB_RESEARCH_KEY,
     WEB_USER_AGENT,
     ToolRegistry,
     _PublicOnlyAsyncNetworkBackend,
@@ -1230,6 +1232,255 @@ def test_web_verify_scores_saved_evidence(monkeypatch, tmp_path):
         "one.example",
         "two.example",
     }
+    storage.close()
+
+
+def test_web_research_pipeline_returns_citations(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    async def fake_search(_ctx, args):
+        assert args["limit"] >= 4
+        return ToolRunResponse(
+            tool="web.search",
+            ok=True,
+            summary="Search returned one result.",
+            data={
+                "source": "fake",
+                "results": [
+                    {
+                        "rank": 1,
+                        "title": "Alpha launch notes",
+                        "url": "https://example.com/alpha",
+                        "snippet": "Alpha launched in July.",
+                    }
+                ],
+            },
+        )
+
+    async def fake_fetch(_ctx, args):
+        assert args["url"] == "https://example.com/alpha"
+        return ToolRunResponse(
+            tool="web.fetch",
+            ok=True,
+            summary="Fetched alpha source.",
+            data={
+                "url": args["url"],
+                "content_type": "text/html",
+                "text": "Alpha launched in July with public documentation.",
+                "evidence_id": "ev_alpha",
+            },
+        )
+
+    async def fake_extract(_ctx, args):
+        assert args["evidence_id"] == "ev_alpha"
+        return ToolRunResponse(
+            tool="web.extract",
+            ok=True,
+            summary="Extracted article.",
+            data={
+                "extraction": {
+                    "kind": "article",
+                    "title_candidates": ["Alpha launch notes"],
+                    "dates": ["July 2026"],
+                    "metadata": {"title": "Alpha launch notes"},
+                }
+            },
+        )
+
+    async def fake_verify(_ctx, args):
+        assert args["evidence_ids"] == ["ev_alpha"]
+        return ToolRunResponse(
+            tool="web.verify",
+            ok=True,
+            summary="Verification verdict: supported.",
+            data={
+                "verification": {
+                    "verdict": "supported",
+                    "confidence": 0.9,
+                    "missing_terms": [],
+                    "independent_domains": ["example.com"],
+                }
+            },
+        )
+
+    monkeypatch.setattr("jarvis_gpt.tools._web_search", fake_search)
+    monkeypatch.setattr("jarvis_gpt.tools._web_fetch", fake_fetch)
+    monkeypatch.setattr("jarvis_gpt.tools._web_extract", fake_extract)
+    monkeypatch.setattr("jarvis_gpt.tools._web_verify", fake_verify)
+
+    result = asyncio.run(
+        tools.run(
+            "web.research",
+            {"query": "Alpha launch", "max_sources": 1, "render_fallback": False},
+        )
+    )
+
+    assert result.ok is True
+    assert result.data["citations"][0]["evidence_id"] == "ev_alpha"
+    assert result.data["verification"]["verdict"] == "supported"
+    assert "Alpha launch notes" in result.data["report"]
+    assert storage.get_runtime_value(WEB_RESEARCH_KEY)[0]["query"] == "Alpha launch"
+    storage.close()
+
+
+def test_web_document_read_reads_quarantined_text(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+    downloads = settings.cache_dir / "downloads"
+    downloads.mkdir(parents=True, exist_ok=True)
+    document_path = downloads / "brief.txt"
+    document_path.write_text("Internet document text for Jarvis.", encoding="utf-8")
+
+    result = asyncio.run(
+        tools.run("web.document.read", {"path": str(document_path), "max_chars": 2000})
+    )
+
+    assert result.ok is True
+    assert result.data["text"] == "Internet document text for Jarvis."
+    assert result.data["document"]["kind"] == "txt"
+    assert result.data["evidence_id"]
+    storage.close()
+
+
+def test_web_document_read_refuses_large_quarantine_file(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr("jarvis_gpt.tools.WEB_DOCUMENT_READ_MAX_BYTES", 4)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+    downloads = settings.cache_dir / "downloads"
+    downloads.mkdir(parents=True, exist_ok=True)
+    document_path = downloads / "large.txt"
+    document_path.write_text("too large", encoding="utf-8")
+
+    result = asyncio.run(tools.run("web.document.read", {"path": str(document_path)}))
+
+    assert result.ok is False
+    assert "too large" in result.summary
+    assert result.data["max_bytes"] == 4
+    storage.close()
+
+
+def test_internet_observability_summarizes_handoff_and_runs(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+    storage.set_runtime_value(
+        "browser.handoff.current",
+        {"id": "handoff_test", "status": "pending", "url": "https://blocked.example/"},
+    )
+    storage.set_runtime_value(
+        "web.evidence.records",
+        [{"id": "ev_blocked", "url": "https://blocked.example/", "excerpt": "blocked"}],
+    )
+    storage.record_tool_run(
+        tool="web.fetch",
+        ok=False,
+        summary="Blocked by 403 human verification.",
+        arguments={"url": "https://blocked.example/"},
+        data={"url": "https://blocked.example/"},
+    )
+    storage.record_tool_run(
+        tool="web.search",
+        ok=True,
+        summary="Search ok.",
+        arguments={"query": "blocked"},
+        data={"source": "bing", "url": "https://www.bing.com/search?q=blocked"},
+    )
+
+    result = asyncio.run(tools.run("internet.observability", {"limit": 20}))
+
+    assert result.ok is True
+    assert result.data["handoff"]["id"] == "handoff_test"
+    assert result.data["summary"]["failed_runs"] == 1
+    assert result.data["by_tool"]["web.fetch"]["failed"] == 1
+    assert result.data["search_providers"]["bing"] == 1
+    assert result.data["blocked_recent"][0]["tool"] == "web.fetch"
+    storage.close()
+
+
+def test_internet_smoke_reports_live_checks(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    async def fake_chrome(_ctx, _args):
+        return ToolRunResponse(
+            tool="browser.chrome.status",
+            ok=False,
+            summary="Chrome CDP is unavailable.",
+        )
+
+    def fake_handoff(_ctx, _args):
+        return ToolRunResponse(
+            tool="browser.handoff.status",
+            ok=True,
+            summary="No active browser handoff.",
+            data={"handoff": None},
+        )
+
+    async def fake_fetch(_ctx, args):
+        return ToolRunResponse(
+            tool="web.fetch",
+            ok=True,
+            summary="Fetched smoke page.",
+            data={"url": args["url"], "text": "Smoke ok", "evidence_id": "ev_smoke"},
+        )
+
+    async def fake_extract(_ctx, _args):
+        return ToolRunResponse(
+            tool="web.extract",
+            ok=True,
+            summary="Extracted smoke page.",
+            data={"source": {"evidence_id": "ev_smoke"}, "extraction": {"kind": "article"}},
+        )
+
+    async def fake_verify(_ctx, args):
+        assert args["evidence_ids"] == ["ev_smoke"]
+        return ToolRunResponse(
+            tool="web.verify",
+            ok=True,
+            summary="Verification verdict: supported.",
+            data={"verification": {"verdict": "supported", "confidence": 0.8}},
+        )
+
+    monkeypatch.setattr("jarvis_gpt.tools._browser_chrome_status", fake_chrome)
+    monkeypatch.setattr("jarvis_gpt.tools._browser_handoff_status", fake_handoff)
+    monkeypatch.setattr("jarvis_gpt.tools._web_fetch", fake_fetch)
+    monkeypatch.setattr("jarvis_gpt.tools._web_extract", fake_extract)
+    monkeypatch.setattr("jarvis_gpt.tools._web_verify", fake_verify)
+
+    result = asyncio.run(
+        tools.run("internet.smoke", {"url": "https://example.com/smoke"})
+    )
+
+    assert result.ok is True
+    checks = {item["tool"]: item for item in result.data["checks"]}
+    assert checks["browser.chrome.status"]["ok"] is False
+    assert checks["web.fetch"]["ok"] is True
+    assert result.data["observability"]["summary"]["total_runs"] >= 0
     storage.close()
 
 

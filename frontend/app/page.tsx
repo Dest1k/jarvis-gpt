@@ -687,6 +687,45 @@ type ToolRunResult = {
   data: Record<string, unknown>;
 };
 
+type BrowserHandoff = {
+  id?: string;
+  status?: string;
+  reason?: string;
+  url?: string;
+  title?: string;
+  instruction?: string;
+  debug_url?: string;
+  created_at?: string;
+};
+
+type InternetToolCounts = {
+  ok: number;
+  failed: number;
+};
+
+type InternetObservability = {
+  summary: {
+    total_runs: number;
+    ok_runs: number;
+    failed_runs: number;
+    evidence_records: number;
+    research_records: number;
+    rate_domains: number;
+    cooldowns: number;
+  };
+  by_tool: Record<string, InternetToolCounts>;
+  search_providers: Record<string, number>;
+  top_domains: [string, number][];
+  blocked_recent: Array<{
+    tool?: string;
+    summary?: string;
+    url?: string;
+    created_at?: string;
+  }>;
+  handoff?: BrowserHandoff | null;
+  cooldowns: Array<Record<string, unknown>>;
+};
+
 type MissionExecution = {
   mission: Mission;
   task: MissionTask | null;
@@ -1503,6 +1542,11 @@ export default function CommandCenter() {
   const [hostCommandDraft, setHostCommandDraft] = useState("");
   const [webUrlDraft, setWebUrlDraft] = useState("");
   const [webFetchResult, setWebFetchResult] = useState<ToolRunResult | null>(null);
+  const [browserHandoff, setBrowserHandoff] = useState<BrowserHandoff | null>(null);
+  const [internetObservability, setInternetObservability] =
+    useState<InternetObservability | null>(null);
+  const [internetSmokeResult, setInternetSmokeResult] = useState<ToolRunResult | null>(null);
+  const [internetSmokeBusy, setInternetSmokeBusy] = useState(false);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [maxTokens, setMaxTokens] = useState(DEFAULT_MAX_TOKENS);
   const [busy, setBusy] = useState(false);
@@ -1626,36 +1670,46 @@ export default function CommandCenter() {
         autonomyJobRunData,
         routineData,
         operatorQueueData,
-        approvalData
+        approvalData,
+        handoffStatusData,
+        internetObservabilityData
       ] = await Promise.all([
-          api<RuntimeStatus>("/api/status"),
-          api<ConversationItem[]>("/api/conversations?limit=8"),
-          api<Mission[]>("/api/missions"),
-          api<ToolInfo[]>("/api/tools"),
-          api<MemoryItem[]>("/api/memory?limit=8"),
-          api<MemoryVault>("/api/memory/vault"),
-          api<FileItem[]>("/api/files?limit=8"),
-          api<AuditEntry[]>("/api/audit?limit=8"),
-          api<ModelCatalog>("/api/models"),
-          api<DispatcherStatus>("/api/dispatcher"),
-          api<TelemetrySnapshot>("/api/telemetry"),
-          api<HostBridgeStatus>("/api/host-bridge"),
-          api<AutonomyStatus>("/api/autonomy"),
-          api<RuntimePreferences>("/api/preferences"),
-          api<OperatorPersona>("/api/persona"),
-          api<AutonomyPolicy>("/api/autonomy/policy"),
-          api<DailyBriefing>("/api/briefing"),
-          api<BrowserPolicy>("/api/browser/policy"),
-          api<DockerPolicy>("/api/docker/policy"),
-          api<DockerContainers>("/api/docker/containers"),
-          api<RuntimeSecurity>("/api/runtime/security"),
-          api<QualityReport>("/api/operator/quality"),
-          api<AutonomyJob[]>("/api/autonomy/jobs"),
-          api<AutonomyJobRun[]>("/api/autonomy/job-runs?limit=8"),
-          api<Routine[]>("/api/routines"),
-          api<OperatorQueue>("/api/operator/queue"),
-          api<ApprovalItem[]>("/api/approvals?limit=8")
-        ]);
+        api<RuntimeStatus>("/api/status"),
+        api<ConversationItem[]>("/api/conversations?limit=8"),
+        api<Mission[]>("/api/missions"),
+        api<ToolInfo[]>("/api/tools"),
+        api<MemoryItem[]>("/api/memory?limit=8"),
+        api<MemoryVault>("/api/memory/vault"),
+        api<FileItem[]>("/api/files?limit=8"),
+        api<AuditEntry[]>("/api/audit?limit=8"),
+        api<ModelCatalog>("/api/models"),
+        api<DispatcherStatus>("/api/dispatcher"),
+        api<TelemetrySnapshot>("/api/telemetry"),
+        api<HostBridgeStatus>("/api/host-bridge"),
+        api<AutonomyStatus>("/api/autonomy"),
+        api<RuntimePreferences>("/api/preferences"),
+        api<OperatorPersona>("/api/persona"),
+        api<AutonomyPolicy>("/api/autonomy/policy"),
+        api<DailyBriefing>("/api/briefing"),
+        api<BrowserPolicy>("/api/browser/policy"),
+        api<DockerPolicy>("/api/docker/policy"),
+        api<DockerContainers>("/api/docker/containers"),
+        api<RuntimeSecurity>("/api/runtime/security"),
+        api<QualityReport>("/api/operator/quality"),
+        api<AutonomyJob[]>("/api/autonomy/jobs"),
+        api<AutonomyJobRun[]>("/api/autonomy/job-runs?limit=8"),
+        api<Routine[]>("/api/routines"),
+        api<OperatorQueue>("/api/operator/queue"),
+        api<ApprovalItem[]>("/api/approvals?limit=8"),
+        api<ToolRunResult>("/api/tools/browser.handoff.status/run", {
+          method: "POST",
+          body: JSON.stringify({ arguments: {} })
+        }),
+        api<ToolRunResult>("/api/tools/internet.observability/run", {
+          method: "POST",
+          body: JSON.stringify({ arguments: { limit: 120 } })
+        })
+      ]);
       setStatus(statusData);
       setConversations(conversationData);
       setMissions(missionData);
@@ -1690,6 +1744,16 @@ export default function CommandCenter() {
       setRoutines(routineData);
       setOperatorQueue(operatorQueueData);
       setApprovals(approvalData);
+      setBrowserHandoff(
+        handoffStatusData.ok
+          ? ((handoffStatusData.data.handoff as BrowserHandoff | null | undefined) ?? null)
+          : null
+      );
+      setInternetObservability(
+        internetObservabilityData.ok
+          ? (internetObservabilityData.data as unknown as InternetObservability)
+          : null
+      );
       if (statusData.health.length) {
         setDiagnostics(statusData.health);
       }
@@ -3449,9 +3513,137 @@ export default function CommandCenter() {
     }
   }
 
+  async function runInternetSmoke() {
+    if (internetSmokeBusy) return;
+    const url = webUrlDraft.trim() || "https://example.com/";
+    setActiveOperation({
+      title: "Интернет smoke",
+      detail: url
+    });
+    setInternetSmokeBusy(true);
+    try {
+      const result = await api<ToolRunResult>("/api/tools/internet.smoke/run", {
+        method: "POST",
+        body: JSON.stringify({
+          arguments: { url }
+        })
+      });
+      setInternetSmokeResult(result);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Интернет smoke не выполнен");
+    } finally {
+      setInternetSmokeBusy(false);
+      setActiveOperation(null);
+    }
+  }
+
   const webFetchText = typeof webFetchResult?.data.text === "string" ? webFetchResult.data.text : "";
   const webFetchStatus =
     typeof webFetchResult?.data.status_code === "number" ? webFetchResult.data.status_code : null;
+  const activeBrowserHandoff = browserHandoff ?? internetObservability?.handoff ?? null;
+  const internetSummary = internetObservability?.summary;
+  const internetTone =
+    activeBrowserHandoff || (internetSummary?.failed_runs ?? 0) > (internetSummary?.ok_runs ?? 0)
+      ? "warn"
+      : "ok";
+  const topInternetDomain = internetObservability?.top_domains?.[0];
+  const searchProviders = Object.keys(internetObservability?.search_providers ?? {}).join(", ");
+  const smokeChecks = Array.isArray(internetSmokeResult?.data.checks)
+    ? internetSmokeResult.data.checks.filter(
+        (item): item is { tool?: string; ok?: boolean; summary?: string } =>
+          typeof item === "object" && item !== null
+      )
+    : [];
+  const internetPanel = (
+    <div className="internetPanel">
+      <article className={`internetHero ${internetTone}`}>
+        <Globe size={17} />
+        <div>
+          <strong>Интернет</strong>
+          <p>
+            {activeBrowserHandoff
+              ? compactText(activeBrowserHandoff.reason ?? activeBrowserHandoff.url, 74)
+              : `${internetSummary?.ok_runs ?? 0} ok / ${internetSummary?.failed_runs ?? 0} fail`}
+          </p>
+        </div>
+        <button
+          className="iconText compact"
+          type="button"
+          onClick={runInternetSmoke}
+          disabled={internetSmokeBusy}
+          title="Запустить интернет smoke"
+          aria-label="Запустить интернет smoke"
+        >
+          {internetSmokeBusy ? <Loader2 className="spin" size={14} /> : <Play size={14} />}
+          <span>Smoke</span>
+        </button>
+      </article>
+      <div className="internetMetrics">
+        <div>
+          <span>Evidence</span>
+          <strong>{internetSummary?.evidence_records ?? 0}</strong>
+        </div>
+        <div>
+          <span>Research</span>
+          <strong>{internetSummary?.research_records ?? 0}</strong>
+        </div>
+        <div>
+          <span>Cooldown</span>
+          <strong>{internetSummary?.cooldowns ?? 0}</strong>
+        </div>
+        <div>
+          <span>Provider</span>
+          <strong>{searchProviders || "нет"}</strong>
+        </div>
+      </div>
+      {topInternetDomain && (
+        <div className="internetLine">
+          <Search size={14} />
+          <span>{topInternetDomain[0]}</span>
+          <strong>{topInternetDomain[1]}</strong>
+        </div>
+      )}
+      {activeBrowserHandoff && (
+        <article className="handoffCard">
+          <ShieldAlert size={15} />
+          <div>
+            <strong>{activeBrowserHandoff.status ?? "handoff"}</strong>
+            <p>{compactText(activeBrowserHandoff.title ?? activeBrowserHandoff.url, 90)}</p>
+            {activeBrowserHandoff.instruction && (
+              <small>{compactText(activeBrowserHandoff.instruction, 120)}</small>
+            )}
+          </div>
+        </article>
+      )}
+      {internetSmokeResult && (
+        <div className={`smokeSummary ${internetSmokeResult.ok ? "ok" : "warn"}`}>
+          <ShieldCheck size={15} />
+          <span>{internetSmokeResult.summary}</span>
+        </div>
+      )}
+      {smokeChecks.length > 0 && (
+        <div className="smokeChecks">
+          {smokeChecks.map((check) => (
+            <div className={check.ok ? "ok" : "warn"} key={check.tool ?? check.summary}>
+              {check.ok ? <CheckCircle2 size={13} /> : <ShieldAlert size={13} />}
+              <span>{check.tool}</span>
+            </div>
+          ))}
+        </div>
+      )}
+      {(internetObservability?.blocked_recent?.length ?? 0) > 0 && (
+        <div className="blockedList">
+          {internetObservability?.blocked_recent.slice(0, 3).map((item, index) => (
+            <div key={`${item.tool ?? "blocked"}-${index}`}>
+              <strong>{item.tool ?? "web"}</strong>
+              <span>{compactText(item.summary, 88)}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
   const vitalsPanel = (
     <div className="vitalsPanel">
       <article className={`vitalHero ${llmReady ? "ok" : "warn"}`}>
@@ -4245,6 +4437,11 @@ export default function CommandCenter() {
                   {chatSideTab === "status" && (
                     <>
                       {vitalsPanel}
+                      <div className="panelHeader compact" id="internet">
+                        <h2>Интернет</h2>
+                        <span>{internetSummary ? `${internetSummary.ok_runs}/${internetSummary.failed_runs}` : "..."}</span>
+                      </div>
+                      {internetPanel}
                       <div className="panelHeader compact" id="health">
                         <h2>Диагностика</h2>
                         <span>{diagnostics.length}</span>

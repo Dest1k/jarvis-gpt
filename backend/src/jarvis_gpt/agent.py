@@ -153,7 +153,9 @@ WEB_SYNTHESIS_PROMPT = (
 MISSION_EXECUTOR_PROMPT = (
     "Ты исполняешь ОДИН шаг миссии как автономный агент, а не пишешь план. Используй "
     "доступные инструменты, чтобы реально продвинуть шаг: собери данные, проверь систему, "
-    "прочитай файлы, посмотри статус. Не выдумывай результаты — опирайся на observation "
+    "прочитай файлы, посмотри статус. Для интернет-шагов предпочитай web.research, "
+    "web.extract, web.verify и web.document.read, чтобы получить источники и citations. "
+    "Не выдумывай результаты — опирайся на observation "
     "инструментов. Опасные действия автономно недоступны и станут approval-гейтом; в этом "
     "случае честно скажи, что шаг требует подтверждения оператора. В конце дай краткий "
     "отчёт по-русски: что фактически сделано, что подтверждено инструментами и что осталось."
@@ -3253,7 +3255,8 @@ class AgentRuntime:
             [
                 (
                     "- durable_capabilities: memory search/save, file ingestion/search, "
-                    "mission planning/execution, learning journal/tick, web.search/web.fetch, "
+                    "mission planning/execution, learning journal/tick, "
+                    "web.search/web.fetch/web.research/web.verify/web.document.read, "
                     "telemetry, diagnostics, Docker/dispatcher inspection, host bridge gates."
                 ),
                 (

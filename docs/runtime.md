@@ -1,5 +1,26 @@
 # Runtime
 
+## 2026-07-10 handoff - internet production surface
+
+For the operator and the second model:
+
+- Prefer `web.research` for current internet answers that need sources. It runs
+  search -> fetch/render fallback -> extract -> verify, returns a report plus
+  citations, and keeps recent records in `web.research.records`.
+- Use `web.document.read` for downloaded web documents. It only reads Jarvis
+  quarantine downloads, extracts bounded text, stores a new evidence id, and
+  does not open or execute the file. Oversized files and oversized Office ZIP
+  members are refused/skipped.
+- Use `internet.observability` to inspect web/browser health: recent ok/failed
+  runs, blocked-page summaries, evidence/research counts, rate cooldowns,
+  search providers, top domains, and active `browser.handoff.status`.
+- Use `internet.smoke` for a live non-mutating check of the internet stack. It
+  checks Chrome CDP status, browser handoff, `web.fetch`, `web.extract`,
+  `web.verify`, and returns an observability snapshot.
+- Command Center -> status now includes the internet panel with handoff,
+  observability metrics, recent blocked summaries, top domain/provider, and a
+  smoke button.
+
 ## 2026-07-10 handoff - internet surfing quality
 
 For the operator and the second model:

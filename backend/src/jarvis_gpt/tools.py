@@ -119,10 +119,13 @@ POTENTIALLY_EXECUTABLE_CONTENT_TYPES = {
 }
 WEB_EVIDENCE_KEY = "web.evidence.records"
 WEB_HANDOFF_KEY = "browser.handoff.current"
+WEB_RESEARCH_KEY = "web.research.records"
 WEB_RATE_KEY_PREFIX = "web.rate."
 WEB_RATE_WINDOW_SEC = 600
 WEB_RATE_MAX_REQUESTS = 12
 WEB_RATE_BLOCKED_COOLDOWN_SEC = 900
+WEB_DOCUMENT_READ_MAX_BYTES = 50_000_000
+WEB_DOCUMENT_ZIP_MEMBER_MAX_BYTES = 2_000_000
 WEB_VERIFY_STOPWORDS = {
     "a",
     "an",
@@ -750,6 +753,23 @@ class ToolRegistry:
         )
         self.add(
             ToolSpec(
+                name="web.research",
+                description=(
+                    "Run a source-backed internet research pipeline: search, fetch/render, "
+                    "extract, verify, and return citation-grade evidence."
+                ),
+                category="web",
+                input_schema={
+                    "query": "Search query or research question",
+                    "claim": "Optional concrete claim to verify",
+                    "max_sources": "Maximum sources to inspect",
+                    "render_fallback": "Try web.render when web.fetch is blocked/thin",
+                },
+                handler=_web_research,
+            )
+        )
+        self.add(
+            ToolSpec(
                 name="web.verify",
                 description=(
                     "Check a claim against saved evidence, supplied URLs, or a search query "
@@ -763,6 +783,23 @@ class ToolRegistry:
                     "urls": "Optional public URLs to fetch and compare",
                 },
                 handler=_web_verify,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="web.document.read",
+                description=(
+                    "Safely read text from a quarantined web download, evidence id, or URL "
+                    "without opening/executing the file."
+                ),
+                category="web",
+                input_schema={
+                    "path": "Path under Jarvis quarantine downloads",
+                    "evidence_id": "Download evidence id with quarantine path",
+                    "url": "Optional public URL to download into quarantine first",
+                    "max_chars": "Maximum extracted text characters",
+                },
+                handler=_web_document_read,
             )
         )
         self.add(
@@ -822,6 +859,29 @@ class ToolRegistry:
                     "wait_ms": "Virtual time budget for page scripts",
                 },
                 handler=_web_render,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="internet.observability",
+                description=(
+                    "Summarize recent internet tool health, evidence, blockers, and handoffs."
+                ),
+                category="web",
+                input_schema={"limit": "Recent tool runs to inspect"},
+                handler=_internet_observability,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="internet.smoke",
+                description=(
+                    "Run a non-mutating live internet smoke check: web fetch/extract/verify, "
+                    "Chrome CDP status, handoff status, and observability snapshot."
+                ),
+                category="web",
+                input_schema={"url": "Public URL for smoke check, default https://example.com/"},
+                handler=_internet_smoke,
             )
         )
         self.add(
@@ -1913,6 +1973,122 @@ async def _web_extract(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespons
     )
 
 
+async def _web_research(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    query = " ".join(str(args.get("query") or "").split())
+    claim = " ".join(str(args.get("claim") or "").split())
+    if not query and not claim:
+        return ToolRunResponse(tool="web.research", ok=False, summary="Query or claim is required.")
+    if not query:
+        query = claim
+    max_sources = _int_arg(args.get("max_sources"), default=4, minimum=1, maximum=8)
+    render_fallback = bool(args.get("render_fallback", True))
+    search = await _web_search(ctx, {"query": query, "limit": max(4, max_sources)})
+    steps: list[dict[str, Any]] = [
+        {"tool": "web.search", "ok": search.ok, "summary": search.summary}
+    ]
+    if not search.ok:
+        return ToolRunResponse(
+            tool="web.research",
+            ok=False,
+            summary=f"Research search failed: {search.summary}",
+            data={"query": query, "steps": steps, "search": search.data},
+        )
+
+    sources: list[dict[str, Any]] = []
+    evidence_ids: list[str] = []
+    for result in _search_results_for_tools(search)[:max_sources]:
+        fetched = await _web_fetch(ctx, {"url": result["url"], "max_chars": 9000})
+        fetched_text = (
+            str(fetched.data.get("text") or "") if isinstance(fetched.data, dict) else ""
+        )
+        content_type = str(fetched.data.get("content_type") or "").lower()
+        should_render = render_fallback and (
+            not fetched.ok
+            or (len(fetched_text) < 600 and ("html" in content_type or not content_type))
+        )
+        if should_render:
+            rendered = await _web_render(
+                ctx,
+                {"url": result["url"], "max_chars": 9000, "wait_ms": 2500},
+            )
+            steps.append({"tool": "web.render", "ok": rendered.ok, "summary": rendered.summary})
+            if rendered.ok and str(rendered.data.get("text") or "").strip():
+                fetched = rendered
+                fetched_text = str(rendered.data.get("text") or "")
+        steps.append(
+            {
+                "tool": fetched.tool,
+                "ok": fetched.ok,
+                "summary": fetched.summary,
+                "url": result["url"],
+            }
+        )
+        evidence_id = str(fetched.data.get("evidence_id") or "")
+        if evidence_id:
+            evidence_ids.append(evidence_id)
+        extraction: dict[str, Any] | None = None
+        if evidence_id:
+            extracted = await _web_extract(ctx, {"evidence_id": evidence_id, "kind": "auto"})
+            steps.append(
+                {"tool": "web.extract", "ok": extracted.ok, "summary": extracted.summary}
+            )
+            if extracted.ok and isinstance(extracted.data.get("extraction"), dict):
+                extraction = extracted.data["extraction"]
+        source = {
+            "rank": result.get("rank"),
+            "title": result.get("title"),
+            "url": result.get("url"),
+            "snippet": result.get("snippet"),
+            "fetched": fetched.ok,
+            "tool": fetched.tool,
+            "evidence_id": evidence_id or None,
+            "excerpt": _short_text(fetched_text or str(result.get("snippet") or ""), 900),
+            "quality": _web_source_quality(str(result.get("url") or ""), fetched=fetched.ok),
+            "extraction": _compact_extraction(extraction),
+        }
+        sources.append(source)
+
+    verification = await _web_verify(
+        ctx,
+        {"claim": claim or query, "evidence_ids": evidence_ids[:8]},
+    )
+    steps.append({"tool": "web.verify", "ok": verification.ok, "summary": verification.summary})
+    verification_data = (
+        verification.data.get("verification")
+        if verification.ok and isinstance(verification.data, dict)
+        else None
+    )
+    report = _format_tool_research_report(
+        query=query,
+        claim=claim,
+        sources=sources,
+        verification=verification_data if isinstance(verification_data, dict) else {},
+    )
+    record = _store_web_research_record(
+        ctx.storage,
+        query=query,
+        claim=claim,
+        sources=sources,
+        verification=verification_data if isinstance(verification_data, dict) else {},
+        report=report,
+    )
+    return ToolRunResponse(
+        tool="web.research",
+        ok=bool(sources),
+        summary=f"Internet research inspected {len(sources)} source(s).",
+        data={
+            "id": record["id"],
+            "query": query,
+            "claim": claim or None,
+            "report": report,
+            "sources": sources,
+            "citations": _research_citations(sources),
+            "verification": verification_data,
+            "steps": steps,
+        },
+    )
+
+
 async def _web_verify(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     claim = " ".join(str(args.get("claim") or "").split())
     query = " ".join(str(args.get("query") or "").split())
@@ -1974,6 +2150,112 @@ async def _web_verify(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
             "query": query or None,
             "verification": verification,
             "sources": _verification_source_payload(sources),
+        },
+    )
+
+
+async def _web_document_read(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    raw_path = str(args.get("path") or "").strip()
+    evidence_id = str(args.get("evidence_id") or "").strip()
+    raw_url = str(args.get("url") or "").strip()
+    max_chars = _int_arg(args.get("max_chars"), default=12000, minimum=512, maximum=50000)
+    source_url = raw_url
+    if raw_url and not raw_path:
+        downloaded = await _web_download(ctx, {"url": raw_url, "max_bytes": 25_000_000})
+        if not downloaded.ok:
+            return ToolRunResponse(
+                tool="web.document.read",
+                ok=False,
+                summary=f"Download failed before document read: {downloaded.summary}",
+                data={"download": downloaded.data},
+            )
+        raw_path = str(downloaded.data.get("path") or "")
+        evidence_id = str(downloaded.data.get("evidence_id") or evidence_id)
+    if evidence_id and not raw_path:
+        record = _get_web_evidence(ctx.storage, evidence_id)
+        if record is None:
+            return ToolRunResponse(
+                tool="web.document.read",
+                ok=False,
+                summary="Evidence not found.",
+            )
+        source_url = str(record.get("url") or source_url)
+        extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
+        raw_path = str(extra.get("path") or "")
+    if not raw_path:
+        return ToolRunResponse(
+            tool="web.document.read",
+            ok=False,
+            summary="A quarantine path, evidence_id, or URL is required.",
+        )
+    try:
+        path = _resolve_allowed_path(ctx.settings, raw_path)
+    except ValueError as exc:
+        return ToolRunResponse(tool="web.document.read", ok=False, summary=str(exc))
+    quarantine_root = (ctx.settings.cache_dir / "downloads").resolve(strict=False)
+    try:
+        path.relative_to(quarantine_root)
+    except ValueError:
+        return ToolRunResponse(
+            tool="web.document.read",
+            ok=False,
+            summary="Only files under Jarvis quarantine downloads can be read.",
+            data={"path": str(path), "quarantine_root": str(quarantine_root)},
+        )
+    if not path.exists() or not path.is_file():
+        return ToolRunResponse(
+            tool="web.document.read",
+            ok=False,
+            summary="Quarantine file does not exist.",
+            data={"path": str(path)},
+        )
+    file_size = path.stat().st_size
+    if file_size > WEB_DOCUMENT_READ_MAX_BYTES:
+        return ToolRunResponse(
+            tool="web.document.read",
+            ok=False,
+            summary="Quarantine file is too large for safe document reading.",
+            data={
+                "path": str(path),
+                "size": file_size,
+                "max_bytes": WEB_DOCUMENT_READ_MAX_BYTES,
+            },
+        )
+    inspection = _inspect_quarantine_file(path)
+    text, document = _read_quarantine_document_text(path, max_chars=max_chars)
+    safety = _web_content_safety(
+        source="web.document.read",
+        url=source_url or str(path),
+        text=text,
+    )
+    evidence = _store_web_evidence(
+        ctx.storage,
+        source="web.document.read",
+        url=source_url or str(path),
+        title=path.name,
+        text=text,
+        content_type=str(inspection["signature"]["mime_hint"]),
+        safety=safety,
+        confidence=0.66 if text.strip() else 0.2,
+        extra={"path": str(path), "document": document, "inspection": inspection},
+    )
+    return ToolRunResponse(
+        tool="web.document.read",
+        ok=bool(text.strip()),
+        summary=(
+            f"Read quarantined {document['kind']} document."
+            if text.strip()
+            else f"Could not extract text from quarantined {document['kind']} document."
+        ),
+        data={
+            "path": str(path),
+            "source_url": source_url or None,
+            "text": text,
+            "truncated": document["truncated"],
+            "document": document,
+            "inspection": inspection,
+            "safety": safety,
+            "evidence_id": evidence["id"],
         },
     )
 
@@ -2534,6 +2816,62 @@ async def _web_render(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespons
             "stderr": str(result.get("stderr") or "")[:1000],
             "safety": safety,
             "evidence_id": evidence["id"],
+        },
+    )
+
+
+async def _internet_observability(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    limit = _int_arg(args.get("limit"), default=120, minimum=10, maximum=300)
+    snapshot = _internet_observability_snapshot(ctx.storage, limit=limit)
+    return ToolRunResponse(
+        tool="internet.observability",
+        ok=True,
+        summary=(
+            "Internet observability snapshot: "
+            f"{snapshot['summary']['ok_runs']} ok / {snapshot['summary']['failed_runs']} failed."
+        ),
+        data=snapshot,
+    )
+
+
+async def _internet_smoke(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    url = str(args.get("url") or "https://example.com/").strip()
+    checks: list[dict[str, Any]] = []
+    chrome = await _browser_chrome_status(ctx, {"debug_url": DEFAULT_CHROME_DEBUG_URL})
+    checks.append(_smoke_check("browser.chrome.status", chrome))
+    handoff = _browser_handoff_status(ctx, {})
+    checks.append(_smoke_check("browser.handoff.status", handoff))
+    fetched = await _web_fetch(ctx, {"url": url, "max_chars": 4000})
+    checks.append(_smoke_check("web.fetch", fetched))
+    extracted = await _web_extract(ctx, {"url": url, "kind": "auto"})
+    checks.append(_smoke_check("web.extract", extracted))
+    evidence_id = ""
+    if isinstance(extracted.data.get("source"), dict):
+        evidence_id = str(extracted.data["source"].get("evidence_id") or "")
+    verified = await _web_verify(
+        ctx,
+        {
+            "claim": f"Smoke page is reachable at {url}",
+            "evidence_ids": [evidence_id] if evidence_id else [],
+            "urls": [] if evidence_id else [url],
+        },
+    )
+    checks.append(_smoke_check("web.verify", verified))
+    observability = _internet_observability_snapshot(ctx.storage, limit=120)
+    required_ok = all(
+        item["ok"]
+        for item in checks
+        if item["tool"] in {"web.fetch", "web.extract", "web.verify"}
+    )
+    return ToolRunResponse(
+        tool="internet.smoke",
+        ok=required_ok,
+        summary="Internet smoke check passed." if required_ok else "Internet smoke check has gaps.",
+        data={
+            "url": url,
+            "checks": checks,
+            "observability": observability,
+            "chrome_required": False,
         },
     )
 
@@ -3716,6 +4054,50 @@ def _get_web_evidence(storage: JarvisStorage, evidence_id: str) -> dict[str, Any
     return None
 
 
+def _search_results_for_tools(search: ToolRunResponse) -> list[dict[str, Any]]:
+    if not isinstance(search.data, dict):
+        return []
+    return [
+        item
+        for item in search.data.get("results", [])
+        if isinstance(item, dict) and item.get("url")
+    ][:12]
+
+
+def _store_web_research_record(
+    storage: JarvisStorage,
+    *,
+    query: str,
+    claim: str,
+    sources: list[dict[str, Any]],
+    verification: dict[str, Any],
+    report: str,
+) -> dict[str, Any]:
+    record = {
+        "id": new_id("research"),
+        "created_at": utc_now(),
+        "query": query,
+        "claim": claim or None,
+        "sources": sources[:12],
+        "verification": verification,
+        "report": report,
+    }
+    records = storage.get_runtime_value(WEB_RESEARCH_KEY, [])
+    if not isinstance(records, list):
+        records = []
+    storage.set_runtime_value(WEB_RESEARCH_KEY, [record, *records][:100])
+    return record
+
+
+def _short_text(value: Any, limit: int) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    if limit <= 3:
+        return text[: max(0, limit)]
+    return f"{text[: limit - 3].rstrip()}..."
+
+
 def _web_rate_limit_block(storage: JarvisStorage, url: str) -> dict[str, Any] | None:
     domain = _url_domain(url)
     if not domain:
@@ -4234,6 +4616,325 @@ def _verification_source_payload(sources: list[dict[str, Any]]) -> list[dict[str
             }
         )
     return payload
+
+
+def _compact_extraction(extraction: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not extraction:
+        return None
+    compact = {
+        "kind": extraction.get("kind"),
+        "titles": extraction.get("title_candidates", [])[:3],
+        "prices": extraction.get("prices", [])[:5],
+        "dates": extraction.get("dates", [])[:5],
+        "availability": extraction.get("availability_markers", [])[:5],
+    }
+    metadata = extraction.get("metadata") if isinstance(extraction.get("metadata"), dict) else {}
+    if metadata:
+        compact["metadata_title"] = metadata.get("title")
+        compact["canonical"] = metadata.get("canonical")
+    schema = extraction.get("schema") if isinstance(extraction.get("schema"), dict) else {}
+    if schema:
+        compact["schema_types"] = schema.get("types", [])[:8]
+    return compact
+
+
+def _web_source_quality(url: str, *, fetched: bool) -> str:
+    host = _url_domain(url)
+    if not fetched:
+        return "snippet-only"
+    if host.endswith((".gov", ".edu", ".int")):
+        return "primary-official"
+    if any(part in host for part in ("docs.", "developer.", "support.", "learn.")):
+        return "vendor-docs"
+    if host in {"github.com", "python.org"} or host.endswith(
+        (".python.org", ".openai.com", ".microsoft.com", ".nvidia.com", ".google.com")
+    ):
+        return "primary-or-vendor"
+    if any(part in host for part in ("reddit.", "x.com", "twitter.", "t.me", "telegram.")):
+        return "community-or-social"
+    return "web-source"
+
+
+def _research_citations(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    citations = []
+    for index, source in enumerate(sources, start=1):
+        url = str(source.get("url") or "")
+        if not url:
+            continue
+        citations.append(
+            {
+                "id": str(index),
+                "title": source.get("title") or url,
+                "url": url,
+                "evidence_id": source.get("evidence_id"),
+                "quality": source.get("quality"),
+            }
+        )
+    return citations
+
+
+def _format_tool_research_report(
+    *,
+    query: str,
+    claim: str,
+    sources: list[dict[str, Any]],
+    verification: dict[str, Any],
+) -> str:
+    lines = [f"Query: {query}"]
+    if claim:
+        lines.append(f"Claim: {claim}")
+    if verification:
+        lines.append(
+            "Verification: "
+            f"{verification.get('verdict', 'unknown')} "
+            f"(confidence {verification.get('confidence', 0)})."
+        )
+        missing = verification.get("missing_terms")
+        if isinstance(missing, list) and missing:
+            lines.append(f"Missing terms: {', '.join(str(item) for item in missing[:10])}.")
+    lines.append("Sources:")
+    for index, source in enumerate(sources, start=1):
+        title = _short_text(source.get("title") or source.get("url"), 140)
+        url = source.get("url")
+        evidence_id = source.get("evidence_id") or "no-evidence-id"
+        quality = source.get("quality") or "unknown"
+        lines.append(f"[{index}] {title} - {url} ({quality}, {evidence_id})")
+        excerpt = _short_text(source.get("excerpt"), 280)
+        if excerpt:
+            lines.append(f"    {excerpt}")
+    return "\n".join(lines)
+
+
+def _read_quarantine_document_text(path: Path, *, max_chars: int) -> tuple[str, dict[str, Any]]:
+    data = path.read_bytes()
+    suffix = path.suffix.lower()
+    signature = _file_signature(data)
+    warnings: list[str] = []
+    kind = signature["kind"] if signature["kind"] != "unknown" else suffix.lstrip(".") or "unknown"
+    text = ""
+    method = "none"
+    if _looks_textual_document(path, signature["mime_hint"]):
+        text = _decode_document_bytes(data)
+        if suffix in {".html", ".htm"} or "<html" in text[:1000].lower():
+            text = _html_to_text(text)
+            method = "html-text"
+        else:
+            method = "plain-text"
+    elif suffix == ".docx" and zipfile.is_zipfile(path):
+        text = _read_docx_text(path)
+        method = "docx-xml"
+    elif suffix == ".xlsx" and zipfile.is_zipfile(path):
+        text = _read_xlsx_text(path)
+        method = "xlsx-xml"
+    elif signature["kind"] == "pdf" or suffix == ".pdf":
+        text = _extract_pdf_text_basic(data)
+        method = "pdf-basic"
+        if not text.strip():
+            warnings.append("PDF text extraction is basic; scanned/compressed PDFs may need OCR.")
+    elif zipfile.is_zipfile(path):
+        warnings.append("Generic ZIP archives are listed by web.download.inspect, not auto-read.")
+        kind = "zip"
+    truncated = len(text) > max_chars
+    if truncated:
+        text = text[:max_chars].rstrip()
+    return text, {
+        "kind": kind,
+        "method": method,
+        "truncated": truncated,
+        "warnings": warnings,
+        "chars": len(text),
+    }
+
+
+def _looks_textual_document(path: Path, mime_hint: str) -> bool:
+    suffix = path.suffix.lower()
+    return (
+        suffix in {".txt", ".md", ".csv", ".tsv", ".json", ".xml", ".html", ".htm", ".log"}
+        or mime_hint.startswith("text/")
+        or mime_hint in {"application/json", "application/xml"}
+    )
+
+
+def _decode_document_bytes(data: bytes) -> str:
+    for encoding in ("utf-8", "utf-16", "cp1251", "latin1"):
+        try:
+            return _repair_mojibake(data.decode(encoding))
+        except UnicodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def _read_docx_text(path: Path) -> str:
+    with zipfile.ZipFile(path) as archive:
+        xml = _read_zip_text_member(archive, "word/document.xml")
+        if not xml:
+            return ""
+    xml = re.sub(r"</w:p>", "\n", xml)
+    xml = re.sub(r"</w:tab>", "\t", xml)
+    return _html_to_text(xml).replace("\t ", "\t").strip()
+
+
+def _read_xlsx_text(path: Path) -> str:
+    texts: list[str] = []
+    total_chars = 0
+    with zipfile.ZipFile(path) as archive:
+        for name in archive.namelist():
+            if name == "xl/sharedStrings.xml" or name.startswith("xl/worksheets/"):
+                xml = _read_zip_text_member(archive, name)
+                text = _html_to_text(xml)
+                if text:
+                    texts.append(text)
+                    total_chars += len(text)
+            if len(texts) >= 20:
+                break
+            if total_chars >= WEB_DOCUMENT_ZIP_MEMBER_MAX_BYTES:
+                break
+    return "\n".join(texts)
+
+
+def _read_zip_text_member(archive: zipfile.ZipFile, name: str) -> str:
+    try:
+        info = archive.getinfo(name)
+    except KeyError:
+        return ""
+    if info.file_size > WEB_DOCUMENT_ZIP_MEMBER_MAX_BYTES:
+        return ""
+    with archive.open(info) as member:
+        data = member.read(WEB_DOCUMENT_ZIP_MEMBER_MAX_BYTES + 1)
+    if len(data) > WEB_DOCUMENT_ZIP_MEMBER_MAX_BYTES:
+        return ""
+    return data.decode("utf-8", errors="replace")
+
+
+def _extract_pdf_text_basic(data: bytes) -> str:
+    raw = data.decode("latin1", errors="ignore")
+    parts: list[str] = []
+    for match in re.finditer(r"\((?P<text>(?:\\.|[^\\()]){2,})\)\s*T[Jj]", raw):
+        text = _pdf_unescape(match.group("text"))
+        if _pdf_text_is_useful(text):
+            parts.append(text)
+        if len(parts) >= 400:
+            break
+    if not parts:
+        for match in re.finditer(r"\((?P<text>(?:\\.|[^\\()]){4,})\)", raw):
+            text = _pdf_unescape(match.group("text"))
+            if _pdf_text_is_useful(text):
+                parts.append(text)
+            if len(parts) >= 400:
+                break
+    return _repair_mojibake(" ".join(parts))
+
+
+def _pdf_unescape(value: str) -> str:
+    value = re.sub(r"\\([()\\])", r"\1", value)
+    value = re.sub(
+        r"\\([0-7]{1,3})",
+        lambda match: chr(int(match.group(1), 8)),
+        value,
+    )
+    return value.replace("\\n", "\n").replace("\\r", "\n").replace("\\t", "\t")
+
+
+def _pdf_text_is_useful(value: str) -> bool:
+    clean = " ".join(value.split())
+    if len(clean) < 3:
+        return False
+    printable = sum(1 for char in clean if char.isprintable())
+    return printable / max(1, len(clean)) > 0.85 and any(ch.isalnum() for ch in clean)
+
+
+def _internet_observability_snapshot(storage: JarvisStorage, *, limit: int) -> dict[str, Any]:
+    runs = storage.list_tool_runs(limit=limit)
+    web_runs = [
+        item
+        for item in runs
+        if str(item.get("tool") or "").startswith(("web.", "browser.", "internet."))
+    ]
+    by_tool: dict[str, dict[str, int]] = {}
+    blocked: list[dict[str, Any]] = []
+    providers: dict[str, int] = {}
+    domains: dict[str, int] = {}
+    for run in web_runs:
+        tool = str(run.get("tool") or "unknown")
+        bucket = by_tool.setdefault(tool, {"ok": 0, "failed": 0})
+        if run.get("ok"):
+            bucket["ok"] += 1
+        else:
+            bucket["failed"] += 1
+        data = run.get("data") if isinstance(run.get("data"), dict) else {}
+        source = data.get("source")
+        if tool == "web.search" and source:
+            providers[str(source)] = providers.get(str(source), 0) + 1
+        url = str(data.get("url") or data.get("requested_url") or "")
+        domain = _url_domain(url)
+        if domain:
+            domains[domain] = domains.get(domain, 0) + 1
+        summary = str(run.get("summary") or "")
+        if _summary_looks_blocked(summary):
+            blocked.append(
+                {
+                    "tool": tool,
+                    "summary": summary,
+                    "url": url,
+                    "created_at": run.get("created_at") or run.get("ts"),
+                }
+            )
+    evidence = storage.get_runtime_value(WEB_EVIDENCE_KEY, [])
+    research = storage.get_runtime_value(WEB_RESEARCH_KEY, [])
+    handoff = storage.get_runtime_value(WEB_HANDOFF_KEY, None)
+    rates = [
+        item
+        for item in storage.list_runtime_values(prefix=WEB_RATE_KEY_PREFIX)
+        if isinstance(item.get("value"), dict)
+    ]
+    cooldowns = [
+        item
+        for item in rates
+        if float((item.get("value") or {}).get("cooldown_until") or 0) > _epoch_seconds()
+    ]
+    return {
+        "summary": {
+            "total_runs": len(web_runs),
+            "ok_runs": sum(1 for item in web_runs if item.get("ok")),
+            "failed_runs": sum(1 for item in web_runs if not item.get("ok")),
+            "evidence_records": len(evidence) if isinstance(evidence, list) else 0,
+            "research_records": len(research) if isinstance(research, list) else 0,
+            "rate_domains": len(rates),
+            "cooldowns": len(cooldowns),
+        },
+        "by_tool": by_tool,
+        "search_providers": providers,
+        "top_domains": sorted(domains.items(), key=lambda item: item[1], reverse=True)[:12],
+        "blocked_recent": blocked[:12],
+        "handoff": handoff if isinstance(handoff, dict) else None,
+        "cooldowns": cooldowns[:12],
+    }
+
+
+def _summary_looks_blocked(summary: str) -> bool:
+    lowered = summary.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "blocked",
+            "captcha",
+            "human verification",
+            "rate",
+            "cooldown",
+            "403",
+            "429",
+            "доступ запрещ",
+        )
+    )
+
+
+def _smoke_check(tool: str, result: ToolRunResponse) -> dict[str, Any]:
+    return {
+        "tool": tool,
+        "ok": result.ok,
+        "summary": result.summary,
+        "data": result.data,
+    }
 
 
 def _content_length(value: str | None) -> int | None:

@@ -702,6 +702,180 @@ h3 {
   font-size: 11px;
 }
 
+.internetPanel {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+}
+
+.internetHero,
+.handoffCard,
+.smokeSummary,
+.internetLine {
+  display: grid;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.internetHero {
+  grid-template-columns: 22px minmax(0, 1fr) auto;
+  min-height: 52px;
+  padding: 9px;
+}
+
+.internetHero.ok {
+  border-color: rgba(40, 199, 183, 0.32);
+}
+
+.internetHero.warn,
+.handoffCard,
+.smokeSummary.warn {
+  border-color: rgba(225, 173, 82, 0.42);
+}
+
+.internetHero svg,
+.internetLine svg,
+.smokeSummary svg {
+  color: var(--teal);
+}
+
+.internetHero strong,
+.internetHero p,
+.internetMetrics strong,
+.internetLine span,
+.handoffCard strong,
+.handoffCard p,
+.handoffCard small,
+.smokeSummary span,
+.blockedList span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.internetHero p,
+.handoffCard p,
+.handoffCard small,
+.blockedList span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.internetMetrics {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.internetMetrics div {
+  min-width: 0;
+  padding: 9px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+
+.internetMetrics span {
+  display: block;
+  margin-bottom: 3px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.internetLine {
+  grid-template-columns: 16px minmax(0, 1fr) auto;
+  min-height: 32px;
+  padding: 7px 9px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.internetLine strong {
+  color: var(--ink);
+}
+
+.handoffCard {
+  grid-template-columns: 16px minmax(0, 1fr);
+  align-items: start;
+  padding: 9px;
+}
+
+.handoffCard svg {
+  margin-top: 2px;
+  color: var(--amber);
+}
+
+.handoffCard small {
+  display: block;
+  margin-top: 3px;
+  white-space: normal;
+}
+
+.smokeSummary {
+  grid-template-columns: 16px minmax(0, 1fr);
+  min-height: 32px;
+  padding: 7px 9px;
+  font-size: 11px;
+}
+
+.smokeSummary.ok {
+  border-color: rgba(40, 199, 183, 0.28);
+}
+
+.smokeChecks,
+.blockedList {
+  display: grid;
+  gap: 5px;
+}
+
+.smokeChecks {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.smokeChecks div,
+.blockedList div {
+  display: grid;
+  align-items: center;
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+
+.smokeChecks div {
+  grid-template-columns: 14px minmax(0, 1fr);
+  gap: 5px;
+  min-height: 28px;
+  padding: 5px 7px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.smokeChecks div.ok svg {
+  color: var(--teal);
+}
+
+.smokeChecks div.warn svg {
+  color: var(--amber);
+}
+
+.blockedList div {
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 8px;
+  min-height: 30px;
+  padding: 6px 8px;
+  font-size: 11px;
+}
+
+.blockedList strong {
+  color: var(--amber);
+}
+
 .sideTabs {
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));

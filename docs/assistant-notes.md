@@ -9,6 +9,32 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-10 - Codex (internet production surface)
+
+- Added safe `web.research`: one call now searches, fetches, optionally renders,
+  extracts, verifies, returns a source-backed report, citations, verification,
+  and stores recent research in runtime key `web.research.records`.
+- Added safe `web.document.read` for quarantined web downloads/evidence/URLs. It
+  only reads files under Jarvis download quarantine, extracts bounded text from
+  txt/md/csv/json/html/docx/xlsx/pdf-like payloads, saves fresh evidence, and
+  never opens or executes the file. It refuses oversized files and caps ZIP/XML
+  member reads for Office documents.
+- Added safe `internet.observability` and `internet.smoke`. Observability
+  summarizes recent web/browser/internet tool health, blocked pages, evidence,
+  research records, rate cooldowns, top domains, search providers, and current
+  browser handoff. Smoke checks Chrome status, handoff status, fetch, extract,
+  verify, and returns a live internet health snapshot.
+- Command Center status panel now shows internet handoff/observability metrics,
+  recent blocked summaries, top domain/provider, and a smoke button using the
+  current web URL draft or `https://example.com/`.
+- Agent mission/tool guidance now explicitly prefers `web.research`,
+  `web.extract`, `web.verify`, and `web.document.read` for internet tasks that
+  need source-backed evidence.
+- Verified: `pytest -q backend\tests --tb=short` (230 pass), backend
+  `ruff check backend\src\jarvis_gpt backend\tests --output-format=concise`,
+  `python -m compileall -q backend\src\jarvis_gpt`, frontend
+  `npm run typecheck`, and frontend `npm run build`.
+
 ### 2026-07-10 - Codex (internet surfing quality)
 
 - Browser action tools now accept semantic `target` hints in addition to CSS

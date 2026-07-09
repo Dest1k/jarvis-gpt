@@ -176,6 +176,11 @@ docker compose --profile llm up -d dispatcher
 
 ## Current readiness
 
+- Internet production surface: `web.research`, `web.document.read`,
+  `internet.observability`, and `internet.smoke` are safe tools. Command Center
+  status shows internet handoff, evidence/research counts, recent blocked pages,
+  cooldowns, top domain/provider, and can run a smoke check from the web URL
+  draft.
 - Unified launcher `.\jarvis.cmd` provides keyboard-menu start/stop/restart/status/logs/doctor/open flows plus `gemma4-turbo` and `gemma4-mono` startup shortcuts.
 - Experience API persists operator preferences, autonomy policy, daily briefing, self-heal reports and benchmark history in SQLite.
 - Operator persona (`/api/persona`) is a first-class understanding layer: the agent injects it into every LLM turn, uses `location` as the generic place fallback (weather/local/geo) instead of a weather-only cache, and surfaces `current_focus` in the daily briefing. Editable from Command Center → «Профиль оператора» and via `jarvis persona` / `persona-set`.
