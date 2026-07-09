@@ -84,15 +84,35 @@ class AutonomyExecutor:
                 }
             started_at = utc_now()
             started_perf = time.perf_counter()
-            try:
-                result = await self.run_kind(str(job.get("kind") or ""), job.get("payload") or {})
-            except Exception as exc:  # noqa: BLE001
+            if _deadline_expired(job.get("deadline_at")):
                 result = {
                     "ok": False,
-                    "summary": f"Autonomy job failed: {exc}",
-                    "data": {"error": repr(exc), "job_id": job_id},
-                    "job_status": "enabled",
+                    "summary": "Autonomy job deadline expired before execution.",
+                    "data": {"job_id": job_id, "deadline_at": job.get("deadline_at")},
+                    "job_status": "cancelled",
                 }
+            else:
+                try:
+                    timeout = _job_timeout_seconds(job)
+                    coroutine = self.run_kind(str(job.get("kind") or ""), job.get("payload") or {})
+                    if timeout:
+                        result = await asyncio.wait_for(coroutine, timeout=timeout)
+                    else:
+                        result = await coroutine
+                except TimeoutError:
+                    result = {
+                        "ok": False,
+                        "summary": "Autonomy job exceeded its runtime budget.",
+                        "data": {"job_id": job_id, "timeout_sec": _job_timeout_seconds(job)},
+                        "job_status": "enabled",
+                    }
+                except Exception as exc:  # noqa: BLE001
+                    result = {
+                        "ok": False,
+                        "summary": f"Autonomy job failed: {exc}",
+                        "data": {"error": repr(exc), "job_id": job_id},
+                        "job_status": "enabled",
+                    }
             finished_at = utc_now()
             duration_ms = int((time.perf_counter() - started_perf) * 1000)
             if job.get("kind") == "mission":
@@ -172,7 +192,7 @@ class AutonomyExecutor:
             }
         if kind == "learning.tick":
             limit = _bounded_int(payload.get("limit"), 5, 100, 20)
-            result = self.learning.tick(limit=limit)
+            result = await self.learning.tick_async(limit=limit)
             return {
                 "ok": True,
                 "summary": f"Learning tick saved {result['lesson_count']} lesson(s).",
@@ -301,6 +321,26 @@ def _bounded_int(value: Any, minimum: int, maximum: int, fallback: int) -> int:
     except (TypeError, ValueError):
         parsed = fallback
     return max(minimum, min(maximum, parsed))
+
+
+def _job_timeout_seconds(job: dict[str, Any]) -> float | None:
+    budget = job.get("budget") if isinstance(job.get("budget"), dict) else {}
+    minutes = _bounded_int(budget.get("max_minutes"), 0, 1440, 0)
+    return float(minutes * 60) if minutes > 0 else None
+
+
+def _deadline_expired(value: Any) -> bool:
+    if not value:
+        return False
+    from datetime import UTC, datetime
+
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except ValueError:
+        return False
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return datetime.now(UTC) > parsed.astimezone(UTC)
 
 
 def _optional_int(value: Any) -> int | None:

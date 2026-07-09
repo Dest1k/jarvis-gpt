@@ -250,6 +250,20 @@ export default function TracePage() {
               <span>Событий runtime: {trace.events.length}</span>
             </div>
           </section>
+
+          {trace.events.length > 0 && (
+            <section className="traceTimeline">
+              {trace.events.slice(0, 12).map((event, index) => (
+                <article key={`${event.type}-${index}`}>
+                  <span>{index + 1}</span>
+                  <div>
+                    <strong>{event.title || eventLabel(event.type)}</strong>
+                    <p>{trimText(event.content || payloadPreview(event.payload) || event.type, 240)}</p>
+                  </div>
+                </article>
+              ))}
+            </section>
+          )}
         </>
       )}
     </main>

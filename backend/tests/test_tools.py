@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
 from jarvis_gpt.llm import LLMRouter
 from jarvis_gpt.storage import JarvisStorage
-from jarvis_gpt.tools import ToolRegistry, _windows_native_command
+from jarvis_gpt.tools import ToolRegistry, _PublicOnlyAsyncNetworkBackend, _windows_native_command
 
 
 def test_tool_registry_runs_memory_tools(monkeypatch, tmp_path):
@@ -111,6 +113,40 @@ def test_system_inspect_refuses_desktop_mutating_action(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_system_inspect_can_capture_screen_to_cache(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+    captured = {}
+
+    async def fake_execute(self, *, command, cwd=None, timeout_sec=30):
+        captured["command"] = command
+        return {
+            "ok": True,
+            "summary": "bridge ok",
+            "data": {
+                "stdout": (
+                    '{"ok":true,"summary":"Screen captured.","action":"screen.capture",'
+                    '"data":{"path":"screen.png","width":1920,"height":1080}}'
+                )
+            },
+        }
+
+    monkeypatch.setattr("jarvis_gpt.host_bridge.HostBridgeClient.execute", fake_execute)
+
+    result = asyncio.run(tools.run("system.inspect", {"action": "screen.capture"}))
+
+    assert result.ok is True
+    assert result.data["action"] == "screen.capture"
+    assert "screen.capture" in captured["command"]
+    assert str(settings.cache_dir / "screens").replace("\\", "\\\\") in captured["command"]
+    storage.close()
+
+
 def test_system_inspect_is_a_safe_autonomous_tool(monkeypatch, tmp_path):
     from jarvis_gpt.agent import AgentRuntime
     from jarvis_gpt.event_bus import EventBus
@@ -128,6 +164,7 @@ def test_system_inspect_is_a_safe_autonomous_tool(monkeypatch, tmp_path):
     spec = agent.tools.get("system.inspect")
     assert spec is not None
     assert spec.danger_level == "safe"
+    assert "screen.capture" in str(spec.input_schema["action"])
     autonomous = {info.name for info in agent._autonomous_tools()}
     assert "system.inspect" in autonomous
     # The mutating native tool stays out of the autonomous loop.
@@ -497,7 +534,10 @@ def test_web_fetch_reads_public_text(monkeypatch, tmp_path):
 
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
-    monkeypatch.setattr("jarvis_gpt.tools._hostname_is_private", lambda _hostname: False)
+    monkeypatch.setattr(
+        "jarvis_gpt.tools._public_resolved_addresses",
+        lambda _hostname: [ipaddress.ip_address("93.184.216.34")],
+    )
     monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
     settings = load_settings()
     ensure_runtime_dirs(settings)
@@ -511,6 +551,75 @@ def test_web_fetch_reads_public_text(monkeypatch, tmp_path):
     assert result.data["status_code"] == 200
     assert result.data["text"] == "hello world"
     assert result.data["truncated"] is False
+    storage.close()
+
+
+def test_public_network_backend_pins_to_validated_ip(monkeypatch):
+    calls = []
+
+    class FakeBackend:
+        async def connect_tcp(
+            self,
+            host,
+            port,
+            timeout=None,
+            local_address=None,
+            socket_options=None,
+        ):
+            calls.append((host, port))
+            return SimpleNamespace()
+
+        async def connect_unix_socket(self, path, timeout=None, socket_options=None):
+            raise AssertionError("not used")
+
+        async def sleep(self, seconds):
+            return None
+
+    monkeypatch.setattr("jarvis_gpt.tools.AutoBackend", FakeBackend)
+    monkeypatch.setattr(
+        "jarvis_gpt.tools._public_resolved_addresses",
+        lambda _hostname: [ipaddress.ip_address("93.184.216.34")],
+    )
+
+    asyncio.run(_PublicOnlyAsyncNetworkBackend().connect_tcp("example.com", 443))
+
+    assert calls == [("93.184.216.34", 443)]
+
+
+def test_web_render_uses_isolated_headless_browser(monkeypatch, tmp_path):
+    class FakeCompleted:
+        returncode = 0
+        stdout = "<html><body><main>Hello <b>rendered</b> world</main></body></html>"
+        stderr = ""
+
+    def fake_run(command, **kwargs):
+        joined = " ".join(command)
+        assert "--headless=new" in command
+        assert "--dump-dom" in command
+        assert "--user-data-dir=" in joined
+        assert "MAP example.com 93.184.216.34" in joined
+        assert kwargs["timeout"] == 25
+        return FakeCompleted()
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr("jarvis_gpt.tools._find_headless_browser", lambda: Path("chrome.exe"))
+    monkeypatch.setattr(
+        "jarvis_gpt.tools._public_resolved_addresses",
+        lambda _hostname: [ipaddress.ip_address("93.184.216.34")],
+    )
+    monkeypatch.setattr("jarvis_gpt.tools.subprocess.run", fake_run)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    result = asyncio.run(tools.run("web.render", {"url": "https://example.com/"}))
+
+    assert result.ok is True
+    assert result.data["text"] == "Hello rendered world"
+    assert result.data["pinned_addresses"] == ["93.184.216.34"]
     storage.close()
 
 

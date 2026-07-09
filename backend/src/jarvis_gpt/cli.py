@@ -169,8 +169,8 @@ def cmd_telemetry(args: argparse.Namespace) -> None:
 
 
 def cmd_learning_tick(args: argparse.Namespace) -> None:
-    _settings, storage, _llm, _agent = _runtime(args.profile)
-    _print_json(LearningEngine(storage).tick(limit=args.limit))
+    _settings, storage, llm, _agent = _runtime(args.profile)
+    _print_json(asyncio.run(LearningEngine(storage, llm=llm).tick_async(limit=args.limit)))
     storage.close()
 
 

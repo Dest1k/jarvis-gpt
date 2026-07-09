@@ -1885,6 +1885,12 @@ h3 {
   background: var(--surface-2);
 }
 
+.jobControls {
+  display: flex;
+  gap: 4px;
+  justify-content: flex-end;
+}
+
 .dockerRow small {
   min-width: 0;
   overflow: hidden;
@@ -3028,6 +3034,47 @@ h3 {
   color: #40d7c4;
 }
 
+.traceTimeline {
+  display: grid;
+  gap: 8px;
+  max-width: 1440px;
+  margin: 18px auto 0;
+}
+
+.traceTimeline article {
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  padding: 10px 12px;
+  border: 1px solid #28433d;
+  border-radius: var(--radius);
+  background: #101916;
+}
+
+.traceTimeline article > span {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 999px;
+  background: rgba(64, 215, 196, 0.14);
+  color: #40d7c4;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.traceTimeline strong,
+.traceTimeline p {
+  margin: 0;
+}
+
+.traceTimeline p {
+  margin-top: 3px;
+  color: #94aba5;
+  font-size: 12px;
+}
+
 .srOnly {
   position: absolute;
   width: 1px;
@@ -3254,7 +3301,7 @@ h3 {
   .auditRow > p,
   .auditRow > span,
   .jobRow > span,
-  .jobRow > button,
+  .jobRow > .jobControls,
   .jobRun > small,
   .dockerRow > span,
   .dockerRow > small,
@@ -3266,7 +3313,8 @@ h3 {
   }
 
   .dispatcherControls,
-  .modelActions {
+  .modelActions,
+  .jobControls {
     flex-wrap: wrap;
     justify-content: flex-start;
   }

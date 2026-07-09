@@ -278,7 +278,15 @@ type ApprovalExecution = {
 
 type OperatorQueueItem = {
   id: string;
-  kind: "approval" | "mission" | "health" | "generation" | "memory" | "model" | "quality";
+  kind:
+    | "approval"
+    | "mission"
+    | "health"
+    | "generation"
+    | "memory"
+    | "model"
+    | "quality"
+    | "autonomy";
   status: string;
   title: string;
   detail: string;
@@ -566,17 +574,20 @@ type AutonomyJob = {
   id: string;
   title: string;
   kind: "diagnostics" | "learning.tick" | "self_heal" | "benchmark" | "mission";
-  status: "enabled" | "paused" | "done";
+  status: "enabled" | "paused" | "done" | "cancelled";
   cadence: string;
   budget: { max_runs?: number; max_minutes?: number };
   payload: Record<string, unknown>;
   run_count: number;
+  priority: number;
   consecutive_failures: number;
   last_started_at?: string | null;
   last_finished_at?: string | null;
   last_duration_ms?: number | null;
   last_run_at?: string | null;
   next_run_after?: string | null;
+  deadline_at?: string | null;
+  cancelled_at?: string | null;
   last_result?: Record<string, unknown>;
 };
 
@@ -604,6 +615,12 @@ type RuntimeBackup = {
   path: string;
   size: number;
   created_at: string;
+};
+
+type QualityReport = {
+  negative_feedback: unknown[];
+  revises: unknown[];
+  top_gaps: string[];
 };
 
 type Routine = {
@@ -1424,6 +1441,7 @@ export default function CommandCenter() {
   const [autonomyJobRuns, setAutonomyJobRuns] = useState<AutonomyJobRun[]>([]);
   const [runtimeSecurity, setRuntimeSecurity] = useState<RuntimeSecurity | null>(null);
   const [runtimeBackup, setRuntimeBackup] = useState<RuntimeBackup | null>(null);
+  const [qualityReport, setQualityReport] = useState<QualityReport | null>(null);
   const [routines, setRoutines] = useState<Routine[]>([]);
   const [routineRun, setRoutineRun] = useState<RoutineRun | null>(null);
   const [directoryDraft, setDirectoryDraft] = useState("D:\\jarvis");
@@ -1552,6 +1570,7 @@ export default function CommandCenter() {
         dockerPolicyData,
         dockerContainersData,
         runtimeSecurityData,
+        qualityReportData,
         autonomyJobData,
         autonomyJobRunData,
         routineData,
@@ -1579,6 +1598,7 @@ export default function CommandCenter() {
           api<DockerPolicy>("/api/docker/policy"),
           api<DockerContainers>("/api/docker/containers"),
           api<RuntimeSecurity>("/api/runtime/security"),
+          api<QualityReport>("/api/operator/quality"),
           api<AutonomyJob[]>("/api/autonomy/jobs"),
           api<AutonomyJobRun[]>("/api/autonomy/job-runs?limit=8"),
           api<Routine[]>("/api/routines"),
@@ -1613,6 +1633,7 @@ export default function CommandCenter() {
       setDockerPolicy(dockerPolicyData);
       setDockerContainers(dockerContainersData);
       setRuntimeSecurity(runtimeSecurityData);
+      setQualityReport(qualityReportData);
       setAutonomyJobs(autonomyJobData);
       setAutonomyJobRuns(autonomyJobRunData);
       setRoutines(routineData);
@@ -2586,6 +2607,7 @@ export default function CommandCenter() {
           title: kind,
           kind,
           cadence: "manual",
+          priority: kind === "self_heal" ? 70 : kind === "diagnostics" ? 50 : 30,
           budget: { max_runs: 3, max_minutes: 10 }
         })
       });
@@ -2627,6 +2649,30 @@ export default function CommandCenter() {
     }
   }
 
+  async function cancelAutonomyJob(jobId: string) {
+    const jobTitle = autonomyJobs.find((job) => job.id === jobId)?.title ?? jobId;
+    setActiveOperation({
+      title: "Autonomy job",
+      detail: `cancel ${jobTitle}`
+    });
+    setBusy(true);
+    try {
+      const updated = await api<AutonomyJob>(`/api/autonomy/jobs/${jobId}/cancel`, {
+        method: "POST",
+        body: "{}"
+      });
+      setAutonomyJobs((current) =>
+        current.map((job) => (job.id === updated.id ? updated : job))
+      );
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Autonomy job was not cancelled");
+    } finally {
+      setBusy(false);
+      setActiveOperation(null);
+    }
+  }
+
   async function enqueueMissionInBackground(missionId: string) {
     const mission = missions.find((item) => item.id === missionId);
     setActiveOperation({
@@ -2641,6 +2687,7 @@ export default function CommandCenter() {
           title: `mission: ${mission?.title ?? missionId}`.slice(0, 120),
           kind: "mission",
           cadence: "background",
+          priority: 60,
           budget: { max_runs: 100, max_minutes: 60 },
           payload: {
             mission_id: missionId,
@@ -4575,17 +4622,28 @@ export default function CommandCenter() {
                   <span title={job.next_run_after ? `retry after ${job.next_run_after}` : undefined}>
                     {job.consecutive_failures
                       ? `fail ${job.consecutive_failures}`
-                      : `${job.run_count}/${job.budget.max_runs ?? 1}`}
+                      : `p${job.priority} ${job.run_count}/${job.budget.max_runs ?? 1}`}
                   </span>
-                  <button
-                    type="button"
-                    disabled={busy || job.status !== "enabled"}
-                    title="Запустить задачу"
-                    aria-label="Запустить задачу"
-                    onClick={() => runAutonomyJob(job.id)}
-                  >
-                    <Play size={14} />
-                  </button>
+                  <div className="jobControls">
+                    <button
+                      type="button"
+                      disabled={busy || job.status !== "enabled"}
+                      title="Запустить задачу"
+                      aria-label="Запустить задачу"
+                      onClick={() => runAutonomyJob(job.id)}
+                    >
+                      <Play size={14} />
+                    </button>
+                    <button
+                      type="button"
+                      disabled={busy || !["enabled", "paused"].includes(job.status)}
+                      title="Cancel job"
+                      aria-label="Cancel job"
+                      onClick={() => cancelAutonomyJob(job.id)}
+                    >
+                      <Square size={13} />
+                    </button>
+                  </div>
                 </div>
               ))}
               {autonomyJobRuns.length > 0 && (
@@ -4687,6 +4745,30 @@ export default function CommandCenter() {
                 <span>{browserPolicy?.max_urls_per_action ?? 0} вкладок</span>
                 <span>{browserPolicy?.allowed_hosts.slice(0, 2).join(", ")}</span>
               </div>
+            </div>
+
+            <div className="panelHeader lower">
+              <h2>Quality</h2>
+              <span>
+                {(qualityReport?.negative_feedback?.length ?? 0) +
+                  (qualityReport?.revises?.length ?? 0)}
+              </span>
+            </div>
+            <div className="benchmarkPanel">
+              <article className="benchmarkReport">
+                <strong>
+                  {qualityReport?.negative_feedback?.length
+                    ? `${qualityReport.negative_feedback.length} flagged answer(s)`
+                    : "No recent operator flags"}
+                </strong>
+                <div className="metricRows">
+                  <span>feedback {qualityReport?.negative_feedback?.length ?? 0}</span>
+                  <span>revisions {qualityReport?.revises?.length ?? 0}</span>
+                </div>
+                {(qualityReport?.top_gaps ?? []).slice(0, 3).map((item) => (
+                  <p key={item}>{item}</p>
+                ))}
+              </article>
             </div>
 
             <div className="panelHeader lower">

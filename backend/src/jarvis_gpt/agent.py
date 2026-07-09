@@ -93,11 +93,13 @@ SYSTEM_PROMPT = """Ты JARVIS GPT: локальный агент Windows/WSL/Do
   помечай confidence и не выдавай предположения за факты.
 - Если запрос требует актуальной информации из интернета: билеты, цены, расписания, новости,
   наличие, курсы, погоду, адреса, телефоны, часы работы, открыто ли место сейчас,
-  ближайшие бытовые точки или "послезавтра/сегодня/завтра", сначала используй web.search/web.fetch.
+  ближайшие бытовые точки или "послезавтра/сегодня/завтра", сначала используй
+  web.search/web.fetch; для JS-heavy страниц используй web.render.
   Не пиши "запускаю поиск" и не имитируй результаты. Если поиск или сайт не отдал данные,
   прямо скажи, что именно не подтверждено, и дай проверяемые ссылки.
 - Если вопрос ставит тебя в угол, зависит от сегодняшней реальности или есть риск ответить
-  уверенной выдумкой, сначала честно гугли через web.search/web.fetch и анализируй найденное.
+  уверенной выдумкой, сначала честно гугли через web.search/web.fetch/web.render
+  и анализируй найденное.
   Это относится не только к бытовым вопросам, но и к техническим, админским, разработческим,
   железным, финансовым, правовым и прочим меняющимся темам. Лучше показать источники
   и границы уверенности, чем красиво угадать.
@@ -1916,17 +1918,33 @@ class AgentRuntime:
                 "web.fetch",
                 {"url": item["url"], "max_chars": 5000},
             )
+            fetched_text = str(fetched.data.get("text") or "")
+            fetched_content_type = str(fetched.data.get("content_type") or "").lower()
+            should_render = not fetched.ok or (
+                len(fetched_text) < 600
+                and ("html" in fetched_content_type or "xml" in fetched_content_type)
+            )
+            if should_render and self.tools.get("web.render") is not None:
+                rendered = await self.tools.run(
+                    "web.render",
+                    {"url": item["url"], "max_chars": 5000, "wait_ms": 2500},
+                )
+                if rendered.ok and str(rendered.data.get("text") or "").strip():
+                    fetched = rendered
             fetches.append(fetched)
+            payload: dict[str, Any] = {
+                "tool": fetched.tool,
+                "ok": fetched.ok,
+                "url": item["url"],
+            }
+            if fetched.tool == "web.render":
+                payload["headless"] = True
             events.append(
                 ChatEvent(
                     type="tool_call",
-                    title="web.fetch",
+                    title=fetched.tool,
                     content=fetched.summary,
-                    payload={
-                        "tool": fetched.tool,
-                        "ok": fetched.ok,
-                        "url": item["url"],
-                    },
+                    payload=payload,
                 )
             )
         evidence = _research_evidence(results, fetches)

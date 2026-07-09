@@ -26,7 +26,7 @@ class RuntimeSupervisor:
         self.llm = llm or LLMRouter(settings)
         self.autonomy_executor = autonomy_executor
         self.telemetry = TelemetryCollector(settings)
-        self.learning = LearningEngine(storage)
+        self.learning = LearningEngine(storage, llm=self.llm)
         self._tasks: list[asyncio.Task[None]] = []
         self._started_at: str | None = None
         self._last_telemetry_at: str | None = None
@@ -168,7 +168,7 @@ class RuntimeSupervisor:
 
     async def _run_learning(self) -> None:
         try:
-            result = await asyncio.to_thread(self.learning.tick)
+            result = await self.learning.tick_async()
             self._last_learning_at = utc_now()
             self.storage.add_event(
                 kind="autonomy.learning",

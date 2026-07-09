@@ -57,6 +57,30 @@ def test_runtime_security_and_backup(client, monkeypatch):
     assert Path(body["path"]).exists()
 
 
+def test_operator_quality_and_autonomy_cancel(client):
+    quality = client.get("/api/operator/quality")
+    assert quality.status_code == 200
+    assert "negative_feedback" in quality.json()
+
+    created = client.post(
+        "/api/autonomy/jobs",
+        json={
+            "title": "Cancelable diagnostics",
+            "kind": "diagnostics",
+            "cadence": "1m",
+            "priority": 42,
+            "budget": {"max_runs": 3, "max_minutes": 5},
+        },
+    )
+    assert created.status_code == 200
+    job = created.json()
+    assert job["priority"] == 42
+
+    cancelled = client.post(f"/api/autonomy/jobs/{job['id']}/cancel")
+    assert cancelled.status_code == 200
+    assert cancelled.json()["status"] == "cancelled"
+
+
 def test_cors_is_loopback_only(client):
     requested = {
         "Access-Control-Request-Method": "POST",

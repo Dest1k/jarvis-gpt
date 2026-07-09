@@ -1,25 +1,47 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
+from .llm import LLMRouter
 from .storage import JarvisStorage
 
 
 class LearningEngine:
-    def __init__(self, storage: JarvisStorage) -> None:
+    def __init__(self, storage: JarvisStorage, llm: LLMRouter | None = None) -> None:
         self.storage = storage
+        self.llm = llm
 
     def tick(self, *, limit: int = 20) -> dict[str, Any]:
+        inputs = self._collect_inputs(limit=limit)
+        lessons = self._derive_lessons(**inputs)
+        return self._save_tick(lessons, inputs=inputs, limit=limit)
+
+    async def tick_async(self, *, limit: int = 20) -> dict[str, Any]:
+        inputs = self._collect_inputs(limit=limit)
+        lessons = self._derive_lessons(**inputs)
+        lessons.extend(await self._distill_lessons(inputs=inputs, deterministic=lessons))
+        return self._save_tick(lessons, inputs=inputs, limit=limit)
+
+    def _collect_inputs(self, *, limit: int) -> dict[str, list[dict[str, Any]]]:
         audit = self.storage.list_audit(limit=limit)
         tool_runs = self.storage.list_tool_runs(limit=limit)
         approvals = self.storage.list_approvals(limit=limit)
         observations = self.storage.list_learning_observations(limit=max(50, limit * 4))
-        lessons = self._derive_lessons(
-            audit=audit,
-            tool_runs=tool_runs,
-            approvals=approvals,
-            observations=observations,
-        )
+        return {
+            "audit": audit,
+            "tool_runs": tool_runs,
+            "approvals": approvals,
+            "observations": observations,
+        }
+
+    def _save_tick(
+        self,
+        lessons: list[dict[str, Any]],
+        *,
+        inputs: dict[str, list[dict[str, Any]]],
+        limit: int,
+    ) -> dict[str, Any]:
         consolidation = self.storage.consolidate_memories(limit=max(200, limit * 20))
         saved = []
         skipped_duplicates = 0
@@ -41,7 +63,7 @@ class LearningEngine:
             payload={
                 "saved": len(saved),
                 "skipped_duplicates": skipped_duplicates,
-                "examined": len(audit) + len(tool_runs) + len(approvals) + len(observations),
+                "examined": sum(len(items) for items in inputs.values()),
             },
         )
         return {
@@ -50,10 +72,10 @@ class LearningEngine:
             "skipped_duplicates": skipped_duplicates,
             "consolidated": consolidation,
             "examined": {
-                "audit": len(audit),
-                "tool_runs": len(tool_runs),
-                "approvals": len(approvals),
-                "learning_observations": len(observations),
+                "audit": len(inputs["audit"]),
+                "tool_runs": len(inputs["tool_runs"]),
+                "approvals": len(inputs["approvals"]),
+                "learning_observations": len(inputs["observations"]),
             },
         }
 
@@ -63,6 +85,66 @@ class LearningEngine:
             item.get("namespace") == "learning" and item.get("content") == content
             for item in existing
         )
+
+    async def _distill_lessons(
+        self,
+        *,
+        inputs: dict[str, list[dict[str, Any]]],
+        deterministic: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if self.llm is None or not self.llm.settings.llm_enabled:
+            return []
+        signal_text = _learning_signal_text(inputs=inputs, deterministic=deterministic)
+        if not signal_text:
+            return []
+        result = await self.llm.complete(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "You distill operator/runtime feedback into durable behavioral lessons "
+                        "for a local assistant. Return strict JSON only: "
+                        '{"lessons":[{"content":"...","tags":["learning","distilled"],'
+                        '"importance":0.0}]}. Keep at most 2 lessons, each actionable, '
+                        "short, non-secret, and grounded only in the provided signals."
+                    ),
+                },
+                {"role": "user", "content": signal_text},
+            ],
+            temperature=0.1,
+            max_tokens=700,
+            thinking_enabled=False,
+        )
+        if not result.ok:
+            return []
+        try:
+            parsed = json.loads(_json_object_text(result.content))
+        except (json.JSONDecodeError, ValueError):
+            return []
+        raw_lessons = parsed.get("lessons") if isinstance(parsed, dict) else None
+        if not isinstance(raw_lessons, list):
+            return []
+        lessons: list[dict[str, Any]] = []
+        for raw in raw_lessons[:2]:
+            if not isinstance(raw, dict):
+                continue
+            content = _compact_text(str(raw.get("content") or ""), 500)
+            if len(content) < 24:
+                continue
+            tags = raw.get("tags") if isinstance(raw.get("tags"), list) else []
+            clean_tags = ["learning", "distilled"]
+            for tag in tags[:6]:
+                text = str(tag).strip().lower()[:40]
+                if text and text not in clean_tags:
+                    clean_tags.append(text)
+            lessons.append(
+                {
+                    "content": content,
+                    "tags": clean_tags,
+                    "importance": _bounded_float(raw.get("importance"), 0.7, 0.5, 0.92),
+                }
+            )
+        return lessons
 
     def _derive_lessons(
         self,
@@ -291,3 +373,54 @@ def _compact_text(value: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
     return f"{text[: max_chars - 1].rstrip()}..."
+
+
+def _learning_signal_text(
+    *,
+    inputs: dict[str, list[dict[str, Any]]],
+    deterministic: list[dict[str, Any]],
+) -> str:
+    lines = ["Recent deterministic lessons:"]
+    for item in deterministic[:6]:
+        lines.append(f"- {_compact_text(str(item.get('content') or ''), 260)}")
+    lines.append("Recent observations:")
+    for item in inputs.get("observations", [])[:20]:
+        kind = str(item.get("kind") or "")
+        summary = _compact_text(str(item.get("summary") or item.get("content") or ""), 220)
+        if summary:
+            lines.append(f"- {kind}: {summary}")
+    lines.append("Recent failed tools / approvals:")
+    for item in inputs.get("tool_runs", [])[:12]:
+        if not item.get("ok"):
+            lines.append(
+                f"- tool {item.get('tool')}: {_compact_text(str(item.get('summary') or ''), 180)}"
+            )
+    for item in inputs.get("approvals", [])[:12]:
+        if item.get("status") in {"rejected", "pending"}:
+            lines.append(
+                f"- approval {item.get('status')}: "
+                f"{_compact_text(str(item.get('title') or ''), 180)}"
+            )
+    text = "\n".join(line for line in lines if line.strip())
+    return text[:5000]
+
+
+def _json_object_text(value: str) -> str:
+    text = value.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lower().startswith("json"):
+            text = text[4:].strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end <= start:
+        raise ValueError("No JSON object found")
+    return text[start : end + 1]
+
+
+def _bounded_float(value: Any, default: float, minimum: float, maximum: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(maximum, parsed))

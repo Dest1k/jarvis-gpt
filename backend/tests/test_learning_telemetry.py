@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import jarvis_gpt.telemetry as telemetry_module
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
@@ -84,6 +85,44 @@ def test_learning_journal_survives_chat_deletion_and_feeds_lessons(monkeypatch, 
     assert any(item["kind"] == "conversation.deleted" for item in observations)
     assert any(item["kind"] == "tool.web.search" for item in observations)
     assert storage.search_memory("фоновые проверки", limit=10)
+    storage.close()
+
+
+def test_learning_tick_can_distill_with_llm(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "1")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    storage.record_learning_observation(
+        kind="operator.feedback",
+        summary="operator flagged answer",
+        content="Too verbose and did not answer the actual admin task",
+        payload={"rating": "down", "comment": "be shorter and finish the task"},
+    )
+
+    class FakeLLM:
+        async def complete(self, *args, **kwargs):
+            return SimpleNamespace(
+                ok=True,
+                content=(
+                    '{"lessons":[{"content":"When the operator flags verbosity, answer '
+                    'briefly and close the concrete admin task first.",'
+                    '"tags":["operator","brevity"],"importance":0.86}]}'
+                ),
+            )
+
+    fake_llm = FakeLLM()
+    fake_llm.settings = settings
+
+    result = asyncio.run(LearningEngine(storage, llm=fake_llm).tick_async(limit=10))
+
+    assert result["lesson_count"] >= 1
+    assert any(
+        "briefly and close" in item["content"]
+        for item in storage.search_memory("briefly close admin task", limit=10)
+    )
     storage.close()
 
 

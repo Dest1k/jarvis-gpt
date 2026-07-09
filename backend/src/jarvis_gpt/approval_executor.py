@@ -118,7 +118,7 @@ class ApprovalExecutor:
             )
         if action == "learning.tick":
             limit = _int_value(payload.get("limit"), default=20, minimum=5, maximum=100)
-            result = LearningEngine(self.storage).tick(limit=limit)
+            result = await LearningEngine(self.storage, llm=self.llm).tick_async(limit=limit)
             return ApprovalExecution(
                 ok=True,
                 summary=(

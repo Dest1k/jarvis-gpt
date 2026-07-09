@@ -144,6 +144,55 @@ def test_autonomy_job_failure_backoff_and_run_history(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_autonomy_jobs_have_priority_deadline_and_cancel(monkeypatch, tmp_path):
+    manager, storage = _manager(monkeypatch, tmp_path)
+    now = datetime(2026, 7, 9, 12, tzinfo=UTC)
+    low = manager.create_job(
+        {
+            "title": "Low",
+            "kind": "diagnostics",
+            "cadence": "1m",
+            "priority": 1,
+            "budget": {"max_runs": 3},
+        }
+    )
+    high = manager.create_job(
+        {
+            "title": "High",
+            "kind": "diagnostics",
+            "cadence": "1m",
+            "priority": 90,
+            "budget": {"max_runs": 3},
+        }
+    )
+    expired = manager.create_job(
+        {
+            "title": "Expired",
+            "kind": "diagnostics",
+            "cadence": "1m",
+            "priority": 100,
+            "deadline_at": (now - timedelta(minutes=1)).isoformat(),
+            "budget": {"max_runs": 3},
+        }
+    )
+
+    due = manager.due_jobs(now=now)
+    cancelled = manager.update_job(low["id"], {"status": "cancelled"})
+    after_late_result = manager.mark_job_run(
+        low["id"],
+        {"ok": True, "summary": "finished after cancel", "job_status": "enabled"},
+    )
+
+    assert [item["id"] for item in due] == [high["id"], low["id"]]
+    assert expired["id"] not in {item["id"] for item in due}
+    assert cancelled is not None
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["cancelled_at"] is not None
+    assert after_late_result is not None
+    assert after_late_result["status"] == "cancelled"
+    storage.close()
+
+
 def test_mission_autonomy_job_runs_headless_and_persists_mission_id(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import ipaddress
 import json
@@ -8,6 +9,7 @@ import re
 import shutil
 import socket
 import subprocess
+import tempfile
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from html import unescape
@@ -15,7 +17,10 @@ from pathlib import Path, PureWindowsPath
 from typing import Any, Literal
 from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
+import httpcore
 import httpx
+from httpcore._backends.auto import AutoBackend
+from httpcore._backends.base import SOCKET_OPTION, AsyncNetworkBackend, AsyncNetworkStream
 
 from .config import JarvisSettings
 from .diagnostics import run_diagnostics
@@ -336,11 +341,11 @@ class ToolRegistry:
                 name="system.inspect",
                 description=(
                     "Read-only inspection of the operator's Windows machine through WMI/CIM "
-                    "(and the visible-window list). YOU choose the Win32_* class and properties "
-                    "from your own knowledge, e.g. Win32_OperatingSystem, Win32_Processor, "
-                    "Win32_PhysicalMemory, Win32_LogicalDisk, Win32_Battery, "
-                    "Win32_VideoController, Win32_Service, Win32_Process, "
-                    "Win32_StartupCommand, Win32_Printer, "
+                    "(plus visible-window list and screen capture to Jarvis cache). YOU choose "
+                    "the Win32_* class and properties from your own knowledge, e.g. "
+                    "Win32_OperatingSystem, Win32_Processor, Win32_PhysicalMemory, "
+                    "Win32_LogicalDisk, Win32_Battery, Win32_VideoController, Win32_Service, "
+                    "Win32_Process, Win32_StartupCommand, Win32_Printer, "
                     "Win32_NetworkAdapterConfiguration, Win32_PnPEntity. Use it for everyday "
                     "questions about hardware, OS, disks, memory, battery, services, startup, "
                     "printers or network. Non-mutating and safe to run autonomously; runs through "
@@ -348,10 +353,10 @@ class ToolRegistry:
                 ),
                 category="host",
                 input_schema={
-                    "action": "wmi.query (default), window.list, or capabilities",
+                    "action": "wmi.query (default), window.list, screen.capture, or capabilities",
                     "payload": (
                         "wmi.query: {class_name, properties[], filter?, limit?}; "
-                        "window.list: {limit}"
+                        "window.list: {limit}; screen.capture: {path?, include_windows?, limit?}"
                     ),
                     "timeout_sec": "1-120 second timeout",
                 },
@@ -494,6 +499,23 @@ class ToolRegistry:
                 category="web",
                 input_schema={"url": "Public http(s) URL", "max_chars": "Maximum text characters"},
                 handler=_web_fetch,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="web.render",
+                description=(
+                    "Render a public HTTP(S) page in an isolated headless Chrome/Edge process "
+                    "and return the visible DOM text. This is for JS-heavy pages and never opens "
+                    "the operator's real browser window."
+                ),
+                category="web",
+                input_schema={
+                    "url": "Public http(s) URL",
+                    "max_chars": "Maximum visible text characters",
+                    "wait_ms": "Virtual time budget for page scripts",
+                },
+                handler=_web_render,
             )
         )
         self.add(
@@ -735,9 +757,9 @@ def _dispatcher_stop(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunResponse
     )
 
 
-def _learning_tick(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+async def _learning_tick(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     limit = _int_arg(args.get("limit"), default=20, minimum=5, maximum=100)
-    result = LearningEngine(ctx.storage).tick(limit=limit)
+    result = await LearningEngine(ctx.storage, llm=ctx.llm).tick_async(limit=limit)
     return ToolRunResponse(
         tool="learning.tick",
         ok=True,
@@ -778,8 +800,9 @@ async def _host_bridge_execute(ctx: ToolContext, args: dict[str, Any]) -> ToolRu
 
 # Read-only native actions that never change desktop/host state, so the agentic
 # loop may drive them without approval. wmi.query is a WMI SELECT, window.list
-# enumerates visible windows, capabilities reports what the bridge supports.
-SAFE_INSPECT_ACTIONS = frozenset({"capabilities", "window.list", "wmi.query"})
+# enumerates visible windows, screen.capture writes a PNG into Jarvis cache, and
+# capabilities reports what the bridge supports.
+SAFE_INSPECT_ACTIONS = frozenset({"capabilities", "screen.capture", "window.list", "wmi.query"})
 
 
 async def _run_native_bridge_command(
@@ -837,7 +860,8 @@ async def _system_inspect(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResp
 
     This is the safe, autonomous counterpart of windows.native: the model picks
     the WMI class and properties from its own knowledge and reads system/hardware
-    state without an approval gate, because a WMI SELECT changes nothing. Actions
+    state without an approval gate, because a WMI SELECT changes nothing. It may
+    also list windows or capture the current screen to Jarvis cache. Actions
     that touch the desktop stay on the approval-gated windows.native tool.
     """
 
@@ -857,6 +881,12 @@ async def _system_inspect(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResp
     payload = args.get("payload")
     if not isinstance(payload, dict):
         payload = {}
+    if action == "screen.capture" and not payload.get("path"):
+        screen_dir = ctx.settings.cache_dir / "screens"
+        payload = {
+            **payload,
+            "path": str(screen_dir / f"screen-{_timestamp_slug()}.png"),
+        }
     timeout_sec = _int_arg(args.get("timeout_sec"), default=30, minimum=1, maximum=120)
     try:
         native, ok, summary, bridge_data = await _run_native_bridge_command(
@@ -1102,6 +1132,7 @@ async def _web_search(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespons
             timeout=httpx.Timeout(20.0),
             follow_redirects=True,
             trust_env=False,
+            transport=_PublicOnlyAsyncHTTPTransport(),
         ) as client:
             response = await client.get(url, headers=headers)
             response.raise_for_status()
@@ -1134,7 +1165,11 @@ async def _web_fetch(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
     headers = {"User-Agent": "JARVIS-GPT/0.1"}
     timeout = httpx.Timeout(20.0)
     try:
-        async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            trust_env=False,
+            transport=_PublicOnlyAsyncHTTPTransport(),
+        ) as client:
             for _ in range(6):
                 async with client.stream(
                     "GET",
@@ -1190,6 +1225,63 @@ async def _web_fetch(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
         ok=False,
         summary="Too many redirects.",
         data={"url": current_url, "redirects": redirects},
+    )
+
+
+async def _web_render(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    raw_url = str(args.get("url") or "").strip()
+    max_chars = _int_arg(args.get("max_chars"), default=8000, minimum=512, maximum=30000)
+    wait_ms = _int_arg(args.get("wait_ms"), default=2500, minimum=250, maximum=10000)
+    timeout_sec = _int_arg(args.get("timeout_sec"), default=25, minimum=5, maximum=60)
+    try:
+        url = _validate_public_http_url(raw_url)
+        parsed = urlparse(url)
+        addresses = _public_resolved_addresses(str(parsed.hostname or ""))
+    except ValueError as exc:
+        return ToolRunResponse(tool="web.render", ok=False, summary=str(exc))
+
+    browser = _find_headless_browser()
+    if browser is None:
+        return ToolRunResponse(
+            tool="web.render",
+            ok=False,
+            summary="No headless Chrome/Edge executable was found.",
+            data={"url": url},
+        )
+
+    result = await asyncio.to_thread(
+        _run_headless_dump_dom,
+        browser,
+        url,
+        addresses=addresses,
+        wait_ms=wait_ms,
+        timeout_sec=timeout_sec,
+    )
+    if not result["ok"]:
+        return ToolRunResponse(
+            tool="web.render",
+            ok=False,
+            summary=str(result["summary"]),
+            data={"url": url, **result},
+        )
+    html = str(result.get("html") or "")
+    text = _html_to_text(html)
+    truncated = len(text) > max_chars
+    if truncated:
+        text = text[:max_chars].rstrip()
+    return ToolRunResponse(
+        tool="web.render",
+        ok=True,
+        summary="Rendered public URL in isolated headless browser.",
+        data={
+            "url": url,
+            "browser": str(browser),
+            "text": text,
+            "html_chars": len(html),
+            "truncated": truncated,
+            "pinned_addresses": [str(item) for item in addresses],
+            "stderr": str(result.get("stderr") or "")[:1000],
+        },
     )
 
 
@@ -1960,6 +2052,66 @@ def _validate_browser_url(raw_url: str, policy: dict[str, Any] | None = None) ->
     return parsed.geturl()
 
 
+class _PublicOnlyAsyncNetworkBackend(AsyncNetworkBackend):
+    """httpcore network backend that pins DNS to public IPs resolved by Jarvis."""
+
+    def __init__(self) -> None:
+        self._backend = AutoBackend()
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: list[SOCKET_OPTION] | None = None,
+    ) -> AsyncNetworkStream:
+        addresses = _public_resolved_addresses(host)
+        last_error: Exception | None = None
+        for address in addresses:
+            try:
+                return await self._backend.connect_tcp(
+                    str(address),
+                    port,
+                    timeout=timeout,
+                    local_address=local_address,
+                    socket_options=socket_options,
+                )
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+        raise OSError(f"Could not connect to public host: {host}")
+
+    async def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: list[SOCKET_OPTION] | None = None,
+    ) -> AsyncNetworkStream:
+        return await self._backend.connect_unix_socket(
+            path,
+            timeout=timeout,
+            socket_options=socket_options,
+        )
+
+    async def sleep(self, seconds: float) -> None:
+        await self._backend.sleep(seconds)
+
+
+class _PublicOnlyAsyncHTTPTransport(httpx.AsyncHTTPTransport):
+    """httpx transport that avoids the second resolver hop inside httpcore."""
+
+    def __init__(self) -> None:
+        super().__init__(trust_env=False, retries=0)
+        self._pool = httpcore.AsyncConnectionPool(
+            http1=True,
+            http2=False,
+            retries=0,
+            network_backend=_PublicOnlyAsyncNetworkBackend(),
+        )
+
+
 def _powershell_quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
@@ -1972,8 +2124,7 @@ def _validate_public_http_url(raw_url: str) -> str:
         raise ValueError("Only http and https URLs are supported.")
     if not parsed.hostname:
         raise ValueError("URL host is required.")
-    if _hostname_is_private(parsed.hostname):
-        raise ValueError("URL host must resolve only to public addresses.")
+    _public_resolved_addresses(parsed.hostname)
     return parsed.geturl()
 
 
@@ -2042,6 +2193,27 @@ def _html_to_text(value: str) -> str:
 
 
 def _hostname_is_private(hostname: str) -> bool:
+    return bool(_private_resolved_addresses(hostname))
+
+
+def _public_resolved_addresses(
+    hostname: str,
+) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    addresses = _resolved_ip_addresses(hostname)
+    private_addresses = [address for address in addresses if _address_is_private(address)]
+    if private_addresses:
+        blocked = ", ".join(str(item) for item in private_addresses[:4])
+        raise ValueError(f"URL host must resolve only to public addresses; blocked: {blocked}")
+    return addresses
+
+
+def _private_resolved_addresses(
+    hostname: str,
+) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    return [address for address in _resolved_ip_addresses(hostname) if _address_is_private(address)]
+
+
+def _resolved_ip_addresses(hostname: str) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
     try:
         resolved = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
     except OSError as exc:
@@ -2049,20 +2221,134 @@ def _hostname_is_private(hostname: str) -> bool:
     if not resolved:
         raise ValueError(f"Could not resolve URL host: {hostname}")
 
+    addresses: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
     for item in resolved:
         address = item[4][0]
-        ip = ipaddress.ip_address(address)
-        if (
-            not ip.is_global
-            or ip.is_private
-            or ip.is_loopback
-            or ip.is_link_local
-            or ip.is_multicast
-            or ip.is_reserved
-            or ip.is_unspecified
-        ):
-            return True
-    return False
+        parsed = ipaddress.ip_address(address)
+        if parsed not in addresses:
+            addresses.append(parsed)
+    return addresses
+
+
+def _address_is_private(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    return (
+        not address.is_global
+        or address.is_private
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_multicast
+        or address.is_reserved
+        or address.is_unspecified
+    )
+
+
+def _find_headless_browser() -> Path | None:
+    names = ("chrome.exe", "chrome", "msedge.exe", "msedge", "chromium.exe", "chromium")
+    for name in names:
+        found = shutil.which(name)
+        if found:
+            return Path(found)
+    candidates = [
+        Path("C:/Program Files/Google/Chrome/Application/chrome.exe"),
+        Path("C:/Program Files (x86)/Google/Chrome/Application/chrome.exe"),
+        Path("C:/Program Files/Microsoft/Edge/Application/msedge.exe"),
+        Path("C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe"),
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    return None
+
+
+def _run_headless_dump_dom(
+    browser: Path,
+    url: str,
+    *,
+    addresses: list[ipaddress.IPv4Address | ipaddress.IPv6Address],
+    wait_ms: int,
+    timeout_sec: int,
+) -> dict[str, Any]:
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    resolver_rules = _headless_host_resolver_rules(host, addresses)
+    with tempfile.TemporaryDirectory(prefix="jarvis-headless-") as profile_dir:
+        command = [
+            str(browser),
+            "--headless=new",
+            "--disable-gpu",
+            "--disable-extensions",
+            "--disable-background-networking",
+            "--disable-sync",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--no-proxy-server",
+            "--proxy-server=direct://",
+            "--proxy-bypass-list=*",
+            f"--user-data-dir={profile_dir}",
+            f"--virtual-time-budget={wait_ms}",
+            f"--host-resolver-rules={resolver_rules}",
+            "--dump-dom",
+            url,
+        ]
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout_sec,
+                check=False,
+                creationflags=_hidden_process_flags(),
+            )
+        except subprocess.TimeoutExpired:
+            return {
+                "ok": False,
+                "summary": f"Headless browser timed out after {timeout_sec}s.",
+                "browser": str(browser),
+            }
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "ok": False,
+                "summary": f"Headless browser failed: {exc}",
+                "browser": str(browser),
+            }
+    ok = result.returncode == 0 and bool(result.stdout.strip())
+    return {
+        "ok": ok,
+        "summary": (
+            "Headless browser rendered DOM."
+            if ok
+            else f"Headless browser exited with {result.returncode}."
+        ),
+        "browser": str(browser),
+        "returncode": result.returncode,
+        "html": result.stdout,
+        "stderr": result.stderr.strip(),
+        "resolver_rules": resolver_rules,
+    }
+
+
+def _headless_host_resolver_rules(
+    host: str,
+    addresses: list[ipaddress.IPv4Address | ipaddress.IPv6Address],
+) -> str:
+    if not host or not addresses:
+        return "EXCLUDE localhost"
+    address = next((item for item in addresses if item.version == 4), addresses[0])
+    # Keep SNI/Host as the original hostname while making Chrome use the public
+    # IP Jarvis already validated. The wildcard sink reduces background lookups.
+    return f"MAP {host} {address}, MAP * 0.0.0.0, EXCLUDE localhost"
+
+
+def _hidden_process_flags() -> int:
+    return getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def _timestamp_slug() -> str:
+    from datetime import UTC, datetime
+
+    return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
 
 
 async def _read_limited_response_text(

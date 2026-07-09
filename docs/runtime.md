@@ -1,5 +1,32 @@
 # Runtime
 
+## 2026-07-09 handoff - headless browsing, distilled learning, autonomy controls
+
+For the operator and the second model:
+
+- Model profiles are intentionally left as future scaffolding in this pass.
+- `web.render` is now available for JS-heavy public pages. It launches an
+  isolated headless Chrome/Edge process with a temporary profile, returns visible
+  DOM text, and never opens the operator's working browser.
+- `web.search` and `web.fetch` now use a public-only async transport that pins
+  TCP connections to DNS answers Jarvis already validated as public. This closes
+  the earlier DNS-rebinding gap while keeping SNI/Host on the original hostname.
+- `system.inspect` now includes read-only `screen.capture`, writing screenshots
+  to Jarvis cache by default. Mutating desktop/native actions stay behind the
+  approval-gated `windows.native` path.
+- `learning.tick` has an async LLM-assisted path. It still derives deterministic
+  lessons first, then asks the configured local LLM for strict JSON with up to
+  two short, non-secret, grounded lessons from recent feedback/runtime signals.
+- New quality surface: `GET /api/operator/quality` and a Command Center Quality
+  panel summarize recent negative feedback, verifier revise signals, and top
+  repeated gaps.
+- Autonomy jobs now support `priority`, optional `deadline_at`, cancellation,
+  runtime budget timeouts, priority-aware due-job ordering, and queue items for
+  failed/cancelled jobs.
+- The trace page now includes a compact event timeline below the graph, making
+  observable routing/tool/synthesis events easier to review without exposing
+  hidden chain-of-thought.
+
 ## 2026-07-09 handoff - runtime guardrails and autonomy observability
 
 For the operator and the second model:
@@ -295,10 +322,11 @@ For the operator and the second model:
 
 For the operator and the second model:
 
-- Direct web research is now `search/fetch -> evidence synthesis -> answer`.
-  `_run_web_research` still gathers public pages through backend `web.search` and
-  `web.fetch`, but then asks the local LLM to produce a conclusion from the
-  fetched evidence only, with uncertainty and source URLs.
+- Direct web research is now `search/fetch/render -> evidence synthesis -> answer`.
+  `_run_web_research` gathers public pages through backend `web.search`,
+  `web.fetch`, and, when normal fetch is thin or blocked, `web.render`, then asks
+  the local LLM to produce a conclusion from the fetched evidence only, with
+  uncertainty and source URLs.
 - The deterministic formatter remains the fallback. If the synthesis response is
   empty, router-shaped JSON, or otherwise invalid, Jarvis returns the old source
   list instead of exposing broken routing output.
@@ -321,7 +349,8 @@ For the operator and the second model:
   approval. The validator still rejects non-http schemes and policy-locked URLs.
 - `browser.open` and `browser.open_many` are intentionally denied from the
   autonomous tool loop. Background/current-data research should use backend
-  `web.search` and `web.fetch`, which do not touch the operator's desktop browser.
+  `web.search`, `web.fetch`, and `web.render`, which do not touch the operator's
+  desktop browser.
 - Added `learning_observations`: an append-only journal for dialogue messages,
   tool runs, web/browser observations, and conversation deletion markers. Deleting
   a chat removes visible history but leaves the learning journal intact.
@@ -573,11 +602,13 @@ POST /api/dispatcher/start
 POST /api/dispatcher/stop
 GET  /api/telemetry
 GET  /api/host-bridge
+GET  /api/operator/quality
 GET  /api/autonomy
 GET  /api/autonomy/jobs
 GET  /api/autonomy/job-runs
 POST /api/autonomy/jobs
 PATCH /api/autonomy/jobs/{job_id}
+POST /api/autonomy/jobs/{job_id}/cancel
 POST /api/autonomy/jobs/{job_id}/run
 GET  /api/routines
 POST /api/routines/{routine_id}/run

@@ -424,7 +424,16 @@ class MissionRunResponse(BaseModel):
 
 class OperatorQueueItem(BaseModel):
     id: str
-    kind: Literal["approval", "mission", "health", "generation", "memory", "model", "quality"]
+    kind: Literal[
+        "approval",
+        "mission",
+        "health",
+        "generation",
+        "memory",
+        "model",
+        "quality",
+        "autonomy",
+    ]
     status: str
     title: str
     detail: str = ""
@@ -608,14 +617,18 @@ class AutonomyJobCreateRequest(BaseModel):
     cadence: str = Field(default="manual", max_length=80)
     budget: dict[str, int] = Field(default_factory=dict)
     payload: dict[str, Any] = Field(default_factory=dict)
+    priority: int = Field(default=0, ge=0, le=100)
+    deadline_at: str | None = Field(default=None, max_length=80)
 
 
 class AutonomyJobUpdateRequest(BaseModel):
     title: str | None = Field(default=None, max_length=120)
-    status: Literal["enabled", "paused", "done"] | None = None
+    status: Literal["enabled", "paused", "done", "cancelled"] | None = None
     cadence: str | None = Field(default=None, max_length=80)
     budget: dict[str, int] | None = None
     payload: dict[str, Any] | None = None
+    priority: int | None = Field(default=None, ge=0, le=100)
+    deadline_at: str | None = Field(default=None, max_length=80)
 
 
 class AutonomyJobResponse(BaseModel):
@@ -627,6 +640,7 @@ class AutonomyJobResponse(BaseModel):
     budget: dict[str, int] = Field(default_factory=dict)
     payload: dict[str, Any] = Field(default_factory=dict)
     run_count: int
+    priority: int = 0
     consecutive_failures: int = 0
     created_at: str
     updated_at: str
@@ -635,6 +649,8 @@ class AutonomyJobResponse(BaseModel):
     last_duration_ms: int | None = None
     last_run_at: str | None = None
     next_run_after: str | None = None
+    deadline_at: str | None = None
+    cancelled_at: str | None = None
     last_result: dict[str, Any] = Field(default_factory=dict)
 
 

@@ -32,7 +32,9 @@ Agent Runtime
   |-- memory hygiene
   |-- model profile roadmap
   |-- web evidence synthesis
+  |-- isolated headless web render
   |-- per-answer observable trace
+  |-- answer quality dashboard
   |-- capability/current-work manifest
   |-- result integrity (self-check, repair, mission deliverable, clarify)
   |-- experience loop (operator feedback, outcome lessons, lessons-in-prompt)
@@ -61,7 +63,9 @@ External host runtime
 - LLM является заменяемым маршрутом, а не фундаментом всей системы.
 - Operator persona — первоклассный слой понимания оператора: durable профиль (роль, домашний город, языки, стек, увлечения, текущий фокус, постоянные правила, глоссарий) читается на каждом ходу и обобщает узкие маршруты (например, домашний город закрывает погоду/локальные/гео запросы вместо отдельного weather-кэша). Это широкое поле правок вместо патча под каждый юзкейс.
 - Reasoning-first интент: для fuzzy web-семьи И для локального bucket (запросы о состоянии/действиях на машине оператора) агент не доверяет каскаду `_looks_like_*`, а спрашивает модель (`_understand_intent`), которая понимает задачу по смыслу и operator-контексту и решает маршрут. Арбитр может вернуть `web_research | reasoning | local_action | mission | chat | clarify`, и каждое решение обрабатывается: `local_action` уводит запрос в агентный loop с нативными инструментами (system.inspect для чтения состояния, windows.native под approval для мутаций) вместо интернет-поиска локального состояния. Эвристики остаются детерминированным фолбэком (офлайн и для конкретных matched tool-биндингов вроде явного native OS action, который срабатывает ДО арбитра). Так «понимание задачи» вытесняет «правила-затычки» и на web-, и на локальном маршруте, не ломая деградацию без LLM.
-- Web evidence synthesis: прямой web-маршрут теперь не заканчивается механическим списком ссылок. Backend собирает search/fetch evidence, присваивает источникам простой quality label, затем LLM делает краткий вывод только из этих фактов. Если synthesis даёт мусор или router JSON, включается старый deterministic formatter.
+- Web evidence synthesis: прямой web-маршрут теперь не заканчивается механическим списком ссылок. Backend собирает search/fetch/render evidence, присваивает источникам простой quality label, затем LLM делает краткий вывод только из этих фактов. Если synthesis даёт мусор или router JSON, включается старый deterministic formatter.
+- JS-heavy web pages go through backend-owned `web.render`: isolated headless Chrome/Edge, temporary profile, public-only DNS pinning, no operator browser tabs. The normal route tries `web.fetch` first and falls back to render when fetched text is too thin or unavailable.
+- Web SSRF protection is enforced both before request setup and at connect time: `web.search`/`web.fetch` use a public-only httpx transport that resolves, validates, and pins public IPs before opening TCP, closing the old DNS-rebinding window without giving the model local network reach.
 - Per-answer trace: сохранённый assistant message можно открыть как `/trace/{messageId}`. Backend отдаёт предыдущий user input, assistant output, события runtime и nodes/edges граф; UI показывает анимированный путь сигнала без раскрытия hidden chain-of-thought.
 - Агентный tool-loop: на пути ответа модель — не одиночный forward-pass, а цикл, где она сама выбирает безопасные инструменты, читает observation и продолжает до финального ответа. Опасные инструменты автономно не выполняются, а становятся approval-гейтами. Это снимает «чат-бот»-стену (у модели появляются руки), не завися от размера модели.
 - Гибридный retrieval: память достаётся не только лексически (BM25/LIKE), но и семантически (fuzzy-вектор или remote-эмбеддинги), фьюз через RRF над ограниченным пулом кандидатов. Модель получает релевантный контекст даже при перефразировании — это отдельная подсистема, которую нельзя «дообучить» размером чат-модели.
@@ -75,9 +79,11 @@ External host runtime
 - Dispatcher вынесен в отдельный Compose profile `llm`, чтобы Command Center можно было запускать без случайной загрузки тяжёлых весов в VRAM.
 - Любое действие с риском выше safe должно сначала стать approval gate; выполнение после approve проходит через отдельный whitelisted gated executor.
 - Self-learning идёт через append-only learning journal и `learning.tick`: диалоги, tool runs, web/browser observations и deletion markers превращаются в lessons без привязки к видимой истории чатов.
+- When the local LLM is enabled, learning tick also runs a bounded JSON-only distillation pass over recent signals, adding at most two grounded lessons on top of deterministic lessons. The quality dashboard exposes recent negative feedback, verifier revise signals, and repeated gaps for operator/assistant review.
 - Устойчивость слоя целостности: самопроверка и ремонт запускаются после готового черновика, поэтому у них отдельный таймаут-бюджет (`VERIFY_TIMEOUT_SEC`, не больше `llm_timeout_sec`) — зависший критик деградирует до отдачи черновика, а не держит готовый ответ на полный LLM-таймаут. Это тот же принцип «сбой контроля качества не портит хороший результат», но на оси латентности.
 - Контракт API проверяется end-to-end: `test_api_smoke.py` поднимает реальное ASGI-приложение (offline, autonomy off) и проходит критичный путь оператора, ловя регрессии роутинга (response_model, await, статус-коды), которые unit-тесты компонентов пропускают.
 - Autonomous supervisor безопасно выполняет только наблюдение: telemetry snapshots и learning tick сразу при старте и далее по расписанию; действия с риском остаются через approvals.
+- Persisted autonomy jobs now carry priority, deadline, runtime budget, cancel state, and run history. Due jobs are priority-aware, expired jobs cancel before execution, long jobs are timed out by their budget, and failed/cancelled jobs surface in the operator queue.
 - Performance слой разделяет лёгкий backend и тяжёлый dispatcher; GPU утилизируется vLLM-профилем, а backend собирает telemetry без удержания весов.
 
 - Persona учится сама через понимание, а не через regex: у модели есть safe-

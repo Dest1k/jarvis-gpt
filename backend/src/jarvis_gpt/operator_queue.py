@@ -151,6 +151,33 @@ def operator_queue_snapshot(settings: JarvisSettings, storage: JarvisStorage) ->
             }
         )
 
+    autonomy_jobs = storage.get_runtime_value("operations.autonomy.jobs", [])
+    if isinstance(autonomy_jobs, list):
+        for job in autonomy_jobs[:20]:
+            if not isinstance(job, dict):
+                continue
+            failures = _safe_int(job.get("consecutive_failures"), 0)
+            status = str(job.get("status") or "")
+            if failures <= 0 and status != "cancelled":
+                continue
+            items.append(
+                {
+                    "id": f"autonomy:{job.get('id')}",
+                    "kind": "autonomy",
+                    "status": status or "unknown",
+                    "title": str(job.get("title") or job.get("kind") or "Autonomy job"),
+                    "detail": str((job.get("last_result") or {}).get("summary") or ""),
+                    "priority": "high" if failures >= 3 else "medium",
+                    "action": "review_job",
+                    "updated_at": job.get("updated_at") or job.get("last_run_at"),
+                    "payload": {
+                        "job_id": job.get("id"),
+                        "consecutive_failures": failures,
+                        "next_run_after": job.get("next_run_after"),
+                    },
+                }
+            )
+
     if int(memory_hygiene["stats"].get("duplicate_groups", 0)) > 0:
         items.append(
             {
@@ -373,6 +400,13 @@ def _timestamp_value(value: Any) -> float:
         return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
     except ValueError:
         return 0.0
+
+
+def _safe_int(value: Any, fallback: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
 
 
 def _normalize_memory_text(value: str) -> str:

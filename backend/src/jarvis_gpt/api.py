@@ -103,7 +103,12 @@ from .models import (
     ToolRunResponse,
 )
 from .operations import OperationsManager
-from .operator_queue import memory_hygiene_report, model_profile_plan, operator_queue_snapshot
+from .operator_queue import (
+    answer_quality_report,
+    memory_hygiene_report,
+    model_profile_plan,
+    operator_queue_snapshot,
+)
 from .persona import PersonaManager
 from .storage import JarvisStorage
 from .supervisor import RuntimeSupervisor
@@ -124,7 +129,7 @@ async def lifespan(app: FastAPI):
     model_hub = ModelHubManager(settings=settings, storage=storage)
     dispatcher = DispatcherManager(settings, storage=storage)
     telemetry = TelemetryCollector(settings)
-    learning = LearningEngine(storage)
+    learning = LearningEngine(storage, llm=llm)
     host_bridge = HostBridgeStatus(settings)
     experience = ExperienceManager(settings=settings, storage=storage)
     persona = PersonaManager(settings=settings, storage=storage)
@@ -304,6 +309,11 @@ async def runtime_backup() -> dict[str, Any]:
 @app.get("/api/operator/queue", response_model=OperatorQueueResponse)
 async def operator_queue() -> OperatorQueueResponse:
     return operator_queue_snapshot(app.state.settings, app.state.storage)
+
+
+@app.get("/api/operator/quality")
+async def operator_quality() -> dict[str, Any]:
+    return answer_quality_report(app.state.storage)
 
 
 @app.get("/api/model-profiles", response_model=ModelProfilesResponse)
@@ -586,7 +596,7 @@ async def telemetry_live() -> TelemetryResponse:
 
 @app.post("/api/learning/tick", response_model=LearningTickResponse)
 async def learning_tick() -> LearningTickResponse:
-    result = app.state.learning.tick()
+    result = await app.state.learning.tick_async()
     await app.state.bus.publish({"channel": "learning", "lesson_count": result["lesson_count"]})
     return result
 
@@ -727,6 +737,17 @@ async def update_autonomy_job(
     if job is None:
         raise HTTPException(status_code=404, detail="Autonomy job not found")
     await app.state.bus.publish({"channel": "autonomy.jobs", "action": "updated", "job_id": job_id})
+    return job
+
+
+@app.post("/api/autonomy/jobs/{job_id}/cancel", response_model=AutonomyJobResponse)
+async def cancel_autonomy_job(job_id: str) -> AutonomyJobResponse:
+    job = app.state.operations.update_job(job_id, {"status": "cancelled"})
+    if job is None:
+        raise HTTPException(status_code=404, detail="Autonomy job not found")
+    await app.state.bus.publish(
+        {"channel": "autonomy.jobs", "action": "cancelled", "job_id": job_id}
+    )
     return job
 
 

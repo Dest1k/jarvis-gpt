@@ -9,6 +9,27 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-09 - Codex (headless web, learning, autonomy controls)
+
+- Implemented the remaining broad hardening/observability items except model
+  profiles, which stay as future scaffolding.
+- Added `web.render`: isolated headless Chrome/Edge DOM render for JS-heavy
+  public pages. It uses a throwaway profile and does not open the operator's
+  Chrome. `web.search`/`web.fetch` now use a public-only httpx transport that
+  pins connections to already validated public DNS answers.
+- Extended safe local inspection: `system.inspect` can now run `screen.capture`
+  into Jarvis cache without approval, while mutating native actions still go
+  through `windows.native` approval gates.
+- Learning tick is now LLM-assisted when the local LLM is available:
+  deterministic lessons are still produced first, then a short JSON-only
+  distillation pass can add up to two grounded behavioral lessons.
+- Added quality visibility (`GET /api/operator/quality`, Command Center Quality
+  panel) and autonomy visibility/control: job priority, optional deadline,
+  runtime budget timeout, cancel endpoint, queue surfacing for failed/cancelled
+  jobs, and trace timeline polish.
+- Verified: ruff, full backend pytest (201 pass), frontend typecheck/build, and
+  a live `web.fetch`/`web.render` smoke against `https://example.com/`.
+
 ### 2026-07-09 - Codex
 
 - Runtime hardening pass: API remains loopback-open, but remote HTTP and

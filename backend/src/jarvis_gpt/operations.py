@@ -193,6 +193,7 @@ class OperationsManager:
     def due_jobs(self, *, now: datetime | None = None, limit: int = 3) -> list[dict[str, Any]]:
         current = now or datetime.now(UTC)
         due = [job for job in self.list_jobs() if _job_is_due(job, current)]
+        due.sort(key=_job_due_sort_key)
         return due[: max(1, min(10, int(limit)))]
 
     def create_job(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -225,6 +226,8 @@ class OperationsManager:
             if job["id"] == job_id:
                 before = job
                 updated = _normalize_job({**job, **patch, "updated_at": utc_now()})
+                if updated["status"] == "cancelled" and not updated.get("cancelled_at"):
+                    updated["cancelled_at"] = utc_now()
                 self.storage.record_audit(
                     actor="operator",
                     action="autonomy.job.update",
@@ -260,7 +263,9 @@ class OperationsManager:
                 status = job["status"]
                 run_count = int(job.get("run_count") or 0) + 1
                 requested_status = str(result.get("job_status") or "")
-                if requested_status in {"enabled", "paused", "done"}:
+                if status == "cancelled":
+                    requested_status = "cancelled"
+                if requested_status in {"enabled", "paused", "done", "cancelled"}:
                     status = requested_status
                 elif run_count >= int(job["budget"]["max_runs"]):
                     status = "done"
@@ -280,6 +285,8 @@ class OperationsManager:
                     "last_run_at": now,
                     "next_run_after": next_run_after,
                     "last_result": result,
+                    "cancelled_at": job.get("cancelled_at")
+                    or (now if status == "cancelled" else None),
                     "updated_at": now,
                 }
                 next_jobs.append(updated)
@@ -310,6 +317,7 @@ class OperationsManager:
             "ok": bool(result.get("ok")),
             "summary": str(result.get("summary") or "")[:500],
             "job_status": result.get("job_status"),
+            "priority": _bounded_int(job.get("priority"), 0, 100, 0),
         }
         history = _list(self.storage.get_runtime_value(AUTONOMY_JOB_RUNS_KEY, []))
         self.storage.set_runtime_value(AUTONOMY_JOB_RUNS_KEY, [item, *history][:200])
@@ -388,7 +396,7 @@ def _normalize_job(value: dict[str, Any]) -> dict[str, Any]:
     if kind not in {"diagnostics", "learning.tick", "self_heal", "benchmark", "mission"}:
         kind = "diagnostics"
     status = str(value.get("status") or "enabled")
-    if status not in {"enabled", "paused", "done"}:
+    if status not in {"enabled", "paused", "done", "cancelled"}:
         status = "enabled"
     budget = _dict(value.get("budget"))
     default_max_runs = 100 if kind == "mission" else 1
@@ -404,6 +412,7 @@ def _normalize_job(value: dict[str, Any]) -> dict[str, Any]:
         },
         "payload": _dict(value.get("payload")),
         "run_count": _bounded_int(value.get("run_count"), 0, 10000, 0),
+        "priority": _bounded_int(value.get("priority"), 0, 100, 0),
         "consecutive_failures": _bounded_int(value.get("consecutive_failures"), 0, 1000, 0),
         "created_at": str(value.get("created_at") or utc_now()),
         "updated_at": str(value.get("updated_at") or utc_now()),
@@ -412,6 +421,8 @@ def _normalize_job(value: dict[str, Any]) -> dict[str, Any]:
         "last_duration_ms": value.get("last_duration_ms"),
         "last_run_at": value.get("last_run_at"),
         "next_run_after": value.get("next_run_after"),
+        "deadline_at": value.get("deadline_at"),
+        "cancelled_at": value.get("cancelled_at"),
         "last_result": _dict(value.get("last_result")),
     }
 
@@ -451,6 +462,9 @@ def _job_is_due(job: dict[str, Any], now: datetime) -> bool:
     budget = _dict(job.get("budget"))
     if int(job.get("run_count") or 0) >= _bounded_int(budget.get("max_runs"), 1, 1000, 1):
         return False
+    deadline = _parse_datetime(job.get("deadline_at"))
+    if deadline is not None and now > deadline:
+        return False
     next_run_after = _parse_datetime(job.get("next_run_after"))
     if next_run_after is not None and now < next_run_after:
         return False
@@ -466,6 +480,11 @@ def _job_is_due(job: dict[str, Any], now: datetime) -> bool:
     if last_run is None:
         return True
     return now - last_run >= interval
+
+
+def _job_due_sort_key(job: dict[str, Any]) -> tuple[int, datetime, str]:
+    created = _parse_datetime(job.get("created_at")) or datetime.now(UTC)
+    return (-_bounded_int(job.get("priority"), 0, 100, 0), created, str(job.get("id") or ""))
 
 
 def _cadence_interval(cadence: str) -> timedelta | None:
