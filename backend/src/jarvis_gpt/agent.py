@@ -2068,6 +2068,12 @@ class AgentRuntime:
                     content=f"Unknown tool requested: {name}",
                     payload={"tool": name},
                 )
+            payload: dict[str, Any] = {"tool": name, "arguments": args}
+            mission_id = None
+            conversation_id = str(context.conversation_id or "")
+            if conversation_id.startswith("mission:"):
+                mission_id = conversation_id.split(":", 1)[1]
+                payload["mission_id"] = mission_id
             gate = self.storage.create_approval(
                 title=f"Автономный запрос инструмента {name}",
                 description=(
@@ -2076,7 +2082,7 @@ class AgentRuntime:
                 ),
                 requested_action="tool.run",
                 risk=spec.danger_level if spec.danger_level in {"review", "danger"} else "review",
-                payload={"tool": name, "arguments": args},
+                payload=payload,
             )
             observation = (
                 f"observation[{name} · blocked]: инструмент требует подтверждения оператора; "
@@ -2087,7 +2093,12 @@ class AgentRuntime:
                 type="approval",
                 title=f"Approval requested: {name}",
                 content=f"Autonomous tool {name} needs operator approval.",
-                payload={"approval_id": gate["id"], "tool": name, "risk": spec.danger_level},
+                payload={
+                    "approval_id": gate["id"],
+                    "tool": name,
+                    "risk": spec.danger_level,
+                    "mission_id": mission_id,
+                },
             )
         result = await self.tools.run(name, args)
         event = ChatEvent(

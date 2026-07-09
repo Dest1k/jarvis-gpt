@@ -222,6 +222,42 @@ def test_mission_step_executes_with_tools_when_llm_enabled(monkeypatch, tmp_path
     storage.close()
 
 
+def test_mission_step_approval_carries_mission_id(monkeypatch, tmp_path):
+    class MissionDangerLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, messages, *, temperature=None, max_tokens=None, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return _result(
+                    '{"tool": "host.bridge.execute", "arguments": {"command": "Get-Date"}}'
+                )
+            return _result("Шаг требует подтверждения оператора для действия на хосте.")
+
+    agent, storage = _agent(monkeypatch, tmp_path, MissionDangerLLM())
+
+    async def fail_run(name, arguments=None, **kwargs):
+        raise AssertionError(f"dangerous tool {name} must not run autonomously")
+
+    monkeypatch.setattr(agent.tools, "run", fail_run)
+    mission = agent.create_mission("Проверить дату на хосте")
+
+    response = asyncio.run(agent.execute_next_mission_step(mission["id"]))
+
+    assert response.task is not None
+    pending = storage.list_approvals(limit=10, status="pending")
+    assert len(pending) == 1
+    payload = pending[0]["payload"]
+    if isinstance(payload, str):
+        import json as _json
+
+        payload = _json.loads(payload)
+    assert payload.get("mission_id") == mission["id"]
+    assert payload.get("tool") == "host.bridge.execute"
+    storage.close()
+
+
 def test_agentic_stream_plain_answer_has_no_regression(monkeypatch, tmp_path):
     class PlainStreamLLM:
         async def stream_complete(self, messages, *, temperature=None, max_tokens=None, **kwargs):

@@ -3088,15 +3088,27 @@ export default function CommandCenter() {
                     >
                       <ClipboardCheck size={14} />
                     </button>
-                    <button
-                      type="button"
-                      title="Заблокировано"
-                      aria-label="Заблокировано"
-                      disabled={busy || task.status === "blocked"}
-                      onClick={() => updateTaskStatus(mission.id, task.id, "blocked")}
-                    >
-                      <ShieldAlert size={14} />
-                    </button>
+                    {task.status === "blocked" ? (
+                      <button
+                        type="button"
+                        title="Повторить шаг (после подтверждения допуска)"
+                        aria-label="Повторить шаг"
+                        disabled={busy}
+                        onClick={() => updateTaskStatus(mission.id, task.id, "pending")}
+                      >
+                        <RefreshCw size={14} />
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        title="Заблокировано"
+                        aria-label="Заблокировано"
+                        disabled={busy}
+                        onClick={() => updateTaskStatus(mission.id, task.id, "blocked")}
+                      >
+                        <ShieldAlert size={14} />
+                      </button>
+                    )}
                   </div>
                 </div>
               ))}
