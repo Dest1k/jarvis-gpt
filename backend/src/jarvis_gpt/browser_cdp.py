@@ -37,6 +37,9 @@ class BrowserPageSnapshot:
     text: str
     truncated: bool
     needs_human_verification: bool
+    form_count: int = 0
+    password_input_count: int = 0
+    sensitive_input_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -224,6 +227,9 @@ async def _snapshot_page(
         text=text,
         truncated=truncated,
         needs_human_verification=looks_like_human_verification(title, text),
+        form_count=_int_value(value.get("formCount")),
+        password_input_count=_int_value(value.get("passwordInputCount")),
+        sensitive_input_count=_int_value(value.get("sensitiveInputCount")),
     )
 
 
@@ -231,6 +237,15 @@ def _snapshot_expression(limit: int) -> str:
     return f"""(() => {{
   const limit = {int(limit)};
   const raw = document.body ? (document.body.innerText || "") : "";
+  const inputs = Array.from(document.querySelectorAll("input, textarea"));
+  const sensitive = inputs.filter((input) => {{
+    const type = String(input.getAttribute("type") || "").toLowerCase();
+    const name = String(input.getAttribute("name") || "").toLowerCase();
+    const id = String(input.getAttribute("id") || "").toLowerCase();
+    const autocomplete = String(input.getAttribute("autocomplete") || "").toLowerCase();
+    const hint = `${{type}} ${{name}} ${{id}} ${{autocomplete}}`;
+    return /password|passcode|otp|token|secret|card|cc-|credit|cvv|cvc|ssn|passport/.test(hint);
+  }});
   const text = raw
     .replace(/\\r/g, "")
     .replace(/[ \\t]+\\n/g, "\\n")
@@ -241,7 +256,12 @@ def _snapshot_expression(limit: int) -> str:
     title: document.title || "",
     url: location.href,
     readyState: document.readyState,
-    text
+    text,
+    formCount: document.forms ? document.forms.length : 0,
+    passwordInputCount: inputs.filter((input) =>
+      String(input.getAttribute("type") || "").toLowerCase() === "password"
+    ).length,
+    sensitiveInputCount: sensitive.length
   }};
 }})()"""
 
@@ -249,3 +269,10 @@ def _snapshot_expression(limit: int) -> str:
 def looks_like_human_verification(title: str, text: str) -> bool:
     haystack = f"{title}\n{text[:2000]}".lower()
     return any(marker in haystack for marker in HUMAN_VERIFICATION_MARKERS)
+
+
+def _int_value(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0

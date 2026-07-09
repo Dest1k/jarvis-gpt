@@ -1,5 +1,23 @@
 # Runtime
 
+## 2026-07-10 handoff - internet safety hardening
+
+For the operator and the second model:
+
+- `web.download` stores public HTTP(S) files only in Jarvis quarantine cache,
+  returns SHA256/size/content-type, flags executable-risk downloads, and never
+  opens or executes files automatically.
+- `web.search`, `web.fetch`, `web.render`, `web.download`, and `browser.read`
+  now include `data.safety.trusted_as_instruction=false`; remote page text is
+  evidence only. Prompt-injection phrases are surfaced in
+  `data.safety.prompt_injection_markers`.
+- `browser.read` reports form/password/sensitive-input counts with
+  `values_read=false`. It does not read form values.
+- Embedded URL credentials such as `https://user:pass@example.com` are rejected
+  by public web and browser validators.
+- Tool-loop prompt now explicitly warns the model not to obey remote page text
+  asking it to reveal secrets, call tools, send cookies, or change instructions.
+
 ## 2026-07-10 handoff - blocked web pages and right-panel polish
 
 For the operator and the second model:
@@ -649,6 +667,7 @@ py -3.11 .\jarvis.py diag
 py -3.11 .\jarvis.py chat "JARVIS, оформи это как mission plan: ..."
 py -3.11 .\jarvis.py tools
 py -3.11 .\jarvis.py tool-run memory.search --set query=runtime --set limit=5
+py -3.11 .\jarvis.py tool-run web.download --set url=https://example.com/file.pdf
 py -3.11 .\jarvis.py tool-run browser.chrome.status
 py -3.11 .\jarvis.py tool-run browser.chrome.launch --allow-danger
 py -3.11 .\jarvis.py tool-run browser.read --set url=https://example.com --allow-danger

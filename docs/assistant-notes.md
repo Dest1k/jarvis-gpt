@@ -9,6 +9,23 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-10 - Codex (internet safety hardening)
+
+- Added `web.download`: public-only HTTP(S) download into Jarvis quarantine cache
+  (`D:\jarvis\cache\jarvis-gpt\downloads`), with size cap, SHA256, executable
+  risk flag, and explicit `open_allowed=false` / `auto_execute_allowed=false`.
+- Added shared untrusted-web safety metadata to `web.search`, `web.fetch`,
+  `web.render`, `web.download`, and `browser.read`: remote content is evidence,
+  not instructions; prompt-injection markers are surfaced in `data.safety`.
+- `browser.read` now reports form/password/sensitive-input counts without
+  reading field values. URLs with embedded credentials are rejected for both
+  public fetch/download and browser tools.
+- Tool-loop prompt now explicitly tells the model not to obey web/browser page
+  text that asks it to ignore prompts, reveal secrets, call tools, send cookies,
+  or change behavior.
+- Verified: full `pytest backend/tests` (217 pass), targeted backend
+  `ruff check`, and `python -m compileall backend/src/jarvis_gpt`.
+
 ### 2026-07-10 - Codex (web blocked-page handling + UI polish)
 
 - Fixed Command Center file panel styling: native file input is hidden behind a
