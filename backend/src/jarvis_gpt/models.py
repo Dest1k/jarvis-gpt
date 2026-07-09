@@ -63,6 +63,11 @@ class MessageItem(BaseModel):
     created_at: str
 
 
+class MessageFeedbackRequest(BaseModel):
+    rating: Literal["up", "down"]
+    comment: str = Field(default="", max_length=600)
+
+
 class MissionCreateRequest(BaseModel):
     goal: str = Field(min_length=1, max_length=20000)
     title: str | None = Field(default=None, max_length=240)
@@ -419,7 +424,7 @@ class MissionRunResponse(BaseModel):
 
 class OperatorQueueItem(BaseModel):
     id: str
-    kind: Literal["approval", "mission", "health", "generation", "memory", "model"]
+    kind: Literal["approval", "mission", "health", "generation", "memory", "model", "quality"]
     status: str
     title: str
     detail: str = ""

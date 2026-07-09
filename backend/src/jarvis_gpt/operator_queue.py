@@ -110,6 +110,47 @@ def operator_queue_snapshot(settings: JarvisSettings, storage: JarvisStorage) ->
             )
             break
 
+    quality = answer_quality_report(storage)
+    if quality["negative_feedback"]:
+        latest = quality["negative_feedback"][0]
+        payload = latest.get("payload") if isinstance(latest.get("payload"), dict) else {}
+        comment = str(payload.get("comment") or "").strip()
+        items.append(
+            {
+                "id": "quality:feedback",
+                "kind": "quality",
+                "status": "operator-flagged",
+                "title": (
+                    f"Оператор отметил {len(quality['negative_feedback'])} ответ(а) "
+                    "как неудачные"
+                ),
+                "detail": comment or str(latest.get("content") or "")[:180],
+                "priority": "high",
+                "action": "review_lessons",
+                "updated_at": latest.get("ts"),
+                "payload": {
+                    "count": len(quality["negative_feedback"]),
+                    "message_id": payload.get("message_id"),
+                },
+            }
+        )
+    if len(quality["revises"]) >= 3:
+        items.append(
+            {
+                "id": "quality:self-check",
+                "kind": "quality",
+                "status": "recurring-gaps",
+                "title": (
+                    f"Самопроверка нашла пробелы в {len(quality['revises'])} недавних ответах"
+                ),
+                "detail": "; ".join(quality["top_gaps"][:3]),
+                "priority": "medium",
+                "action": "learning_tick",
+                "updated_at": quality["revises"][0].get("ts"),
+                "payload": {"count": len(quality["revises"]), "gaps": quality["top_gaps"]},
+            }
+        )
+
     if int(memory_hygiene["stats"].get("duplicate_groups", 0)) > 0:
         items.append(
             {
@@ -152,6 +193,32 @@ def operator_queue_snapshot(settings: JarvisSettings, storage: JarvisStorage) ->
         "items": items[:25],
         "memory_hygiene": memory_hygiene,
         "model_profiles": model_profiles,
+    }
+
+
+def answer_quality_report(storage: JarvisStorage, *, limit: int = 40) -> dict[str, Any]:
+    """Aggregate recent quality signals: operator feedback and failed self-checks."""
+
+    observations = storage.list_learning_observations(limit=limit)
+    negative_feedback = [
+        item
+        for item in observations
+        if item.get("kind") == "operator.feedback"
+        and isinstance(item.get("payload"), dict)
+        and item["payload"].get("rating") == "down"
+    ]
+    revises = [item for item in observations if item.get("kind") == "verification.revise"]
+    gaps: list[str] = []
+    for item in revises:
+        payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+        missing = payload.get("missing")
+        if isinstance(missing, list):
+            gaps.extend(str(gap)[:120] for gap in missing[:2] if str(gap).strip())
+    top_gaps = [gap for gap, _count in Counter(gaps).most_common(5)]
+    return {
+        "negative_feedback": negative_feedback,
+        "revises": revises,
+        "top_gaps": top_gaps,
     }
 
 

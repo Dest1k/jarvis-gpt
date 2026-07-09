@@ -566,6 +566,69 @@ class JarvisStorage:
             return None
         return {**dict(row), "metadata": _loads(row["metadata"], {})}
 
+    def set_message_feedback(
+        self,
+        message_id: str,
+        *,
+        rating: str,
+        comment: str = "",
+    ) -> dict[str, Any] | None:
+        """Persist operator feedback on an assistant message.
+
+        The rating lands in the message metadata (so the UI can restore it) and
+        in the append-only learning journal (so the learning tick can turn it
+        into a durable lesson even after the visible chat is deleted).
+        """
+
+        message = self.get_message(message_id)
+        if message is None:
+            return None
+        rating = "up" if str(rating).strip().lower() == "up" else "down"
+        comment = " ".join(str(comment or "").split())[:600]
+        feedback = {"rating": rating, "comment": comment, "ts": utc_now()}
+        metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+        metadata = {**metadata, "feedback": feedback}
+        with self._lock:
+            conn = self.connect()
+            conn.execute(
+                "UPDATE messages SET metadata = ? WHERE id = ?",
+                (_json(metadata), message_id),
+            )
+            self._insert_learning_observation(
+                conn,
+                kind="operator.feedback",
+                source_id=message_id,
+                conversation_id=message.get("conversation_id"),
+                role="operator",
+                content=str(message.get("content") or "")[:2000],
+                summary=(
+                    f"Operator rated an answer {rating}"
+                    + (f": {comment}" if comment else ".")
+                ),
+                payload={"rating": rating, "comment": comment, "message_id": message_id},
+            )
+            conn.commit()
+        self.record_audit(
+            actor="operator",
+            action="message.feedback",
+            target_type="message",
+            target_id=message_id,
+            summary=f"Feedback {rating}" + (f": {comment[:120]}" if comment else ""),
+            after=feedback,
+        )
+        self.add_event(
+            kind="feedback",
+            title=f"Оценка ответа: {'полезно' if rating == 'up' else 'мимо задачи'}",
+            level="info" if rating == "up" else "warn",
+            payload={
+                "message_id": message_id,
+                "conversation_id": message.get("conversation_id"),
+                "rating": rating,
+                "comment": comment,
+            },
+        )
+        return {**message, "metadata": metadata}
+
     def delete_conversation(self, conversation_id: str) -> bool:
         with self._lock:
             conn = self.connect()

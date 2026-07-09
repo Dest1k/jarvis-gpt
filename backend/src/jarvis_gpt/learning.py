@@ -73,6 +73,105 @@ class LearningEngine:
         observations: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         lessons: list[dict[str, Any]] = []
+
+        # Outcome signals come first: they carry the operator's own judgement
+        # (feedback), the self-check's findings and explicit approval denials,
+        # so they must survive the lesson cap ahead of generic activity notes.
+        negative_feedback = [
+            item
+            for item in observations
+            if item.get("kind") == "operator.feedback"
+            and isinstance(item.get("payload"), dict)
+            and item["payload"].get("rating") == "down"
+        ]
+        if negative_feedback:
+            fragments = []
+            for item in negative_feedback[:3]:
+                payload = item["payload"]
+                excerpt = _compact_text(str(item.get("content") or ""), 110)
+                comment = _compact_text(str(payload.get("comment") or ""), 110)
+                fragments.append(f"«{excerpt}»" + (f" — оператор: {comment}" if comment else ""))
+            lessons.append(
+                {
+                    "content": (
+                        "Оператор отметил ответы как неудачные; избегай повторения в похожих "
+                        "задачах: " + " | ".join(fragments)
+                    ),
+                    "tags": ["learning", "feedback", "operator"],
+                    "importance": 0.9,
+                }
+            )
+
+        positive_feedback = [
+            item
+            for item in observations
+            if item.get("kind") == "operator.feedback"
+            and isinstance(item.get("payload"), dict)
+            and item["payload"].get("rating") == "up"
+            and str(item["payload"].get("comment") or "").strip()
+        ]
+        if positive_feedback:
+            fragments = [
+                _compact_text(str(item["payload"].get("comment") or ""), 130)
+                for item in positive_feedback[:3]
+            ]
+            lessons.append(
+                {
+                    "content": (
+                        "Оператор явно похвалил такие ответы — воспроизводи этот стиль/подход: "
+                        + " | ".join(fragments)
+                    ),
+                    "tags": ["learning", "feedback", "operator"],
+                    "importance": 0.68,
+                }
+            )
+
+        revises = [
+            item
+            for item in observations
+            if item.get("kind") == "verification.revise"
+        ]
+        if revises:
+            gaps: list[str] = []
+            for item in revises[:4]:
+                payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+                missing = payload.get("missing")
+                if isinstance(missing, list) and missing:
+                    gaps.extend(_compact_text(str(gap), 100) for gap in missing[:2])
+                else:
+                    gaps.append(_compact_text(str(item.get("summary") or ""), 100))
+            gaps = list(dict.fromkeys(gap for gap in gaps if gap))[:5]
+            if gaps:
+                lessons.append(
+                    {
+                        "content": (
+                            "Самопроверка регулярно находит одни и те же пробелы — закрывай их "
+                            "сразу в черновике: " + " | ".join(gaps)
+                        ),
+                        "tags": ["learning", "verification", "quality"],
+                        "importance": 0.74,
+                    }
+                )
+
+        rejected = [item for item in approvals if item.get("status") == "rejected"]
+        if rejected:
+            titles = [
+                _compact_text(str(item.get("title") or ""), 110)
+                for item in rejected[:3]
+                if str(item.get("title") or "").strip()
+            ]
+            if titles:
+                lessons.append(
+                    {
+                        "content": (
+                            "Оператор отклонил эти approval-гейты — не предлагай такие действия "
+                            "повторно без новых оснований: " + " | ".join(titles)
+                        ),
+                        "tags": ["learning", "approval", "operator"],
+                        "importance": 0.8,
+                    }
+                )
+
         dialogue = [
             item
             for item in observations
@@ -184,7 +283,7 @@ class LearningEngine:
                     "importance": 0.55,
                 }
             )
-        return lessons[:5]
+        return lessons[:6]
 
 
 def _compact_text(value: str, max_chars: int) -> str:

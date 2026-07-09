@@ -9,6 +9,32 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-09 - Claude (experience loop)
+
+- Closed the open half of the self-learning thesis: signals -> lessons ->
+  behavior is now a loop, not a shelf.
+- Operator feedback: `POST /api/messages/{id}/feedback` +
+  `storage.set_message_feedback` (message metadata for UI restore, journal
+  `operator.feedback` that survives chat deletion, audit, WS `feedback` event).
+  Command Center has 👍/👎 on assistant bubbles (comment prompt on 👎).
+- `verification.revise` verdicts are journaled from `_verify_and_repair_answer`.
+- LearningEngine v2 derives priority lessons from negative/positive feedback,
+  recurring self-check gaps, and rejected approvals — quoting real operator
+  text; lesson cap raised to 6.
+- `AgentRuntime._lessons_prompt()` injects top lessons (importance/recency,
+  ~900 chars) into every chat/stream turn and mission step — this is the piece
+  that makes learning change behavior deterministically.
+- `answer_quality_report` + operator queue `quality` items
+  (`quality:feedback` high, `quality:self-check` at >=3 revises).
+- Frontend: feedback buttons, verification shield badge on bubbles (restored
+  from metadata on reload), «Отчёт» button on done missions, auto-report after
+  «Запустить всё». New CSS: `.bubbleAction.selected`, `.bubbleBadge`.
+- Tests: `backend/tests/test_experience_loop.py` (5). Full run: 178 pass, ruff
+  clean, frontend typecheck + build clean.
+- Possible next steps: show quality history chart; let learning tick distill
+  lessons via LLM (deterministic templates stay the fallback); feedback-driven
+  persona insights.
+
 ### 2026-07-09 - Claude (result integrity layer)
 
 - New module `backend/src/jarvis_gpt/verification.py`: strict JSON critic

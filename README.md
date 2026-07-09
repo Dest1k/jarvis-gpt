@@ -25,6 +25,7 @@
 - Result integrity: substantive-ответы проходят самопроверку против задачи и критериев готовности с одним ремонт-раундом (rewrite в чате, «Поправка после самопроверки» в стриме, переписанный отчёт шага миссии); сбой критика никогда не портит ответ. Выключается `JARVIS_VERIFY_ANSWERS=0` или policy-ключом `verify_answers`.
 - Итоговый mission-отчёт: завершённая миссия синтезирует операторский deliverable (LLM + детерминированный fallback), доступный через `final_report`, `GET /api/missions/{id}/report`, событие `mission_report` и память.
 - Clarify-маршрут: если задача действительно неоднозначна, арбитр задаёт один точный вопрос вместо уверенной догадки.
+- Experience loop: оценки оператора (👍/👎 с комментарием), revise-вердикты самопроверки и отклонённые допуски становятся уроками с реальными цитатами, а топ-уроки вставляются в промпт каждого хода — негативный опыт меняет поведение со следующего ответа. Качество агрегируется в operator queue (kind `quality`).
 - Retrieval adds normalized relevance, matched terms and snippets for memory/file context.
 - Learning tick deduplicates repeated lessons before writing long-term memory.
 - Autonomous supervisor: безопасный фоновой цикл собирает telemetry и запускает learning tick.

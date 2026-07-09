@@ -70,6 +70,7 @@ from .models import (
     MemoryHygieneResponse,
     MemoryItem,
     MemoryVaultResponse,
+    MessageFeedbackRequest,
     MessageItem,
     Mission,
     MissionCreateRequest,
@@ -733,6 +734,27 @@ async def list_conversation_messages(
     if not messages and app.state.storage.get_conversation(conversation_id) is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
     return messages
+
+
+@app.post("/api/messages/{message_id}/feedback", response_model=MessageItem)
+async def set_message_feedback(message_id: str, request: MessageFeedbackRequest) -> MessageItem:
+    updated = app.state.storage.set_message_feedback(
+        message_id,
+        rating=request.rating,
+        comment=request.comment,
+    )
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Message not found")
+    if app.state.bus is not None:
+        await app.state.bus.publish(
+            {
+                "channel": "agent",
+                "type": "feedback",
+                "title": "Оценка ответа получена",
+                "payload": {"message_id": message_id, "rating": request.rating},
+            }
+        )
+    return MessageItem.model_validate(updated)
 
 
 @app.delete("/api/conversations/{conversation_id}")

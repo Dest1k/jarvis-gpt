@@ -8,6 +8,7 @@ import re
 import time
 import uuid
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
@@ -1280,6 +1281,9 @@ class AgentRuntime:
         persona_prompt = self._persona_prompt()
         if persona_prompt:
             base_messages.append({"role": "system", "content": persona_prompt})
+        lessons_prompt = self._lessons_prompt()
+        if lessons_prompt:
+            base_messages.append({"role": "system", "content": lessons_prompt})
         base_messages.append(
             {
                 "role": "user",
@@ -2725,6 +2729,21 @@ class AgentRuntime:
         if verdict.verdict == "pass":
             event = self._verification_event(verdict)
             return answer, [event], event.payload
+        # Failed self-checks are learning signals: the journal survives chat
+        # deletion, and the learning tick turns repeated gaps into lessons.
+        # Journaling must never break a turn, hence the suppress.
+        with suppress(Exception):
+            self.storage.record_learning_observation(
+                kind="verification.revise",
+                conversation_id=str(context.conversation_id or "") or None,
+                role="verifier",
+                content=task[:1200],
+                summary=(
+                    "Self-check found gaps: "
+                    + ("; ".join(verdict.missing) or verdict.fix_hint or "unspecified")
+                ),
+                payload=verdict.payload(),
+            )
         repaired_text = ""
         try:
             result = await self._complete_llm(
@@ -3071,6 +3090,9 @@ class AgentRuntime:
         persona_prompt = self._persona_prompt()
         if persona_prompt:
             messages.append({"role": "system", "content": persona_prompt})
+        lessons_prompt = self._lessons_prompt()
+        if lessons_prompt:
+            messages.append({"role": "system", "content": lessons_prompt})
         if not thinking_enabled:
             messages.append({"role": "system", "content": THINKING_DISABLED_PROMPT})
         if memory_block:
@@ -3387,6 +3409,47 @@ class AgentRuntime:
         if profile_items:
             lines.append("Durable typed notes:")
             lines.extend(profile_items[:10])
+        return "\n".join(lines)
+
+    def _lessons_prompt(self) -> str:
+        """Render top experience lessons as a bounded system block.
+
+        Lessons only lived in the memory table before, so they influenced a turn
+        only when retrieval happened to match them. Injecting the top few every
+        turn is what actually closes the learning loop: feedback and self-check
+        findings change future behavior deterministically.
+        """
+
+        try:
+            memories = self.storage.search_memory(None, limit=40)
+        except Exception:  # noqa: BLE001 - prompt assembly must never break a turn
+            return ""
+        lessons = [item for item in memories if item.get("namespace") == "learning"]
+        if not lessons:
+            return ""
+        ranked = sorted(
+            lessons,
+            key=lambda item: (
+                float(item.get("importance") or 0),
+                str(item.get("updated_at") or item.get("created_at") or ""),
+            ),
+            reverse=True,
+        )
+        lines = ["Уроки из опыта Jarvis (применяй только к релевантным задачам):"]
+        used_chars = 0
+        for item in ranked:
+            text = " ".join(str(item.get("content") or "").split())
+            if not text:
+                continue
+            excerpt = text[:240]
+            if used_chars + len(excerpt) > 900:
+                break
+            lines.append(f"- {excerpt}")
+            used_chars += len(excerpt)
+            if len(lines) >= 6:
+                break
+        if len(lines) <= 1:
+            return ""
         return "\n".join(lines)
 
     def _persona(self) -> dict[str, Any]:

@@ -35,6 +35,7 @@ Agent Runtime
   |-- per-answer observable trace
   |-- capability/current-work manifest
   |-- result integrity (self-check, repair, mission deliverable, clarify)
+  |-- experience loop (operator feedback, outcome lessons, lessons-in-prompt)
   |
 LLM Router
   |
@@ -108,6 +109,13 @@ External host runtime
   точным вопросом, и Jarvis задаёт его вместо уверенной догадки. Порог выше
   обычного, промпт запрещает clarify при очевидном допущении — поэтому это
   инструмент против «уверенно не то», а не источник лишних переспросов.
+- Петля опыта замкнута: сигналы исхода (оценки оператора 👍/👎 с комментарием,
+  revise-вердикты самопроверки, отклонённые approval-гейты) попадают в
+  append-only learning journal, learning tick превращает их в уроки с цитатами
+  реального контекста, а топ-уроки детерминированно вставляются в промпт
+  каждого хода и каждого шага миссии. Обучение перестало зависеть от того,
+  «вспомнит» ли retrieval нужный урок; негативный опыт меняет поведение уже на
+  следующем ходу и переживает удаление видимой истории чата.
 - Mission approvals resume in-place: a gated mission tool stores a compact
   agentic snapshot, and the approval executor feeds the approved tool observation
   back into that same step before marking the task done/blocked.

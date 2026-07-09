@@ -1,5 +1,40 @@
 # Runtime
 
+## 2026-07-09 handoff - experience loop (feedback -> lessons -> behavior)
+
+Для оператора и второй модели. Раньше петля самообучения была разомкнута:
+сигналы качества рождались, но оператор не мог оценить ответ, LearningEngine
+строил шаблонные уроки и не видел новые сигналы, а уроки влияли на ход только
+если retrieval случайно их находил. Теперь петля замкнута.
+
+- Фидбек оператора: `POST /api/messages/{id}/feedback` (`rating: up|down`,
+  `comment`), `storage.set_message_feedback` пишет оценку в metadata сообщения
+  (UI восстанавливает её после перезагрузки), в append-only learning journal
+  (`operator.feedback`, переживает удаление чата), в аудит и в событие
+  `feedback` (WS). В Command Center у каждого ответа есть 👍/👎; на 👎 можно
+  добавить комментарий «что не так».
+- Вердикты самопроверки — теперь сигнал обучения: `revise` пишется в журнал как
+  `verification.revise` с missing-пунктами.
+- LearningEngine v2: приоритетные уроки из негативного фидбека (цитирует ответ
+  и комментарий оператора, importance 0.9), похвалы с комментарием (0.68),
+  повторяющихся пробелов самопроверки (0.74) и отклонённых approval-гейтов
+  («не предлагай повторно», 0.8). Шаблонные уроки активности остались ниже по
+  приоритету; кап поднят до 6 уроков за tick.
+- Уроки теперь реально меняют поведение: `_lessons_prompt()` вставляет топ
+  learning-уроков (сорт по importance/свежести, бюджет ~900 символов, максимум
+  5 строк) системным блоком в КАЖДЫЙ ход `chat`/`stream_chat` и в исполнение
+  шага миссии. Раньше уроки жили только в памяти и всплывали от случая к случаю.
+- Качество на виду: `answer_quality_report` агрегирует свежий негативный фидбек
+  и revise-вердикты; operator queue получает элементы kind=`quality`
+  (`quality:feedback` — high, `quality:self-check` при >=3 revise — medium).
+- Command Center: 👍/👎 и бейдж самопроверки (щит: pass/gaps) на ответах,
+  кнопка «Отчёт» на завершённых миссиях, авто-показ итогового отчёта после
+  «Запустить всё».
+- Тесты: `backend/tests/test_experience_loop.py` (5): metadata+journal фидбека
+  и выживание после удаления чата, уроки из сигналов, инъекция уроков в промпт,
+  quality-элементы очереди, запись `verification.revise` из реального чата.
+  Полный прогон — 178 pass, ruff clean, frontend typecheck + build clean.
+
 ## 2026-07-09 handoff - result integrity layer (self-check, mission deliverable, clarify)
 
 Для оператора и второй модели. Этот проход закрывает вторую половину тезиса
@@ -410,6 +445,7 @@ GET  /api/agent/trace/{conversation_id}
 GET  /api/agent/trace/message/{message_id}
 GET  /api/conversations
 GET  /api/conversations/{conversation_id}/messages
+POST /api/messages/{message_id}/feedback
 GET  /api/missions
 POST /api/missions
 POST /api/missions/{mission_id}/execute-next

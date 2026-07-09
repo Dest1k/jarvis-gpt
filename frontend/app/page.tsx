@@ -22,13 +22,17 @@ import {
   Play,
   RefreshCw,
   Save,
+  ScrollText,
   Search,
   Send,
   Server,
   ShieldAlert,
+  ShieldCheck,
   Sparkles,
   Square,
   Terminal,
+  ThumbsDown,
+  ThumbsUp,
   Trash2,
   Zap,
   Upload,
@@ -124,6 +128,8 @@ type ChatLine = {
   durationMs?: number | null;
   pending?: boolean;
   startedAt?: number | null;
+  feedback?: "up" | "down" | null;
+  verification?: { verdict: string; repaired?: boolean } | null;
 };
 
 type ChatWindow = {
@@ -271,7 +277,7 @@ type ApprovalExecution = {
 
 type OperatorQueueItem = {
   id: string;
-  kind: "approval" | "mission" | "health" | "generation" | "memory" | "model";
+  kind: "approval" | "mission" | "health" | "generation" | "memory" | "model" | "quality";
   status: string;
   title: string;
   detail: string;
@@ -641,6 +647,7 @@ type ChatStreamItem = {
   duration_ms?: number;
   error?: string;
   message_id?: string;
+  events?: Array<Record<string, unknown>>;
 };
 
 type VoiceState = "idle" | "listening";
@@ -792,6 +799,40 @@ function normalizeChatAttachments(value: unknown): ChatAttachment[] {
 
 function attachmentsFromMetadata(metadata?: Record<string, unknown>): ChatAttachment[] {
   return normalizeChatAttachments(metadata?.attachments);
+}
+
+function feedbackFromMetadata(metadata?: Record<string, unknown>): "up" | "down" | null {
+  const feedback = metadata?.feedback;
+  if (feedback && typeof feedback === "object") {
+    const rating = (feedback as Record<string, unknown>).rating;
+    if (rating === "up" || rating === "down") {
+      return rating;
+    }
+  }
+  return null;
+}
+
+function verificationFromEvents(
+  events?: unknown
+): { verdict: string; repaired?: boolean } | null {
+  if (!Array.isArray(events)) {
+    return null;
+  }
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (!event || typeof event !== "object") {
+      continue;
+    }
+    const record = event as Record<string, unknown>;
+    if (record.type !== "verification") {
+      continue;
+    }
+    const payload = (record.payload ?? {}) as Record<string, unknown>;
+    if (typeof payload.verdict === "string" && payload.verdict) {
+      return { verdict: payload.verdict, repaired: payload.repaired === true };
+    }
+  }
+  return null;
 }
 
 function attachmentHref(attachment: ChatAttachment) {
@@ -2087,7 +2128,8 @@ export default function CommandCenter() {
                       content: !receivedDelta && item.answer ? item.answer : line.content,
                       durationMs,
                       pending: false,
-                      startedAt: null
+                      startedAt: null,
+                      verification: verificationFromEvents(item.events) ?? line.verification ?? null
                     }
                   : line
               )
@@ -2206,6 +2248,44 @@ export default function CommandCenter() {
     window.addEventListener("pointerup", onUp, { once: true });
   }
 
+  async function sendMessageFeedback(line: ChatLine, rating: "up" | "down") {
+    if (!line.id || !line.id.startsWith("msg_") || line.feedback) {
+      return;
+    }
+    let comment = "";
+    if (rating === "down") {
+      comment = window.prompt("Что не так с ответом? (необязательно)")?.trim() ?? "";
+    }
+    try {
+      await api<MessageItem>(`/api/messages/${encodeURIComponent(line.id)}/feedback`, {
+        method: "POST",
+        body: JSON.stringify({ rating, comment })
+      });
+      setLines((current) =>
+        current.map((item) => (item.id === line.id ? { ...item, feedback: rating } : item))
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Не удалось отправить оценку ответа");
+    }
+  }
+
+  async function showMissionReport(missionId: string) {
+    setBusy(true);
+    try {
+      const record = await api<{ report: string }>(
+        `/api/missions/${encodeURIComponent(missionId)}/report`
+      );
+      setLines((current) => [
+        ...current,
+        { role: "system", content: `Итоговый отчёт миссии:\n\n${record.report}` }
+      ]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Отчёт миссии ещё не готов");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function loadConversation(id: string) {
     const conversation = conversations.find((item) => item.id === id);
     transcriptShouldStickRef.current = true;
@@ -2231,7 +2311,9 @@ export default function CommandCenter() {
             attachments: attachmentsFromMetadata(message.metadata),
             durationMs: coerceDurationMs(message.metadata?.duration_ms),
             pending: false,
-            startedAt: null
+            startedAt: null,
+            feedback: feedbackFromMetadata(message.metadata),
+            verification: verificationFromEvents(message.metadata?.events)
           }))
       );
     } catch (err) {
@@ -2844,6 +2926,19 @@ export default function CommandCenter() {
             ? `Миссия остановлена: шаг требует внимания или подтверждения (после ${executed} шаг(ов)).`
             : `Достигнут лимит шагов (${executed}). Запусти ещё раз, чтобы продолжить.`;
       setLines((current) => [...current, { role: "system", content: label }]);
+      if (stoppedReason === "completed") {
+        try {
+          const record = await api<{ report: string }>(
+            `/api/missions/${encodeURIComponent(missionId)}/report`
+          );
+          setLines((current) => [
+            ...current,
+            { role: "system", content: `Итоговый отчёт миссии:\n\n${record.report}` }
+          ]);
+        } catch {
+          // Отчёт синтезируется на последнем шаге; если его ещё нет — кнопка «Отчёт».
+        }
+      }
       await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Не удалось выполнить миссию");
@@ -3303,6 +3398,18 @@ export default function CommandCenter() {
                 )}
                 <span>{runningMissionId === mission.id ? "Выполняю…" : "Запустить всё"}</span>
               </button>
+              {mission.status === "done" && (
+                <button
+                  className="iconText compact"
+                  type="button"
+                  onClick={() => showMissionReport(mission.id)}
+                  disabled={busy}
+                  title="Показать итоговый отчёт миссии"
+                >
+                  <ScrollText size={15} />
+                  <span>Отчёт</span>
+                </button>
+              )}
               <button
                 className="iconText compact"
                 type="button"
@@ -3737,15 +3844,57 @@ export default function CommandCenter() {
                         )}
                         {line.role === "assistant" && line.content.trim() && !line.pending && (
                           <>
-                            {line.id?.startsWith("msg_") && (
-                              <a
-                                className="bubbleAction"
-                                href={`/trace/${encodeURIComponent(line.id)}`}
-                                title="Схема мышления"
-                                aria-label="Схема мышления"
+                            {line.verification && (
+                              <span
+                                className={`bubbleBadge ${
+                                  line.verification.verdict === "pass" ? "pass" : "revise"
+                                }`}
+                                title={
+                                  line.verification.verdict === "pass"
+                                    ? "Самопроверка пройдена"
+                                    : line.verification.repaired
+                                      ? "Самопроверка нашла пробелы; ответ был исправлен"
+                                      : "Самопроверка нашла пробелы"
+                                }
                               >
-                                <Brain size={13} />
-                              </a>
+                                {line.verification.verdict === "pass" ? (
+                                  <ShieldCheck size={13} />
+                                ) : (
+                                  <ShieldAlert size={13} />
+                                )}
+                              </span>
+                            )}
+                            {line.id?.startsWith("msg_") && (
+                              <>
+                                <button
+                                  className={`bubbleAction ${line.feedback === "up" ? "selected" : ""}`}
+                                  type="button"
+                                  title="Полезный ответ"
+                                  aria-label="Полезный ответ"
+                                  disabled={Boolean(line.feedback)}
+                                  onClick={() => void sendMessageFeedback(line, "up")}
+                                >
+                                  <ThumbsUp size={13} />
+                                </button>
+                                <button
+                                  className={`bubbleAction ${line.feedback === "down" ? "selected" : ""}`}
+                                  type="button"
+                                  title="Ответ мимо задачи (учить Jarvis)"
+                                  aria-label="Ответ мимо задачи"
+                                  disabled={Boolean(line.feedback)}
+                                  onClick={() => void sendMessageFeedback(line, "down")}
+                                >
+                                  <ThumbsDown size={13} />
+                                </button>
+                                <a
+                                  className="bubbleAction"
+                                  href={`/trace/${encodeURIComponent(line.id)}`}
+                                  title="Схема мышления"
+                                  aria-label="Схема мышления"
+                                >
+                                  <Brain size={13} />
+                                </a>
+                              </>
                             )}
                             <button
                               className="bubbleAction"
