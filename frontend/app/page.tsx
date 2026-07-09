@@ -5216,7 +5216,7 @@ export default function CommandCenter() {
 
         <footer className="runtimeLine">
           <span>{status?.settings.home ?? "D:\\jarvis"}</span>
-          <span>{status?.settings.llm.base_url ?? apiUrl()}</span>
+          <span>{status?.settings.llm.base_url ?? (CONFIGURED_API_URL || DEFAULT_API_URL)}</span>
         </footer>
       </section>
     </main>
