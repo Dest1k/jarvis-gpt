@@ -22,6 +22,7 @@ Agent Runtime
   |-- HITL approval gates
   |-- telemetry and learning tick
   |-- autonomous supervisor
+  |-- long-lived autonomy executor
   |-- host bridge status and gated execution
   |-- task lifecycle
   |-- diagnostics
@@ -32,6 +33,7 @@ Agent Runtime
   |-- model profile roadmap
   |-- web evidence synthesis
   |-- per-answer observable trace
+  |-- capability/current-work manifest
   |
 LLM Router
   |
@@ -87,6 +89,16 @@ External host runtime
 - Model-profile planning is a roadmap layer for now. `GET /api/model-profiles`
   describes future planner/reviewer and fast-executor roles, but live routing
   remains on the current Gemma profile until stronger hardware and endpoints exist.
+
+## Long-Lived Autonomy
+
+- Persisted autonomy jobs can now run without a visible UI request. The supervisor
+  periodically asks the shared `AutonomyExecutor` for due work.
+- Mission jobs continue `run_mission` within budgets, preserve approval gates,
+  pause when blocked, and finish when the mission is done.
+- Normal chat and mission execution prompts include a compact
+  capability/current-work manifest so the LLM sees safe tools, gated tools,
+  current mission/conversation context, and existing background jobs.
 
 ## Runtime profiles
 

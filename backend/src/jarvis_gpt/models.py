@@ -323,9 +323,11 @@ class AutonomyStatusResponse(BaseModel):
     telemetry_interval_sec: int
     health_interval_sec: int
     learning_interval_sec: int
+    mission_interval_sec: int = 120
     last_telemetry_at: str | None = None
     last_health_at: str | None = None
     last_learning_at: str | None = None
+    last_background_job_at: str | None = None
     last_error: str | None = None
     capabilities: list[str] = Field(default_factory=list)
 
@@ -590,7 +592,13 @@ class CleanupRequest(BaseModel):
 
 class AutonomyJobCreateRequest(BaseModel):
     title: str = Field(min_length=1, max_length=120)
-    kind: Literal["diagnostics", "learning.tick", "self_heal", "benchmark"] = "diagnostics"
+    kind: Literal[
+        "diagnostics",
+        "learning.tick",
+        "self_heal",
+        "benchmark",
+        "mission",
+    ] = "diagnostics"
     cadence: str = Field(default="manual", max_length=80)
     budget: dict[str, int] = Field(default_factory=dict)
     payload: dict[str, Any] = Field(default_factory=dict)

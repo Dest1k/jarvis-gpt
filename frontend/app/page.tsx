@@ -447,9 +447,13 @@ type AutonomyStatus = {
   enabled: boolean;
   running_tasks: string[];
   telemetry_interval_sec: number;
+  health_interval_sec: number;
   learning_interval_sec: number;
+  mission_interval_sec: number;
   last_telemetry_at?: string | null;
+  last_health_at?: string | null;
   last_learning_at?: string | null;
+  last_background_job_at?: string | null;
   last_error?: string | null;
 };
 
@@ -554,10 +558,11 @@ type DockerContainers = {
 type AutonomyJob = {
   id: string;
   title: string;
-  kind: "diagnostics" | "learning.tick" | "self_heal" | "benchmark";
+  kind: "diagnostics" | "learning.tick" | "self_heal" | "benchmark" | "mission";
   status: "enabled" | "paused" | "done";
   cadence: string;
   budget: { max_runs?: number; max_minutes?: number };
+  payload: Record<string, unknown>;
   run_count: number;
   last_run_at?: string | null;
   last_result?: Record<string, unknown>;
@@ -2485,6 +2490,37 @@ export default function CommandCenter() {
     }
   }
 
+  async function enqueueMissionInBackground(missionId: string) {
+    const mission = missions.find((item) => item.id === missionId);
+    setActiveOperation({
+      title: "Фоновая миссия",
+      detail: mission?.title ?? missionId
+    });
+    setBusy(true);
+    try {
+      const created = await api<AutonomyJob>("/api/autonomy/jobs", {
+        method: "POST",
+        body: JSON.stringify({
+          title: `mission: ${mission?.title ?? missionId}`.slice(0, 120),
+          kind: "mission",
+          cadence: "background",
+          budget: { max_runs: 100, max_minutes: 60 },
+          payload: {
+            mission_id: missionId,
+            max_steps: autonomyPolicy?.max_autonomous_steps ?? 4
+          }
+        })
+      });
+      setAutonomyJobs((current) => [created, ...current].slice(0, 10));
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Не удалось поставить миссию в фон");
+    } finally {
+      setBusy(false);
+      setActiveOperation(null);
+    }
+  }
+
   async function runRoutine(routineId: string) {
     const routineTitle = routines.find((routine) => routine.id === routineId)?.title ?? routineId;
     setActiveOperation({
@@ -3266,6 +3302,25 @@ export default function CommandCenter() {
                   <Zap size={15} />
                 )}
                 <span>{runningMissionId === mission.id ? "Выполняю…" : "Запустить всё"}</span>
+              </button>
+              <button
+                className="iconText compact"
+                type="button"
+                onClick={() => enqueueMissionInBackground(mission.id)}
+                disabled={
+                  busy ||
+                  mission.status === "done" ||
+                  autonomyJobs.some(
+                    (job) =>
+                      job.kind === "mission" &&
+                      job.status === "enabled" &&
+                      stringValue(job.payload?.mission_id) === mission.id
+                  )
+                }
+                title="Поставить миссию в фоновое выполнение"
+              >
+                <Brain size={15} />
+                <span>В фон</span>
               </button>
               <small>{Math.round(mission.progress * 100)}%</small>
             </div>

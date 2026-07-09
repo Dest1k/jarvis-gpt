@@ -19,10 +19,12 @@ class RuntimeSupervisor:
         settings: JarvisSettings,
         storage: JarvisStorage,
         llm: LLMRouter | None = None,
+        autonomy_executor: Any | None = None,
     ) -> None:
         self.settings = settings
         self.storage = storage
         self.llm = llm or LLMRouter(settings)
+        self.autonomy_executor = autonomy_executor
         self.telemetry = TelemetryCollector(settings)
         self.learning = LearningEngine(storage)
         self._tasks: list[asyncio.Task[None]] = []
@@ -30,6 +32,7 @@ class RuntimeSupervisor:
         self._last_telemetry_at: str | None = None
         self._last_health_at: str | None = None
         self._last_learning_at: str | None = None
+        self._last_background_job_at: str | None = None
         self._last_error: str | None = None
 
     async def start(self) -> None:
@@ -46,6 +49,10 @@ class RuntimeSupervisor:
             asyncio.create_task(self._health_loop(), name="jarvis-health-loop"),
             asyncio.create_task(self._learning_loop(), name="jarvis-learning-loop"),
         ]
+        if self.autonomy_executor is not None:
+            self._tasks.append(
+                asyncio.create_task(self._background_job_loop(), name="jarvis-background-jobs")
+            )
         self.storage.add_event(
             kind="autonomy.start",
             title="Runtime supervisor started",
@@ -73,9 +80,11 @@ class RuntimeSupervisor:
             "telemetry_interval_sec": self.settings.telemetry_interval_sec,
             "health_interval_sec": self.settings.health_interval_sec,
             "learning_interval_sec": self.settings.learning_interval_sec,
+            "mission_interval_sec": self.settings.autonomy_mission_interval_sec,
             "last_telemetry_at": self._last_telemetry_at,
             "last_health_at": self._last_health_at,
             "last_learning_at": self._last_learning_at,
+            "last_background_job_at": self._last_background_job_at,
             "last_error": self._last_error,
             "capabilities": [
                 "telemetry.persist",
@@ -85,6 +94,9 @@ class RuntimeSupervisor:
                 "learning.observe_web",
                 "learning.append_only_journal",
                 "learning.deduplicate",
+                "background.mission.scheduler",
+                "background.mission.runner",
+                "background.mission.budgeted",
                 "audit.observe",
                 "approval.respect",
             ],
@@ -107,6 +119,12 @@ class RuntimeSupervisor:
         while True:
             await asyncio.sleep(max(60, self.settings.health_interval_sec))
             await self._record_health()
+
+    async def _background_job_loop(self) -> None:
+        await self._run_background_jobs()
+        while True:
+            await asyncio.sleep(max(30, self.settings.autonomy_mission_interval_sec))
+            await self._run_background_jobs()
 
     async def _record_telemetry(self) -> None:
         try:
@@ -162,6 +180,38 @@ class RuntimeSupervisor:
             self.storage.add_event(
                 kind="autonomy.error",
                 title="Learning loop failed",
+                level="warn",
+                payload={"error": self._last_error},
+            )
+
+    async def _run_background_jobs(self) -> None:
+        if self.autonomy_executor is None:
+            return
+        try:
+            results = await self.autonomy_executor.run_due_jobs(limit=1)
+            self._last_background_job_at = utc_now()
+            if results:
+                self.storage.add_event(
+                    kind="autonomy.background",
+                    title=f"Background autonomy ran {len(results)} due job(s)",
+                    payload={
+                        "jobs": [
+                            {
+                                "job_id": (item.get("job") or {}).get("id"),
+                                "kind": (item.get("job") or {}).get("kind"),
+                                "ok": item.get("ok"),
+                                "summary": item.get("summary"),
+                            }
+                            for item in results
+                            if isinstance(item, dict)
+                        ]
+                    },
+                )
+        except Exception as exc:  # noqa: BLE001
+            self._last_error = str(exc) or exc.__class__.__name__
+            self.storage.add_event(
+                kind="autonomy.error",
+                title="Background job loop failed",
                 level="warn",
                 payload={"error": self._last_error},
             )

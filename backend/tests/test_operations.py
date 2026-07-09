@@ -1,6 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+from datetime import UTC, datetime, timedelta
+
+from jarvis_gpt.agent import AgentRuntime
+from jarvis_gpt.autonomy_executor import AutonomyExecutor
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
+from jarvis_gpt.experience import ExperienceManager
+from jarvis_gpt.learning import LearningEngine
+from jarvis_gpt.llm import LLMRouter
 from jarvis_gpt.operations import OperationsManager, docker_container_allowed
 from jarvis_gpt.storage import JarvisStorage
 
@@ -49,6 +57,91 @@ def test_autonomy_jobs_are_budgeted(monkeypatch, tmp_path):
     assert updated is not None
     assert updated["run_count"] == 1
     assert updated["status"] == "done"
+    storage.close()
+
+
+def test_autonomy_jobs_report_due_work(monkeypatch, tmp_path):
+    manager, storage = _manager(monkeypatch, tmp_path)
+    now = datetime(2026, 7, 9, 12, tzinfo=UTC)
+    manager.create_job(
+        {
+            "title": "Manual",
+            "kind": "diagnostics",
+            "cadence": "manual",
+            "budget": {"max_runs": 3},
+        }
+    )
+    manager.create_job(
+        {
+            "title": "Due once",
+            "kind": "diagnostics",
+            "cadence": "once",
+            "budget": {"max_runs": 3},
+        }
+    )
+    interval = manager.create_job(
+        {
+            "title": "Due interval",
+            "kind": "diagnostics",
+            "cadence": "15m",
+            "budget": {"max_runs": 3},
+        }
+    )
+    manager.mark_job_run(
+        interval["id"],
+        {"ok": True, "summary": "old", "job_status": "enabled"},
+    )
+    stored = next(job for job in manager.list_jobs() if job["id"] == interval["id"])
+    manager.update_job(
+        interval["id"],
+        {"last_run_at": (now - timedelta(minutes=16)).isoformat()},
+    )
+
+    due = manager.due_jobs(now=now)
+
+    assert {job["title"] for job in due} == {"Due once", "Due interval"}
+    assert stored["status"] == "enabled"
+    storage.close()
+
+
+def test_mission_autonomy_job_runs_headless_and_persists_mission_id(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    operations = OperationsManager(settings=settings, storage=storage)
+    llm = LLMRouter(settings)
+    agent = AgentRuntime(settings=settings, storage=storage, llm=llm)
+    executor = AutonomyExecutor(
+        settings=settings,
+        storage=storage,
+        operations=operations,
+        agent=agent,
+        experience=ExperienceManager(settings=settings, storage=storage),
+        llm=llm,
+        telemetry=object(),
+        dispatcher=object(),
+        learning=LearningEngine(storage),
+    )
+    job = operations.create_job(
+        {
+            "title": "Headless mission",
+            "kind": "mission",
+            "cadence": "once",
+            "budget": {"max_runs": 5, "max_minutes": 30},
+            "payload": {"goal": "Build tools runtime", "max_steps": 24},
+        }
+    )
+
+    result = asyncio.run(executor.run_job(job))
+
+    assert result["ok"] is True
+    assert result["job"]["status"] == "done"
+    assert result["job"]["payload"]["mission_id"].startswith("mis_")
+    assert result["data"]["completed"] is True
+    assert storage.get_mission(result["job"]["payload"]["mission_id"])["status"] == "done"
     storage.close()
 
 

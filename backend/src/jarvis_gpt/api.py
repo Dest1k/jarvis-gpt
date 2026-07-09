@@ -20,6 +20,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 
 from .agent import AgentRuntime
 from .approval_executor import ApprovalExecutor
+from .autonomy_executor import AutonomyExecutor
 from .config import ensure_runtime_dirs, load_settings
 from .diagnostics import run_diagnostics
 from .dispatcher import DispatcherManager
@@ -123,7 +124,24 @@ async def lifespan(app: FastAPI):
     experience = ExperienceManager(settings=settings, storage=storage)
     persona = PersonaManager(settings=settings, storage=storage)
     operations = OperationsManager(settings=settings, storage=storage)
-    supervisor = RuntimeSupervisor(settings=settings, storage=storage, llm=llm)
+    autonomy_executor = AutonomyExecutor(
+        settings=settings,
+        storage=storage,
+        operations=operations,
+        agent=agent,
+        experience=experience,
+        llm=llm,
+        telemetry=telemetry,
+        dispatcher=dispatcher,
+        learning=learning,
+        bus=bus,
+    )
+    supervisor = RuntimeSupervisor(
+        settings=settings,
+        storage=storage,
+        llm=llm,
+        autonomy_executor=autonomy_executor,
+    )
     approval_executor = ApprovalExecutor(
         storage=storage,
         llm=llm,
@@ -147,6 +165,7 @@ async def lifespan(app: FastAPI):
     app.state.experience = experience
     app.state.persona = persona
     app.state.operations = operations
+    app.state.autonomy_executor = autonomy_executor
     app.state.supervisor = supervisor
     app.state.approval_executor = approval_executor
     storage.add_event(kind="runtime.start", title="JARVIS GPT backend started")
@@ -633,16 +652,7 @@ async def run_autonomy_job(job_id: str) -> AutonomyJobRunResponse:
     job = next((item for item in app.state.operations.list_jobs() if item["id"] == job_id), None)
     if job is None:
         raise HTTPException(status_code=404, detail="Autonomy job not found")
-    if job["status"] != "enabled":
-        raise HTTPException(status_code=409, detail=f"Autonomy job is {job['status']}")
-    result = await _run_operation_kind(job["kind"], job.get("payload") or {})
-    updated = app.state.operations.mark_job_run(job_id, result)
-    if updated is None:
-        raise HTTPException(status_code=404, detail="Autonomy job not found")
-    await app.state.bus.publish(
-        {"channel": "autonomy.jobs", "action": "run", "job_id": job_id, "ok": result["ok"]}
-    )
-    return {"job": updated, **result}
+    return await app.state.autonomy_executor.run_job(job)
 
 
 @app.get("/api/routines", response_model=list[RoutineResponse])
@@ -658,7 +668,7 @@ async def run_routine(routine_id: str) -> RoutineRunResponse:
     )
     if routine is None:
         raise HTTPException(status_code=404, detail="Routine not found")
-    results = [await _run_operation_kind(step, {}) for step in routine["steps"]]
+    results = [await app.state.autonomy_executor.run_kind(step, {}) for step in routine["steps"]]
     ok = all(item["ok"] for item in results)
     response = {
         "routine": routine,
@@ -1037,61 +1047,6 @@ async def benchmark() -> BenchmarkResponse:
         {"channel": "benchmark", "summary": report["summary"], "profile": report["profile"]}
     )
     return report
-
-
-async def _run_operation_kind(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
-    if kind == "briefing":
-        dispatcher_status = await asyncio.to_thread(app.state.dispatcher.status)
-        report = app.state.experience.daily_briefing(dispatcher_status=dispatcher_status)
-        return {"ok": True, "summary": report["headline"], "data": report}
-    if kind == "diagnostics":
-        result = await run_diagnostics(
-            settings=app.state.settings,
-            storage=app.state.storage,
-            llm=app.state.llm,
-        )
-        warn_count = sum(1 for check in result.checks if check.status == "warn")
-        error_count = sum(1 for check in result.checks if check.status == "error")
-        return {
-            "ok": result.ok,
-            "summary": f"Diagnostics: {error_count} error(s), {warn_count} warning(s).",
-            "data": result.model_dump(),
-        }
-    if kind == "learning.tick":
-        limit = int(payload.get("limit") or 20)
-        result = app.state.learning.tick(limit=max(5, min(100, limit)))
-        return {
-            "ok": True,
-            "summary": f"Learning tick saved {result['lesson_count']} lesson(s).",
-            "data": result,
-        }
-    if kind == "self_heal":
-        diagnostics_result = await run_diagnostics(
-            settings=app.state.settings,
-            storage=app.state.storage,
-            llm=app.state.llm,
-        )
-        telemetry_snapshot = await asyncio.to_thread(app.state.telemetry.snapshot)
-        app.state.storage.record_telemetry(telemetry_snapshot)
-        dispatcher_status = await asyncio.to_thread(app.state.dispatcher.status)
-        report = app.state.experience.self_heal_report(
-            checks=diagnostics_result.checks,
-            telemetry_snapshot=telemetry_snapshot,
-            dispatcher_status=dispatcher_status,
-        )
-        return {"ok": bool(report["ok"]), "summary": report["summary"], "data": report}
-    if kind == "benchmark":
-        report = await app.state.experience.run_benchmark(
-            llm=app.state.llm,
-            telemetry=app.state.telemetry,
-            dispatcher=app.state.dispatcher,
-        )
-        return {"ok": True, "summary": report["summary"], "data": report}
-    return {
-        "ok": False,
-        "summary": f"Unsupported operation kind: {kind}",
-        "data": {"kind": kind},
-    }
 
 
 @app.websocket("/ws/events")

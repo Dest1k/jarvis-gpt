@@ -149,7 +149,9 @@ def test_supervisor_status_reflects_autonomy_settings(monkeypatch, tmp_path):
     assert "telemetry.persist" in status["capabilities"]
     assert "health.persist" in status["capabilities"]
     assert "learning.deduplicate" in status["capabilities"]
+    assert "background.mission.runner" in status["capabilities"]
     assert status["health_interval_sec"] == 300
+    assert status["mission_interval_sec"] == 120
     storage.close()
 
 

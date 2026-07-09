@@ -1113,6 +1113,10 @@ class AgentRuntime:
         base_messages = [
             {"role": "system", "content": MISSION_EXECUTOR_PROMPT},
             {"role": "system", "content": _runtime_date_context()},
+            {
+                "role": "system",
+                "content": self._capability_manifest(mission_id=mission["id"], task_id=task["id"]),
+            },
         ]
         persona_prompt = self._persona_prompt()
         if persona_prompt:
@@ -2694,6 +2698,7 @@ class AgentRuntime:
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "system", "content": _runtime_date_context()},
+            {"role": "system", "content": self._capability_manifest(context=context)},
         ]
         if context.task_plan is not None:
             messages.append({"role": "system", "content": _task_kernel_prompt(context.task_plan)})
@@ -2717,6 +2722,117 @@ class AgentRuntime:
                 messages.append({"role": item["role"], "content": item["content"]})
         messages.append({"role": "user", "content": message})
         return messages
+
+    def _capability_manifest(
+        self,
+        *,
+        context: AgentContext | None = None,
+        mission_id: str | None = None,
+        task_id: str | None = None,
+    ) -> str:
+        tools = self.tools.list()
+        safe_allowed = {tool.name for tool in self._autonomous_tools()}
+        safe_tools = [tool.name for tool in tools if tool.name in safe_allowed]
+        gated_tools = [
+            f"{tool.name}:{tool.danger_level}"
+            for tool in tools
+            if tool.name not in safe_allowed and tool.danger_level != "safe"
+        ]
+        withheld_safe = [
+            tool.name
+            for tool in tools
+            if tool.danger_level == "safe" and tool.name not in safe_allowed
+        ]
+        policy = self.storage.get_runtime_value("experience.autonomy_policy", {})
+        if not isinstance(policy, dict):
+            policy = {}
+        jobs = self.storage.get_runtime_value("operations.autonomy.jobs", [])
+        job_lines = []
+        if isinstance(jobs, list):
+            for item in jobs[:6]:
+                if not isinstance(item, dict):
+                    continue
+                payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+                mission_ref = payload.get("mission_id") or payload.get("goal")
+                job_lines.append(
+                    "- "
+                    f"{item.get('id')} [{item.get('kind')}/{item.get('status')}] "
+                    f"cadence={item.get('cadence')} runs={item.get('run_count')}/"
+                    f"{(item.get('budget') or {}).get('max_runs')} "
+                    f"{_short_value(mission_ref, 80) if mission_ref else item.get('title')}"
+                )
+        mission_lines = []
+        for mission in self.storage.list_missions(limit=5):
+            mission_lines.append(
+                "- "
+                f"{mission['id']} [{mission['status']}] "
+                f"{_short_value(mission['title'], 90)} "
+                f"progress={round(float(mission.get('progress') or 0) * 100)}%"
+            )
+        active_context = context or AgentContext(
+            conversation_id=f"mission:{mission_id}" if mission_id else "system",
+            memory_hits=[],
+            file_hits=[],
+            mission_id=mission_id,
+            task_id=task_id,
+        )
+        lines = [
+            "Jarvis capability and current-work manifest:",
+            (
+                f"- profile: {self.settings.profile.name}; "
+                f"llm_enabled={self.settings.llm_enabled}; "
+                f"model={self.settings.llm_model}."
+            ),
+            (
+                f"- current_context: conversation_id={active_context.conversation_id}; "
+                f"mission_id={active_context.mission_id}; task_id={active_context.task_id}."
+            ),
+            (
+                "- autonomy_policy: "
+                f"mode={policy.get('mode', 'balanced')}; "
+                "max_autonomous_steps="
+                f"{policy.get('max_autonomous_steps', DEFAULT_MAX_TOOL_STEPS)}; "
+                f"allow_safe_tools={policy.get('allow_safe_tools', True)}; "
+                f"allow_review_tools={policy.get('allow_review_tools', False)}; "
+                f"allow_danger_tools={policy.get('allow_danger_tools', False)}."
+            ),
+            (
+                "- autonomous_safe_tools: "
+                + (", ".join(safe_tools[:40]) if safe_tools else "none available")
+            ),
+            (
+                "- gated_tools_need_operator_approval: "
+                + (", ".join(gated_tools[:30]) if gated_tools else "none")
+            ),
+        ]
+        if withheld_safe:
+            lines.append(
+                "- safe_tools_withheld_from_autonomous_llm_loop: "
+                + ", ".join(withheld_safe[:20])
+                + "."
+            )
+        lines.extend(
+            [
+                (
+                    "- durable_capabilities: memory search/save, file ingestion/search, "
+                    "mission planning/execution, learning journal/tick, web.search/web.fetch, "
+                    "telemetry, diagnostics, Docker/dispatcher inspection, host bridge gates."
+                ),
+                (
+                    "- background_capabilities: supervisor persists telemetry/health/learning "
+                    "and can run due mission jobs without a visible UI request."
+                ),
+                (
+                    "- rule: use safe tools for facts and local state; for review/danger tools "
+                    "create or respect approval gates instead of pretending the action ran."
+                ),
+            ]
+        )
+        if mission_lines:
+            lines.append("Current missions:\n" + "\n".join(mission_lines))
+        if job_lines:
+            lines.append("Background autonomy jobs:\n" + "\n".join(job_lines))
+        return "\n".join(lines)
 
     def _capture_explicit_memories(
         self,

@@ -1,5 +1,28 @@
 # Runtime
 
+## 2026-07-09 handoff - long-lived LLM executor
+
+For the operator and the second model:
+
+- `AutonomyExecutor` is the single backend path for persisted autonomy jobs,
+  routine steps, and background mission runs. API, routines, and supervisor now
+  call this executor instead of duplicating job logic.
+- New autonomy job kind: `mission`. Payload can contain an existing `mission_id`
+  or a new `goal`. The executor calls `AgentRuntime.run_mission`, persists a
+  newly created `mission_id` back into the job payload, keeps the job enabled
+  while budget remains, pauses it on blocked/approval-needed missions, and marks
+  it done when the mission completes.
+- Supervisor starts `jarvis-background-jobs` when autonomy is enabled and runs
+  due jobs every `JARVIS_AUTONOMY_MISSION_INTERVAL_SEC` seconds (default 120).
+  Cadences now support `once`, `startup`, `background`, `hourly`, `daily`,
+  `interval:15m`, `every 15m`, and short forms like `30s`, `15m`, `2h`.
+- The LLM itself now gets a compact capability/current-work manifest in chat and
+  mission prompts: profile/model, current conversation/mission/task, autonomy
+  policy, safe autonomous tools, gated tools, recent missions, and background
+  jobs. This prevents "wrapper knows, model does not" drift.
+- Command Center mission cards now have `В фон`, which creates a persisted
+  mission autonomy job so the page does not need to stay open for progress.
+
 ## 2026-07-09 handoff - per-answer thought trace
 
 For the operator and the second model:
@@ -234,6 +257,7 @@ to retry from scratch.
 | `JARVIS_TELEMETRY_INTERVAL_SEC` | `120` | Интервал telemetry snapshots |
 | `JARVIS_HEALTH_INTERVAL_SEC` | `300` | Интервал автономных health snapshots |
 | `JARVIS_LEARNING_INTERVAL_SEC` | `600` | Интервал autonomous learning tick |
+| `JARVIS_AUTONOMY_MISSION_INTERVAL_SEC` | `120` | Background autonomy job sweep interval |
 | `JARVIS_API_HOST` | `0.0.0.0` | Host FastAPI backend |
 | `JARVIS_API_PORT` | `8000` | Port FastAPI backend |
 
@@ -288,6 +312,12 @@ POST /api/dispatcher/stop
 GET  /api/telemetry
 GET  /api/host-bridge
 GET  /api/autonomy
+GET  /api/autonomy/jobs
+POST /api/autonomy/jobs
+PATCH /api/autonomy/jobs/{job_id}
+POST /api/autonomy/jobs/{job_id}/run
+GET  /api/routines
+POST /api/routines/{routine_id}/run
 GET  /api/persona
 PATCH /api/persona
 POST /api/persona/insight

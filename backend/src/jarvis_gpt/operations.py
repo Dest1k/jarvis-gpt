@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from .config import JarvisSettings
@@ -47,6 +48,12 @@ DEFAULT_ROUTINES: list[dict[str, Any]] = [
         "title": "Learning sweep",
         "description": "Mine audit/tool/approval history into deduplicated lessons.",
         "steps": ["learning.tick"],
+    },
+    {
+        "id": "routine_background_missions",
+        "title": "Background mission sweep",
+        "description": "Run due long-lived LLM mission jobs within their budgets.",
+        "steps": ["background.missions"],
     },
 ]
 
@@ -168,6 +175,11 @@ class OperationsManager:
         stored = self.storage.get_runtime_value(AUTONOMY_JOBS_KEY, [])
         return [_normalize_job(item) for item in _list(stored)]
 
+    def due_jobs(self, *, now: datetime | None = None, limit: int = 3) -> list[dict[str, Any]]:
+        current = now or datetime.now(UTC)
+        due = [job for job in self.list_jobs() if _job_is_due(job, current)]
+        return due[: max(1, min(10, int(limit)))]
+
     def create_job(self, payload: dict[str, Any]) -> dict[str, Any]:
         jobs = self.list_jobs()
         job = _normalize_job(
@@ -223,7 +235,10 @@ class OperationsManager:
             if job["id"] == job_id:
                 status = job["status"]
                 run_count = int(job.get("run_count") or 0) + 1
-                if run_count >= int(job["budget"]["max_runs"]):
+                requested_status = str(result.get("job_status") or "")
+                if requested_status in {"enabled", "paused", "done"}:
+                    status = requested_status
+                elif run_count >= int(job["budget"]["max_runs"]):
                     status = "done"
                 updated = {
                     **job,
@@ -311,12 +326,13 @@ def _normalize_docker_policy(value: dict[str, Any]) -> dict[str, Any]:
 
 def _normalize_job(value: dict[str, Any]) -> dict[str, Any]:
     kind = str(value.get("kind") or "diagnostics")
-    if kind not in {"diagnostics", "learning.tick", "self_heal", "benchmark"}:
+    if kind not in {"diagnostics", "learning.tick", "self_heal", "benchmark", "mission"}:
         kind = "diagnostics"
     status = str(value.get("status") or "enabled")
     if status not in {"enabled", "paused", "done"}:
         status = "enabled"
     budget = _dict(value.get("budget"))
+    default_max_runs = 100 if kind == "mission" else 1
     return {
         "id": str(value.get("id") or new_id("job")),
         "title": str(value.get("title") or kind)[:120],
@@ -324,7 +340,7 @@ def _normalize_job(value: dict[str, Any]) -> dict[str, Any]:
         "status": status,
         "cadence": str(value.get("cadence") or "manual")[:80],
         "budget": {
-            "max_runs": _bounded_int(budget.get("max_runs"), 1, 100, 1),
+            "max_runs": _bounded_int(budget.get("max_runs"), 1, 1000, default_max_runs),
             "max_minutes": _bounded_int(budget.get("max_minutes"), 1, 1440, 10),
         },
         "payload": _dict(value.get("payload")),
@@ -363,6 +379,65 @@ def _bounded_int(value: Any, minimum: int, maximum: int, fallback: int) -> int:
     except (TypeError, ValueError):
         parsed = fallback
     return max(minimum, min(maximum, parsed))
+
+
+def _job_is_due(job: dict[str, Any], now: datetime) -> bool:
+    if job.get("status") != "enabled":
+        return False
+    budget = _dict(job.get("budget"))
+    if int(job.get("run_count") or 0) >= _bounded_int(budget.get("max_runs"), 1, 1000, 1):
+        return False
+    cadence = str(job.get("cadence") or "manual").strip().lower()
+    if cadence in {"", "manual", "off", "disabled"}:
+        return False
+    if cadence in {"once", "startup", "on-start"}:
+        return int(job.get("run_count") or 0) == 0
+    interval = _cadence_interval(cadence)
+    if interval is None:
+        return False
+    last_run = _parse_datetime(job.get("last_run_at"))
+    if last_run is None:
+        return True
+    return now - last_run >= interval
+
+
+def _cadence_interval(cadence: str) -> timedelta | None:
+    aliases = {
+        "hourly": timedelta(hours=1),
+        "daily": timedelta(days=1),
+        "background": timedelta(minutes=15),
+    }
+    if cadence in aliases:
+        return aliases[cadence]
+    text = cadence.removeprefix("interval:").removeprefix("every ").strip()
+    if text.isdigit():
+        return timedelta(minutes=max(1, int(text)))
+    unit = text[-1:] if text else ""
+    raw_value = text[:-1]
+    if not raw_value.isdigit():
+        return None
+    value = max(1, int(raw_value))
+    if unit == "s":
+        return timedelta(seconds=value)
+    if unit == "m":
+        return timedelta(minutes=value)
+    if unit == "h":
+        return timedelta(hours=value)
+    if unit == "d":
+        return timedelta(days=value)
+    return None
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 def _run_docker(args: list[str], *, timeout: int) -> dict[str, Any]:

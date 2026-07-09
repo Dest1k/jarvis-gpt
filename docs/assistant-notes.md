@@ -11,6 +11,21 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ### 2026-07-09 - Codex
 
+- Added `backend/src/jarvis_gpt/autonomy_executor.py`: a shared executor for
+  persisted autonomy jobs, direct routine steps, and headless mission jobs.
+- Supervisor now runs due background jobs on `JARVIS_AUTONOMY_MISSION_INTERVAL_SEC`
+  while preserving existing approval gates. Mission jobs persist `mission_id`,
+  stay enabled while budget remains, pause on blocked missions, and finish on done.
+- The LLM now receives a compact capability/current-work manifest in normal chat
+  and mission execution prompts: profile/model, current conversation/mission/task,
+  safe autonomous tools, gated tools, recent missions, and background jobs.
+- Command Center mission cards have `В фон`, which creates a persisted mission
+  autonomy job instead of requiring the page to stay open.
+- Tests run before handoff: `ruff`, full backend `pytest`, frontend `typecheck`,
+  and frontend `build`.
+
+### 2026-07-09 - Codex
+
 - Added per-answer thought trace UI: assistant bubbles now show a Brain icon once
   the persisted `msg_*` id is known. It opens `/trace/{messageId}`.
 - New backend endpoint `GET /api/agent/trace/message/{message_id}` returns the
