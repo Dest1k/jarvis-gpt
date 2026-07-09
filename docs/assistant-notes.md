@@ -11,6 +11,25 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ### 2026-07-09 - Codex
 
+- Runtime hardening pass: API remains loopback-open, but remote HTTP and
+  `/ws/events` now require `JARVIS_API_TOKEN`; frontend can forward
+  `NEXT_PUBLIC_JARVIS_API_TOKEN`.
+- Added SQLite backup path through `JarvisStorage.backup_database`,
+  `POST /api/runtime/backup`, CLI `backup`, audit/event logging, and Command
+  Center controls/status.
+- Added autonomy run history and retry visibility:
+  `GET /api/autonomy/job-runs`, per-job failure counters, timestamps,
+  durations, and bounded backoff after failed enabled jobs.
+- `AutonomyExecutor.run_job` catches exceptions, records them as failed runs,
+  and leaves enabled jobs retryable instead of making failures disappear into
+  supervisor logs.
+- Frontend runtime/resources panels now show API guard, backup state, job
+  failure badges, and recent job runs.
+- Verified before handoff: ruff, backend pytest (195 pass), frontend build, and
+  backend/frontend restart via `scripts/jarvis-launcher.ps1`.
+
+### 2026-07-09 - Codex
+
 - Reviewed Claude's recent trend: replace keyword plugs with reasoning-first
   routing, give the model safe read-only tools, verify outputs, and close the
   feedback/lesson loop.

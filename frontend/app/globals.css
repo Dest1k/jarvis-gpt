@@ -1796,6 +1796,54 @@ h3 {
   gap: 6px;
 }
 
+.jobRuns {
+  display: grid;
+  gap: 6px;
+  padding-top: 2px;
+}
+
+.jobRun {
+  display: grid;
+  grid-template-columns: 40px minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  min-height: 28px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.jobRun span {
+  display: grid;
+  place-items: center;
+  min-height: 22px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--muted);
+}
+
+.jobRun.ok span {
+  background: var(--teal-2);
+  color: var(--teal);
+}
+
+.jobRun.warn span {
+  background: rgba(210, 99, 68, 0.12);
+  color: var(--danger);
+}
+
+.jobRun strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.jobRun small {
+  text-align: right;
+  white-space: nowrap;
+}
+
 .jobRow,
 .dockerRow {
   display: grid;
@@ -3180,6 +3228,10 @@ h3 {
     align-items: start;
   }
 
+  .jobRun {
+    grid-template-columns: 40px minmax(0, 1fr);
+  }
+
   .modelBudget > span,
   .modelBudget > small,
   .downloadRow > span,
@@ -3203,6 +3255,7 @@ h3 {
   .auditRow > span,
   .jobRow > span,
   .jobRow > button,
+  .jobRun > small,
   .dockerRow > span,
   .dockerRow > small,
   .approvalRow > span {

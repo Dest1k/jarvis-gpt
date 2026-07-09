@@ -73,6 +73,12 @@ def cmd_status(args: argparse.Namespace) -> None:
     storage.close()
 
 
+def cmd_backup(args: argparse.Namespace) -> None:
+    _settings, storage, _llm, _agent = _runtime(args.profile)
+    _print_json(storage.backup_database(args.output_dir))
+    storage.close()
+
+
 def cmd_models(args: argparse.Namespace) -> None:
     settings, storage, _llm, _agent = _runtime(args.profile)
     catalog = ModelCatalog(settings).response()
@@ -354,6 +360,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     status_parser = sub.add_parser("status", help="Show local runtime status")
     status_parser.set_defaults(func=cmd_status)
+
+    backup_parser = sub.add_parser("backup", help="Create a consistent SQLite runtime backup")
+    backup_parser.add_argument("--output-dir", default=None)
+    backup_parser.set_defaults(func=cmd_backup)
 
     models_parser = sub.add_parser("models", help="Show local model catalog and dispatcher config")
     models_parser.add_argument("--env", action="store_true", help="Print vLLM dispatcher env only")

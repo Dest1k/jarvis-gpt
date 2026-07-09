@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any
 
 from .agent import AgentRuntime
@@ -11,7 +12,7 @@ from .experience import ExperienceManager
 from .learning import LearningEngine
 from .llm import LLMRouter
 from .operations import OperationsManager
-from .storage import JarvisStorage
+from .storage import JarvisStorage, utc_now
 from .telemetry import TelemetryCollector
 
 
@@ -81,10 +82,47 @@ class AutonomyExecutor:
                     "summary": f"Autonomy job is {job.get('status')}.",
                     "data": {"job_id": job_id},
                 }
-            result = await self.run_kind(str(job.get("kind") or ""), job.get("payload") or {})
+            started_at = utc_now()
+            started_perf = time.perf_counter()
+            try:
+                result = await self.run_kind(str(job.get("kind") or ""), job.get("payload") or {})
+            except Exception as exc:  # noqa: BLE001
+                result = {
+                    "ok": False,
+                    "summary": f"Autonomy job failed: {exc}",
+                    "data": {"error": repr(exc), "job_id": job_id},
+                    "job_status": "enabled",
+                }
+            finished_at = utc_now()
+            duration_ms = int((time.perf_counter() - started_perf) * 1000)
             if job.get("kind") == "mission":
-                self._persist_mission_payload(job, result)
-            updated = self.operations.mark_job_run(job_id, result) or job
+                try:
+                    self._persist_mission_payload(job, result)
+                except Exception as exc:  # noqa: BLE001
+                    result = {
+                        "ok": False,
+                        "summary": f"Mission job state persist failed: {exc}",
+                        "data": {
+                            "error": repr(exc),
+                            "job_id": job_id,
+                            "previous_result": result,
+                        },
+                        "job_status": "enabled",
+                    }
+            updated = self.operations.mark_job_run(
+                job_id,
+                result,
+                started_at=started_at,
+                finished_at=finished_at,
+                duration_ms=duration_ms,
+            ) or job
+            run_record = self.operations.record_job_run(
+                job,
+                result,
+                started_at=started_at,
+                finished_at=finished_at,
+                duration_ms=duration_ms,
+            )
             response = {"job": updated, **result}
             self.storage.add_event(
                 kind="autonomy.job.run",
@@ -95,6 +133,8 @@ class AutonomyExecutor:
                     "kind": job.get("kind"),
                     "status": updated.get("status"),
                     "ok": bool(result.get("ok")),
+                    "duration_ms": duration_ms,
+                    "run_id": run_record["id"],
                 },
             )
             if self.bus:

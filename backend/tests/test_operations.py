@@ -104,6 +104,46 @@ def test_autonomy_jobs_report_due_work(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_autonomy_job_failure_backoff_and_run_history(monkeypatch, tmp_path):
+    manager, storage = _manager(monkeypatch, tmp_path)
+    now = datetime(2026, 7, 9, 12, tzinfo=UTC)
+    job = manager.create_job(
+        {
+            "title": "Retrying diagnostics",
+            "kind": "diagnostics",
+            "cadence": "1m",
+            "budget": {"max_runs": 3},
+        }
+    )
+    started_at = now.isoformat()
+    finished_at = (now + timedelta(seconds=2)).isoformat()
+
+    updated = manager.mark_job_run(
+        job["id"],
+        {"ok": False, "summary": "temporary failure", "job_status": "enabled"},
+        started_at=started_at,
+        finished_at=finished_at,
+        duration_ms=2000,
+    )
+    run = manager.record_job_run(
+        job,
+        {"ok": False, "summary": "temporary failure", "job_status": "enabled"},
+        started_at=started_at,
+        finished_at=finished_at,
+        duration_ms=2000,
+    )
+
+    assert updated is not None
+    assert updated["status"] == "enabled"
+    assert updated["consecutive_failures"] == 1
+    assert updated["last_duration_ms"] == 2000
+    assert updated["next_run_after"] is not None
+    assert manager.due_jobs(now=now + timedelta(seconds=30)) == []
+    assert [item["id"] for item in manager.due_jobs(now=now + timedelta(minutes=2))] == [job["id"]]
+    assert manager.list_job_runs(job_id=job["id"])[0]["id"] == run["id"]
+    storage.close()
+
+
 def test_mission_autonomy_job_runs_headless_and_persists_mission_id(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
@@ -142,6 +182,54 @@ def test_mission_autonomy_job_runs_headless_and_persists_mission_id(monkeypatch,
     assert result["job"]["payload"]["mission_id"].startswith("mis_")
     assert result["data"]["completed"] is True
     assert storage.get_mission(result["job"]["payload"]["mission_id"])["status"] == "done"
+    assert operations.list_job_runs(job_id=job["id"])[0]["ok"] is True
+    storage.close()
+
+
+def test_autonomy_executor_records_exceptions_as_failed_runs(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    operations = OperationsManager(settings=settings, storage=storage)
+    llm = LLMRouter(settings)
+    executor = AutonomyExecutor(
+        settings=settings,
+        storage=storage,
+        operations=operations,
+        agent=AgentRuntime(settings=settings, storage=storage, llm=llm),
+        experience=ExperienceManager(settings=settings, storage=storage),
+        llm=llm,
+        telemetry=object(),
+        dispatcher=object(),
+        learning=LearningEngine(storage),
+    )
+    job = operations.create_job(
+        {
+            "title": "Exploding diagnostics",
+            "kind": "diagnostics",
+            "cadence": "1m",
+            "budget": {"max_runs": 3, "max_minutes": 5},
+        }
+    )
+
+    async def explode(_kind, _payload):
+        raise RuntimeError("boom")
+
+    executor.run_kind = explode
+
+    result = asyncio.run(executor.run_job(job))
+    stored = operations.list_jobs()[0]
+    run = operations.list_job_runs(job_id=job["id"])[0]
+
+    assert result["ok"] is False
+    assert stored["status"] == "enabled"
+    assert stored["consecutive_failures"] == 1
+    assert stored["next_run_after"] is not None
+    assert run["ok"] is False
+    assert "boom" in run["summary"]
     storage.close()
 
 

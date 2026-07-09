@@ -12,6 +12,7 @@ from .storage import JarvisStorage, new_id, utc_now
 BROWSER_POLICY_KEY = "operations.browser_policy"
 DOCKER_POLICY_KEY = "operations.docker_policy"
 AUTONOMY_JOBS_KEY = "operations.autonomy.jobs"
+AUTONOMY_JOB_RUNS_KEY = "operations.autonomy.job_runs"
 ROUTINE_RUNS_KEY = "operations.routine_runs"
 
 DEFAULT_BROWSER_POLICY: dict[str, Any] = {
@@ -175,6 +176,20 @@ class OperationsManager:
         stored = self.storage.get_runtime_value(AUTONOMY_JOBS_KEY, [])
         return [_normalize_job(item) for item in _list(stored)]
 
+    def list_job_runs(
+        self,
+        *,
+        limit: int = 50,
+        job_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        stored = [
+            item for item in _list(self.storage.get_runtime_value(AUTONOMY_JOB_RUNS_KEY, []))
+            if isinstance(item, dict)
+        ]
+        if job_id:
+            stored = [item for item in stored if item.get("job_id") == job_id]
+        return stored[: max(1, min(200, int(limit)))]
+
     def due_jobs(self, *, now: datetime | None = None, limit: int = 3) -> list[dict[str, Any]]:
         current = now or datetime.now(UTC)
         due = [job for job in self.list_jobs() if _job_is_due(job, current)]
@@ -227,10 +242,19 @@ class OperationsManager:
         self.storage.set_runtime_value(AUTONOMY_JOBS_KEY, next_jobs)
         return updated
 
-    def mark_job_run(self, job_id: str, result: dict[str, Any]) -> dict[str, Any] | None:
+    def mark_job_run(
+        self,
+        job_id: str,
+        result: dict[str, Any],
+        *,
+        started_at: str | None = None,
+        finished_at: str | None = None,
+        duration_ms: int | None = None,
+    ) -> dict[str, Any] | None:
         jobs = self.list_jobs()
         updated: dict[str, Any] | None = None
         next_jobs: list[dict[str, Any]] = []
+        now = finished_at or utc_now()
         for job in jobs:
             if job["id"] == job_id:
                 status = job["status"]
@@ -240,13 +264,23 @@ class OperationsManager:
                     status = requested_status
                 elif run_count >= int(job["budget"]["max_runs"]):
                     status = "done"
+                ok = bool(result.get("ok"))
+                consecutive_failures = 0 if ok else int(job.get("consecutive_failures") or 0) + 1
+                next_run_after = None
+                if status == "enabled" and not ok:
+                    next_run_after = _iso_after(now, _retry_delay(consecutive_failures))
                 updated = {
                     **job,
                     "status": status,
                     "run_count": run_count,
-                    "last_run_at": utc_now(),
+                    "consecutive_failures": consecutive_failures,
+                    "last_started_at": started_at or now,
+                    "last_finished_at": now,
+                    "last_duration_ms": duration_ms,
+                    "last_run_at": now,
+                    "next_run_after": next_run_after,
                     "last_result": result,
-                    "updated_at": utc_now(),
+                    "updated_at": now,
                 }
                 next_jobs.append(updated)
             else:
@@ -255,6 +289,31 @@ class OperationsManager:
             return None
         self.storage.set_runtime_value(AUTONOMY_JOBS_KEY, next_jobs)
         return updated
+
+    def record_job_run(
+        self,
+        job: dict[str, Any],
+        result: dict[str, Any],
+        *,
+        started_at: str,
+        finished_at: str,
+        duration_ms: int,
+    ) -> dict[str, Any]:
+        item = {
+            "id": new_id("jobrun"),
+            "job_id": job["id"],
+            "title": job.get("title"),
+            "kind": job.get("kind"),
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "duration_ms": duration_ms,
+            "ok": bool(result.get("ok")),
+            "summary": str(result.get("summary") or "")[:500],
+            "job_status": result.get("job_status"),
+        }
+        history = _list(self.storage.get_runtime_value(AUTONOMY_JOB_RUNS_KEY, []))
+        self.storage.set_runtime_value(AUTONOMY_JOB_RUNS_KEY, [item, *history][:200])
+        return item
 
     def routines(self) -> list[dict[str, Any]]:
         return [dict(item) for item in DEFAULT_ROUTINES]
@@ -345,9 +404,14 @@ def _normalize_job(value: dict[str, Any]) -> dict[str, Any]:
         },
         "payload": _dict(value.get("payload")),
         "run_count": _bounded_int(value.get("run_count"), 0, 10000, 0),
+        "consecutive_failures": _bounded_int(value.get("consecutive_failures"), 0, 1000, 0),
         "created_at": str(value.get("created_at") or utc_now()),
         "updated_at": str(value.get("updated_at") or utc_now()),
+        "last_started_at": value.get("last_started_at"),
+        "last_finished_at": value.get("last_finished_at"),
+        "last_duration_ms": value.get("last_duration_ms"),
         "last_run_at": value.get("last_run_at"),
+        "next_run_after": value.get("next_run_after"),
         "last_result": _dict(value.get("last_result")),
     }
 
@@ -386,6 +450,9 @@ def _job_is_due(job: dict[str, Any], now: datetime) -> bool:
         return False
     budget = _dict(job.get("budget"))
     if int(job.get("run_count") or 0) >= _bounded_int(budget.get("max_runs"), 1, 1000, 1):
+        return False
+    next_run_after = _parse_datetime(job.get("next_run_after"))
+    if next_run_after is not None and now < next_run_after:
         return False
     cadence = str(job.get("cadence") or "manual").strip().lower()
     if cadence in {"", "manual", "off", "disabled"}:
@@ -438,6 +505,16 @@ def _parse_datetime(value: Any) -> datetime | None:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)
+
+
+def _iso_after(value: str, delta: timedelta) -> str:
+    base = _parse_datetime(value) or datetime.now(UTC)
+    return (base + delta).isoformat(timespec="seconds")
+
+
+def _retry_delay(consecutive_failures: int) -> timedelta:
+    minutes = min(60, 2 ** max(0, min(6, consecutive_failures - 1)))
+    return timedelta(minutes=minutes)
 
 
 def _run_docker(args: list[str], *, timeout: int) -> dict[str, Any]:

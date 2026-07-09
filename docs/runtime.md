@@ -1,5 +1,28 @@
 # Runtime
 
+## 2026-07-09 handoff - runtime guardrails and autonomy observability
+
+For the operator and the second model:
+
+- Backend API is local-first by default. Loopback clients still work without
+  setup; non-loopback clients now need `JARVIS_API_TOKEN` via bearer auth or
+  `X-Jarvis-Api-Token`. The frontend can forward it with
+  `NEXT_PUBLIC_JARVIS_API_TOKEN`. WebSocket `/ws/events` accepts the same token
+  through a header or `?token=...`.
+- New operator endpoints:
+  `GET /api/runtime/security`, `POST /api/runtime/backup`, and
+  `GET /api/autonomy/job-runs`. The backup endpoint uses SQLite's backup API and
+  writes durable audit/event records.
+- Autonomy jobs now keep `consecutive_failures`, `last_started_at`,
+  `last_finished_at`, `last_duration_ms`, and `next_run_after`. Failed enabled
+  jobs get bounded exponential retry backoff instead of tight retry loops.
+- `AutonomyExecutor.run_job` records both successful runs and caught exceptions
+  into the job run history, so background failures are visible after the fact.
+- Command Center surfaces API guard status, manual DB backup, last backup path,
+  job retry state, and the last few job runs in the runtime/resources panels.
+- Config sync: `.env.example` includes `JARVIS_API_TOKEN` and
+  `NEXT_PUBLIC_JARVIS_API_TOKEN`.
+
 ## 2026-07-09 handoff - reasoning-first arbiter now owns local_action
 
 Для оператора и второй модели. Продолжение system.inspect: тот инструмент дал
@@ -492,8 +515,10 @@ to retry from scratch.
 | `JARVIS_LEARNING_INTERVAL_SEC` | `600` | Интервал autonomous learning tick |
 | `JARVIS_AUTONOMY_MISSION_INTERVAL_SEC` | `120` | Background autonomy job sweep interval |
 | `JARVIS_CORS_ORIGINS` | `` | Optional comma-separated trusted non-loopback browser origins |
+| `JARVIS_API_TOKEN` | `` | Optional token required for non-loopback backend/API/WS clients |
 | `JARVIS_API_HOST` | `0.0.0.0` | Host FastAPI backend |
 | `JARVIS_API_PORT` | `8000` | Port FastAPI backend |
+| `NEXT_PUBLIC_JARVIS_API_TOKEN` | `` | Optional frontend token forwarded to backend/API/WS |
 
 ## CLI
 
@@ -501,6 +526,7 @@ to retry from scratch.
 py -3.11 .\jarvis.py init
 py -3.11 .\jarvis.py profiles
 py -3.11 .\jarvis.py status
+py -3.11 .\jarvis.py backup
 py -3.11 .\jarvis.py models
 py -3.11 .\jarvis.py models --env
 py -3.11 .\jarvis.py llm-health
@@ -539,6 +565,8 @@ py -3.11 .\jarvis.py serve --reload
 ```text
 GET  /health
 GET  /api/status
+GET  /api/runtime/security
+POST /api/runtime/backup
 GET  /api/models
 GET  /api/dispatcher
 POST /api/dispatcher/start
@@ -547,6 +575,7 @@ GET  /api/telemetry
 GET  /api/host-bridge
 GET  /api/autonomy
 GET  /api/autonomy/jobs
+GET  /api/autonomy/job-runs
 POST /api/autonomy/jobs
 PATCH /api/autonomy/jobs/{job_id}
 POST /api/autonomy/jobs/{job_id}/run

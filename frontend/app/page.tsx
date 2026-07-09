@@ -43,6 +43,7 @@ import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "re
 import type { CSSProperties, KeyboardEvent, PointerEvent as ReactPointerEvent, ReactNode } from "react";
 
 const CONFIGURED_API_URL = process.env.NEXT_PUBLIC_JARVIS_API_URL ?? "http://localhost:8000";
+const CONFIGURED_API_TOKEN = process.env.NEXT_PUBLIC_JARVIS_API_TOKEN ?? "";
 const CHAT_WINDOWS_KEY = "jarvis-gpt.chatWindows.v1";
 const CHAT_SETTINGS_KEY = "jarvis-gpt.chatSettings.v1";
 const DEFAULT_CHAT_HEIGHT = 620;
@@ -570,8 +571,39 @@ type AutonomyJob = {
   budget: { max_runs?: number; max_minutes?: number };
   payload: Record<string, unknown>;
   run_count: number;
+  consecutive_failures: number;
+  last_started_at?: string | null;
+  last_finished_at?: string | null;
+  last_duration_ms?: number | null;
   last_run_at?: string | null;
+  next_run_after?: string | null;
   last_result?: Record<string, unknown>;
+};
+
+type AutonomyJobRun = {
+  id: string;
+  job_id: string;
+  title?: string | null;
+  kind?: string | null;
+  started_at: string;
+  finished_at: string;
+  duration_ms: number;
+  ok: boolean;
+  summary: string;
+};
+
+type RuntimeSecurity = {
+  client_host: string;
+  loopback_client: boolean;
+  token_configured: boolean;
+  remote_requires_token: boolean;
+};
+
+type RuntimeBackup = {
+  ok: boolean;
+  path: string;
+  size: number;
+  created_at: string;
 };
 
 type Routine = {
@@ -688,6 +720,7 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
     ...init,
     headers: {
       "Content-Type": "application/json",
+      ...apiAuthHeaders(),
       ...(init?.headers ?? {})
     }
   });
@@ -704,7 +737,7 @@ async function streamApi(
 ) {
   const response = await fetch(`${apiUrl()}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...apiAuthHeaders() },
     body: JSON.stringify(body)
   });
   if (!response.ok) {
@@ -747,6 +780,18 @@ function apiUrl() {
 
 function wsUrl() {
   return apiUrl().replace(/^http/, "ws");
+}
+
+function apiAuthHeaders(): Record<string, string> {
+  const token = CONFIGURED_API_TOKEN.trim();
+  return token ? { "X-Jarvis-Api-Token": token } : {};
+}
+
+function withWsAuth(url: string) {
+  const token = CONFIGURED_API_TOKEN.trim();
+  if (!token) return url;
+  const separator = url.includes("?") ? "&" : "?";
+  return `${url}${separator}token=${encodeURIComponent(token)}`;
 }
 
 function liveEventLabel(type: string): string {
@@ -1376,6 +1421,9 @@ export default function CommandCenter() {
   const [dockerPolicy, setDockerPolicy] = useState<DockerPolicy | null>(null);
   const [dockerContainers, setDockerContainers] = useState<DockerContainers | null>(null);
   const [autonomyJobs, setAutonomyJobs] = useState<AutonomyJob[]>([]);
+  const [autonomyJobRuns, setAutonomyJobRuns] = useState<AutonomyJobRun[]>([]);
+  const [runtimeSecurity, setRuntimeSecurity] = useState<RuntimeSecurity | null>(null);
+  const [runtimeBackup, setRuntimeBackup] = useState<RuntimeBackup | null>(null);
   const [routines, setRoutines] = useState<Routine[]>([]);
   const [routineRun, setRoutineRun] = useState<RoutineRun | null>(null);
   const [directoryDraft, setDirectoryDraft] = useState("D:\\jarvis");
@@ -1503,7 +1551,9 @@ export default function CommandCenter() {
         browserPolicyData,
         dockerPolicyData,
         dockerContainersData,
+        runtimeSecurityData,
         autonomyJobData,
+        autonomyJobRunData,
         routineData,
         operatorQueueData,
         approvalData
@@ -1528,7 +1578,9 @@ export default function CommandCenter() {
           api<BrowserPolicy>("/api/browser/policy"),
           api<DockerPolicy>("/api/docker/policy"),
           api<DockerContainers>("/api/docker/containers"),
+          api<RuntimeSecurity>("/api/runtime/security"),
           api<AutonomyJob[]>("/api/autonomy/jobs"),
+          api<AutonomyJobRun[]>("/api/autonomy/job-runs?limit=8"),
           api<Routine[]>("/api/routines"),
           api<OperatorQueue>("/api/operator/queue"),
           api<ApprovalItem[]>("/api/approvals?limit=8")
@@ -1560,7 +1612,9 @@ export default function CommandCenter() {
       setBrowserPolicy(browserPolicyData);
       setDockerPolicy(dockerPolicyData);
       setDockerContainers(dockerContainersData);
+      setRuntimeSecurity(runtimeSecurityData);
       setAutonomyJobs(autonomyJobData);
+      setAutonomyJobRuns(autonomyJobRunData);
       setRoutines(routineData);
       setOperatorQueue(operatorQueueData);
       setApprovals(approvalData);
@@ -1645,7 +1699,7 @@ export default function CommandCenter() {
 
     const connect = () => {
       try {
-        socket = new WebSocket(`${wsUrl()}/ws/events`);
+        socket = new WebSocket(withWsAuth(`${wsUrl()}/ws/events`));
       } catch {
         return;
       }
@@ -2010,6 +2064,7 @@ export default function CommandCenter() {
       formData.append("file", file);
       const response = await fetch(`${apiUrl()}/api/files/upload`, {
         method: "POST",
+        headers: apiAuthHeaders(),
         body: formData
       });
       if (!response.ok) {
@@ -2839,6 +2894,35 @@ export default function CommandCenter() {
     }
   }
 
+  async function createRuntimeBackup() {
+    setActiveOperation({
+      title: "Runtime backup",
+      detail: "SQLite snapshot"
+    });
+    setBusy(true);
+    try {
+      const backup = await api<RuntimeBackup>("/api/runtime/backup", {
+        method: "POST",
+        body: "{}"
+      });
+      setRuntimeBackup(backup);
+      setLines((current) => [
+        ...current,
+        {
+          id: crypto.randomUUID(),
+          role: "system",
+          content: `Runtime backup: ${backup.path} (${formatBytes(backup.size)})`
+        }
+      ]);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Runtime backup failed");
+    } finally {
+      setBusy(false);
+      setActiveOperation(null);
+    }
+  }
+
   async function executeNextMissionStep(missionId: string) {
     const mission = missions.find((item) => item.id === missionId);
     const nextTask = mission?.tasks.find((task) => task.status !== "done");
@@ -3026,6 +3110,7 @@ export default function CommandCenter() {
     try {
       const response = await fetch(`${apiUrl()}/api/files/upload`, {
         method: "POST",
+        headers: apiAuthHeaders(),
         body: formData
       });
       if (!response.ok) {
@@ -4365,6 +4450,35 @@ export default function CommandCenter() {
                   {hostBridge?.native_capabilities?.length ?? 0} native
                 </small>
               </div>
+              <div
+                className={`bridgeRow ${
+                  runtimeSecurity?.loopback_client || runtimeSecurity?.token_configured
+                    ? "online"
+                    : ""
+                }`}
+              >
+                <ShieldCheck size={14} />
+                <strong>API guard</strong>
+                <span>{runtimeSecurity?.token_configured ? "token" : "local"}</span>
+                <small>{runtimeSecurity?.client_host ?? "unknown"}</small>
+              </div>
+              <button
+                className="iconText compact full"
+                type="button"
+                onClick={createRuntimeBackup}
+                disabled={busy}
+              >
+                <Database size={15} />
+                <span>Backup DB</span>
+              </button>
+              {runtimeBackup && (
+                <div className="bridgeRow online">
+                  <Database size={14} />
+                  <strong>{formatBytes(runtimeBackup.size)}</strong>
+                  <span>backup</span>
+                  <small>{compactText(runtimeBackup.path, 48)}</small>
+                </div>
+              )}
               <form className="hostCommandForm" onSubmit={requestHostCommandApproval}>
                 <input
                   aria-label="Команда хоста"
@@ -4458,7 +4572,11 @@ export default function CommandCenter() {
                 <div className={`jobRow ${job.status}`} key={job.id}>
                   <Brain size={14} />
                   <strong>{job.title}</strong>
-                  <span>{job.run_count}/{job.budget.max_runs ?? 1}</span>
+                  <span title={job.next_run_after ? `retry after ${job.next_run_after}` : undefined}>
+                    {job.consecutive_failures
+                      ? `fail ${job.consecutive_failures}`
+                      : `${job.run_count}/${job.budget.max_runs ?? 1}`}
+                  </span>
                   <button
                     type="button"
                     disabled={busy || job.status !== "enabled"}
@@ -4470,6 +4588,17 @@ export default function CommandCenter() {
                   </button>
                 </div>
               ))}
+              {autonomyJobRuns.length > 0 && (
+                <div className="jobRuns">
+                  {autonomyJobRuns.slice(0, 3).map((run) => (
+                    <div className={`jobRun ${run.ok ? "ok" : "warn"}`} key={run.id}>
+                      <span>{run.ok ? "ok" : "fail"}</span>
+                      <strong>{run.title ?? run.kind ?? run.job_id}</strong>
+                      <small>{formatDuration(run.duration_ms)}</small>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
 
             <div className="panelHeader lower">

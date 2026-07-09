@@ -336,6 +336,47 @@ class JarvisStorage:
             self.connect().execute("SELECT 1").fetchone()
         return True
 
+    def backup_database(self, target_dir: str | Path | None = None) -> dict[str, Any]:
+        """Create a consistent SQLite backup using the SQLite backup API."""
+
+        created_at = utc_now()
+        backup_dir = (
+            Path(target_dir)
+            if target_dir is not None
+            else self.database_path.parent / "backups"
+        )
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        target_path = backup_dir / f"{self.database_path.stem}-{stamp}.sqlite3"
+        counter = 1
+        while target_path.exists():
+            target_path = backup_dir / f"{self.database_path.stem}-{stamp}-{counter}.sqlite3"
+            counter += 1
+        with self._lock:
+            source = self.connect()
+            with sqlite3.connect(target_path) as target:
+                source.backup(target)
+        result = {
+            "ok": True,
+            "path": str(target_path),
+            "size": target_path.stat().st_size,
+            "created_at": created_at,
+        }
+        self.add_event(
+            kind="runtime.backup",
+            title="Runtime database backup created",
+            payload=result,
+        )
+        self.record_audit(
+            actor="operator",
+            action="runtime.backup",
+            target_type="runtime",
+            target_id="sqlite",
+            summary="Runtime database backup created",
+            after=result,
+        )
+        return result
+
     def counters(self) -> dict[str, int]:
         tables = [
             "runtime_kv",

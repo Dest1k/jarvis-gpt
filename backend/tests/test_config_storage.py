@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
 from jarvis_gpt.storage import JarvisStorage
 
@@ -30,6 +32,26 @@ def test_storage_persists_mission(tmp_path):
     assert mission["title"] == "Build runtime"
     assert len(mission["tasks"]) == 3
     assert storage.counters()["missions"] == 1
+    storage.close()
+
+
+def test_storage_creates_consistent_database_backup(tmp_path):
+    storage = JarvisStorage(tmp_path / "state" / "jarvis.sqlite3")
+    storage.initialize()
+    storage.add_memory(content="Backup me", namespace="runtime")
+
+    backup = storage.backup_database()
+    second_backup = storage.backup_database()
+
+    backup_path = Path(backup["path"])
+    assert backup["ok"] is True
+    assert second_backup["path"] != backup["path"]
+    assert backup_path.exists()
+    assert backup_path.stat().st_size > 0
+    clone = JarvisStorage(backup_path)
+    clone.initialize()
+    assert clone.counters()["memories"] == 1
+    clone.close()
     storage.close()
 
 

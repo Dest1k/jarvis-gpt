@@ -19,6 +19,7 @@ import { useEffect, useMemo, useState } from "react";
 import type { CSSProperties, ReactNode } from "react";
 
 const CONFIGURED_API_URL = process.env.NEXT_PUBLIC_JARVIS_API_URL ?? "http://localhost:8000";
+const CONFIGURED_API_TOKEN = process.env.NEXT_PUBLIC_JARVIS_API_TOKEN ?? "";
 
 type TraceMessage = {
   id: string;
@@ -73,6 +74,11 @@ function apiUrl() {
   } catch {
     return `${window.location.protocol}//${window.location.hostname}:8000`;
   }
+}
+
+function apiAuthHeaders(): Record<string, string> {
+  const token = CONFIGURED_API_TOKEN.trim();
+  return token ? { "X-Jarvis-Api-Token": token } : {};
 }
 
 function formatDuration(ms?: number | null) {
@@ -140,7 +146,7 @@ export default function TracePage() {
       try {
         const response = await fetch(
           `${apiUrl()}/api/agent/trace/message/${encodeURIComponent(messageId)}`,
-          { cache: "no-store" }
+          { cache: "no-store", headers: apiAuthHeaders() }
         );
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}`);

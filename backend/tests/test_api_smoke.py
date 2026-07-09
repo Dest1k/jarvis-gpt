@@ -9,8 +9,10 @@ status -> chat -> feedback -> mission -> report -> queue -> tools/memory/approva
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
-from jarvis_gpt.api import app
+from jarvis_gpt.api import _is_loopback_host, _token_allowed, app
 from starlette.testclient import TestClient
 
 
@@ -36,6 +38,23 @@ def test_health_and_status(client):
 
     models = client.get("/api/models")
     assert models.status_code == 200
+
+
+def test_runtime_security_and_backup(client, monkeypatch):
+    security = client.get("/api/runtime/security")
+    assert security.status_code == 200
+    assert security.json()["remote_requires_token"] is True
+    assert _is_loopback_host("127.0.0.1") is True
+    assert _is_loopback_host("10.0.0.50") is False
+    monkeypatch.setenv("JARVIS_API_TOKEN", "secret")
+    assert _token_allowed("secret") is True
+    assert _token_allowed("wrong") is False
+
+    backup = client.post("/api/runtime/backup")
+    assert backup.status_code == 200
+    body = backup.json()
+    assert body["ok"] is True
+    assert Path(body["path"]).exists()
 
 
 def test_cors_is_loopback_only(client):

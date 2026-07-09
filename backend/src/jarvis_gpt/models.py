@@ -627,9 +627,14 @@ class AutonomyJobResponse(BaseModel):
     budget: dict[str, int] = Field(default_factory=dict)
     payload: dict[str, Any] = Field(default_factory=dict)
     run_count: int
+    consecutive_failures: int = 0
     created_at: str
     updated_at: str
+    last_started_at: str | None = None
+    last_finished_at: str | None = None
+    last_duration_ms: int | None = None
     last_run_at: str | None = None
+    next_run_after: str | None = None
     last_result: dict[str, Any] = Field(default_factory=dict)
 
 

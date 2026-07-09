@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import os
+import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -12,12 +14,13 @@ from fastapi import (
     File,
     HTTPException,
     Query,
+    Request,
     UploadFile,
     WebSocket,
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from .agent import AgentRuntime
 from .approval_executor import ApprovalExecutor
@@ -185,6 +188,34 @@ def _cors_origins() -> list[str]:
     return [item.strip().rstrip("/") for item in raw.split(",") if item.strip()]
 
 
+def _api_token() -> str:
+    return os.environ.get("JARVIS_API_TOKEN", "").strip()
+
+
+def _is_loopback_host(host: str | None) -> bool:
+    if not host:
+        return False
+    normalized = host.strip().strip("[]").lower()
+    if normalized in {"localhost", "testclient"}:
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
+def _header_token(headers: Any) -> str:
+    auth = str(headers.get("authorization") or "")
+    if auth.lower().startswith("bearer "):
+        return auth.split(" ", 1)[1].strip()
+    return str(headers.get("x-jarvis-api-token") or "").strip()
+
+
+def _token_allowed(token: str) -> bool:
+    expected = _api_token()
+    return bool(expected and token and secrets.compare_digest(token, expected))
+
+
 app = FastAPI(title="JARVIS GPT", version="0.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
@@ -194,6 +225,22 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def local_api_guard(request: Request, call_next):
+    if request.method == "OPTIONS" or request.url.path in {"/", "/health"}:
+        return await call_next(request)
+    host = request.client.host if request.client else ""
+    if _is_loopback_host(host) or _token_allowed(_header_token(request.headers)):
+        return await call_next(request)
+    status_code = 401 if _api_token() else 403
+    detail = (
+        "Remote API access requires a valid bearer token."
+        if _api_token()
+        else "Remote API access is locked until JARVIS_API_TOKEN is configured."
+    )
+    return JSONResponse({"detail": detail}, status_code=status_code)
 
 
 def storage(request_app: FastAPI) -> JarvisStorage:
@@ -232,6 +279,26 @@ async def status() -> StatusResponse:
         health=health_checks,
         recent_events=app.state.storage.list_events(limit=25),
     )
+
+
+@app.get("/api/runtime/security")
+async def runtime_security(request: Request) -> dict[str, Any]:
+    host = request.client.host if request.client else ""
+    return {
+        "client_host": host,
+        "loopback_client": _is_loopback_host(host),
+        "token_configured": bool(_api_token()),
+        "remote_requires_token": True,
+        "cors": {
+            "explicit_origins": _cors_origins(),
+            "loopback_origins_allowed": True,
+        },
+    }
+
+
+@app.post("/api/runtime/backup")
+async def runtime_backup() -> dict[str, Any]:
+    return app.state.storage.backup_database()
 
 
 @app.get("/api/operator/queue", response_model=OperatorQueueResponse)
@@ -632,6 +699,14 @@ async def cleanup_runtime(request: CleanupRequest) -> dict[str, Any]:
 @app.get("/api/autonomy/jobs", response_model=list[AutonomyJobResponse])
 async def autonomy_jobs() -> list[AutonomyJobResponse]:
     return app.state.operations.list_jobs()
+
+
+@app.get("/api/autonomy/job-runs")
+async def autonomy_job_runs(
+    limit: int = Query(default=50, ge=1, le=200),
+    job_id: str | None = Query(default=None, max_length=120),
+) -> list[dict[str, Any]]:
+    return app.state.operations.list_job_runs(limit=limit, job_id=job_id)
 
 
 @app.post("/api/autonomy/jobs", response_model=AutonomyJobResponse)
@@ -1092,6 +1167,11 @@ async def benchmark() -> BenchmarkResponse:
 
 @app.websocket("/ws/events")
 async def ws_events(websocket: WebSocket) -> None:
+    host = websocket.client.host if websocket.client else ""
+    token = _header_token(websocket.headers) or str(websocket.query_params.get("token") or "")
+    if not _is_loopback_host(host) and not _token_allowed(token):
+        await websocket.close(code=1008)
+        return
     bus: EventBus = app.state.bus
     await bus.connect(websocket)
     try:
