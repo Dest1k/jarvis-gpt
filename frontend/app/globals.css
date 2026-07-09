@@ -409,8 +409,15 @@ h3 {
   flex-direction: column;
   min-height: min(560px, calc(100dvh - 36px));
   max-height: calc(100dvh - 36px);
-  overflow: hidden;
   padding-bottom: 12px;
+}
+
+.dialogOps {
+  overflow: hidden;
+}
+
+.sectionOps {
+  overflow: auto;
 }
 
 .panelHeader {
@@ -1306,7 +1313,7 @@ h3 {
   flex-direction: column;
   gap: 10px;
   padding: 12px;
-  overflow: auto;
+  overflow: visible;
 }
 
 .missionItem {
@@ -2500,6 +2507,46 @@ h3 {
   padding-top: 8px;
 }
 
+.filePicker {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: center;
+  min-width: 0;
+  height: 32px;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 0 10px;
+  background: var(--control);
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.filePicker:hover,
+.filePicker:focus-within {
+  border-color: var(--teal);
+  color: var(--teal);
+}
+
+.filePicker svg {
+  color: currentColor;
+}
+
+.filePicker span {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink);
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.filePicker small {
+  color: var(--muted);
+  white-space: nowrap;
+}
+
 .directoryForm {
   padding-top: 8px;
 }
@@ -2536,12 +2583,6 @@ h3 {
 .preferencesForm select:focus {
   border-color: var(--teal);
   box-shadow: 0 0 0 3px rgba(13, 118, 111, 0.12);
-}
-
-.fileForm input[type="file"] {
-  padding: 4px 8px;
-  color: var(--muted);
-  font-size: 12px;
 }
 
 .memoryVault {

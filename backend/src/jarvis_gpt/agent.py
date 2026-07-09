@@ -1954,12 +1954,14 @@ class AgentRuntime:
             results=results,
             fetches=fetches,
         )
-        synthesis = await self._synthesize_web_research_answer(
-            message=message,
-            query=query,
-            evidence=evidence,
-            fallback_answer=answer,
-        )
+        synthesis = None
+        if not _should_skip_web_synthesis(message, evidence):
+            synthesis = await self._synthesize_web_research_answer(
+                message=message,
+                query=query,
+                evidence=evidence,
+                fallback_answer=answer,
+            )
         if synthesis is not None:
             answer = synthesis
             events.append(
@@ -5445,6 +5447,11 @@ def _format_web_research_answer(
     evidence = _research_evidence(results, fetches)
     if shopping:
         facts = _extract_shopping_facts(evidence)
+        if evidence and not any(item.get("fetched") == "true" for item in evidence):
+            lines.append(
+                "\nDNS/магазин не отдал содержимое страниц автоматическому клиенту, поэтому цену "
+                "и наличие я не подтверждаю. Ссылки ниже взяты из поисковой выдачи."
+            )
         if _mentions_dns_store(normalized):
             lines.append("\nПриоритетно проверял выдачу магазина DNS (`dns-shop.ru`).")
         if facts["prices"] or facts["availability"]:
@@ -5462,6 +5469,29 @@ def _format_web_research_answer(
                 "\nПоиск нашёл источники по товару, но статические страницы "
                 "не отдали точную цену или наличие. Не выдумываю."
             )
+        ranking_criterion = _ranking_criterion_from_message(message)
+        if ranking_criterion:
+            candidates = _sort_shopping_candidates(
+                _shopping_candidates_from_evidence(evidence),
+                criterion=ranking_criterion,
+            )
+            ranked = [
+                item
+                for item in candidates
+                if _candidate_metric(item, ranking_criterion) is not None
+            ]
+            if ranked:
+                lines.append(
+                    "\nПредварительно отсортировал по критерию: "
+                    f"{_ranking_criterion_label(ranking_criterion)}."
+                )
+                for index, item in enumerate(ranked[:5], start=1):
+                    lines.append(f"{index}. {_shopping_candidate_label(item)} — {item['url']}")
+            elif candidates:
+                lines.append(
+                    "\nТочно отсортировать по цене/критерию не могу: "
+                    "в доступных сниппетах нет подтверждённого числа."
+                )
     elif place_lookup:
         facts = _extract_place_lookup_facts(evidence)
         if facts["phones"] or facts["hours"] or facts["addresses"]:
@@ -5636,6 +5666,15 @@ def _synthesis_source_payload(evidence: list[dict[str, str]]) -> list[dict[str, 
             }
         )
     return sources
+
+
+def _should_skip_web_synthesis(message: str, evidence: list[dict[str, str]]) -> bool:
+    normalized = message.lower()
+    if not _looks_like_shopping_query(normalized) or not evidence:
+        return False
+    has_store_link = any(urlparse(str(item.get("url") or "")).hostname for item in evidence)
+    has_fetched_source = any(str(item.get("fetched") or "") == "true" for item in evidence)
+    return has_store_link and not has_fetched_source
 
 
 def _source_quality_label(url: str, *, fetched: bool) -> str:

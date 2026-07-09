@@ -1293,6 +1293,82 @@ def test_agent_expands_bare_gpu_model_for_dns_shop(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_agent_returns_dns_links_when_store_blocks_automation(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "1")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+
+    class ResearchLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None):
+            rendered = "\n".join(item["content"] for item in messages)
+            if "intent-router" in rendered:
+                return type(
+                    "Result",
+                    (),
+                    {
+                        "ok": True,
+                        "content": (
+                            '{"route":"web_research","confidence":0.9,'
+                            '"query":"rtx 5090 site:dns-shop.ru купить цена наличие",'
+                            '"rationale":"shopping link request"}'
+                        ),
+                        "error": None,
+                    },
+                )()
+            raise AssertionError("shopping snippet-only evidence should skip synthesis")
+
+    agent = AgentRuntime(settings=settings, storage=storage, llm=ResearchLLM(), bus=EventBus())
+
+    async def fake_run(name, arguments=None, **kwargs):
+        if name == "web.search":
+            return _tool_response(
+                name,
+                True,
+                "Web search returned 1 result(s).",
+                {
+                    "results": [
+                        {
+                            "title": "RTX 5090 DNS",
+                            "url": "https://www.dns-shop.ru/product/rtx-5090",
+                            "snippet": "Купить видеокарту RTX 5090 в DNS.",
+                        }
+                    ]
+                },
+            )
+        if name == "web.fetch":
+            return _tool_response(
+                name,
+                False,
+                "Fetched URL with HTTP 403; page appears blocked.",
+                {
+                    "url": arguments["url"],
+                    "status_code": 403,
+                    "text": "HTTP 403 Error Forbidden",
+                },
+            )
+        if name == "web.render":
+            return _tool_response(
+                name,
+                False,
+                "Rendered page appears blocked by the remote site.",
+                {"url": arguments["url"], "text": "HTTP 403 Error Forbidden"},
+            )
+        raise AssertionError(f"unexpected tool {name}")
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+
+    response = asyncio.run(agent.chat("выдай ссылку на самую дешёвую 5090 в днс"))
+
+    assert "https://www.dns-shop.ru/product/rtx-5090" in response.answer
+    assert "не подтверждаю" in response.answer
+    assert "невозможно" not in response.answer.lower()
+    assert not any(event.title == "web.synthesis" for event in response.events)
+    storage.close()
+
+
 def test_agent_sorts_previous_shopping_results_and_opens_cheapest(monkeypatch, tmp_path):
     agent, storage = _agent_without_llm(monkeypatch, tmp_path)
     calls = []

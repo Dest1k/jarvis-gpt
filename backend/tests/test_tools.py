@@ -9,7 +9,12 @@ import httpx
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
 from jarvis_gpt.llm import LLMRouter
 from jarvis_gpt.storage import JarvisStorage
-from jarvis_gpt.tools import ToolRegistry, _PublicOnlyAsyncNetworkBackend, _windows_native_command
+from jarvis_gpt.tools import (
+    WEB_USER_AGENT,
+    ToolRegistry,
+    _PublicOnlyAsyncNetworkBackend,
+    _windows_native_command,
+)
 
 
 def test_tool_registry_runs_memory_tools(monkeypatch, tmp_path):
@@ -554,7 +559,7 @@ def test_web_fetch_reads_public_text(monkeypatch, tmp_path):
         def stream(self, method, url, *, headers, follow_redirects):
             assert method == "GET"
             assert url == "https://example.com/"
-            assert headers["User-Agent"] == "JARVIS-GPT/0.1"
+            assert headers["User-Agent"] == WEB_USER_AGENT
             assert follow_redirects is False
             assert self.kwargs["trust_env"] is False
             return FakeStream()
@@ -578,6 +583,59 @@ def test_web_fetch_reads_public_text(monkeypatch, tmp_path):
     assert result.data["status_code"] == 200
     assert result.data["text"] == "hello world"
     assert result.data["truncated"] is False
+    storage.close()
+
+
+def test_web_fetch_marks_forbidden_pages_as_blocked(monkeypatch, tmp_path):
+    class FakeResponse:
+        status_code = 403
+        headers = {"content-type": "text/html; charset=utf-8"}
+
+        async def aiter_bytes(self):
+            yield "HTTP 403 Error Forbidden Доступ к сайту запрещен".encode()
+
+    class FakeStream:
+        async def __aenter__(self):
+            return FakeResponse()
+
+        async def __aexit__(self, _exc_type, _exc, _traceback):
+            return None
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, _exc_type, _exc, _traceback):
+            return None
+
+        def stream(self, method, url, *, headers, follow_redirects):
+            assert method == "GET"
+            assert headers["User-Agent"] == WEB_USER_AGENT
+            assert follow_redirects is False
+            assert self.kwargs["trust_env"] is False
+            return FakeStream()
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr(
+        "jarvis_gpt.tools._public_resolved_addresses",
+        lambda _hostname: [ipaddress.ip_address("93.184.216.34")],
+    )
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    result = asyncio.run(tools.run("web.fetch", {"url": "https://example.com/"}))
+
+    assert result.ok is False
+    assert result.data["status_code"] == 403
+    assert "blocked" in result.summary
     storage.close()
 
 
@@ -650,6 +708,34 @@ def test_web_render_uses_isolated_headless_browser(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_web_render_marks_forbidden_dom_as_blocked(monkeypatch, tmp_path):
+    class FakeCompleted:
+        returncode = 0
+        stdout = "<html><body>HTTP 403 Error Forbidden Доступ к сайту запрещен</body></html>"
+        stderr = ""
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr("jarvis_gpt.tools._find_headless_browser", lambda: Path("chrome.exe"))
+    monkeypatch.setattr(
+        "jarvis_gpt.tools._public_resolved_addresses",
+        lambda _hostname: [ipaddress.ip_address("93.184.216.34")],
+    )
+    monkeypatch.setattr("jarvis_gpt.tools.subprocess.run", lambda *args, **kwargs: FakeCompleted())
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    result = asyncio.run(tools.run("web.render", {"url": "https://example.com/"}))
+
+    assert result.ok is False
+    assert "blocked" in result.summary
+    assert "Forbidden" in result.data["text"]
+    storage.close()
+
+
 def test_web_search_parses_public_results(monkeypatch, tmp_path):
     class FakeResponse:
         text = """
@@ -663,6 +749,8 @@ def test_web_search_parses_public_results(monkeypatch, tmp_path):
           <div class="result__snippet">News snippet</div>
         </html>
         """
+        headers = {"content-type": "text/html; charset=utf-8"}
+        content = text.encode()
 
         def raise_for_status(self):
             return None
@@ -679,7 +767,7 @@ def test_web_search_parses_public_results(monkeypatch, tmp_path):
 
         async def get(self, url, *, headers):
             assert "duckduckgo.com/html/" in url
-            assert "JARVIS-GPT" in headers["User-Agent"]
+            assert headers["User-Agent"] == WEB_USER_AGENT
             assert self.kwargs["trust_env"] is False
             return FakeResponse()
 

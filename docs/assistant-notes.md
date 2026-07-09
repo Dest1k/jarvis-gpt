@@ -9,6 +9,23 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-10 - Codex (web blocked-page handling + UI polish)
+
+- Fixed Command Center file panel styling: native file input is hidden behind a
+  themed picker row, and non-chat right-panel sections now use one outer scroll
+  instead of nested tiny scroll areas in empty mission/approval/briefing blocks.
+- `web.fetch` now uses browser-like Accept/User-Agent headers, repairs common
+  UTF-8 mojibake from search/fetch HTML, and marks HTTP 401/403/429 or obvious
+  anti-bot pages as blocked instead of successful evidence.
+- `web.render` now treats rendered 403/captcha/anti-bot DOM as blocked. It still
+  runs in isolated headless Chrome/Edge and does not touch the operator browser.
+- Shopping research now skips LLM synthesis when only snippet/search links are
+  available because a shop blocked automation. In that case it returns the
+  found store links, says price/availability are not confirmed, and avoids the
+  false "link impossible" answer.
+- Verified: backend ruff, full backend pytest (210 pass), frontend typecheck,
+  frontend build.
+
 ### 2026-07-10 - Codex (API host selection hotfix)
 
 - Fixed Command Center API host selection when the UI is opened on

@@ -41,6 +41,16 @@ ToolHandler = Callable[
     ToolRunResponse | Awaitable[ToolRunResponse],
 ]
 
+WEB_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+WEB_HEADERS = {
+    "User-Agent": WEB_USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.7",
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+}
+
 
 @dataclass(frozen=True)
 class ToolContext:
@@ -1125,10 +1135,7 @@ async def _web_search(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespons
         query = query[:300].rstrip()
 
     url = f"https://duckduckgo.com/html/?q={quote_plus(query)}"
-    headers = {
-        "User-Agent": "JARVIS-GPT/0.1",
-        "Accept": "text/html,application/xhtml+xml",
-    }
+    headers = WEB_HEADERS
     try:
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(20.0),
@@ -1146,7 +1153,7 @@ async def _web_search(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespons
             data={"query": query, "url": url},
         )
 
-    results = _parse_duckduckgo_results(response.text, limit=limit)
+    results = _parse_duckduckgo_results(_decode_response_text(response), limit=limit)
     return ToolRunResponse(
         tool="web.search",
         ok=True,
@@ -1164,7 +1171,7 @@ async def _web_fetch(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
         return ToolRunResponse(tool="web.fetch", ok=False, summary=str(exc))
 
     redirects: list[dict[str, Any]] = []
-    headers = {"User-Agent": "JARVIS-GPT/0.1"}
+    headers = WEB_HEADERS
     timeout = httpx.Timeout(20.0)
     try:
         async with httpx.AsyncClient(
@@ -1201,10 +1208,17 @@ async def _web_fetch(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
                         continue
 
                     text, truncated = await _read_limited_response_text(response, max_chars)
+                    blocked = _web_response_blocked(response.status_code, text)
+                    summary = f"Fetched URL with HTTP {response.status_code}."
+                    if blocked:
+                        summary = (
+                            f"Fetched URL with HTTP {response.status_code}; "
+                            "page appears blocked."
+                        )
                     return ToolRunResponse(
                         tool="web.fetch",
-                        ok=True,
-                        summary=f"Fetched URL with HTTP {response.status_code}.",
+                        ok=response.status_code < 400 and not blocked,
+                        summary=summary,
                         data={
                             "url": current_url,
                             "status_code": response.status_code,
@@ -1271,6 +1285,21 @@ async def _web_render(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespons
     truncated = len(text) > max_chars
     if truncated:
         text = text[:max_chars].rstrip()
+    if _web_response_blocked(200, text):
+        return ToolRunResponse(
+            tool="web.render",
+            ok=False,
+            summary="Rendered page appears blocked by the remote site.",
+            data={
+                "url": url,
+                "browser": str(browser),
+                "text": text,
+                "html_chars": len(html),
+                "truncated": truncated,
+                "pinned_addresses": [str(item) for item in addresses],
+                "stderr": str(result.get("stderr") or "")[:1000],
+            },
+        )
     return ToolRunResponse(
         tool="web.render",
         ok=True,
@@ -2213,7 +2242,53 @@ def _html_to_text(value: str) -> str:
         value,
     )
     without_tags = re.sub(r"(?s)<[^>]+>", " ", without_scripts)
-    return " ".join(unescape(without_tags).split())
+    return _repair_mojibake(" ".join(unescape(without_tags).split()))
+
+
+def _decode_response_text(response: httpx.Response) -> str:
+    encoding = _charset_from_content_type(response.headers.get("content-type")) or "utf-8"
+    return _repair_mojibake(response.content.decode(encoding, errors="replace"))
+
+
+def _repair_mojibake(text: str) -> str:
+    if not text or not _looks_like_mojibake(text):
+        return text
+
+    candidates = [text]
+    for encoding in ("cp1252", "latin1"):
+        try:
+            candidates.append(text.encode(encoding).decode("utf-8"))
+        except UnicodeError:
+            continue
+    return min(candidates, key=_mojibake_score)
+
+
+def _looks_like_mojibake(text: str) -> bool:
+    return any(marker in text for marker in ("Ð", "Ñ", "Â", "â€"))
+
+
+def _mojibake_score(text: str) -> tuple[int, int]:
+    marker_score = sum(text.count(marker) for marker in ("Ð", "Ñ", "Â", "â€", "�"))
+    cyrillic_bonus = sum(1 for char in text if "а" <= char.lower() <= "я" or char.lower() == "ё")
+    return marker_score, -cyrillic_bonus
+
+
+def _web_response_blocked(status_code: int, text: str) -> bool:
+    if status_code in {401, 403, 429}:
+        return True
+    normalized = _repair_mojibake(text).lower()
+    blocked_markers = (
+        "403 error forbidden",
+        "access denied",
+        "forbidden",
+        "доступ к сайту",
+        "доступ запрещ",
+        "captcha",
+        "проверка браузера",
+        "request id",
+        "guru meditation",
+    )
+    return any(marker in normalized for marker in blocked_markers)
 
 
 def _hostname_is_private(hostname: str) -> bool:
@@ -2394,7 +2469,7 @@ async def _read_limited_response_text(
         content.extend(chunk)
 
     encoding = _charset_from_content_type(response.headers.get("content-type")) or "utf-8"
-    text = bytes(content).decode(encoding, errors="replace")
+    text = _repair_mojibake(bytes(content).decode(encoding, errors="replace"))
     content_type = response.headers.get("content-type", "").lower()
     if "html" in content_type or "<html" in text[:500].lower():
         text = _html_to_text(text)

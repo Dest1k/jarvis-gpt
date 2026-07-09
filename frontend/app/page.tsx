@@ -4216,7 +4216,10 @@ export default function CommandCenter() {
             </div>
           </section>
 
-          <section className="opsPanel" aria-label={activeTabTitle[activeTab]}>
+          <section
+            className={`opsPanel ${activeTab === "chat" ? "dialogOps" : "sectionOps"}`}
+            aria-label={activeTabTitle[activeTab]}
+          >
             {activeTab === "chat" && (
               <>
                 <div className="panelHeader">
@@ -4928,10 +4931,17 @@ export default function CommandCenter() {
             </div>
             <form className="fileForm" onSubmit={uploadSelectedFile}>
               <input
+                className="srOnly"
+                id="command-center-file-upload"
                 type="file"
                 aria-label="Файл"
                 onChange={(event) => setSelectedFile(event.currentTarget.files?.[0] ?? null)}
               />
+              <label className="filePicker" htmlFor="command-center-file-upload">
+                <Paperclip size={15} />
+                <span>{selectedFile?.name ?? "Выбрать файл"}</span>
+                {selectedFile ? <small>{formatBytes(selectedFile.size)}</small> : null}
+              </label>
               <button type="submit" disabled={busy || !selectedFile} title="Загрузить">
                 {busy && selectedFile ? <Loader2 className="spin" size={15} /> : <Upload size={15} />}
               </button>

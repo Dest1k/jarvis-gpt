@@ -1,5 +1,21 @@
 # Runtime
 
+## 2026-07-10 handoff - blocked web pages and right-panel polish
+
+For the operator and the second model:
+
+- Command Center file panel no longer exposes the native browser file input in
+  the themed UI. It shows a stable picker row with selected filename/size.
+- Runtime/files side panels now use the outer panel scroll for non-chat tabs;
+  empty mission/approval/briefing blocks no longer create tiny inner scrollbars.
+- Web tools now use browser-like request headers and repair common mojibake in
+  DuckDuckGo/search HTML. HTTP 401/403/429 and rendered anti-bot pages are
+  marked blocked instead of being treated as successful evidence.
+- For shopping requests, when a store such as DNS blocks automated fetch/render
+  but public search results contain product/catalog links, the agent returns
+  those links and explicitly says price/availability are unverified instead of
+  claiming that a direct link is impossible.
+
 ## 2026-07-10 handoff - API host selection and same-machine LAN
 
 For the operator and the second model:
