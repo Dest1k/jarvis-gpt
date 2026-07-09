@@ -30,6 +30,7 @@ Agent Runtime
   |-- operator queue
   |-- memory hygiene
   |-- model profile roadmap
+  |-- web evidence synthesis
   |
 LLM Router
   |
@@ -55,6 +56,7 @@ External host runtime
 - LLM является заменяемым маршрутом, а не фундаментом всей системы.
 - Operator persona — первоклассный слой понимания оператора: durable профиль (роль, домашний город, языки, стек, увлечения, текущий фокус, постоянные правила, глоссарий) читается на каждом ходу и обобщает узкие маршруты (например, домашний город закрывает погоду/локальные/гео запросы вместо отдельного weather-кэша). Это широкое поле правок вместо патча под каждый юзкейс.
 - Reasoning-first интент: для fuzzy web-семьи агент не доверяет каскаду `_looks_like_*`, а спрашивает модель (`_understand_intent`), которая понимает задачу по смыслу и operator-контексту и решает маршрут. Эвристики остаются детерминированным фолбэком (офлайн и для конкретных tool-биндингов вроде native OS action). Так «понимание задачи» вытесняет «правила-затычки», не ломая деградацию без LLM.
+- Web evidence synthesis: прямой web-маршрут теперь не заканчивается механическим списком ссылок. Backend собирает search/fetch evidence, присваивает источникам простой quality label, затем LLM делает краткий вывод только из этих фактов. Если synthesis даёт мусор или router JSON, включается старый deterministic formatter.
 - Агентный tool-loop: на пути ответа модель — не одиночный forward-pass, а цикл, где она сама выбирает безопасные инструменты, читает observation и продолжает до финального ответа. Опасные инструменты автономно не выполняются, а становятся approval-гейтами. Это снимает «чат-бот»-стену (у модели появляются руки), не завися от размера модели.
 - Гибридный retrieval: память достаётся не только лексически (BM25/LIKE), но и семантически (fuzzy-вектор или remote-эмбеддинги), фьюз через RRF над ограниченным пулом кандидатов. Модель получает релевантный контекст даже при перефразировании — это отдельная подсистема, которую нельзя «дообучить» размером чат-модели.
 - Реальное исполнение миссий: `execute_next_mission_step` при живом LLM прогоняет шаг через агентный tool-loop (реальные вызовы инструментов, approval для опасного, аудит), а не отдаёт статичный brief. Миссии перестали быть «планами, которые ничего не делают». Офлайн остаётся детерминированный brief.
@@ -65,8 +67,8 @@ External host runtime
 - Профили `gemma4-mono` и `gemma4-turbo` указывают на реальные каталоги весов в `D:\jarvis\data\models`; backend не хранит веса в репозитории.
 - Dispatcher вынесен в отдельный Compose profile `llm`, чтобы Command Center можно было запускать без случайной загрузки тяжёлых весов в VRAM.
 - Любое действие с риском выше safe должно сначала стать approval gate; выполнение после approve проходит через отдельный whitelisted gated executor.
-- Self-learning пока идёт через explicit `learning.tick`: он добывает lessons из audit/tool/approval истории и пишет их в долговременную память.
-- Autonomous supervisor безопасно выполняет только наблюдение: telemetry snapshots и learning tick по расписанию; действия с риском остаются через approvals.
+- Self-learning идёт через append-only learning journal и `learning.tick`: диалоги, tool runs, web/browser observations и deletion markers превращаются в lessons без привязки к видимой истории чатов.
+- Autonomous supervisor безопасно выполняет только наблюдение: telemetry snapshots и learning tick сразу при старте и далее по расписанию; действия с риском остаются через approvals.
 - Performance слой разделяет лёгкий backend и тяжёлый dispatcher; GPU утилизируется vLLM-профилем, а backend собирает telemetry без удержания весов.
 
 - Mission approvals resume in-place: a gated mission tool stores a compact

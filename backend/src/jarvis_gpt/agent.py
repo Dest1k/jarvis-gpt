@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 from . import persona as persona_module
 from .config import JarvisSettings
@@ -112,6 +112,18 @@ CONTINUE_AFTER_LENGTH_PROMPT = (
     "The previous assistant message ended because of a token limit. Continue the same answer "
     "from the exact point where it stopped. Do not restart, do not apologize, do not repeat "
     "completed text, and finish naturally in Russian."
+)
+
+
+WEB_SYNTHESIS_PROMPT = (
+    "web-evidence-synthesis-v1\n"
+    "You are the evidence synthesis layer for JARVIS. Reply in Russian.\n"
+    "Use only the supplied search/fetch evidence. Do not add facts from memory, guesses, "
+    "or generic model knowledge. Put the conclusion first, then the key confirmed facts, "
+    "then uncertainty/gaps if evidence is weak. Prefer fetched page excerpts over search "
+    "snippets. Treat snippet-only sources as weak. If the evidence does not support a "
+    "conclusion, say that plainly and suggest the next verification step. Keep the answer "
+    "concise and human. Include source URLs in an 'Источники' section."
 )
 
 
@@ -1394,6 +1406,13 @@ class AgentRuntime:
             if followup is not None:
                 return followup
 
+        research_followup = await self._run_web_research_followup(
+            message=message,
+            conversation_id=context.conversation_id,
+        )
+        if research_followup is not None:
+            return research_followup
+
         weather_events: list[ChatEvent] = []
         inferred_weather_location: str | None = None
         if (
@@ -1660,15 +1679,44 @@ class AgentRuntime:
                     },
                 )
             )
+        evidence = _research_evidence(results, fetches)
         answer = _format_web_research_answer(
             message=message,
             query=query,
             results=results,
             fetches=fetches,
         )
+        synthesis = await self._synthesize_web_research_answer(
+            message=message,
+            query=query,
+            evidence=evidence,
+            fallback_answer=answer,
+        )
+        if synthesis is not None:
+            answer = synthesis
+            events.append(
+                ChatEvent(
+                    type="thought",
+                    title="web.synthesis",
+                    content="Synthesized fetched web evidence before answering.",
+                    payload={
+                        "query": query,
+                        "sources": len(evidence),
+                        "snippet_only_sources": sum(
+                            1 for item in evidence if item.get("fetched") != "true"
+                        ),
+                    },
+                )
+            )
         normalized = message.lower()
         if conversation_id and results:
-            evidence = _research_evidence(results, fetches)
+            self._remember_web_research(
+                conversation_id=conversation_id,
+                message=message,
+                query=query,
+                evidence=evidence,
+                answer=answer,
+            )
             candidates = _shopping_candidates_from_evidence(evidence)
             criterion = _ranking_criterion_from_message(message)
             self._remember_shopping_research(
@@ -1685,6 +1733,129 @@ class AgentRuntime:
                 events.extend(open_action.events)
                 answer = f"{answer}\n\n{open_action.answer}"
         return DirectAction(answer=answer, events=events)
+
+    async def _run_web_research_followup(
+        self,
+        *,
+        message: str,
+        conversation_id: str,
+    ) -> DirectAction | None:
+        if not _web_research_followup_intent(message):
+            return None
+        state = self._web_research_state(conversation_id)
+        if state is None:
+            return None
+        evidence = [
+            item for item in state.get("evidence", []) if isinstance(item, dict) and item.get("url")
+        ][:6]
+        if not evidence:
+            return None
+        query = str(state.get("query") or "previous web research")
+        original_message = str(state.get("message") or "")
+        fallback = _format_web_research_followup_answer(
+            followup_message=message,
+            query=query,
+            evidence=evidence,
+            previous_answer=str(state.get("answer") or ""),
+        )
+        synthesis = await self._synthesize_web_research_answer(
+            message=original_message or message,
+            query=query,
+            evidence=evidence,
+            fallback_answer=fallback,
+            followup_message=message,
+        )
+        answer = synthesis or fallback
+        self.storage.record_learning_observation(
+            kind="web.research.followup",
+            conversation_id=conversation_id,
+            content=answer,
+            summary=f"Web research follow-up: {query}",
+            payload={
+                "query": query,
+                "message": message,
+                "sources": _synthesis_source_payload(evidence),
+            },
+        )
+        return DirectAction(
+            answer=answer,
+            events=[
+                ChatEvent(
+                    type="thought",
+                    title="web.synthesis",
+                    content="Reused previous web evidence for the follow-up.",
+                    payload={"query": query, "sources": len(evidence)},
+                )
+            ],
+        )
+
+    async def _synthesize_web_research_answer(
+        self,
+        *,
+        message: str,
+        query: str,
+        evidence: list[dict[str, str]],
+        fallback_answer: str,
+        followup_message: str | None = None,
+    ) -> str | None:
+        if not self.settings.llm_enabled or not evidence or not hasattr(self.llm, "complete"):
+            return None
+        payload = {
+            "current_date": date.today().isoformat(),
+            "operator_question": message,
+            "followup_question": followup_message,
+            "search_query": query,
+            "sources": _synthesis_source_payload(evidence),
+            "fallback_answer": _short_value(fallback_answer, 1800),
+        }
+        result = await self._complete_llm(
+            [
+                {"role": "system", "content": WEB_SYNTHESIS_PROMPT},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            temperature=0.1,
+            max_tokens=min(max(self.settings.llm_max_tokens, 1024), 3072),
+            thinking_enabled=False,
+        )
+        if not getattr(result, "ok", False) or not getattr(result, "content", ""):
+            return None
+        answer = _clean_web_synthesis_answer(str(result.content))
+        if not _valid_web_synthesis_answer(answer):
+            return None
+        return _ensure_synthesis_sources(answer, evidence)
+
+    def _remember_web_research(
+        self,
+        *,
+        conversation_id: str,
+        message: str,
+        query: str,
+        evidence: list[dict[str, str]],
+        answer: str,
+    ) -> None:
+        state = {
+            "ts": time.time(),
+            "message": message,
+            "query": query,
+            "evidence": evidence[:6],
+            "answer": answer[:12000],
+        }
+        self.storage.set_runtime_value(_web_research_state_key(conversation_id), state)
+        self.storage.record_learning_observation(
+            kind="web.research",
+            conversation_id=conversation_id,
+            content=answer,
+            summary=f"Web research: {query}",
+            payload={
+                "query": query,
+                "message": message,
+                "sources": _synthesis_source_payload(evidence),
+            },
+        )
+
+    def _web_research_state(self, conversation_id: str) -> dict[str, Any] | None:
+        value = self.storage.get_runtime_value(_web_research_state_key(conversation_id), None)
+        return value if isinstance(value, dict) else None
 
     async def _run_shopping_followup(
         self,
@@ -4766,17 +4937,152 @@ def _research_evidence(
     for result in results:
         url = str(result.get("url") or "")
         fetched_text = fetched_by_url.get(url, "")
-        snippet = str(result.get("snippet") or "")
+        search_snippet = str(result.get("snippet") or "")
+        snippet = search_snippet
         if fetched_text:
             snippet = _short_value(fetched_text, 240)
+        excerpt = _short_value(fetched_text or search_snippet, 1200)
         evidence.append(
             {
                 "title": str(result.get("title") or url),
                 "url": url,
                 "snippet": snippet,
+                "excerpt": excerpt,
+                "fetched": "true" if fetched_text else "false",
+                "quality": _source_quality_label(url, fetched=bool(fetched_text)),
             }
         )
     return evidence
+
+
+def _synthesis_source_payload(evidence: list[dict[str, str]]) -> list[dict[str, str]]:
+    sources: list[dict[str, str]] = []
+    for index, item in enumerate(evidence[:6], start=1):
+        url = str(item.get("url") or "")
+        if not url:
+            continue
+        sources.append(
+            {
+                "id": str(index),
+                "title": _short_value(item.get("title") or url, 180),
+                "url": url,
+                "quality": str(item.get("quality") or "unknown"),
+                "fetched": str(item.get("fetched") or "false"),
+                "excerpt": _short_value(item.get("excerpt") or item.get("snippet") or "", 1200),
+            }
+        )
+    return sources
+
+
+def _source_quality_label(url: str, *, fetched: bool) -> str:
+    host = (urlparse(url).hostname or "").lower()
+    if not fetched:
+        return "snippet-only"
+    if host.endswith((".gov", ".edu", ".int")):
+        return "primary-official"
+    if any(part in host for part in ("docs.", "developer.", "support.", "learn.")):
+        return "vendor-docs"
+    if host in {
+        "github.com",
+        "python.org",
+        "openai.com",
+        "anthropic.com",
+        "deepmind.google",
+        "ai.google.dev",
+        "huggingface.co",
+    } or host.endswith(
+        (
+            ".python.org",
+            ".openai.com",
+            ".anthropic.com",
+            ".google.com",
+            ".microsoft.com",
+            ".nvidia.com",
+        )
+    ):
+        return "primary-or-vendor"
+    if any(part in host for part in ("reddit.", "x.com", "twitter.", "t.me", "telegram.")):
+        return "community-or-social"
+    return "fetched-page"
+
+
+def _clean_web_synthesis_answer(text: str) -> str:
+    cleaned = _clean_assistant_answer(text).strip()
+    cleaned = re.sub(r"(?is)^```(?:markdown|md|text)?\s*|\s*```$", "", cleaned).strip()
+    return cleaned
+
+
+def _valid_web_synthesis_answer(answer: str) -> bool:
+    if len(answer) < 20:
+        return False
+    try:
+        parsed = json.loads(answer)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, dict) and (
+        "route" in parsed or "confidence" in parsed or "rationale" in parsed
+    ):
+        return False
+    return not re.fullmatch(r"\s*\{.*\}\s*", answer, flags=re.DOTALL)
+
+
+def _ensure_synthesis_sources(answer: str, evidence: list[dict[str, str]]) -> str:
+    urls = [str(item.get("url") or "") for item in evidence[:6] if item.get("url")]
+    if any(url and url in answer for url in urls):
+        return answer
+    lines = ["", "Источники:"]
+    for index, item in enumerate(evidence[:6], start=1):
+        url = str(item.get("url") or "")
+        if not url:
+            continue
+        title = _short_value(item.get("title") or url, 140)
+        lines.append(f"{index}. {title}: {url}")
+    return answer.rstrip() + "\n" + "\n".join(lines)
+
+
+def _web_research_followup_intent(message: str) -> bool:
+    normalized = message.casefold()
+    if len(normalized) > 600:
+        return False
+    direct_markers = (
+        "какой вывод",
+        "какие выводы",
+        "что понял",
+        "что из этого следует",
+        "итог по поиску",
+        "вывод по поиску",
+        "по найденному",
+        "по источникам",
+        "резюмируй найденное",
+        "суммируй найденное",
+        "сделай вывод по",
+    )
+    return _contains_any(normalized, direct_markers)
+
+
+def _format_web_research_followup_answer(
+    *,
+    followup_message: str,
+    query: str,
+    evidence: list[dict[str, str]],
+    previous_answer: str,
+) -> str:
+    lines = [
+        "По прошлому веб-поиску могу опереться только на уже сохранённые источники.",
+        f"Запрос: `{query}`.",
+    ]
+    if previous_answer:
+        lines.append("\nПредыдущая выжимка:")
+        lines.append(_short_value(previous_answer, 1400))
+    else:
+        lines.append(f"\nУточнение оператора: {_short_value(followup_message, 300)}")
+    lines.append("\nИсточники:")
+    for index, item in enumerate(evidence[:6], start=1):
+        url = str(item.get("url") or "")
+        title = str(item.get("title") or url)
+        snippet = f" — {item.get('snippet')}" if item.get("snippet") else ""
+        lines.append(f"{index}. {title}: {url}{snippet}")
+    return "\n".join(lines)
 
 
 def _shopping_followup_intent(
@@ -4978,6 +5284,10 @@ def _ranking_criterion_label(criterion: str) -> str:
 
 def _shopping_research_key(conversation_id: str) -> str:
     return f"research.last_ranked.{conversation_id}"
+
+
+def _web_research_state_key(conversation_id: str) -> str:
+    return f"research.last_web.{conversation_id}"
 
 
 def _shopping_state_from_recent_messages(messages: list[dict[str, Any]]) -> dict[str, Any] | None:

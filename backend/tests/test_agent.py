@@ -1970,6 +1970,239 @@ def test_semantic_router_can_refine_ambiguous_web_query(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_web_research_synthesizes_fetched_evidence(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "1")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    captured = {}
+
+    class ResearchLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None):
+            rendered = "\n".join(item["content"] for item in messages)
+            if "intent-router" in rendered:
+                return type(
+                    "Result",
+                    (),
+                    {
+                        "ok": True,
+                        "content": (
+                            '{"route":"web_research","confidence":0.9,'
+                            '"query":"fundamental AI model architecture breakthroughs latest",'
+                            '"rationale":"current model landscape"}'
+                        ),
+                        "error": None,
+                    },
+                )()
+            captured["synthesis_messages"] = messages
+            payload = json.loads(messages[1]["content"])
+            assert payload["sources"][0]["fetched"] == "true"
+            assert "state-space memory" in payload["sources"][0]["excerpt"]
+            return type(
+                "Result",
+                (),
+                {
+                    "ok": True,
+                    "content": (
+                        "Вывод: подтверждённый сдвиг здесь не просто масштабирование, "
+                        "а модель Alpha с state-space memory.\n\n"
+                        "Источники:\n1. Alpha report: https://example.com/alpha"
+                    ),
+                    "error": None,
+                },
+            )()
+
+    agent = AgentRuntime(settings=settings, storage=storage, llm=ResearchLLM(), bus=EventBus())
+
+    async def fake_run(name, arguments=None, **kwargs):
+        if name == "web.search":
+            return _tool_response(
+                name,
+                True,
+                "Web search returned 1 result(s).",
+                {
+                    "results": [
+                        {
+                            "title": "Alpha report",
+                            "url": "https://example.com/alpha",
+                            "snippet": "Alpha model report",
+                        }
+                    ]
+                },
+            )
+        if name == "web.fetch":
+            return _tool_response(
+                name,
+                True,
+                "Fetched URL with HTTP 200.",
+                {
+                    "url": arguments["url"],
+                    "text": "Alpha introduced state-space memory; Beta mostly scaled training.",
+                },
+            )
+        raise AssertionError(f"unexpected tool {name}")
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+
+    response = asyncio.run(
+        agent.chat("погугли, какие свежие AI модели внесли фундаментально новое")
+    )
+
+    assert "Вывод:" in response.answer
+    assert "https://example.com/alpha" in response.answer
+    assert any(event.title == "web.synthesis" for event in response.events)
+    assert "web-evidence-synthesis-v1" in captured["synthesis_messages"][0]["content"]
+    observations = storage.list_learning_observations(limit=10, kind="web.research")
+    assert observations
+    assert observations[0]["payload"]["query"] == (
+        "fundamental AI model architecture breakthroughs latest"
+    )
+    storage.close()
+
+
+def test_web_research_synthesis_rejects_router_json(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "1")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+
+    class RouterOnlyLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None):
+            return type(
+                "Result",
+                (),
+                {
+                    "ok": True,
+                    "content": '{"route":"web_research","confidence":0.9,"query":"x"}',
+                    "error": None,
+                },
+            )()
+
+    agent = AgentRuntime(settings=settings, storage=storage, llm=RouterOnlyLLM(), bus=EventBus())
+
+    async def fake_run(name, arguments=None, **kwargs):
+        if name == "web.search":
+            return _tool_response(
+                name,
+                True,
+                "Web search returned 1 result(s).",
+                {
+                    "results": [
+                        {
+                            "title": "Python releases",
+                            "url": "https://www.python.org/downloads/",
+                            "snippet": "Latest Python release information",
+                        }
+                    ]
+                },
+            )
+        if name == "web.fetch":
+            return _tool_response(
+                name,
+                True,
+                "Fetched URL with HTTP 200.",
+                {"url": arguments["url"], "text": "Latest Python release information"},
+            )
+        raise AssertionError(f"unexpected tool {name}")
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+
+    response = asyncio.run(agent.chat("сейчас какая самая свежая версия Python?"))
+
+    assert "Проверил веб-поиск" in response.answer
+    assert "https://www.python.org/downloads/" in response.answer
+    assert '"route"' not in response.answer
+    storage.close()
+
+
+def test_web_research_followup_uses_previous_evidence(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "1")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tool_calls = []
+    synthesis_payloads = []
+
+    class FollowupLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None):
+            rendered = "\n".join(item["content"] for item in messages)
+            if "intent-router" in rendered:
+                return type(
+                    "Result",
+                    (),
+                    {
+                        "ok": True,
+                        "content": (
+                            '{"route":"web_research","confidence":0.92,'
+                            '"query":"AI model architecture breakthroughs latest",'
+                            '"rationale":"current facts"}'
+                        ),
+                        "error": None,
+                    },
+                )()
+            payload = json.loads(messages[1]["content"])
+            synthesis_payloads.append(payload)
+            followup = payload.get("followup_question")
+            content = (
+                "Вывод: из прошлого поиска следует, что Alpha заявлена как "
+                "архитектурный сдвиг, а не просто новая версия.\n\n"
+                "Источники:\n1. Alpha report: https://example.com/alpha"
+                if followup
+                else "Вывод: Alpha выглядит главным подтверждённым кандидатом.\n\n"
+                "Источники:\n1. Alpha report: https://example.com/alpha"
+            )
+            return type("Result", (), {"ok": True, "content": content, "error": None})()
+
+    agent = AgentRuntime(settings=settings, storage=storage, llm=FollowupLLM(), bus=EventBus())
+
+    async def fake_run(name, arguments=None, **kwargs):
+        tool_calls.append(name)
+        if name == "web.search":
+            return _tool_response(
+                name,
+                True,
+                "Web search returned 1 result(s).",
+                {
+                    "results": [
+                        {
+                            "title": "Alpha report",
+                            "url": "https://example.com/alpha",
+                            "snippet": "Alpha model report",
+                        }
+                    ]
+                },
+            )
+        if name == "web.fetch":
+            return _tool_response(
+                name,
+                True,
+                "Fetched URL with HTTP 200.",
+                {
+                    "url": arguments["url"],
+                    "text": "Alpha uses a new architecture; Beta is a scale update.",
+                },
+            )
+        raise AssertionError(f"unexpected tool {name}")
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+
+    first = asyncio.run(agent.chat("погугли свежие фундаментальные AI модели"))
+    second = asyncio.run(agent.chat("какой вывод сделан?", first.conversation_id))
+
+    assert tool_calls == ["web.search", "web.fetch"]
+    assert "из прошлого поиска следует" in second.answer
+    assert synthesis_payloads[-1]["followup_question"] == "какой вывод сделан?"
+    observations = storage.list_learning_observations(limit=10, kind="web.research.followup")
+    assert observations
+    storage.close()
+
+
 def test_reasoning_arbiter_can_override_shopping_keyword_plug(monkeypatch, tmp_path):
     # A shopping-shaped message that the keyword plug would send to web_research,
     # but the reasoning-first arbiter judges to be reasoning: no web tool must run.

@@ -1,5 +1,24 @@
 # Runtime
 
+## 2026-07-09 handoff - web evidence synthesis
+
+For the operator and the second model:
+
+- Direct web research is now `search/fetch -> evidence synthesis -> answer`.
+  `_run_web_research` still gathers public pages through backend `web.search` and
+  `web.fetch`, but then asks the local LLM to produce a conclusion from the
+  fetched evidence only, with uncertainty and source URLs.
+- The deterministic formatter remains the fallback. If the synthesis response is
+  empty, router-shaped JSON, or otherwise invalid, Jarvis returns the old source
+  list instead of exposing broken routing output.
+- Per-conversation evidence is persisted in runtime KV as `research.last_web.*`
+  and mirrored into the append-only learning journal as `web.research`.
+  Follow-ups such as "какой вывод?" use that stored evidence and do not re-open
+  the operator's browser.
+- Source payloads include a small quality label (`primary-or-vendor`,
+  `vendor-docs`, `fetched-page`, `snippet-only`, etc.) so the synthesis prompt can
+  treat snippets as weak and fetched official/vendor pages as stronger evidence.
+
 ## 2026-07-09 handoff - open browsing and durable learning journal
 
 For the operator and the second model:

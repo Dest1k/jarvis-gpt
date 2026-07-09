@@ -11,6 +11,19 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ### 2026-07-09 - Codex
 
+- Added an evidence-synthesis pass after `web.search`/`web.fetch`: web answers now
+  ask the LLM to form a conclusion from fetched evidence, mark uncertainty, and
+  keep source URLs, instead of returning only a mechanical source dump.
+- Recent web evidence is stored per conversation under `research.last_web.*` and
+  mirrored into `learning_observations` as `web.research`; follow-ups like
+  "какой вывод?" reuse the saved evidence without opening the operator browser.
+- The synthesis layer rejects router-shaped JSON or weak model output and falls
+  back to the deterministic formatter, so offline/degraded behavior is preserved.
+- Regression tests cover successful synthesis, JSON fallback, and follow-up
+  synthesis from previous evidence.
+
+### 2026-07-09 - Codex
+
 - Browser policy default is now `open`: validated public HTTP(S) browser opens no
   longer need approval. `browser.open`/`browser.open_many` are still excluded from
   the autonomous agentic tool loop, so background web work should use
