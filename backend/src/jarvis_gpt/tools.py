@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from html import unescape
 from pathlib import Path, PureWindowsPath
 from typing import Any, Literal
-from urllib.parse import parse_qs, quote_plus, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlparse
 from xml.etree import ElementTree
 
 import httpcore
@@ -32,6 +32,7 @@ from .browser_cdp import (
     normalize_debug_url,
     read_chrome_page,
     run_chrome_action,
+    scroll_chrome_page,
 )
 from .config import JarvisSettings
 from .diagnostics import run_diagnostics
@@ -129,6 +130,9 @@ POTENTIALLY_EXECUTABLE_CONTENT_TYPES = {
 WEB_EVIDENCE_KEY = "web.evidence.records"
 WEB_HANDOFF_KEY = "browser.handoff.current"
 WEB_RESEARCH_KEY = "web.research.records"
+WEB_FETCH_CACHE_KEY = "web.fetch.cache"
+WEB_FETCH_CACHE_TTL_SEC = 900
+WEB_FETCH_CACHE_MAX_RECORDS = 100
 WEB_RATE_KEY_PREFIX = "web.rate."
 WEB_RATE_WINDOW_SEC = 600
 WEB_RATE_MAX_REQUESTS = 12
@@ -136,6 +140,28 @@ WEB_RATE_BLOCKED_COOLDOWN_SEC = 900
 WEB_DOCUMENT_READ_MAX_BYTES = 50_000_000
 WEB_DOCUMENT_ZIP_MEMBER_MAX_BYTES = 2_000_000
 DOCUMENT_OUTPUT_DIRNAME = "document-outputs"
+CONSENT_WALL_MARKERS = (
+    "accept cookies",
+    "allow cookies",
+    "manage cookies",
+    "cookie settings",
+    "cookie preferences",
+    "privacy preferences",
+    "we use cookies",
+    "this site uses cookies",
+    "consent",
+    "gdpr",
+    "принять cookies",
+    "принять cookie",
+    "принять куки",
+    "настройки cookie",
+    "настройки cookies",
+    "настройки куки",
+    "используем cookies",
+    "используем cookie",
+    "используем куки",
+    "согласие на обработку",
+)
 WEB_VERIFY_STOPWORDS = {
     "a",
     "an",
@@ -557,6 +583,27 @@ class ToolRegistry:
         )
         self.add(
             ToolSpec(
+                name="browser.scroll",
+                description=(
+                    "Scroll an HTTP(S) page through a local Chrome DevTools session to load "
+                    "lazy/infinite content, then return the visible text."
+                ),
+                category="browser",
+                input_schema={
+                    "url": "HTTP(S) URL to open",
+                    "direction": "down, up, top, or bottom",
+                    "pixels": "Pixels per scroll pass",
+                    "passes": "Number of scroll passes",
+                    "max_chars": "Maximum text characters",
+                    "wait_ms": "Milliseconds to wait for page load",
+                    "debug_url": "Local Chrome DevTools URL, default 127.0.0.1:9222",
+                },
+                handler=_browser_scroll,
+                danger_level="review",
+            )
+        )
+        self.add(
+            ToolSpec(
                 name="browser.click",
                 description="Click a CSS selector in a local Chrome CDP session after review.",
                 category="browser",
@@ -808,11 +855,36 @@ class ToolRegistry:
             ToolSpec(
                 name="web.search",
                 description=(
-                    "Search the public web and return result titles, URLs and snippets."
+                    "Search the public web with region/freshness/pagination controls and "
+                    "return result titles, URLs and snippets."
                 ),
                 category="web",
-                input_schema={"query": "Search query", "limit": "Maximum results"},
+                input_schema={
+                    "query": "Search query",
+                    "limit": "Maximum results",
+                    "region": "Search region, default ru-ru",
+                    "freshness": "day, week, month, year, or empty",
+                    "pages": "Search result pages to inspect",
+                    "provider": "auto, duckduckgo, bing, or yandex",
+                },
                 handler=_web_search,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="web.crawl",
+                description=(
+                    "Bounded same-site crawl for paginated articles, forum threads, docs, and "
+                    "next-page materials."
+                ),
+                category="web",
+                input_schema={
+                    "url": "Starting public http(s) URL",
+                    "max_pages": "Maximum pages to fetch",
+                    "max_chars": "Maximum text characters per page",
+                    "same_site": "Keep crawl on the same host",
+                },
+                handler=_web_crawl,
             )
         )
         self.add(
@@ -1035,6 +1107,7 @@ class ToolRegistry:
                     "url": "Public http(s) URL",
                     "max_chars": "Maximum visible text characters",
                     "wait_ms": "Virtual time budget for page scripts",
+                    "scroll_passes": "Optional headless scroll passes for lazy-loaded content",
                 },
                 handler=_web_render,
             )
@@ -1581,9 +1654,15 @@ async def _browser_read(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
         url=snapshot.url or url,
         text=snapshot.text,
     )
-    ok = bool(snapshot.text.strip()) and not snapshot.needs_human_verification
+    ok = (
+        bool(snapshot.text.strip())
+        and not snapshot.needs_human_verification
+        and not safety["consent_wall_detected"]
+    )
     if snapshot.needs_human_verification:
         summary = "Page appears to require human verification; complete it in Chrome and retry."
+    elif safety["consent_wall_detected"]:
+        summary = "Browser page appears to be a cookie/consent wall."
     elif snapshot.text.strip():
         summary = f"Read browser page: {snapshot.title or snapshot.url}"
     else:
@@ -1608,7 +1687,7 @@ async def _browser_read(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
         text=snapshot.text,
         content_type="text/plain",
         safety=safety,
-        confidence=0.74 if ok else 0.35,
+        confidence=0.74 if ok else 0.25,
         extra={"needs_human_verification": snapshot.needs_human_verification},
     )
     return ToolRunResponse(
@@ -1627,6 +1706,114 @@ async def _browser_read(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
                 "form_count": snapshot.form_count,
                 "password_input_count": snapshot.password_input_count,
                 "sensitive_input_count": snapshot.sensitive_input_count,
+                "values_read": False,
+            },
+            "safety": safety,
+            "handoff": handoff,
+            "evidence_id": evidence["id"],
+            "debug_url": debug_url,
+        },
+    )
+
+
+async def _browser_scroll(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    policy = OperationsManager(settings=ctx.settings, storage=ctx.storage).browser_policy()
+    try:
+        url = _validate_browser_url(str(args.get("url") or ""), policy=policy)
+        debug_url = normalize_debug_url(str(args.get("debug_url") or DEFAULT_CHROME_DEBUG_URL))
+    except (BrowserCdpError, ValueError) as exc:
+        return ToolRunResponse(tool="browser.scroll", ok=False, summary=str(exc))
+
+    direction = str(args.get("direction") or "down").strip().lower()
+    if direction not in {"down", "up", "top", "bottom", "end"}:
+        return ToolRunResponse(
+            tool="browser.scroll",
+            ok=False,
+            summary="Scroll direction must be down, up, top, bottom, or end.",
+        )
+    pixels = _int_arg(args.get("pixels"), default=900, minimum=100, maximum=5000)
+    passes = _int_arg(args.get("passes"), default=3, minimum=1, maximum=20)
+    wait_ms = _int_arg(args.get("wait_ms"), default=5000, minimum=1000, maximum=30000)
+    max_chars = _int_arg(args.get("max_chars"), default=9000, minimum=256, maximum=30000)
+
+    try:
+        result = await scroll_chrome_page(
+            url=url,
+            direction=direction,
+            pixels=pixels,
+            passes=passes,
+            max_chars=max_chars,
+            wait_ms=wait_ms,
+            debug_url=debug_url,
+        )
+    except BrowserCdpError as exc:
+        return ToolRunResponse(
+            tool="browser.scroll",
+            ok=False,
+            summary=(
+                f"{exc}. Start Chrome with browser.chrome.launch or complete any "
+                "human verification in Chrome, then retry."
+            ),
+            data={"url": url, "debug_url": debug_url},
+        )
+
+    safety = _web_content_safety(
+        source="browser.scroll",
+        url=result.url,
+        text=result.snapshot.text,
+    )
+    ok = (
+        result.ok
+        and bool(result.snapshot.text.strip())
+        and not result.snapshot.needs_human_verification
+    )
+    if result.snapshot.needs_human_verification:
+        summary = "Page appears to require human verification after scrolling."
+    elif safety["consent_wall_detected"]:
+        ok = False
+        summary = "Scrolled page appears to be a cookie/consent wall."
+    else:
+        summary = result.summary
+    if ok and safety["prompt_injection_detected"]:
+        summary = f"{summary} Remote prompt-injection markers detected."
+    handoff = _browser_handoff_from_snapshot(
+        ctx.storage,
+        source="browser.scroll",
+        snapshot=result.snapshot,
+        debug_url=debug_url,
+    )
+    if handoff and not result.snapshot.needs_human_verification:
+        summary = f"{summary} Human handoff may be needed for login or sensitive form."
+    elif not handoff:
+        _clear_browser_handoff(ctx.storage, url=result.snapshot.url, source="browser.scroll")
+    evidence = _store_web_evidence(
+        ctx.storage,
+        source="browser.scroll",
+        url=result.url,
+        title=result.title,
+        text=result.snapshot.text,
+        content_type="text/plain",
+        safety=safety,
+        confidence=0.72 if ok else 0.28,
+        extra={"scroll": result.target_info or {}},
+    )
+    return ToolRunResponse(
+        tool="browser.scroll",
+        ok=ok,
+        summary=summary,
+        data={
+            "url": result.url,
+            "requested_url": url,
+            "title": result.title,
+            "ready_state": result.ready_state,
+            "text": result.snapshot.text,
+            "truncated": result.snapshot.truncated,
+            "needs_human_verification": result.snapshot.needs_human_verification,
+            "scroll": result.target_info or {},
+            "forms": {
+                "form_count": result.snapshot.form_count,
+                "password_input_count": result.snapshot.password_input_count,
+                "sensitive_input_count": result.snapshot.sensitive_input_count,
                 "values_read": False,
             },
             "safety": safety,
@@ -2121,18 +2308,29 @@ def _documents_apply_replacements(ctx: ToolContext, args: dict[str, Any]) -> Too
 
 async def _web_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     query = " ".join(str(args.get("query") or "").split())
-    limit = _int_arg(args.get("limit"), default=6, minimum=1, maximum=12)
+    limit = _int_arg(args.get("limit"), default=6, minimum=1, maximum=30)
+    region = _normalize_search_region(args.get("region"))
+    freshness = _normalize_search_freshness(args.get("freshness"))
+    pages = _int_arg(args.get("pages"), default=1, minimum=1, maximum=5)
+    provider = str(args.get("provider") or "auto").strip().lower()
     if not query:
         return ToolRunResponse(tool="web.search", ok=False, summary="Search query is required.")
     if len(query) > 300:
         query = query[:300].rstrip()
-
-    providers = [
-        ("duckduckgo_html", f"https://duckduckgo.com/html/?q={quote_plus(query)}"),
-        ("bing_html", f"https://www.bing.com/search?q={quote_plus(query)}"),
-    ]
+    providers = _web_search_requests(
+        query,
+        region=region,
+        freshness=freshness,
+        pages=pages,
+        provider=provider,
+    )
+    if not providers:
+        return ToolRunResponse(tool="web.search", ok=False, summary="Unsupported search provider.")
     headers = WEB_HEADERS
     last_failure: dict[str, Any] | None = None
+    collected: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    provider_stats: list[dict[str, Any]] = []
     try:
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(20.0),
@@ -2140,7 +2338,9 @@ async def _web_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
             trust_env=False,
             transport=_PublicOnlyAsyncHTTPTransport(),
         ) as client:
-            for source, url in providers:
+            for request in providers:
+                source = str(request["source"])
+                url = str(request["url"])
                 rate_block = _web_rate_limit_block(ctx.storage, url)
                 if rate_block is not None:
                     last_failure = {"source": source, **rate_block}
@@ -2150,15 +2350,51 @@ async def _web_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
                     response.raise_for_status()
                 except httpx.HTTPError as exc:
                     last_failure = {"source": source, "summary": str(exc), "url": url}
+                    _web_rate_limit_record(ctx.storage, url, ok=False)
                     continue
                 html = _decode_response_text(response)
-                if source == "bing_html":
-                    results = _parse_bing_results(html, limit=limit)
-                else:
-                    results = _parse_duckduckgo_results(html, limit=limit)
-                if not results and source != providers[-1][0]:
-                    _web_rate_limit_record(ctx.storage, url, ok=True)
+                status_code = int(getattr(response, "status_code", 200) or 200)
+                if _web_response_blocked(status_code, _html_to_text(html)):
+                    last_failure = {
+                        "source": source,
+                        "summary": "Search provider returned a blocked page.",
+                        "url": url,
+                    }
+                    _web_rate_limit_record(ctx.storage, url, ok=False, blocked=True)
                     continue
+                parsed = _web_parse_search_results(source, html, limit=limit)
+                added = 0
+                for item in parsed:
+                    result_url = str(item.get("url") or "")
+                    if not result_url or result_url in seen_urls:
+                        continue
+                    seen_urls.add(result_url)
+                    collected.append(
+                        {
+                            **item,
+                            "rank": len(collected) + 1,
+                            "provider": source,
+                            "provider_page": request.get("page"),
+                            "provider_rank": item.get("rank"),
+                        }
+                    )
+                    added += 1
+                    if len(collected) >= limit:
+                        break
+                provider_stats.append(
+                    {
+                        "source": source,
+                        "page": request.get("page"),
+                        "url": url,
+                        "parsed": len(parsed),
+                        "added": added,
+                    }
+                )
+                _web_rate_limit_record(ctx.storage, url, ok=True)
+                if len(collected) >= limit:
+                    break
+            results = collected[:limit]
+            if results:
                 evidence_text = "\n".join(
                     f"{item.get('title', '')}\n{item.get('url', '')}\n{item.get('snippet', '')}"
                     for item in results
@@ -2174,20 +2410,33 @@ async def _web_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
                     url=url,
                     title=query,
                     text=evidence_text,
-                    content_type=response.headers.get("content-type"),
+                    content_type="text/plain",
                     safety=safety,
                     confidence=0.45 if results else 0.1,
-                    extra={"query": query, "provider": source, "result_count": len(results)},
+                    extra={
+                        "query": query,
+                        "region": region,
+                        "freshness": freshness,
+                        "pages": pages,
+                        "providers": provider_stats,
+                        "result_count": len(results),
+                    },
                 )
-                _web_rate_limit_record(ctx.storage, url, ok=True)
                 return ToolRunResponse(
                     tool="web.search",
                     ok=True,
-                    summary=f"Web search returned {len(results)} result(s) via {source}.",
+                    summary=(
+                        f"Web search returned {len(results)} result(s) "
+                        f"across {len(provider_stats)} provider page(s)."
+                    ),
                     data={
                         "query": query,
                         "results": results,
-                        "source": source,
+                        "source": results[0].get("provider") if results else None,
+                        "region": region,
+                        "freshness": freshness,
+                        "pages": pages,
+                        "providers": provider_stats,
                         "safety": safety,
                         "evidence_id": evidence["id"],
                     },
@@ -2293,6 +2542,67 @@ async def _web_extract(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespons
     )
 
 
+async def _web_crawl(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    raw_url = str(args.get("url") or "").strip()
+    max_pages = _int_arg(args.get("max_pages"), default=4, minimum=1, maximum=12)
+    max_chars = _int_arg(args.get("max_chars"), default=6000, minimum=512, maximum=12000)
+    same_site = _bool_arg(args.get("same_site"), default=True)
+    try:
+        start_url = _validate_public_http_url(raw_url)
+    except ValueError as exc:
+        return ToolRunResponse(tool="web.crawl", ok=False, summary=str(exc))
+
+    start_host = _url_domain(start_url)
+    queue: list[str] = [start_url]
+    seen: set[str] = set()
+    pages: list[dict[str, Any]] = []
+    steps: list[dict[str, Any]] = []
+    while queue and len(pages) < max_pages:
+        url = queue.pop(0)
+        if url in seen:
+            continue
+        seen.add(url)
+        fetched = await _web_fetch(ctx, {"url": url, "max_chars": max_chars})
+        steps.append(
+            {"tool": "web.fetch", "ok": fetched.ok, "summary": fetched.summary, "url": url}
+        )
+        if not fetched.ok or not isinstance(fetched.data, dict):
+            continue
+        text = str(fetched.data.get("text") or "")
+        links = fetched.data.get("links") if isinstance(fetched.data.get("links"), list) else []
+        evidence_id = str(fetched.data.get("evidence_id") or "")
+        pages.append(
+            {
+                "url": fetched.data.get("url") or url,
+                "text": _short_text(text, 1200),
+                "evidence_id": evidence_id or None,
+                "links_found": len(links),
+            }
+        )
+        for link in _prioritize_crawl_links(links):
+            next_url = str(link.get("url") or "")
+            if not next_url or next_url in seen or next_url in queue:
+                continue
+            if same_site and _url_domain(next_url) != start_host:
+                continue
+            queue.append(next_url)
+            if len(queue) >= max_pages * 3:
+                break
+
+    return ToolRunResponse(
+        tool="web.crawl",
+        ok=bool(pages),
+        summary=f"Crawled {len(pages)} page(s) from {start_host}.",
+        data={
+            "url": start_url,
+            "same_site": same_site,
+            "max_pages": max_pages,
+            "pages": pages,
+            "steps": steps,
+        },
+    )
+
+
 async def _web_research(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     query = " ".join(str(args.get("query") or "").split())
     claim = " ".join(str(args.get("claim") or "").split())
@@ -2301,8 +2611,20 @@ async def _web_research(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
     if not query:
         query = claim
     max_sources = _int_arg(args.get("max_sources"), default=4, minimum=1, maximum=8)
-    render_fallback = bool(args.get("render_fallback", True))
-    search = await _web_search(ctx, {"query": query, "limit": max(4, max_sources)})
+    render_fallback = _bool_arg(args.get("render_fallback"), default=True)
+    archive_fallback = _bool_arg(args.get("archive_fallback"), default=True)
+    search_pages = _int_arg(args.get("pages"), default=2, minimum=1, maximum=5)
+    search = await _web_search(
+        ctx,
+        {
+            "query": query,
+            "limit": max(6, max_sources * 2),
+            "region": args.get("region") or "ru-ru",
+            "freshness": args.get("freshness") or "",
+            "pages": search_pages,
+            "provider": args.get("provider") or "auto",
+        },
+    )
     steps: list[dict[str, Any]] = [
         {"tool": "web.search", "ok": search.ok, "summary": search.summary}
     ]
@@ -2329,12 +2651,30 @@ async def _web_research(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
         if should_render:
             rendered = await _web_render(
                 ctx,
-                {"url": result["url"], "max_chars": 9000, "wait_ms": 2500},
+                {
+                    "url": result["url"],
+                    "max_chars": 9000,
+                    "wait_ms": 2500,
+                    "scroll_passes": 2,
+                },
             )
             steps.append({"tool": "web.render", "ok": rendered.ok, "summary": rendered.summary})
             if rendered.ok and str(rendered.data.get("text") or "").strip():
                 fetched = rendered
                 fetched_text = str(rendered.data.get("text") or "")
+        if archive_fallback and (
+            not fetched.ok
+            or bool((fetched.data or {}).get("blocked"))
+            or bool((fetched.data or {}).get("consent_wall"))
+        ):
+            archived = await _web_archive(
+                ctx,
+                {"url": result["url"], "max_chars": 9000},
+            )
+            steps.append({"tool": "web.archive", "ok": archived.ok, "summary": archived.summary})
+            if archived.ok and str(archived.data.get("text") or "").strip():
+                fetched = archived
+                fetched_text = str(archived.data.get("text") or "")
         steps.append(
             {
                 "tool": fetched.tool,
@@ -2633,16 +2973,24 @@ async def _fetch_public_document(
                         max_chars,
                     )
                     blocked = _web_response_blocked(response.status_code, text)
+                    safety = _web_content_safety(source=source, url=current_url, text=text)
+                    consent_wall = bool(safety["consent_wall_detected"])
+                    ok = response.status_code < 400 and not blocked and not consent_wall
                     _web_rate_limit_record(
                         ctx.storage,
                         current_url,
-                        ok=response.status_code < 400 and not blocked,
+                        ok=ok,
                         blocked=blocked,
                     )
                     return {
-                        "ok": response.status_code < 400 and not blocked,
+                        "ok": ok,
                         "summary": (
                             f"Fetched document for {source} with HTTP {response.status_code}."
+                            if not consent_wall
+                            else (
+                                f"Fetched document for {source} with HTTP {response.status_code}; "
+                                "page appears to be a cookie/consent wall."
+                            )
                         ),
                         "data": {
                             "url": current_url,
@@ -2653,6 +3001,7 @@ async def _fetch_public_document(
                             "truncated": truncated,
                             "redirects": redirects,
                             "blocked": blocked,
+                            "consent_wall": consent_wall,
                         },
                     }
     except httpx.HTTPError as exc:
@@ -2671,10 +3020,21 @@ async def _fetch_public_document(
 async def _web_fetch(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     raw_url = str(args.get("url") or "").strip()
     max_chars = _int_arg(args.get("max_chars"), default=6000, minimum=256, maximum=20000)
+    use_cache = _bool_arg(args.get("use_cache"), default=True)
     try:
         current_url = _validate_public_http_url(raw_url)
     except ValueError as exc:
         return ToolRunResponse(tool="web.fetch", ok=False, summary=str(exc))
+    requested_url = current_url
+    if use_cache:
+        cached = _web_fetch_cache_get(ctx.storage, current_url, max_chars=max_chars)
+        if cached is not None:
+            return ToolRunResponse(
+                tool="web.fetch",
+                ok=True,
+                summary="Fetched URL from TTL cache.",
+                data=cached,
+            )
     rate_block = _web_rate_limit_block(ctx.storage, current_url)
     if rate_block is not None:
         return ToolRunResponse(
@@ -2737,6 +3097,7 @@ async def _web_fetch(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
                         url=current_url,
                         text=text,
                     )
+                    consent_wall = bool(safety["consent_wall_detected"])
                     summary = f"Fetched URL with HTTP {response.status_code}."
                     if blocked:
                         summary = (
@@ -2744,8 +3105,14 @@ async def _web_fetch(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
                             "page appears blocked. Try web.archive for a Wayback copy "
                             "or web.render for a JS-rendered view."
                         )
+                    elif consent_wall:
+                        summary = (
+                            f"Fetched URL with HTTP {response.status_code}; "
+                            "page appears to be a cookie/consent wall."
+                        )
                     elif safety["prompt_injection_detected"]:
                         summary = f"{summary} Remote prompt-injection markers detected."
+                    ok = response.status_code < 400 and not blocked and not consent_wall
                     evidence = _store_web_evidence(
                         ctx.storage,
                         source="web.fetch",
@@ -2754,7 +3121,7 @@ async def _web_fetch(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
                         text=text,
                         content_type=content_type,
                         safety=safety,
-                        confidence=0.72 if response.status_code < 400 and not blocked else 0.25,
+                        confidence=0.72 if ok else 0.22,
                         extra={
                             "status_code": response.status_code,
                             "html_metadata": html_metadata or {},
@@ -2763,24 +3130,47 @@ async def _web_fetch(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
                     _web_rate_limit_record(
                         ctx.storage,
                         current_url,
-                        ok=response.status_code < 400 and not blocked,
+                        ok=ok,
                         blocked=blocked,
                     )
+                    data = {
+                        "url": current_url,
+                        "requested_url": requested_url,
+                        "status_code": response.status_code,
+                        "content_type": content_type,
+                        "text": text,
+                        "truncated": truncated,
+                        "redirects": redirects,
+                        "safety": safety,
+                        "html_metadata": html_metadata or {},
+                        "links": (
+                            _extract_html_links(raw_text, current_url)
+                            if html_metadata is not None
+                            else []
+                        ),
+                        "blocked": blocked,
+                        "consent_wall": consent_wall,
+                        "evidence_id": evidence["id"],
+                    }
+                    if ok and use_cache:
+                        _web_fetch_cache_store(
+                            ctx.storage,
+                            requested_url,
+                            data,
+                            max_chars=max_chars,
+                        )
+                        if current_url != requested_url:
+                            _web_fetch_cache_store(
+                                ctx.storage,
+                                current_url,
+                                data,
+                                max_chars=max_chars,
+                            )
                     return ToolRunResponse(
                         tool="web.fetch",
-                        ok=response.status_code < 400 and not blocked,
+                        ok=ok,
                         summary=summary,
-                        data={
-                            "url": current_url,
-                            "status_code": response.status_code,
-                            "content_type": content_type,
-                            "text": text,
-                            "truncated": truncated,
-                            "redirects": redirects,
-                            "safety": safety,
-                            "html_metadata": html_metadata or {},
-                            "evidence_id": evidence["id"],
-                        },
+                        data=data,
                     )
     except httpx.HTTPError as exc:
         return ToolRunResponse(
@@ -2846,17 +3236,53 @@ async def _web_archive(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespons
     if snapshot_url.startswith("http://"):
         snapshot_url = "https://" + snapshot_url.removeprefix("http://")
 
-    fetched = await _web_fetch(ctx, {"url": snapshot_url, "max_chars": max_chars})
+    fetched = await _web_fetch(
+        ctx,
+        {
+            "url": snapshot_url,
+            "max_chars": max_chars,
+            "use_cache": args.get("use_cache", True),
+        },
+    )
     archive_note = (
         "Archived Wayback copy; the live page may differ — treat prices, availability "
         "and dates as historical."
     )
+    text = str((fetched.data or {}).get("text") or "")
+    evidence_id = str((fetched.data or {}).get("evidence_id") or "")
+    safety = (
+        _web_content_safety(source="web.archive", url=target_url, text=text)
+        if text.strip()
+        else {}
+    )
+    if fetched.ok and text.strip():
+        evidence = _store_web_evidence(
+            ctx.storage,
+            source="web.archive",
+            url=target_url,
+            title="",
+            text=text,
+            content_type=str((fetched.data or {}).get("content_type") or "text/html"),
+            safety=safety,
+            confidence=0.58,
+            extra={
+                "snapshot_url": snapshot_url,
+                "snapshot_timestamp": str(snapshot.get("timestamp") or ""),
+                "fetched_evidence_id": evidence_id or None,
+            },
+        )
+        evidence_id = evidence["id"]
     combined = {
         **(fetched.data or {}),
+        "url": target_url,
         "requested_url": target_url,
         "snapshot_url": snapshot_url,
+        "archive_url": snapshot_url,
         "snapshot_timestamp": str(snapshot.get("timestamp") or ""),
+        "snapshot": snapshot,
         "archive_note": archive_note,
+        "safety": safety or (fetched.data or {}).get("safety"),
+        "evidence_id": evidence_id or None,
     }
     summary = (
         f"Read Wayback snapshot {snapshot.get('timestamp') or ''} for {target_url}."
@@ -3617,6 +4043,7 @@ async def _web_render(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespons
     max_chars = _int_arg(args.get("max_chars"), default=8000, minimum=512, maximum=30000)
     wait_ms = _int_arg(args.get("wait_ms"), default=2500, minimum=250, maximum=10000)
     timeout_sec = _int_arg(args.get("timeout_sec"), default=25, minimum=5, maximum=60)
+    scroll_passes = _int_arg(args.get("scroll_passes"), default=0, minimum=0, maximum=12)
     try:
         url = _validate_public_http_url(raw_url)
         parsed = urlparse(url)
@@ -3641,14 +4068,25 @@ async def _web_render(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespons
             data={"url": url},
         )
 
-    result = await asyncio.to_thread(
-        _run_headless_dump_dom,
-        browser,
-        url,
-        addresses=addresses,
-        wait_ms=wait_ms,
-        timeout_sec=timeout_sec,
-    )
+    if scroll_passes:
+        result = await _run_headless_cdp_render(
+            browser,
+            url,
+            addresses=addresses,
+            wait_ms=wait_ms,
+            timeout_sec=timeout_sec,
+            max_chars=max_chars,
+            scroll_passes=scroll_passes,
+        )
+    else:
+        result = await asyncio.to_thread(
+            _run_headless_dump_dom,
+            browser,
+            url,
+            addresses=addresses,
+            wait_ms=wait_ms,
+            timeout_sec=timeout_sec,
+        )
     if not result["ok"]:
         return ToolRunResponse(
             tool="web.render",
@@ -3657,11 +4095,12 @@ async def _web_render(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespons
             data={"url": url, **result},
         )
     html = str(result.get("html") or "")
-    text = _html_to_text(html)
+    text = str(result.get("text") or "") if result.get("text") is not None else _html_to_text(html)
     truncated = len(text) > max_chars
     if truncated:
         text = text[:max_chars].rstrip()
     safety = _web_content_safety(source="web.render", url=url, text=text)
+    consent_wall = bool(safety["consent_wall_detected"])
     if _web_response_blocked(200, text):
         _web_rate_limit_record(_ctx.storage, url, ok=False, blocked=True)
         return ToolRunResponse(
@@ -3679,6 +4118,24 @@ async def _web_render(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespons
                 "safety": safety,
             },
         )
+    if consent_wall:
+        _web_rate_limit_record(_ctx.storage, url, ok=False, blocked=False)
+        return ToolRunResponse(
+            tool="web.render",
+            ok=False,
+            summary="Rendered page appears to be a cookie/consent wall.",
+            data={
+                "url": url,
+                "browser": str(browser),
+                "text": text,
+                "html_chars": len(html),
+                "truncated": truncated,
+                "pinned_addresses": [str(item) for item in addresses],
+                "stderr": str(result.get("stderr") or "")[:1000],
+                "safety": safety,
+                "consent_wall": True,
+            },
+        )
     summary = "Rendered public URL in isolated headless browser."
     if safety["prompt_injection_detected"]:
         summary = f"{summary} Remote prompt-injection markers detected."
@@ -3691,7 +4148,11 @@ async def _web_render(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespons
         content_type="text/html",
         safety=safety,
         confidence=0.7,
-        extra={"html_chars": len(html), "pinned_addresses": [str(item) for item in addresses]},
+        extra={
+            "html_chars": len(html),
+            "pinned_addresses": [str(item) for item in addresses],
+            "scroll_passes": scroll_passes,
+        },
     )
     _web_rate_limit_record(_ctx.storage, url, ok=True)
     return ToolRunResponse(
@@ -3705,6 +4166,7 @@ async def _web_render(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespons
             "html_chars": len(html),
             "truncated": truncated,
             "pinned_addresses": [str(item) for item in addresses],
+            "scroll_passes": scroll_passes,
             "stderr": str(result.get("stderr") or "")[:1000],
             "safety": safety,
             "evidence_id": evidence["id"],
@@ -4877,6 +5339,143 @@ def _validate_public_http_url(raw_url: str) -> str:
     return parsed.geturl()
 
 
+def _normalize_search_region(value: Any) -> str:
+    raw = str(value or "ru-ru").strip().lower().replace("_", "-")
+    aliases = {
+        "ru": "ru-ru",
+        "ru-ru": "ru-ru",
+        "russia": "ru-ru",
+        "россия": "ru-ru",
+        "en": "en-us",
+        "us": "en-us",
+        "en-us": "en-us",
+        "usa": "en-us",
+        "wt-wt": "wt-wt",
+        "global": "wt-wt",
+        "all": "wt-wt",
+    }
+    return aliases.get(raw, raw if re.match(r"^[a-z]{2}-[a-z]{2}$", raw) else "ru-ru")
+
+
+def _normalize_search_freshness(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    aliases = {
+        "d": "day",
+        "day": "day",
+        "today": "day",
+        "24h": "day",
+        "w": "week",
+        "week": "week",
+        "7d": "week",
+        "m": "month",
+        "month": "month",
+        "30d": "month",
+        "y": "year",
+        "year": "year",
+    }
+    return aliases.get(raw, "")
+
+
+def _web_search_requests(
+    query: str,
+    *,
+    region: str,
+    freshness: str,
+    pages: int,
+    provider: str,
+) -> list[dict[str, Any]]:
+    selected = (
+        ["duckduckgo_html", "bing_html", "yandex_html"]
+        if provider in {"", "auto", "all"}
+        else [_search_provider_name(provider)]
+    )
+    selected = [item for item in selected if item]
+    requests: list[dict[str, Any]] = []
+    for source in selected:
+        for page in range(max(1, pages)):
+            requests.append(
+                {
+                    "source": source,
+                    "page": page + 1,
+                    "url": _web_search_url(
+                        source,
+                        query,
+                        region=region,
+                        freshness=freshness,
+                        page=page,
+                    ),
+                }
+            )
+    return requests
+
+
+def _search_provider_name(provider: str) -> str:
+    return {
+        "duck": "duckduckgo_html",
+        "ddg": "duckduckgo_html",
+        "duckduckgo": "duckduckgo_html",
+        "duckduckgo_html": "duckduckgo_html",
+        "bing": "bing_html",
+        "bing_html": "bing_html",
+        "yandex": "yandex_html",
+        "ya": "yandex_html",
+        "yandex_html": "yandex_html",
+    }.get(provider, "")
+
+
+def _web_search_url(
+    source: str,
+    query: str,
+    *,
+    region: str,
+    freshness: str,
+    page: int,
+) -> str:
+    if source == "duckduckgo_html":
+        params = {"q": query, "kl": region}
+        ddg_freshness = {"day": "d", "week": "w", "month": "m", "year": "y"}.get(freshness)
+        if ddg_freshness:
+            params["df"] = ddg_freshness
+        if page:
+            params["s"] = str(page * 30)
+        return f"https://duckduckgo.com/html/?{urlencode(params)}"
+    if source == "bing_html":
+        country = region.split("-", 1)[1].upper() if "-" in region else "RU"
+        params = {
+            "q": query,
+            "cc": country,
+            "setlang": region,
+            "mkt": region,
+            "first": str(page * 10 + 1),
+        }
+        bing_freshness = {"day": "Day", "week": "Week", "month": "Month"}.get(freshness)
+        if bing_freshness:
+            params["freshness"] = bing_freshness
+        return f"https://www.bing.com/search?{urlencode(params)}"
+    if source == "yandex_html":
+        params = {"text": query, "lr": _yandex_region_id(region), "p": str(page)}
+        yandex_within = {"day": "1", "week": "2", "month": "3", "year": "4"}.get(freshness)
+        if yandex_within:
+            params["within"] = yandex_within
+        return f"https://yandex.ru/search/?{urlencode(params)}"
+    return ""
+
+
+def _yandex_region_id(region: str) -> str:
+    return {
+        "ru-ru": "213",
+        "en-us": "84",
+    }.get(region, "213")
+
+
+def _web_parse_search_results(source: str, html: str, *, limit: int) -> list[dict[str, Any]]:
+    if source == "bing_html":
+        return _parse_bing_results(html, limit=limit)
+    if source == "yandex_html":
+        return _parse_yandex_results(html, limit=limit)
+    return _parse_duckduckgo_results(html, limit=limit)
+
+
 def _parse_duckduckgo_results(html: str, *, limit: int) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -4940,12 +5539,83 @@ def _parse_bing_results(html: str, *, limit: int) -> list[dict[str, Any]]:
     return results
 
 
+def _parse_yandex_results(html: str, *, limit: int) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    item_pattern = re.compile(
+        r'<li[^>]+class="[^"]*\bserp-item\b[^"]*"[^>]*>(?P<body>.*?)</li>',
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    bodies = [match.group("body") for match in item_pattern.finditer(html)]
+    if not bodies:
+        bodies = re.findall(
+            r'<div[^>]+class="[^"]*\borganic\b[^"]*"[^>]*>(.*?)</div>',
+            html,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+    if not bodies:
+        bodies = [html]
+    for body in bodies:
+        link_match = re.search(
+            r'<a[^>]+href="(?P<href>[^"]+)"[^>]*>(?P<title>.*?)</a>',
+            body,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if not link_match:
+            continue
+        url = _unwrap_yandex_url(unescape(link_match.group("href")).strip())
+        title = _html_to_text(link_match.group("title"))
+        if not url or not title or url in seen:
+            continue
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"}:
+            continue
+        if (parsed.hostname or "").lower().endswith(("yandex.ru", "ya.ru")):
+            continue
+        snippet = _yandex_snippet(body)
+        results.append(
+            {
+                "title": title,
+                "url": url,
+                "snippet": snippet,
+                "rank": len(results) + 1,
+            }
+        )
+        seen.add(url)
+        if len(results) >= limit:
+            break
+    return results
+
+
 def _unwrap_duckduckgo_url(raw_url: str) -> str:
     parsed = urlparse(raw_url)
     if parsed.netloc.endswith("duckduckgo.com") and parsed.path.startswith("/l/"):
         target = parse_qs(parsed.query).get("uddg", [""])[0]
         return unquote(target)
     return raw_url
+
+
+def _unwrap_yandex_url(raw_url: str) -> str:
+    parsed = urlparse(raw_url)
+    if (parsed.hostname or "").lower().endswith(("yandex.ru", "ya.ru")):
+        query = parse_qs(parsed.query)
+        for key in ("url", "u", "to"):
+            target = query.get(key, [""])[0]
+            if target:
+                return unquote(target)
+    return raw_url
+
+
+def _yandex_snippet(html: str) -> str:
+    for pattern in (
+        r'<div[^>]+class="[^"]*\btext-container\b[^"]*"[^>]*>(?P<snippet>.*?)</div>',
+        r'<span[^>]+class="[^"]*\bOrganicTextContentSpan\b[^"]*"[^>]*>(?P<snippet>.*?)</span>',
+        r'<div[^>]+class="[^"]*\borganic__text\b[^"]*"[^>]*>(?P<snippet>.*?)</div>',
+    ):
+        match = re.search(pattern, html, flags=re.IGNORECASE | re.DOTALL)
+        if match:
+            return _html_to_text(match.group("snippet"))
+    return ""
 
 
 def _snippet_after_result(html: str, offset: int) -> str:
@@ -5022,6 +5692,7 @@ def _web_response_blocked(status_code: int, text: str) -> bool:
 
 def _web_content_safety(*, source: str, url: str, text: str) -> dict[str, Any]:
     markers = _prompt_injection_markers(text)
+    consent_markers = _consent_wall_markers(text)
     return {
         "source": source,
         "url": url,
@@ -5030,6 +5701,8 @@ def _web_content_safety(*, source: str, url: str, text: str) -> dict[str, Any]:
         "instruction": WEB_EVIDENCE_INSTRUCTION,
         "prompt_injection_detected": bool(markers),
         "prompt_injection_markers": markers,
+        "consent_wall_detected": _looks_like_consent_wall(text, consent_markers),
+        "consent_wall_markers": consent_markers,
     }
 
 
@@ -5042,6 +5715,41 @@ def _prompt_injection_markers(text: str) -> list[str]:
         if len(found) >= 8:
             break
     return found
+
+
+def _consent_wall_markers(text: str) -> list[str]:
+    normalized = _repair_mojibake(text[:20_000]).lower()
+    found: list[str] = []
+    for marker in CONSENT_WALL_MARKERS:
+        if marker.lower() in normalized and marker not in found:
+            found.append(marker)
+        if len(found) >= 8:
+            break
+    return found
+
+
+def _looks_like_consent_wall(text: str, markers: list[str] | None = None) -> bool:
+    found = markers if markers is not None else _consent_wall_markers(text)
+    if not found:
+        return False
+    cleaned = " ".join(_repair_mojibake(text).split())
+    if len(cleaned) <= 1800:
+        return True
+    content_markers = (
+        "article",
+        "published",
+        "updated",
+        "price",
+        "review",
+        "comments",
+        "дата",
+        "опубликовано",
+        "цена",
+        "отзывы",
+        "комментарии",
+    )
+    normalized = cleaned[:6000].lower()
+    return len(found) >= 2 and not any(marker in normalized for marker in content_markers)
 
 
 def _browser_handoff_from_snapshot(
@@ -5162,6 +5870,119 @@ def _get_web_evidence(storage: JarvisStorage, evidence_id: str) -> dict[str, Any
         if isinstance(item, dict) and item.get("id") == evidence_id:
             return item
     return None
+
+
+def _web_fetch_cache_get(
+    storage: JarvisStorage,
+    url: str,
+    *,
+    max_chars: int,
+) -> dict[str, Any] | None:
+    records = storage.get_runtime_value(WEB_FETCH_CACHE_KEY, [])
+    if not isinstance(records, list):
+        return None
+    now = _epoch_seconds()
+    for item in records:
+        if not isinstance(item, dict) or item.get("url") != url:
+            continue
+        if float(item.get("expires_at") or 0) <= now:
+            continue
+        data = item.get("data")
+        if not isinstance(data, dict):
+            continue
+        cached_max_chars = int(item.get("max_chars") or 0)
+        if bool(data.get("truncated")) and cached_max_chars < max_chars:
+            continue
+        payload = dict(data)
+        text = str(payload.get("text") or "")
+        if len(text) > max_chars:
+            payload["text"] = text[:max_chars].rstrip()
+            payload["truncated"] = True
+        payload["cache"] = {
+            "hit": True,
+            "cached_at": item.get("cached_at"),
+            "ttl_sec": WEB_FETCH_CACHE_TTL_SEC,
+            "expires_at": item.get("expires_at"),
+        }
+        return payload
+    return None
+
+
+def _web_fetch_cache_store(
+    storage: JarvisStorage,
+    url: str,
+    data: dict[str, Any],
+    *,
+    max_chars: int,
+) -> None:
+    if bool(data.get("blocked")) or bool(data.get("consent_wall")):
+        return
+    text = str(data.get("text") or "")
+    if not text.strip():
+        return
+    now = _epoch_seconds()
+    entry = {
+        "url": url,
+        "cached_at": utc_now(),
+        "expires_at": now + WEB_FETCH_CACHE_TTL_SEC,
+        "max_chars": max_chars,
+        "data": {**data, "cache": {"hit": False}},
+    }
+    records = storage.get_runtime_value(WEB_FETCH_CACHE_KEY, [])
+    if not isinstance(records, list):
+        records = []
+    fresh = [
+        item
+        for item in records
+        if isinstance(item, dict)
+        and item.get("url") != url
+        and float(item.get("expires_at") or 0) > now
+    ]
+    storage.set_runtime_value(WEB_FETCH_CACHE_KEY, [entry, *fresh][:WEB_FETCH_CACHE_MAX_RECORDS])
+
+
+def _latest_wayback_snapshot(payload: Any) -> dict[str, str] | None:
+    if not isinstance(payload, list) or len(payload) < 2:
+        return None
+    header = payload[0]
+    row = payload[1]
+    if not isinstance(header, list) or not isinstance(row, list):
+        return None
+    values = {str(key): str(row[index]) for index, key in enumerate(header) if index < len(row)}
+    timestamp = values.get("timestamp", "")
+    if not re.fullmatch(r"\d{8,14}", timestamp):
+        return None
+    return {
+        "timestamp": timestamp,
+        "original": values.get("original", ""),
+        "statuscode": values.get("statuscode", ""),
+        "mimetype": values.get("mimetype", ""),
+        "digest": values.get("digest", ""),
+    }
+
+
+def _prioritize_crawl_links(links: Any) -> list[dict[str, Any]]:
+    if not isinstance(links, list):
+        return []
+    scored: list[tuple[int, dict[str, Any]]] = []
+    for raw in links:
+        if not isinstance(raw, dict):
+            continue
+        url = str(raw.get("url") or "")
+        text = str(raw.get("text") or "").lower()
+        rel = str(raw.get("rel") or "").lower()
+        path = urlparse(url).path.lower()
+        score = 10
+        if "next" in rel or text in {"next", "далее", "следующая", "следующая страница"}:
+            score = 0
+        elif any(marker in text for marker in ("next", "далее", "след", "older", "more")):
+            score = 1
+        elif re.search(r"(?:page|p|strana|страница)[=/_-]?\d+", path):
+            score = 2
+        elif re.search(r"/\d+/?$", path):
+            score = 4
+        scored.append((score, raw))
+    return [item for _score, item in sorted(scored, key=lambda pair: pair[0])]
 
 
 def _search_results_for_tools(search: ToolRunResponse) -> list[dict[str, Any]]:
@@ -5398,6 +6219,36 @@ def _html_tag_attrs(attrs: str) -> dict[str, str]:
     for name, double, single, bare in pattern.findall(attrs):
         result[name.lower()] = unescape(double or single or bare or "")
     return result
+
+
+def _extract_html_links(html: str, base_url: str, *, limit: int = 120) -> list[dict[str, str]]:
+    links: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for match in re.finditer(r"(?is)<a\b(?P<attrs>[^>]*)>(?P<body>.*?)</a>", html[:1_500_000]):
+        attrs = _html_tag_attrs(match.group("attrs"))
+        href = str(attrs.get("href") or "").strip()
+        if not href or href.startswith(("#", "javascript:", "mailto:", "tel:", "data:")):
+            continue
+        url = urljoin(base_url, href)
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            continue
+        normalized = parsed._replace(fragment="").geturl()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        rel = str(attrs.get("rel") or "").strip().lower()
+        text = _html_to_text(match.group("body"))
+        links.append(
+            {
+                "url": normalized,
+                "text": _short_text(text, 160),
+                "rel": rel,
+            }
+        )
+        if len(links) >= limit:
+            break
+    return links
 
 
 def _extract_json_ld(html: str) -> list[dict[str, Any]]:
@@ -6029,6 +6880,8 @@ def _summary_looks_blocked(summary: str) -> bool:
             "blocked",
             "captcha",
             "human verification",
+            "consent",
+            "cookie",
             "rate",
             "cooldown",
             "403",
@@ -6329,6 +7182,129 @@ def _run_headless_dump_dom(
     }
 
 
+async def _run_headless_cdp_render(
+    browser: Path,
+    url: str,
+    *,
+    addresses: list[ipaddress.IPv4Address | ipaddress.IPv6Address],
+    wait_ms: int,
+    timeout_sec: int,
+    max_chars: int,
+    scroll_passes: int,
+) -> dict[str, Any]:
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    resolver_rules = _headless_host_resolver_rules(host, addresses)
+    port = _available_loopback_port()
+    debug_url = f"http://127.0.0.1:{port}"
+    process: subprocess.Popen[str] | None = None
+    stderr = ""
+    with tempfile.TemporaryDirectory(prefix="jarvis-headless-") as profile_dir:
+        command = [
+            str(browser),
+            "--headless=new",
+            "--disable-gpu",
+            "--disable-extensions",
+            "--disable-background-networking",
+            "--disable-sync",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--no-proxy-server",
+            "--proxy-server=direct://",
+            "--proxy-bypass-list=*",
+            f"--user-data-dir={profile_dir}",
+            f"--host-resolver-rules={resolver_rules}",
+            f"--remote-debugging-port={port}",
+            "about:blank",
+        ]
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=_hidden_process_flags(),
+            )
+            await _wait_for_headless_debugger(debug_url, timeout_sec=min(timeout_sec, 10))
+            result = await scroll_chrome_page(
+                url=url,
+                direction="bottom",
+                pixels=900,
+                passes=scroll_passes,
+                max_chars=max_chars + 1,
+                wait_ms=wait_ms,
+                debug_url=debug_url,
+            )
+            return {
+                "ok": result.ok and bool(result.snapshot.text.strip()),
+                "summary": result.summary,
+                "browser": str(browser),
+                "returncode": None,
+                "html": "",
+                "html_chars": 0,
+                "text": result.snapshot.text,
+                "stderr": "",
+                "resolver_rules": resolver_rules,
+                "scroll": result.target_info or {},
+                "debug_url": debug_url,
+            }
+        except subprocess.TimeoutExpired:
+            return {
+                "ok": False,
+                "summary": f"Headless browser timed out after {timeout_sec}s.",
+                "browser": str(browser),
+                "debug_url": debug_url,
+            }
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "ok": False,
+                "summary": f"Headless CDP render failed: {exc}",
+                "browser": str(browser),
+                "debug_url": debug_url,
+            }
+        finally:
+            if process is not None and process.poll() is None:
+                process.terminate()
+                try:
+                    _stdout, stderr = process.communicate(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    _stdout, stderr = process.communicate(timeout=3)
+            elif process is not None and process.stderr is not None:
+                try:
+                    stderr = process.stderr.read()
+                except OSError:
+                    stderr = ""
+    if stderr:
+        return {
+            "ok": False,
+            "summary": "Headless CDP render exited before completion.",
+            "browser": str(browser),
+            "stderr": stderr.strip(),
+            "debug_url": debug_url,
+        }
+
+
+async def _wait_for_headless_debugger(debug_url: str, *, timeout_sec: int) -> None:
+    deadline = asyncio.get_running_loop().time() + max(1, timeout_sec)
+    last_summary = ""
+    while asyncio.get_running_loop().time() < deadline:
+        status = await chrome_debugger_status(debug_url)
+        if status.get("ok"):
+            return
+        last_summary = str(status.get("summary") or "")
+        await asyncio.sleep(0.2)
+    raise BrowserCdpError(last_summary or "Headless Chrome DevTools endpoint did not start.")
+
+
+def _available_loopback_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as handle:
+        handle.bind(("127.0.0.1", 0))
+        return int(handle.getsockname()[1])
+
+
 def _headless_host_resolver_rules(
     host: str,
     addresses: list[ipaddress.IPv4Address | ipaddress.IPv6Address],
@@ -6426,6 +7402,19 @@ def _float_arg(value: Any, *, default: float, minimum: float, maximum: float) ->
     if math.isnan(parsed):
         parsed = default
     return max(minimum, min(maximum, parsed))
+
+
+def _bool_arg(value: Any, *, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
 
 
 def _string_list_arg(value: Any, *, limit: int) -> list[str]:

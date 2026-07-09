@@ -45,6 +45,27 @@
   (сейчас видны в общей панели autonomy jobs), цепочка web.feed→web.watch для
   «следи за новостями по теме», и web.archive как автоматический фолбэк внутри
   web.research при blocked-источниках.
+## 2026-07-10 handoff - web search, archive, crawl, lazy pages
+
+For the operator and the second model:
+
+- `web.search` now accepts `region`, `freshness`, `pages`, and `provider`.
+  Defaults are tuned for Russian-local use (`region=ru-ru`, auto provider).
+  Auto provider order is DuckDuckGo HTML, Bing HTML, then Yandex HTML fallback.
+- `web.research` now searches up to two pages by default and tries live
+  `web.fetch`, `web.render` with scroll passes, then `web.archive` before
+  giving up on a blocked or consent-walled source.
+- `web.fetch` keeps a 15-minute TTL cache for successful public reads. Use
+  `use_cache=false` when testing rate budgets or when a truly fresh live fetch
+  is required.
+- Cookie/consent walls are reported through `safety.consent_wall_detected` and
+  `consent_wall=true`; treat those results as not enough evidence until the
+  page is accepted in browser or another source/archive is found.
+- `web.crawl` does bounded same-site traversal from a start URL. It prioritizes
+  `rel=next`/next-like links and returns page evidence ids plus short excerpts.
+- `browser.scroll` is review-gated and uses the operator Chrome CDP session.
+  Use it for logged-in/lazy pages after `browser.chrome.launch`.
+- `web.render` supports `scroll_passes` for isolated headless lazy-load reads.
 
 ## 2026-07-10 handoff - document intelligence tools
 

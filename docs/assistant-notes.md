@@ -38,6 +38,28 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 - Next candidates: Command Center row for active watches; feed+watch combo for
   topic monitoring; web.archive as automatic fallback inside web.research.
 
+### 2026-07-10 - Codex (web search, archive, crawl, lazy pages)
+
+- Implemented Claude's web weak-point list in `backend/src/jarvis_gpt/tools.py`
+  and `backend/src/jarvis_gpt/browser_cdp.py`.
+- `web.search` now supports `region`, `freshness`, `pages`, and `provider`;
+  it paginates DDG/Bing, adds Yandex HTML fallback for Russian-local queries,
+  deduplicates URLs, and records provider/page stats in evidence.
+- `web.fetch` now has a 15-minute TTL cache, extracts safe link lists for crawl,
+  and detects cookie/consent walls so banner-only pages are low-confidence
+  failures rather than normal source evidence.
+- Added `web.archive` using Wayback CDX and wired it into `web.research` after
+  blocked/thin live fetch and render fallback. Added `web.crawl` for bounded
+  same-site multipage/forum/docs traversal.
+- Added review-gated `browser.scroll` plus a CDP-backed `web.render`
+  `scroll_passes` path for lazy/infinite pages in isolated headless Chrome.
+- Rebased over Claude commit `36f4718`; preserved `web.feed`, `web.weather`,
+  `web.watch.*`, and merged archive behavior into the single availability-API
+  `web.archive` implementation instead of keeping a duplicate CDX function.
+- Verified: `py -3.11 -m compileall -q backend/src/jarvis_gpt`,
+  `py -3.11 -m ruff check backend/src/jarvis_gpt backend/tests --output-format=concise`,
+  and `py -3.11 -m pytest -q backend/tests --tb=short` (252 passed).
+
 ### 2026-07-10 - Codex (document intelligence tools)
 
 - Added shared `document_runtime` extraction for uploaded/local documents:

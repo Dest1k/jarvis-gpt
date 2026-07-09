@@ -119,6 +119,59 @@ async def read_chrome_page(
         raise BrowserCdpError(f"Chrome DevTools websocket failed: {exc}") from exc
 
 
+async def scroll_chrome_page(
+    *,
+    url: str,
+    direction: str,
+    pixels: int,
+    passes: int,
+    max_chars: int,
+    wait_ms: int,
+    debug_url: str = DEFAULT_CHROME_DEBUG_URL,
+) -> BrowserActionResult:
+    base_url = normalize_debug_url(debug_url)
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0), trust_env=False) as client:
+            version = await client.get(f"{base_url}/json/version")
+            version.raise_for_status()
+            target = await _open_target(client, base_url, url)
+    except (httpx.HTTPError, ValueError) as exc:
+        raise BrowserCdpError(f"Chrome DevTools endpoint is unavailable: {exc}") from exc
+
+    try:
+        async with websockets.connect(
+            target.web_socket_debugger_url,
+            max_size=8_000_000,
+            open_timeout=8,
+            close_timeout=2,
+        ) as websocket:
+            cdp = _CdpConnection(websocket)
+            await cdp.send("Page.enable")
+            await cdp.send("Runtime.enable")
+            await cdp.send("Page.navigate", {"url": url})
+            ready_state = await _wait_for_ready_state(cdp, wait_ms)
+            scroll_payload = await _run_scroll_expression(
+                cdp,
+                direction=direction,
+                pixels=pixels,
+                passes=passes,
+            )
+            ready_state = await _wait_for_ready_state(cdp, min(wait_ms, 3000))
+            snapshot = await _snapshot_page(cdp, max_chars=max_chars, ready_state=ready_state)
+            return BrowserActionResult(
+                action="scroll",
+                url=snapshot.url,
+                title=snapshot.title,
+                ready_state=snapshot.ready_state,
+                ok=bool(scroll_payload.get("ok", True)),
+                summary=str(scroll_payload.get("summary") or "Scrolled page."),
+                snapshot=snapshot,
+                target_info=scroll_payload,
+            )
+    except (OSError, WebSocketException, TimeoutError) as exc:
+        raise BrowserCdpError(f"Chrome DevTools websocket failed: {exc}") from exc
+
+
 async def run_chrome_action(
     *,
     url: str,
@@ -356,6 +409,76 @@ async def _capture_screenshot(cdp: _CdpConnection) -> bytes:
     if not isinstance(data, str) or not data:
         raise BrowserCdpError("Chrome screenshot returned no image data.")
     return base64.b64decode(data)
+
+
+async def _run_scroll_expression(
+    cdp: _CdpConnection,
+    *,
+    direction: str,
+    pixels: int,
+    passes: int,
+) -> dict[str, Any]:
+    expression = _scroll_expression(direction=direction, pixels=pixels, passes=passes)
+    result = await cdp.send(
+        "Runtime.evaluate",
+        {"expression": expression, "returnByValue": True, "awaitPromise": True},
+        timeout=20.0,
+    )
+    value_payload = (result.get("result") or {}).get("value")
+    if not isinstance(value_payload, dict):
+        raise BrowserCdpError("Chrome scroll returned no serializable value.")
+    return value_payload
+
+
+def _scroll_expression(*, direction: str, pixels: int, passes: int) -> str:
+    direction_json = json.dumps(direction)
+    pixels_json = json.dumps(max(100, int(pixels)))
+    passes_json = json.dumps(max(1, int(passes)))
+    return f"""(async () => {{
+  const direction = {direction_json};
+  const pixels = {pixels_json};
+  const passes = {passes_json};
+  const before = {{
+    x: window.scrollX || 0,
+    y: window.scrollY || 0,
+    height: Math.max(document.body?.scrollHeight || 0, document.documentElement?.scrollHeight || 0),
+  }};
+  const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  if (direction === "top") {{
+    window.scrollTo({{ top: 0, behavior: "instant" }});
+    await wait(250);
+  }} else if (direction === "bottom" || direction === "end") {{
+    for (let index = 0; index < passes; index += 1) {{
+      const height = Math.max(
+        document.body?.scrollHeight || 0,
+        document.documentElement?.scrollHeight || 0
+      );
+      window.scrollTo({{ top: height, behavior: "instant" }});
+      await wait(450);
+    }}
+  }} else {{
+    const delta = direction === "up" ? -pixels : pixels;
+    for (let index = 0; index < passes; index += 1) {{
+      window.scrollBy({{ top: delta, left: 0, behavior: "instant" }});
+      await wait(450);
+    }}
+  }}
+  const after = {{
+    x: window.scrollX || 0,
+    y: window.scrollY || 0,
+    height: Math.max(document.body?.scrollHeight || 0, document.documentElement?.scrollHeight || 0),
+  }};
+  return {{
+    ok: true,
+    summary: `Scrolled ${{direction}} ${{passes}} pass(es).`,
+    direction,
+    pixels,
+    passes,
+    before,
+    after,
+    heightChanged: after.height !== before.height,
+  }};
+}})()"""
 
 
 def _action_expression(
