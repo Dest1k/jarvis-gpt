@@ -1368,6 +1368,8 @@ export default function CommandCenter() {
   const chatFileInputRef = useRef<HTMLInputElement | null>(null);
   const chatPanelRef = useRef<HTMLElement | null>(null);
   const transcriptRef = useRef<HTMLDivElement | null>(null);
+  const transcriptShouldStickRef = useRef(true);
+  const transcriptActiveWindowRef = useRef(activeChatWindowId);
   const vitalsRequestInFlightRef = useRef(false);
   const telemetryRequestInFlightRef = useRef(false);
   const missionsRef = useRef<Mission[]>([]);
@@ -1423,6 +1425,13 @@ export default function CommandCenter() {
     },
     [updateActiveChatWindow]
   );
+
+  const updateTranscriptStickiness = useCallback(() => {
+    const node = transcriptRef.current;
+    if (!node) return;
+    const distanceFromBottom = node.scrollHeight - node.scrollTop - node.clientHeight;
+    transcriptShouldStickRef.current = distanceFromBottom <= 96;
+  }, []);
 
   const refresh = useCallback(async () => {
     try {
@@ -1693,8 +1702,14 @@ export default function CommandCenter() {
   useEffect(() => {
     const node = transcriptRef.current;
     if (!node) return;
+    const switchedWindow = transcriptActiveWindowRef.current !== activeChatWindowId;
+    if (switchedWindow) {
+      transcriptActiveWindowRef.current = activeChatWindowId;
+      transcriptShouldStickRef.current = true;
+    }
+    if (!transcriptShouldStickRef.current) return;
     const frame = window.requestAnimationFrame(() => {
-      node.scrollTo({ top: node.scrollHeight, behavior: "smooth" });
+      node.scrollTo({ top: node.scrollHeight, behavior: "auto" });
     });
     return () => window.cancelAnimationFrame(frame);
   }, [activeChatWindowId, lines.length, latestLine?.content]);
@@ -1990,6 +2005,7 @@ export default function CommandCenter() {
     const message = typedMessage || "Проанализируй вложенные файлы.";
     const userId = randomId("msg");
     assistantId = randomId("msg");
+    transcriptShouldStickRef.current = true;
     updateChatWindow(chatWindowId, (window) => ({
       ...window,
       title: window.title === "Новый чат" || window.title === "Чат"
@@ -2128,6 +2144,7 @@ export default function CommandCenter() {
 
   function newChatWindow() {
     const window = createChatWindow();
+    transcriptShouldStickRef.current = true;
     setChatWindows((current) => [window, ...current].slice(0, 8));
     setActiveChatWindowId(window.id);
   }
@@ -2136,11 +2153,13 @@ export default function CommandCenter() {
     setChatWindows((current) => {
       if (current.length <= 1) {
         const replacement = createChatWindow();
+        transcriptShouldStickRef.current = true;
         setActiveChatWindowId(replacement.id);
         return [replacement];
       }
       const next = current.filter((window) => window.id !== id);
       if (id === activeChatWindowId) {
+        transcriptShouldStickRef.current = true;
         setActiveChatWindowId(next[0]?.id ?? current[0].id);
       }
       return next;
@@ -2149,6 +2168,7 @@ export default function CommandCenter() {
 
   async function clearCurrentChat() {
     if (!activeChatWindow) return;
+    transcriptShouldStickRef.current = true;
     const clearedWindow = {
       ...activeChatWindow,
       title: "Новый чат",
@@ -2183,6 +2203,7 @@ export default function CommandCenter() {
 
   async function loadConversation(id: string) {
     const conversation = conversations.find((item) => item.id === id);
+    transcriptShouldStickRef.current = true;
     setActiveOperation({
       title: "Загрузка диалога",
       detail: conversation?.title ?? id
@@ -3646,7 +3667,7 @@ export default function CommandCenter() {
                 </div>
               ))}
             </div>
-            <div className="transcript" ref={transcriptRef}>
+            <div className="transcript" ref={transcriptRef} onScroll={updateTranscriptStickiness}>
               {lines.map((line, index) => {
                 const durationLabel = assistantDuration(line, chatTicker);
                 return (

@@ -35,8 +35,15 @@ body {
 
 button,
 input,
-textarea {
+textarea,
+select {
   font: inherit;
+}
+
+img,
+canvas,
+video {
+  max-width: 100%;
 }
 
 button {
@@ -129,6 +136,11 @@ button:disabled {
   align-items: center;
   justify-content: space-between;
   gap: 18px;
+  min-width: 0;
+}
+
+.topbar > div {
+  min-width: 0;
 }
 
 .eyebrow {
@@ -253,12 +265,21 @@ h3 {
   display: inline-flex;
   align-items: center;
   gap: 8px;
+  min-width: 0;
   min-height: 40px;
   padding: 0 14px;
   border-radius: var(--radius);
   border: 1px solid var(--line);
   background: var(--surface);
   color: var(--ink);
+}
+
+.iconText span,
+.primary span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .primary {
@@ -394,14 +415,27 @@ h3 {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
   min-height: 50px;
   padding: 0 16px;
   border-bottom: 1px solid var(--line);
 }
 
+.panelHeader h2 {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .panelHeader span {
+  min-width: 0;
+  overflow: hidden;
   color: var(--muted);
   font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .panelHeader.lower {
@@ -2954,6 +2988,20 @@ h3 {
   }
 }
 
+@media (max-width: 1280px) {
+  .realtimeStrip {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .statusGrid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .mainGrid {
+    grid-template-columns: minmax(0, 1.2fr) minmax(300px, 0.8fr);
+  }
+}
+
 @media (max-width: 1040px) {
   .realtimeStrip {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -3023,6 +3071,11 @@ h3 {
     grid-template-columns: 1fr 1fr;
   }
 
+  .topActions .iconText,
+  .topActions .primary {
+    justify-content: center;
+  }
+
   .realtimeStrip {
     grid-template-columns: 1fr;
   }
@@ -3040,14 +3093,114 @@ h3 {
   .transcript {
     min-height: 300px;
     max-height: none;
+    padding: 12px;
+  }
+
+  .bubble {
+    width: 100%;
+  }
+
+  .bubbleMeta {
+    align-items: flex-start;
+  }
+
+  .chatWindowTab {
+    min-width: 130px;
+  }
+
+  .sideTabs {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .composerSide {
+    justify-content: stretch;
+  }
+
+  .composerSide > * {
+    flex: 1 1 42px;
+  }
+
+  .sendButton {
+    margin-left: 0;
+  }
+
+  .modelSearchForm {
+    grid-template-columns: minmax(0, 1fr) 72px 52px 32px;
+  }
+
+  .modelSearchForm > svg {
+    display: none;
+  }
+
+  .modelBudget,
+  .downloadRow,
+  .localModelRow,
+  .cleanupStrip,
+  .modelRow,
+  .dispatcherRow,
+  .resourceRow,
+  .bridgeRow,
+  .fileRow,
+  .auditRow,
+  .jobRow,
+  .dockerRow,
+  .approvalRow {
+    grid-template-columns: 18px minmax(0, 1fr);
+    align-items: start;
+  }
+
+  .modelBudget > span,
+  .modelBudget > small,
+  .downloadRow > span,
+  .downloadRow > small,
+  .localModelRow > span,
+  .localModelRow > .modelActions,
+  .cleanupStrip > span,
+  .cleanupStrip > button,
+  .modelRow > span,
+  .modelRow > small,
+  .dispatcherRow > span,
+  .dispatcherRow > small,
+  .dispatcherRow > .dispatcherControls,
+  .resourceRow > .meter,
+  .resourceRow > small,
+  .bridgeRow > span,
+  .bridgeRow > small,
+  .fileRow > span,
+  .fileRow > small,
+  .auditRow > p,
+  .auditRow > span,
+  .jobRow > span,
+  .jobRow > button,
+  .dockerRow > span,
+  .dockerRow > small,
+  .approvalRow > span {
+    grid-column: 2;
+    justify-self: start;
+    max-width: 100%;
+    text-align: left;
+  }
+
+  .dispatcherControls,
+  .modelActions {
+    flex-wrap: wrap;
+    justify-content: flex-start;
   }
 
   .preferencesForm {
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 32px;
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .preferencesForm input:first-child {
-    grid-column: 1 / -1;
+    grid-column: auto;
+  }
+
+  .personaForm {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .personaForm .full {
+    grid-column: auto;
   }
 
   .tracePage {
