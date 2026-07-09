@@ -9,6 +9,36 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-09 - Claude
+
+- Closed three follow-ups previously marked "на будущее" in runtime.md, all on
+  `main`:
+  1. Persona auto-learning: added safe tools `persona.get` and `persona.insight`
+     (tools.py) wired to `PersonaManager.add_insight`. `persona.insight` is
+     deliberately allowed in the autonomous agentic loop (single fact, dedup,
+     per-field caps, audit + `persona.insight` event) — the reasoning-first
+     replacement for regex persona extraction. SYSTEM_PROMPT now tells the model
+     to save durable operator facts sparingly.
+  2. File-chunk hybrid retrieval no longer dies on zero lexical overlap:
+     `storage.recent_file_chunks` provides a bounded fallback pool, gated by
+     `FILE_FALLBACK_MIN_RELATEDNESS` (fuzzy-vector cosine >= 0.1) so unrelated
+     files never leak into the prompt; fallback hits are marked
+     `retrieval="semantic-recent"` and capped at 3.
+  3. Mission detection through understanding: the intent arbiter's `mission`
+     decision (confidence >= 0.7) now rewrites the kernel plan via
+     `_mission_plan_from_intent`, and chat/stream re-read `context.task_plan`
+     after `_try_direct_action`, so a mission-shaped task without mission
+     keywords still becomes a persisted mission. Keyword counter stays as the
+     offline path.
+- Tests: `test_agentic_loop_learns_persona_insight_from_dialogue`,
+  `test_persona_insight_tool_learns_deduplicates_and_validates`,
+  `test_hybrid_files_falls_back_to_recent_chunks_without_lexical_overlap`,
+  `test_reasoning_arbiter_can_promote_research_to_mission`.
+- Full run before handoff: backend pytest 164 pass, ruff clean, frontend
+  typecheck + build clean.
+- Possible next steps: let the arbiter also own `local_action`; feed persona
+  insights into the learning journal; persist chunk vectors for large corpora.
+
 ### 2026-07-09 - Codex
 
 - Added `backend/src/jarvis_gpt/autonomy_executor.py`: a shared executor for

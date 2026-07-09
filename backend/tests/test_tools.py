@@ -39,6 +39,41 @@ def test_tool_registry_runs_memory_tools(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_persona_insight_tool_learns_deduplicates_and_validates(monkeypatch, tmp_path):
+    from jarvis_gpt.persona import load_persona
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    learned = asyncio.run(
+        tools.run("persona.insight", {"field": "interests", "value": "домашние NAS"})
+    )
+    duplicate = asyncio.run(
+        tools.run("persona.insight", {"field": "interests", "value": "Домашние NAS"})
+    )
+    invalid = asyncio.run(
+        tools.run("persona.insight", {"field": "display_name", "value": "hacker"})
+    )
+    snapshot = asyncio.run(tools.run("persona.get", {}))
+
+    assert learned.ok is True
+    assert learned.data["learned"] is True
+    assert duplicate.ok is True
+    assert duplicate.data["learned"] is False
+    assert invalid.ok is False
+    assert "does not accept insights" in invalid.summary
+    assert snapshot.ok is True
+    persona = load_persona(storage)
+    assert persona["interests"] == ["домашние NAS"]
+    assert persona["display_name"] == ""
+    storage.close()
+
+
 def test_filesystem_tool_stays_inside_allowed_roots(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
     settings = load_settings()

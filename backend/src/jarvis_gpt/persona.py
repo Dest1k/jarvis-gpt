@@ -266,6 +266,11 @@ class PersonaManager:
             summary=f"Persona {field} learned: {text[:120]}",
             after={"field": field, "value": text},
         )
+        self.storage.add_event(
+            kind="persona.insight",
+            title=f"Persona {field} learned: {text[:120]}",
+            payload={"field": field, "value": text, "actor": actor},
+        )
         return updated
 
     def system_block(self, preferences: dict[str, Any] | None = None) -> str:

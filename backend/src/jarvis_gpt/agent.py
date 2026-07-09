@@ -18,8 +18,10 @@ from . import persona as persona_module
 from .config import JarvisSettings
 from .embeddings import (
     EmbeddingBackend,
+    lexical_vector,
     reciprocal_rank_fusion,
     semantic_similarity_order,
+    sparse_cosine,
 )
 from .event_bus import EventBus
 from .llm import LLMRouter
@@ -88,6 +90,10 @@ SYSTEM_PROMPT = """Ты JARVIS GPT: локальный агент Windows/WSL/Do
 - Всегда держи в уме текущую дату из runtime context. Если тема могла измениться после
   начала 2026 года или пользователь спрашивает про 2026+ / "сейчас" / свежую версию,
   не опирайся только на встроенные знания модели: сначала проверь источники.
+- Если оператор мимоходом раскрывает устойчивый факт о себе (новый инструмент в стеке,
+  увлечение, текущий фокус, постоянное правило "всегда/никогда"), сохрани его одним вызовом
+  persona.insight, чтобы понимать оператора в будущих сессиях. Делай это скупо: только
+  стабильные факты, не догадки и не сиюминутные детали; не переспрашивай ради этого.
 - Не используй декоративные служебные префиксы и pseudo-tags вроде
   "$\\rightarrow$ **Важное уточнение:**".
   Пиши сразу человеческий ответ."""
@@ -151,11 +157,18 @@ MISSION_MARKERS = (
 
 # Agentic tool loop: how many tool rounds the model may take before it must
 # answer, and which safe tools are withheld from autonomous use because they
-# mutate durable state rather than gather facts.
+# mutate durable state rather than gather facts. persona.insight is deliberately
+# NOT withheld: it is the reasoning-first replacement for regex persona
+# extraction, and its writes are single-fact, deduplicated, capped per field,
+# audit-logged and editable from Command Center.
 DEFAULT_MAX_TOOL_STEPS = 4
 AGENTIC_TOOL_DENYLIST = frozenset(
     {"memory.save", "learning.tick", "mission.brief", "browser.open", "browser.open_many"}
 )
+
+# When lexical file search finds nothing, recent chunks are only allowed into
+# the prompt if their fuzzy-vector similarity to the query clears this bar.
+FILE_FALLBACK_MIN_RELATEDNESS = 0.1
 
 
 @dataclass
@@ -527,6 +540,9 @@ class AgentRuntime:
                 duration_ms=duration_ms,
             )
 
+        # The reasoning-first arbiter may have rewritten the kernel plan inside
+        # _try_direct_action (for example web_research -> mission), so re-read it.
+        task_plan = context.task_plan or task_plan
         forced_mission = mode == "mission"
         if forced_mission or task_plan.route == "mission":
             mission = self.create_mission(message)
@@ -722,6 +738,9 @@ class AgentRuntime:
             }
             return
 
+        # The reasoning-first arbiter may have rewritten the kernel plan inside
+        # _try_direct_action (for example web_research -> mission), so re-read it.
+        task_plan = context.task_plan or task_plan
         forced_mission = mode == "mission"
         if forced_mission or task_plan.route == "mission":
             mission = self.create_mission(message)
@@ -1395,6 +1414,18 @@ class AgentRuntime:
                 and arbiter.confidence >= 0.6
             ):
                 context.task_plan = _reroute_plan(context.task_plan, arbiter)
+                return None
+            # The arbiter may also understand the task as a real multi-step
+            # mission even when the keyword counter missed it. Rewriting the
+            # kernel plan here lets the normal mission branch create the plan;
+            # the bar is higher than for reasoning/chat because this creates
+            # durable state.
+            if (
+                arbiter is not None
+                and arbiter.route == "mission"
+                and arbiter.confidence >= 0.7
+            ):
+                context.task_plan = _mission_plan_from_intent(context.task_plan, arbiter)
                 return None
 
         shopping_followup = _shopping_followup_intent(
@@ -2313,15 +2344,50 @@ class AgentRuntime:
         query = " ".join(str(message or "").split())
         if not query:
             return
+        extra_pool = self.storage.search_file_chunks(query[:160], limit=30)
+        if context.file_hits or extra_pool:
+            ranked = await self._hybrid_rerank(
+                query,
+                context.file_hits,
+                extra_pool,
+                id_key="chunk_id",
+                limit=limit,
+            )
+            if ranked is not None:
+                context.file_hits = ranked
+            return
+        # Zero lexical overlap: keyword search has no candidates at all, so a
+        # purely paraphrased question about an indexed file would get no file
+        # context. Fall back to a bounded pool of recent chunks — the file analog
+        # of the recent/important memory pool — but keep only chunks with real
+        # fuzzy-vector relatedness to the query, so unrelated files do not leak
+        # into the prompt just because they were ingested recently.
+        query_vector = lexical_vector(query)
+        related = [
+            item
+            for item in self.storage.recent_file_chunks(limit=24)
+            if sparse_cosine(
+                query_vector,
+                lexical_vector(str(item.get("content") or "")),
+            )
+            >= FILE_FALLBACK_MIN_RELATEDNESS
+        ]
+        if not related:
+            return
         ranked = await self._hybrid_rerank(
             query,
-            context.file_hits,
-            self.storage.search_file_chunks(query[:160], limit=30),
+            [],
+            related,
             id_key="chunk_id",
-            limit=limit,
+            limit=min(3, limit),
         )
-        if ranked is not None:
-            context.file_hits = ranked
+        if ranked is None:
+            # A single related chunk cannot be re-ranked but is still context.
+            ranked = related[:1]
+            ranked[0].setdefault("relevance", 1.0)
+        for item in ranked:
+            item["retrieval"] = "semantic-recent"
+        context.file_hits = ranked
 
     def _attached_file_hits(self, attachments: list[dict[str, Any]]) -> list[dict[str, Any]]:
         hits: list[dict[str, Any]] = []
@@ -3682,6 +3748,32 @@ def _reroute_plan(plan: TaskKernelPlan | None, decision: IntentDecision) -> Task
             "call out any genuinely missing information instead of guessing",
         ),
         rationale=decision.rationale or "Intent understood as solvable without external lookup.",
+    )
+
+
+def _mission_plan_from_intent(
+    plan: TaskKernelPlan | None,
+    decision: IntentDecision,
+) -> TaskKernelPlan:
+    """Rebuild the task kernel when the arbiter understands the task as a mission.
+
+    Mirrors the heuristic mission plan so the downstream mission branch behaves
+    identically whether the route came from keywords or from understanding.
+    """
+
+    mode = plan.mode if plan is not None else "standard"
+    return TaskKernelPlan(
+        route="mission",
+        mode=mode,
+        intent="multi_step_project",
+        confidence=decision.confidence,
+        tools=("mission.create",),
+        completion_criteria=(
+            "create an executable mission plan",
+            "persist the plan in local runtime storage",
+            "return the next runnable step",
+        ),
+        rationale=decision.rationale or "Intent understood as a real multi-step mission.",
     )
 
 

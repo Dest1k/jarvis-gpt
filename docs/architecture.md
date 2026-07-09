@@ -75,6 +75,22 @@ External host runtime
 - Autonomous supervisor безопасно выполняет только наблюдение: telemetry snapshots и learning tick сразу при старте и далее по расписанию; действия с риском остаются через approvals.
 - Performance слой разделяет лёгкий backend и тяжёлый dispatcher; GPU утилизируется vLLM-профилем, а backend собирает telemetry без удержания весов.
 
+- Persona учится сама через понимание, а не через regex: у модели есть safe-
+  инструменты `persona.get`/`persona.insight`, и когда оператор мимоходом
+  раскрывает устойчивый факт о себе, модель сохраняет его одним вызовом.
+  `persona.insight` — единственная сознательно разрешённая в автономном цикле
+  мутация: один факт за вызов, дедуп, пер-полевые капы, аудит и событие, правка
+  доступна из Command Center. Так закрывается разрыв «add_insight есть, но агент
+  его не вызывает» без каскада эвристик.
+- Файловый retrieval не слепнет на перефразировании без общих словоформ: при
+  пустом лексическом пуле включается ограниченный fallback по недавним чанкам с
+  порогом fuzzy-связности, помеченный `semantic-recent`. Деградация прежняя:
+  нет связанных чанков — нет файлового контекста, чужие файлы в промпт не
+  попадают.
+- Mission-детекция — тоже понимание, а не счётчик ключевых слов: если
+  reasoning-first арбитр уверенно (>= 0.7) видит в задаче реальную многошаговую
+  миссию, task kernel переписывается на mission-маршрут и создаётся обычный
+  persisted mission plan. Ключевые слова остаются офлайн-фолбэком.
 - Mission approvals resume in-place: a gated mission tool stores a compact
   agentic snapshot, and the approval executor feeds the approved tool observation
   back into that same step before marking the task done/blocked.

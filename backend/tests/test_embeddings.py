@@ -106,6 +106,49 @@ def test_hybrid_files_reranks_chunks_by_semantic_closeness(monkeypatch, tmp_path
     storage.close()
 
 
+def test_hybrid_files_falls_back_to_recent_chunks_without_lexical_overlap(monkeypatch, tmp_path):
+    # The query shares no exact word form with any chunk, so lexical search finds
+    # nothing at all. The recent-chunk fallback must still surface the related
+    # chunk while the relatedness gate keeps the unrelated file out of the prompt.
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    stored = tmp_path / "gpu-notes.txt"
+    stored.write_text("gpu notes", encoding="utf-8")
+    record = storage.create_file_record(
+        name="gpu-notes.txt",
+        stored_path=stored,
+        sha256="abc",
+        size=stored.stat().st_size,
+        mime_type="text/plain",
+        status="indexed",
+        chunk_count=2,
+    )
+    hot = "Видеокарта перегревается под нагрузкой, нужно чистить кулер и менять термопасту."
+    soup = "Рецепт борща с говядиной, свёклой и сметаной."
+    storage.add_file_chunks(record["id"], [soup, hot])
+    agent = AgentRuntime(
+        settings=settings,
+        storage=storage,
+        llm=LLMRouter(settings),
+        bus=EventBus(),
+    )
+
+    query = "перегрев видеокарты после игр"
+    context = agent._prepare_context(query, None)
+    assert context.file_hits == []  # sanity: zero lexical overlap by construction
+    asyncio.run(agent._augment_semantic_files(context, query))
+
+    assert context.file_hits, "recent-chunk fallback should supply file context"
+    assert context.file_hits[0]["content"] == hot
+    assert all(item.get("retrieval") == "semantic-recent" for item in context.file_hits)
+    assert all(item["content"] != soup for item in context.file_hits)
+    storage.close()
+
+
 def test_hybrid_memory_surfaces_paraphrase_missed_by_keywords(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")

@@ -1,5 +1,44 @@
 # Runtime
 
+## 2026-07-09 handoff - persona auto-learning, file fallback retrieval, mission by understanding
+
+Для оператора и второй модели. Этот проход закрывает три пункта, которые ранее
+были явно помечены «на будущее», и все три — про соответствие тезисам
+«понимание вместо затычек», «persona — слой понимания» и «retrieval — отдельная
+подсистема».
+
+- Persona auto-learning через агентный tool-loop: новые safe-инструменты
+  `persona.get` (прочитать durable-профиль) и `persona.insight` (доклеить ОДИН
+  устойчивый факт в list-поле persona: языки, экспертиза, стек, интересы,
+  текущий фокус, standing instructions). `persona.insight` сознательно НЕ в
+  `AGENTIC_TOOL_DENYLIST`: это reasoning-first замена regex-извлечения persona,
+  а мутация ограничена одним фактом, дедупом, пер-полевыми капами, аудитом
+  (`persona.insight`) и событием для Command Center. SYSTEM_PROMPT просит модель
+  сохранять только стабильные факты и делать это скупо.
+- Файловый гибридный retrieval больше не слепнет при нулевом лексическом
+  пересечении: если keyword-поиск не дал НИ одного кандидата, берётся
+  ограниченный пул `storage.recent_file_chunks(24)` (аналог recent/important
+  пула памяти), фильтруется порогом связности
+  `FILE_FALLBACK_MIN_RELATEDNESS = 0.1` (fuzzy-вектор косинус к запросу), и
+  только связанные чанки попадают в контекст (максимум 3, помечены
+  `retrieval="semantic-recent"`). Нерелевантные недавние файлы в промпт не
+  утекают: на тестовых строках связанный чанк даёт ~0.23, чужой — 0.0.
+- Mission-детекция переведена на понимание: решение intent-арбитра `mission`
+  (confidence >= 0.7, порог выше, чем у reasoning/chat, потому что создаётся
+  durable state) переписывает task kernel через `_mission_plan_from_intent`, и
+  `chat()`/`stream_chat()` перечитывают `context.task_plan` после
+  `_try_direct_action`. Миссия без ключевых слов («найди варианты недорогого
+  NAS для дома» при арбитре mission) становится персистентным mission plan.
+  Счётчик `_looks_like_mission` остаётся детерминированным офлайн-фолбэком.
+- Тесты: `test_agentic_loop_learns_persona_insight_from_dialogue`,
+  `test_persona_insight_tool_learns_deduplicates_and_validates`,
+  `test_hybrid_files_falls_back_to_recent_chunks_without_lexical_overlap`,
+  `test_reasoning_arbiter_can_promote_research_to_mission`. Полный прогон —
+  164 pass, ruff clean, frontend typecheck + build clean.
+- На будущее: арбитр пока не управляет `local_action` (детерминированные
+  биндинги покрыты тестами); persona insights можно зеркалить в learning
+  journal; для больших корпусов остаётся кандидатом персист векторов чанков.
+
 ## 2026-07-09 handoff - long-lived LLM executor
 
 For the operator and the second model:

@@ -1599,6 +1599,34 @@ class JarvisStorage:
             ).fetchall()
         return [_decorate_file_hit(dict(row), query) for row in rows]
 
+    def recent_file_chunks(self, limit: int = 20) -> list[dict[str, Any]]:
+        """Chunks of the most recently updated files, as a semantic fallback pool.
+
+        Used when lexical file search finds nothing (zero token overlap with the
+        query) so hybrid retrieval still has candidates to re-rank — the file
+        analog of the recent/important memory pool.
+        """
+
+        with self._lock:
+            rows = self.connect().execute(
+                """
+                SELECT
+                    f.id AS file_id,
+                    f.name AS file_name,
+                    c.id AS chunk_id,
+                    c.position,
+                    c.content,
+                    c.created_at,
+                    NULL AS rank
+                FROM file_chunks c
+                JOIN files f ON f.id = c.file_id
+                ORDER BY f.updated_at DESC, f.rowid DESC, c.position ASC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def create_approval(
         self,
         *,

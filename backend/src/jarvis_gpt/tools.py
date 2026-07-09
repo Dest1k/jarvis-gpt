@@ -26,6 +26,7 @@ from .llm import LLMRouter
 from .model_catalog import ModelCatalog
 from .models import ToolInfo, ToolRunResponse
 from .operations import OperationsManager, docker_container_allowed
+from .persona import INSIGHT_FIELDS, PersonaManager, load_persona
 from .storage import JarvisStorage
 from .telemetry import TelemetryCollector
 
@@ -371,6 +372,38 @@ class ToolRegistry:
                 },
                 handler=_approval_request,
                 danger_level="review",
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="persona.get",
+                description=(
+                    "Read the durable operator persona: role, home location, languages, "
+                    "tech stack, interests, current focus, standing instructions, glossary."
+                ),
+                category="operator",
+                input_schema={},
+                handler=_persona_get,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="persona.insight",
+                description=(
+                    "Append ONE durable fact the operator just revealed about themselves "
+                    "to the persona. Use sparingly for stable facts only (new tech stack, "
+                    "interest, current focus, standing 'always/never' rule), never for "
+                    "transient or speculative details. Deduplicated, capped and audited."
+                ),
+                category="operator",
+                input_schema={
+                    "field": (
+                        "One of: languages, expertise, tech_stack, interests, "
+                        "current_focus, standing_instructions"
+                    ),
+                    "value": "The single learned fact, short and durable",
+                },
+                handler=_persona_insight,
             )
         )
         self.add(
@@ -858,6 +891,52 @@ def _memory_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
         ok=True,
         summary=f"Memory search returned {len(items)} item(s).",
         data={"items": items, "query": query, "limit": limit},
+    )
+
+
+def _persona_get(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    persona = load_persona(ctx.storage)
+    return ToolRunResponse(
+        tool="persona.get",
+        ok=True,
+        summary="Operator persona loaded.",
+        data={"persona": persona, "insight_fields": sorted(INSIGHT_FIELDS)},
+    )
+
+
+def _persona_insight(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    field = str(args.get("field") or "").strip()
+    value = str(args.get("value") or "").strip()
+    if field not in INSIGHT_FIELDS:
+        return ToolRunResponse(
+            tool="persona.insight",
+            ok=False,
+            summary=(
+                f"Persona field {field!r} does not accept insights. "
+                f"Allowed: {', '.join(sorted(INSIGHT_FIELDS))}."
+            ),
+        )
+    if not value:
+        return ToolRunResponse(
+            tool="persona.insight",
+            ok=False,
+            summary="Persona insight value is required.",
+        )
+    manager = PersonaManager(settings=ctx.settings, storage=ctx.storage)
+    before = list(manager.persona().get(field) or [])
+    persona = manager.add_insight(field, value, actor="agent")
+    after = list(persona.get(field) or [])
+    learned = after != before
+    summary = (
+        f"Persona {field} learned: {value[:120]}"
+        if learned
+        else f"Persona {field} already knows: {value[:120]}"
+    )
+    return ToolRunResponse(
+        tool="persona.insight",
+        ok=True,
+        summary=summary,
+        data={"field": field, "value": value, "learned": learned, "items": after},
     )
 
 

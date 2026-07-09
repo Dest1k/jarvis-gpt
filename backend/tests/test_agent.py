@@ -2255,6 +2255,57 @@ def test_reasoning_arbiter_can_override_shopping_keyword_plug(monkeypatch, tmp_p
     storage.close()
 
 
+def test_reasoning_arbiter_can_promote_research_to_mission(monkeypatch, tmp_path):
+    # No mission keywords, so the keyword counter never fires; the heuristics
+    # send the message to web_research, but the arbiter understands it as a real
+    # multi-step mission and the agent must create a persisted mission plan.
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    calls = []
+
+    class MissionRouterLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None):
+            calls.append(messages)
+            return type(
+                "Result",
+                (),
+                {
+                    "ok": True,
+                    "content": (
+                        '{"route":"mission","confidence":0.85,'
+                        '"query":"","rationale":"real multi-step home lab task"}'
+                    ),
+                    "error": None,
+                },
+            )()
+
+    agent = AgentRuntime(
+        settings=settings,
+        storage=storage,
+        llm=MissionRouterLLM(),
+        bus=EventBus(),
+    )
+
+    async def fail_tool(name, arguments=None, **kwargs):
+        raise AssertionError(f"tool {name} must not run when arbiter promotes to mission")
+
+    monkeypatch.setattr(agent.tools, "run", fail_tool)
+
+    response = asyncio.run(agent.chat("найди варианты недорогого NAS для дома"))
+
+    assert len(calls) == 1
+    assert "intent-router" in calls[0][0]["content"]
+    assert response.mission_id is not None
+    mission = storage.get_mission(response.mission_id)
+    assert mission is not None
+    assert mission["tasks"]
+    assert any(event.type == "mission" for event in response.events)
+    storage.close()
+
+
 def test_intent_router_receives_operator_persona_context(monkeypatch, tmp_path):
     from jarvis_gpt.persona import PersonaManager
 

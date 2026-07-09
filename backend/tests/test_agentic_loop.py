@@ -70,6 +70,44 @@ def test_agentic_loop_runs_safe_tool_then_answers(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_agentic_loop_learns_persona_insight_from_dialogue(monkeypatch, tmp_path):
+    # The operator reveals a durable fact in passing; the model saves it through
+    # the real persona.insight tool (no monkeypatched registry) so future turns
+    # see it in the persona block. This is the reasoning-first replacement for
+    # regex persona extraction.
+    from jarvis_gpt.persona import load_persona
+
+    class InsightThenAnswerLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, messages, *, temperature=None, max_tokens=None, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return _result(
+                    '{"tool": "persona.insight", '
+                    '"arguments": {"field": "tech_stack", "value": "Proxmox"}}'
+                )
+            return _result("Запомнил: Proxmox теперь часть твоего стека.")
+
+    llm = InsightThenAnswerLLM()
+    agent, storage = _agent(monkeypatch, tmp_path, llm)
+
+    response = asyncio.run(agent.chat("кстати, я перевёл домашний кластер на Proxmox"))
+
+    assert llm.calls == 2
+    assert "Proxmox" in response.answer
+    persona = load_persona(storage)
+    assert "Proxmox" in persona["tech_stack"]
+    assert any(
+        event.type == "tool_call" and event.payload.get("tool") == "persona.insight"
+        for event in response.events
+    )
+    audit_actions = {item["action"] for item in storage.list_audit(limit=20)}
+    assert "persona.insight" in audit_actions
+    storage.close()
+
+
 def test_agentic_answer_auto_continues_after_length_finish(monkeypatch, tmp_path):
     class LengthThenDoneLLM:
         def __init__(self) -> None:
