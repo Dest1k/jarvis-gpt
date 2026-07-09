@@ -22,6 +22,13 @@ import httpx
 from httpcore._backends.auto import AutoBackend
 from httpcore._backends.base import SOCKET_OPTION, AsyncNetworkBackend, AsyncNetworkStream
 
+from .browser_cdp import (
+    DEFAULT_CHROME_DEBUG_URL,
+    BrowserCdpError,
+    chrome_debugger_status,
+    normalize_debug_url,
+    read_chrome_page,
+)
 from .config import JarvisSettings
 from .diagnostics import run_diagnostics
 from .dispatcher import DispatcherManager
@@ -389,6 +396,49 @@ class ToolRegistry:
                 category="browser",
                 input_schema={},
                 handler=_browser_policy,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="browser.chrome.status",
+                description="Check the local Chrome DevTools endpoint used for browser reading.",
+                category="browser",
+                input_schema={"debug_url": "Local Chrome DevTools URL, default 127.0.0.1:9222"},
+                handler=_browser_chrome_status,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="browser.chrome.launch",
+                description=(
+                    "Launch Chrome with a dedicated Jarvis profile and local DevTools endpoint."
+                ),
+                category="browser",
+                input_schema={
+                    "debug_port": "Local DevTools port, default 9222",
+                    "profile_dir": "Optional profile directory under allowed roots",
+                    "start_url": "Optional HTTP(S) URL to open",
+                },
+                handler=_browser_chrome_launch,
+                danger_level="review",
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="browser.read",
+                description=(
+                    "Read visible text from an HTTP(S) page through a local Chrome DevTools "
+                    "session, preserving browser-side cookies without exporting them."
+                ),
+                category="browser",
+                input_schema={
+                    "url": "HTTP(S) URL to open and read",
+                    "max_chars": "Maximum text characters",
+                    "wait_ms": "Milliseconds to wait for page load",
+                    "debug_url": "Local Chrome DevTools URL, default 127.0.0.1:9222",
+                },
+                handler=_browser_read,
+                danger_level="review",
             )
         )
         self.add(
@@ -938,6 +988,131 @@ def _browser_policy(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunResponse:
         ok=True,
         summary="Browser automation policy loaded.",
         data={"policy": policy},
+    )
+
+
+async def _browser_chrome_status(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    try:
+        debug_url = normalize_debug_url(str(args.get("debug_url") or DEFAULT_CHROME_DEBUG_URL))
+        status = await chrome_debugger_status(debug_url)
+    except BrowserCdpError as exc:
+        return ToolRunResponse(tool="browser.chrome.status", ok=False, summary=str(exc))
+    return ToolRunResponse(
+        tool="browser.chrome.status",
+        ok=bool(status.get("ok")),
+        summary=str(status.get("summary") or "Chrome DevTools status collected."),
+        data=status,
+    )
+
+
+async def _browser_chrome_launch(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    policy = OperationsManager(settings=ctx.settings, storage=ctx.storage).browser_policy()
+    debug_port = _int_arg(args.get("debug_port"), default=9222, minimum=1024, maximum=65535)
+    debug_url = f"http://127.0.0.1:{debug_port}"
+    raw_start_url = str(args.get("start_url") or "").strip()
+    if raw_start_url:
+        try:
+            start_url = _validate_browser_url(raw_start_url, policy=policy)
+        except ValueError as exc:
+            return ToolRunResponse(tool="browser.chrome.launch", ok=False, summary=str(exc))
+    else:
+        start_url = "about:blank"
+
+    raw_profile_dir = str(args.get("profile_dir") or "").strip()
+    try:
+        profile_dir = (
+            _resolve_allowed_path(ctx.settings, raw_profile_dir)
+            if raw_profile_dir
+            else ctx.settings.cache_dir / "chrome-profile"
+        )
+    except ValueError as exc:
+        return ToolRunResponse(tool="browser.chrome.launch", ok=False, summary=str(exc))
+
+    args_list = [
+        f"--remote-debugging-port={debug_port}",
+        f"--user-data-dir={profile_dir}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        start_url,
+    ]
+    ps_args = ", ".join(_powershell_quote(item) for item in args_list)
+    command = (
+        "$candidates = @("
+        "\"$env:ProgramFiles\\Google\\Chrome\\Application\\chrome.exe\", "
+        "\"${env:ProgramFiles(x86)}\\Google\\Chrome\\Application\\chrome.exe\", "
+        "\"$env:LOCALAPPDATA\\Google\\Chrome\\Application\\chrome.exe\""
+        "); "
+        "$chrome = $candidates | Where-Object { $_ -and (Test-Path $_) } | "
+        "Select-Object -First 1; "
+        "if (-not $chrome) { throw 'Chrome executable was not found.' }; "
+        f"New-Item -ItemType Directory -Force -Path {_powershell_quote(str(profile_dir))} "
+        "| Out-Null; "
+        f"Start-Process -FilePath $chrome -ArgumentList @({ps_args})"
+    )
+    result = await HostBridgeClient(ctx.settings).execute(command=command, timeout_sec=15)
+    data = result.get("data") if isinstance(result.get("data"), dict) else result
+    return ToolRunResponse(
+        tool="browser.chrome.launch",
+        ok=bool(result.get("ok")),
+        summary=str(result.get("summary") or "Chrome launch requested."),
+        data={
+            "debug_url": debug_url,
+            "profile_dir": str(profile_dir),
+            "start_url": start_url,
+            "bridge": data,
+        },
+    )
+
+
+async def _browser_read(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    policy = OperationsManager(settings=ctx.settings, storage=ctx.storage).browser_policy()
+    try:
+        url = _validate_browser_url(str(args.get("url") or ""), policy=policy)
+        debug_url = normalize_debug_url(str(args.get("debug_url") or DEFAULT_CHROME_DEBUG_URL))
+    except (BrowserCdpError, ValueError) as exc:
+        return ToolRunResponse(tool="browser.read", ok=False, summary=str(exc))
+
+    max_chars = _int_arg(args.get("max_chars"), default=6000, minimum=256, maximum=30000)
+    wait_ms = _int_arg(args.get("wait_ms"), default=5000, minimum=1000, maximum=30000)
+    try:
+        snapshot = await read_chrome_page(
+            url=url,
+            max_chars=max_chars,
+            wait_ms=wait_ms,
+            debug_url=debug_url,
+        )
+    except BrowserCdpError as exc:
+        return ToolRunResponse(
+            tool="browser.read",
+            ok=False,
+            summary=(
+                f"{exc}. Start Chrome with browser.chrome.launch or manually expose "
+                "a local DevTools endpoint."
+            ),
+            data={"url": url, "debug_url": debug_url},
+        )
+
+    ok = bool(snapshot.text.strip()) and not snapshot.needs_human_verification
+    if snapshot.needs_human_verification:
+        summary = "Page appears to require human verification; complete it in Chrome and retry."
+    elif snapshot.text.strip():
+        summary = f"Read browser page: {snapshot.title or snapshot.url}"
+    else:
+        summary = "Browser page loaded but no visible text was found."
+    return ToolRunResponse(
+        tool="browser.read",
+        ok=ok,
+        summary=summary,
+        data={
+            "url": snapshot.url,
+            "requested_url": url,
+            "title": snapshot.title,
+            "ready_state": snapshot.ready_state,
+            "text": snapshot.text,
+            "truncated": snapshot.truncated,
+            "needs_human_verification": snapshot.needs_human_verification,
+            "debug_url": debug_url,
+        },
     )
 
 

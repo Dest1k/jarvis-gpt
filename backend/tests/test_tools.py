@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
+from jarvis_gpt.browser_cdp import BrowserPageSnapshot
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
 from jarvis_gpt.llm import LLMRouter
 from jarvis_gpt.storage import JarvisStorage
@@ -509,6 +510,136 @@ def test_browser_policy_and_open_many(monkeypatch, tmp_path):
     assert policy.ok is True
     assert opened.ok is True
     assert opened.data["urls"] == ["https://example.com/a", "https://example.com/b"]
+    storage.close()
+
+
+def test_browser_chrome_status_uses_local_cdp(monkeypatch, tmp_path):
+    async def fake_status(debug_url):
+        assert debug_url == "http://127.0.0.1:9222"
+        return {"ok": True, "summary": "ready", "debug_url": debug_url}
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr("jarvis_gpt.tools.chrome_debugger_status", fake_status)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    result = asyncio.run(tools.run("browser.chrome.status", {}))
+    blocked = asyncio.run(
+        tools.run("browser.chrome.status", {"debug_url": "http://192.168.1.2:9222"})
+    )
+
+    assert result.ok is True
+    assert result.data["debug_url"] == "http://127.0.0.1:9222"
+    assert blocked.ok is False
+    assert "localhost" in blocked.summary
+    storage.close()
+
+
+def test_browser_read_is_gated_and_uses_chrome_session(monkeypatch, tmp_path):
+    async def fake_read_chrome_page(*, url, max_chars, wait_ms, debug_url):
+        assert url == "https://example.com/private"
+        assert max_chars == 1024
+        assert wait_ms == 2000
+        assert debug_url == "http://127.0.0.1:9222"
+        return BrowserPageSnapshot(
+            title="Private page",
+            url=url,
+            ready_state="complete",
+            text="session-backed text",
+            truncated=False,
+            needs_human_verification=False,
+        )
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr("jarvis_gpt.tools.read_chrome_page", fake_read_chrome_page)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+    info = {tool.name: tool for tool in tools.list()}
+
+    blocked = asyncio.run(tools.run("browser.read", {"url": "https://example.com/private"}))
+    read = asyncio.run(
+        tools.run(
+            "browser.read",
+            {"url": "https://example.com/private", "max_chars": 1024, "wait_ms": 2000},
+            allow_danger=True,
+        )
+    )
+
+    assert info["browser.read"].danger_level == "review"
+    assert blocked.ok is False
+    assert "requires approval" in blocked.summary
+    assert read.ok is True
+    assert read.data["text"] == "session-backed text"
+    storage.close()
+
+
+def test_browser_read_reports_human_verification(monkeypatch, tmp_path):
+    async def fake_read_chrome_page(**_kwargs):
+        return BrowserPageSnapshot(
+            title="Just a moment",
+            url="https://example.com/",
+            ready_state="complete",
+            text="Checking your browser before accessing the site.",
+            truncated=False,
+            needs_human_verification=True,
+        )
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr("jarvis_gpt.tools.read_chrome_page", fake_read_chrome_page)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    result = asyncio.run(
+        tools.run("browser.read", {"url": "https://example.com/"}, allow_danger=True)
+    )
+
+    assert result.ok is False
+    assert result.data["needs_human_verification"] is True
+    assert "human verification" in result.summary
+    storage.close()
+
+
+def test_browser_chrome_launch_uses_dedicated_profile(monkeypatch, tmp_path):
+    class FakeBridgeClient:
+        def __init__(self, _settings):
+            pass
+
+        async def execute(self, *, command, cwd=None, timeout_sec=30):
+            assert cwd is None
+            assert timeout_sec == 15
+            assert "--remote-debugging-port=9222" in command
+            assert "chrome-profile" in command
+            return {"ok": True, "summary": "launched", "data": {"command": command}}
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr("jarvis_gpt.tools.HostBridgeClient", FakeBridgeClient)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    blocked = asyncio.run(tools.run("browser.chrome.launch", {}))
+    launched = asyncio.run(tools.run("browser.chrome.launch", {}, allow_danger=True))
+
+    assert blocked.ok is False
+    assert "requires approval" in blocked.summary
+    assert launched.ok is True
+    assert launched.data["debug_url"] == "http://127.0.0.1:9222"
+    assert launched.data["profile_dir"].endswith("chrome-profile")
     storage.close()
 
 

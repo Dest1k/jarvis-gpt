@@ -10,6 +10,7 @@ dependencies = [
   "pydantic==2.10.4",
   "python-multipart==0.0.20",
   "uvicorn[standard]==0.34.0",
+  "websockets==16.0",
 ]
 
 [project.optional-dependencies]

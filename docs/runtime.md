@@ -590,6 +590,14 @@ to retry from scratch.
 - Host bridge follow-up closed: bundled `scripts/windows_rpc_bridge.py` exposes local token-auth command execution for approved host actions.
 - Autonomous supervisor now persists health snapshots on its own interval, so `/api/status` stays fresh without manual diagnostics.
 
+## 2026-07-10 handoff
+
+- Browser work in progress for Claude: added `backend/src/jarvis_gpt/browser_cdp.py` with a local-only Chrome DevTools Protocol reader.
+- New tools registered in `backend/src/jarvis_gpt/tools.py`: `browser.chrome.status`, `browser.chrome.launch`, and approval-gated `browser.read`.
+- Safety boundary: do not copy/decrypt/export Chrome cookies or cache. The supported path is a dedicated Chrome profile launched with `--remote-debugging-port=9222`; the operator logs in or completes checks in that browser, then Jarvis reads visible DOM text through CDP.
+- `browser.read` returns `needs_human_verification=true` instead of trying to bypass CAPTCHA/anti-bot pages.
+- Tests were added in `backend/tests/test_tools.py`; current verification passed with `pytest backend/tests`, targeted `ruff check`, and `python -m compileall backend/src/jarvis_gpt`.
+
 ## Переменные окружения
 
 | Variable | Default | Purpose |
@@ -641,6 +649,9 @@ py -3.11 .\jarvis.py diag
 py -3.11 .\jarvis.py chat "JARVIS, оформи это как mission plan: ..."
 py -3.11 .\jarvis.py tools
 py -3.11 .\jarvis.py tool-run memory.search --set query=runtime --set limit=5
+py -3.11 .\jarvis.py tool-run browser.chrome.status
+py -3.11 .\jarvis.py tool-run browser.chrome.launch --allow-danger
+py -3.11 .\jarvis.py tool-run browser.read --set url=https://example.com --allow-danger
 py -3.11 .\jarvis.py ingest README.md
 py -3.11 .\jarvis.py files
 py -3.11 .\jarvis.py file-search Jarvis --limit 5
@@ -712,6 +723,17 @@ GET  /api/tool-runs
 POST /api/diagnostics
 WS   /ws/events
 ```
+
+## Browser Reading
+
+`web.fetch` remains the safe public HTTP reader. For sites that need a real browser session, use Chrome CDP:
+
+```powershell
+py -3.11 .\jarvis.py tool-run browser.chrome.launch --allow-danger
+py -3.11 .\jarvis.py tool-run browser.read --set url=https://example.com --allow-danger
+```
+
+Chrome is launched with a dedicated profile under `D:\jarvis\cache\jarvis-gpt\chrome-profile` and local DevTools on `127.0.0.1:9222`. If a site asks for login or human verification, complete it in that Chrome window and retry `browser.read`.
 
 ## Host Bridge
 

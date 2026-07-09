@@ -196,6 +196,7 @@ docker compose --profile llm up -d dispatcher
 - Command Center can create host-command approval gates and execute them after approval.
 - Native host bridge now has a bundled local RPC script, token detection, CLI execution, and a `danger` tool for approved host commands.
 - Safe tools include `web.fetch` for public HTTP(S) context with private-network and redirect guards.
+- Browser tools include local-only Chrome CDP status/launch/read flows for reading pages through a dedicated user browser session without exporting cookies.
 - Safe tools include read-only `docker.ps` and restricted `docker.logs` for Jarvis container diagnostics.
 - Safe tool `system.inspect` даёт агенту read-only инспекцию машины через WMI/CIM (и список окон): модель сама выбирает Win32_* класс по своему знанию для бытовых вопросов о железе/ОС/дисках/оперативке/батарее/службах/автозагрузке/принтерах/сети, без слова «wmi». Мутирующие native-действия остаются на approval-gated `windows.native`.
 - Dispatcher status/logs are tools, while dispatcher start/stop are approval-gated tool actions.
