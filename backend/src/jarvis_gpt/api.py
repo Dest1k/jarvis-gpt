@@ -72,6 +72,7 @@ from .models import (
     Mission,
     MissionCreateRequest,
     MissionExecutionResponse,
+    MissionRunResponse,
     MissionTask,
     MissionTaskUpdateRequest,
     ModelActivateRequest,
@@ -583,6 +584,16 @@ async def execute_next_mission_step(mission_id: str) -> MissionExecutionResponse
     if app.state.storage.get_mission(mission_id) is None:
         raise HTTPException(status_code=404, detail="Mission not found")
     return await app.state.agent.execute_next_mission_step(mission_id)
+
+
+@app.post("/api/missions/{mission_id}/run", response_model=MissionRunResponse)
+async def run_mission(
+    mission_id: str,
+    max_steps: int | None = Query(default=None, ge=1, le=24),
+) -> MissionRunResponse:
+    if app.state.storage.get_mission(mission_id) is None:
+        raise HTTPException(status_code=404, detail="Mission not found")
+    return await app.state.agent.run_mission(mission_id, max_steps=max_steps)
 
 
 @app.patch("/api/missions/{mission_id}/tasks/{task_id}", response_model=MissionTask)

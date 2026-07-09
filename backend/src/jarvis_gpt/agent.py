@@ -28,6 +28,8 @@ from .models import (
     ChatResponse,
     Mission,
     MissionExecutionResponse,
+    MissionRunResponse,
+    MissionStepOutcome,
     MissionTask,
     ToolInfo,
     ToolRunResponse,
@@ -969,6 +971,79 @@ class AgentRuntime:
             task=MissionTask.model_validate(updated_task or running_task or task),
             result=result,
         )
+
+    async def run_mission(
+        self,
+        mission_id: str,
+        *,
+        max_steps: int | None = None,
+    ) -> MissionRunResponse:
+        """Execute mission steps in sequence until the mission finishes, a step is
+        blocked (e.g. it needs an approval), or the step budget is exhausted.
+
+        Each step still runs through the agentic executor, so this only chains the
+        real work; it never bypasses approval gates. ``mission_step`` events are
+        emitted per step, so the Command Center can render progress live.
+        """
+
+        mission = self.storage.get_mission(mission_id)
+        if mission is None:
+            return MissionRunResponse(
+                mission=_empty_mission(mission_id),
+                steps=[],
+                completed=False,
+                stopped_reason="empty",
+                executed_steps=0,
+            )
+
+        budget = self._mission_run_budget(max_steps)
+        steps: list[MissionStepOutcome] = []
+        stopped_reason = "empty"
+        for _ in range(budget):
+            if self.storage.next_mission_task(mission_id) is None:
+                break
+            response = await self.execute_next_mission_step(mission_id)
+            steps.append(MissionStepOutcome(task=response.task, result=response.result))
+            if not response.result.ok or (response.task and response.task.status == "blocked"):
+                stopped_reason = "blocked"
+                break
+
+        refreshed = self.storage.get_mission(mission_id) or mission
+        completed = self.storage.next_mission_task(mission_id) is None
+        if stopped_reason != "blocked":
+            stopped_reason = ("completed" if steps else "empty") if completed else "budget"
+        await self._emit(
+            ChatEvent(
+                type="mission_run",
+                title="Mission run finished",
+                content=refreshed.get("title", mission_id),
+                payload={
+                    "mission_id": mission_id,
+                    "executed_steps": len(steps),
+                    "stopped_reason": stopped_reason,
+                    "completed": completed,
+                },
+            )
+        )
+        return MissionRunResponse(
+            mission=Mission.model_validate(refreshed),
+            steps=steps,
+            completed=completed,
+            stopped_reason=stopped_reason,  # type: ignore[arg-type]
+            executed_steps=len(steps),
+        )
+
+    def _mission_run_budget(self, max_steps: int | None) -> int:
+        if max_steps is not None:
+            return max(1, min(24, int(max_steps)))
+        policy = self.storage.get_runtime_value("experience.autonomy_policy", {})
+        steps = 6
+        if isinstance(policy, dict):
+            try:
+                steps = int(policy.get("max_autonomous_steps", steps))
+            except (TypeError, ValueError):
+                steps = 6
+        return max(1, min(24, steps))
 
     async def _execute_mission_step_agentic(
         self,

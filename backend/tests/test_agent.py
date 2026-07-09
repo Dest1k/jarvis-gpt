@@ -114,6 +114,35 @@ def test_agent_executes_next_mission_step(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_run_mission_chains_all_steps_offline(monkeypatch, tmp_path):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    mission = agent.create_mission("Build tools runtime")
+    task_count = len(mission["tasks"])
+
+    run = asyncio.run(agent.run_mission(mission["id"], max_steps=task_count))
+    refreshed = storage.get_mission(mission["id"])
+
+    assert run.completed is True
+    assert run.stopped_reason == "completed"
+    assert run.executed_steps == task_count
+    assert all(task["status"] == "done" for task in refreshed["tasks"])
+    assert refreshed["progress"] == 1.0
+    storage.close()
+
+
+def test_run_mission_respects_step_budget(monkeypatch, tmp_path):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    mission = agent.create_mission("Build tools runtime")
+    assert len(mission["tasks"]) > 1
+
+    run = asyncio.run(agent.run_mission(mission["id"], max_steps=1))
+
+    assert run.executed_steps == 1
+    assert run.completed is False
+    assert run.stopped_reason == "budget"
+    storage.close()
+
+
 def test_agent_streams_chat_response(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     settings = load_settings()

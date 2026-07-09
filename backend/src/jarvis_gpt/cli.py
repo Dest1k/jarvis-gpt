@@ -319,6 +319,16 @@ def cmd_mission_next(args: argparse.Namespace) -> None:
     asyncio.run(run())
 
 
+def cmd_mission_run(args: argparse.Namespace) -> None:
+    async def run() -> None:
+        _settings, storage, _llm, agent = _runtime(args.profile)
+        response = await agent.run_mission(args.mission_id, max_steps=args.max_steps)
+        _print_json(response.model_dump())
+        storage.close()
+
+    asyncio.run(run())
+
+
 def cmd_serve(args: argparse.Namespace) -> None:
     settings = load_settings(args.profile)
     uvicorn.run(
@@ -489,6 +499,14 @@ def build_parser() -> argparse.ArgumentParser:
     mission_next_parser = sub.add_parser("mission-next", help="Execute next pending mission task")
     mission_next_parser.add_argument("mission_id")
     mission_next_parser.set_defaults(func=cmd_mission_next)
+
+    mission_run_parser = sub.add_parser(
+        "mission-run",
+        help="Auto-chain mission steps until completion, a blocked step, or the budget",
+    )
+    mission_run_parser.add_argument("mission_id")
+    mission_run_parser.add_argument("--max-steps", type=int, default=None)
+    mission_run_parser.set_defaults(func=cmd_mission_run)
 
     serve_parser = sub.add_parser("serve", help="Start FastAPI backend")
     serve_parser.add_argument("--host", default=None)

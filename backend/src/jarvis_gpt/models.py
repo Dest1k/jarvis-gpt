@@ -380,6 +380,19 @@ class MissionExecutionResponse(BaseModel):
     result: ToolRunResponse
 
 
+class MissionStepOutcome(BaseModel):
+    task: MissionTask | None = None
+    result: ToolRunResponse
+
+
+class MissionRunResponse(BaseModel):
+    mission: Mission
+    steps: list[MissionStepOutcome] = Field(default_factory=list)
+    completed: bool = False
+    stopped_reason: Literal["completed", "blocked", "budget", "empty"] = "completed"
+    executed_steps: int = 0
+
+
 class DiagnosticCheck(BaseModel):
     name: str
     status: Literal["ok", "warn", "error"]
