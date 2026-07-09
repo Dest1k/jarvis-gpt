@@ -12,7 +12,13 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from jarvis_gpt.api import _is_loopback_host, _persist_interrupted_stream, _token_allowed, app
+from jarvis_gpt.api import (
+    _is_local_machine_host,
+    _is_loopback_host,
+    _persist_interrupted_stream,
+    _token_allowed,
+    app,
+)
 from starlette.testclient import TestClient
 
 
@@ -46,6 +52,12 @@ def test_runtime_security_and_backup(client, monkeypatch):
     assert security.json()["remote_requires_token"] is True
     assert _is_loopback_host("127.0.0.1") is True
     assert _is_loopback_host("10.0.0.50") is False
+    monkeypatch.setattr(
+        "jarvis_gpt.api._local_interface_addresses",
+        lambda: frozenset({"10.0.0.50"}),
+    )
+    assert _is_local_machine_host("10.0.0.50") is True
+    assert _is_local_machine_host("10.0.0.51") is False
     monkeypatch.setenv("JARVIS_API_TOKEN", "secret")
     assert _token_allowed("secret") is True
     assert _token_allowed("wrong") is False

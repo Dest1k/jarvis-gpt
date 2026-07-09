@@ -5,7 +5,9 @@ import ipaddress
 import json
 import os
 import secrets
+import socket
 from contextlib import asynccontextmanager
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -209,6 +211,34 @@ def _is_loopback_host(host: str | None) -> bool:
         return False
 
 
+@lru_cache(maxsize=1)
+def _local_interface_addresses() -> frozenset[str]:
+    addresses: set[str] = {"127.0.0.1", "::1"}
+    hostnames = {socket.gethostname(), socket.getfqdn()}
+    for hostname in {item for item in hostnames if item}:
+        try:
+            for result in socket.getaddrinfo(hostname, None):
+                address = str(result[4][0]).split("%", 1)[0].lower()
+                if address:
+                    addresses.add(address)
+        except OSError:
+            continue
+    return frozenset(addresses)
+
+
+def _is_local_machine_host(host: str | None) -> bool:
+    if _is_loopback_host(host):
+        return True
+    if not host:
+        return False
+    normalized = host.strip().strip("[]").split("%", 1)[0].lower()
+    try:
+        address = ipaddress.ip_address(normalized)
+    except ValueError:
+        return False
+    return str(address).lower() in _local_interface_addresses()
+
+
 def _header_token(headers: Any) -> str:
     auth = str(headers.get("authorization") or "")
     if auth.lower().startswith("bearer "):
@@ -242,7 +272,7 @@ async def local_api_guard(request: Request, call_next):
         return await call_next(request)
     host = request.client.host if request.client else ""
     token_ok = _token_allowed(_header_token(request.headers))
-    if token_ok or (_is_loopback_host(host) and not _strict_loopback_token_required()):
+    if token_ok or (_is_local_machine_host(host) and not _strict_loopback_token_required()):
         return await call_next(request)
     status_code = 401 if _api_token() else 403
     detail = (
@@ -297,6 +327,7 @@ async def runtime_security(request: Request) -> dict[str, Any]:
     return {
         "client_host": host,
         "loopback_client": _is_loopback_host(host),
+        "local_machine_client": _is_local_machine_host(host),
         "token_configured": bool(_api_token()),
         "loopback_requires_token": app.state.settings.api_require_token_on_loopback,
         "remote_requires_token": True,
@@ -1268,7 +1299,7 @@ async def benchmark() -> BenchmarkResponse:
 async def ws_events(websocket: WebSocket) -> None:
     host = websocket.client.host if websocket.client else ""
     token = _header_token(websocket.headers) or str(websocket.query_params.get("token") or "")
-    if not _is_loopback_host(host) and not _token_allowed(token):
+    if not _is_local_machine_host(host) and not _token_allowed(token):
         await websocket.close(code=1008)
         return
     bus: EventBus = app.state.bus
