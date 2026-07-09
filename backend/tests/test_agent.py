@@ -2255,6 +2255,131 @@ def test_reasoning_arbiter_can_override_shopping_keyword_plug(monkeypatch, tmp_p
     storage.close()
 
 
+def test_arbiter_routes_local_query_to_native_inspection(monkeypatch, tmp_path):
+    # A plain machine-state question the native heuristics do not bind: the
+    # arbiter understands it as local_action, and the agent must inspect the
+    # machine with system.inspect instead of web-searching local state.
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    storage.set_runtime_value("experience.autonomy_policy", {"verify_answers": False})
+    calls = []
+
+    class LocalRouterThenInspectLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None, **kwargs):
+            calls.append(messages)
+            system = "\n".join(m["content"] for m in messages if m["role"] == "system")
+            user = "\n".join(m["content"] for m in messages if m["role"] == "user")
+            if "intent-router" in system:
+                return type(
+                    "Result",
+                    (),
+                    {
+                        "ok": True,
+                        "content": (
+                            '{"route":"local_action","confidence":0.85,'
+                            '"query":"","rationale":"machine state, read locally"}'
+                        ),
+                        "error": None,
+                    },
+                )()
+            if "observation[" in user:
+                return type(
+                    "Result",
+                    (),
+                    {"ok": True, "content": "Службы получены: активно 42 службы.", "error": None},
+                )()
+            return type(
+                "Result",
+                (),
+                {
+                    "ok": True,
+                    "content": (
+                        '{"tool": "system.inspect", "arguments": {"action": "wmi.query", '
+                        '"payload": {"class_name": "Win32_Service"}}}'
+                    ),
+                    "error": None,
+                },
+            )()
+
+    agent = AgentRuntime(
+        settings=settings,
+        storage=storage,
+        llm=LocalRouterThenInspectLLM(),
+        bus=EventBus(),
+    )
+    captured = []
+
+    async def fake_run(name, arguments=None, **kwargs):
+        captured.append(name)
+        return _tool_response(name, True, "Win32_Service rows", {"action": "wmi.query"})
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+
+    response = asyncio.run(agent.chat("покажи запущенные службы на компьютере"))
+
+    assert "intent-router" in calls[0][0]["content"]
+    assert "system.inspect" in captured
+    assert "web.search" not in captured
+    assert response.answer == "Службы получены: активно 42 службы."
+    storage.close()
+
+
+def test_arbiter_gate_opens_for_local_bucket_and_stays_closed_for_chat(monkeypatch, tmp_path):
+    from jarvis_gpt.agent import AgentContext, TaskKernelPlan
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    router_calls = []
+
+    class RouterLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None, **kwargs):
+            router_calls.append(messages)
+            return type(
+                "Result",
+                (),
+                {
+                    "ok": True,
+                    "content": '{"route":"local_action","confidence":0.8,"rationale":"machine"}',
+                    "error": None,
+                },
+            )()
+
+    agent = AgentRuntime(settings=settings, storage=storage, llm=RouterLLM(), bus=EventBus())
+    conversation_id = storage.create_conversation("gate test")
+
+    # Local bucket (reasoning/local_admin_advice): the arbiter must now run.
+    local_ctx = AgentContext(conversation_id=conversation_id, memory_hits=[], file_hits=[])
+    local_ctx.task_plan = TaskKernelPlan(
+        route="reasoning",
+        mode="standard",
+        intent="local_admin_advice",
+        confidence=0.66,
+    )
+    local_decision = asyncio.run(agent._understand_intent("покажи службы", local_ctx))
+    assert local_decision is not None
+    assert local_decision.route == "local_action"
+    assert len(router_calls) == 1
+
+    # Plain chat: the gate stays closed, no router call.
+    chat_ctx = AgentContext(conversation_id=conversation_id, memory_hits=[], file_hits=[])
+    chat_ctx.task_plan = TaskKernelPlan(
+        route="chat",
+        mode="standard",
+        intent="general_chat",
+        confidence=0.58,
+    )
+    chat_decision = asyncio.run(agent._understand_intent("расскажи анекдот", chat_ctx))
+    assert chat_decision is None
+    assert len(router_calls) == 1
+    storage.close()
+
+
 def test_reasoning_arbiter_can_promote_research_to_mission(monkeypatch, tmp_path):
     # No mission keywords, so the keyword counter never fires; the heuristics
     # send the message to web_research, but the arbiter understands it as a real

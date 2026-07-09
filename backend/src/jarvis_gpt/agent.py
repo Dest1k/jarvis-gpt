@@ -1605,6 +1605,20 @@ class AgentRuntime:
             ):
                 context.task_plan = _mission_plan_from_intent(context.task_plan, arbiter)
                 return None
+            # The arbiter understood the task as a local machine action or state
+            # query the keyword heuristics missed (or misrouted to web). Reroute
+            # to local_action and fall through to the agentic loop, where the model
+            # reads state with the safe system.inspect tool (picking the WMI class
+            # itself) and mutating desktop actions become approval-gated
+            # windows.native calls. This is what stops "сколько оперативки" or
+            # "покажи автозагрузку" from being web-searched instead of inspected.
+            if (
+                arbiter is not None
+                and arbiter.route == "local_action"
+                and arbiter.confidence >= 0.6
+            ):
+                context.task_plan = _local_action_plan_from_intent(context.task_plan, arbiter)
+                return None
             # Genuinely ambiguous task: ask the operator one targeted question
             # instead of guessing and delivering a confidently wrong result.
             if (
@@ -1726,19 +1740,23 @@ class AgentRuntime:
         This is the reasoning-first arbiter: instead of trusting a cascade of
         ``_looks_like_*`` heuristics, we ask the LLM to read the message together
         with the operator persona and recent turns and classify the real intent.
-        It only runs when the fast heuristic plan already wants an external,
-        tool-driven route (``web_research``) — that is exactly the fuzzy zone
-        where the keyword plugs produce false positives. Deterministic bindings
-        (native OS actions, host commands, explicit URLs) are handled earlier and
-        never routed through here. When the LLM is offline the heuristics stay
-        authoritative, so behavior degrades gracefully.
+        It runs in the two fuzzy zones where keyword plugs misfire: the external
+        ``web_research`` family, and the local-machine bucket (``reasoning`` with
+        intent ``local_admin_advice``) where plain machine-state/action phrasings
+        land without an explicit native binding. Concrete deterministic bindings
+        (matched native OS actions, host commands, explicit URLs) are handled
+        earlier and never routed through here. When the LLM is offline the
+        heuristics stay authoritative, so behavior degrades gracefully.
         """
 
         if context.intent_consulted:
             return context.intent_decision
         context.intent_consulted = True
         plan = context.task_plan
-        if plan is None or plan.route != "web_research":
+        if plan is None:
+            return None
+        local_bucket = plan.route == "reasoning" and plan.intent == "local_admin_advice"
+        if plan.route != "web_research" and not local_bucket:
             return None
         if not self.settings.llm_enabled:
             return None
@@ -4151,6 +4169,36 @@ def _mission_plan_from_intent(
     )
 
 
+def _local_action_plan_from_intent(
+    plan: TaskKernelPlan | None,
+    decision: IntentDecision,
+) -> TaskKernelPlan:
+    """Rebuild the task kernel when the arbiter understands a local machine task.
+
+    Steers the agentic loop toward the operator's machine: read state with the
+    safe ``system.inspect`` tool (the model picks the WMI class), and treat
+    desktop-changing actions as approval-gated ``windows.native`` calls, instead
+    of web-searching local state or merely advising a command.
+    """
+
+    mode = plan.mode if plan is not None else "standard"
+    return TaskKernelPlan(
+        route="local_action",
+        mode=mode,
+        intent="understood_local_action",
+        confidence=decision.confidence,
+        query=decision.query,
+        tools=("system.inspect", "windows.native"),
+        completion_criteria=(
+            "read real machine state via system.inspect (choose the WMI class yourself) "
+            "instead of web-searching local state",
+            "for desktop-changing actions request the native tool and respect its approval gate",
+            "report the actual tool result, not a guess or a bare command suggestion",
+        ),
+        rationale=decision.rationale or "Intent understood as a local machine action or state.",
+    )
+
+
 def _task_kernel_prompt(plan: TaskKernelPlan) -> str:
     lines = [
         "Task kernel decision:",
@@ -4306,7 +4354,14 @@ def _intent_router_messages(
                 "reasoning: задача решается размышлением по данным из самого сообщения — "
                 "логика, оценка, разбор, гипотетический/ролевой сценарий, совет, объяснение, "
                 "код; web не нужен, даже если встречаются слова вроде 'сейчас' или 'самый'.\n"
-                "local_action: надо управлять ОС/GUI/файлами/консолью на машине оператора.\n"
+                "local_action: запрос про МАШИНУ оператора — либо прочитать её состояние "
+                "(железо, ОС, диски, оперативка/RAM, заряд батареи, службы, автозагрузка, "
+                "принтеры, сеть, запущенные процессы), либо совершить действие с ОС/GUI/файлами/"
+                "консолью (открыть приложение, ввести текст, переключиться на окно, выполнить "
+                "локальную команду). Это НЕ web_research: состояние машины читается локально "
+                "инструментом, а не поиском в интернете. Примеры local_action: 'сколько у меня "
+                "оперативки', 'заряд батареи', 'что в автозагрузке', 'список принтеров', "
+                "'открой калькулятор', 'переключись на окно браузера'.\n"
                 "mission: крупная реальная многошаговая задача с исполнимыми шагами.\n"
                 "chat: обычный разговорный ответ без инструментов.\n"
                 "clarify: задача ДЕЙСТВИТЕЛЬНО неоднозначна, и один короткий вопрос оператору "

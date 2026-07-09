@@ -9,6 +9,30 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-09 - Claude (arbiter owns local_action)
+
+- Follow-up to system.inspect: the tool gave the model hands, but the ROUTE was
+  still keyword-decided. Now the reasoning-first arbiter owns local tasks too.
+- Two gaps closed in agent.py:
+  1. `arbiter.route == "local_action"` was produced but ignored (fell through to
+     web branches). `_try_direct_action` now handles it: reroute via new
+     `_local_action_plan_from_intent` and return None → agentic loop with native
+     tools. Stops "покажи автозагрузку" being web-searched.
+  2. The arbiter only ran for web_research plans; plain machine questions land in
+     reasoning/local_admin_advice and never reached it. `_understand_intent`'s
+     gate now also opens for that local bucket. Narrowly scoped (only
+     local_admin_advice), offline unchanged (gated on llm_enabled), one extra
+     router call only in that already-local bucket.
+- Arbiter prompt strengthened: local_action now explicitly covers reading machine
+  state (hardware/OS/disks/RAM/battery/services/startup/printers/network/processes)
+  AND actions (open app, type, focus window, local command), with examples and
+  "this is NOT web_research".
+- Deterministic native fast-paths untouched (they return before the arbiter), so
+  all offline native tests are unchanged.
+- Tests: test_arbiter_routes_local_query_to_native_inspection,
+  test_arbiter_gate_opens_for_local_bucket_and_stays_closed_for_chat. 190 pass,
+  ruff clean, frontend clean.
+
 ### 2026-07-09 - Claude (system.inspect: unlock WMI understanding)
 
 - Diagnosis for "why doesn't a 26-31B model get everyday Windows requests": the
