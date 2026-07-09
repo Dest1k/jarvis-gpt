@@ -9,6 +9,27 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-10 - Codex (internet workflow tools)
+
+- Added review-gated Chrome CDP actions: `browser.click`, `browser.type`,
+  `browser.select`, and `browser.screenshot`. They reuse the operator-approved
+  local Chrome CDP session, return a fresh page snapshot, and keep form values
+  unread. `browser.type` refuses password/card/token-like targets unless
+  `allow_sensitive` is explicitly set after review.
+- Added a runtime web evidence ledger. `web.search`, `web.fetch`, `web.render`,
+  `web.download`, `browser.read`, and the new browser actions now save compact
+  evidence records and return `evidence_id`; `web.evidence.list` exposes recent
+  records for follow-up reasoning.
+- Added `web.extract` for structured article/product/contact/table hints from a
+  URL, saved evidence id, or supplied text.
+- Added per-domain web request budgets and cooldowns after blocked/rate-limited
+  responses so Jarvis backs off instead of hammering anti-bot pages.
+- Added `web.download.inspect` for quarantined downloads: file signature,
+  SHA256, executable-risk flag, and bounded ZIP entry listing without opening or
+  executing anything.
+- Verified: `pytest -q backend\tests --tb=short` (222 pass), backend
+  `ruff check`, and `python -m compileall -q backend\src\jarvis_gpt`.
+
 ### 2026-07-10 - Codex (internet safety hardening)
 
 - Added `web.download`: public-only HTTP(S) download into Jarvis quarantine cache

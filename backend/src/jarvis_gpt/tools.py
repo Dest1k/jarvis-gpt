@@ -11,6 +11,7 @@ import shutil
 import socket
 import subprocess
 import tempfile
+import zipfile
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from html import unescape
@@ -29,6 +30,7 @@ from .browser_cdp import (
     chrome_debugger_status,
     normalize_debug_url,
     read_chrome_page,
+    run_chrome_action,
 )
 from .config import JarvisSettings
 from .diagnostics import run_diagnostics
@@ -40,7 +42,7 @@ from .model_catalog import ModelCatalog
 from .models import ToolInfo, ToolRunResponse
 from .operations import OperationsManager, docker_container_allowed
 from .persona import INSIGHT_FIELDS, PersonaManager, load_persona
-from .storage import JarvisStorage
+from .storage import JarvisStorage, new_id, utc_now
 from .telemetry import TelemetryCollector
 
 DangerLevel = Literal["safe", "review", "danger"]
@@ -115,6 +117,11 @@ POTENTIALLY_EXECUTABLE_CONTENT_TYPES = {
     "application/x-msi",
     "application/x-sh",
 }
+WEB_EVIDENCE_KEY = "web.evidence.records"
+WEB_RATE_KEY_PREFIX = "web.rate."
+WEB_RATE_WINDOW_SEC = 600
+WEB_RATE_MAX_REQUESTS = 12
+WEB_RATE_BLOCKED_COOLDOWN_SEC = 900
 
 
 @dataclass(frozen=True)
@@ -501,6 +508,62 @@ class ToolRegistry:
         )
         self.add(
             ToolSpec(
+                name="browser.click",
+                description="Click a CSS selector in a local Chrome CDP session after review.",
+                category="browser",
+                input_schema={
+                    "url": "HTTP(S) URL to open",
+                    "selector": "CSS selector to click",
+                    "wait_ms": "Milliseconds to wait for page load",
+                },
+                handler=_browser_click,
+                danger_level="review",
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="browser.type",
+                description="Type text into a CSS selector in local Chrome after review.",
+                category="browser",
+                input_schema={
+                    "url": "HTTP(S) URL to open",
+                    "selector": "CSS selector to type into",
+                    "text": "Text to type",
+                    "allow_sensitive": "Allow typing into password/card/token-like fields",
+                },
+                handler=_browser_type,
+                danger_level="review",
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="browser.select",
+                description="Select a value in a CSS selector in local Chrome after review.",
+                category="browser",
+                input_schema={
+                    "url": "HTTP(S) URL to open",
+                    "selector": "CSS selector to select",
+                    "value": "Option value",
+                },
+                handler=_browser_select,
+                danger_level="review",
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="browser.screenshot",
+                description="Capture a page screenshot through local Chrome CDP after review.",
+                category="browser",
+                input_schema={
+                    "url": "HTTP(S) URL to open",
+                    "wait_ms": "Milliseconds to wait for page load",
+                },
+                handler=_browser_screenshot,
+                danger_level="review",
+            )
+        )
+        self.add(
+            ToolSpec(
                 name="browser.open_many",
                 description="Open multiple validated HTTP(S) URLs through the native host browser.",
                 category="browser",
@@ -610,6 +673,32 @@ class ToolRegistry:
         )
         self.add(
             ToolSpec(
+                name="web.evidence.list",
+                description="List recent structured web evidence saved by web/browser tools.",
+                category="web",
+                input_schema={"limit": "Maximum records", "domain": "Optional domain filter"},
+                handler=_web_evidence_list,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="web.extract",
+                description=(
+                    "Extract structured article/product/contact/table hints from a URL, "
+                    "recent evidence id, or supplied text."
+                ),
+                category="web",
+                input_schema={
+                    "url": "Optional public URL to fetch first",
+                    "evidence_id": "Optional saved evidence id",
+                    "text": "Optional text to extract",
+                    "kind": "article, product, contact, table, or auto",
+                },
+                handler=_web_extract,
+            )
+        )
+        self.add(
+            ToolSpec(
                 name="web.fetch",
                 description=(
                     "Fetch text from a public HTTP(S) URL with private-network SSRF guards."
@@ -633,6 +722,21 @@ class ToolRegistry:
                     "filename": "Optional quarantine filename",
                 },
                 handler=_web_download,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="web.download.inspect",
+                description=(
+                    "Inspect a quarantined downloaded file by path or evidence id without "
+                    "opening/executing it; reports signature and safe archive listing."
+                ),
+                category="web",
+                input_schema={
+                    "path": "Path under Jarvis quarantine downloads",
+                    "evidence_id": "Optional download evidence id",
+                },
+                handler=_web_download_inspect,
             )
         )
         self.add(
@@ -1180,6 +1284,17 @@ async def _browser_read(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
         summary = "Browser page loaded but no visible text was found."
     if ok and safety["prompt_injection_detected"]:
         summary = f"{summary}. Remote prompt-injection markers detected."
+    evidence = _store_web_evidence(
+        ctx.storage,
+        source="browser.read",
+        url=snapshot.url,
+        title=snapshot.title,
+        text=snapshot.text,
+        content_type="text/plain",
+        safety=safety,
+        confidence=0.74 if ok else 0.35,
+        extra={"needs_human_verification": snapshot.needs_human_verification},
+    )
     return ToolRunResponse(
         tool="browser.read",
         ok=ok,
@@ -1199,6 +1314,128 @@ async def _browser_read(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
                 "values_read": False,
             },
             "safety": safety,
+            "evidence_id": evidence["id"],
+            "debug_url": debug_url,
+        },
+    )
+
+
+async def _browser_click(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    return await _browser_action(ctx, args, action="click")
+
+
+async def _browser_type(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    return await _browser_action(ctx, args, action="type")
+
+
+async def _browser_select(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    return await _browser_action(ctx, args, action="select")
+
+
+async def _browser_screenshot(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    return await _browser_action(ctx, args, action="screenshot")
+
+
+async def _browser_action(
+    ctx: ToolContext,
+    args: dict[str, Any],
+    *,
+    action: str,
+) -> ToolRunResponse:
+    policy = OperationsManager(settings=ctx.settings, storage=ctx.storage).browser_policy()
+    try:
+        url = _validate_browser_url(str(args.get("url") or ""), policy=policy)
+        debug_url = normalize_debug_url(str(args.get("debug_url") or DEFAULT_CHROME_DEBUG_URL))
+        selector = _browser_selector_arg(args.get("selector"), required=action != "screenshot")
+    except (BrowserCdpError, ValueError) as exc:
+        return ToolRunResponse(tool=f"browser.{action}", ok=False, summary=str(exc))
+
+    text = str(args.get("text") or "")
+    value = str(args.get("value") or "")
+    if len(text) > 4000 or len(value) > 1000:
+        return ToolRunResponse(
+            tool=f"browser.{action}",
+            ok=False,
+            summary="Browser input is too long.",
+        )
+    wait_ms = _int_arg(args.get("wait_ms"), default=5000, minimum=1000, maximum=30000)
+    max_chars = _int_arg(args.get("max_chars"), default=6000, minimum=256, maximum=30000)
+    allow_sensitive = bool(args.get("allow_sensitive", False))
+
+    try:
+        result = await run_chrome_action(
+            url=url,
+            action=action,
+            selector=selector,
+            text=text,
+            value=value,
+            max_chars=max_chars,
+            wait_ms=wait_ms,
+            allow_sensitive=allow_sensitive,
+            debug_url=debug_url,
+        )
+    except BrowserCdpError as exc:
+        return ToolRunResponse(
+            tool=f"browser.{action}",
+            ok=False,
+            summary=(
+                f"{exc}. Start Chrome with browser.chrome.launch or complete any "
+                "human verification in Chrome, then retry."
+            ),
+            data={"url": url, "debug_url": debug_url},
+        )
+
+    safety = _web_content_safety(
+        source=f"browser.{action}",
+        url=result.url,
+        text=result.snapshot.text,
+    )
+    screenshot_path = None
+    if result.screenshot_png is not None:
+        screenshot_dir = ctx.settings.cache_dir / "browser-screens"
+        screenshot_dir.mkdir(parents=True, exist_ok=True)
+        screenshot_path = _unique_child_path(
+            screenshot_dir,
+            f"browser-{_timestamp_slug()}.png",
+        )
+        screenshot_path.write_bytes(result.screenshot_png)
+
+    evidence = _store_web_evidence(
+        ctx.storage,
+        source=f"browser.{action}",
+        url=result.url,
+        title=result.title,
+        text=result.snapshot.text,
+        content_type="text/plain",
+        safety=safety,
+        confidence=0.68 if result.ok else 0.3,
+        extra={"screenshot_path": str(screenshot_path) if screenshot_path else None},
+    )
+    summary = result.summary
+    if safety["prompt_injection_detected"]:
+        summary = f"{summary} Remote prompt-injection markers detected."
+    return ToolRunResponse(
+        tool=f"browser.{action}",
+        ok=result.ok,
+        summary=summary,
+        data={
+            "url": result.url,
+            "requested_url": url,
+            "action": action,
+            "selector": selector,
+            "title": result.title,
+            "ready_state": result.ready_state,
+            "text": result.snapshot.text,
+            "truncated": result.snapshot.truncated,
+            "forms": {
+                "form_count": result.snapshot.form_count,
+                "password_input_count": result.snapshot.password_input_count,
+                "sensitive_input_count": result.snapshot.sensitive_input_count,
+                "values_read": False,
+            },
+            "screenshot_path": str(screenshot_path) if screenshot_path else None,
+            "safety": safety,
+            "evidence_id": evidence["id"],
             "debug_url": debug_url,
         },
     )
@@ -1389,7 +1626,7 @@ def _files_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     )
 
 
-async def _web_search(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+async def _web_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     query = " ".join(str(args.get("query") or "").split())
     limit = _int_arg(args.get("limit"), default=6, minimum=1, maximum=12)
     if not query:
@@ -1398,6 +1635,14 @@ async def _web_search(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespons
         query = query[:300].rstrip()
 
     url = f"https://duckduckgo.com/html/?q={quote_plus(query)}"
+    rate_block = _web_rate_limit_block(ctx.storage, url)
+    if rate_block is not None:
+        return ToolRunResponse(
+            tool="web.search",
+            ok=False,
+            summary=rate_block["summary"],
+            data=rate_block,
+        )
     headers = WEB_HEADERS
     try:
         async with httpx.AsyncClient(
@@ -1424,6 +1669,7 @@ async def _web_search(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespons
             f"{item.get('title', '')}\n{item.get('snippet', '')}" for item in results
         ),
     )
+    _web_rate_limit_record(ctx.storage, url, ok=True)
     return ToolRunResponse(
         tool="web.search",
         ok=True,
@@ -1437,13 +1683,77 @@ async def _web_search(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespons
     )
 
 
-async def _web_fetch(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+async def _web_evidence_list(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    limit = _int_arg(args.get("limit"), default=10, minimum=1, maximum=100)
+    domain = str(args.get("domain") or "").strip().lower()
+    records = _list_web_evidence(ctx.storage, limit=limit, domain=domain or None)
+    return ToolRunResponse(
+        tool="web.evidence.list",
+        ok=True,
+        summary=f"Listed {len(records)} web evidence record(s).",
+        data={"records": records, "limit": limit, "domain": domain or None},
+    )
+
+
+async def _web_extract(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    kind = str(args.get("kind") or "auto").strip().lower()
+    if kind not in {"auto", "article", "product", "contact", "table"}:
+        return ToolRunResponse(tool="web.extract", ok=False, summary="Unsupported extract kind.")
+    text = str(args.get("text") or "")
+    source: dict[str, Any] = {"kind": "inline"}
+    evidence_id = str(args.get("evidence_id") or "").strip()
+    raw_url = str(args.get("url") or "").strip()
+    if evidence_id:
+        record = _get_web_evidence(ctx.storage, evidence_id)
+        if record is None:
+            return ToolRunResponse(
+                tool="web.extract",
+                ok=False,
+                summary="Evidence record not found.",
+            )
+        text = str(record.get("excerpt") or "")
+        source = {"kind": "evidence", "id": evidence_id, "url": record.get("url")}
+    elif raw_url:
+        fetched = await _web_fetch(ctx, {"url": raw_url, "max_chars": 20000})
+        if not fetched.ok:
+            return ToolRunResponse(
+                tool="web.extract",
+                ok=False,
+                summary=f"Could not fetch URL before extraction: {fetched.summary}",
+                data={"fetch": fetched.data},
+            )
+        text = str(fetched.data.get("text") or "")
+        source = {
+            "kind": "url",
+            "url": fetched.data.get("url"),
+            "evidence_id": fetched.data.get("evidence_id"),
+        }
+    if not text.strip():
+        return ToolRunResponse(tool="web.extract", ok=False, summary="Text or URL is required.")
+    extraction = _extract_web_structured(text, kind=kind)
+    return ToolRunResponse(
+        tool="web.extract",
+        ok=True,
+        summary=f"Extracted web {extraction['kind']} hints.",
+        data={"source": source, "extraction": extraction},
+    )
+
+
+async def _web_fetch(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     raw_url = str(args.get("url") or "").strip()
     max_chars = _int_arg(args.get("max_chars"), default=6000, minimum=256, maximum=20000)
     try:
         current_url = _validate_public_http_url(raw_url)
     except ValueError as exc:
         return ToolRunResponse(tool="web.fetch", ok=False, summary=str(exc))
+    rate_block = _web_rate_limit_block(ctx.storage, current_url)
+    if rate_block is not None:
+        return ToolRunResponse(
+            tool="web.fetch",
+            ok=False,
+            summary=rate_block["summary"],
+            data=rate_block,
+        )
 
     redirects: list[dict[str, Any]] = []
     headers = WEB_HEADERS
@@ -1497,6 +1807,23 @@ async def _web_fetch(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
                         )
                     elif safety["prompt_injection_detected"]:
                         summary = f"{summary} Remote prompt-injection markers detected."
+                    evidence = _store_web_evidence(
+                        ctx.storage,
+                        source="web.fetch",
+                        url=current_url,
+                        title="",
+                        text=text,
+                        content_type=response.headers.get("content-type"),
+                        safety=safety,
+                        confidence=0.72 if response.status_code < 400 and not blocked else 0.25,
+                        extra={"status_code": response.status_code},
+                    )
+                    _web_rate_limit_record(
+                        ctx.storage,
+                        current_url,
+                        ok=response.status_code < 400 and not blocked,
+                        blocked=blocked,
+                    )
                     return ToolRunResponse(
                         tool="web.fetch",
                         ok=response.status_code < 400 and not blocked,
@@ -1509,6 +1836,7 @@ async def _web_fetch(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
                             "truncated": truncated,
                             "redirects": redirects,
                             "safety": safety,
+                            "evidence_id": evidence["id"],
                         },
                     )
     except httpx.HTTPError as exc:
@@ -1539,6 +1867,14 @@ async def _web_download(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
         current_url = _validate_public_http_url(raw_url)
     except ValueError as exc:
         return ToolRunResponse(tool="web.download", ok=False, summary=str(exc))
+    rate_block = _web_rate_limit_block(ctx.storage, current_url)
+    if rate_block is not None:
+        return ToolRunResponse(
+            tool="web.download",
+            ok=False,
+            summary=rate_block["summary"],
+            data=rate_block,
+        )
 
     requested_filename = str(args.get("filename") or "").strip()
     redirects: list[dict[str, Any]] = []
@@ -1649,6 +1985,28 @@ async def _web_download(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
                         path,
                         content_type,
                     )
+                    safety = _web_content_safety(
+                        source="web.download",
+                        url=current_url,
+                        text=f"{path.name}\n{content_type}",
+                    )
+                    evidence = _store_web_evidence(
+                        ctx.storage,
+                        source="web.download",
+                        url=current_url,
+                        title=path.name,
+                        text=f"Downloaded file: {path.name}\nContent-Type: {content_type}",
+                        content_type=content_type,
+                        safety=safety,
+                        confidence=0.6,
+                        extra={
+                            "path": str(path),
+                            "size": bytes_written,
+                            "sha256": hasher.hexdigest(),
+                            "potentially_executable": potentially_executable,
+                        },
+                    )
+                    _web_rate_limit_record(ctx.storage, current_url, ok=True)
                     return ToolRunResponse(
                         tool="web.download",
                         ok=True,
@@ -1671,11 +2029,8 @@ async def _web_download(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
                                     "Jarvis must not open or execute them automatically."
                                 ),
                             },
-                            "safety": _web_content_safety(
-                                source="web.download",
-                                url=current_url,
-                                text=f"{path.name}\n{content_type}",
-                            ),
+                            "safety": safety,
+                            "evidence_id": evidence["id"],
                         },
                     )
     except httpx.HTTPError as exc:
@@ -1694,6 +2049,55 @@ async def _web_download(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
     )
 
 
+def _web_download_inspect(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    raw_path = str(args.get("path") or "").strip()
+    evidence_id = str(args.get("evidence_id") or "").strip()
+    if evidence_id and not raw_path:
+        record = _get_web_evidence(ctx.storage, evidence_id)
+        if record is None:
+            return ToolRunResponse(
+                tool="web.download.inspect",
+                ok=False,
+                summary="Evidence record not found.",
+            )
+        extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
+        raw_path = str(extra.get("path") or "")
+    if not raw_path:
+        return ToolRunResponse(
+            tool="web.download.inspect",
+            ok=False,
+            summary="A quarantine path or evidence_id is required.",
+        )
+    try:
+        path = _resolve_allowed_path(ctx.settings, raw_path)
+    except ValueError as exc:
+        return ToolRunResponse(tool="web.download.inspect", ok=False, summary=str(exc))
+    quarantine_root = (ctx.settings.cache_dir / "downloads").resolve(strict=False)
+    try:
+        path.relative_to(quarantine_root)
+    except ValueError:
+        return ToolRunResponse(
+            tool="web.download.inspect",
+            ok=False,
+            summary="Only files under Jarvis quarantine downloads can be inspected.",
+            data={"quarantine_root": str(quarantine_root), "path": str(path)},
+        )
+    if not path.exists() or not path.is_file():
+        return ToolRunResponse(
+            tool="web.download.inspect",
+            ok=False,
+            summary="Quarantine file does not exist.",
+            data={"path": str(path)},
+        )
+    report = _inspect_quarantine_file(path)
+    return ToolRunResponse(
+        tool="web.download.inspect",
+        ok=True,
+        summary="Inspected quarantined file without opening or executing it.",
+        data=report,
+    )
+
+
 async def _web_render(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     raw_url = str(args.get("url") or "").strip()
     max_chars = _int_arg(args.get("max_chars"), default=8000, minimum=512, maximum=30000)
@@ -1705,6 +2109,14 @@ async def _web_render(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespons
         addresses = _public_resolved_addresses(str(parsed.hostname or ""))
     except ValueError as exc:
         return ToolRunResponse(tool="web.render", ok=False, summary=str(exc))
+    rate_block = _web_rate_limit_block(_ctx.storage, url)
+    if rate_block is not None:
+        return ToolRunResponse(
+            tool="web.render",
+            ok=False,
+            summary=rate_block["summary"],
+            data=rate_block,
+        )
 
     browser = _find_headless_browser()
     if browser is None:
@@ -1737,6 +2149,7 @@ async def _web_render(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespons
         text = text[:max_chars].rstrip()
     safety = _web_content_safety(source="web.render", url=url, text=text)
     if _web_response_blocked(200, text):
+        _web_rate_limit_record(_ctx.storage, url, ok=False, blocked=True)
         return ToolRunResponse(
             tool="web.render",
             ok=False,
@@ -1755,6 +2168,18 @@ async def _web_render(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespons
     summary = "Rendered public URL in isolated headless browser."
     if safety["prompt_injection_detected"]:
         summary = f"{summary} Remote prompt-injection markers detected."
+    evidence = _store_web_evidence(
+        _ctx.storage,
+        source="web.render",
+        url=url,
+        title="",
+        text=text,
+        content_type="text/html",
+        safety=safety,
+        confidence=0.7,
+        extra={"html_chars": len(html), "pinned_addresses": [str(item) for item in addresses]},
+    )
+    _web_rate_limit_record(_ctx.storage, url, ok=True)
     return ToolRunResponse(
         tool="web.render",
         ok=True,
@@ -1768,6 +2193,7 @@ async def _web_render(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespons
             "pinned_addresses": [str(item) for item in addresses],
             "stderr": str(result.get("stderr") or "")[:1000],
             "safety": safety,
+            "evidence_id": evidence["id"],
         },
     )
 
@@ -2411,6 +2837,19 @@ def _native_string(value: Any, field: str, *, max_length: int) -> str:
     return text
 
 
+def _browser_selector_arg(value: Any, *, required: bool) -> str:
+    text = str(value or "").strip()
+    if not text:
+        if required:
+            raise ValueError("CSS selector is required.")
+        return ""
+    if any(char in text for char in ("\r", "\n", "\0")):
+        raise ValueError("CSS selector contains unsupported control characters.")
+    if len(text) > 500:
+        raise ValueError("CSS selector is too long.")
+    return text
+
+
 def _parse_native_stdout(stdout: str) -> dict[str, Any]:
     for line in reversed(stdout.splitlines()):
         candidate = line.strip()
@@ -2775,6 +3214,291 @@ def _prompt_injection_markers(text: str) -> list[str]:
     return found
 
 
+def _store_web_evidence(
+    storage: JarvisStorage,
+    *,
+    source: str,
+    url: str,
+    title: str,
+    text: str,
+    content_type: str | None,
+    safety: dict[str, Any],
+    confidence: float,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    excerpt = " ".join(str(text or "").split())[:6000]
+    record = {
+        "id": new_id("ev"),
+        "created_at": utc_now(),
+        "source": source,
+        "url": url,
+        "domain": _url_domain(url),
+        "title": str(title or "")[:240],
+        "content_type": str(content_type or "")[:120],
+        "excerpt": excerpt,
+        "text_sha256": hashlib.sha256(
+            str(text or "").encode("utf-8", errors="replace")
+        ).hexdigest(),
+        "confidence": max(0.0, min(1.0, float(confidence))),
+        "safety": safety,
+        "extra": extra or {},
+    }
+    records = storage.get_runtime_value(WEB_EVIDENCE_KEY, [])
+    if not isinstance(records, list):
+        records = []
+    storage.set_runtime_value(WEB_EVIDENCE_KEY, [record, *records][:200])
+    return record
+
+
+def _list_web_evidence(
+    storage: JarvisStorage,
+    *,
+    limit: int,
+    domain: str | None = None,
+) -> list[dict[str, Any]]:
+    records = storage.get_runtime_value(WEB_EVIDENCE_KEY, [])
+    if not isinstance(records, list):
+        return []
+    result = []
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        if domain and str(item.get("domain") or "").lower() != domain.lower():
+            continue
+        result.append(item)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _get_web_evidence(storage: JarvisStorage, evidence_id: str) -> dict[str, Any] | None:
+    records = storage.get_runtime_value(WEB_EVIDENCE_KEY, [])
+    if not isinstance(records, list):
+        return None
+    for item in records:
+        if isinstance(item, dict) and item.get("id") == evidence_id:
+            return item
+    return None
+
+
+def _web_rate_limit_block(storage: JarvisStorage, url: str) -> dict[str, Any] | None:
+    domain = _url_domain(url)
+    if not domain:
+        return None
+    now = _epoch_seconds()
+    key = f"{WEB_RATE_KEY_PREFIX}{domain}"
+    state = storage.get_runtime_value(key, {})
+    if not isinstance(state, dict):
+        state = {}
+    cooldown_until = float(state.get("cooldown_until") or 0)
+    if cooldown_until > now:
+        return {
+            "summary": "Domain is in cooldown after recent blocked/rate-limited responses.",
+            "domain": domain,
+            "retry_after_sec": int(cooldown_until - now),
+        }
+    hits = [
+        float(item)
+        for item in state.get("hits", [])
+        if isinstance(item, int | float) and float(item) >= now - WEB_RATE_WINDOW_SEC
+    ]
+    if len(hits) >= WEB_RATE_MAX_REQUESTS:
+        return {
+            "summary": "Domain request budget is exhausted; retry later.",
+            "domain": domain,
+            "window_sec": WEB_RATE_WINDOW_SEC,
+            "max_requests": WEB_RATE_MAX_REQUESTS,
+        }
+    return None
+
+
+def _web_rate_limit_record(
+    storage: JarvisStorage,
+    url: str,
+    *,
+    ok: bool,
+    blocked: bool = False,
+) -> None:
+    domain = _url_domain(url)
+    if not domain:
+        return
+    now = _epoch_seconds()
+    key = f"{WEB_RATE_KEY_PREFIX}{domain}"
+    state = storage.get_runtime_value(key, {})
+    if not isinstance(state, dict):
+        state = {}
+    hits = [
+        float(item)
+        for item in state.get("hits", [])
+        if isinstance(item, int | float) and float(item) >= now - WEB_RATE_WINDOW_SEC
+    ]
+    hits.append(now)
+    next_state = {
+        "domain": domain,
+        "hits": hits[-WEB_RATE_MAX_REQUESTS:],
+        "last_ok": bool(ok),
+        "last_at": utc_now(),
+        "cooldown_until": float(state.get("cooldown_until") or 0),
+    }
+    if blocked:
+        next_state["cooldown_until"] = now + WEB_RATE_BLOCKED_COOLDOWN_SEC
+    storage.set_runtime_value(key, next_state)
+
+
+def _url_domain(url: str) -> str:
+    host = urlparse(str(url or "")).hostname or ""
+    return host.lower().strip(".")
+
+
+def _epoch_seconds() -> float:
+    import time
+
+    return time.time()
+
+
+def _extract_web_structured(text: str, *, kind: str) -> dict[str, Any]:
+    cleaned = " ".join(text.split())
+    detected_kind = kind if kind != "auto" else _detect_extract_kind(cleaned)
+    data: dict[str, Any] = {
+        "kind": detected_kind,
+        "title_candidates": _extract_title_candidates(text),
+        "prices": _extract_prices(cleaned),
+        "emails": sorted(set(re.findall(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", cleaned)))[:20],
+        "phones": _extract_phones(cleaned),
+        "dates": _extract_dates(cleaned),
+        "tables": _extract_table_like_lines(text),
+    }
+    if detected_kind == "article":
+        data["headings"] = _extract_heading_lines(text)
+        data["summary_hint"] = cleaned[:800]
+    if detected_kind == "product":
+        data["availability_markers"] = _extract_availability_markers(cleaned)
+    if detected_kind == "contact":
+        data["address_hints"] = _extract_address_hints(text)
+    return data
+
+
+def _detect_extract_kind(text: str) -> str:
+    lowered = text.lower()
+    if re.search(r"[$€£₽]\s?\d|\d[\d\s.,]*(руб|₽|usd|eur|€|\\$)", lowered):
+        return "product"
+    if "@" in text or re.search(r"\+?\d[\d\s().-]{8,}", text):
+        return "contact"
+    return "article"
+
+
+def _extract_title_candidates(text: str) -> list[str]:
+    lines = [line.strip() for line in text.splitlines() if 8 <= len(line.strip()) <= 160]
+    return lines[:5]
+
+
+def _extract_prices(text: str) -> list[str]:
+    patterns = [
+        r"(?:[$€£₽]\s?\d[\d\s.,]*)",
+        r"(?:\d[\d\s.,]*\s?(?:руб\.?|₽|usd|eur|dollars?|€|\$))",
+    ]
+    found: list[str] = []
+    for pattern in patterns:
+        for match in re.findall(pattern, text, flags=re.IGNORECASE):
+            cleaned = " ".join(str(match).split())
+            if cleaned not in found:
+                found.append(cleaned)
+            if len(found) >= 20:
+                return found
+    return found
+
+
+def _extract_phones(text: str) -> list[str]:
+    found = []
+    for match in re.findall(r"(?:\+?\d[\d\s().-]{8,}\d)", text):
+        cleaned = " ".join(match.split())
+        digits = re.sub(r"\D", "", cleaned)
+        if 9 <= len(digits) <= 16 and cleaned not in found:
+            found.append(cleaned)
+        if len(found) >= 20:
+            break
+    return found
+
+
+def _extract_dates(text: str) -> list[str]:
+    patterns = [
+        r"\b\d{4}-\d{2}-\d{2}\b",
+        r"\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b",
+        r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2}, \d{4}\b",
+    ]
+    found: list[str] = []
+    for pattern in patterns:
+        for match in re.findall(pattern, text, flags=re.IGNORECASE):
+            if match not in found:
+                found.append(match)
+            if len(found) >= 20:
+                return found
+    return found
+
+
+def _extract_table_like_lines(text: str) -> list[list[str]]:
+    rows = []
+    for line in text.splitlines():
+        if "|" in line:
+            cells = [cell.strip() for cell in line.split("|") if cell.strip()]
+        elif "\t" in line:
+            cells = [cell.strip() for cell in line.split("\t") if cell.strip()]
+        else:
+            continue
+        if len(cells) >= 2:
+            rows.append(cells[:12])
+        if len(rows) >= 20:
+            break
+    return rows
+
+
+def _extract_heading_lines(text: str) -> list[str]:
+    return [
+        line.strip()
+        for line in text.splitlines()
+        if 6 <= len(line.strip()) <= 120 and not line.strip().endswith(".")
+    ][:12]
+
+
+def _extract_availability_markers(text: str) -> list[str]:
+    markers = (
+        "in stock",
+        "out of stock",
+        "available",
+        "unavailable",
+        "в наличии",
+        "нет в наличии",
+        "доступно",
+        "предзаказ",
+    )
+    lowered = text.lower()
+    return [marker for marker in markers if marker in lowered]
+
+
+def _extract_address_hints(text: str) -> list[str]:
+    hints = []
+    for line in text.splitlines():
+        lowered = line.lower()
+        markers = (
+            "street",
+            "st.",
+            "avenue",
+            "ave",
+            "ул.",
+            "улица",
+            "проспект",
+            "address",
+            "адрес",
+        )
+        if any(marker in lowered for marker in markers):
+            clean = " ".join(line.split())
+            if 8 <= len(clean) <= 220:
+                hints.append(clean)
+        if len(hints) >= 10:
+            break
+    return hints
+
+
 def _content_length(value: str | None) -> int | None:
     if not value:
         return None
@@ -2852,6 +3576,72 @@ def _potentially_executable_download(path: Path, content_type: str) -> bool:
         path.suffix.lower() in POTENTIALLY_EXECUTABLE_EXTENSIONS
         or normalized_type in POTENTIALLY_EXECUTABLE_CONTENT_TYPES
     )
+
+
+def _inspect_quarantine_file(path: Path) -> dict[str, Any]:
+    data = path.read_bytes()
+    sha256 = hashlib.sha256(data).hexdigest()
+    signature = _file_signature(data)
+    report: dict[str, Any] = {
+        "path": str(path),
+        "filename": path.name,
+        "size": len(data),
+        "sha256": sha256,
+        "signature": signature,
+        "potentially_executable": _potentially_executable_download(path, signature["mime_hint"]),
+        "open_allowed": False,
+        "auto_execute_allowed": False,
+    }
+    if zipfile.is_zipfile(path):
+        try:
+            with zipfile.ZipFile(path) as archive:
+                entries = []
+                total_uncompressed = 0
+                executable_entries = []
+                for item in archive.infolist()[:200]:
+                    total_uncompressed += int(item.file_size)
+                    entry = {
+                        "name": item.filename,
+                        "compressed_size": item.compress_size,
+                        "size": item.file_size,
+                    }
+                    entries.append(entry)
+                    if Path(item.filename).suffix.lower() in POTENTIALLY_EXECUTABLE_EXTENSIONS:
+                        executable_entries.append(item.filename)
+                report["archive"] = {
+                    "type": "zip",
+                    "entries": entries,
+                    "entry_count": len(archive.infolist()),
+                    "total_uncompressed_size": total_uncompressed,
+                    "potentially_executable_entries": executable_entries[:50],
+                    "zip_bomb_suspected": (
+                        total_uncompressed > max(100_000_000, len(data) * 100)
+                    ),
+                }
+        except zipfile.BadZipFile:
+            report["archive"] = {"type": "zip", "error": "bad zip file"}
+    return report
+
+
+def _file_signature(data: bytes) -> dict[str, str]:
+    prefix = data[:16]
+    if prefix.startswith(b"%PDF"):
+        kind = ("pdf", "application/pdf")
+    elif prefix.startswith(b"PK\x03\x04"):
+        kind = ("zip", "application/zip")
+    elif prefix.startswith(b"MZ"):
+        kind = ("pe", "application/vnd.microsoft.portable-executable")
+    elif prefix.startswith(b"\x7fELF"):
+        kind = ("elf", "application/x-elf")
+    elif prefix.startswith(b"\x89PNG\r\n\x1a\n"):
+        kind = ("png", "image/png")
+    elif prefix.startswith(b"\xff\xd8\xff"):
+        kind = ("jpeg", "image/jpeg")
+    elif prefix[:6] in {b"GIF87a", b"GIF89a"}:
+        kind = ("gif", "image/gif")
+    else:
+        kind = ("unknown", "application/octet-stream")
+    return {"kind": kind[0], "mime_hint": kind[1], "hex_prefix": prefix.hex()}
 
 
 def _hostname_is_private(hostname: str) -> bool:

@@ -1,5 +1,26 @@
 # Runtime
 
+## 2026-07-10 handoff - internet workflow tools
+
+For the operator and the second model:
+
+- New review-gated Chrome CDP tools: `browser.click`, `browser.type`,
+  `browser.select`, and `browser.screenshot`. They open/read through the local
+  Chrome DevTools endpoint, return snapshots, and do not read form values.
+  `browser.type` blocks password/card/token-like targets unless
+  `allow_sensitive` is explicitly approved.
+- Web/browser observations now save compact runtime evidence records and return
+  `evidence_id`. Use `web.evidence.list` to inspect recent records before doing
+  follow-up synthesis.
+- `web.extract` can pull structured article/product/contact/table hints from a
+  URL, an `evidence_id`, or supplied text.
+- Web requests now have per-domain budgets and cooldowns after blocked or
+  rate-limited responses. Treat this as intentional backoff, not a transient
+  network failure.
+- `web.download.inspect` inspects only files under the Jarvis quarantine
+  download cache, reports signature/SHA256/executable risk, and lists ZIP
+  entries without opening or executing them.
+
 ## 2026-07-10 handoff - internet safety hardening
 
 For the operator and the second model:

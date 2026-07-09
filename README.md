@@ -6,7 +6,7 @@
 
 - FastAPI backend с `/health`, `/api/status`, `/api/models`, `/api/chat`, `/api/chat/stream`, `/api/missions`, `/api/memory`, `/api/files`, `/api/approvals`, `/api/audit`, `/api/diagnostics`.
 - Offline-first агент: сохраняет диалоги, создаёт mission plans и деградирует корректно, если локальная LLM не поднята.
-- Safe tools runtime: диагностика, статус, память, публичный web fetch с SSRF-защитой, validated browser open без approval для явных запросов открыть URL, Docker ps/logs для Jarvis-контейнеров, файловое чтение в разрешённых корнях, approval-gated sandbox write, token-auth host bridge и execution brief для миссий.
+- Safe tools runtime: диагностика, статус, память, публичный web fetch/search/render/download с SSRF-защитой, evidence ledger/extract, quarantine download inspection, review-gated Chrome CDP read/click/type/select/screenshot, validated browser open без approval для явных запросов открыть URL, Docker ps/logs для Jarvis-контейнеров, файловое чтение в разрешённых корнях, approval-gated sandbox write, token-auth host bridge и execution brief для миссий.
 - File ingestion: загрузка текстовых файлов, хранение в `D:\jarvis\data\jarvis-gpt\files`, chunk search и audit trail.
 - Model catalog: активные профили знают реальные Gemma 4 веса в `D:\jarvis\data\models`.
 - HITL approvals: опасные действия оформляются как durable approval gates, а не выполняются молча.

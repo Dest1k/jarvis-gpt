@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
-from jarvis_gpt.browser_cdp import BrowserPageSnapshot
+from jarvis_gpt.browser_cdp import BrowserActionResult, BrowserPageSnapshot
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
 from jarvis_gpt.llm import LLMRouter
 from jarvis_gpt.storage import JarvisStorage
@@ -649,6 +650,106 @@ def test_browser_chrome_launch_uses_dedicated_profile(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_browser_click_is_gated_and_saves_evidence(monkeypatch, tmp_path):
+    async def fake_run_chrome_action(**kwargs):
+        assert kwargs["action"] == "click"
+        assert kwargs["selector"] == "#next"
+        return BrowserActionResult(
+            action="click",
+            url=kwargs["url"],
+            title="Clicked page",
+            ready_state="complete",
+            ok=True,
+            summary="Clicked target.",
+            snapshot=BrowserPageSnapshot(
+                title="Clicked page",
+                url=kwargs["url"],
+                ready_state="complete",
+                text="clicked result text",
+                truncated=False,
+                needs_human_verification=False,
+            ),
+        )
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr("jarvis_gpt.tools.run_chrome_action", fake_run_chrome_action)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+    info = {tool.name: tool for tool in tools.list()}
+
+    blocked = asyncio.run(
+        tools.run("browser.click", {"url": "https://example.com/", "selector": "#next"})
+    )
+    clicked = asyncio.run(
+        tools.run(
+            "browser.click",
+            {"url": "https://example.com/", "selector": "#next"},
+            allow_danger=True,
+        )
+    )
+
+    assert info["browser.click"].danger_level == "review"
+    assert blocked.ok is False
+    assert clicked.ok is True
+    assert clicked.data["evidence_id"].startswith("ev_")
+    evidence = asyncio.run(tools.run("web.evidence.list", {"limit": 5}))
+    assert evidence.data["records"][0]["source"] == "browser.click"
+    storage.close()
+
+
+def test_browser_type_blocks_sensitive_target_without_opt_in(monkeypatch, tmp_path):
+    async def fake_run_chrome_action(**_kwargs):
+        return BrowserActionResult(
+            action="type",
+            url="https://example.com/login",
+            title="Login",
+            ready_state="complete",
+            ok=False,
+            summary="Target looks sensitive; set allow_sensitive only after operator approval.",
+            snapshot=BrowserPageSnapshot(
+                title="Login",
+                url="https://example.com/login",
+                ready_state="complete",
+                text="login form",
+                truncated=False,
+                needs_human_verification=False,
+                form_count=1,
+                password_input_count=1,
+                sensitive_input_count=1,
+            ),
+        )
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr("jarvis_gpt.tools.run_chrome_action", fake_run_chrome_action)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    result = asyncio.run(
+        tools.run(
+            "browser.type",
+            {
+                "url": "https://example.com/login",
+                "selector": "input[type=password]",
+                "text": "secret",
+            },
+            allow_danger=True,
+        )
+    )
+
+    assert result.ok is False
+    assert result.data["forms"]["password_input_count"] == 1
+    assert "sensitive" in result.summary
+    storage.close()
+
+
 def test_web_fetch_blocks_private_addresses(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
@@ -892,6 +993,111 @@ def test_web_download_refuses_oversized_content_length(monkeypatch, tmp_path):
     assert result.ok is False
     assert "size limit" in result.summary
     assert not list((settings.cache_dir / "downloads").glob("*"))
+    storage.close()
+
+
+def test_web_download_inspect_reports_zip_entries(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+    downloads = settings.cache_dir / "downloads"
+    downloads.mkdir(parents=True)
+    archive_path = downloads / "bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("readme.txt", "hello")
+        archive.writestr("setup.exe", b"MZfake")
+
+    result = asyncio.run(tools.run("web.download.inspect", {"path": str(archive_path)}))
+
+    assert result.ok is True
+    assert result.data["signature"]["kind"] == "zip"
+    assert result.data["archive"]["entry_count"] == 2
+    assert result.data["archive"]["potentially_executable_entries"] == ["setup.exe"]
+    assert result.data["open_allowed"] is False
+    storage.close()
+
+
+def test_web_extract_uses_saved_evidence(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+    storage.set_runtime_value(
+        "web.evidence.records",
+        [
+            {
+                "id": "ev_test",
+                "url": "https://shop.example/item",
+                "domain": "shop.example",
+                "excerpt": "Widget Pro Price $19.99 In stock contact sales@example.com",
+                "source": "web.fetch",
+            }
+        ],
+    )
+
+    result = asyncio.run(tools.run("web.extract", {"evidence_id": "ev_test", "kind": "auto"}))
+
+    assert result.ok is True
+    assert result.data["extraction"]["kind"] == "product"
+    assert "$19.99" in result.data["extraction"]["prices"]
+    assert "sales@example.com" in result.data["extraction"]["emails"]
+    storage.close()
+
+
+def test_web_rate_limit_blocks_domain_budget(monkeypatch, tmp_path):
+    class FakeResponse:
+        status_code = 200
+        headers = {"content-type": "text/plain; charset=utf-8"}
+
+        async def aiter_bytes(self):
+            yield b"ok"
+
+    class FakeStream:
+        async def __aenter__(self):
+            return FakeResponse()
+
+        async def __aexit__(self, _exc_type, _exc, _traceback):
+            return None
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, _exc_type, _exc, _traceback):
+            return None
+
+        def stream(self, method, url, *, headers, follow_redirects):
+            return FakeStream()
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr(
+        "jarvis_gpt.tools._public_resolved_addresses",
+        lambda _hostname: [ipaddress.ip_address("93.184.216.34")],
+    )
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    for _ in range(12):
+        assert asyncio.run(tools.run("web.fetch", {"url": "https://example.com/"})).ok is True
+    blocked = asyncio.run(tools.run("web.fetch", {"url": "https://example.com/"}))
+
+    assert blocked.ok is False
+    assert "budget" in blocked.summary
     storage.close()
 
 

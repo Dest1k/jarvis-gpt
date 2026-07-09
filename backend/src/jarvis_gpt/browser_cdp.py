@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 from dataclasses import dataclass
 from typing import Any
@@ -47,6 +48,18 @@ class BrowserTarget:
     id: str
     url: str
     web_socket_debugger_url: str
+
+
+@dataclass(frozen=True)
+class BrowserActionResult:
+    action: str
+    url: str
+    title: str
+    ready_state: str
+    ok: bool
+    summary: str
+    snapshot: BrowserPageSnapshot
+    screenshot_png: bytes | None = None
 
 
 async def chrome_debugger_status(debug_url: str = DEFAULT_CHROME_DEBUG_URL) -> dict[str, Any]:
@@ -99,6 +112,67 @@ async def read_chrome_page(
             await cdp.send("Page.navigate", {"url": url})
             ready_state = await _wait_for_ready_state(cdp, wait_ms)
             return await _snapshot_page(cdp, max_chars=max_chars, ready_state=ready_state)
+    except (OSError, WebSocketException, TimeoutError) as exc:
+        raise BrowserCdpError(f"Chrome DevTools websocket failed: {exc}") from exc
+
+
+async def run_chrome_action(
+    *,
+    url: str,
+    action: str,
+    selector: str = "",
+    text: str = "",
+    value: str = "",
+    max_chars: int,
+    wait_ms: int,
+    allow_sensitive: bool = False,
+    debug_url: str = DEFAULT_CHROME_DEBUG_URL,
+) -> BrowserActionResult:
+    base_url = normalize_debug_url(debug_url)
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0), trust_env=False) as client:
+            version = await client.get(f"{base_url}/json/version")
+            version.raise_for_status()
+            target = await _open_target(client, base_url, url)
+    except (httpx.HTTPError, ValueError) as exc:
+        raise BrowserCdpError(f"Chrome DevTools endpoint is unavailable: {exc}") from exc
+
+    try:
+        async with websockets.connect(
+            target.web_socket_debugger_url,
+            max_size=8_000_000,
+            open_timeout=8,
+            close_timeout=2,
+        ) as websocket:
+            cdp = _CdpConnection(websocket)
+            await cdp.send("Page.enable")
+            await cdp.send("Runtime.enable")
+            await cdp.send("Page.navigate", {"url": url})
+            ready_state = await _wait_for_ready_state(cdp, wait_ms)
+            action_payload = await _run_action_expression(
+                cdp,
+                action=action,
+                selector=selector,
+                text=text,
+                value=value,
+                allow_sensitive=allow_sensitive,
+            )
+            await asyncio.sleep(0.35)
+            ready_state = await _wait_for_ready_state(cdp, min(wait_ms, 3000))
+            snapshot = await _snapshot_page(cdp, max_chars=max_chars, ready_state=ready_state)
+            screenshot = None
+            if action == "screenshot":
+                screenshot = await _capture_screenshot(cdp)
+            return BrowserActionResult(
+                action=action,
+                url=snapshot.url,
+                title=snapshot.title,
+                ready_state=snapshot.ready_state,
+                ok=bool(action_payload.get("ok", True)),
+                summary=str(action_payload.get("summary") or f"Browser action {action} finished."),
+                snapshot=snapshot,
+                screenshot_png=screenshot,
+            )
     except (OSError, WebSocketException, TimeoutError) as exc:
         raise BrowserCdpError(f"Chrome DevTools websocket failed: {exc}") from exc
 
@@ -231,6 +305,128 @@ async def _snapshot_page(
         password_input_count=_int_value(value.get("passwordInputCount")),
         sensitive_input_count=_int_value(value.get("sensitiveInputCount")),
     )
+
+
+async def _run_action_expression(
+    cdp: _CdpConnection,
+    *,
+    action: str,
+    selector: str,
+    text: str,
+    value: str,
+    allow_sensitive: bool,
+) -> dict[str, Any]:
+    if action == "screenshot":
+        return {"ok": True, "summary": "Screenshot captured."}
+    expression = _action_expression(
+        action=action,
+        selector=selector,
+        text=text,
+        value=value,
+        allow_sensitive=allow_sensitive,
+    )
+    result = await cdp.send(
+        "Runtime.evaluate",
+        {"expression": expression, "returnByValue": True, "awaitPromise": True},
+        timeout=12.0,
+    )
+    value_payload = (result.get("result") or {}).get("value")
+    if not isinstance(value_payload, dict):
+        raise BrowserCdpError("Chrome action returned no serializable value.")
+    return value_payload
+
+
+async def _capture_screenshot(cdp: _CdpConnection) -> bytes:
+    result = await cdp.send(
+        "Page.captureScreenshot",
+        {"format": "png", "captureBeyondViewport": False},
+        timeout=12.0,
+    )
+    data = result.get("data")
+    if not isinstance(data, str) or not data:
+        raise BrowserCdpError("Chrome screenshot returned no image data.")
+    return base64.b64decode(data)
+
+
+def _action_expression(
+    *,
+    action: str,
+    selector: str,
+    text: str,
+    value: str,
+    allow_sensitive: bool,
+) -> str:
+    action_json = json.dumps(action)
+    selector_json = json.dumps(selector)
+    text_json = json.dumps(text)
+    value_json = json.dumps(value)
+    allow_sensitive_json = "true" if allow_sensitive else "false"
+    return f"""(() => {{
+  const action = {action_json};
+  const selector = {selector_json};
+  const text = {text_json};
+  const value = {value_json};
+  const allowSensitive = {allow_sensitive_json};
+  const dangerousWords =
+    /pay|purchase|buy|order|delete|remove|submit|confirm|transfer|checkout/i;
+  const sensitiveWords = /password|passcode|otp|token|secret|card|cc-|credit|cvv|cvc|ssn|passport/i;
+  const event = (name) => new Event(name, {{ bubbles: true, cancelable: true }});
+  const target = selector ? document.querySelector(selector) : null;
+  if (action !== "screenshot" && !target) {{
+    return {{ ok: false, summary: `Selector not found: ${{selector}}` }};
+  }}
+  const hint = target
+    ? [
+        target.type || "",
+        target.name || "",
+        target.id || "",
+        target.autocomplete || "",
+      ].join(" ")
+    : "";
+  const label = target
+    ? [
+        target.innerText || target.value || "",
+        target.getAttribute("aria-label") || "",
+        target.title || "",
+      ].join(" ").trim()
+    : "";
+  const sensitive = target && sensitiveWords.test(hint);
+  const dangerous = target && dangerousWords.test(`${{hint}} ${{label}}`);
+  if (sensitive && !allowSensitive) {{
+    return {{
+      ok: false,
+      summary: "Target looks sensitive; set allow_sensitive only after operator approval.",
+      sensitive,
+      dangerous,
+    }};
+  }}
+  if (action === "click") {{
+    target.scrollIntoView({{ block: "center", inline: "center" }});
+    target.click();
+    return {{
+      ok: true,
+      summary: dangerous ? "Clicked target with dangerous-word warning." : "Clicked target.",
+      sensitive,
+      dangerous,
+      label: label.slice(0, 160),
+    }};
+  }}
+  if (action === "type") {{
+    target.focus();
+    target.value = text;
+    target.dispatchEvent(event("input"));
+    target.dispatchEvent(event("change"));
+    return {{ ok: true, summary: "Typed text into target.", sensitive, dangerous }};
+  }}
+  if (action === "select") {{
+    target.focus();
+    target.value = value || text;
+    target.dispatchEvent(event("input"));
+    target.dispatchEvent(event("change"));
+    return {{ ok: true, summary: "Selected value on target.", sensitive, dangerous }};
+  }}
+  return {{ ok: false, summary: `Unsupported browser action: ${{action}}` }};
+}})()"""
 
 
 def _snapshot_expression(limit: int) -> str:
