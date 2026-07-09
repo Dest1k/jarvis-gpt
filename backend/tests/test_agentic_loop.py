@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 
 from jarvis_gpt.agent import AgentRuntime
+from jarvis_gpt.approval_executor import ApprovalExecutor
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
+from jarvis_gpt.dispatcher import DispatcherManager
 from jarvis_gpt.event_bus import EventBus
 from jarvis_gpt.llm import LLMStreamChunk
 from jarvis_gpt.storage import JarvisStorage
@@ -258,6 +260,62 @@ def test_mission_step_approval_carries_mission_id(monkeypatch, tmp_path):
         payload = _json.loads(payload)
     assert payload.get("mission_id") == mission["id"]
     assert payload.get("tool") == "host.bridge.execute"
+    storage.close()
+
+
+def test_approval_execution_resumes_blocked_mission_step(monkeypatch, tmp_path):
+    async def fake_execute(self, *, command, cwd=None, timeout_sec=30):
+        return {
+            "ok": True,
+            "summary": f"fake bridge: {command}",
+            "data": {"stdout": "approved\n", "cwd": cwd, "timeout_sec": timeout_sec},
+        }
+
+    class MissionDangerThenResumeLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, messages, *, temperature=None, max_tokens=None, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return _result(
+                    '{"tool": "host.bridge.execute", "arguments": {"command": "Get-Date"}}'
+                )
+            if self.calls == 2:
+                return _result("Шаг требует допуска оператора.")
+            return _result("Шаг завершён после допуска: команда на хосте выполнена.")
+
+    monkeypatch.setattr("jarvis_gpt.host_bridge.HostBridgeClient.execute", fake_execute)
+    llm = MissionDangerThenResumeLLM()
+    agent, storage = _agent(monkeypatch, tmp_path, llm)
+    mission = agent.create_mission("Проверить дату на хосте")
+
+    blocked = asyncio.run(agent.execute_next_mission_step(mission["id"]))
+    approval = storage.list_approvals(limit=1, status="pending")[0]
+    storage.update_approval(approval["id"], status="approved", result={"operator": "test"})
+    executor = ApprovalExecutor(
+        storage=storage,
+        llm=agent.llm,
+        dispatcher=DispatcherManager(agent.settings, repo_root=tmp_path),
+        tools=agent.tools,
+        mission_resumer=agent.resume_mission_after_approval,
+    )
+
+    result = asyncio.run(executor.execute(approval["id"]))
+    refreshed = storage.get_mission(mission["id"])
+    task = refreshed["tasks"][0]
+    hits = storage.search_memory("после допуска", limit=5)
+
+    assert blocked.task is not None
+    assert blocked.task.status == "blocked"
+    assert result.ok is True
+    assert result.approval is not None
+    assert result.approval["status"] == "executed"
+    assert result.data["tool_run"]["tool"] == "host.bridge.execute"
+    assert result.data["mission_resume"]["ok"] is True
+    assert task["status"] == "done"
+    assert "после допуска" in task["notes"]
+    assert hits
     storage.close()
 
 

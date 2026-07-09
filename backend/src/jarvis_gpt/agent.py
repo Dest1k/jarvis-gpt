@@ -141,6 +141,8 @@ class AgentContext:
     conversation_id: str
     memory_hits: list[dict[str, Any]]
     file_hits: list[dict[str, Any]]
+    mission_id: str | None = None
+    task_id: str | None = None
     task_plan: TaskKernelPlan | None = None
     intent_consulted: bool = False
     intent_decision: IntentDecision | None = None
@@ -1089,6 +1091,8 @@ class AgentRuntime:
             conversation_id=f"mission:{mission['id']}",
             memory_hits=[],
             file_hits=[],
+            mission_id=mission["id"],
+            task_id=task["id"],
         )
         agentic = await self._agentic_answer(
             base_messages,
@@ -1112,6 +1116,122 @@ class AgentRuntime:
                 "autonomous": True,
             },
         )
+
+    async def resume_mission_after_approval(
+        self,
+        approval: dict[str, Any],
+        tool_response: ToolRunResponse,
+    ) -> ToolRunResponse | None:
+        payload = approval.get("payload") or {}
+        if not isinstance(payload, dict):
+            return None
+        mission_id = _optional_text(payload.get("mission_id"))
+        task_id = _optional_text(payload.get("task_id"))
+        if not mission_id or not task_id:
+            return None
+
+        mission = self.storage.get_mission(mission_id)
+        if mission is None:
+            return ToolRunResponse(
+                tool="mission.resume_after_approval",
+                ok=False,
+                summary="Cannot resume mission after approval: mission not found.",
+                data={"mission_id": mission_id, "task_id": task_id},
+            )
+        task = next((item for item in mission.get("tasks", []) if item.get("id") == task_id), None)
+        if task is None:
+            return ToolRunResponse(
+                tool="mission.resume_after_approval",
+                ok=False,
+                summary="Cannot resume mission after approval: task not found.",
+                data={"mission_id": mission_id, "task_id": task_id},
+            )
+
+        resume = payload.get("resume") if isinstance(payload.get("resume"), dict) else {}
+        messages = _llm_messages_from_payload(resume.get("messages") if resume else None)
+        if messages:
+            messages.append({"role": "user", "content": _tool_observation_excerpt(tool_response)})
+            allowed = {info.name for info in self._autonomous_tools()}
+            agentic = await self._continue_agentic_answer(
+                messages,
+                AgentContext(
+                    conversation_id=f"mission:{mission_id}",
+                    memory_hits=[],
+                    file_hits=[],
+                    mission_id=mission_id,
+                    task_id=task_id,
+                ),
+                allowed=allowed,
+                temperature=_optional_float(resume.get("temperature")),
+                max_tokens=_optional_int(resume.get("max_tokens")),
+                thinking_enabled=bool(resume.get("thinking_enabled", False)),
+                initial_used_tools=_optional_int(resume.get("used_tools"), default=1) or 1,
+            )
+            summary = agentic.answer.strip() if agentic.answer else ""
+            if not summary:
+                summary = agentic.error or "Mission did not resume after approval."
+            result = ToolRunResponse(
+                tool="mission.resume_after_approval",
+                ok=(
+                    tool_response.ok
+                    and agentic.ok
+                    and bool(agentic.answer)
+                    and not agentic.blocked_by_approval
+                ),
+                summary=summary[:2000],
+                data={
+                    "mission_id": mission_id,
+                    "task_id": task_id,
+                    "approval_id": approval["id"],
+                    "approved_tool": tool_response.model_dump(),
+                    "tool_steps": agentic.used_tools,
+                    "approval_ids": list(agentic.approval_ids),
+                    "resumed": True,
+                },
+            )
+        else:
+            result = ToolRunResponse(
+                tool="mission.resume_after_approval",
+                ok=tool_response.ok,
+                summary=f"Approved tool completed: {tool_response.summary}"[:2000],
+                data={
+                    "mission_id": mission_id,
+                    "task_id": task_id,
+                    "approval_id": approval["id"],
+                    "approved_tool": tool_response.model_dump(),
+                    "resumed": False,
+                },
+            )
+
+        final_status = "done" if result.ok else "blocked"
+        updated_task = self.storage.update_mission_task(
+            task_id,
+            mission_id=mission_id,
+            status=final_status,
+            notes=_task_notes_from_result(result),
+        )
+        if result.ok:
+            self.storage.add_memory(
+                content=f"Mission step completed after approval: {task['title']}. {result.summary}",
+                namespace="missions",
+                tags=["mission", mission_id, task_id, "approval"],
+                importance=0.66,
+            )
+        await self._emit(
+            ChatEvent(
+                type="mission_step",
+                title="Mission step resumed after approval",
+                content=str(task["title"]),
+                payload={
+                    "mission_id": mission_id,
+                    "task_id": task_id,
+                    "approval_id": approval["id"],
+                    "ok": result.ok,
+                    "status": (updated_task or task).get("status"),
+                },
+            )
+        )
+        return result
 
     async def _try_direct_action(
         self,
@@ -2062,6 +2182,7 @@ class AgentRuntime:
         args: dict[str, Any],
         allowed: set[str],
         context: AgentContext,
+        resume: dict[str, Any] | None = None,
     ) -> tuple[str, ChatEvent]:
         if name not in allowed:
             spec = self.tools.get(name)
@@ -2077,11 +2198,17 @@ class AgentRuntime:
                     payload={"tool": name},
                 )
             payload: dict[str, Any] = {"tool": name, "arguments": args}
-            mission_id = None
+            mission_id = context.mission_id
             conversation_id = str(context.conversation_id or "")
-            if conversation_id.startswith("mission:"):
+            if mission_id is None and conversation_id.startswith("mission:"):
                 mission_id = conversation_id.split(":", 1)[1]
+            task_id = context.task_id
+            if mission_id:
                 payload["mission_id"] = mission_id
+            if task_id:
+                payload["task_id"] = task_id
+            if resume:
+                payload["resume"] = resume
             gate = self.storage.create_approval(
                 title=f"Автономный запрос инструмента {name}",
                 description=(
@@ -2106,9 +2233,15 @@ class AgentRuntime:
                     "tool": name,
                     "risk": spec.danger_level,
                     "mission_id": mission_id,
+                    "task_id": task_id,
                 },
             )
-        result = await self.tools.run(name, args)
+        result = await self.tools.run(
+            name,
+            args,
+            mission_id=context.mission_id,
+            task_id=context.task_id,
+        )
         event = ChatEvent(
             type="tool_call",
             title=name,
@@ -2144,11 +2277,33 @@ class AgentRuntime:
                 finish_reason=_finish_reason_from_llm_result(result),
             )
 
-        allowed = {info.name for info in tools}
         messages = [*base_messages, {"role": "system", "content": _tool_protocol_prompt(tools)}]
-        used_tools = 0
+        return await self._continue_agentic_answer(
+            messages,
+            context,
+            allowed={info.name for info in tools},
+            temperature=temperature,
+            max_tokens=max_tokens,
+            thinking_enabled=thinking_enabled,
+            initial_used_tools=0,
+        )
+
+    async def _continue_agentic_answer(
+        self,
+        messages: list[dict[str, str]],
+        context: AgentContext,
+        *,
+        allowed: set[str],
+        temperature: float | None,
+        max_tokens: int | None,
+        thinking_enabled: bool,
+        initial_used_tools: int = 0,
+    ) -> _AgenticResult:
+        events: list[ChatEvent] = []
+        used_tools = max(0, initial_used_tools)
         approval_ids: list[str] = []
-        for _step in range(self._max_tool_steps()):
+        remaining_steps = max(0, self._max_tool_steps() - used_tools)
+        for _step in range(remaining_steps):
             result = await self._complete_llm(
                 messages,
                 temperature=temperature,
@@ -2156,7 +2311,7 @@ class AgentRuntime:
                 thinking_enabled=thinking_enabled,
             )
             if not result.ok:
-                if used_tools == 0:
+                if used_tools == initial_used_tools:
                     return _AgenticResult(ok=False, answer="", events=events, error=result.error)
                 break
             action = _parse_tool_action(result.content)
@@ -2170,7 +2325,22 @@ class AgentRuntime:
                     approval_ids=tuple(approval_ids),
                     used_tools=used_tools,
                 )
-            observation, event = await self._run_agentic_tool(*action, allowed, context)
+            resume = {
+                "kind": "agentic_tool_loop",
+                "messages": _llm_message_snapshot(
+                    [*messages, {"role": "assistant", "content": result.content}]
+                ),
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "thinking_enabled": thinking_enabled,
+                "used_tools": used_tools + 1,
+            }
+            observation, event = await self._run_agentic_tool(
+                *action,
+                allowed,
+                context,
+                resume=resume,
+            )
             await self._emit(event)
             events.append(event)
             if event.type == "approval":
@@ -2985,6 +3155,59 @@ def _short_value(value: Any, max_chars: int = 100) -> str:
     if len(text) <= max_chars:
         return text
     return f"{text[:max_chars].rstrip()}..."
+
+
+def _optional_text(value: Any) -> str | None:
+    text = str(value or "").strip()
+    return text or None
+
+
+def _optional_int(value: Any, default: int | None = None) -> int | None:
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _llm_message_snapshot(
+    messages: list[dict[str, str]],
+    *,
+    max_messages: int = 40,
+    max_chars: int = 16000,
+) -> list[dict[str, str]]:
+    snapshot: list[dict[str, str]] = []
+    for item in messages[-max_messages:]:
+        role = str(item.get("role") or "").strip()
+        if role not in {"system", "user", "assistant"}:
+            continue
+        content = str(item.get("content") or "")
+        if len(content) > max_chars:
+            content = f"{content[:max_chars].rstrip()}..."
+        snapshot.append({"role": role, "content": content})
+    return snapshot
+
+
+def _llm_messages_from_payload(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    return _llm_message_snapshot(
+        [
+            {"role": item.get("role"), "content": item.get("content")}
+            for item in value
+            if isinstance(item, dict)
+        ]
+    )
 
 
 def _context_relevance(item: dict[str, Any]) -> str:

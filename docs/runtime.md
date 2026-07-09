@@ -1,5 +1,30 @@
 # Runtime
 
+## 2026-07-09 handoff - mission approval resume
+
+For the operator and the second model. This closes the deeper approval follow-up
+left by track 5.3: approving a gated mission tool no longer leaves the mission
+to retry from scratch.
+
+- Agent loop: `_run_agentic_tool` now writes `mission_id`, `task_id`, and a
+  compact `resume` snapshot into approval payloads created from mission steps.
+  Safe autonomous tool runs also receive mission/task ids, so the audit trail is
+  attached to the mission.
+- Approval executor: `tool.run` approvals execute the approved tool with
+  `allow_danger=True` and mission/task ids, then call
+  `AgentRuntime.resume_mission_after_approval` when the approval came from a
+  mission step.
+- Resume flow: the approved tool observation is fed back into the saved agentic
+  messages through `_continue_agentic_answer`. The task is marked `done` only if
+  the approved tool and resumed answer both succeed; otherwise it remains
+  `blocked`. A second gated action creates a new approval instead of bypassing
+  policy.
+- Persistence/events: successful resumed steps write a mission memory and emit a
+  `mission_step` event, so Command Center refreshes through the existing WS/REST
+  flow after `/api/approvals/{id}/execute`.
+- Tests: `test_approval_execution_resumes_blocked_mission_step` covers
+  block -> approve -> execute approved tool -> resume model -> task done.
+
 ## 2026-07-09 handoff — mission approval linkage + retry (track 5.3)
 
 Для оператора и второй модели. Замыкаем петлю approval↔миссия из трека 3/4: когда шаг миссии просит опасный инструмент, создаётся approval и шаг блокируется; не хватало явной связи и способа продолжить.

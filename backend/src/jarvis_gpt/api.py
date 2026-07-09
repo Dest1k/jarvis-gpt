@@ -125,6 +125,7 @@ async def lifespan(app: FastAPI):
         llm=llm,
         dispatcher=dispatcher,
         tools=agent.tools,
+        mission_resumer=agent.resume_mission_after_approval,
     )
 
     app.state.settings = settings

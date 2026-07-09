@@ -279,6 +279,7 @@ def cmd_approval_execute(args: argparse.Namespace) -> None:
             llm=llm,
             dispatcher=DispatcherManager(settings),
             tools=agent.tools,
+            mission_resumer=agent.resume_mission_after_approval,
         )
         result = await executor.execute(args.id)
         _print_json(

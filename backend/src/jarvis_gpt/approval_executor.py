@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -7,9 +8,12 @@ from .diagnostics import run_diagnostics
 from .dispatcher import DispatcherManager
 from .learning import LearningEngine
 from .llm import LLMRouter
+from .models import ToolRunResponse
 from .storage import JarvisStorage, utc_now
 from .telemetry import TelemetryCollector
 from .tools import ToolRegistry
+
+MissionResumer = Callable[[dict[str, Any], ToolRunResponse], Awaitable[ToolRunResponse | None]]
 
 
 @dataclass(frozen=True)
@@ -30,11 +34,13 @@ class ApprovalExecutor:
         llm: LLMRouter,
         dispatcher: DispatcherManager,
         tools: ToolRegistry,
+        mission_resumer: MissionResumer | None = None,
     ) -> None:
         self.storage = storage
         self.llm = llm
         self.dispatcher = dispatcher
         self.tools = tools
+        self.mission_resumer = mission_resumer
 
     async def execute(self, approval_id: str) -> ApprovalExecution:
         approval = self.storage.get_approval(approval_id)
@@ -64,7 +70,7 @@ class ApprovalExecutor:
         payload = approval.get("payload") or {}
         if not isinstance(payload, dict):
             payload = {}
-        result = await self._execute_action(action, payload)
+        result = await self._execute_action(approval, action, payload)
         if not result.finalize:
             return result
 
@@ -87,7 +93,12 @@ class ApprovalExecutor:
             finalize=True,
         )
 
-    async def _execute_action(self, action: str, payload: dict[str, Any]) -> ApprovalExecution:
+    async def _execute_action(
+        self,
+        approval: dict[str, Any],
+        action: str,
+        payload: dict[str, Any],
+    ) -> ApprovalExecution:
         if action == "dispatcher.start":
             result = self.dispatcher.run_compose("up")
             return _compose_result("Dispatcher start requested.", result)
@@ -166,11 +177,32 @@ class ApprovalExecutor:
                     summary=f"Tool {tool_name!r} is not registered.",
                     data={"tool": tool_name},
                 )
-            response = await self.tools.run(tool_name, arguments, allow_danger=True)
+            mission_id = _optional_text(payload.get("mission_id"))
+            task_id = _optional_text(payload.get("task_id"))
+            response = await self.tools.run(
+                tool_name,
+                arguments,
+                allow_danger=True,
+                mission_id=mission_id,
+                task_id=task_id,
+            )
+            data: dict[str, Any] = {"tool_run": response.model_dump()}
+            ok = response.ok
+            summary = response.summary
+            if self.mission_resumer is not None and mission_id and task_id:
+                resume_result = await self.mission_resumer(approval, response)
+                if resume_result is not None:
+                    data["mission_resume"] = resume_result.model_dump()
+                    ok = response.ok and resume_result.ok
+                    summary = (
+                        f"{response.summary} Mission resumed: {resume_result.summary}"
+                        if resume_result.summary
+                        else response.summary
+                    )
             return ApprovalExecution(
-                ok=response.ok,
-                summary=response.summary,
-                data={"tool_run": response.model_dump()},
+                ok=ok,
+                summary=summary[:2000],
+                data=data,
             )
 
         return ApprovalExecution(
@@ -215,3 +247,8 @@ def _float_value(value: Any, *, default: float, minimum: float, maximum: float) 
     except (TypeError, ValueError):
         parsed = default
     return max(minimum, min(maximum, parsed))
+
+
+def _optional_text(value: Any) -> str | None:
+    text = str(value or "").strip()
+    return text or None
