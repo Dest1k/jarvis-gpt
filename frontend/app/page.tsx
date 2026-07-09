@@ -1194,6 +1194,7 @@ export default function CommandCenter() {
   const [status, setStatus] = useState<RuntimeStatus | null>(null);
   const [conversations, setConversations] = useState<ConversationItem[]>([]);
   const [missions, setMissions] = useState<Mission[]>([]);
+  const [runningMissionId, setRunningMissionId] = useState<string | null>(null);
   const [diagnostics, setDiagnostics] = useState<DiagnosticCheck[]>([]);
   const [tools, setTools] = useState<ToolInfo[]>([]);
   const [memories, setMemories] = useState<MemoryItem[]>([]);
@@ -1275,6 +1276,7 @@ export default function CommandCenter() {
   const transcriptRef = useRef<HTMLDivElement | null>(null);
   const vitalsRequestInFlightRef = useRef(false);
   const telemetryRequestInFlightRef = useRef(false);
+  const missionsRef = useRef<Mission[]>([]);
 
   const activeChatWindow = useMemo(
     () => chatWindows.find((window) => window.id === activeChatWindowId) ?? chatWindows[0],
@@ -1468,6 +1470,10 @@ export default function CommandCenter() {
     setActiveChatWindowId(storedWindows.activeId);
     setStorageReady(true);
   }, []);
+
+  useEffect(() => {
+    missionsRef.current = missions;
+  }, [missions]);
 
   useEffect(() => {
     const interval = window.setInterval(() => {
@@ -2545,6 +2551,71 @@ export default function CommandCenter() {
     }
   }
 
+  async function runMissionToCompletion(missionId: string) {
+    // Chain execute-next on the client so each step's progress lands in the UI
+    // live (progress bar + per-task status), stopping on completion, a blocked
+    // step, or a safety cap. The server /run endpoint stays for headless use.
+    const MAX_STEPS = 24;
+    setRunningMissionId(missionId);
+    setBusy(true);
+    let executed = 0;
+    let stoppedReason: "completed" | "blocked" | "budget" = "completed";
+    try {
+      for (let step = 0; step < MAX_STEPS; step += 1) {
+        const current = missionsRef.current.find((item) => item.id === missionId);
+        const nextTask = current?.tasks.find(
+          (task) => task.status !== "done" && task.status !== "blocked"
+        );
+        if (!nextTask) {
+          stoppedReason = "completed";
+          break;
+        }
+        setActiveOperation({
+          title: `Миссия · шаг ${executed + 1}`,
+          detail: nextTask.title
+        });
+        const response = await api<MissionExecution>(
+          `/api/missions/${missionId}/execute-next`,
+          { method: "POST", body: "{}" }
+        );
+        executed += 1;
+        setMissions((list) =>
+          list.map((item) => (item.id === response.mission.id ? response.mission : item))
+        );
+        setLines((current) => [
+          ...current,
+          {
+            role: "system",
+            content: `Шаг ${executed}: ${response.result.summary}${
+              response.task ? `\n${response.task.title} → ${response.task.status}` : ""
+            }`
+          }
+        ]);
+        if (!response.result.ok || response.task?.status === "blocked") {
+          stoppedReason = "blocked";
+          break;
+        }
+        if (step === MAX_STEPS - 1) {
+          stoppedReason = "budget";
+        }
+      }
+      const label =
+        stoppedReason === "completed"
+          ? `Миссия выполнена за ${executed} шаг(ов).`
+          : stoppedReason === "blocked"
+            ? `Миссия остановлена: шаг требует внимания или подтверждения (после ${executed} шаг(ов)).`
+            : `Достигнут лимит шагов (${executed}). Запусти ещё раз, чтобы продолжить.`;
+      setLines((current) => [...current, { role: "system", content: label }]);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Не удалось выполнить миссию");
+    } finally {
+      setBusy(false);
+      setRunningMissionId(null);
+      setActiveOperation(null);
+    }
+  }
+
   async function updateTaskStatus(missionId: string, taskId: string, statusValue: string) {
     const task = missions
       .find((mission) => mission.id === missionId)
@@ -2867,7 +2938,10 @@ export default function CommandCenter() {
         <div className="emptyState">Нет активных планов миссий</div>
       ) : (
         missions.slice(0, 5).map((mission) => (
-          <article className="missionItem" key={mission.id}>
+          <article
+            className={`missionItem${runningMissionId === mission.id ? " running" : ""}`}
+            key={mission.id}
+          >
             <div className="missionTitle">
               <CheckCircle2 size={17} />
               <div>
@@ -2878,7 +2952,7 @@ export default function CommandCenter() {
               </div>
             </div>
             <div className="taskList">
-              {mission.tasks.slice(0, 6).map((task) => (
+              {mission.tasks.slice(0, 8).map((task) => (
                 <div className={`taskRow ${task.status}`} key={task.id}>
                   <span>{task.position}</span>
                   <p>{task.title}</p>
@@ -2913,7 +2987,21 @@ export default function CommandCenter() {
                 disabled={busy || mission.status === "done"}
               >
                 <Play size={15} />
-                <span>Следующий шаг</span>
+                <span>Шаг</span>
+              </button>
+              <button
+                className="iconText compact"
+                type="button"
+                onClick={() => runMissionToCompletion(mission.id)}
+                disabled={busy || mission.status === "done"}
+                title="Выполнять шаги до завершения или блокировки"
+              >
+                {runningMissionId === mission.id ? (
+                  <Loader2 className="spin" size={15} />
+                ) : (
+                  <Zap size={15} />
+                )}
+                <span>{runningMissionId === mission.id ? "Выполняю…" : "Запустить всё"}</span>
               </button>
               <small>{Math.round(mission.progress * 100)}%</small>
             </div>

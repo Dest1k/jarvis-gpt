@@ -1248,6 +1248,37 @@ h3 {
   color: var(--coral);
 }
 
+.taskRow.done span {
+  background: var(--teal);
+  color: #fff;
+}
+
+.taskRow.running span {
+  background: var(--teal);
+  color: #fff;
+  animation: taskPulse 1.1s ease-in-out infinite;
+}
+
+.taskRow.blocked span {
+  background: var(--coral);
+  color: #fff;
+}
+
+@keyframes taskPulse {
+  0%,
+  100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+.missionItem.running {
+  border-color: var(--teal);
+  box-shadow: 0 0 0 2px rgba(13, 118, 111, 0.14);
+}
+
 .taskControls {
   display: flex;
   gap: 4px;
