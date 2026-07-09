@@ -97,6 +97,12 @@ SYSTEM_PROMPT = """Ты JARVIS GPT: локальный агент Windows/WSL/Do
   web.search/web.fetch; для JS-heavy страниц используй web.render, web.extract и web.verify.
   Не пиши "запускаю поиск" и не имитируй результаты. Если поиск или сайт не отдал данные,
   прямо скажи, что именно не подтверждено, и дай проверяемые ссылки.
+- Специализированные интернет-маршруты: погода — web.weather (геокодированный прогноз без
+  ключа, надёжнее сниппетов); новости/блоги/релизы — web.feed по RSS/Atom вместо скрейпинга;
+  заблокированная или исчезнувшая страница — web.archive (Wayback-копия, данные могут быть
+  устаревшими). Если оператор просит следить за страницей (цена, наличие, изменение) —
+  создай вотч через web.watch.add и скажи, как он узнает об изменении; web.watch.list /
+  web.watch.remove управляют вотчами.
 - Если вопрос ставит тебя в угол, зависит от сегодняшней реальности или есть риск ответить
   уверенной выдумкой, сначала честно гугли через web.search/web.fetch/web.render
   и проверяй важные утверждения через web.verify
@@ -1667,6 +1673,16 @@ class AgentRuntime:
         if research_followup is not None:
             return research_followup
 
+        # Weather goes through the keyless Open-Meteo tool first: deterministic
+        # geocoded forecast instead of scraping search snippets. Any failure
+        # (offline, geocode miss, mocked registry) falls back to the search path.
+        if _looks_like_weather_query(message.lower()):
+            explicit_weather_location = _weather_location_from_message(message)
+            if explicit_weather_location:
+                weather_action = await self._try_weather_tool(explicit_weather_location)
+                if weather_action is not None:
+                    return weather_action
+
         weather_events: list[ChatEvent] = []
         inferred_weather_location: str | None = None
         if (
@@ -1675,6 +1691,10 @@ class AgentRuntime:
         ):
             inferred_weather_location, weather_events = await self._infer_weather_location()
             if inferred_weather_location:
+                weather_action = await self._try_weather_tool(inferred_weather_location)
+                if weather_action is not None:
+                    weather_action.events = [*weather_events, *weather_action.events]
+                    return weather_action
                 research_query = _web_research_query_from_message(
                     message,
                     weather_location=inferred_weather_location,
@@ -1803,6 +1823,33 @@ class AgentRuntime:
             if values:
                 parts.append(f"{field}={', '.join(values)}")
         return "; ".join(parts)
+
+    async def _try_weather_tool(self, location: str) -> DirectAction | None:
+        """Resolve weather through web.weather (Open-Meteo). None means fall back.
+
+        The response shape is validated strictly — a mocked or failing registry
+        that returns ok without a real report must not hijack the search path.
+        """
+
+        try:
+            result = await self.tools.run("web.weather", {"location": location})
+        except Exception:  # noqa: BLE001 - weather must fall back, never break the turn
+            return None
+        data = result.data if isinstance(result.data, dict) else {}
+        report = str(data.get("report") or "").strip()
+        if not result.ok or not report or data.get("source") != "open-meteo.com":
+            return None
+        event = ChatEvent(
+            type="tool_call",
+            title="web.weather",
+            content=result.summary,
+            payload={
+                "tool": result.tool,
+                "ok": True,
+                "location": data.get("location") or location,
+            },
+        )
+        return DirectAction(answer=report, events=[event])
 
     async def _infer_weather_location(self) -> tuple[str | None, list[ChatEvent]]:
         persona_location = self._operator_home_location()

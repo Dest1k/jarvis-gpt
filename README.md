@@ -181,6 +181,13 @@ docker compose --profile llm up -d dispatcher
   status shows internet handoff, evidence/research counts, recent blocked pages,
   cooldowns, top domain/provider, and can run a smoke check from the web URL
   draft.
+- Internet everyday coverage: `web.archive` читает Wayback-копию заблокированных
+  или исчезнувших страниц (blocked-ответ `web.fetch` сам подсказывает этот
+  фолбэк), `web.feed` читает RSS/Atom вместо скрейпинга, `web.weather` даёт
+  геокодированный прогноз через бесключевой Open-Meteo (погодный маршрут
+  пробует его первым и честно падает на поиск), а `web.watch.add/list/remove` +
+  фоновый job kind `web.watch` следят за изменением страницы (цена, наличие,
+  статус) и при изменении поднимают событие и durable-память.
 - Document intelligence surface: uploaded files or local paths can use
   `documents.inspect`, `documents.read`, `documents.compare`,
   `documents.edit.plan`, and `documents.apply_replacements` for Word/Excel/PDF

@@ -9,6 +9,35 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-10 - Claude (internet coverage: archive, feeds, weather, watches)
+
+- Continued the internet theme with four everyday gaps the surf stack still had:
+  1. `web.archive` (safe): Wayback availability API + existing public-only fetch;
+     blocked `web.fetch` summaries now hint at it. Snapshot timestamp +
+     "historical data" note in the payload.
+  2. `web.feed` (safe): bounded RSS/RDF/Atom parser (`_parse_feed_entries`,
+     ~200k char cap, honest failure on truncation/garbage), evidence record,
+     domain cooldown respected.
+  3. `web.weather` (safe): keyless Open-Meteo geocode+forecast, Russian WMO
+     descriptions, `data.report`. The agent weather fast-path now tries it FIRST
+     via `_try_weather_tool` (strict shape check: report + source=open-meteo.com)
+     and falls back to the old search route on any failure — existing mocked
+     weather tests pass unchanged because of the strict validation.
+  4. `web.watch`: page-change monitoring. New autonomy job kind (operations
+     whitelist, max_runs default 500) + `AutonomyExecutor._run_web_watch`
+     (fetch → normalized text or regex match → sha256 vs KV state keyed by
+     url+pattern; baseline, then warn event + durable memory + bus publish on
+     change; fetch failure keeps the job enabled). Safe tools `web.watch.add`
+     (dedup, 12-active cap, cadence/regex validation), `.list`, `.remove` —
+     autonomous mutation deliberately allowed, same rationale as persona.insight.
+- SYSTEM_PROMPT gained a "специализированные интернет-маршруты" bullet.
+- State key helper `_web_watch_state_key` lives in tools.py and is imported by
+  the executor so tool listing and job runner share one key format.
+- Tests: `backend/tests/test_web_coverage.py` (10). Full run: 244 pass, ruff
+  clean, frontend typecheck + build clean.
+- Next candidates: Command Center row for active watches; feed+watch combo for
+  topic monitoring; web.archive as automatic fallback inside web.research.
+
 ### 2026-07-10 - Codex (document intelligence tools)
 
 - Added shared `document_runtime` extraction for uploaded/local documents:

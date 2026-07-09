@@ -1,5 +1,51 @@
 # Runtime
 
+## 2026-07-10 handoff - internet coverage: archive, feeds, weather, page watches
+
+Для оператора и второй модели. Продолжение интернет-темы Codex: активный сёрфинг
+(CDP, render, extract, verify, research, download-карантин) уже есть; этот проход
+закрывает четыре оставшихся бытовых кейса, где Jarvis раньше упирался в тупик или
+делал ненадёжный обход.
+
+- `web.archive` (safe): чтение Wayback-снапшота публичного URL через
+  availability API + существующий public-only fetch-путь. Когда живая страница
+  заблокирована/исчезла — это теперь не тупик. Ответ несёт `snapshot_timestamp`
+  и `archive_note` («данные исторические»); blocked-ответ `web.fetch` теперь сам
+  подсказывает «Try web.archive… or web.render».
+- `web.feed` (safe): RSS 2.0/RDF/Atom без скрейпинга HTML — bounded XML parse
+  (лимит ~200k символов, отказ на переполнении/не-XML), entries с
+  title/link/published/summary, evidence-запись, соблюдение domain cooldown.
+- `web.weather` (safe): бесключевой Open-Meteo (геокодинг → forecast),
+  русские WMO-описания, «сейчас + N дней» в `data.report`, evidence.
+  Погодный fast-path агента теперь пробует `web.weather` ПЕРВЫМ (и для явной,
+  и для выведенной из persona локации) через `_try_weather_tool`; форма ответа
+  валидируется строго (нужны report и source=open-meteo.com), любой сбой —
+  честный фолбэк на старый поисковый маршрут, офлайн-поведение не тронуто.
+- `web.watch` — мониторинг страниц («следи за ценой/наличием/статусом»):
+  - Новый autonomy job kind `web.watch` (operations whitelist, default
+    max_runs=500). Исполнитель `AutonomyExecutor._run_web_watch`: web.fetch →
+    нормализованный текст или первый regex-`pattern` матч → sha256 против
+    состояния в KV `web.watch.state.{hash(url+pattern)}`. Baseline при первом
+    прогоне; изменение → warn-событие `web.watch`, durable memory (namespace
+    `web`), bus publish. Сбой fetch НЕ убивает вотч (job остаётся enabled).
+  - Safe-инструменты `web.watch.add` (валидация URL/regex/cadence, дедуп по
+    url+pattern, лимит 12 активных), `web.watch.list` (с last state),
+    `web.watch.remove`. Мутация durable state сознательно разрешена автономно:
+    bounded, аудируемая через create_job, видима и отменяема в Command Center —
+    тот же принцип, что persona.insight.
+- SYSTEM_PROMPT: новый пункт про специализированные интернет-маршруты
+  (weather/feed/archive/watch), чтобы модель тянулась к ним по смыслу.
+- Тесты: `backend/tests/test_web_coverage.py` (10): парсер RSS+Atom и отказ на
+  мусоре, web.feed с evidence, archive снапшот и отсутствие снапшота, формат
+  погодного отчёта, погодный маршрут предпочитает Open-Meteo (web.search не
+  вызывается), add/list/remove/лимит вотчей, baseline→no-change→change с
+  памятью и событием, персист job kind. Прогон — 244 pass, ruff clean,
+  frontend typecheck + build clean.
+- Кандидаты дальше: показать активные вотчи в Command Center отдельной строкой
+  (сейчас видны в общей панели autonomy jobs), цепочка web.feed→web.watch для
+  «следи за новостями по теме», и web.archive как автоматический фолбэк внутри
+  web.research при blocked-источниках.
+
 ## 2026-07-10 handoff - document intelligence tools
 
 For the operator and the second model:

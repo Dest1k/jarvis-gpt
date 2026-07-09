@@ -18,6 +18,7 @@ from html import unescape
 from pathlib import Path, PureWindowsPath
 from typing import Any, Literal
 from urllib.parse import parse_qs, quote_plus, unquote, urlparse
+from xml.etree import ElementTree
 
 import httpcore
 import httpx
@@ -48,7 +49,7 @@ from .learning import LearningEngine
 from .llm import LLMRouter
 from .model_catalog import ModelCatalog
 from .models import ToolInfo, ToolRunResponse
-from .operations import OperationsManager, docker_container_allowed
+from .operations import OperationsManager, _cadence_interval, docker_container_allowed
 from .persona import INSIGHT_FIELDS, PersonaManager, load_persona
 from .storage import JarvisStorage, new_id, utc_now
 from .telemetry import TelemetryCollector
@@ -821,6 +822,94 @@ class ToolRegistry:
                 category="web",
                 input_schema={"limit": "Maximum records", "domain": "Optional domain filter"},
                 handler=_web_evidence_list,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="web.archive",
+                description=(
+                    "Read a Wayback Machine (web.archive.org) snapshot of a public URL. "
+                    "Use this when web.fetch/web.render report the live page as blocked, "
+                    "rate-limited, or gone. The snapshot may be older than the live page, "
+                    "so treat prices/availability as historical."
+                ),
+                category="web",
+                input_schema={
+                    "url": "Public HTTP(S) URL to look up in the archive",
+                    "timestamp": "Optional preferred snapshot time (YYYYMMDD or YYYYMMDDhhmmss)",
+                    "max_chars": "Maximum extracted text characters",
+                },
+                handler=_web_archive,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="web.feed",
+                description=(
+                    "Read an RSS/Atom feed and return the latest entries "
+                    "(title, link, published, summary). Use for news sites, blogs, "
+                    "release feeds, and podcasts instead of scraping their HTML."
+                ),
+                category="web",
+                input_schema={
+                    "url": "Public feed URL (RSS or Atom)",
+                    "limit": "Maximum entries to return (default 10)",
+                },
+                handler=_web_feed,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="web.weather",
+                description=(
+                    "Get current weather and a short forecast for a place through the "
+                    "keyless Open-Meteo API (geocoding + forecast). More reliable than "
+                    "scraping search snippets; answers in Russian with WMO descriptions."
+                ),
+                category="web",
+                input_schema={
+                    "location": "City or place name (e.g. 'Казань')",
+                    "days": "Forecast days 1-7 (default 3)",
+                },
+                handler=_web_weather,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="web.watch.add",
+                description=(
+                    "Start monitoring a public page for changes (price, availability, "
+                    "news, status). Creates a bounded background watch job that re-fetches "
+                    "the page on a cadence and raises an event + durable memory when the "
+                    "watched content changes. Deduplicated and capped; cancellable via "
+                    "web.watch.remove or the Command Center."
+                ),
+                category="web",
+                input_schema={
+                    "url": "Public HTTP(S) URL to watch",
+                    "label": "Short human label (e.g. 'цена RTX 4070 в DNS')",
+                    "cadence": "Check interval like 30m, 2h, hourly, daily (default 30m)",
+                    "pattern": "Optional regex; watch only the first match, not the whole page",
+                },
+                handler=_web_watch_add,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="web.watch.list",
+                description="List active page watches with their last observed state.",
+                category="web",
+                input_schema={},
+                handler=_web_watch_list,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="web.watch.remove",
+                description="Stop a page watch by its job id (from web.watch.list).",
+                category="web",
+                input_schema={"job_id": "Watch job id"},
+                handler=_web_watch_remove,
             )
         )
         self.add(
@@ -2652,7 +2741,8 @@ async def _web_fetch(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
                     if blocked:
                         summary = (
                             f"Fetched URL with HTTP {response.status_code}; "
-                            "page appears blocked."
+                            "page appears blocked. Try web.archive for a Wayback copy "
+                            "or web.render for a JS-rendered view."
                         )
                     elif safety["prompt_injection_detected"]:
                         summary = f"{summary} Remote prompt-injection markers detected."
@@ -2706,6 +2796,577 @@ async def _web_fetch(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
         summary="Too many redirects.",
         data={"url": current_url, "redirects": redirects},
     )
+
+
+ARCHIVE_AVAILABILITY_URL = "https://archive.org/wayback/available"
+
+
+async def _web_archive(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    raw_url = str(args.get("url") or "").strip()
+    timestamp = re.sub(r"[^0-9]", "", str(args.get("timestamp") or ""))[:14]
+    max_chars = _int_arg(args.get("max_chars"), default=6000, minimum=256, maximum=20000)
+    try:
+        target_url = _validate_public_http_url(raw_url)
+    except ValueError as exc:
+        return ToolRunResponse(tool="web.archive", ok=False, summary=str(exc))
+
+    params: dict[str, str] = {"url": target_url}
+    if timestamp:
+        params["timestamp"] = timestamp
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(20.0),
+            trust_env=False,
+            transport=_PublicOnlyAsyncHTTPTransport(),
+        ) as client:
+            response = await client.get(
+                ARCHIVE_AVAILABILITY_URL,
+                params=params,
+                headers=WEB_HEADERS,
+            )
+            response.raise_for_status()
+            data = response.json()
+    except Exception as exc:  # noqa: BLE001 - archive lookup degrades honestly
+        return ToolRunResponse(
+            tool="web.archive",
+            ok=False,
+            summary=f"Wayback availability lookup failed: {exc}",
+            data={"url": target_url},
+        )
+
+    snapshot = ((data or {}).get("archived_snapshots") or {}).get("closest") or {}
+    snapshot_url = str(snapshot.get("url") or "").strip()
+    if not snapshot_url or not snapshot.get("available"):
+        return ToolRunResponse(
+            tool="web.archive",
+            ok=False,
+            summary="No Wayback snapshot is available for this URL.",
+            data={"url": target_url},
+        )
+    if snapshot_url.startswith("http://"):
+        snapshot_url = "https://" + snapshot_url.removeprefix("http://")
+
+    fetched = await _web_fetch(ctx, {"url": snapshot_url, "max_chars": max_chars})
+    archive_note = (
+        "Archived Wayback copy; the live page may differ — treat prices, availability "
+        "and dates as historical."
+    )
+    combined = {
+        **(fetched.data or {}),
+        "requested_url": target_url,
+        "snapshot_url": snapshot_url,
+        "snapshot_timestamp": str(snapshot.get("timestamp") or ""),
+        "archive_note": archive_note,
+    }
+    summary = (
+        f"Read Wayback snapshot {snapshot.get('timestamp') or ''} for {target_url}."
+        if fetched.ok
+        else f"Wayback snapshot found but could not be read: {fetched.summary}"
+    )
+    return ToolRunResponse(
+        tool="web.archive",
+        ok=fetched.ok,
+        summary=summary.strip(),
+        data=combined,
+    )
+
+
+WEB_FEED_MAX_BYTES_CHARS = 200_000
+
+
+async def _web_feed(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    raw_url = str(args.get("url") or "").strip()
+    limit = _int_arg(args.get("limit"), default=10, minimum=1, maximum=30)
+    try:
+        feed_url = _validate_public_http_url(raw_url)
+    except ValueError as exc:
+        return ToolRunResponse(tool="web.feed", ok=False, summary=str(exc))
+    rate_block = _web_rate_limit_block(ctx.storage, feed_url)
+    if rate_block is not None:
+        return ToolRunResponse(
+            tool="web.feed",
+            ok=False,
+            summary=rate_block["summary"],
+            data=rate_block,
+        )
+    feed_accept = (
+        "application/rss+xml,application/atom+xml,application/xml,"
+        "text/xml;q=0.9,*/*;q=0.5"
+    )
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(20.0),
+            trust_env=False,
+            transport=_PublicOnlyAsyncHTTPTransport(),
+        ) as client, client.stream(
+            "GET",
+            feed_url,
+            headers={**WEB_HEADERS, "Accept": feed_accept},
+            follow_redirects=True,
+        ) as response:
+            status_code = response.status_code
+            _text, raw_text, truncated = await _read_limited_response_document(
+                response,
+                WEB_FEED_MAX_BYTES_CHARS,
+            )
+    except httpx.HTTPError as exc:
+        return ToolRunResponse(
+            tool="web.feed",
+            ok=False,
+            summary=f"Feed request failed: {exc}",
+            data={"url": feed_url},
+        )
+    _web_rate_limit_record(ctx.storage, feed_url, ok=status_code < 400, blocked=False)
+    if status_code >= 400:
+        return ToolRunResponse(
+            tool="web.feed",
+            ok=False,
+            summary=f"Feed responded with HTTP {status_code}.",
+            data={"url": feed_url, "status_code": status_code},
+        )
+    if truncated:
+        return ToolRunResponse(
+            tool="web.feed",
+            ok=False,
+            summary="Feed is too large to parse safely.",
+            data={"url": feed_url},
+        )
+    try:
+        feed_title, entries = _parse_feed_entries(raw_text, limit=limit)
+    except ValueError as exc:
+        return ToolRunResponse(
+            tool="web.feed",
+            ok=False,
+            summary=f"Feed parse failed: {exc}",
+            data={"url": feed_url},
+        )
+    digest_text = "\n".join(
+        f"{item['title']} — {item['link']}" for item in entries
+    )
+    safety = _web_content_safety(source="web.feed", url=feed_url, text=digest_text)
+    evidence = _store_web_evidence(
+        ctx.storage,
+        source="web.feed",
+        url=feed_url,
+        title=feed_title,
+        text=digest_text,
+        content_type="application/xml",
+        safety=safety,
+        confidence=0.7,
+        extra={"entries": len(entries)},
+    )
+    return ToolRunResponse(
+        tool="web.feed",
+        ok=True,
+        summary=f"Feed '{feed_title or feed_url}' returned {len(entries)} entr(ies).",
+        data={
+            "url": feed_url,
+            "feed_title": feed_title,
+            "entries": entries,
+            "safety": safety,
+            "evidence_id": evidence["id"],
+        },
+    )
+
+
+def _parse_feed_entries(text: str, *, limit: int) -> tuple[str, list[dict[str, str]]]:
+    """Parse RSS 2.0 / RDF / Atom into (feed_title, entries). Raises ValueError."""
+
+    try:
+        root = ElementTree.fromstring(text.strip())
+    except ElementTree.ParseError as exc:
+        raise ValueError(f"not valid XML ({exc})") from exc
+
+    def local(tag: Any) -> str:
+        return str(tag).rsplit("}", 1)[-1].lower()
+
+    def child_text(node: Any, names: set[str]) -> str:
+        for child in node:
+            if local(child.tag) in names:
+                return " ".join(str(child.text or "").split())
+        return ""
+
+    root_tag = local(root.tag)
+    entries: list[dict[str, str]] = []
+    feed_title = ""
+
+    if root_tag in {"rss", "rdf"}:
+        channel = next((node for node in root if local(node.tag) == "channel"), root)
+        feed_title = child_text(channel, {"title"})
+        item_parent = channel if root_tag == "rss" else root
+        for item in item_parent.iter():
+            if local(item.tag) != "item":
+                continue
+            link = child_text(item, {"link"})
+            entries.append(
+                {
+                    "title": child_text(item, {"title"})[:300],
+                    "link": link[:500],
+                    "published": child_text(item, {"pubdate", "date"})[:80],
+                    "summary": _html_to_text(child_text(item, {"description"}))[:400],
+                }
+            )
+            if len(entries) >= limit:
+                break
+    elif root_tag == "feed":
+        feed_title = child_text(root, {"title"})
+        for entry in root:
+            if local(entry.tag) != "entry":
+                continue
+            link = ""
+            for child in entry:
+                if local(child.tag) == "link":
+                    href = str(child.get("href") or "").strip()
+                    rel = str(child.get("rel") or "alternate")
+                    if href and rel in {"alternate", ""}:
+                        link = href
+                        break
+                    if href and not link:
+                        link = href
+            entries.append(
+                {
+                    "title": child_text(entry, {"title"})[:300],
+                    "link": link[:500],
+                    "published": child_text(entry, {"published", "updated"})[:80],
+                    "summary": _html_to_text(
+                        child_text(entry, {"summary", "content"})
+                    )[:400],
+                }
+            )
+            if len(entries) >= limit:
+                break
+    else:
+        raise ValueError(f"unsupported feed root element <{root_tag}>")
+
+    if not entries:
+        raise ValueError("feed has no entries")
+    return feed_title[:240], entries
+
+
+OPEN_METEO_GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
+OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+
+WMO_WEATHER_CODES = {
+    0: "ясно",
+    1: "преимущественно ясно",
+    2: "переменная облачность",
+    3: "пасмурно",
+    45: "туман",
+    48: "изморозь",
+    51: "лёгкая морось",
+    53: "морось",
+    55: "сильная морось",
+    56: "ледяная морось",
+    57: "сильная ледяная морось",
+    61: "небольшой дождь",
+    63: "дождь",
+    65: "сильный дождь",
+    66: "ледяной дождь",
+    67: "сильный ледяной дождь",
+    71: "небольшой снег",
+    73: "снег",
+    75: "сильный снег",
+    77: "снежная крупа",
+    80: "кратковременный дождь",
+    81: "ливень",
+    82: "сильный ливень",
+    85: "небольшой снегопад",
+    86: "сильный снегопад",
+    95: "гроза",
+    96: "гроза с небольшим градом",
+    99: "гроза с сильным градом",
+}
+
+
+def _wmo_description(code: Any) -> str:
+    try:
+        return WMO_WEATHER_CODES.get(int(code), f"код погоды {code}")
+    except (TypeError, ValueError):
+        return "неизвестно"
+
+
+async def _web_weather(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    location = " ".join(str(args.get("location") or "").split())
+    days = _int_arg(args.get("days"), default=3, minimum=1, maximum=7)
+    if not location:
+        return ToolRunResponse(
+            tool="web.weather",
+            ok=False,
+            summary="Weather lookup needs a location name.",
+        )
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(20.0),
+            trust_env=False,
+            transport=_PublicOnlyAsyncHTTPTransport(),
+        ) as client:
+            geo_response = await client.get(
+                OPEN_METEO_GEOCODE_URL,
+                params={"name": location, "count": 1, "language": "ru", "format": "json"},
+                headers=WEB_HEADERS,
+            )
+            geo_response.raise_for_status()
+            geo = geo_response.json()
+            places = geo.get("results") if isinstance(geo, dict) else None
+            if not isinstance(places, list) or not places:
+                return ToolRunResponse(
+                    tool="web.weather",
+                    ok=False,
+                    summary=f"Could not geocode location: {location}.",
+                    data={"location": location},
+                )
+            place = places[0]
+            forecast_response = await client.get(
+                OPEN_METEO_FORECAST_URL,
+                params={
+                    "latitude": place.get("latitude"),
+                    "longitude": place.get("longitude"),
+                    "current": (
+                        "temperature_2m,apparent_temperature,relative_humidity_2m,"
+                        "wind_speed_10m,weather_code"
+                    ),
+                    "daily": (
+                        "temperature_2m_max,temperature_2m_min,"
+                        "precipitation_probability_max,weather_code"
+                    ),
+                    "wind_speed_unit": "ms",
+                    "timezone": "auto",
+                    "forecast_days": days,
+                },
+                headers=WEB_HEADERS,
+            )
+            forecast_response.raise_for_status()
+            forecast = forecast_response.json()
+    except Exception as exc:  # noqa: BLE001 - weather degrades to the search route
+        return ToolRunResponse(
+            tool="web.weather",
+            ok=False,
+            summary=f"Open-Meteo request failed: {exc}",
+            data={"location": location},
+        )
+
+    place_label = ", ".join(
+        str(part)
+        for part in (place.get("name"), place.get("admin1"), place.get("country"))
+        if part
+    )
+    current = forecast.get("current") if isinstance(forecast, dict) else {}
+    if not isinstance(current, dict):
+        current = {}
+    daily = forecast.get("daily") if isinstance(forecast, dict) else {}
+    if not isinstance(daily, dict):
+        daily = {}
+
+    lines = [f"Погода — {place_label or location} (Open-Meteo):"]
+    if current.get("temperature_2m") is not None:
+        lines.append(
+            "Сейчас: {t}°C (ощущается {feels}°C), {desc}, ветер {wind} м/с, "
+            "влажность {hum}%.".format(
+                t=current.get("temperature_2m"),
+                feels=current.get("apparent_temperature"),
+                desc=_wmo_description(current.get("weather_code")),
+                wind=current.get("wind_speed_10m"),
+                hum=current.get("relative_humidity_2m"),
+            )
+        )
+    dates = daily.get("time") or []
+    daily_rows: list[dict[str, Any]] = []
+    for index, day in enumerate(dates[:days]):
+        row = {
+            "date": day,
+            "min_c": (daily.get("temperature_2m_min") or [None] * len(dates))[index],
+            "max_c": (daily.get("temperature_2m_max") or [None] * len(dates))[index],
+            "precipitation_probability_max": (
+                daily.get("precipitation_probability_max") or [None] * len(dates)
+            )[index],
+            "description": _wmo_description(
+                (daily.get("weather_code") or [None] * len(dates))[index]
+            ),
+        }
+        daily_rows.append(row)
+        lines.append(
+            f"{row['date']}: {row['min_c']}…{row['max_c']}°C, {row['description']}, "
+            f"вероятность осадков {row['precipitation_probability_max']}%."
+        )
+    report = "\n".join(lines)
+    safety = _web_content_safety(source="web.weather", url=OPEN_METEO_FORECAST_URL, text=report)
+    evidence = _store_web_evidence(
+        ctx.storage,
+        source="web.weather",
+        url=OPEN_METEO_FORECAST_URL,
+        title=f"Weather: {place_label or location}",
+        text=report,
+        content_type="application/json",
+        safety=safety,
+        confidence=0.85,
+        extra={"location": place_label or location, "days": days},
+    )
+    return ToolRunResponse(
+        tool="web.weather",
+        ok=True,
+        summary=f"Weather resolved for {place_label or location}.",
+        data={
+            "location": place_label or location,
+            "report": report,
+            "current": current,
+            "daily": daily_rows,
+            "source": "open-meteo.com",
+            "evidence_id": evidence["id"],
+        },
+    )
+
+
+WEB_WATCH_MAX_ACTIVE = 12
+WEB_WATCH_DEFAULT_CADENCE = "30m"
+
+
+def _web_watch_jobs(operations: OperationsManager) -> list[dict[str, Any]]:
+    return [job for job in operations.list_jobs() if job.get("kind") == "web.watch"]
+
+
+def _web_watch_add(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    raw_url = str(args.get("url") or "").strip()
+    label = " ".join(str(args.get("label") or "").split())[:120]
+    pattern = str(args.get("pattern") or "").strip()[:400]
+    cadence = str(args.get("cadence") or WEB_WATCH_DEFAULT_CADENCE).strip().lower()[:40]
+    try:
+        url = _validate_public_http_url(raw_url)
+    except ValueError as exc:
+        return ToolRunResponse(tool="web.watch.add", ok=False, summary=str(exc))
+    if pattern:
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            return ToolRunResponse(
+                tool="web.watch.add",
+                ok=False,
+                summary=f"Watch pattern is not a valid regex: {exc}",
+            )
+    if _cadence_interval(cadence) is None and cadence not in {"hourly", "daily"}:
+        cadence = WEB_WATCH_DEFAULT_CADENCE
+    operations = OperationsManager(settings=ctx.settings, storage=ctx.storage)
+    watches = _web_watch_jobs(operations)
+    active = [job for job in watches if job.get("status") == "enabled"]
+    for job in active:
+        payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+        if payload.get("url") == url and str(payload.get("pattern") or "") == pattern:
+            return ToolRunResponse(
+                tool="web.watch.add",
+                ok=True,
+                summary=f"This page is already being watched (job {job['id']}).",
+                data={"job_id": job["id"], "existing": True},
+            )
+    if len(active) >= WEB_WATCH_MAX_ACTIVE:
+        return ToolRunResponse(
+            tool="web.watch.add",
+            ok=False,
+            summary=(
+                f"Watch limit reached ({WEB_WATCH_MAX_ACTIVE} active). "
+                "Remove one with web.watch.remove first."
+            ),
+            data={"active": len(active)},
+        )
+    job = operations.create_job(
+        {
+            "kind": "web.watch",
+            "title": f"Watch: {label or url}"[:120],
+            "cadence": cadence,
+            "budget": {"max_runs": 500, "max_minutes": 5},
+            "payload": {"url": url, "label": label, "pattern": pattern},
+        }
+    )
+    ctx.storage.add_event(
+        kind="web.watch",
+        title=f"Начал следить за страницей: {label or url}"[:240],
+        payload={"job_id": job["id"], "url": url, "cadence": cadence},
+    )
+    return ToolRunResponse(
+        tool="web.watch.add",
+        ok=True,
+        summary=(
+            f"Watching {label or url} every {cadence}. I will raise an event and save a "
+            "memory when the watched content changes."
+        ),
+        data={
+            "job_id": job["id"],
+            "url": url,
+            "label": label,
+            "cadence": cadence,
+            "pattern": pattern,
+        },
+    )
+
+
+def _web_watch_list(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunResponse:
+    operations = OperationsManager(settings=ctx.settings, storage=ctx.storage)
+    rows: list[dict[str, Any]] = []
+    for job in _web_watch_jobs(operations):
+        payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+        state = ctx.storage.get_runtime_value(
+            _web_watch_state_key(payload.get("url"), payload.get("pattern")),
+            {},
+        )
+        if not isinstance(state, dict):
+            state = {}
+        rows.append(
+            {
+                "job_id": job["id"],
+                "status": job.get("status"),
+                "label": payload.get("label") or payload.get("url"),
+                "url": payload.get("url"),
+                "pattern": payload.get("pattern") or "",
+                "cadence": job.get("cadence"),
+                "run_count": job.get("run_count"),
+                "last_checked_at": state.get("checked_at"),
+                "last_changed_at": state.get("changed_at"),
+                "observed_excerpt": str(state.get("observed") or "")[:200],
+            }
+        )
+    active = sum(1 for row in rows if row["status"] == "enabled")
+    return ToolRunResponse(
+        tool="web.watch.list",
+        ok=True,
+        summary=f"{active} active watch(es), {len(rows)} total.",
+        data={"watches": rows, "active": active, "limit": WEB_WATCH_MAX_ACTIVE},
+    )
+
+
+def _web_watch_remove(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    job_id = str(args.get("job_id") or "").strip()
+    if not job_id:
+        return ToolRunResponse(
+            tool="web.watch.remove",
+            ok=False,
+            summary="job_id is required (see web.watch.list).",
+        )
+    operations = OperationsManager(settings=ctx.settings, storage=ctx.storage)
+    job = next((item for item in _web_watch_jobs(operations) if item["id"] == job_id), None)
+    if job is None:
+        return ToolRunResponse(
+            tool="web.watch.remove",
+            ok=False,
+            summary=f"Watch job {job_id} not found.",
+        )
+    updated = operations.update_job(job_id, {"status": "cancelled"})
+    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+    ctx.storage.add_event(
+        kind="web.watch",
+        title=f"Прекратил следить за страницей: {payload.get('label') or payload.get('url')}",
+        payload={"job_id": job_id},
+    )
+    return ToolRunResponse(
+        tool="web.watch.remove",
+        ok=updated is not None,
+        summary=f"Watch {job_id} cancelled.",
+        data={"job_id": job_id},
+    )
+
+
+def _web_watch_state_key(url: Any, pattern: Any) -> str:
+    digest = hashlib.sha256(
+        f"{url}\n{pattern or ''}".encode("utf-8", errors="replace")
+    ).hexdigest()[:24]
+    return f"web.watch.state.{digest}"
 
 
 async def _web_download(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:

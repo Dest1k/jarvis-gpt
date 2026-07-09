@@ -465,13 +465,25 @@ def _normalize_docker_policy(value: dict[str, Any]) -> dict[str, Any]:
 
 def _normalize_job(value: dict[str, Any]) -> dict[str, Any]:
     kind = str(value.get("kind") or "diagnostics")
-    if kind not in {"diagnostics", "learning.tick", "self_heal", "benchmark", "mission"}:
+    if kind not in {
+        "diagnostics",
+        "learning.tick",
+        "self_heal",
+        "benchmark",
+        "mission",
+        "web.watch",
+    }:
         kind = "diagnostics"
     status = str(value.get("status") or "enabled")
     if status not in {"enabled", "paused", "done", "cancelled"}:
         status = "enabled"
     budget = _dict(value.get("budget"))
-    default_max_runs = 100 if kind == "mission" else 1
+    if kind == "mission":
+        default_max_runs = 100
+    elif kind == "web.watch":
+        default_max_runs = 500
+    else:
+        default_max_runs = 1
     return {
         "id": str(value.get("id") or new_id("job")),
         "title": str(value.get("title") or kind)[:120],

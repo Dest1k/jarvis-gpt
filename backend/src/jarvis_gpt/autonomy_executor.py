@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import re
 import time
 from typing import Any
 
@@ -14,6 +16,7 @@ from .llm import LLMRouter
 from .operations import OperationsManager
 from .storage import JarvisStorage, new_id, utc_now
 from .telemetry import TelemetryCollector
+from .tools import _web_watch_state_key as _watch_state_key
 
 
 class AutonomyExecutor:
@@ -267,6 +270,8 @@ class AutonomyExecutor:
             return {"ok": True, "summary": report["summary"], "data": report}
         if kind == "mission":
             return await self._run_mission(payload)
+        if kind == "web.watch":
+            return await self._run_web_watch(payload)
         if kind == "background.missions":
             results = await self.run_due_jobs(limit=_bounded_int(payload.get("limit"), 1, 10, 2))
             ok = all(item.get("ok") for item in results)
@@ -279,6 +284,123 @@ class AutonomyExecutor:
             "ok": False,
             "summary": f"Unsupported operation kind: {kind}",
             "data": {"kind": kind},
+        }
+
+    async def _run_web_watch(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Re-fetch a watched public page and raise a signal when it changes.
+
+        The watch state lives in runtime KV keyed by url+pattern, so the job can
+        be recreated without losing the baseline. A change produces a warn-level
+        ``web.watch`` event, a durable memory, and a bus publish; fetch failures
+        keep the job enabled so a temporary block does not kill the watch.
+        """
+
+        url = _optional_text(payload.get("url"))
+        if not url:
+            return {
+                "ok": False,
+                "summary": "web.watch job needs a url in its payload.",
+                "job_status": "paused",
+                "data": {"payload": payload},
+            }
+        label = _optional_text(payload.get("label")) or url
+        pattern = _optional_text(payload.get("pattern"))
+        fetch = await self.agent.tools.run("web.fetch", {"url": url, "max_chars": 12000})
+        if not fetch.ok:
+            return {
+                "ok": False,
+                "summary": f"web.watch could not read {label}: {fetch.summary}",
+                "data": {"url": url, "changed": False},
+            }
+        text = str((fetch.data or {}).get("text") or "")
+        observed = " ".join(text.split())[:4000]
+        if pattern:
+            try:
+                match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
+            except re.error as exc:
+                return {
+                    "ok": False,
+                    "summary": f"web.watch pattern is invalid: {exc}",
+                    "job_status": "paused",
+                    "data": {"url": url, "pattern": pattern},
+                }
+            observed = " ".join(match.group(0).split())[:1000] if match else ""
+        digest = hashlib.sha256(observed.encode("utf-8", errors="replace")).hexdigest()
+        state_key = _watch_state_key(url, pattern)
+        state = self.storage.get_runtime_value(state_key, None)
+        now = utc_now()
+        if not isinstance(state, dict) or not state.get("digest"):
+            self.storage.set_runtime_value(
+                state_key,
+                {
+                    "url": url,
+                    "label": label,
+                    "digest": digest,
+                    "observed": observed[:1000],
+                    "checked_at": now,
+                    "changed_at": None,
+                },
+            )
+            return {
+                "ok": True,
+                "summary": f"Watch baseline captured: {label}.",
+                "data": {"url": url, "changed": False, "baseline": True},
+            }
+        if state.get("digest") == digest:
+            self.storage.set_runtime_value(state_key, {**state, "checked_at": now})
+            return {
+                "ok": True,
+                "summary": f"No change: {label}.",
+                "data": {"url": url, "changed": False},
+            }
+        previous = str(state.get("observed") or "")
+        self.storage.set_runtime_value(
+            state_key,
+            {
+                **state,
+                "digest": digest,
+                "observed": observed[:1000],
+                "checked_at": now,
+                "changed_at": now,
+            },
+        )
+        self.storage.add_event(
+            kind="web.watch",
+            title=f"Изменение на странице: {label}"[:240],
+            level="warn",
+            payload={
+                "url": url,
+                "current": observed[:300],
+                "previous": previous[:300],
+            },
+        )
+        self.storage.add_memory(
+            content=(
+                f"Web watch «{label}» ({url}) зафиксировал изменение: "
+                f"было «{previous[:200]}», стало «{observed[:200]}»."
+            ),
+            namespace="web",
+            tags=["web", "watch"],
+            importance=0.7,
+        )
+        if self.bus:
+            await self.bus.publish(
+                {
+                    "channel": "agent",
+                    "type": "web.watch",
+                    "title": f"Изменение на странице: {label}"[:240],
+                    "payload": {"url": url},
+                }
+            )
+        return {
+            "ok": True,
+            "summary": f"Change detected: {label}.",
+            "data": {
+                "url": url,
+                "changed": True,
+                "current": observed[:300],
+                "previous": previous[:300],
+            },
         }
 
     async def _run_mission(self, payload: dict[str, Any]) -> dict[str, Any]:
