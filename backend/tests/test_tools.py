@@ -41,6 +41,28 @@ def test_tool_registry_runs_memory_tools(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_tool_run_storage_redacts_secrets(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+
+    stored = storage.record_tool_run(
+        tool="web.fetch",
+        ok=True,
+        summary="authorization=Bearer super-secret-token",
+        arguments={"api_token": "super-secret-token", "query": "status"},
+        data={"headers": {"Authorization": "Bearer abcdefghijklmnop"}},
+    )
+    listed = storage.list_tool_runs(limit=1)[0]
+
+    assert "super-secret-token" not in stored["summary"]
+    assert stored["arguments"]["api_token"] == "[redacted]"
+    assert listed["data"]["headers"]["Authorization"] == "[redacted]"
+    storage.close()
+
+
 def test_system_inspect_runs_read_only_wmi_query(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
@@ -399,11 +421,16 @@ def test_windows_native_process_start_preserves_nonempty_arguments():
 
 def test_windows_native_screen_capture_command_is_structured(tmp_path):
     path = tmp_path / "screen.png"
-    command = _windows_native_command("screen.capture", {"path": str(path), "limit": 8})
+    command = _windows_native_command(
+        "screen.capture",
+        {"path": str(path), "limit": 8, "ocr": True},
+    )
 
     assert "screen.capture" in command
     assert "System.Drawing" in command
     assert "CopyFromScreen" in command
+    assert "tesseract" in command
+    assert "ocrText" in command
     assert "Screen captured." in command
     assert "screen.png" in command
     assert "test_windows_native_screen_cap" in command

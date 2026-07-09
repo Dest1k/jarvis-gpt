@@ -9,6 +9,27 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-09 - Codex (leases, stream durability, background cognition)
+
+- Added persisted autonomy run leases. Running jobs now write
+  `running_lease_id/started_at/until`, cancel through `AutonomyExecutor`, and
+  recover stale interrupted leases on backend startup with visible failed run
+  history instead of silently hanging.
+- Added a background cognition loop (`jarvis-cognition-loop`) controlled by
+  `JARVIS_COGNITION_ENABLED/INTERVAL_SEC/MAX_TOKENS`. It runs observational
+  JSON-only LLM pulses over recent runtime signals, saves `cognition.last_pulse`,
+  and mirrors the result into the append-only learning journal. It does not
+  browse, mutate the host, or auto-create jobs.
+- Hardened chat streaming: if the client disconnects mid-answer, the backend
+  persists the partial assistant message with `metadata.interrupted=true` and
+  exposes it through `/api/chat/stream/interrupted/{conversation_id}`.
+- Tool run storage now redacts obvious token/secret/password/cookie/bearer data
+  before writing telemetry, audit payloads, and learning observations.
+- `system.inspect` screen capture can request OCR when `tesseract` is available;
+  capture still uses Jarvis cache and does not touch the operator's browser.
+- Command Center chat scroll now respects manual upward scrolling during live
+  generation and the chat/side panels stretch to the viewport more consistently.
+
 ### 2026-07-09 - Codex (headless web, learning, autonomy controls)
 
 - Implemented the remaining broad hardening/observability items except model

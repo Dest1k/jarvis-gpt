@@ -464,10 +464,15 @@ type AutonomyStatus = {
   telemetry_interval_sec: number;
   health_interval_sec: number;
   learning_interval_sec: number;
+  cognition_enabled?: boolean;
+  cognition_interval_sec?: number;
+  cognition_max_tokens?: number;
   mission_interval_sec: number;
   last_telemetry_at?: string | null;
   last_health_at?: string | null;
   last_learning_at?: string | null;
+  last_cognition_at?: string | null;
+  last_cognition_error?: string | null;
   last_background_job_at?: string | null;
   last_error?: string | null;
 };
@@ -586,6 +591,9 @@ type AutonomyJob = {
   last_duration_ms?: number | null;
   last_run_at?: string | null;
   next_run_after?: string | null;
+  running_lease_id?: string | null;
+  running_started_at?: string | null;
+  running_lease_until?: string | null;
   deadline_at?: string | null;
   cancelled_at?: string | null;
   last_result?: Record<string, unknown>;
@@ -607,6 +615,7 @@ type RuntimeSecurity = {
   client_host: string;
   loopback_client: boolean;
   token_configured: boolean;
+  loopback_requires_token?: boolean;
   remote_requires_token: boolean;
 };
 
@@ -1066,7 +1075,9 @@ function normalizeChatSideTab(value: unknown): ChatSideTab {
 
 function clampChatHeight(value: number) {
   if (!Number.isFinite(value)) return DEFAULT_CHAT_HEIGHT;
-  return Math.max(460, Math.min(1600, Math.round(value)));
+  const viewportMax =
+    typeof window === "undefined" ? 1600 : Math.max(520, window.innerHeight - 36);
+  return Math.max(460, Math.min(viewportMax, Math.round(value)));
 }
 
 function compactText(value: string | null | undefined, maxLength = 72) {
@@ -1481,6 +1492,7 @@ export default function CommandCenter() {
   const chatPanelRef = useRef<HTMLElement | null>(null);
   const transcriptRef = useRef<HTMLDivElement | null>(null);
   const transcriptShouldStickRef = useRef(true);
+  const transcriptManualScrollRef = useRef(false);
   const transcriptActiveWindowRef = useRef(activeChatWindowId);
   const vitalsRequestInFlightRef = useRef(false);
   const telemetryRequestInFlightRef = useRef(false);
@@ -1542,7 +1554,17 @@ export default function CommandCenter() {
     const node = transcriptRef.current;
     if (!node) return;
     const distanceFromBottom = node.scrollHeight - node.scrollTop - node.clientHeight;
-    transcriptShouldStickRef.current = distanceFromBottom <= 96;
+    if (distanceFromBottom <= 32) {
+      transcriptManualScrollRef.current = false;
+      transcriptShouldStickRef.current = true;
+      return;
+    }
+    transcriptShouldStickRef.current = !transcriptManualScrollRef.current && distanceFromBottom <= 96;
+  }, []);
+
+  const markTranscriptManualScroll = useCallback(() => {
+    transcriptManualScrollRef.current = true;
+    transcriptShouldStickRef.current = false;
   }, []);
 
   const refresh = useCallback(async () => {
@@ -1826,6 +1848,7 @@ export default function CommandCenter() {
     const switchedWindow = transcriptActiveWindowRef.current !== activeChatWindowId;
     if (switchedWindow) {
       transcriptActiveWindowRef.current = activeChatWindowId;
+      transcriptManualScrollRef.current = false;
       transcriptShouldStickRef.current = true;
     }
     if (!transcriptShouldStickRef.current) return;
@@ -2127,6 +2150,7 @@ export default function CommandCenter() {
     const message = typedMessage || "Проанализируй вложенные файлы.";
     const userId = randomId("msg");
     assistantId = randomId("msg");
+    transcriptManualScrollRef.current = false;
     transcriptShouldStickRef.current = true;
     updateChatWindow(chatWindowId, (window) => ({
       ...window,
@@ -3961,7 +3985,14 @@ export default function CommandCenter() {
                 </div>
               ))}
             </div>
-            <div className="transcript" ref={transcriptRef} onScroll={updateTranscriptStickiness}>
+            <div
+              className="transcript"
+              ref={transcriptRef}
+              onPointerDown={markTranscriptManualScroll}
+              onScroll={updateTranscriptStickiness}
+              onTouchStart={markTranscriptManualScroll}
+              onWheel={markTranscriptManualScroll}
+            >
               {lines.map((line, index) => {
                 const durationLabel = assistantDuration(line, chatTicker);
                 return (
@@ -4547,6 +4578,12 @@ export default function CommandCenter() {
                 <strong>Автономия</strong>
                 <span>{autonomy?.enabled ? "вкл" : "выкл"}</span>
                 <small>{autonomy?.running_tasks.length ?? 0} задач</small>
+              </div>
+              <div className={`bridgeRow ${autonomy?.last_cognition_at ? "online" : ""}`}>
+                <Sparkles size={14} />
+                <strong>Фоновое мышление</strong>
+                <span>{autonomy?.cognition_enabled ? "вкл" : "выкл"}</span>
+                <small>{autonomy?.last_cognition_at ?? `${autonomy?.cognition_interval_sec ?? 0}s`}</small>
               </div>
               <button
                 className="iconText compact full"

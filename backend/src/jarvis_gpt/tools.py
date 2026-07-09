@@ -356,7 +356,7 @@ class ToolRegistry:
                     "action": "wmi.query (default), window.list, screen.capture, or capabilities",
                     "payload": (
                         "wmi.query: {class_name, properties[], filter?, limit?}; "
-                        "window.list: {limit}; screen.capture: {path?, include_windows?, limit?}"
+                        "window.list: {limit}; screen.capture: {path?, limit?, ocr?}"
                     ),
                     "timeout_sec": "1-120 second timeout",
                 },
@@ -887,6 +887,8 @@ async def _system_inspect(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResp
             **payload,
             "path": str(screen_dir / f"screen-{_timestamp_slug()}.png"),
         }
+    if action == "screen.capture":
+        payload = {**payload, "ocr": bool(payload.get("ocr", True))}
     timeout_sec = _int_arg(args.get("timeout_sec"), default=30, minimum=1, maximum=120)
     try:
         native, ok, summary, bridge_data = await _run_native_bridge_command(
@@ -1651,7 +1653,20 @@ public static class JWin {
       Select-Object -First ([int](Val $Limit 30)) Id, ProcessName, MainWindowTitle
   }
 
-  function CaptureScreen($OutputPath, $Limit) {
+  function ReadScreenOcr($OutputPath) {
+    $tesseract = Get-Command tesseract -ErrorAction SilentlyContinue
+    if (-not $tesseract) {
+      return @{ available = $false; text = ''; error = 'tesseract not found' }
+    }
+    try {
+      $text = & $tesseract.Source $OutputPath stdout --psm 6 2>$null | Out-String
+      return @{ available = $true; text = ([string]$text).Trim(); error = '' }
+    } catch {
+      return @{ available = $false; text = ''; error = $_.Exception.Message }
+    }
+  }
+
+  function CaptureScreen($OutputPath, $Limit, $Ocr) {
     $directory = Split-Path -Parent $OutputPath
     if ($directory) {
       New-Item -ItemType Directory -Path $directory -Force | Out-Null
@@ -1676,6 +1691,10 @@ public static class JWin {
       $active = Get-Process -Id $foregroundPid -ErrorAction SilentlyContinue |
         Select-Object -First 1 Id, ProcessName, MainWindowTitle
     }
+    $ocrResult = @{ available = $false; text = ''; error = '' }
+    if ([bool]$Ocr) {
+      $ocrResult = ReadScreenOcr $OutputPath
+    }
     Out $true "Screen captured." @{
       path = $OutputPath
       width = $bounds.Width
@@ -1683,6 +1702,10 @@ public static class JWin {
       left = $bounds.Left
       top = $bounds.Top
       activeWindow = $active
+      ocrRequested = [bool]$Ocr
+      ocrAvailable = [bool]$ocrResult.available
+      ocrText = $ocrResult.text
+      ocrError = $ocrResult.error
       windows = @(VisibleWindows $Limit)
     }
   }
@@ -1715,7 +1738,7 @@ public static class JWin {
       break
     }
     'screen.capture' {
-      CaptureScreen $Payload.path $Payload.limit
+      CaptureScreen $Payload.path $Payload.limit $Payload.ocr
       break
     }
     'window.focus' {
@@ -1859,6 +1882,7 @@ def _validate_native_payload(action: str, payload: dict[str, Any]) -> dict[str, 
     if action == "screen.capture":
         clean["path"] = _native_string(clean.get("path"), "path", max_length=500)
         clean["limit"] = _int_arg(clean.get("limit"), default=30, minimum=1, maximum=100)
+        clean["ocr"] = bool(clean.get("ocr", False))
     if action == "wmi.query":
         clean = _validate_wmi_payload(clean)
     return clean

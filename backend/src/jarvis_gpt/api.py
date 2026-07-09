@@ -110,7 +110,7 @@ from .operator_queue import (
     operator_queue_snapshot,
 )
 from .persona import PersonaManager
-from .storage import JarvisStorage
+from .storage import JarvisStorage, utc_now
 from .supervisor import RuntimeSupervisor
 from .telemetry import TelemetryCollector
 
@@ -221,6 +221,10 @@ def _token_allowed(token: str) -> bool:
     return bool(expected and token and secrets.compare_digest(token, expected))
 
 
+def _strict_loopback_token_required() -> bool:
+    return bool(app.state.settings.api_require_token_on_loopback)
+
+
 app = FastAPI(title="JARVIS GPT", version="0.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
@@ -237,13 +241,14 @@ async def local_api_guard(request: Request, call_next):
     if request.method == "OPTIONS" or request.url.path in {"/", "/health"}:
         return await call_next(request)
     host = request.client.host if request.client else ""
-    if _is_loopback_host(host) or _token_allowed(_header_token(request.headers)):
+    token_ok = _token_allowed(_header_token(request.headers))
+    if token_ok or (_is_loopback_host(host) and not _strict_loopback_token_required()):
         return await call_next(request)
     status_code = 401 if _api_token() else 403
     detail = (
-        "Remote API access requires a valid bearer token."
+        "API access requires a valid bearer token."
         if _api_token()
-        else "Remote API access is locked until JARVIS_API_TOKEN is configured."
+        else "API access is locked until JARVIS_API_TOKEN is configured."
     )
     return JSONResponse({"detail": detail}, status_code=status_code)
 
@@ -293,6 +298,7 @@ async def runtime_security(request: Request) -> dict[str, Any]:
         "client_host": host,
         "loopback_client": _is_loopback_host(host),
         "token_configured": bool(_api_token()),
+        "loopback_requires_token": app.state.settings.api_require_token_on_loopback,
         "remote_requires_token": True,
         "cors": {
             "explicit_origins": _cors_origins(),
@@ -742,12 +748,9 @@ async def update_autonomy_job(
 
 @app.post("/api/autonomy/jobs/{job_id}/cancel", response_model=AutonomyJobResponse)
 async def cancel_autonomy_job(job_id: str) -> AutonomyJobResponse:
-    job = app.state.operations.update_job(job_id, {"status": "cancelled"})
+    job = await app.state.autonomy_executor.cancel_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Autonomy job not found")
-    await app.state.bus.publish(
-        {"channel": "autonomy.jobs", "action": "cancelled", "job_id": job_id}
-    )
     return job
 
 
@@ -804,21 +807,96 @@ async def chat(request: ChatRequest) -> ChatResponse:
     )
 
 
+INTERRUPTED_STREAM_KEY_PREFIX = "agent.stream.interrupted."
+
+
+def _persist_interrupted_stream(
+    storage: JarvisStorage,
+    *,
+    conversation_id: str | None,
+    partial: list[str],
+    events: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if not conversation_id:
+        return None
+    answer = "".join(partial).strip()
+    if not answer:
+        return None
+    message_id = storage.add_message(
+        conversation_id=conversation_id,
+        role="assistant",
+        content=answer,
+        metadata={
+            "duration_ms": None,
+            "events": events,
+            "interrupted": True,
+            "stream": True,
+        },
+    )
+    item = {
+        "conversation_id": conversation_id,
+        "message_id": message_id,
+        "saved_at": utc_now(),
+        "chars": len(answer),
+    }
+    storage.set_runtime_value(f"{INTERRUPTED_STREAM_KEY_PREFIX}{conversation_id}", item)
+    storage.add_event(
+        kind="agent.stream.interrupted",
+        title="Interrupted streaming answer persisted.",
+        level="warn",
+        payload=item,
+    )
+    return item
+
+
 @app.post("/api/chat/stream")
 async def chat_stream(request: ChatRequest) -> StreamingResponse:
     async def lines():
-        async for item in app.state.agent.stream_chat(
-            request.message,
-            conversation_id=request.conversation_id,
-            mode=request.mode,
-            temperature=request.temperature,
-            max_tokens=request.max_tokens,
-            attachments=[item.model_dump() for item in request.attachments],
-            thinking_enabled=request.thinking_enabled,
-        ):
-            yield f"{json.dumps(item, ensure_ascii=False)}\n".encode()
+        conversation_id = request.conversation_id
+        partial: list[str] = []
+        events: list[dict[str, Any]] = []
+        saved_done = False
+        try:
+            async for item in app.state.agent.stream_chat(
+                request.message,
+                conversation_id=request.conversation_id,
+                mode=request.mode,
+                temperature=request.temperature,
+                max_tokens=request.max_tokens,
+                attachments=[item.model_dump() for item in request.attachments],
+                thinking_enabled=request.thinking_enabled,
+            ):
+                if item.get("type") == "meta":
+                    conversation_id = str(item.get("conversation_id") or conversation_id or "")
+                elif item.get("type") == "delta":
+                    partial.append(str(item.get("content") or ""))
+                elif item.get("type") == "event" and isinstance(item.get("event"), dict):
+                    events.append(item["event"])
+                elif item.get("type") == "done":
+                    saved_done = True
+                yield f"{json.dumps(item, ensure_ascii=False)}\n".encode()
+        except asyncio.CancelledError:
+            if not saved_done:
+                _persist_interrupted_stream(
+                    app.state.storage,
+                    conversation_id=conversation_id,
+                    partial=partial,
+                    events=events,
+                )
+            raise
 
     return StreamingResponse(lines(), media_type="application/x-ndjson")
+
+
+@app.get("/api/chat/stream/interrupted/{conversation_id}")
+async def interrupted_stream(conversation_id: str) -> dict[str, Any]:
+    item = app.state.storage.get_runtime_value(
+        f"{INTERRUPTED_STREAM_KEY_PREFIX}{conversation_id}",
+        None,
+    )
+    if item is None:
+        raise HTTPException(status_code=404, detail="Interrupted stream not found")
+    return item
 
 
 @app.get("/api/conversations", response_model=list[ConversationItem])

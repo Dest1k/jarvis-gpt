@@ -196,6 +196,47 @@ class OperationsManager:
         due.sort(key=_job_due_sort_key)
         return due[: max(1, min(10, int(limit)))]
 
+    def recover_stale_running_jobs(self, *, now: datetime | None = None) -> list[dict[str, Any]]:
+        current = now or datetime.now(UTC)
+        recovered: list[dict[str, Any]] = []
+        for job in self.list_jobs():
+            lease_until = _parse_datetime(job.get("running_lease_until"))
+            if job.get("running_lease_id") and lease_until is not None and current > lease_until:
+                result = {
+                    "ok": False,
+                    "summary": (
+                        "Autonomy job running lease expired; previous backend run was "
+                        "interrupted."
+                    ),
+                    "data": {
+                        "job_id": job["id"],
+                        "lease_id": job.get("running_lease_id"),
+                        "running_started_at": job.get("running_started_at"),
+                    },
+                    "job_status": "enabled",
+                    "stale_lease": True,
+                }
+                updated = self.mark_job_run(
+                    job["id"],
+                    result,
+                    started_at=job.get("running_started_at") or job.get("last_started_at"),
+                    finished_at=current.isoformat(timespec="seconds"),
+                    duration_ms=None,
+                )
+                if updated is not None:
+                    run_started_at = job.get("running_started_at") or current.isoformat(
+                        timespec="seconds"
+                    )
+                    self.record_job_run(
+                        job,
+                        result,
+                        started_at=run_started_at,
+                        finished_at=current.isoformat(timespec="seconds"),
+                        duration_ms=0,
+                    )
+                    recovered.append(updated)
+        return recovered
+
     def create_job(self, payload: dict[str, Any]) -> dict[str, Any]:
         jobs = self.list_jobs()
         job = _normalize_job(
@@ -245,6 +286,34 @@ class OperationsManager:
         self.storage.set_runtime_value(AUTONOMY_JOBS_KEY, next_jobs)
         return updated
 
+    def mark_job_started(
+        self,
+        job_id: str,
+        *,
+        lease_id: str,
+        started_at: str,
+        lease_until: str,
+    ) -> dict[str, Any] | None:
+        jobs = self.list_jobs()
+        updated: dict[str, Any] | None = None
+        next_jobs: list[dict[str, Any]] = []
+        for job in jobs:
+            if job["id"] == job_id:
+                updated = {
+                    **job,
+                    "running_lease_id": lease_id,
+                    "running_started_at": started_at,
+                    "running_lease_until": lease_until,
+                    "updated_at": started_at,
+                }
+                next_jobs.append(updated)
+            else:
+                next_jobs.append(job)
+        if updated is None:
+            return None
+        self.storage.set_runtime_value(AUTONOMY_JOBS_KEY, next_jobs)
+        return updated
+
     def mark_job_run(
         self,
         job_id: str,
@@ -279,6 +348,9 @@ class OperationsManager:
                     "status": status,
                     "run_count": run_count,
                     "consecutive_failures": consecutive_failures,
+                    "running_lease_id": None,
+                    "running_started_at": None,
+                    "running_lease_until": None,
                     "last_started_at": started_at or now,
                     "last_finished_at": now,
                     "last_duration_ms": duration_ms,
@@ -421,6 +493,9 @@ def _normalize_job(value: dict[str, Any]) -> dict[str, Any]:
         "last_duration_ms": value.get("last_duration_ms"),
         "last_run_at": value.get("last_run_at"),
         "next_run_after": value.get("next_run_after"),
+        "running_lease_id": value.get("running_lease_id"),
+        "running_started_at": value.get("running_started_at"),
+        "running_lease_until": value.get("running_lease_until"),
         "deadline_at": value.get("deadline_at"),
         "cancelled_at": value.get("cancelled_at"),
         "last_result": _dict(value.get("last_result")),
@@ -461,6 +536,9 @@ def _job_is_due(job: dict[str, Any], now: datetime) -> bool:
         return False
     budget = _dict(job.get("budget"))
     if int(job.get("run_count") or 0) >= _bounded_int(budget.get("max_runs"), 1, 1000, 1):
+        return False
+    running_until = _parse_datetime(job.get("running_lease_until"))
+    if job.get("running_lease_id") and running_until is not None and now <= running_until:
         return False
     deadline = _parse_datetime(job.get("deadline_at"))
     if deadline is not None and now > deadline:

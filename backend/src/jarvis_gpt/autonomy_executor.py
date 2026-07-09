@@ -12,7 +12,7 @@ from .experience import ExperienceManager
 from .learning import LearningEngine
 from .llm import LLMRouter
 from .operations import OperationsManager
-from .storage import JarvisStorage, utc_now
+from .storage import JarvisStorage, new_id, utc_now
 from .telemetry import TelemetryCollector
 
 
@@ -49,6 +49,8 @@ class AutonomyExecutor:
         self.learning = learning
         self.bus = bus
         self._running_job_ids: set[str] = set()
+        self._running_tasks: dict[str, asyncio.Task[dict[str, Any]]] = {}
+        self._cancelled_job_ids: set[str] = set()
         self._run_lock = asyncio.Lock()
 
     async def run_due_jobs(self, *, limit: int = 1) -> list[dict[str, Any]]:
@@ -84,6 +86,14 @@ class AutonomyExecutor:
                 }
             started_at = utc_now()
             started_perf = time.perf_counter()
+            lease_id = new_id("joblease")
+            lease_until = _lease_until(job)
+            self.operations.mark_job_started(
+                job_id,
+                lease_id=lease_id,
+                started_at=started_at,
+                lease_until=lease_until,
+            )
             if _deadline_expired(job.get("deadline_at")):
                 result = {
                     "ok": False,
@@ -94,11 +104,28 @@ class AutonomyExecutor:
             else:
                 try:
                     timeout = _job_timeout_seconds(job)
-                    coroutine = self.run_kind(str(job.get("kind") or ""), job.get("payload") or {})
+                    task = asyncio.create_task(
+                        self.run_kind(str(job.get("kind") or ""), job.get("payload") or {})
+                    )
+                    async with self._run_lock:
+                        self._running_tasks[job_id] = task
+                        if job_id in self._cancelled_job_ids:
+                            task.cancel()
                     if timeout:
-                        result = await asyncio.wait_for(coroutine, timeout=timeout)
+                        result = await asyncio.wait_for(task, timeout=timeout)
                     else:
-                        result = await coroutine
+                        result = await task
+                except asyncio.CancelledError:
+                    async with self._run_lock:
+                        explicitly_cancelled = job_id in self._cancelled_job_ids
+                    if not explicitly_cancelled:
+                        raise
+                    result = {
+                        "ok": False,
+                        "summary": "Autonomy job was cancelled while running.",
+                        "data": {"job_id": job_id, "lease_id": lease_id},
+                        "job_status": "cancelled",
+                    }
                 except TimeoutError:
                     result = {
                         "ok": False,
@@ -171,6 +198,24 @@ class AutonomyExecutor:
         finally:
             async with self._run_lock:
                 self._running_job_ids.discard(job_id)
+                self._running_tasks.pop(job_id, None)
+                self._cancelled_job_ids.discard(job_id)
+
+    async def cancel_job(self, job_id: str) -> dict[str, Any] | None:
+        job = self.operations.update_job(job_id, {"status": "cancelled"})
+        if job is None:
+            return None
+        async with self._run_lock:
+            task = self._running_tasks.get(job_id)
+            if job_id in self._running_job_ids:
+                self._cancelled_job_ids.add(job_id)
+        if task is not None and not task.done():
+            task.cancel()
+        if self.bus:
+            await self.bus.publish(
+                {"channel": "autonomy.jobs", "action": "cancelled", "job_id": job_id}
+            )
+        return job
 
     async def run_kind(self, kind: str, payload: dict[str, Any]) -> dict[str, Any]:
         if kind == "briefing":
@@ -327,6 +372,15 @@ def _job_timeout_seconds(job: dict[str, Any]) -> float | None:
     budget = job.get("budget") if isinstance(job.get("budget"), dict) else {}
     minutes = _bounded_int(budget.get("max_minutes"), 0, 1440, 0)
     return float(minutes * 60) if minutes > 0 else None
+
+
+def _lease_until(job: dict[str, Any]) -> str:
+    from datetime import UTC, datetime, timedelta
+
+    timeout = _job_timeout_seconds(job) or 600.0
+    # Add breathing room so a healthy long call is not recovered as stale while
+    # wait_for is still enforcing its own stricter runtime budget.
+    return (datetime.now(UTC) + timedelta(seconds=timeout + 120)).isoformat(timespec="seconds")
 
 
 def _deadline_expired(value: Any) -> bool:

@@ -124,7 +124,7 @@ button:disabled {
   flex-direction: column;
   gap: 18px;
   min-width: 0;
-  min-height: 100vh;
+  min-height: 100dvh;
   padding: 24px;
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0.025), rgba(255, 255, 255, 0) 360px),
@@ -378,7 +378,7 @@ h3 {
 
 .mainGrid {
   display: grid;
-  align-items: start;
+  align-items: stretch;
   grid-template-columns: minmax(360px, 1.35fr) minmax(320px, 0.75fr);
   gap: 16px;
   flex: 1;
@@ -398,16 +398,18 @@ h3 {
   position: sticky;
   top: 18px;
   grid-template-rows: auto auto minmax(0, 1fr) auto 14px;
-  height: max(520px, var(--chat-target-height, 620px), calc(100vh - 380px));
-  min-height: 460px;
-  max-height: none;
+  height: min(max(560px, var(--chat-target-height, 620px), calc(100dvh - 300px)), calc(100dvh - 36px));
+  min-height: min(560px, calc(100dvh - 36px));
+  max-height: calc(100dvh - 36px);
   overflow: hidden;
 }
 
 .opsPanel {
   display: flex;
   flex-direction: column;
-  min-height: 480px;
+  min-height: min(560px, calc(100dvh - 36px));
+  max-height: calc(100dvh - 36px);
+  overflow: hidden;
   padding-bottom: 12px;
 }
 
@@ -742,7 +744,9 @@ h3 {
 }
 
 .sideTabBody {
+  flex: 1;
   min-height: 0;
+  overflow: auto;
 }
 
 .chatPanel,
@@ -3143,7 +3147,7 @@ h3 {
 
   .chatPanel {
     position: static;
-    height: max(520px, var(--chat-target-height, 620px), calc(100vh - 220px));
+    height: max(540px, var(--chat-target-height, 620px), calc(100dvh - 180px));
     min-height: 520px;
     max-height: none;
   }
@@ -3212,7 +3216,7 @@ h3 {
 
   .chatPanel {
     grid-template-rows: auto auto minmax(300px, 1fr) auto 14px;
-    height: max(520px, var(--chat-target-height, 620px), calc(100vh - 160px));
+    height: max(520px, var(--chat-target-height, 620px), calc(100dvh - 120px));
     min-height: 520px;
   }
 

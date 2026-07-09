@@ -188,6 +188,9 @@ def test_supervisor_status_reflects_autonomy_settings(monkeypatch, tmp_path):
     assert "telemetry.persist" in status["capabilities"]
     assert "health.persist" in status["capabilities"]
     assert "learning.deduplicate" in status["capabilities"]
+    assert "cognition.background_pulse" in status["capabilities"]
+    assert status["cognition_enabled"] is True
+    assert status["cognition_interval_sec"] == 300
     assert "background.mission.runner" in status["capabilities"]
     assert status["health_interval_sec"] == 300
     assert status["mission_interval_sec"] == 120
@@ -208,4 +211,40 @@ def test_supervisor_records_health_snapshot(monkeypatch, tmp_path):
     status = supervisor.status()
     assert status["last_health_at"] is not None
     assert storage.latest_health(limit=5)
+    storage.close()
+
+
+def test_supervisor_background_cognition_persists_pulse(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "1")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    storage.add_event(kind="test.signal", title="Operator asked for a living background brain")
+
+    class FakeLLM:
+        async def complete(self, _messages, **_kwargs):
+            return SimpleNamespace(
+                ok=True,
+                content=(
+                    '{"summary":"Observed runtime and found one follow-up.",'
+                    '"insights":["Keep background cognition observational."],'
+                    '"questions":["Should proactive jobs be auto-created?"],'
+                    '"suggested_jobs":[{"title":"Refresh learning","kind":"learning.tick",'
+                    '"cadence":"background","priority":30,"payload":{"limit":20}}]}'
+                ),
+            )
+
+    supervisor = RuntimeSupervisor(settings=settings, storage=storage, llm=FakeLLM())
+
+    asyncio.run(supervisor._run_cognition())
+
+    status = supervisor.status()
+    pulse = storage.get_runtime_value("cognition.last_pulse")
+    observations = storage.list_learning_observations(limit=5)
+    assert status["last_cognition_at"] is not None
+    assert pulse["summary"] == "Observed runtime and found one follow-up."
+    assert pulse["suggested_jobs"][0]["kind"] == "learning.tick"
+    assert any(item["kind"] == "cognition.pulse" for item in observations)
     storage.close()

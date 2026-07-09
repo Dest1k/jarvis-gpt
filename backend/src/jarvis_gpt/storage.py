@@ -106,6 +106,53 @@ def _loads(data: str | None, default: Any) -> Any:
         return default
 
 
+_SENSITIVE_KEY_FRAGMENTS = (
+    "authorization",
+    "api_key",
+    "apikey",
+    "bearer",
+    "cookie",
+    "password",
+    "secret",
+    "token",
+)
+_BEARER_RE = re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]{8,}")
+_SECRET_VALUE_RE = re.compile(
+    r"(?i)\b(api[_-]?key|authorization|cookie|password|secret|token)\b\s*[:=]\s*[^,\s;]+"
+)
+_OPENAI_KEY_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b")
+
+
+def _redact_sensitive(value: Any) -> Any:
+    if isinstance(value, dict):
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            text_key = str(key)
+            if _sensitive_key(text_key):
+                redacted[text_key] = "[redacted]"
+            else:
+                redacted[text_key] = _redact_sensitive(item)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_sensitive(item) for item in value]
+    if isinstance(value, tuple):
+        return [_redact_sensitive(item) for item in value]
+    if isinstance(value, str):
+        return _redact_sensitive_text(value)
+    return value
+
+
+def _redact_sensitive_text(text: str) -> str:
+    text = _BEARER_RE.sub(r"\1[redacted]", text)
+    text = _OPENAI_KEY_RE.sub("sk-[redacted]", text)
+    return _SECRET_VALUE_RE.sub(lambda match: f"{match.group(1)}=[redacted]", text)
+
+
+def _sensitive_key(key: str) -> bool:
+    normalized = key.casefold().replace("-", "_")
+    return any(fragment in normalized for fragment in _SENSITIVE_KEY_FRAGMENTS)
+
+
 def _query_terms(query: str | None, *, limit: int = 12) -> list[str]:
     if not query:
         return []
@@ -1222,9 +1269,9 @@ class JarvisStorage:
             "ts": utc_now(),
             "tool": tool,
             "ok": 1 if ok else 0,
-            "summary": summary,
-            "arguments": arguments or {},
-            "data": data or {},
+            "summary": _redact_sensitive_text(summary),
+            "arguments": _redact_sensitive(arguments or {}),
+            "data": _redact_sensitive(data or {}),
             "mission_id": mission_id,
             "task_id": task_id,
         }

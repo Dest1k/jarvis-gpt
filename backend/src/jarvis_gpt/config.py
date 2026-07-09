@@ -123,9 +123,13 @@ class JarvisSettings:
     telemetry_interval_sec: int
     health_interval_sec: int
     learning_interval_sec: int
+    cognition_enabled: bool
+    cognition_interval_sec: int
+    cognition_max_tokens: int
     autonomy_mission_interval_sec: int
     api_host: str
     api_port: int
+    api_require_token_on_loopback: bool
 
     def public_dict(self) -> dict[str, object]:
         return {
@@ -174,9 +178,16 @@ class JarvisSettings:
                 "telemetry_interval_sec": self.telemetry_interval_sec,
                 "health_interval_sec": self.health_interval_sec,
                 "learning_interval_sec": self.learning_interval_sec,
+                "cognition_enabled": self.cognition_enabled,
+                "cognition_interval_sec": self.cognition_interval_sec,
+                "cognition_max_tokens": self.cognition_max_tokens,
                 "mission_interval_sec": self.autonomy_mission_interval_sec,
             },
-            "api": {"host": self.api_host, "port": self.api_port},
+            "api": {
+                "host": self.api_host,
+                "port": self.api_port,
+                "require_token_on_loopback": self.api_require_token_on_loopback,
+            },
         }
 
 
@@ -223,9 +234,13 @@ def load_settings(profile_name: str | None = None) -> JarvisSettings:
         telemetry_interval_sec=_int_env("JARVIS_TELEMETRY_INTERVAL_SEC", 120),
         health_interval_sec=_int_env("JARVIS_HEALTH_INTERVAL_SEC", 300),
         learning_interval_sec=_int_env("JARVIS_LEARNING_INTERVAL_SEC", 120),
+        cognition_enabled=_bool_env("JARVIS_COGNITION_ENABLED", True),
+        cognition_interval_sec=_int_env("JARVIS_COGNITION_INTERVAL_SEC", 300),
+        cognition_max_tokens=_int_env("JARVIS_COGNITION_MAX_TOKENS", 512),
         autonomy_mission_interval_sec=_int_env("JARVIS_AUTONOMY_MISSION_INTERVAL_SEC", 120),
         api_host=os.environ.get("JARVIS_API_HOST", "0.0.0.0"),
         api_port=_int_env("JARVIS_API_PORT", 8000),
+        api_require_token_on_loopback=_bool_env("JARVIS_API_REQUIRE_TOKEN_ON_LOOPBACK", False),
     )
 
 

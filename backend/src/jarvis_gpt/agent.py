@@ -4001,6 +4001,9 @@ def _format_screen_capture(data: dict[str, Any]) -> str:
         process = active.get("ProcessName") or active.get("processName") or ""
         if title or process:
             lines.append(f"- активное окно: {_short_value(process)} — {_short_value(title)}")
+    ocr_text = str(data.get("ocrText") or "").strip()
+    if ocr_text:
+        lines.append(f"- OCR: {_short_value(ocr_text, max_chars=500)}")
     windows = _format_native_rows(data.get("windows"), title="Видимые окна:")
     if not lines and not windows:
         return ""
@@ -6387,7 +6390,7 @@ def _screen_capture_action(
     output_path = _screen_capture_file(settings)
     return NativeAction(
         action="screen.capture",
-        payload={"path": str(output_path), "limit": 30},
+        payload={"path": str(output_path), "limit": 30, "ocr": True},
         answer="сделал снимок экрана для визуальной проверки",
     )
 

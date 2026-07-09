@@ -1,5 +1,38 @@
 # Runtime
 
+## 2026-07-09 handoff - leases, interrupted streams, background cognition
+
+For the operator and the second model:
+
+- Autonomy jobs now have persisted running leases:
+  `running_lease_id`, `running_started_at`, and `running_lease_until`. Startup
+  recovery converts stale leases into failed run-history records, so a backend
+  crash or killed worker no longer leaves a job looking permanently in-flight.
+- Job cancellation now goes through `AutonomyExecutor.cancel_job`, cancels the
+  active child task when one exists, keeps the stored job state cancelled, and
+  still records the final cancelled run.
+- Chat streaming now persists a partial assistant message when the HTTP stream
+  is cancelled before `done`. Partial messages carry
+  `metadata.interrupted=true`; the last interrupted stream marker is available
+  at `/api/chat/stream/interrupted/{conversation_id}`.
+- New background cognition loop: when autonomy and LLM are enabled, supervisor
+  starts `jarvis-cognition-loop` every `JARVIS_COGNITION_INTERVAL_SEC` (default
+  300). It asks the local model for strict JSON observations over recent runtime
+  events, learning observations, counters, and autonomy jobs, then saves
+  `cognition.last_pulse` and a `cognition.pulse` learning observation. It is
+  intentionally observational: no browsing, no host mutation, no automatic job
+  creation.
+- Config/env additions: `JARVIS_COGNITION_ENABLED`,
+  `JARVIS_COGNITION_INTERVAL_SEC`, `JARVIS_COGNITION_MAX_TOKENS`, and
+  `JARVIS_API_REQUIRE_TOKEN_ON_LOOPBACK`.
+- Tool-run persistence now redacts obvious secrets (`token`, `secret`,
+  `password`, `authorization`, `cookie`, bearer values) before storage/audit/
+  learning. `system.inspect` screen capture can request OCR if `tesseract` is
+  installed.
+- Command Center chat changes: live streaming no longer forces the transcript
+  back to the bottom after the operator manually scrolls up, and desktop chat/
+  side panels stretch to the viewport instead of leaving dead lower space.
+
 ## 2026-07-09 handoff - headless browsing, distilled learning, autonomy controls
 
 For the operator and the second model:

@@ -193,6 +193,39 @@ def test_autonomy_jobs_have_priority_deadline_and_cancel(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_autonomy_running_lease_blocks_due_and_recovers_stale(monkeypatch, tmp_path):
+    manager, storage = _manager(monkeypatch, tmp_path)
+    now = datetime(2026, 7, 9, 12, tzinfo=UTC)
+    job = manager.create_job(
+        {
+            "title": "Leased diagnostics",
+            "kind": "diagnostics",
+            "cadence": "1m",
+            "budget": {"max_runs": 3},
+        }
+    )
+    active = manager.mark_job_started(
+        job["id"],
+        lease_id="lease-active",
+        started_at=now.isoformat(),
+        lease_until=(now + timedelta(minutes=5)).isoformat(),
+    )
+
+    due = manager.due_jobs(now=now + timedelta(minutes=1))
+    recovered = manager.recover_stale_running_jobs(now=now + timedelta(minutes=6))
+    run = manager.list_job_runs(job_id=job["id"])[0]
+
+    assert active is not None
+    assert due == []
+    assert recovered[0]["id"] == job["id"]
+    assert recovered[0]["status"] == "enabled"
+    assert recovered[0]["running_lease_id"] is None
+    assert recovered[0]["consecutive_failures"] == 1
+    assert run["ok"] is False
+    assert "lease expired" in run["summary"]
+    storage.close()
+
+
 def test_mission_autonomy_job_runs_headless_and_persists_mission_id(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
@@ -279,6 +312,63 @@ def test_autonomy_executor_records_exceptions_as_failed_runs(monkeypatch, tmp_pa
     assert stored["next_run_after"] is not None
     assert run["ok"] is False
     assert "boom" in run["summary"]
+    storage.close()
+
+
+def test_autonomy_executor_cancels_running_child_task(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    operations = OperationsManager(settings=settings, storage=storage)
+    llm = LLMRouter(settings)
+    executor = AutonomyExecutor(
+        settings=settings,
+        storage=storage,
+        operations=operations,
+        agent=AgentRuntime(settings=settings, storage=storage, llm=llm),
+        experience=ExperienceManager(settings=settings, storage=storage),
+        llm=llm,
+        telemetry=object(),
+        dispatcher=object(),
+        learning=LearningEngine(storage),
+    )
+    job = operations.create_job(
+        {
+            "title": "Slow diagnostics",
+            "kind": "diagnostics",
+            "cadence": "manual",
+            "budget": {"max_runs": 3, "max_minutes": 5},
+        }
+    )
+
+    async def scenario():
+        started = asyncio.Event()
+
+        async def slow(_kind, _payload):
+            started.set()
+            await asyncio.sleep(60)
+            return {"ok": True, "summary": "late"}
+
+        executor.run_kind = slow
+        run_task = asyncio.create_task(executor.run_job(job))
+        await asyncio.wait_for(started.wait(), timeout=1)
+        cancelled = await executor.cancel_job(job["id"])
+        result = await asyncio.wait_for(run_task, timeout=1)
+        return cancelled, result
+
+    cancelled, result = asyncio.run(scenario())
+    stored = operations.list_jobs()[0]
+    run = operations.list_job_runs(job_id=job["id"])[0]
+
+    assert cancelled is not None
+    assert cancelled["status"] == "cancelled"
+    assert result["ok"] is False
+    assert result["job"]["status"] == "cancelled"
+    assert stored["running_lease_id"] is None
+    assert run["job_status"] == "cancelled"
     storage.close()
 
 

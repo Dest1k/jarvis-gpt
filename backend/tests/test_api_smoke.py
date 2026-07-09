@@ -12,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from jarvis_gpt.api import _is_loopback_host, _token_allowed, app
+from jarvis_gpt.api import _is_loopback_host, _persist_interrupted_stream, _token_allowed, app
 from starlette.testclient import TestClient
 
 
@@ -55,6 +55,29 @@ def test_runtime_security_and_backup(client, monkeypatch):
     body = backup.json()
     assert body["ok"] is True
     assert Path(body["path"]).exists()
+
+
+def test_loopback_api_can_require_token(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setenv("JARVIS_AUTONOMY_ENABLED", "0")
+    monkeypatch.setenv("JARVIS_API_REQUIRE_TOKEN_ON_LOOPBACK", "1")
+    monkeypatch.setenv("JARVIS_API_TOKEN", "secret")
+
+    with TestClient(app) as test_client:
+        denied = test_client.get("/api/status")
+        allowed = test_client.get(
+            "/api/status",
+            headers={"X-Jarvis-Api-Token": "secret"},
+        )
+        security = test_client.get(
+            "/api/runtime/security",
+            headers={"X-Jarvis-Api-Token": "secret"},
+        )
+
+    assert denied.status_code == 401
+    assert allowed.status_code == 200
+    assert security.json()["loopback_requires_token"] is True
 
 
 def test_operator_quality_and_autonomy_cancel(client):
@@ -138,6 +161,25 @@ def test_chat_offline_and_feedback_roundtrip(client):
         json={"rating": "meh"},
     )
     assert bad_rating.status_code == 422
+
+
+def test_interrupted_stream_partial_answer_is_recoverable(client):
+    conversation_id = app.state.storage.create_conversation("interrupted stream")
+    saved = _persist_interrupted_stream(
+        app.state.storage,
+        conversation_id=conversation_id,
+        partial=["partial ", "answer"],
+        events=[{"type": "assistant_done", "payload": {"source": "test"}}],
+    )
+
+    response = client.get(f"/api/chat/stream/interrupted/{conversation_id}")
+    messages = client.get(f"/api/conversations/{conversation_id}/messages").json()
+
+    assert saved is not None
+    assert response.status_code == 200
+    assert response.json()["message_id"] == saved["message_id"]
+    assert messages[-1]["content"] == "partial answer"
+    assert messages[-1]["metadata"]["interrupted"] is True
 
 
 def test_mission_lifecycle_and_report(client):

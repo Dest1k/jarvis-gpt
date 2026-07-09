@@ -328,10 +328,15 @@ class AutonomyStatusResponse(BaseModel):
     telemetry_interval_sec: int
     health_interval_sec: int
     learning_interval_sec: int
+    cognition_enabled: bool = True
+    cognition_interval_sec: int = 300
+    cognition_max_tokens: int = 512
     mission_interval_sec: int = 120
     last_telemetry_at: str | None = None
     last_health_at: str | None = None
     last_learning_at: str | None = None
+    last_cognition_at: str | None = None
+    last_cognition_error: str | None = None
     last_background_job_at: str | None = None
     last_error: str | None = None
     capabilities: list[str] = Field(default_factory=list)
@@ -649,6 +654,9 @@ class AutonomyJobResponse(BaseModel):
     last_duration_ms: int | None = None
     last_run_at: str | None = None
     next_run_after: str | None = None
+    running_lease_id: str | None = None
+    running_started_at: str | None = None
+    running_lease_until: str | None = None
     deadline_at: str | None = None
     cancelled_at: str | None = None
     last_result: dict[str, Any] = Field(default_factory=dict)
