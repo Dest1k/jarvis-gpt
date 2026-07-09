@@ -14,7 +14,13 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+from . import persona as persona_module
 from .config import JarvisSettings
+from .embeddings import (
+    EmbeddingBackend,
+    reciprocal_rank_fusion,
+    semantic_similarity_order,
+)
 from .event_bus import EventBus
 from .llm import LLMRouter
 from .models import (
@@ -22,7 +28,10 @@ from .models import (
     ChatResponse,
     Mission,
     MissionExecutionResponse,
+    MissionRunResponse,
+    MissionStepOutcome,
     MissionTask,
+    ToolInfo,
     ToolRunResponse,
 )
 from .storage import JarvisStorage
@@ -31,13 +40,20 @@ from .tools import ToolRegistry
 SYSTEM_PROMPT = """Ты JARVIS GPT: локальный агент Windows/WSL/Docker и личный операционный помощник.
 Говори по-русски. Держи тон как у кинематографичного Jarvis: спокойный, точный, слегка ироничный,
 с уважительной уверенностью и готовностью действовать, но без карикатурной театральности.
+
+Сначала ПОЙМИ задачу оператора по смыслу и по контексту (профиль оператора, история диалога,
+память, вложения), а уже потом действуй. Ты не бот, отвечающий по ключевым словам, и не следуешь
+шаблонным правилам-затычкам: правила ниже — это принципы и умолчания, а не скрипт. Если реальная
+задача расходится с формальным правилом или с автоматическим маршрутом — следуй задаче, а не ярлыку.
+Рассуждай от условий и от того, что уже известно об операторе, и доводи мысль до конца.
+
 Работай как системный администратор Windows/Linux, web-исследователь, помощник по бытовым задачам
 и аналитик по публичным источникам. Отделяй факты от предположений, фиксируй неопределенность.
 Тяжелые локальные модели, кеши, данные и логи находятся вне репозитория в D:\\jarvis.
 Если локальная LLM или инструмент недоступны, честно называй деградацию и предлагай следующий
 проверяемый шаг, но не превращай это в отказ от всей задачи.
 
-Capability contract:
+Принципы работы (умолчания, а не жёсткий скрипт):
 - Не выдумывай policy refusal. Исторические, энциклопедические, журналистские, образовательные,
   исследовательские и OSINT-запросы разрешены, если оператор не просит причинить вред,
   украсть доступы, преследовать людей или обходить защиту.
@@ -84,6 +100,23 @@ THINKING_DISABLED_PROMPT = (
 )
 
 
+FINAL_ANSWER_PROMPT = (
+    "Лимит шагов с инструментами исчерпан. Дай финальный ответ оператору по-русски на "
+    "основе собранных observation. Не вызывай больше инструменты и не выводи JSON. Если "
+    "данных не хватило, честно скажи, что именно не подтверждено."
+)
+
+
+MISSION_EXECUTOR_PROMPT = (
+    "Ты исполняешь ОДИН шаг миссии как автономный агент, а не пишешь план. Используй "
+    "доступные инструменты, чтобы реально продвинуть шаг: собери данные, проверь систему, "
+    "прочитай файлы, посмотри статус. Не выдумывай результаты — опирайся на observation "
+    "инструментов. Опасные действия автономно недоступны и станут approval-гейтом; в этом "
+    "случае честно скажи, что шаг требует подтверждения оператора. В конце дай краткий "
+    "отчёт по-русски: что фактически сделано, что подтверждено инструментами и что осталось."
+)
+
+
 MISSION_MARKERS = (
     "мисси",
     "mission",
@@ -96,6 +129,12 @@ MISSION_MARKERS = (
     "реализ",
 )
 
+# Agentic tool loop: how many tool rounds the model may take before it must
+# answer, and which safe tools are withheld from autonomous use because they
+# mutate durable state rather than gather facts.
+DEFAULT_MAX_TOOL_STEPS = 4
+AGENTIC_TOOL_DENYLIST = frozenset({"memory.save", "learning.tick", "mission.brief"})
+
 
 @dataclass
 class AgentContext:
@@ -103,6 +142,8 @@ class AgentContext:
     memory_hits: list[dict[str, Any]]
     file_hits: list[dict[str, Any]]
     task_plan: TaskKernelPlan | None = None
+    intent_consulted: bool = False
+    intent_decision: IntentDecision | None = None
 
 
 @dataclass(frozen=True)
@@ -157,6 +198,18 @@ class NativeAction:
     payload: dict[str, Any]
     answer: str
     fallback: NativeAction | None = None
+
+
+@dataclass
+class _AgenticResult:
+    ok: bool
+    answer: str
+    events: list[ChatEvent]
+    finish_reason: str | None = None
+    error: str | None = None
+    blocked_by_approval: bool = False
+    approval_ids: tuple[str, ...] = ()
+    used_tools: int = 0
 
 
 def _normalize_chat_attachments(attachments: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
@@ -293,6 +346,56 @@ class _ThinkBlockFilter:
         return tail
 
 
+class _ToolActionSniffer:
+    """Classify a streamed completion as a tool-call JSON or a normal answer.
+
+    The agentic protocol asks the model to emit ONLY a JSON object when it wants
+    a tool. So we watch the first meaningful character: ``{`` means a tool call
+    (suppress the stream, buffer the JSON), anything else means a normal answer
+    (emit and pass through token by token). This keeps real answers streaming
+    with no extra completion while still supporting tools. When thinking is
+    disabled we also strip ``<think>`` from the visible output.
+    """
+
+    def __init__(self, *, thinking_enabled: bool) -> None:
+        self._raw = ""
+        self._mode: str | None = None
+        self._pending = ""
+        self._think = None if thinking_enabled else _ThinkBlockFilter()
+
+    def push(self, chunk: str) -> tuple[str, str | None]:
+        self._raw += chunk
+        visible = self._think.push(chunk) if self._think else chunk
+        if self._mode == "answer":
+            return visible, "answer"
+        if self._mode == "tool":
+            return "", "tool"
+        self._pending += visible
+        stripped = self._pending.lstrip()
+        if not stripped:
+            return "", None
+        if stripped[0] == "{":
+            self._mode = "tool"
+            self._pending = ""
+            return "", "tool"
+        self._mode = "answer"
+        out = self._pending
+        self._pending = ""
+        return out, "answer"
+
+    def finish(self) -> tuple[str, str]:
+        if self._mode == "tool":
+            return "", "tool"
+        tail = self._think.flush() if self._think else ""
+        pending = self._pending
+        self._pending = ""
+        return f"{pending}{tail}", "answer"
+
+    @property
+    def raw(self) -> str:
+        return self._raw
+
+
 @dataclass(frozen=True)
 class IntentDecision:
     route: str
@@ -316,6 +419,7 @@ class AgentRuntime:
         self.llm = llm
         self.bus = bus
         self.tools = tools or ToolRegistry(settings, storage, llm)
+        self.embeddings = EmbeddingBackend(settings)
 
     async def chat(
         self,
@@ -336,6 +440,8 @@ class AgentRuntime:
                 self._attached_file_hits(attachments),
                 context.file_hits,
             )
+        await self._augment_semantic_memory(context, context_message)
+        await self._augment_semantic_files(context, context_message)
         task_plan = self._plan_task(
             context_message,
             context,
@@ -443,15 +549,17 @@ class AgentRuntime:
             )
         )
         await self._emit(events[-1])
-        result = await self._complete_llm(
+        agentic = await self._agentic_answer(
             llm_messages,
+            context,
             temperature=temperature,
             max_tokens=max_tokens,
             thinking_enabled=thinking_enabled,
         )
-        if result.ok and result.content:
-            answer = _clean_assistant_answer(result.content)
-            finish_reason = _finish_reason_from_llm_result(result)
+        events.extend(agentic.events)
+        if agentic.ok and agentic.answer:
+            answer = agentic.answer
+            finish_reason = agentic.finish_reason
             if finish_reason == "length":
                 effective_max_tokens = max_tokens or self.settings.llm_max_tokens
                 answer = (
@@ -463,16 +571,20 @@ class AgentRuntime:
                 ChatEvent(
                     type="assistant_done",
                     title="Ответ получен",
-                    payload={"source": "llm", "finish_reason": finish_reason},
+                    payload={
+                        "source": "llm",
+                        "finish_reason": finish_reason,
+                        "tool_steps": agentic.used_tools,
+                    },
                 )
             )
         else:
-            answer = self._offline_answer(message, result.error)
+            answer = self._offline_answer(message, agentic.error)
             events.append(
                 ChatEvent(
                     type="assistant_done",
                     title="Offline fallback",
-                    content=result.error,
+                    content=agentic.error,
                     payload={"source": "fallback"},
                 )
             )
@@ -514,6 +626,8 @@ class AgentRuntime:
                 self._attached_file_hits(attachments),
                 context.file_hits,
             )
+        await self._augment_semantic_memory(context, context_message)
+        await self._augment_semantic_files(context, context_message)
         task_plan = self._plan_task(
             context_message,
             context,
@@ -642,30 +756,84 @@ class AgentRuntime:
         answer_parts: list[str] = []
         stream_error: str | None = None
         stream_finish_reason: str | None = None
-        think_filter = _ThinkBlockFilter() if not thinking_enabled else None
-        async for chunk in self._stream_llm(
-            llm_messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            thinking_enabled=thinking_enabled,
-        ):
-            if chunk.kind == "delta" and chunk.content:
-                content = think_filter.push(chunk.content) if think_filter else chunk.content
-                if not content:
-                    continue
-                answer_parts.append(content)
-                yield {"type": "delta", "content": content}
-            elif chunk.kind == "error":
-                stream_error = chunk.error
-                break
-            elif chunk.kind == "done":
-                stream_finish_reason = getattr(chunk, "finish_reason", None)
-                break
-        if think_filter:
-            tail = think_filter.flush()
-            if tail:
-                answer_parts.append(tail)
-                yield {"type": "delta", "content": tail}
+        used_tools = 0
+        tools = self._autonomous_tools()
+        allowed = {info.name for info in tools}
+        messages = list(llm_messages)
+        if tools:
+            messages.append({"role": "system", "content": _tool_protocol_prompt(tools)})
+        max_steps = self._max_tool_steps() if tools else 0
+
+        for step in range(max_steps + 1):
+            force_final = bool(tools) and step == max_steps
+            sniff = bool(tools) and not force_final
+            round_messages = messages
+            if force_final:
+                round_messages = [*messages, {"role": "system", "content": FINAL_ANSWER_PROMPT}]
+            sniffer = _ToolActionSniffer(thinking_enabled=thinking_enabled) if sniff else None
+            think_filter = (
+                _ThinkBlockFilter() if (not thinking_enabled and sniffer is None) else None
+            )
+            round_error: str | None = None
+            round_finish: str | None = None
+            async for chunk in self._stream_llm(
+                round_messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                thinking_enabled=thinking_enabled,
+            ):
+                if chunk.kind == "delta" and chunk.content:
+                    if sniffer is not None:
+                        emit, mode = sniffer.push(chunk.content)
+                        if mode == "answer" and emit:
+                            answer_parts.append(emit)
+                            yield {"type": "delta", "content": emit}
+                    else:
+                        content = (
+                            think_filter.push(chunk.content) if think_filter else chunk.content
+                        )
+                        if not content:
+                            continue
+                        answer_parts.append(content)
+                        yield {"type": "delta", "content": content}
+                elif chunk.kind == "error":
+                    round_error = chunk.error
+                    break
+                elif chunk.kind == "done":
+                    round_finish = getattr(chunk, "finish_reason", None)
+                    break
+
+            if sniffer is not None:
+                tail, mode = sniffer.finish()
+                if mode == "tool" and not round_error:
+                    action = _parse_tool_action(sniffer.raw)
+                    if action is not None:
+                        observation, event = await self._run_agentic_tool(
+                            *action, allowed, context
+                        )
+                        await self._emit(event)
+                        events.append(event)
+                        yield {"type": "event", "event": event.model_dump()}
+                        used_tools += 1
+                        messages.append({"role": "assistant", "content": sniffer.raw})
+                        messages.append({"role": "user", "content": observation})
+                        continue
+                    stray = _clean_assistant_answer(sniffer.raw)
+                    if stray:
+                        answer_parts.append(stray)
+                        yield {"type": "delta", "content": stray}
+                elif tail:
+                    answer_parts.append(tail)
+                    yield {"type": "delta", "content": tail}
+            elif think_filter:
+                tail = think_filter.flush()
+                if tail:
+                    answer_parts.append(tail)
+                    yield {"type": "delta", "content": tail}
+
+            stream_error = round_error
+            stream_finish_reason = round_finish
+            break
 
         if answer_parts:
             answer = _clean_assistant_answer("".join(answer_parts).strip())
@@ -689,6 +857,7 @@ class AgentRuntime:
                         "source": "llm",
                         "stream": True,
                         "finish_reason": stream_finish_reason,
+                        "tool_steps": used_tools,
                     },
                 )
             )
@@ -768,17 +937,25 @@ class AgentRuntime:
                 result=result,
             )
 
-        running_task = self.storage.update_mission_task(task["id"], status="running")
-        result = await self.tools.run(
-            "mission.brief",
-            {"goal": mission["goal"], "task_title": task["title"]},
+        running_task = self.storage.update_mission_task(
+            task["id"],
             mission_id=mission_id,
-            task_id=task["id"],
+            status="running",
         )
+        if self.settings.llm_enabled:
+            result = await self._execute_mission_step_agentic(mission, task)
+        else:
+            result = await self.tools.run(
+                "mission.brief",
+                {"goal": mission["goal"], "task_title": task["title"]},
+                mission_id=mission_id,
+                task_id=task["id"],
+            )
         notes = _task_notes_from_result(result)
         final_status = "done" if result.ok else "blocked"
         updated_task = self.storage.update_mission_task(
             task["id"],
+            mission_id=mission_id,
             status=final_status,
             notes=notes,
         )
@@ -802,6 +979,138 @@ class AgentRuntime:
             mission=Mission.model_validate(refreshed),
             task=MissionTask.model_validate(updated_task or running_task or task),
             result=result,
+        )
+
+    async def run_mission(
+        self,
+        mission_id: str,
+        *,
+        max_steps: int | None = None,
+    ) -> MissionRunResponse:
+        """Execute mission steps in sequence until the mission finishes, a step is
+        blocked (e.g. it needs an approval), or the step budget is exhausted.
+
+        Each step still runs through the agentic executor, so this only chains the
+        real work; it never bypasses approval gates. ``mission_step`` events are
+        emitted per step, so the Command Center can render progress live.
+        """
+
+        mission = self.storage.get_mission(mission_id)
+        if mission is None:
+            return MissionRunResponse(
+                mission=_empty_mission(mission_id),
+                steps=[],
+                completed=False,
+                stopped_reason="empty",
+                executed_steps=0,
+            )
+
+        budget = self._mission_run_budget(max_steps)
+        steps: list[MissionStepOutcome] = []
+        stopped_reason = "empty"
+        for _ in range(budget):
+            if self.storage.next_mission_task(mission_id) is None:
+                break
+            response = await self.execute_next_mission_step(mission_id)
+            steps.append(MissionStepOutcome(task=response.task, result=response.result))
+            if not response.result.ok or (response.task and response.task.status == "blocked"):
+                stopped_reason = "blocked"
+                break
+
+        refreshed = self.storage.get_mission(mission_id) or mission
+        completed = self.storage.next_mission_task(mission_id) is None
+        if stopped_reason != "blocked":
+            stopped_reason = ("completed" if steps else "empty") if completed else "budget"
+        await self._emit(
+            ChatEvent(
+                type="mission_run",
+                title="Mission run finished",
+                content=refreshed.get("title", mission_id),
+                payload={
+                    "mission_id": mission_id,
+                    "executed_steps": len(steps),
+                    "stopped_reason": stopped_reason,
+                    "completed": completed,
+                },
+            )
+        )
+        return MissionRunResponse(
+            mission=Mission.model_validate(refreshed),
+            steps=steps,
+            completed=completed,
+            stopped_reason=stopped_reason,  # type: ignore[arg-type]
+            executed_steps=len(steps),
+        )
+
+    def _mission_run_budget(self, max_steps: int | None) -> int:
+        if max_steps is not None:
+            return max(1, min(24, int(max_steps)))
+        policy = self.storage.get_runtime_value("experience.autonomy_policy", {})
+        steps = 6
+        if isinstance(policy, dict):
+            try:
+                steps = int(policy.get("max_autonomous_steps", steps))
+            except (TypeError, ValueError):
+                steps = 6
+        return max(1, min(24, steps))
+
+    async def _execute_mission_step_agentic(
+        self,
+        mission: dict[str, Any],
+        task: dict[str, Any],
+    ) -> ToolRunResponse:
+        """Run one mission step for real through the agentic tool loop.
+
+        Instead of returning a static brief, the model actually uses safe tools
+        (gather facts, inspect the system, read files) to advance the step, and
+        dangerous actions become approval gates. The inner tool runs are recorded
+        by the tool registry, so the mission gets a genuine execution trail.
+        """
+
+        base_messages = [
+            {"role": "system", "content": MISSION_EXECUTOR_PROMPT},
+            {"role": "system", "content": _runtime_date_context()},
+        ]
+        persona_prompt = self._persona_prompt()
+        if persona_prompt:
+            base_messages.append({"role": "system", "content": persona_prompt})
+        base_messages.append(
+            {
+                "role": "user",
+                "content": (
+                    f"Цель миссии: {mission['goal']}\n"
+                    f"Текущий шаг: {task['title']}\n"
+                    "Выполни этот шаг с помощью инструментов и кратко отчитайся: что сделано, "
+                    "что подтверждено инструментами и что осталось для следующего шага."
+                ),
+            }
+        )
+        mission_context = AgentContext(
+            conversation_id=f"mission:{mission['id']}",
+            memory_hits=[],
+            file_hits=[],
+        )
+        agentic = await self._agentic_answer(
+            base_messages,
+            mission_context,
+            temperature=0.2,
+            max_tokens=None,
+            thinking_enabled=False,
+        )
+        summary = agentic.answer.strip() if agentic.answer else ""
+        if not summary:
+            summary = agentic.error or "Шаг не удалось выполнить: модель не вернула результат."
+        return ToolRunResponse(
+            tool="mission.execute_next",
+            ok=agentic.ok and bool(agentic.answer) and not agentic.blocked_by_approval,
+            summary=summary[:2000],
+            data={
+                "mission_id": mission["id"],
+                "task_id": task["id"],
+                "tool_steps": agentic.used_tools,
+                "approval_ids": list(agentic.approval_ids),
+                "autonomous": True,
+            },
         )
 
     async def _try_direct_action(
@@ -908,6 +1217,21 @@ class AgentRuntime:
                 events=[event],
             )
 
+        # Reasoning-first arbiter: before any fuzzy web-ish branch (shopping,
+        # weather, generic research) fires on keyword matches, let the model judge
+        # whether the task actually needs external data or is solvable by reasoning
+        # from the message and operator context. This is what stops the keyword
+        # plugs from hijacking reasoning/chat tasks.
+        if context is not None:
+            arbiter = await self._understand_intent(message, context)
+            if (
+                arbiter is not None
+                and arbiter.route in {"reasoning", "chat"}
+                and arbiter.confidence >= 0.6
+            ):
+                context.task_plan = _reroute_plan(context.task_plan, arbiter)
+                return None
+
         shopping_followup = _shopping_followup_intent(
             message,
             has_previous_search=self._shopping_research_state(context.conversation_id) is not None,
@@ -962,12 +1286,9 @@ class AgentRuntime:
             else _web_research_query_from_message(message)
         )
         if research_query is not None:
-            intent = await self._semantic_intent_decision(
-                message,
-                context=context,
-                heuristic_route="web_research",
-                heuristic_query=research_query,
-            )
+            intent = None
+            if context is not None:
+                intent = await self._understand_intent(message, context)
             if intent and intent.route in {"reasoning", "chat"} and intent.confidence >= 0.55:
                 return None
             if intent and intent.route == "web_research" and intent.query:
@@ -995,15 +1316,31 @@ class AgentRuntime:
 
         return None
 
-    async def _semantic_intent_decision(
+    async def _understand_intent(
         self,
         message: str,
-        *,
         context: AgentContext,
-        heuristic_route: str,
-        heuristic_query: str | None = None,
     ) -> IntentDecision | None:
-        if not _should_use_semantic_router(message, heuristic_route):
+        """Let the model understand the task from full context and decide the route.
+
+        This is the reasoning-first arbiter: instead of trusting a cascade of
+        ``_looks_like_*`` heuristics, we ask the LLM to read the message together
+        with the operator persona and recent turns and classify the real intent.
+        It only runs when the fast heuristic plan already wants an external,
+        tool-driven route (``web_research``) — that is exactly the fuzzy zone
+        where the keyword plugs produce false positives. Deterministic bindings
+        (native OS actions, host commands, explicit URLs) are handled earlier and
+        never routed through here. When the LLM is offline the heuristics stay
+        authoritative, so behavior degrades gracefully.
+        """
+
+        if context.intent_consulted:
+            return context.intent_decision
+        context.intent_consulted = True
+        plan = context.task_plan
+        if plan is None or plan.route != "web_research":
+            return None
+        if not self.settings.llm_enabled:
             return None
         recent_user_messages = [
             item["content"]
@@ -1014,17 +1351,45 @@ class AgentRuntime:
             _intent_router_messages(
                 message=message,
                 recent_user_messages=recent_user_messages,
-                heuristic_route=heuristic_route,
-                heuristic_query=heuristic_query,
+                heuristic_route=plan.route,
+                heuristic_query=plan.query,
+                operator_context=self._intent_operator_context(),
             ),
             temperature=0.0,
-            max_tokens=180,
+            max_tokens=200,
         )
         if not result.ok or not result.content:
             return None
-        return _parse_intent_decision(result.content)
+        context.intent_decision = _parse_intent_decision(result.content)
+        return context.intent_decision
+
+    def _intent_operator_context(self) -> str:
+        persona = self._persona()
+        parts: list[str] = []
+        role = str(persona.get("role") or "").strip()
+        if role:
+            parts.append(f"role={role}")
+        location = persona_module.home_location(persona)
+        if location:
+            parts.append(f"home_location={location}")
+        for field in ("tech_stack", "interests"):
+            values = [str(item) for item in (persona.get(field) or [])][:6]
+            if values:
+                parts.append(f"{field}={', '.join(values)}")
+        return "; ".join(parts)
 
     async def _infer_weather_location(self) -> tuple[str | None, list[ChatEvent]]:
+        persona_location = self._operator_home_location()
+        if persona_location:
+            return persona_location, [
+                ChatEvent(
+                    type="thought",
+                    title="Weather location inferred",
+                    content=f"Using operator persona home location: {persona_location}.",
+                    payload={"source": "persona", "location": persona_location},
+                )
+            ]
+
         configured = _normalize_search_query(os.environ.get("JARVIS_DEFAULT_CITY", ""))
         if configured:
             return configured, [
@@ -1532,6 +1897,108 @@ class AgentRuntime:
             file_hits=file_hits,
         )
 
+    async def _hybrid_rerank(
+        self,
+        query: str,
+        lexical_hits: list[dict[str, Any]],
+        extra_pool: list[dict[str, Any]],
+        *,
+        id_key: str,
+        limit: int,
+    ) -> list[dict[str, Any]] | None:
+        """Fuse a lexical order with a semantic order over a bounded pool.
+
+        Returns the re-ranked hits, or None when there is nothing to improve or
+        anything fails — retrieval must never break a turn. Shared by memory and
+        file-chunk retrieval so both get semantic recall that keyword search
+        misses (paraphrase, inflection, word order).
+        """
+
+        pool: dict[str, dict[str, Any]] = {}
+        for item in (*lexical_hits, *extra_pool):
+            key = str(item.get(id_key) or "")
+            if key:
+                pool.setdefault(key, item)
+        candidates = list(pool.values())
+        if len(candidates) < 2:
+            return None
+        try:
+            semantic_order = await semantic_similarity_order(
+                self.embeddings,
+                query,
+                [str(item.get("content") or "") for item in candidates],
+            )
+        except Exception:  # noqa: BLE001 - retrieval must never break a turn
+            return None
+        semantic_ranking = [str(candidates[index].get(id_key) or "") for index in semantic_order]
+        lexical_ranking = [str(item.get(id_key) or "") for item in lexical_hits]
+        fused = reciprocal_rank_fusion([lexical_ranking, semantic_ranking])
+        if not fused:
+            return None
+        top_score = max(fused.values()) or 1.0
+        # Order candidates by semantic closeness first so equal fused scores
+        # break toward the stronger paraphrase signal (stable sort keeps it).
+        semantic_first = [candidates[index] for index in semantic_order]
+        ranked = sorted(
+            semantic_first,
+            key=lambda item: fused.get(str(item.get(id_key) or ""), 0.0),
+            reverse=True,
+        )[:limit]
+        for item in ranked:
+            score = fused.get(str(item.get(id_key) or ""), 0.0)
+            item["relevance"] = round(min(1.0, score / top_score), 4)
+            item.setdefault("retrieval", "hybrid")
+        return ranked
+
+    async def _augment_semantic_memory(
+        self,
+        context: AgentContext,
+        message: str,
+        *,
+        limit: int = 8,
+    ) -> None:
+        """Hybrid re-rank of durable memory (lexical hits + recent/important pool)."""
+
+        query = " ".join(str(message or "").split())
+        if not query:
+            return
+        ranked = await self._hybrid_rerank(
+            query,
+            context.memory_hits,
+            self.storage.search_memory(None, limit=60),
+            id_key="id",
+            limit=limit,
+        )
+        if ranked is not None:
+            context.memory_hits = ranked
+
+    async def _augment_semantic_files(
+        self,
+        context: AgentContext,
+        message: str,
+        *,
+        limit: int = 5,
+    ) -> None:
+        """Hybrid re-rank of indexed file chunks over an oversampled lexical pool.
+
+        Promotes the semantically closest chunk even when keyword ranking buried
+        it, so paraphrased questions about uploaded/indexed files still land the
+        right passage.
+        """
+
+        query = " ".join(str(message or "").split())
+        if not query:
+            return
+        ranked = await self._hybrid_rerank(
+            query,
+            context.file_hits,
+            self.storage.search_file_chunks(query[:160], limit=30),
+            id_key="chunk_id",
+            limit=limit,
+        )
+        if ranked is not None:
+            context.file_hits = ranked
+
     def _attached_file_hits(self, attachments: list[dict[str, Any]]) -> list[dict[str, Any]]:
         hits: list[dict[str, Any]] = []
         for item in attachments[:4]:
@@ -1566,6 +2033,180 @@ class AgentRuntime:
         if _supports_keyword(self.llm.stream_complete, "thinking_enabled"):
             kwargs["thinking_enabled"] = thinking_enabled
         return self.llm.stream_complete(messages, **kwargs)
+
+    def _autonomous_tools(self) -> list[ToolInfo]:
+        if not self.settings.llm_enabled:
+            return []
+        policy = self.storage.get_runtime_value("experience.autonomy_policy", {})
+        if isinstance(policy, dict) and policy.get("allow_safe_tools") is False:
+            return []
+        return [
+            info
+            for info in self.tools.list()
+            if info.danger_level == "safe" and info.name not in AGENTIC_TOOL_DENYLIST
+        ]
+
+    def _max_tool_steps(self) -> int:
+        policy = self.storage.get_runtime_value("experience.autonomy_policy", {})
+        steps = DEFAULT_MAX_TOOL_STEPS
+        if isinstance(policy, dict):
+            try:
+                steps = int(policy.get("max_autonomous_steps", DEFAULT_MAX_TOOL_STEPS))
+            except (TypeError, ValueError):
+                steps = DEFAULT_MAX_TOOL_STEPS
+        return max(1, min(8, steps))
+
+    async def _run_agentic_tool(
+        self,
+        name: str,
+        args: dict[str, Any],
+        allowed: set[str],
+        context: AgentContext,
+    ) -> tuple[str, ChatEvent]:
+        if name not in allowed:
+            spec = self.tools.get(name)
+            if spec is None:
+                observation = (
+                    f"observation[{name} · error]: инструмент не существует. "
+                    f"Доступны: {', '.join(sorted(allowed))}."
+                )
+                return observation, ChatEvent(
+                    type="thought",
+                    title="Tool rejected",
+                    content=f"Unknown tool requested: {name}",
+                    payload={"tool": name},
+                )
+            payload: dict[str, Any] = {"tool": name, "arguments": args}
+            mission_id = None
+            conversation_id = str(context.conversation_id or "")
+            if conversation_id.startswith("mission:"):
+                mission_id = conversation_id.split(":", 1)[1]
+                payload["mission_id"] = mission_id
+            gate = self.storage.create_approval(
+                title=f"Автономный запрос инструмента {name}",
+                description=(
+                    f"Модель хочет вызвать {name} ({spec.danger_level}) во время ответа "
+                    f"оператору {context.conversation_id}."
+                ),
+                requested_action="tool.run",
+                risk=spec.danger_level if spec.danger_level in {"review", "danger"} else "review",
+                payload=payload,
+            )
+            observation = (
+                f"observation[{name} · blocked]: инструмент требует подтверждения оператора; "
+                f"создан approval {gate['id']}. Ответь по доступным данным или предложи "
+                "оператору подтвердить этот шаг."
+            )
+            return observation, ChatEvent(
+                type="approval",
+                title=f"Approval requested: {name}",
+                content=f"Autonomous tool {name} needs operator approval.",
+                payload={
+                    "approval_id": gate["id"],
+                    "tool": name,
+                    "risk": spec.danger_level,
+                    "mission_id": mission_id,
+                },
+            )
+        result = await self.tools.run(name, args)
+        event = ChatEvent(
+            type="tool_call",
+            title=name,
+            content=result.summary,
+            payload={"tool": name, "ok": result.ok, "autonomous": True},
+        )
+        return _tool_observation_excerpt(result), event
+
+    async def _agentic_answer(
+        self,
+        base_messages: list[dict[str, str]],
+        context: AgentContext,
+        *,
+        temperature: float | None,
+        max_tokens: int | None,
+        thinking_enabled: bool,
+    ) -> _AgenticResult:
+        tools = self._autonomous_tools()
+        events: list[ChatEvent] = []
+        if not tools:
+            result = await self._complete_llm(
+                base_messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                thinking_enabled=thinking_enabled,
+            )
+            if not result.ok or not result.content:
+                return _AgenticResult(ok=False, answer="", events=events, error=result.error)
+            return _AgenticResult(
+                ok=True,
+                answer=_clean_assistant_answer(result.content),
+                events=events,
+                finish_reason=_finish_reason_from_llm_result(result),
+            )
+
+        allowed = {info.name for info in tools}
+        messages = [*base_messages, {"role": "system", "content": _tool_protocol_prompt(tools)}]
+        used_tools = 0
+        approval_ids: list[str] = []
+        for _step in range(self._max_tool_steps()):
+            result = await self._complete_llm(
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                thinking_enabled=thinking_enabled,
+            )
+            if not result.ok:
+                if used_tools == 0:
+                    return _AgenticResult(ok=False, answer="", events=events, error=result.error)
+                break
+            action = _parse_tool_action(result.content)
+            if action is None:
+                return _AgenticResult(
+                    ok=True,
+                    answer=_clean_assistant_answer(result.content),
+                    events=events,
+                    finish_reason=_finish_reason_from_llm_result(result),
+                    blocked_by_approval=bool(approval_ids),
+                    approval_ids=tuple(approval_ids),
+                    used_tools=used_tools,
+                )
+            observation, event = await self._run_agentic_tool(*action, allowed, context)
+            await self._emit(event)
+            events.append(event)
+            if event.type == "approval":
+                approval_id = event.payload.get("approval_id") if event.payload else None
+                if isinstance(approval_id, str):
+                    approval_ids.append(approval_id)
+            used_tools += 1
+            messages.append({"role": "assistant", "content": result.content})
+            messages.append({"role": "user", "content": observation})
+
+        messages.append({"role": "system", "content": FINAL_ANSWER_PROMPT})
+        result = await self._complete_llm(
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            thinking_enabled=thinking_enabled,
+        )
+        if result.ok and result.content:
+            return _AgenticResult(
+                ok=True,
+                answer=_clean_assistant_answer(result.content),
+                events=events,
+                finish_reason=_finish_reason_from_llm_result(result),
+                blocked_by_approval=bool(approval_ids),
+                approval_ids=tuple(approval_ids),
+                used_tools=used_tools,
+            )
+        return _AgenticResult(
+            ok=False,
+            answer="",
+            events=events,
+            error=result.error,
+            blocked_by_approval=bool(approval_ids),
+            approval_ids=tuple(approval_ids),
+            used_tools=used_tools,
+        )
 
     def _build_llm_messages(
         self,
@@ -1612,6 +2253,9 @@ class AgentRuntime:
         operator_profile = self._operator_profile_context()
         if operator_profile:
             messages.append({"role": "system", "content": operator_profile})
+        persona_prompt = self._persona_prompt()
+        if persona_prompt:
+            messages.append({"role": "system", "content": persona_prompt})
         if not thinking_enabled:
             messages.append({"role": "system", "content": THINKING_DISABLED_PROMPT})
         if memory_block:
@@ -1808,6 +2452,25 @@ class AgentRuntime:
             lines.append("Durable typed notes:")
             lines.extend(profile_items[:10])
         return "\n".join(lines)
+
+    def _persona(self) -> dict[str, Any]:
+        return persona_module.load_persona(self.storage)
+
+    def _persona_prompt(self) -> str:
+        preferences = self.storage.get_runtime_value("experience.preferences", {})
+        if not isinstance(preferences, dict):
+            preferences = {}
+        persona = self._persona()
+        if not persona_module.is_configured(persona) and not persona.get("display_name"):
+            return ""
+        return persona_module.render_system_block(
+            persona,
+            settings=self.settings,
+            preferences=preferences,
+        )
+
+    def _operator_home_location(self) -> str | None:
+        return persona_module.home_location(self._persona())
 
     def _active_console_target(self, conversation_id: str) -> dict[str, Any] | None:
         value = self.storage.get_runtime_value(_console_target_key(conversation_id), None)
@@ -2359,6 +3022,29 @@ def _runtime_date_context() -> str:
     )
 
 
+def _reroute_plan(plan: TaskKernelPlan | None, decision: IntentDecision) -> TaskKernelPlan:
+    """Rebuild the task kernel after the reasoning-first arbiter overrides the route.
+
+    Keeps the prompt coherent: the model should be told it is reasoning, not
+    told to honor a web_research 'execution contract' the arbiter just rejected.
+    """
+
+    mode = plan.mode if plan is not None else "standard"
+    intent = "chat_response" if decision.route == "chat" else "reasoned_answer"
+    return TaskKernelPlan(
+        route=decision.route,
+        mode=mode,
+        intent=intent,
+        confidence=decision.confidence,
+        completion_criteria=(
+            "understand the actual task from the message and operator context",
+            "reason to a complete answer without inventing external facts",
+            "call out any genuinely missing information instead of guessing",
+        ),
+        rationale=decision.rationale or "Intent understood as solvable without external lookup.",
+    )
+
+
 def _task_kernel_prompt(plan: TaskKernelPlan) -> str:
     lines = [
         "Task kernel decision:",
@@ -2379,8 +3065,10 @@ def _task_kernel_prompt(plan: TaskKernelPlan) -> str:
     if plan.rationale:
         lines.append(f"- rationale: {plan.rationale}")
     lines.append(
-        "Use this routing decision as an execution contract. If the answer is incomplete, "
-        "say so explicitly instead of ending mid-step."
+        "This routing is a starting hypothesis from a fast classifier, not a script to obey. "
+        "Understand what the operator actually needs and reason from the message and context; "
+        "if the routing does not fit the real task, follow the task, not the label. "
+        "If the answer is incomplete, say so explicitly instead of ending mid-step."
     )
     return "\n".join(lines)
 
@@ -2483,55 +3171,13 @@ def _research_intent_from_message(normalized: str) -> str:
     return "web_research"
 
 
-def _should_use_semantic_router(message: str, heuristic_route: str) -> bool:
-    if heuristic_route != "web_research":
-        return False
-    normalized = message.lower()
-    if _contains_any(
-        normalized,
-        (
-            "загугли",
-            "погугли",
-            "в интернете",
-            "в сети",
-            "site:",
-            "http://",
-            "https://",
-        ),
-    ):
-        return False
-    if _looks_like_shopping_query(normalized) or _looks_like_travel_query(normalized):
-        return False
-    if _looks_like_place_lookup_query(normalized) or _looks_like_osint_query(normalized):
-        return False
-    ambiguous_markers = (
-        "сейчас",
-        "текущая ситуация",
-        "твоя задача",
-        "обоснуй",
-        "исключительно",
-        "представь",
-        "допустим",
-        "сценар",
-        "дилемм",
-        "если ",
-        "самый",
-        "самая",
-        "логическ",
-        "ошибк",
-        "приоритет",
-        "выбери",
-        "распредели",
-    )
-    return len(message) > 280 or _contains_any(normalized, ambiguous_markers)
-
-
 def _intent_router_messages(
     *,
     message: str,
     recent_user_messages: list[str],
     heuristic_route: str,
     heuristic_query: str | None,
+    operator_context: str = "",
 ) -> list[dict[str, str]]:
     today = date.today().isoformat()
     history = "\n".join(f"- {item[:500]}" for item in recent_user_messages[:-1])
@@ -2541,25 +3187,33 @@ def _intent_router_messages(
         {
             "role": "system",
             "content": (
-                "Ты компактный intent-router для локального агента Jarvis. "
+                "Ты intent-router для локального агента Jarvis. Твоя работа — ПОНЯТЬ реальную "
+                "задачу оператора по смыслу и контексту, а не по совпадению ключевых слов. "
+                "Эвристика ниже могла ошибиться, потому что реагирует на отдельные слова. "
+                "Реши сам, опираясь на суть запроса и на профиль оператора.\n"
                 "Верни только JSON без markdown. Поля: route, confidence, query, rationale. "
                 "route: web_research | reasoning | local_action | mission | chat.\n"
-                "web_research: нужны внешние, актуальные, проверяемые факты, цены, расписания, "
-                "версии, новости, публичные источники.\n"
-                "reasoning: пользователь дал гипотетический/ролевой/логический/этический "
-                "сценарий и просит рассуждать по условиям задачи; web не нужен.\n"
-                "local_action: надо управлять ОС/GUI/файлами/консолью.\n"
-                "mission: крупная реальная задача на несколько исполнимых шагов.\n"
-                "chat: обычный ответ без инструментов.\n"
-                "Если есть сомнение между web_research и reasoning, выбирай reasoning, "
-                "когда все необходимые факты уже заданы в сообщении. "
-                "Если выбираешь web_research, query должен быть коротким поисковым запросом."
+                "web_research: оператору реально нужны свежие внешние проверяемые факты "
+                "(цены, наличие, расписания, версии, новости, погода, адреса, курсы) и "
+                "ответ зависит от сегодняшней реальности, а не от знаний модели.\n"
+                "reasoning: задача решается размышлением по данным из самого сообщения — "
+                "логика, оценка, разбор, гипотетический/ролевой сценарий, совет, объяснение, "
+                "код; web не нужен, даже если встречаются слова вроде 'сейчас' или 'самый'.\n"
+                "local_action: надо управлять ОС/GUI/файлами/консолью на машине оператора.\n"
+                "mission: крупная реальная многошаговая задача с исполнимыми шагами.\n"
+                "chat: обычный разговорный ответ без инструментов.\n"
+                "Правило разрешения сомнений: выбирай web_research ТОЛЬКО если без свежих "
+                "внешних данных честный ответ невозможен. Если фактов из сообщения и контекста "
+                "достаточно — это reasoning или chat. "
+                "Если выбираешь web_research, query — короткий поисковый запрос; учитывай "
+                "профиль оператора (например, домашний город для локальных запросов)."
             ),
         },
         {
             "role": "user",
             "content": (
                 f"current_date: {today}\n"
+                f"operator_context: {operator_context or 'none'}\n"
                 f"heuristic_route: {heuristic_route}\n"
                 f"heuristic_query: {heuristic_query or ''}\n"
                 f"recent_user_messages:\n{history}\n\n"
@@ -2597,6 +3251,82 @@ def _parse_intent_decision(content: str) -> IntentDecision | None:
         query=str(data.get("query") or "").strip() or None,
         rationale=str(data.get("rationale") or "").strip(),
     )
+
+
+def _tool_protocol_prompt(tools: list[ToolInfo]) -> str:
+    lines = [
+        "У тебя есть инструменты для сбора фактов и локальной проверки. Пользуйся ими "
+        "ТОЛЬКО если без свежих внешних данных или реального осмотра системы честный ответ "
+        "невозможен. Если можешь ответить по знаниям и контексту — отвечай сразу текстом.",
+        "Чтобы вызвать инструмент, верни РОВНО одну строку JSON и больше ничего: "
+        '{"tool": "<имя>", "arguments": { ... }}',
+        "После вызова ты получишь observation с результатом. Повторяй вызовы, пока не "
+        "соберёшь достаточно, затем дай финальный ответ обычным текстом. Не выдумывай "
+        "результаты инструментов и не показывай сырые observation оператору.",
+        "Доступные инструменты:",
+    ]
+    for tool in tools:
+        lines.append(f"- {tool.name}({_schema_hint(tool.input_schema)}): {tool.description}")
+    return "\n".join(lines)
+
+
+def _schema_hint(schema: dict[str, Any]) -> str:
+    if not isinstance(schema, dict):
+        return ""
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return ""
+    required = schema.get("required")
+    required_set = {str(item) for item in required} if isinstance(required, list) else set()
+    parts = []
+    for name in list(properties.keys())[:6]:
+        parts.append(str(name) if name in required_set else f"{name}?")
+    return ", ".join(parts)
+
+
+def _parse_tool_action(content: str) -> tuple[str, dict[str, Any]] | None:
+    """Parse a tool-call JSON emitted by the model, or None for a normal answer.
+
+    To avoid hijacking a prose answer that merely contains an example JSON, the
+    message must start with the JSON object (optionally fenced).
+    """
+
+    text = content.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text).strip()
+    if not text.startswith("{"):
+        return None
+    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if not match:
+        return None
+    try:
+        data = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    name = data.get("tool") or data.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    args = data.get("arguments")
+    if not isinstance(args, dict):
+        args = data.get("args") if isinstance(data.get("args"), dict) else {}
+    return name.strip(), args
+
+
+def _tool_observation_excerpt(result: ToolRunResponse, *, max_chars: int = 1400) -> str:
+    status = "ok" if result.ok else "error"
+    payload = ""
+    if isinstance(result.data, dict) and result.data:
+        try:
+            payload = json.dumps(result.data, ensure_ascii=False)[:max_chars]
+        except (TypeError, ValueError):
+            payload = _short_value(str(result.data), max_chars)
+    body = f"observation[{result.tool} · {status}]: {result.summary}"
+    if payload:
+        body = f"{body}\ndata: {payload}"
+    return body
 
 
 def _web_research_query_from_message(

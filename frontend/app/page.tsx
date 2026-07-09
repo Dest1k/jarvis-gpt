@@ -76,6 +76,14 @@ type RuntimeEvent = {
   payload: Record<string, unknown>;
 };
 
+type LiveEvent = {
+  id: string;
+  type: string;
+  title: string;
+  content?: string;
+  ts: number;
+};
+
 type DiagnosticCheck = {
   name: string;
   status: "ok" | "warn" | "error";
@@ -428,6 +436,22 @@ type RuntimePreferences = {
   working_roots: string[];
 };
 
+type OperatorPersona = {
+  display_name: string;
+  headline: string;
+  role: string;
+  location: string;
+  timezone: string;
+  languages: string[];
+  expertise: string[];
+  tech_stack: string[];
+  interests: string[];
+  current_focus: string[];
+  standing_instructions: string[];
+  glossary: Record<string, string>;
+  notes: string;
+};
+
 type AutonomyPolicy = {
   mode: "safe" | "balanced" | "operator";
   allow_safe_tools: boolean;
@@ -682,6 +706,25 @@ function apiUrl() {
   }
 }
 
+function wsUrl() {
+  return apiUrl().replace(/^http/, "ws");
+}
+
+function liveEventLabel(type: string): string {
+  const labels: Record<string, string> = {
+    tool_call: "инструмент",
+    mission_step: "шаг миссии",
+    mission_run: "миссия",
+    mission: "миссия",
+    approval: "допуск",
+    memory: "память",
+    thought: "мысль",
+    task_kernel: "маршрут",
+    assistant_done: "ответ"
+  };
+  return labels[type] ?? type.replace(/_/g, " ");
+}
+
 function fileItemToAttachment(file: FileItem): ChatAttachment {
   return {
     id: file.id,
@@ -927,6 +970,26 @@ function communicationStyleLabel(value: string | null | undefined) {
   return labels[value ?? ""] ?? value ?? "кратко";
 }
 
+function splitList(value: string): string[] {
+  return value
+    .split(/[\n,;]+/)
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+}
+
+function personaDraftFrom(persona: OperatorPersona) {
+  return {
+    display_name: persona.display_name ?? "",
+    role: persona.role ?? "",
+    headline: persona.headline ?? "",
+    location: persona.location ?? "",
+    tech_stack: (persona.tech_stack ?? []).join(", "),
+    interests: (persona.interests ?? []).join(", "),
+    current_focus: (persona.current_focus ?? []).join(", "),
+    standing_instructions: (persona.standing_instructions ?? []).join("\n")
+  };
+}
+
 function isThrowawayChatTitle(value: string) {
   const normalized = value
     .toLowerCase()
@@ -1158,6 +1221,9 @@ export default function CommandCenter() {
   const [status, setStatus] = useState<RuntimeStatus | null>(null);
   const [conversations, setConversations] = useState<ConversationItem[]>([]);
   const [missions, setMissions] = useState<Mission[]>([]);
+  const [runningMissionId, setRunningMissionId] = useState<string | null>(null);
+  const [liveConnected, setLiveConnected] = useState(false);
+  const [liveEvents, setLiveEvents] = useState<LiveEvent[]>([]);
   const [diagnostics, setDiagnostics] = useState<DiagnosticCheck[]>([]);
   const [tools, setTools] = useState<ToolInfo[]>([]);
   const [memories, setMemories] = useState<MemoryItem[]>([]);
@@ -1181,6 +1247,17 @@ export default function CommandCenter() {
     operator_name: "",
     communication_style: "concise" as RuntimePreferences["communication_style"],
     quiet_hours: ""
+  });
+  const [persona, setPersona] = useState<OperatorPersona | null>(null);
+  const [personaDraft, setPersonaDraft] = useState({
+    display_name: "",
+    role: "",
+    headline: "",
+    location: "",
+    tech_stack: "",
+    interests: "",
+    current_focus: "",
+    standing_instructions: ""
   });
   const [autonomyPolicy, setAutonomyPolicy] = useState<AutonomyPolicy | null>(null);
   const [briefing, setBriefing] = useState<DailyBriefing | null>(null);
@@ -1228,6 +1305,7 @@ export default function CommandCenter() {
   const transcriptRef = useRef<HTMLDivElement | null>(null);
   const vitalsRequestInFlightRef = useRef(false);
   const telemetryRequestInFlightRef = useRef(false);
+  const missionsRef = useRef<Mission[]>([]);
 
   const activeChatWindow = useMemo(
     () => chatWindows.find((window) => window.id === activeChatWindowId) ?? chatWindows[0],
@@ -1299,6 +1377,7 @@ export default function CommandCenter() {
         hostBridgeData,
         autonomyData,
         preferencesData,
+        personaData,
         autonomyPolicyData,
         briefingData,
         browserPolicyData,
@@ -1322,6 +1401,7 @@ export default function CommandCenter() {
           api<HostBridgeStatus>("/api/host-bridge"),
           api<AutonomyStatus>("/api/autonomy"),
           api<RuntimePreferences>("/api/preferences"),
+          api<OperatorPersona>("/api/persona"),
           api<AutonomyPolicy>("/api/autonomy/policy"),
           api<DailyBriefing>("/api/briefing"),
           api<BrowserPolicy>("/api/browser/policy"),
@@ -1351,6 +1431,8 @@ export default function CommandCenter() {
         communication_style: preferencesData.communication_style,
         quiet_hours: preferencesData.quiet_hours
       });
+      setPersona(personaData);
+      setPersonaDraft(personaDraftFrom(personaData));
       setAutonomyPolicy(autonomyPolicyData);
       setBriefing(briefingData);
       setBrowserPolicy(browserPolicyData);
@@ -1416,6 +1498,92 @@ export default function CommandCenter() {
     setChatWindows(storedWindows.windows);
     setActiveChatWindowId(storedWindows.activeId);
     setStorageReady(true);
+  }, []);
+
+  useEffect(() => {
+    missionsRef.current = missions;
+  }, [missions]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    let socket: WebSocket | null = null;
+    let closed = false;
+    let reconnectTimer: number | undefined;
+    let missionTimer: number | undefined;
+
+    const refreshMissionsSoon = () => {
+      window.clearTimeout(missionTimer);
+      missionTimer = window.setTimeout(() => {
+        api<Mission[]>("/api/missions")
+          .then(setMissions)
+          .catch(() => {});
+      }, 400);
+    };
+
+    const connect = () => {
+      try {
+        socket = new WebSocket(`${wsUrl()}/ws/events`);
+      } catch {
+        return;
+      }
+      socket.onopen = () => setLiveConnected(true);
+      socket.onclose = () => {
+        setLiveConnected(false);
+        if (!closed) {
+          reconnectTimer = window.setTimeout(connect, 3000);
+        }
+      };
+      socket.onerror = () => {
+        try {
+          socket?.close();
+        } catch {
+          /* ignore */
+        }
+      };
+      socket.onmessage = (event) => {
+        let data: Record<string, unknown>;
+        try {
+          data = JSON.parse(event.data as string);
+        } catch {
+          return;
+        }
+        if (!data || data.channel !== "agent") return;
+        const type = String(data.type ?? "");
+        if (!type) return;
+        setLiveEvents((current) =>
+          [
+            {
+              id: randomId("live"),
+              type,
+              title: String(data.title ?? type),
+              content: data.content ? String(data.content) : undefined,
+              ts: Date.now()
+            },
+            ...current
+          ].slice(0, 8)
+        );
+        if (type.startsWith("mission")) {
+          refreshMissionsSoon();
+        }
+        if (type === "approval") {
+          api<ApprovalItem[]>("/api/approvals?limit=8")
+            .then(setApprovals)
+            .catch(() => {});
+        }
+      };
+    };
+
+    connect();
+    return () => {
+      closed = true;
+      window.clearTimeout(reconnectTimer);
+      window.clearTimeout(missionTimer);
+      try {
+        socket?.close();
+      } catch {
+        /* ignore */
+      }
+    };
   }, []);
 
   useEffect(() => {
@@ -2097,6 +2265,39 @@ export default function CommandCenter() {
     }
   }
 
+  async function savePersona(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setActiveOperation({
+      title: "Профиль оператора",
+      detail: "сохранение persona"
+    });
+    setBusy(true);
+    try {
+      const payload = {
+        display_name: personaDraft.display_name,
+        role: personaDraft.role,
+        headline: personaDraft.headline,
+        location: personaDraft.location,
+        tech_stack: splitList(personaDraft.tech_stack),
+        interests: splitList(personaDraft.interests),
+        current_focus: splitList(personaDraft.current_focus),
+        standing_instructions: splitList(personaDraft.standing_instructions)
+      };
+      const updated = await api<OperatorPersona>("/api/persona", {
+        method: "PATCH",
+        body: JSON.stringify(payload)
+      });
+      setPersona(updated);
+      setPersonaDraft(personaDraftFrom(updated));
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Не удалось сохранить профиль оператора");
+    } finally {
+      setBusy(false);
+      setActiveOperation(null);
+    }
+  }
+
   async function updateBrowserPolicyMode(mode: BrowserPolicy["mode"]) {
     setActiveOperation({
       title: "Политика браузера",
@@ -2461,6 +2662,71 @@ export default function CommandCenter() {
     }
   }
 
+  async function runMissionToCompletion(missionId: string) {
+    // Chain execute-next on the client so each step's progress lands in the UI
+    // live (progress bar + per-task status), stopping on completion, a blocked
+    // step, or a safety cap. The server /run endpoint stays for headless use.
+    const MAX_STEPS = 24;
+    setRunningMissionId(missionId);
+    setBusy(true);
+    let executed = 0;
+    let stoppedReason: "completed" | "blocked" | "budget" = "completed";
+    try {
+      for (let step = 0; step < MAX_STEPS; step += 1) {
+        const current = missionsRef.current.find((item) => item.id === missionId);
+        const nextTask = current?.tasks.find(
+          (task) => task.status !== "done" && task.status !== "blocked"
+        );
+        if (!nextTask) {
+          stoppedReason = "completed";
+          break;
+        }
+        setActiveOperation({
+          title: `Миссия · шаг ${executed + 1}`,
+          detail: nextTask.title
+        });
+        const response = await api<MissionExecution>(
+          `/api/missions/${missionId}/execute-next`,
+          { method: "POST", body: "{}" }
+        );
+        executed += 1;
+        setMissions((list) =>
+          list.map((item) => (item.id === response.mission.id ? response.mission : item))
+        );
+        setLines((current) => [
+          ...current,
+          {
+            role: "system",
+            content: `Шаг ${executed}: ${response.result.summary}${
+              response.task ? `\n${response.task.title} → ${response.task.status}` : ""
+            }`
+          }
+        ]);
+        if (!response.result.ok || response.task?.status === "blocked") {
+          stoppedReason = "blocked";
+          break;
+        }
+        if (step === MAX_STEPS - 1) {
+          stoppedReason = "budget";
+        }
+      }
+      const label =
+        stoppedReason === "completed"
+          ? `Миссия выполнена за ${executed} шаг(ов).`
+          : stoppedReason === "blocked"
+            ? `Миссия остановлена: шаг требует внимания или подтверждения (после ${executed} шаг(ов)).`
+            : `Достигнут лимит шагов (${executed}). Запусти ещё раз, чтобы продолжить.`;
+      setLines((current) => [...current, { role: "system", content: label }]);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Не удалось выполнить миссию");
+    } finally {
+      setBusy(false);
+      setRunningMissionId(null);
+      setActiveOperation(null);
+    }
+  }
+
   async function updateTaskStatus(missionId: string, taskId: string, statusValue: string) {
     const task = missions
       .find((mission) => mission.id === missionId)
@@ -2756,7 +3022,18 @@ export default function CommandCenter() {
           <strong>{modelActivity.label}</strong>
           <p>{modelActivity.detail}</p>
         </div>
+        <span className={`liveDot ${liveConnected ? "on" : "off"}`} title={liveConnected ? "Живые события подключены" : "Ожидание событий"} />
       </article>
+      {liveEvents.length > 0 && (
+        <div className="liveFeed">
+          {liveEvents.slice(0, 4).map((event) => (
+            <div className="liveRow" key={event.id}>
+              <strong>{liveEventLabel(event.type)}</strong>
+              <span>{compactText(event.content || event.title, 52)}</span>
+            </div>
+          ))}
+        </div>
+      )}
       <div className="vitalGrid">
         <div>
           <span>Backend</span>
@@ -2783,7 +3060,10 @@ export default function CommandCenter() {
         <div className="emptyState">Нет активных планов миссий</div>
       ) : (
         missions.slice(0, 5).map((mission) => (
-          <article className="missionItem" key={mission.id}>
+          <article
+            className={`missionItem${runningMissionId === mission.id ? " running" : ""}`}
+            key={mission.id}
+          >
             <div className="missionTitle">
               <CheckCircle2 size={17} />
               <div>
@@ -2794,7 +3074,7 @@ export default function CommandCenter() {
               </div>
             </div>
             <div className="taskList">
-              {mission.tasks.slice(0, 6).map((task) => (
+              {mission.tasks.slice(0, 8).map((task) => (
                 <div className={`taskRow ${task.status}`} key={task.id}>
                   <span>{task.position}</span>
                   <p>{task.title}</p>
@@ -2808,15 +3088,27 @@ export default function CommandCenter() {
                     >
                       <ClipboardCheck size={14} />
                     </button>
-                    <button
-                      type="button"
-                      title="Заблокировано"
-                      aria-label="Заблокировано"
-                      disabled={busy || task.status === "blocked"}
-                      onClick={() => updateTaskStatus(mission.id, task.id, "blocked")}
-                    >
-                      <ShieldAlert size={14} />
-                    </button>
+                    {task.status === "blocked" ? (
+                      <button
+                        type="button"
+                        title="Повторить шаг (после подтверждения допуска)"
+                        aria-label="Повторить шаг"
+                        disabled={busy}
+                        onClick={() => updateTaskStatus(mission.id, task.id, "pending")}
+                      >
+                        <RefreshCw size={14} />
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        title="Заблокировано"
+                        aria-label="Заблокировано"
+                        disabled={busy}
+                        onClick={() => updateTaskStatus(mission.id, task.id, "blocked")}
+                      >
+                        <ShieldAlert size={14} />
+                      </button>
+                    )}
                   </div>
                 </div>
               ))}
@@ -2829,7 +3121,21 @@ export default function CommandCenter() {
                 disabled={busy || mission.status === "done"}
               >
                 <Play size={15} />
-                <span>Следующий шаг</span>
+                <span>Шаг</span>
+              </button>
+              <button
+                className="iconText compact"
+                type="button"
+                onClick={() => runMissionToCompletion(mission.id)}
+                disabled={busy || mission.status === "done"}
+                title="Выполнять шаги до завершения или блокировки"
+              >
+                {runningMissionId === mission.id ? (
+                  <Loader2 className="spin" size={15} />
+                ) : (
+                  <Zap size={15} />
+                )}
+                <span>{runningMissionId === mission.id ? "Выполняю…" : "Запустить всё"}</span>
               </button>
               <small>{Math.round(mission.progress * 100)}%</small>
             </div>
@@ -4064,6 +4370,100 @@ export default function CommandCenter() {
                 disabled={busy}
                 title="Сохранить настройки"
                 aria-label="Сохранить настройки"
+              >
+                {busy ? <Loader2 className="spin" size={15} /> : <Save size={15} />}
+              </button>
+            </form>
+
+            <div className="panelHeader lower">
+              <h2>Профиль оператора</h2>
+              <span>{persona?.role || "не заполнен"}</span>
+            </div>
+            <p className="personaHint">
+              Кто ты, где ты, твой стек и правила. JARVIS читает это в каждом ответе, чтобы быть
+              продолжением тебя, а не универсальным ботом.
+            </p>
+            <form className="personaForm" onSubmit={savePersona}>
+              <input
+                value={personaDraft.display_name}
+                onChange={(event) =>
+                  setPersonaDraft((current) => ({ ...current, display_name: event.target.value }))
+                }
+                placeholder="Имя / позывной"
+                aria-label="Имя оператора"
+              />
+              <input
+                value={personaDraft.location}
+                onChange={(event) =>
+                  setPersonaDraft((current) => ({ ...current, location: event.target.value }))
+                }
+                placeholder="Домашний город (для погоды и локальных запросов)"
+                aria-label="Домашний город"
+              />
+              <input
+                className="full"
+                value={personaDraft.role}
+                onChange={(event) =>
+                  setPersonaDraft((current) => ({ ...current, role: event.target.value }))
+                }
+                placeholder="Роль, например: системный администратор"
+                aria-label="Роль"
+              />
+              <input
+                className="full"
+                value={personaDraft.headline}
+                onChange={(event) =>
+                  setPersonaDraft((current) => ({ ...current, headline: event.target.value }))
+                }
+                placeholder="Пара слов о себе"
+                aria-label="О себе"
+              />
+              <input
+                className="full"
+                value={personaDraft.tech_stack}
+                onChange={(event) =>
+                  setPersonaDraft((current) => ({ ...current, tech_stack: event.target.value }))
+                }
+                placeholder="Стек через запятую: Proxmox, Debian, Docker, PowerShell"
+                aria-label="Технический стек"
+              />
+              <input
+                className="full"
+                value={personaDraft.interests}
+                onChange={(event) =>
+                  setPersonaDraft((current) => ({ ...current, interests: event.target.value }))
+                }
+                placeholder="Увлечения через запятую"
+                aria-label="Увлечения"
+              />
+              <input
+                className="full"
+                value={personaDraft.current_focus}
+                onChange={(event) =>
+                  setPersonaDraft((current) => ({ ...current, current_focus: event.target.value }))
+                }
+                placeholder="Текущий фокус: проекты и задачи через запятую"
+                aria-label="Текущий фокус"
+              />
+              <textarea
+                className="full"
+                value={personaDraft.standing_instructions}
+                onChange={(event) =>
+                  setPersonaDraft((current) => ({
+                    ...current,
+                    standing_instructions: event.target.value
+                  }))
+                }
+                placeholder="Постоянные правила, по одному на строку: всегда показывай команды для Debian; никогда не выполняй rm без подтверждения"
+                aria-label="Постоянные инструкции"
+                rows={3}
+              />
+              <button
+                type="submit"
+                className="full"
+                disabled={busy}
+                title="Сохранить профиль оператора"
+                aria-label="Сохранить профиль оператора"
               >
                 {busy ? <Loader2 className="spin" size={15} /> : <Save size={15} />}
               </button>

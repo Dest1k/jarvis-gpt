@@ -114,6 +114,35 @@ def test_agent_executes_next_mission_step(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_run_mission_chains_all_steps_offline(monkeypatch, tmp_path):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    mission = agent.create_mission("Build tools runtime")
+    task_count = len(mission["tasks"])
+
+    run = asyncio.run(agent.run_mission(mission["id"], max_steps=task_count))
+    refreshed = storage.get_mission(mission["id"])
+
+    assert run.completed is True
+    assert run.stopped_reason == "completed"
+    assert run.executed_steps == task_count
+    assert all(task["status"] == "done" for task in refreshed["tasks"])
+    assert refreshed["progress"] == 1.0
+    storage.close()
+
+
+def test_run_mission_respects_step_budget(monkeypatch, tmp_path):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    mission = agent.create_mission("Build tools runtime")
+    assert len(mission["tasks"]) > 1
+
+    run = asyncio.run(agent.run_mission(mission["id"], max_steps=1))
+
+    assert run.executed_steps == 1
+    assert run.completed is False
+    assert run.stopped_reason == "budget"
+    storage.close()
+
+
 def test_agent_streams_chat_response(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     settings = load_settings()
@@ -1938,6 +1967,102 @@ def test_semantic_router_can_refine_ambiguous_web_query(monkeypatch, tmp_path):
 
     assert captured["query"] == "Python release cycle official docs latest"
     assert "https://www.python.org/downloads/" in response.answer
+    storage.close()
+
+
+def test_reasoning_arbiter_can_override_shopping_keyword_plug(monkeypatch, tmp_path):
+    # A shopping-shaped message that the keyword plug would send to web_research,
+    # but the reasoning-first arbiter judges to be reasoning: no web tool must run.
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    calls = []
+
+    class RouterThenAnswerLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None):
+            calls.append(messages)
+            if len(calls) == 1:
+                return type(
+                    "Result",
+                    (),
+                    {
+                        "ok": True,
+                        "content": (
+                            '{"route":"reasoning","confidence":0.82,'
+                            '"query":"","rationale":"operator wants advice, not live prices"}'
+                        ),
+                        "error": None,
+                    },
+                )()
+            return type(
+                "Result",
+                (),
+                {"ok": True, "content": "Разберём по бюджету и задачам.", "error": None},
+            )()
+
+    agent = AgentRuntime(
+        settings=settings,
+        storage=storage,
+        llm=RouterThenAnswerLLM(),
+        bus=EventBus(),
+    )
+
+    async def fail_tool(name, arguments=None, **kwargs):
+        raise AssertionError(f"web tool {name} must not run when arbiter routes to reasoning")
+
+    monkeypatch.setattr(agent.tools, "run", fail_tool)
+
+    response = asyncio.run(agent.chat("найди самый дешевый iphone 16 на ozon"))
+
+    assert response.answer == "Разберём по бюджету и задачам."
+    assert len(calls) == 2
+    assert "intent-router" in calls[0][0]["content"]
+    storage.close()
+
+
+def test_intent_router_receives_operator_persona_context(monkeypatch, tmp_path):
+    from jarvis_gpt.persona import PersonaManager
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    PersonaManager(settings=settings, storage=storage).update(
+        {"location": "Казань", "role": "системный администратор"}
+    )
+    captured = {}
+
+    class RouterLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None):
+            captured.setdefault("router", messages)
+            return type(
+                "Result",
+                (),
+                {
+                    "ok": True,
+                    "content": (
+                        '{"route":"reasoning","confidence":0.8,'
+                        '"query":"","rationale":"advice"}'
+                    ),
+                    "error": None,
+                },
+            )()
+
+    agent = AgentRuntime(settings=settings, storage=storage, llm=RouterLLM(), bus=EventBus())
+
+    async def noop(name, arguments=None, **kwargs):
+        raise AssertionError(f"unexpected tool {name}")
+
+    monkeypatch.setattr(agent.tools, "run", noop)
+
+    asyncio.run(agent.chat("найди самый дешевый iphone 16 на ozon"))
+
+    router_user_message = captured["router"][1]["content"]
+    assert "operator_context" in router_user_message
+    assert "Казань" in router_user_message
     storage.close()
 
 

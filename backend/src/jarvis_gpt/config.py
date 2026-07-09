@@ -115,6 +115,9 @@ class JarvisSettings:
     llm_enabled: bool
     llm_timeout_sec: float
     llm_max_tokens: int
+    embeddings_enabled: bool
+    embeddings_base_url: str
+    embeddings_model: str
     autonomy_enabled: bool
     telemetry_interval_sec: int
     health_interval_sec: int
@@ -158,6 +161,11 @@ class JarvisSettings:
                 "timeout_sec": self.llm_timeout_sec,
                 "max_tokens": self.llm_max_tokens,
             },
+            "embeddings": {
+                "enabled": self.embeddings_enabled,
+                "base_url": self.embeddings_base_url,
+                "model": self.embeddings_model,
+            },
             "autonomy": {
                 "enabled": self.autonomy_enabled,
                 "telemetry_interval_sec": self.telemetry_interval_sec,
@@ -200,6 +208,12 @@ def load_settings(profile_name: str | None = None) -> JarvisSettings:
         llm_enabled=_bool_env("JARVIS_LLM_ENABLED", True),
         llm_timeout_sec=_float_env("JARVIS_LLM_TIMEOUT_SEC", 240.0),
         llm_max_tokens=_int_env("JARVIS_LLM_MAX_TOKENS", 2048),
+        embeddings_enabled=_bool_env("JARVIS_EMBEDDINGS_ENABLED", False),
+        embeddings_base_url=os.environ.get(
+            "JARVIS_EMBEDDINGS_BASE_URL",
+            os.environ.get("JARVIS_LLM_BASE_URL", "http://localhost:8001/v1"),
+        ).rstrip("/"),
+        embeddings_model=os.environ.get("JARVIS_EMBEDDINGS_MODEL", ""),
         autonomy_enabled=_bool_env("JARVIS_AUTONOMY_ENABLED", True),
         telemetry_interval_sec=_int_env("JARVIS_TELEMETRY_INTERVAL_SEC", 120),
         health_interval_sec=_int_env("JARVIS_HEALTH_INTERVAL_SEC", 300),

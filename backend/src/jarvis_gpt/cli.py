@@ -18,6 +18,7 @@ from .ingest import FileIngestor
 from .learning import LearningEngine
 from .llm import LLMRouter
 from .model_catalog import ModelCatalog
+from .persona import PersonaManager
 from .storage import JarvisStorage
 from .supervisor import RuntimeSupervisor
 from .telemetry import TelemetryCollector
@@ -195,6 +196,20 @@ def cmd_autonomy(args: argparse.Namespace) -> None:
     storage.close()
 
 
+def cmd_persona(args: argparse.Namespace) -> None:
+    settings, storage, _llm, _agent = _runtime(args.profile)
+    _print_json(PersonaManager(settings=settings, storage=storage).persona())
+    storage.close()
+
+
+def cmd_persona_set(args: argparse.Namespace) -> None:
+    settings, storage, _llm, _agent = _runtime(args.profile)
+    patch = _set_arguments(args.sets)
+    updated = PersonaManager(settings=settings, storage=storage).update(patch)
+    _print_json(updated)
+    storage.close()
+
+
 def cmd_ingest(args: argparse.Namespace) -> None:
     settings, storage, _llm, _agent = _runtime(args.profile)
     result = FileIngestor(settings=settings, storage=storage).ingest_path(args.path)
@@ -304,6 +319,16 @@ def cmd_mission_next(args: argparse.Namespace) -> None:
     asyncio.run(run())
 
 
+def cmd_mission_run(args: argparse.Namespace) -> None:
+    async def run() -> None:
+        _settings, storage, _llm, agent = _runtime(args.profile)
+        response = await agent.run_mission(args.mission_id, max_steps=args.max_steps)
+        _print_json(response.model_dump())
+        storage.close()
+
+    asyncio.run(run())
+
+
 def cmd_serve(args: argparse.Namespace) -> None:
     settings = load_settings(args.profile)
     uvicorn.run(
@@ -389,6 +414,22 @@ def build_parser() -> argparse.ArgumentParser:
     autonomy_parser = sub.add_parser("autonomy", help="Show autonomous supervisor settings")
     autonomy_parser.set_defaults(func=cmd_autonomy)
 
+    persona_parser = sub.add_parser("persona", help="Show the durable operator persona")
+    persona_parser.set_defaults(func=cmd_persona)
+
+    persona_set_parser = sub.add_parser(
+        "persona-set",
+        help="Update persona fields, e.g. --set location=Kazan --set tech_stack=Proxmox,Debian",
+    )
+    persona_set_parser.add_argument(
+        "--set",
+        dest="sets",
+        action="append",
+        default=[],
+        help="Set one persona field as key=value (comma-separated for lists). Repeatable.",
+    )
+    persona_set_parser.set_defaults(func=cmd_persona_set)
+
     ingest_parser = sub.add_parser("ingest", help="Copy and index a local text file")
     ingest_parser.add_argument("path")
     ingest_parser.set_defaults(func=cmd_ingest)
@@ -458,6 +499,14 @@ def build_parser() -> argparse.ArgumentParser:
     mission_next_parser = sub.add_parser("mission-next", help="Execute next pending mission task")
     mission_next_parser.add_argument("mission_id")
     mission_next_parser.set_defaults(func=cmd_mission_next)
+
+    mission_run_parser = sub.add_parser(
+        "mission-run",
+        help="Auto-chain mission steps until completion, a blocked step, or the budget",
+    )
+    mission_run_parser.add_argument("mission_id")
+    mission_run_parser.add_argument("--max-steps", type=int, default=None)
+    mission_run_parser.set_defaults(func=cmd_mission_run)
 
     serve_parser = sub.add_parser("serve", help="Start FastAPI backend")
     serve_parser.add_argument("--host", default=None)

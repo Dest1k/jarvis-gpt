@@ -104,6 +104,44 @@ def test_storage_updates_task_progress_and_searches_memory(tmp_path):
     storage.close()
 
 
+def test_storage_update_mission_task_requires_matching_mission_when_provided(tmp_path):
+    storage = JarvisStorage(tmp_path / "state" / "jarvis.sqlite3")
+    storage.initialize()
+    first = storage.create_mission(
+        title="First mission",
+        goal="Keep task ownership isolated",
+        tasks=["Owned task"],
+    )
+    second = storage.create_mission(
+        title="Second mission",
+        goal="Should not update first mission",
+        tasks=["Other task"],
+    )
+    first_task = first["tasks"][0]
+
+    rejected = storage.update_mission_task(
+        first_task["id"],
+        mission_id=second["id"],
+        status="done",
+        notes="wrong mission",
+    )
+    unchanged = storage.get_mission(first["id"])["tasks"][0]
+    accepted = storage.update_mission_task(
+        first_task["id"],
+        mission_id=first["id"],
+        status="done",
+        notes="right mission",
+    )
+
+    assert rejected is None
+    assert unchanged["status"] == "pending"
+    assert unchanged["notes"] is None
+    assert accepted is not None
+    assert accepted["status"] == "done"
+    assert accepted["notes"] == "right mission"
+    storage.close()
+
+
 def test_storage_merges_duplicate_memories_and_hybrid_search(tmp_path):
     storage = JarvisStorage(tmp_path / "state" / "jarvis.sqlite3")
     storage.initialize()

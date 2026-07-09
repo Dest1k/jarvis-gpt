@@ -998,6 +998,7 @@ class JarvisStorage:
         self,
         task_id: str,
         *,
+        mission_id: str | None = None,
         title: str | None = None,
         status: str | None = None,
         notes: str | None = None,
@@ -1009,9 +1010,9 @@ class JarvisStorage:
                 """
                 SELECT id, mission_id, title, status, notes, position, created_at, updated_at
                 FROM mission_tasks
-                WHERE id = ?
+                WHERE id = ? AND (? IS NULL OR mission_id = ?)
                 """,
-                (task_id,),
+                (task_id, mission_id, mission_id),
             ).fetchone()
             if existing is None:
                 return None
@@ -1023,9 +1024,9 @@ class JarvisStorage:
                 """
                 UPDATE mission_tasks
                 SET title = ?, status = ?, notes = ?, updated_at = ?
-                WHERE id = ?
+                WHERE id = ? AND (? IS NULL OR mission_id = ?)
                 """,
-                (next_title, next_status, next_notes, now, task_id),
+                (next_title, next_status, next_notes, now, task_id, mission_id, mission_id),
             )
             self._refresh_mission_progress(conn, existing["mission_id"], now=now)
             conn.commit()

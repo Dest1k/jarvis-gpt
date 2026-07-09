@@ -380,6 +380,19 @@ class MissionExecutionResponse(BaseModel):
     result: ToolRunResponse
 
 
+class MissionStepOutcome(BaseModel):
+    task: MissionTask | None = None
+    result: ToolRunResponse
+
+
+class MissionRunResponse(BaseModel):
+    mission: Mission
+    steps: list[MissionStepOutcome] = Field(default_factory=list)
+    completed: bool = False
+    stopped_reason: Literal["completed", "blocked", "budget", "empty"] = "completed"
+    executed_steps: int = 0
+
+
 class DiagnosticCheck(BaseModel):
     name: str
     status: Literal["ok", "warn", "error"]
@@ -605,3 +618,47 @@ class StatusResponse(BaseModel):
     counters: dict[str, int]
     health: list[DiagnosticCheck]
     recent_events: list[dict[str, Any]]
+
+
+class OperatorPersonaResponse(BaseModel):
+    display_name: str = ""
+    headline: str = ""
+    role: str = ""
+    location: str = ""
+    timezone: str = ""
+    languages: list[str] = Field(default_factory=list)
+    expertise: list[str] = Field(default_factory=list)
+    tech_stack: list[str] = Field(default_factory=list)
+    interests: list[str] = Field(default_factory=list)
+    current_focus: list[str] = Field(default_factory=list)
+    standing_instructions: list[str] = Field(default_factory=list)
+    glossary: dict[str, str] = Field(default_factory=dict)
+    notes: str = ""
+
+
+class OperatorPersonaUpdateRequest(BaseModel):
+    display_name: str | None = Field(default=None, max_length=80)
+    headline: str | None = Field(default=None, max_length=240)
+    role: str | None = Field(default=None, max_length=160)
+    location: str | None = Field(default=None, max_length=120)
+    timezone: str | None = Field(default=None, max_length=64)
+    languages: list[str] | None = None
+    expertise: list[str] | None = None
+    tech_stack: list[str] | None = None
+    interests: list[str] | None = None
+    current_focus: list[str] | None = None
+    standing_instructions: list[str] | None = None
+    glossary: dict[str, str] | None = None
+    notes: str | None = Field(default=None, max_length=800)
+
+
+class OperatorPersonaInsightRequest(BaseModel):
+    field: Literal[
+        "languages",
+        "expertise",
+        "tech_stack",
+        "interests",
+        "current_focus",
+        "standing_instructions",
+    ]
+    value: str = Field(min_length=1, max_length=160)

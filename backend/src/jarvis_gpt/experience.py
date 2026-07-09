@@ -4,6 +4,7 @@ import asyncio
 import time
 from typing import Any
 
+from . import persona as persona_module
 from .config import JarvisSettings
 from .models import DiagnosticCheck
 from .storage import JarvisStorage, utc_now
@@ -135,11 +136,17 @@ class ExperienceManager:
         latest_telemetry = _latest_telemetry_snapshot(self.storage)
         resources = _resource_summary(latest_telemetry)
         counters = self.storage.counters()
+        persona = persona_module.load_persona(self.storage)
         focus = [
-            f"Profile {self.settings.profile.name} on {self.settings.llm_base_url}",
-            f"{counters.get('missions', 0)} missions, {counters.get('memories', 0)} memories, "
-            f"{counters.get('files', 0)} files",
+            f"Focus: {item}" for item in list(persona.get("current_focus") or [])[:2]
         ]
+        focus.extend(
+            [
+                f"Profile {self.settings.profile.name} on {self.settings.llm_base_url}",
+                f"{counters.get('missions', 0)} missions, {counters.get('memories', 0)} "
+                f"memories, {counters.get('files', 0)} files",
+            ]
+        )
         if dispatcher_status is not None:
             focus.append(
                 "Dispatcher online"
