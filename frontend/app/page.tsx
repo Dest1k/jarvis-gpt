@@ -3660,15 +3660,27 @@ export default function CommandCenter() {
                           </time>
                         )}
                         {line.role === "assistant" && line.content.trim() && !line.pending && (
-                          <button
-                            className="bubbleAction"
-                            type="button"
-                            title="Скачать ответ как Markdown"
-                            aria-label="Скачать ответ как Markdown"
-                            onClick={() => downloadChatMessage(line, index)}
-                          >
-                            <Download size={13} />
-                          </button>
+                          <>
+                            {line.id?.startsWith("msg_") && (
+                              <a
+                                className="bubbleAction"
+                                href={`/trace/${encodeURIComponent(line.id)}`}
+                                title="Схема мышления"
+                                aria-label="Схема мышления"
+                              >
+                                <Brain size={13} />
+                              </a>
+                            )}
+                            <button
+                              className="bubbleAction"
+                              type="button"
+                              title="Скачать ответ как Markdown"
+                              aria-label="Скачать ответ как Markdown"
+                              onClick={() => downloadChatMessage(line, index)}
+                            >
+                              <Download size={13} />
+                            </button>
+                          </>
                         )}
                       </div>
                     </div>

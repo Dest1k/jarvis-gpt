@@ -58,6 +58,28 @@ def test_storage_lists_conversations_and_messages(tmp_path):
     storage.close()
 
 
+def test_storage_get_message_by_id_preserves_metadata(tmp_path):
+    storage = JarvisStorage(tmp_path / "state" / "jarvis.sqlite3")
+    storage.initialize()
+    conversation_id = storage.create_conversation("Trace")
+    message_id = storage.add_message(
+        conversation_id=conversation_id,
+        role="assistant",
+        content="observable answer",
+        metadata={"duration_ms": 123, "events": [{"type": "thought", "title": "route"}]},
+    )
+
+    message = storage.get_message(message_id)
+
+    assert message is not None
+    assert message["id"] == message_id
+    assert message["conversation_id"] == conversation_id
+    assert message["metadata"]["duration_ms"] == 123
+    assert message["metadata"]["events"][0]["title"] == "route"
+    assert storage.get_message("msg_missing") is None
+    storage.close()
+
+
 def test_storage_deletes_conversation_and_messages(tmp_path):
     storage = JarvisStorage(tmp_path / "state" / "jarvis.sqlite3")
     storage.initialize()

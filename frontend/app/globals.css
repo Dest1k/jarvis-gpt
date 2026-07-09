@@ -1008,6 +1008,10 @@ h3 {
   color: var(--chat-accent);
 }
 
+.bubbleAction[href] {
+  text-decoration: none;
+}
+
 .richMessage {
   display: grid;
   gap: 9px;
@@ -2648,6 +2652,269 @@ h3 {
   white-space: nowrap;
 }
 
+.tracePage {
+  min-height: 100vh;
+  padding: 22px;
+  background:
+    linear-gradient(180deg, rgba(40, 199, 183, 0.08), rgba(40, 199, 183, 0) 260px),
+    #08100e;
+  color: #edf8f4;
+}
+
+.traceTopbar {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 18px;
+  align-items: center;
+  max-width: 1440px;
+  margin: 0 auto 18px;
+}
+
+.traceBack,
+.traceStatus {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 36px;
+  border: 1px solid #28433d;
+  border-radius: var(--radius);
+  padding: 0 11px;
+  background: #101916;
+  color: #91a7a0;
+  text-decoration: none;
+}
+
+.traceBack:hover {
+  border-color: var(--teal);
+  color: var(--teal);
+}
+
+.traceTopbar p,
+.traceSectionHead p {
+  margin: 0 0 3px;
+  color: #91a7a0;
+  font-size: 11px;
+  text-transform: uppercase;
+}
+
+.traceTopbar h1,
+.traceSectionHead h2 {
+  margin: 0;
+  color: #ffffff;
+  font-size: 20px;
+  line-height: 1.2;
+}
+
+.traceNotice {
+  max-width: 1440px;
+  margin: 0 auto 18px;
+  border: 1px solid #28433d;
+  border-radius: var(--radius);
+  padding: 14px;
+  background: #101916;
+  color: #b7cac4;
+}
+
+.traceNotice.error {
+  border-color: #68444b;
+  background: #21181c;
+  color: #f0b8c4;
+}
+
+.traceIOGrid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr);
+  gap: 16px;
+  max-width: 1440px;
+  margin: 0 auto 18px;
+}
+
+.traceTextPanel,
+.traceSignalSection {
+  min-width: 0;
+  border: 1px solid #28433d;
+  border-radius: var(--radius);
+  background: #101916;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.25);
+}
+
+.traceTextPanel.output {
+  border-color: rgba(64, 215, 196, 0.34);
+}
+
+.tracePanelHeader,
+.traceSectionHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 44px;
+  border-bottom: 1px solid #28433d;
+  padding: 0 14px;
+  color: #91a7a0;
+}
+
+.tracePanelHeader {
+  justify-content: flex-start;
+}
+
+.tracePanelHeader span,
+.traceSectionHead span {
+  color: #91a7a0;
+  font-size: 12px;
+}
+
+.traceTextPanel pre {
+  max-height: 320px;
+  margin: 0;
+  overflow: auto;
+  padding: 14px;
+  color: #edf8f4;
+  font-family: "Cascadia Code", "JetBrains Mono", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+
+.traceSignalSection {
+  max-width: 1440px;
+  margin: 0 auto 18px;
+  overflow: hidden;
+}
+
+.traceRail {
+  display: grid;
+  grid-template-columns: repeat(var(--trace-node-count), minmax(180px, 1fr));
+  gap: 0;
+  overflow-x: auto;
+  padding: 22px 18px 24px;
+}
+
+.traceNode {
+  position: relative;
+  display: grid;
+  grid-template-rows: auto 1fr;
+  justify-items: center;
+  min-width: 180px;
+  padding: 0 10px;
+}
+
+.traceWire {
+  position: absolute;
+  top: 20px;
+  left: 50%;
+  width: 100%;
+  height: 2px;
+  overflow: hidden;
+  background: #28433d;
+}
+
+.traceWire::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: -40%;
+  width: 40%;
+  height: 100%;
+  background: linear-gradient(90deg, transparent, #40d7c4, #ffffff, transparent);
+  animation: traceSignal 1.65s linear infinite;
+}
+
+.traceNodeIcon {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  place-items: center;
+  width: 42px;
+  height: 42px;
+  border: 1px solid #2c5b51;
+  border-radius: 50%;
+  background: #0d1714;
+  color: #40d7c4;
+}
+
+.tracePulse {
+  position: absolute;
+  inset: -5px;
+  border: 1px solid rgba(64, 215, 196, 0.38);
+  border-radius: 50%;
+  animation: tracePulse 2.2s ease-out infinite;
+}
+
+.traceNodeBody {
+  width: 100%;
+  min-height: 168px;
+  margin-top: 12px;
+  border: 1px solid #28433d;
+  border-radius: var(--radius);
+  padding: 11px;
+  background: #121d1a;
+}
+
+.traceNodeBody span {
+  color: #91a7a0;
+  font-size: 10px;
+  text-transform: uppercase;
+}
+
+.traceNodeBody h3 {
+  margin: 4px 0 7px;
+  color: #ffffff;
+  font-size: 13px;
+  line-height: 1.3;
+}
+
+.traceNodeBody p,
+.traceMetaGrid span {
+  margin: 0;
+  color: #bfd1cc;
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.traceNodeBody pre {
+  max-height: 110px;
+  margin: 9px 0 0;
+  overflow: auto;
+  border: 1px solid #28433d;
+  border-radius: var(--radius);
+  padding: 8px;
+  background: #0b1311;
+  color: #8fe9dc;
+  font-family: "Cascadia Code", "JetBrains Mono", Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+
+.traceNode.input .traceNodeIcon,
+.traceNode.output .traceNodeIcon {
+  border-color: var(--teal);
+  background: #0f5f5b;
+  color: #ffffff;
+}
+
+.traceMetaGrid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  max-width: 1440px;
+  margin: 0 auto;
+}
+
+.traceMetaGrid div {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  border: 1px solid #28433d;
+  border-radius: var(--radius);
+  padding: 12px;
+  background: #101916;
+  color: #40d7c4;
+}
+
 .srOnly {
   position: absolute;
   width: 1px;
@@ -2670,6 +2937,23 @@ h3 {
   }
 }
 
+@keyframes traceSignal {
+  to {
+    left: 100%;
+  }
+}
+
+@keyframes tracePulse {
+  0% {
+    opacity: 0.9;
+    transform: scale(0.8);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1.35);
+  }
+}
+
 @media (max-width: 1040px) {
   .realtimeStrip {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -2688,6 +2972,16 @@ h3 {
     height: max(520px, var(--chat-target-height, 620px), calc(100vh - 220px));
     min-height: 520px;
     max-height: none;
+  }
+
+  .traceIOGrid,
+  .traceMetaGrid {
+    grid-template-columns: 1fr;
+  }
+
+  .traceTopbar {
+    grid-template-columns: 1fr;
+    align-items: stretch;
   }
 }
 
@@ -2754,5 +3048,50 @@ h3 {
 
   .preferencesForm input:first-child {
     grid-column: 1 / -1;
+  }
+
+  .tracePage {
+    padding: 14px;
+  }
+
+  .traceRail {
+    grid-template-columns: 1fr;
+    overflow-x: visible;
+    gap: 14px;
+  }
+
+  .traceNode {
+    grid-template-columns: 42px minmax(0, 1fr);
+    grid-template-rows: 1fr;
+    justify-items: stretch;
+    min-width: 0;
+    padding: 0;
+  }
+
+  .traceWire {
+    top: 42px;
+    left: 20px;
+    width: 2px;
+    height: calc(100% + 14px);
+  }
+
+  .traceWire::after {
+    top: -40%;
+    left: 0;
+    width: 100%;
+    height: 40%;
+    background: linear-gradient(180deg, transparent, #40d7c4, #ffffff, transparent);
+    animation-name: traceSignalVertical;
+  }
+
+  .traceNodeBody {
+    margin-top: 0;
+    margin-left: 12px;
+  }
+}
+
+@keyframes traceSignalVertical {
+  to {
+    top: 100%;
   }
 }

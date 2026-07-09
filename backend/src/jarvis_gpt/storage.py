@@ -552,6 +552,20 @@ class JarvisStorage:
             ).fetchone()
         return dict(row) if row else None
 
+    def get_message(self, message_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self.connect().execute(
+                """
+                SELECT id, conversation_id, role, content, metadata, created_at
+                FROM messages
+                WHERE id = ?
+                """,
+                (message_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {**dict(row), "metadata": _loads(row["metadata"], {})}
+
     def delete_conversation(self, conversation_id: str) -> bool:
         with self._lock:
             conn = self.connect()

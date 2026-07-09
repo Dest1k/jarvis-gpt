@@ -250,6 +250,159 @@ async def agent_trace(conversation_id: str) -> dict[str, Any]:
     }
 
 
+@app.get("/api/agent/trace/message/{message_id}")
+async def agent_message_trace(message_id: str) -> dict[str, Any]:
+    message = app.state.storage.get_message(message_id)
+    if message is None:
+        raise HTTPException(status_code=404, detail="Message not found")
+    if message.get("role") != "assistant":
+        raise HTTPException(status_code=400, detail="Only assistant messages have thought traces")
+    conversation_id = str(message.get("conversation_id") or "")
+    conversation = app.state.storage.get_conversation(conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    messages = app.state.storage.list_messages(conversation_id, limit=500)
+    return _message_trace_payload(conversation=conversation, messages=messages, output=message)
+
+
+def _message_trace_payload(
+    *,
+    conversation: dict[str, Any],
+    messages: list[dict[str, Any]],
+    output: dict[str, Any],
+) -> dict[str, Any]:
+    output_id = str(output.get("id") or "")
+    output_index = next(
+        (index for index, item in enumerate(messages) if item.get("id") == output_id),
+        -1,
+    )
+    input_message = _previous_user_message(messages, before_index=output_index)
+    metadata = output.get("metadata") if isinstance(output.get("metadata"), dict) else {}
+    events = metadata.get("events") if isinstance(metadata, dict) else []
+    if not isinstance(events, list):
+        events = []
+    nodes, edges = _trace_nodes_and_edges(
+        input_message=input_message,
+        output_message=output,
+        events=events,
+    )
+    return {
+        "conversation": conversation,
+        "input": _trace_message_payload(input_message),
+        "output": _trace_message_payload(output),
+        "duration_ms": metadata.get("duration_ms") if isinstance(metadata, dict) else None,
+        "events": events,
+        "nodes": nodes,
+        "edges": edges,
+        "disclosure": (
+            "Trace shows observable runtime stages, tools, routing and stored metadata; "
+            "it does not expose hidden chain-of-thought."
+        ),
+    }
+
+
+def _previous_user_message(
+    messages: list[dict[str, Any]],
+    *,
+    before_index: int,
+) -> dict[str, Any] | None:
+    if before_index < 0:
+        return None
+    for item in reversed(messages[:before_index]):
+        if item.get("role") == "user":
+            return item
+    return None
+
+
+def _trace_message_payload(message: dict[str, Any] | None) -> dict[str, Any] | None:
+    if message is None:
+        return None
+    metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+    return {
+        "id": message.get("id"),
+        "conversation_id": message.get("conversation_id"),
+        "role": message.get("role"),
+        "content": message.get("content"),
+        "created_at": message.get("created_at"),
+        "metadata": metadata,
+    }
+
+
+def _trace_nodes_and_edges(
+    *,
+    input_message: dict[str, Any] | None,
+    output_message: dict[str, Any],
+    events: list[Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    nodes: list[dict[str, Any]] = [
+        {
+            "id": "input",
+            "kind": "input",
+            "title": "Вход",
+            "summary": _short_trace_text((input_message or {}).get("content")),
+        }
+    ]
+    previous_id = "input"
+    edges: list[dict[str, str]] = []
+    for index, raw_event in enumerate(events):
+        if not isinstance(raw_event, dict):
+            continue
+        node_id = f"event-{index}"
+        payload = raw_event.get("payload") if isinstance(raw_event.get("payload"), dict) else {}
+        nodes.append(
+            {
+                "id": node_id,
+                "kind": str(raw_event.get("type") or "event"),
+                "title": str(raw_event.get("title") or raw_event.get("type") or "Событие"),
+                "summary": _short_trace_text(
+                    raw_event.get("content") or _event_payload_summary(payload)
+                ),
+                "payload": payload,
+            }
+        )
+        edges.append({"from": previous_id, "to": node_id})
+        previous_id = node_id
+    nodes.append(
+        {
+            "id": "output",
+            "kind": "output",
+            "title": "Выход",
+            "summary": _short_trace_text(output_message.get("content")),
+        }
+    )
+    edges.append({"from": previous_id, "to": "output"})
+    return nodes, edges
+
+
+def _event_payload_summary(payload: dict[str, Any]) -> str:
+    if not payload:
+        return ""
+    preferred = []
+    for key in (
+        "route",
+        "intent",
+        "query",
+        "tool",
+        "ok",
+        "source",
+        "finish_reason",
+        "tool_steps",
+        "continuations",
+    ):
+        if key in payload:
+            preferred.append(f"{key}={payload[key]}")
+    if preferred:
+        return "; ".join(preferred)
+    return json.dumps(payload, ensure_ascii=False)[:500]
+
+
+def _short_trace_text(value: Any, max_chars: int = 360) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars].rstrip()}..."
+
+
 @app.get("/api/models", response_model=ModelCatalogResponse)
 async def models() -> ModelCatalogResponse:
     return app.state.model_hub.inventory()

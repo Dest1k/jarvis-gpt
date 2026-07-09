@@ -11,6 +11,17 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ### 2026-07-09 - Codex
 
+- Added per-answer thought trace UI: assistant bubbles now show a Brain icon once
+  the persisted `msg_*` id is known. It opens `/trace/{messageId}`.
+- New backend endpoint `GET /api/agent/trace/message/{message_id}` returns the
+  previous user input, assistant output, recorded runtime events, nodes/edges, and
+  a disclosure that this is observable runtime trace rather than hidden CoT.
+- Added a trace page with animated signal rail from input through task kernel,
+  tools/memory/thought events, and output. It uses stored message metadata; no
+  real browser opens or extra LLM calls are involved.
+
+### 2026-07-09 - Codex
+
 - Added an evidence-synthesis pass after `web.search`/`web.fetch`: web answers now
   ask the LLM to form a conclusion from fetched evidence, mark uncertainty, and
   keep source URLs, instead of returning only a mechanical source dump.

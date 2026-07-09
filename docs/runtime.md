@@ -1,5 +1,18 @@
 # Runtime
 
+## 2026-07-09 handoff - per-answer thought trace
+
+For the operator and the second model:
+
+- Assistant chat bubbles now show a Brain action once the saved backend message id
+  is known. The action opens `/trace/{messageId}`.
+- `GET /api/agent/trace/message/{message_id}` returns the previous user input,
+  assistant output, recorded event metadata, and a nodes/edges graph for the turn.
+- The trace page visualizes the observable runtime path with an animated signal:
+  input -> task kernel / memory / tools / synthesis / assistant_done -> output.
+- This deliberately exposes operational trace, not hidden chain-of-thought. It is
+  built from persisted metadata and does not trigger a new LLM call.
+
 ## 2026-07-09 handoff - web evidence synthesis
 
 For the operator and the second model:
@@ -281,6 +294,8 @@ POST /api/persona/insight
 POST /api/learning/tick
 POST /api/chat
 POST /api/chat/stream
+GET  /api/agent/trace/{conversation_id}
+GET  /api/agent/trace/message/{message_id}
 GET  /api/conversations
 GET  /api/conversations/{conversation_id}/messages
 GET  /api/missions

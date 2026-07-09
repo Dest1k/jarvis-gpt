@@ -20,6 +20,7 @@
 - Реальное исполнение миссий: шаг миссии при живом LLM выполняется агентным tool-loop (реальные инструменты, approval для опасного, аудит), а не статичным brief; офлайн — прежний детерминированный brief.
 - Авто-цепочка миссий: `run_mission` / `POST /api/missions/{id}/run` / `mission-run` проходят миссию до завершения, блокировки или бюджета шагов; в Command Center кнопка «Запустить всё» показывает прогресс живьём (прогресс-бар, статусы задач, лог шагов).
 - Живые события: Command Center подписан на `/ws/events` по WebSocket — лента активности агента, живой индикатор и авто-обновление миссий/допусков без поллинга.
+- Per-answer thought trace: у каждого сохранённого ответа есть переход на `/trace/{messageId}` с визуальной цепочкой input -> runtime events -> output.
 - Retrieval adds normalized relevance, matched terms and snippets for memory/file context.
 - Learning tick deduplicates repeated lessons before writing long-term memory.
 - Autonomous supervisor: безопасный фоновой цикл собирает telemetry и запускает learning tick.
