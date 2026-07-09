@@ -94,6 +94,41 @@ def test_chat_answer_repaired_after_failed_self_check(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_slow_self_check_does_not_block_the_ready_draft(monkeypatch, tmp_path):
+    # A hung critic must degrade to shipping the already-computed draft, not
+    # hold it for the full LLM timeout.
+    import jarvis_gpt.agent as agent_module
+
+    class HangingCriticLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, messages, *, temperature=None, max_tokens=None, **kwargs):
+            self.calls += 1
+            system = _system_text(messages)
+            if "answer-verification-v1" in system:
+                await asyncio.sleep(5)  # longer than the patched verify timeout
+                return _result(PASS_VERDICT)
+            if self.calls == 1:
+                return _result('{"tool": "runtime.status", "arguments": {}}')
+            return _result("Готовый ответ по данным инструментов.")
+
+    monkeypatch.setattr(agent_module, "VERIFY_TIMEOUT_SEC", 0.2)
+    llm = HangingCriticLLM()
+    agent, storage = _agent(monkeypatch, tmp_path, llm)
+
+    async def fake_run(name, arguments=None, **kwargs):
+        return type("R", (), {"tool": name, "ok": True, "summary": "ok", "data": {}})()
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+
+    response = asyncio.run(agent.chat("собери статус рантайма и ответь"))
+
+    assert response.answer == "Готовый ответ по данным инструментов."
+    assert not [event for event in response.events if event.type == "verification"]
+    storage.close()
+
+
 def test_chat_answer_passes_self_check_unchanged(monkeypatch, tmp_path):
     class PassingLLM:
         def __init__(self) -> None:

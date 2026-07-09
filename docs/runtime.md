@@ -1,5 +1,40 @@
 # Runtime
 
+## 2026-07-09 handoff - hardening pass (API smoke, verify timeout, config sync)
+
+Для оператора и второй модели. Не фича, а закрытие насущных пробелов после трёх
+feature-слоёв (understanding / result integrity / experience loop). Аудит
+критичных путей (безопасность, устойчивость, конкурентность, покрытие) выявил
+три реальные проблемы; SQLite-конкурентность (единое соединение под RLock,
+`check_same_thread=False`) и лимит тела `web.fetch` уже были корректны.
+
+- End-to-end смоук API (`backend/tests/test_api_smoke.py`): раньше НИ один тест
+  не гонял ~40 роутов через реальный ASGI, только компоненты в изоляции —
+  регрессия роутинга (неверный response_model, забытый await) уехала бы молча.
+  Тест поднимает приложение (offline LLM, autonomy off) и проходит критичный
+  путь оператора: health/status/models, chat offline + feedback roundtrip
+  (+404/422), mission create/run/report (+404 до готовности), operator queue,
+  memory, tools (safe-run + отказ danger без approval), approvals, persona
+  get/patch. Уже окупился: поймал два неверных предположения о контракте
+  (`/health` даёт `{ok}`, `/api/persona` — плоский объект).
+- Таймаут-бюджет самопроверки: критик и ремонт запускаются ПОСЛЕ готового
+  черновика, поэтому зависший критик не должен держать ответ. Обе LLM-операции
+  теперь в `asyncio.wait_for(..., self._verify_timeout())`
+  (`VERIFY_TIMEOUT_SEC=45`, но не больше `llm_timeout_sec`); таймаут/ошибка
+  деградируют до «отдать черновик», а не блок на 240с. Тест
+  `test_slow_self_check_does_not_block_the_ready_draft`.
+- `.env.example` синхронизирован с config: добавлены `JARVIS_VERIFY_ANSWERS`,
+  `JARVIS_EMBEDDINGS_ENABLED/BASE_URL/MODEL`, `JARVIS_AUTONOMY_MISSION_INTERVAL_SEC`.
+- Остаточный риск (осознанно НЕ трогал): `web.fetch` проверяет публичность хоста
+  префлайтом `getaddrinfo`, но httpx резолвит заново при запросе — узкое окно
+  DNS-rebinding TOCTOU. Реалистичные атаки (литеральные внутренние IP, внутренние
+  хостнеймы, смешанные A-записи public+private) уже блокируются
+  `_hostname_is_private`. Полный пиннинг к IP ломает TLS SNI/валидацию сертификата
+  для легитимного HTTPS — для локального однопользовательского инструмента это
+  худшая регрессия, чем редкий rebinding. Кандидат: кастомный httpx-транспорт с
+  корректным SNI, если появится многопользовательский сценарий.
+- Полный прогон — 184 pass, ruff clean, frontend typecheck + build clean.
+
 ## 2026-07-09 handoff - experience loop (feedback -> lessons -> behavior)
 
 Для оператора и второй модели. Раньше петля самообучения была разомкнута:

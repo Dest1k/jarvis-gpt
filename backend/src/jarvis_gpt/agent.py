@@ -185,6 +185,10 @@ FILE_FALLBACK_MIN_RELATEDNESS = 0.1
 # answers are exempt so trivial chat stays single-pass.
 VERIFY_MIN_ANSWER_CHARS = 400
 VERIFY_MAX_TOKENS = 350
+# The self-check runs after a good draft already exists, so a slow or hung
+# critic must never hold that draft hostage: it gets a tight budget and any
+# timeout degrades to "ship the draft" instead of blocking for llm_timeout_sec.
+VERIFY_TIMEOUT_SEC = 45.0
 
 
 @dataclass
@@ -2666,25 +2670,31 @@ class AgentRuntime:
         criteria: tuple[str, ...] = (),
         kind: str = "chat",
     ) -> Verdict | None:
-        """One budgeted critic pass; any failure means None and the answer stands."""
+        """One budgeted critic pass; any failure or timeout means None (draft stands)."""
 
         try:
-            result = await self._complete_llm(
-                build_verification_messages(
-                    task=task,
-                    answer=answer,
-                    criteria=criteria,
-                    kind=kind,
+            result = await asyncio.wait_for(
+                self._complete_llm(
+                    build_verification_messages(
+                        task=task,
+                        answer=answer,
+                        criteria=criteria,
+                        kind=kind,
+                    ),
+                    temperature=0.0,
+                    max_tokens=VERIFY_MAX_TOKENS,
+                    thinking_enabled=False,
                 ),
-                temperature=0.0,
-                max_tokens=VERIFY_MAX_TOKENS,
-                thinking_enabled=False,
+                timeout=self._verify_timeout(),
             )
-        except Exception:  # noqa: BLE001 - verification must never break a turn
+        except Exception:  # noqa: BLE001 - timeout or error must never block a ready draft
             return None
         if not result.ok or not result.content:
             return None
         return parse_verdict(result.content)
+
+    def _verify_timeout(self) -> float:
+        return min(VERIFY_TIMEOUT_SEC, max(5.0, float(self.settings.llm_timeout_sec or 45)))
 
     def _verification_event(self, verdict: Verdict, *, repaired: bool = False) -> ChatEvent:
         if verdict.verdict == "pass":
@@ -2746,11 +2756,14 @@ class AgentRuntime:
             )
         repaired_text = ""
         try:
-            result = await self._complete_llm(
-                build_repair_messages(base_messages, answer, verdict, mode=repair_mode),
-                temperature=temperature,
-                max_tokens=max_tokens,
-                thinking_enabled=thinking_enabled,
+            result = await asyncio.wait_for(
+                self._complete_llm(
+                    build_repair_messages(base_messages, answer, verdict, mode=repair_mode),
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    thinking_enabled=thinking_enabled,
+                ),
+                timeout=self._verify_timeout(),
             )
             if result.ok and result.content:
                 repaired_text = _clean_assistant_answer(result.content).strip()
@@ -2758,7 +2771,7 @@ class AgentRuntime:
                 # A repair that came back as tool/router JSON is broken output;
                 # the draft answer must survive it.
                 repaired_text = ""
-        except Exception:  # noqa: BLE001 - a broken repair must not lose the draft
+        except Exception:  # noqa: BLE001 - timeout or error must keep the draft
             repaired_text = ""
         repaired = bool(repaired_text)
         if repaired:

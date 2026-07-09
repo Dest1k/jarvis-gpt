@@ -74,6 +74,8 @@ External host runtime
 - Dispatcher вынесен в отдельный Compose profile `llm`, чтобы Command Center можно было запускать без случайной загрузки тяжёлых весов в VRAM.
 - Любое действие с риском выше safe должно сначала стать approval gate; выполнение после approve проходит через отдельный whitelisted gated executor.
 - Self-learning идёт через append-only learning journal и `learning.tick`: диалоги, tool runs, web/browser observations и deletion markers превращаются в lessons без привязки к видимой истории чатов.
+- Устойчивость слоя целостности: самопроверка и ремонт запускаются после готового черновика, поэтому у них отдельный таймаут-бюджет (`VERIFY_TIMEOUT_SEC`, не больше `llm_timeout_sec`) — зависший критик деградирует до отдачи черновика, а не держит готовый ответ на полный LLM-таймаут. Это тот же принцип «сбой контроля качества не портит хороший результат», но на оси латентности.
+- Контракт API проверяется end-to-end: `test_api_smoke.py` поднимает реальное ASGI-приложение (offline, autonomy off) и проходит критичный путь оператора, ловя регрессии роутинга (response_model, await, статус-коды), которые unit-тесты компонентов пропускают.
 - Autonomous supervisor безопасно выполняет только наблюдение: telemetry snapshots и learning tick сразу при старте и далее по расписанию; действия с риском остаются через approvals.
 - Performance слой разделяет лёгкий backend и тяжёлый dispatcher; GPU утилизируется vLLM-профилем, а backend собирает telemetry без удержания весов.
 

@@ -9,6 +9,27 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-09 - Claude (hardening pass)
+
+- Audit of critical paths after three feature layers; fixed the real gaps,
+  confirmed SQLite concurrency (single conn + RLock, check_same_thread=False)
+  and web.fetch body cap were already sound.
+- `backend/tests/test_api_smoke.py`: first end-to-end test through the real
+  ASGI app (offline LLM, autonomy off) — status/chat/feedback/mission/report/
+  queue/memory/tools/approvals/persona, incl. 404/422 and danger-tool refusal.
+  Boot via `with TestClient(app)` runs the lifespan. It caught two wrong
+  contract assumptions immediately (that is the point).
+- Verify/repair now run under `asyncio.wait_for(self._verify_timeout())`
+  (`VERIFY_TIMEOUT_SEC=45`, capped by llm_timeout): a hung critic degrades to
+  shipping the ready draft instead of blocking for the full LLM timeout.
+- `.env.example` synced with config (verify/embeddings/mission-interval vars).
+- Known residual, deliberately not changed: web.fetch SSRF pre-flight is a
+  DNS-rebinding TOCTOU. Realistic attacks are already blocked; a full IP pin
+  breaks TLS SNI for legitimate HTTPS — worse than the rare rebinding for a
+  single-operator local tool. Revisit with a custom httpx transport if a
+  multi-tenant scenario appears.
+- Full run: 184 pass, ruff clean, frontend typecheck + build clean.
+
 ### 2026-07-09 - Claude (experience loop)
 
 - Closed the open half of the self-learning thesis: signals -> lessons ->
