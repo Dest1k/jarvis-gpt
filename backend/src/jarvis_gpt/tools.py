@@ -1020,6 +1020,24 @@ class ToolRegistry:
         )
         self.add(
             ToolSpec(
+                name="web.answer",
+                description=(
+                    "Google-like answer engine: expand a question into focused searches, "
+                    "research/rank sources, verify coverage, and return a cited answer."
+                ),
+                category="web",
+                input_schema={
+                    "question": "User question to answer from the public web",
+                    "query": "Optional explicit search query",
+                    "max_sources": "Maximum ranked sources",
+                    "region": "Search region, default ru-ru",
+                    "freshness": "day, week, month, year, or empty",
+                },
+                handler=_web_answer,
+            )
+        )
+        self.add(
+            ToolSpec(
                 name="web.verify",
                 description=(
                     "Check a claim against saved evidence, supplied URLs, or a search query "
@@ -2744,6 +2762,123 @@ async def _web_research(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
             "sources": sources,
             "citations": _research_citations(sources),
             "verification": verification_data,
+            "steps": steps,
+        },
+    )
+
+
+async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    question = " ".join(
+        str(args.get("question") or args.get("query") or args.get("claim") or "").split()
+    )
+    explicit_query = " ".join(str(args.get("query") or "").split())
+    if not question:
+        return ToolRunResponse(tool="web.answer", ok=False, summary="Question is required.")
+    if len(question) > 600:
+        question = question[:600].rstrip()
+    max_sources = _int_arg(args.get("max_sources"), default=6, minimum=2, maximum=10)
+    region = _normalize_search_region(args.get("region"))
+    freshness = _normalize_search_freshness(args.get("freshness"))
+    queries = _web_answer_queries(question, explicit_query=explicit_query)
+    sources_by_url: dict[str, dict[str, Any]] = {}
+    evidence_ids: list[str] = []
+    steps: list[dict[str, Any]] = []
+
+    for index, query in enumerate(queries[:3]):
+        per_query_sources = max(2, min(5, max_sources - len(sources_by_url) + 1))
+        researched = await _web_research(
+            ctx,
+            {
+                "query": query,
+                "claim": question,
+                "max_sources": per_query_sources,
+                "region": region,
+                "freshness": freshness,
+                "pages": 2 if index == 0 else 1,
+                "render_fallback": True,
+                "archive_fallback": True,
+            },
+        )
+        steps.append(
+            {
+                "tool": "web.research",
+                "ok": researched.ok,
+                "summary": researched.summary,
+                "query": query,
+            }
+        )
+        if not researched.ok or not isinstance(researched.data, dict):
+            continue
+        for source in researched.data.get("sources", []):
+            if not isinstance(source, dict):
+                continue
+            url = str(source.get("url") or "")
+            if not url:
+                continue
+            ranked = {
+                **source,
+                "answer_query": query,
+                "answer_score": _web_answer_source_score(question, source),
+            }
+            current = sources_by_url.get(url)
+            if current is None or float(ranked["answer_score"]) > float(
+                current.get("answer_score") or 0
+            ):
+                sources_by_url[url] = ranked
+            evidence_id = str(source.get("evidence_id") or "")
+            if evidence_id and evidence_id not in evidence_ids:
+                evidence_ids.append(evidence_id)
+        if len(sources_by_url) >= max_sources and evidence_ids:
+            break
+
+    ranked_sources = sorted(
+        sources_by_url.values(),
+        key=lambda item: float(item.get("answer_score") or 0),
+        reverse=True,
+    )[:max_sources]
+    ranked_evidence_ids = [
+        str(item.get("evidence_id") or "")
+        for item in ranked_sources
+        if str(item.get("evidence_id") or "")
+    ]
+    verification = await _web_verify(
+        ctx,
+        {"claim": question, "evidence_ids": ranked_evidence_ids[:8]},
+    )
+    steps.append({"tool": "web.verify", "ok": verification.ok, "summary": verification.summary})
+    verification_data = (
+        verification.data.get("verification")
+        if verification.ok and isinstance(verification.data, dict)
+        else {}
+    )
+    answer = _format_web_answer_report(
+        question=question,
+        queries=queries,
+        sources=ranked_sources,
+        verification=verification_data if isinstance(verification_data, dict) else {},
+    )
+    record = _store_web_research_record(
+        ctx.storage,
+        query=queries[0],
+        claim=question,
+        sources=ranked_sources,
+        verification=verification_data if isinstance(verification_data, dict) else {},
+        report=answer,
+    )
+    return ToolRunResponse(
+        tool="web.answer",
+        ok=bool(ranked_sources),
+        summary=f"Answer engine ranked {len(ranked_sources)} source(s).",
+        data={
+            "id": record["id"],
+            "question": question,
+            "query": queries[0],
+            "queries": queries,
+            "answer": answer,
+            "sources": ranked_sources,
+            "citations": _research_citations(ranked_sources),
+            "verification": verification_data,
+            "confidence": _web_answer_confidence(ranked_sources, verification_data),
             "steps": steps,
         },
     )
@@ -5993,6 +6128,213 @@ def _search_results_for_tools(search: ToolRunResponse) -> list[dict[str, Any]]:
         for item in search.data.get("results", [])
         if isinstance(item, dict) and item.get("url")
     ][:12]
+
+
+def _web_answer_queries(question: str, *, explicit_query: str = "") -> list[str]:
+    base = explicit_query or question
+    queries = [_web_answer_clean_query(base)]
+    normalized = question.lower()
+    if not any(marker in normalized for marker in ("site:", "официаль", "official")):
+        if _web_answer_looks_like_shopping(normalized):
+            queries.append(_web_answer_clean_query(f"{question} цена наличие официальный магазин"))
+        elif _looks_like_place_lookup_text(normalized):
+            queries.append(_web_answer_clean_query(f"{question} официальный сайт адрес телефон"))
+        elif _looks_like_freshness_question(normalized):
+            queries.append(_web_answer_clean_query(f"{question} latest official"))
+        else:
+            queries.append(_web_answer_clean_query(f"{question} official source"))
+    queries.append(_web_answer_clean_query(f"{question} site:wikipedia.org OR official"))
+    result: list[str] = []
+    for query in queries:
+        if query and query not in result:
+            result.append(query[:300])
+    return result[:3]
+
+
+def _web_answer_clean_query(query: str) -> str:
+    cleaned = " ".join(str(query or "").split())
+    cleaned = re.sub(
+        r"(?i)\b(?:погугли|загугли|найди\s+в\s+интернете|google|search\s+for)\b",
+        " ",
+        cleaned,
+    )
+    return " ".join(cleaned.split())
+
+
+def _looks_like_place_lookup_text(normalized: str) -> bool:
+    return any(
+        marker in normalized
+        for marker in (
+            "адрес",
+            "телефон",
+            "часы",
+            "график",
+            "как добраться",
+            "where is",
+            "address",
+            "phone",
+            "hours",
+        )
+    )
+
+
+def _web_answer_looks_like_shopping(normalized: str) -> bool:
+    return any(
+        marker in normalized
+        for marker in (
+            "купить",
+            "цена",
+            "стоимость",
+            "наличие",
+            "магазин",
+            "заказать",
+            "buy",
+            "price",
+            "in stock",
+            "shop",
+            "store",
+        )
+    )
+
+
+def _looks_like_freshness_question(normalized: str) -> bool:
+    return any(
+        marker in normalized
+        for marker in (
+            "сейчас",
+            "сегодня",
+            "последн",
+            "свеж",
+            "актуаль",
+            "latest",
+            "current",
+            "today",
+            "recent",
+        )
+    )
+
+
+def _web_answer_source_score(question: str, source: dict[str, Any]) -> float:
+    url = str(source.get("url") or "")
+    host = _url_domain(url)
+    quality = str(source.get("quality") or "")
+    text = " ".join(
+        str(source.get(key) or "")
+        for key in ("title", "url", "snippet", "excerpt")
+    )
+    score = 0.0
+    if bool(source.get("fetched")):
+        score += 2.2
+    if source.get("evidence_id"):
+        score += 0.8
+    if source.get("tool") == "web.archive":
+        score += 0.25
+    if quality in {"primary-official", "primary-or-vendor", "vendor-docs"}:
+        score += 1.4
+    elif quality == "fetched-page":
+        score += 0.5
+    elif quality == "snippet-only":
+        score -= 0.9
+    if host.endswith((".gov", ".edu", ".int")):
+        score += 1.2
+    if any(part in host for part in ("docs.", "support.", "developer.", "learn.")):
+        score += 0.8
+    if any(part in host for part in ("reddit.", "twitter.", "x.com", "t.me")):
+        score -= 0.6
+    question_terms = set(_web_answer_terms(question))
+    source_terms = set(_web_answer_terms(text))
+    if question_terms:
+        score += min(2.0, 3.0 * len(question_terms & source_terms) / len(question_terms))
+    return round(score, 3)
+
+
+def _web_answer_terms(text: str) -> list[str]:
+    normalized = _repair_mojibake(text).lower()
+    tokens = re.findall(r"[a-zа-яё0-9]{3,}", normalized, flags=re.IGNORECASE)
+    stopwords = set(WEB_VERIFY_STOPWORDS) | {
+        "как",
+        "что",
+        "где",
+        "это",
+        "для",
+        "the",
+        "and",
+        "with",
+        "latest",
+        "official",
+    }
+    result: list[str] = []
+    for token in tokens:
+        if token in stopwords or token in result:
+            continue
+        result.append(token)
+        if len(result) >= 40:
+            break
+    return result
+
+
+def _format_web_answer_report(
+    *,
+    question: str,
+    queries: list[str],
+    sources: list[dict[str, Any]],
+    verification: dict[str, Any],
+) -> str:
+    lines = [
+        "Ответ по веб-источникам.",
+        f"Вопрос: {question}",
+        f"Основной запрос: `{queries[0]}`.",
+    ]
+    if not sources:
+        lines.append(
+            "Надёжных источников не нашёл: лучше уточнить запрос или попробовать позже."
+        )
+        return "\n".join(lines)
+    verdict = str(verification.get("verdict") or "insufficient_evidence")
+    confidence = _web_answer_confidence(sources, verification)
+    lines.append(f"Уверенность: {confidence:.2f} ({verdict}).")
+    lines.append("")
+    lines.append("Короткий ответ:")
+    for item in sources[:3]:
+        title = _short_text(item.get("title") or item.get("url") or "Источник", 120)
+        excerpt = _short_text(item.get("excerpt") or item.get("snippet") or "", 420)
+        if excerpt:
+            lines.append(f"- {title}: {excerpt}")
+    lines.append("")
+    lines.append("Источники:")
+    for index, item in enumerate(sources[:6], start=1):
+        title = _short_text(item.get("title") or item.get("url") or "Источник", 120)
+        url = str(item.get("url") or "")
+        quality = str(item.get("quality") or "unknown")
+        score = float(item.get("answer_score") or 0)
+        lines.append(f"{index}. {title} — {url} ({quality}, score {score:.2f})")
+    if len(queries) > 1:
+        lines.append("")
+        lines.append("Дополнительные запросы:")
+        for query in queries[1:]:
+            lines.append(f"- `{query}`")
+    missing = verification.get("missing_terms")
+    if isinstance(missing, list) and missing:
+        lines.append("")
+        lines.append("Пробелы проверки: " + ", ".join(str(item) for item in missing[:8]))
+    return "\n".join(lines)
+
+
+def _web_answer_confidence(sources: list[dict[str, Any]], verification: Any) -> float:
+    if not sources:
+        return 0.0
+    verification_confidence = 0.0
+    if isinstance(verification, dict):
+        try:
+            verification_confidence = float(verification.get("confidence") or 0.0)
+        except (TypeError, ValueError):
+            verification_confidence = 0.0
+    fetched = sum(1 for item in sources if item.get("fetched"))
+    domains = {_url_domain(str(item.get("url") or "")) for item in sources if item.get("url")}
+    quality_bonus = min(0.25, 0.05 * fetched + 0.04 * len(domains))
+    ranked_bonus = min(0.2, max(float(item.get("answer_score") or 0) for item in sources) / 30)
+    confidence = verification_confidence * 0.65 + quality_bonus + ranked_bonus
+    return round(max(0.2, min(0.95, confidence)), 2)
 
 
 def _store_web_research_record(

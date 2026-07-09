@@ -176,7 +176,7 @@ docker compose --profile llm up -d dispatcher
 
 ## Current readiness
 
-- Internet production surface: `web.research`, `web.document.read`,
+- Internet production surface: `web.answer`, `web.research`, `web.document.read`,
   `internet.observability`, and `internet.smoke` are safe tools. Command Center
   status shows internet handoff, evidence/research counts, recent blocked pages,
   cooldowns, top domain/provider, and can run a smoke check from the web URL

@@ -2047,6 +2047,56 @@ def test_semantic_router_can_refine_ambiguous_web_query(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_agent_uses_web_answer_engine_for_google_like_query(monkeypatch, tmp_path):
+    captured = {}
+
+    async def fake_web_answer(_ctx, args):
+        captured["args"] = args
+        return ToolRunResponse(
+            tool="web.answer",
+            ok=True,
+            summary="Answer engine ranked 1 source(s).",
+            data={
+                "query": args["query"],
+                "answer": "Ответ по веб-источникам.\nКороткий ответ: Widget 2.0 подтверждён.",
+                "confidence": 0.81,
+                "sources": [
+                    {
+                        "title": "Widget official docs",
+                        "url": "https://docs.vendor.example/widget",
+                        "snippet": "Widget 2.0",
+                        "excerpt": "Widget 2.0 is documented officially.",
+                        "fetched": True,
+                        "quality": "vendor-docs",
+                    }
+                ],
+            },
+        )
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr("jarvis_gpt.tools._web_answer", fake_web_answer)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    agent = AgentRuntime(
+        settings=settings,
+        storage=storage,
+        llm=LLMRouter(settings),
+        bus=EventBus(),
+    )
+
+    response = asyncio.run(agent.chat("погугли последнюю версию Widget"))
+
+    assert captured["args"]["question"] == "погугли последнюю версию Widget"
+    assert "Widget 2.0 подтверждён" in response.answer
+    assert any(event.title == "web.answer" for event in response.events)
+    observations = storage.list_learning_observations(limit=10, kind="web.research")
+    assert observations
+    storage.close()
+
+
 def test_web_research_synthesizes_fetched_evidence(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "1")

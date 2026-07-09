@@ -9,6 +9,21 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-10 - Codex (Google replacement answer engine)
+
+- Added safe `web.answer`: a Google-like answer engine that expands a user
+  question into focused searches, reuses `web.research` for fetch/render/archive
+  safety, ranks sources by fetched evidence/quality/domain/term coverage, runs
+  `web.verify`, and returns a cited answer plus confidence.
+- Direct web-research chat flow now tries `web.answer` first when using the real
+  ToolRegistry, then falls back to the legacy `web.search` -> `web.fetch` path
+  for degraded or mocked registries. Follow-up memory still stores compatible
+  `web.research` evidence.
+- Agent prompts/capability manifest now prefer `web.answer` for internet
+  questions, with `web.search`/`web.fetch` kept as fallback/debug primitives.
+- Tests added for source ranking/query expansion and agent-level routing through
+  `web.answer`.
+
 ### 2026-07-10 - Claude (internet coverage: archive, feeds, weather, watches)
 
 - Continued the internet theme with four everyday gaps the surf stack still had:

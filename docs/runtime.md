@@ -1,5 +1,23 @@
 # Runtime
 
+## 2026-07-10 handoff - Google replacement answer engine
+
+For the operator and the second model:
+
+- Use `web.answer` as the first-choice "replace Google" tool for ordinary
+  internet questions. It expands the question, calls `web.research`, ranks
+  fetched/cited sources, verifies coverage, and returns `answer`, `sources`,
+  `citations`, `confidence`, and `steps`.
+- `AgentRuntime._run_web_research` now tries `web.answer` first when the real
+  ToolRegistry is active. If `web.answer` is unavailable or fails, the old
+  `web.search` -> `web.fetch`/`web.render` path still handles the request.
+- `web.answer` deliberately builds on the existing guarded stack instead of
+  bypassing it: public-only URL validation, fetch cache, consent detection,
+  render/archive fallback, evidence storage, and verification still apply.
+- Current limitation: the deterministic `web.answer` report summarizes top
+  excerpts and source ranking. The next quality layer should add an LLM synthesis
+  pass inside `web.answer` itself, with strict source-grounding and URL retention.
+
 ## 2026-07-10 handoff - internet coverage: archive, feeds, weather, page watches
 
 Для оператора и второй модели. Продолжение интернет-темы Codex: активный сёрфинг

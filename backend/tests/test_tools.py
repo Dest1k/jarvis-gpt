@@ -1694,6 +1694,82 @@ def test_web_research_uses_archive_after_blocked_live_source(monkeypatch, tmp_pa
     storage.close()
 
 
+def test_web_answer_expands_queries_and_ranks_sources(monkeypatch, tmp_path):
+    calls = []
+
+    async def fake_research(_ctx, args):
+        calls.append(args)
+        query = args["query"]
+        if "official" in query:
+            sources = [
+                {
+                    "rank": 1,
+                    "title": "Widget official docs",
+                    "url": "https://docs.vendor.example/widget",
+                    "snippet": "Widget official release notes",
+                    "excerpt": "Widget 2.0 was released with official public documentation.",
+                    "fetched": True,
+                    "tool": "web.fetch",
+                    "quality": "vendor-docs",
+                    "evidence_id": "ev_docs",
+                }
+            ]
+        else:
+            sources = [
+                {
+                    "rank": 1,
+                    "title": "Forum guess",
+                    "url": "https://forum.example/widget",
+                    "snippet": "Users discuss Widget 2.0",
+                    "excerpt": "Forum users discuss possible Widget 2.0 dates.",
+                    "fetched": False,
+                    "tool": "web.search",
+                    "quality": "snippet-only",
+                    "evidence_id": None,
+                }
+            ]
+        return ToolRunResponse(
+            tool="web.research",
+            ok=True,
+            summary="Research ok.",
+            data={"sources": sources, "verification": {"verdict": "partial", "confidence": 0.4}},
+        )
+
+    async def fake_verify(_ctx, args):
+        assert args["evidence_ids"] == ["ev_docs"]
+        return ToolRunResponse(
+            tool="web.verify",
+            ok=True,
+            summary="Verification verdict: supported.",
+            data={"verification": {"verdict": "supported", "confidence": 0.82}},
+        )
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr("jarvis_gpt.tools._web_research", fake_research)
+    monkeypatch.setattr("jarvis_gpt.tools._web_verify", fake_verify)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    result = asyncio.run(
+        tools.run(
+            "web.answer",
+            {"question": "Какая последняя версия Widget?", "max_sources": 3},
+        )
+    )
+
+    assert result.ok is True
+    assert len(calls) >= 2
+    assert result.data["sources"][0]["url"] == "https://docs.vendor.example/widget"
+    assert result.data["confidence"] >= 0.7
+    assert "Ответ по веб-источникам" in result.data["answer"]
+    assert result.data["citations"][0]["url"] == "https://docs.vendor.example/widget"
+    storage.close()
+
+
 def test_web_crawl_follows_bounded_same_site_links(monkeypatch, tmp_path):
     async def fake_fetch(_ctx, args):
         if args["url"].endswith("/start"):

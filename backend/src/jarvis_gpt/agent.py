@@ -94,7 +94,8 @@ SYSTEM_PROMPT = """Ты JARVIS GPT: локальный агент Windows/WSL/Do
 - Если запрос требует актуальной информации из интернета: билеты, цены, расписания, новости,
   наличие, курсы, погоду, адреса, телефоны, часы работы, открыто ли место сейчас,
   ближайшие бытовые точки или "послезавтра/сегодня/завтра", сначала используй
-  web.search/web.fetch; для JS-heavy страниц используй web.render, web.extract и web.verify.
+  web.answer; для fallback/debug используй web.search/web.fetch, для JS-heavy страниц используй
+  web.render, web.extract и web.verify.
   Не пиши "запускаю поиск" и не имитируй результаты. Если поиск или сайт не отдал данные,
   прямо скажи, что именно не подтверждено, и дай проверяемые ссылки.
 - Специализированные интернет-маршруты: погода — web.weather (геокодированный прогноз без
@@ -104,7 +105,8 @@ SYSTEM_PROMPT = """Ты JARVIS GPT: локальный агент Windows/WSL/Do
   создай вотч через web.watch.add и скажи, как он узнает об изменении; web.watch.list /
   web.watch.remove управляют вотчами.
 - Если вопрос ставит тебя в угол, зависит от сегодняшней реальности или есть риск ответить
-  уверенной выдумкой, сначала честно гугли через web.search/web.fetch/web.render
+  уверенной выдумкой, сначала честно гугли через web.answer
+  (fallback: web.search/web.fetch/web.render)
   и проверяй важные утверждения через web.verify
   и анализируй найденное.
   Это относится не только к бытовым вопросам, но и к техническим, админским, разработческим,
@@ -159,7 +161,7 @@ WEB_SYNTHESIS_PROMPT = (
 MISSION_EXECUTOR_PROMPT = (
     "Ты исполняешь ОДИН шаг миссии как автономный агент, а не пишешь план. Используй "
     "доступные инструменты, чтобы реально продвинуть шаг: собери данные, проверь систему, "
-    "прочитай файлы, посмотри статус. Для интернет-шагов предпочитай web.research, "
+    "прочитай файлы, посмотри статус. Для интернет-шагов предпочитай web.answer, web.research, "
     "web.extract, web.verify и web.document.read, чтобы получить источники и citations. "
     "Для Word/Excel/PDF используй documents.inspect/read/compare/edit.plan и создавай "
     "edited copy через documents.apply_replacements, не перезаписывая оригинал. "
@@ -1924,6 +1926,14 @@ class AgentRuntime:
         *,
         conversation_id: str | None = None,
     ) -> DirectAction:
+        answer_action = await self._run_web_answer_engine(
+            message=message,
+            query=query,
+            conversation_id=conversation_id,
+        )
+        if answer_action is not None:
+            return answer_action
+
         search = await self.tools.run("web.search", {"query": query, "limit": 6})
         events = [
             ChatEvent(
@@ -2056,6 +2066,59 @@ class AgentRuntime:
                 events.extend(open_action.events)
                 answer = f"{answer}\n\n{open_action.answer}"
         return DirectAction(answer=answer, events=events)
+
+    async def _run_web_answer_engine(
+        self,
+        *,
+        message: str,
+        query: str,
+        conversation_id: str | None,
+    ) -> DirectAction | None:
+        if self.tools.get("web.answer") is None:
+            return None
+        run_method = getattr(self.tools, "run", None)
+        if getattr(run_method, "__self__", None) is not self.tools:
+            return None
+        try:
+            result = await self.tools.run(
+                "web.answer",
+                {"question": message, "query": query, "max_sources": 6},
+            )
+        except Exception:  # noqa: BLE001 - mocked/minimal registries fall back to legacy search.
+            return None
+        if not result.ok or not isinstance(result.data, dict):
+            return None
+        answer = str(result.data.get("answer") or "").strip()
+        if not answer:
+            return None
+        event = ChatEvent(
+            type="tool_call",
+            title="web.answer",
+            content=result.summary,
+            payload={
+                "tool": result.tool,
+                "ok": result.ok,
+                "query": query,
+                "confidence": result.data.get("confidence"),
+                "sources": len(result.data.get("sources") or []),
+            },
+        )
+        evidence = _answer_sources_to_research_evidence(result.data.get("sources"))
+        if conversation_id and evidence:
+            self._remember_web_research(
+                conversation_id=conversation_id,
+                message=message,
+                query=str(result.data.get("query") or query),
+                evidence=evidence,
+                answer=answer,
+            )
+            candidates = _shopping_candidates_from_evidence(evidence)
+            self._remember_shopping_research(
+                conversation_id=conversation_id,
+                query=str(result.data.get("query") or query),
+                candidates=candidates,
+            )
+        return DirectAction(answer=answer, events=[event])
 
     async def _run_web_research_followup(
         self,
@@ -3313,7 +3376,7 @@ class AgentRuntime:
                 (
                     "- durable_capabilities: memory search/save, file ingestion/search, "
                     "mission planning/execution, learning journal/tick, "
-                    "web.search/web.fetch/web.research/web.verify/web.document.read, "
+                    "web.answer/web.search/web.fetch/web.research/web.verify/web.document.read, "
                     "documents.inspect/read/compare/edit.plan/apply_replacements, "
                     "telemetry, diagnostics, Docker/dispatcher inspection, host bridge gates."
                 ),
@@ -5724,6 +5787,30 @@ def _research_evidence(
                 "quality": _source_quality_label(url, fetched=bool(fetched_text)),
             }
         )
+    return evidence
+
+
+def _answer_sources_to_research_evidence(sources: Any) -> list[dict[str, str]]:
+    evidence: list[dict[str, str]] = []
+    for item in sources if isinstance(sources, list) else []:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "")
+        if not url:
+            continue
+        excerpt = _short_value(item.get("excerpt") or item.get("snippet") or "", 1200)
+        evidence.append(
+            {
+                "title": str(item.get("title") or url),
+                "url": url,
+                "snippet": _short_value(item.get("snippet") or excerpt, 240),
+                "excerpt": excerpt,
+                "fetched": "true" if item.get("fetched") else "false",
+                "quality": str(item.get("quality") or "unknown"),
+            }
+        )
+        if len(evidence) >= 8:
+            break
     return evidence
 
 
