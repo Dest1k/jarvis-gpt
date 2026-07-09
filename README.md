@@ -18,6 +18,7 @@
 - Гибридная семантическая память и файлы: retrieval фьюзит лексический BM25/LIKE с семантическим re-ranking (чистый Python fuzzy-вектор по умолчанию, опциональный remote `/embeddings` для настоящей семантики) через RRF — и для долговременной памяти, и для индексированных файловых чанков — поэтому релевантное находится даже при перефразировании и иной словоформе. Деградирует до лексики без потерь.
 - Реальное исполнение миссий: шаг миссии при живом LLM выполняется агентным tool-loop (реальные инструменты, approval для опасного, аудит), а не статичным brief; офлайн — прежний детерминированный brief.
 - Авто-цепочка миссий: `run_mission` / `POST /api/missions/{id}/run` / `mission-run` проходят миссию до завершения, блокировки или бюджета шагов; в Command Center кнопка «Запустить всё» показывает прогресс живьём (прогресс-бар, статусы задач, лог шагов).
+- Живые события: Command Center подписан на `/ws/events` по WebSocket — лента активности агента, живой индикатор и авто-обновление миссий/допусков без поллинга.
 - Retrieval adds normalized relevance, matched terms and snippets for memory/file context.
 - Learning tick deduplicates repeated lessons before writing long-term memory.
 - Autonomous supervisor: безопасный фоновой цикл собирает telemetry и запускает learning tick.

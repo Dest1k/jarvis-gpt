@@ -76,6 +76,14 @@ type RuntimeEvent = {
   payload: Record<string, unknown>;
 };
 
+type LiveEvent = {
+  id: string;
+  type: string;
+  title: string;
+  content?: string;
+  ts: number;
+};
+
 type DiagnosticCheck = {
   name: string;
   status: "ok" | "warn" | "error";
@@ -698,6 +706,25 @@ function apiUrl() {
   }
 }
 
+function wsUrl() {
+  return apiUrl().replace(/^http/, "ws");
+}
+
+function liveEventLabel(type: string): string {
+  const labels: Record<string, string> = {
+    tool_call: "инструмент",
+    mission_step: "шаг миссии",
+    mission_run: "миссия",
+    mission: "миссия",
+    approval: "допуск",
+    memory: "память",
+    thought: "мысль",
+    task_kernel: "маршрут",
+    assistant_done: "ответ"
+  };
+  return labels[type] ?? type.replace(/_/g, " ");
+}
+
 function fileItemToAttachment(file: FileItem): ChatAttachment {
   return {
     id: file.id,
@@ -1195,6 +1222,8 @@ export default function CommandCenter() {
   const [conversations, setConversations] = useState<ConversationItem[]>([]);
   const [missions, setMissions] = useState<Mission[]>([]);
   const [runningMissionId, setRunningMissionId] = useState<string | null>(null);
+  const [liveConnected, setLiveConnected] = useState(false);
+  const [liveEvents, setLiveEvents] = useState<LiveEvent[]>([]);
   const [diagnostics, setDiagnostics] = useState<DiagnosticCheck[]>([]);
   const [tools, setTools] = useState<ToolInfo[]>([]);
   const [memories, setMemories] = useState<MemoryItem[]>([]);
@@ -1474,6 +1503,88 @@ export default function CommandCenter() {
   useEffect(() => {
     missionsRef.current = missions;
   }, [missions]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    let socket: WebSocket | null = null;
+    let closed = false;
+    let reconnectTimer: number | undefined;
+    let missionTimer: number | undefined;
+
+    const refreshMissionsSoon = () => {
+      window.clearTimeout(missionTimer);
+      missionTimer = window.setTimeout(() => {
+        api<Mission[]>("/api/missions")
+          .then(setMissions)
+          .catch(() => {});
+      }, 400);
+    };
+
+    const connect = () => {
+      try {
+        socket = new WebSocket(`${wsUrl()}/ws/events`);
+      } catch {
+        return;
+      }
+      socket.onopen = () => setLiveConnected(true);
+      socket.onclose = () => {
+        setLiveConnected(false);
+        if (!closed) {
+          reconnectTimer = window.setTimeout(connect, 3000);
+        }
+      };
+      socket.onerror = () => {
+        try {
+          socket?.close();
+        } catch {
+          /* ignore */
+        }
+      };
+      socket.onmessage = (event) => {
+        let data: Record<string, unknown>;
+        try {
+          data = JSON.parse(event.data as string);
+        } catch {
+          return;
+        }
+        if (!data || data.channel !== "agent") return;
+        const type = String(data.type ?? "");
+        if (!type) return;
+        setLiveEvents((current) =>
+          [
+            {
+              id: randomId("live"),
+              type,
+              title: String(data.title ?? type),
+              content: data.content ? String(data.content) : undefined,
+              ts: Date.now()
+            },
+            ...current
+          ].slice(0, 8)
+        );
+        if (type.startsWith("mission")) {
+          refreshMissionsSoon();
+        }
+        if (type === "approval") {
+          api<ApprovalItem[]>("/api/approvals?limit=8")
+            .then(setApprovals)
+            .catch(() => {});
+        }
+      };
+    };
+
+    connect();
+    return () => {
+      closed = true;
+      window.clearTimeout(reconnectTimer);
+      window.clearTimeout(missionTimer);
+      try {
+        socket?.close();
+      } catch {
+        /* ignore */
+      }
+    };
+  }, []);
 
   useEffect(() => {
     const interval = window.setInterval(() => {
@@ -2911,7 +3022,18 @@ export default function CommandCenter() {
           <strong>{modelActivity.label}</strong>
           <p>{modelActivity.detail}</p>
         </div>
+        <span className={`liveDot ${liveConnected ? "on" : "off"}`} title={liveConnected ? "Живые события подключены" : "Ожидание событий"} />
       </article>
+      {liveEvents.length > 0 && (
+        <div className="liveFeed">
+          {liveEvents.slice(0, 4).map((event) => (
+            <div className="liveRow" key={event.id}>
+              <strong>{liveEventLabel(event.type)}</strong>
+              <span>{compactText(event.content || event.title, 52)}</span>
+            </div>
+          ))}
+        </div>
+      )}
       <div className="vitalGrid">
         <div>
           <span>Backend</span>
