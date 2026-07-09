@@ -337,7 +337,6 @@ class ToolRegistry:
                 category="browser",
                 input_schema={"url": "HTTP(S) URL to open"},
                 handler=_browser_open,
-                danger_level="review",
             )
         )
         self.add(
@@ -356,7 +355,6 @@ class ToolRegistry:
                 category="browser",
                 input_schema={"urls": "List of HTTP(S) URLs to open"},
                 handler=_browser_open_many,
-                danger_level="review",
             )
         )
         self.add(
@@ -1784,6 +1782,12 @@ def _validate_browser_url(raw_url: str, policy: dict[str, Any] | None = None) ->
         host = parsed.hostname.lower()
         allowed_hosts = {str(item).lower() for item in policy.get("allowed_hosts", [])}
         is_local = host in {"localhost", "127.0.0.1", "::1"}
+        if (
+            policy.get("mode") == "approval-only"
+            and policy.get("require_approval_for_external", True)
+            and not is_local
+        ):
+            raise ValueError("Browser policy requires approval for external URLs.")
         if policy.get("mode") == "local-safe" and host not in allowed_hosts:
             raise ValueError("Browser policy only allows configured local hosts.")
         if is_local and not policy.get("allow_localhost", True):

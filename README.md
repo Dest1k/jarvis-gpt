@@ -6,12 +6,12 @@
 
 - FastAPI backend с `/health`, `/api/status`, `/api/models`, `/api/chat`, `/api/chat/stream`, `/api/missions`, `/api/memory`, `/api/files`, `/api/approvals`, `/api/audit`, `/api/diagnostics`.
 - Offline-first агент: сохраняет диалоги, создаёт mission plans и деградирует корректно, если локальная LLM не поднята.
-- Safe tools runtime: диагностика, статус, память, публичный web fetch с SSRF-защитой, approval-gated browser open, Docker ps/logs для Jarvis-контейнеров, файловое чтение в разрешённых корнях, approval-gated sandbox write, token-auth host bridge и execution brief для миссий.
+- Safe tools runtime: диагностика, статус, память, публичный web fetch с SSRF-защитой, validated browser open без approval для явных запросов открыть URL, Docker ps/logs для Jarvis-контейнеров, файловое чтение в разрешённых корнях, approval-gated sandbox write, token-auth host bridge и execution brief для миссий.
 - File ingestion: загрузка текстовых файлов, хранение в `D:\jarvis\data\jarvis-gpt\files`, chunk search и audit trail.
 - Model catalog: активные профили знают реальные Gemma 4 веса в `D:\jarvis\data\models`.
 - HITL approvals: опасные действия оформляются как durable approval gates, а не выполняются молча.
 - Telemetry/performance: CPU/RAM/disk/GPU/Docker snapshots, performance profile и host bridge status.
-- Self-learning tick: аудит, tool runs и approvals превращаются в долговременные lessons.
+- Self-learning tick: аудит, tool runs, approvals и append-only learning journal превращаются в долговременные lessons.
 - Operator persona: durable structured profile (роль, домашний город, языки, стек, увлечения, текущий фокус, постоянные правила «всегда/никогда», глоссарий) читается агентом в каждом ответе.
 - Reasoning-first понимание задачи: для fuzzy web-запросов агент спрашивает модель (`_understand_intent`), которая понимает интент по смыслу и профилю оператора, а не по ключевым словам; `_looks_like_*`-эвристики остаются детерминированным офлайн-фолбэком.
 - Агентный tool-loop: на пути ответа модель сама вызывает безопасные инструменты (web.search/fetch, filesystem/docker/runtime read, ...), видит observation и продолжает до готовности; опасные инструменты уходят в HITL-approval, бюджет шагов — из autonomy policy. Протокол JSON-act поверх обычных completions, деградирует без нативного tool-calling.
@@ -191,10 +191,10 @@ docker compose --profile llm up -d dispatcher
 - Safe tools include `web.fetch` for public HTTP(S) context with private-network and redirect guards.
 - Safe tools include read-only `docker.ps` and restricted `docker.logs` for Jarvis container diagnostics.
 - Dispatcher status/logs are tools, while dispatcher start/stop are approval-gated tool actions.
-- `browser.open` can open validated HTTP(S) URLs through the host bridge after approval.
+- `browser.open` can open validated HTTP(S) URLs through the host bridge without approval for explicit open requests; it is excluded from the autonomous background tool loop.
 - `filesystem.write_text` is sandboxed to the repository or `D:\jarvis` and requires approval.
 - Memory and file retrieval now return relevance scores, matched terms, and clipped snippets for mission context.
-- Autonomous learning skips duplicate lessons and reports the skipped count in tick results.
+- Autonomous learning skips duplicate lessons, reads the durable learning journal, and reports the skipped count in tick results.
 - Autonomous supervisor persists telemetry, learning lessons, and health snapshots on separate intervals.
 - Mission planner enriches plans with domain-specific UI, LLM, Docker/GPU, host bridge and performance steps.
 - HITL gates now have a whitelisted executor: approved gates can run dispatcher, diagnostics, learning, telemetry, memory, or registered tool actions.

@@ -31,7 +31,6 @@ DEFAULT_AUTONOMY_POLICY: dict[str, Any] = {
         "filesystem.write_text",
         "dispatcher.start",
         "dispatcher.stop",
-        "browser.open",
     ],
     "max_autonomous_steps": 3,
     "resource_guard": {

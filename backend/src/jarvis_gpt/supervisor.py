@@ -81,6 +81,9 @@ class RuntimeSupervisor:
                 "telemetry.persist",
                 "health.persist",
                 "learning.tick",
+                "learning.observe_dialogues",
+                "learning.observe_web",
+                "learning.append_only_journal",
                 "learning.deduplicate",
                 "audit.observe",
                 "approval.respect",
@@ -94,6 +97,7 @@ class RuntimeSupervisor:
             await self._record_telemetry()
 
     async def _learning_loop(self) -> None:
+        await self._run_learning()
         while True:
             await asyncio.sleep(max(60, self.settings.learning_interval_sec))
             await self._run_learning()

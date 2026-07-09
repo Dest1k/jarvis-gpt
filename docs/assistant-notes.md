@@ -11,6 +11,21 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ### 2026-07-09 - Codex
 
+- Browser policy default is now `open`: validated public HTTP(S) browser opens no
+  longer need approval. `browser.open`/`browser.open_many` are still excluded from
+  the autonomous agentic tool loop, so background web work should use
+  `web.search`/`web.fetch` and not spam the operator's real browser.
+- Added durable `learning_observations` journal. `add_message`, `record_tool_run`
+  and `delete_conversation` append learning observations, so deletion removes UI
+  history but not the learning source trail.
+- Learning tick now reads dialogue/web observations, supervisor runs learning once
+  immediately on startup, and default learning interval is 120s.
+- Command Center chat links are auto-linked for Markdown, `http(s)` and `www.`
+  URLs; chat height now auto-stretches and can be resized beyond the old 760px cap.
+- Tests added/updated around browser-open policy and learning journal retention.
+
+### 2026-07-09 - Codex
+
 - Added an operator queue/kernel surface: `GET /api/operator/queue` combines
   pending/executable approvals, blocked/running mission tasks, health warnings,
   generation truncation signals, memory hygiene, and future model-profile notes.

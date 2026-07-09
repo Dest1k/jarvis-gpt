@@ -13,7 +13,13 @@ class LearningEngine:
         audit = self.storage.list_audit(limit=limit)
         tool_runs = self.storage.list_tool_runs(limit=limit)
         approvals = self.storage.list_approvals(limit=limit)
-        lessons = self._derive_lessons(audit=audit, tool_runs=tool_runs, approvals=approvals)
+        observations = self.storage.list_learning_observations(limit=max(50, limit * 4))
+        lessons = self._derive_lessons(
+            audit=audit,
+            tool_runs=tool_runs,
+            approvals=approvals,
+            observations=observations,
+        )
         consolidation = self.storage.consolidate_memories(limit=max(200, limit * 20))
         saved = []
         skipped_duplicates = 0
@@ -35,7 +41,7 @@ class LearningEngine:
             payload={
                 "saved": len(saved),
                 "skipped_duplicates": skipped_duplicates,
-                "examined": len(audit) + len(tool_runs) + len(approvals),
+                "examined": len(audit) + len(tool_runs) + len(approvals) + len(observations),
             },
         )
         return {
@@ -47,6 +53,7 @@ class LearningEngine:
                 "audit": len(audit),
                 "tool_runs": len(tool_runs),
                 "approvals": len(approvals),
+                "learning_observations": len(observations),
             },
         }
 
@@ -63,8 +70,68 @@ class LearningEngine:
         audit: list[dict[str, Any]],
         tool_runs: list[dict[str, Any]],
         approvals: list[dict[str, Any]],
+        observations: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         lessons: list[dict[str, Any]] = []
+        dialogue = [
+            item
+            for item in observations
+            if item.get("kind") == "conversation.message" and item.get("role") == "user"
+        ]
+        if dialogue:
+            excerpts = [
+                _compact_text(str(item.get("content") or ""), 120)
+                for item in dialogue[:5]
+                if str(item.get("content") or "").strip()
+            ]
+            if excerpts:
+                lessons.append(
+                    {
+                        "content": (
+                            "Recent operator dialogue themes to preserve beyond visible "
+                            "chat history: "
+                            + " | ".join(excerpts)
+                        ),
+                        "tags": ["learning", "dialogue", "operator"],
+                        "importance": 0.62,
+                    }
+                )
+
+        web_observations = [
+            item
+            for item in observations
+            if str(item.get("kind") or "").startswith(("tool.web.", "tool.browser."))
+        ]
+        if web_observations:
+            fragments = []
+            for item in web_observations[:5]:
+                payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+                arguments = (
+                    payload.get("arguments")
+                    if isinstance(payload.get("arguments"), dict)
+                    else {}
+                )
+                data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+                target = (
+                    arguments.get("query")
+                    or arguments.get("url")
+                    or data.get("url")
+                    or item.get("summary")
+                )
+                if target:
+                    fragments.append(_compact_text(str(target), 140))
+            if fragments:
+                lessons.append(
+                    {
+                        "content": (
+                            "Recent web/browser activity useful for future context: "
+                            + " | ".join(fragments)
+                        ),
+                        "tags": ["learning", "web", "browser"],
+                        "importance": 0.64,
+                    }
+                )
+
         failed_tools = [run for run in tool_runs if not run.get("ok")]
         if failed_tools:
             names = sorted({str(run.get("tool")) for run in failed_tools})
@@ -118,3 +185,10 @@ class LearningEngine:
                 }
             )
         return lessons[:5]
+
+
+def _compact_text(value: str, max_chars: int) -> str:
+    text = " ".join(value.split())
+    if len(text) <= max_chars:
+        return text
+    return f"{text[: max_chars - 1].rstrip()}..."

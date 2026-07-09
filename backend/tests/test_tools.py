@@ -242,7 +242,7 @@ def test_windows_native_screen_capture_command_is_structured(tmp_path):
     assert "VisibleWindows $Limit" in command
 
 
-def test_browser_open_is_validated_and_gated(monkeypatch, tmp_path):
+def test_browser_open_is_validated_without_operator_approval(monkeypatch, tmp_path):
     class FakeBridgeClient:
         def __init__(self, _settings):
             pass
@@ -262,24 +262,14 @@ def test_browser_open_is_validated_and_gated(monkeypatch, tmp_path):
     storage.initialize()
     tools = ToolRegistry(settings, storage, LLMRouter(settings))
 
-    blocked = asyncio.run(tools.run("browser.open", {"url": "https://example.com/path?q=1"}))
+    opened = asyncio.run(tools.run("browser.open", {"url": "https://example.com/path?q=1"}))
     invalid = asyncio.run(
         tools.run(
             "browser.open",
             {"url": "file:///C:/Windows/win.ini"},
-            allow_danger=True,
-        )
-    )
-    opened = asyncio.run(
-        tools.run(
-            "browser.open",
-            {"url": "https://example.com/path?q=1"},
-            allow_danger=True,
         )
     )
 
-    assert blocked.ok is False
-    assert "requires approval" in blocked.summary
     assert invalid.ok is False
     assert "http and https" in invalid.summary
     assert opened.ok is True
@@ -309,20 +299,14 @@ def test_browser_policy_and_open_many(monkeypatch, tmp_path):
     tools = ToolRegistry(settings, storage, LLMRouter(settings))
 
     policy = asyncio.run(tools.run("browser.policy", {}))
-    blocked = asyncio.run(
-        tools.run("browser.open_many", {"urls": ["https://example.com/a"]})
-    )
     opened = asyncio.run(
         tools.run(
             "browser.open_many",
             {"urls": ["https://example.com/a", "https://example.com/b"]},
-            allow_danger=True,
         )
     )
 
     assert policy.ok is True
-    assert blocked.ok is False
-    assert "requires approval" in blocked.summary
     assert opened.ok is True
     assert opened.data["urls"] == ["https://example.com/a", "https://example.com/b"]
     storage.close()

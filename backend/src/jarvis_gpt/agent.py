@@ -141,7 +141,9 @@ MISSION_MARKERS = (
 # answer, and which safe tools are withheld from autonomous use because they
 # mutate durable state rather than gather facts.
 DEFAULT_MAX_TOOL_STEPS = 4
-AGENTIC_TOOL_DENYLIST = frozenset({"memory.save", "learning.tick", "mission.brief"})
+AGENTIC_TOOL_DENYLIST = frozenset(
+    {"memory.save", "learning.tick", "mission.brief", "browser.open", "browser.open_many"}
+)
 
 
 @dataclass

@@ -528,7 +528,7 @@ type BenchmarkReport = {
 };
 
 type BrowserPolicy = {
-  mode: "approval-only" | "local-safe" | "locked";
+  mode: "open" | "approval-only" | "local-safe" | "locked";
   allow_localhost: boolean;
   allowed_hosts: string[];
   blocked_schemes: string[];
@@ -958,7 +958,7 @@ function normalizeChatSideTab(value: unknown): ChatSideTab {
 
 function clampChatHeight(value: number) {
   if (!Number.isFinite(value)) return DEFAULT_CHAT_HEIGHT;
-  return Math.max(460, Math.min(760, Math.round(value)));
+  return Math.max(460, Math.min(1600, Math.round(value)));
 }
 
 function compactText(value: string | null | undefined, maxLength = 72) {
@@ -1206,7 +1206,7 @@ function renderRichInlineWithBreaks(text: string, key: string): ReactNode[] {
 
 function renderRichInline(text: string, key: string): ReactNode[] {
   const nodes: ReactNode[] = [];
-  const tokenPattern = /(\[[^\]]+\]\(https?:\/\/[^\s)]+\)|https?:\/\/[^\s<)]+|`[^`\n]+`|\*\*[\s\S]+?\*\*)/g;
+  const tokenPattern = /(\[[^\]]+\]\((?:https?:\/\/|www\.)[^\s)]+\)|(?:https?:\/\/|www\.)[^\s<]+|`[^`\n]+`|\*\*[\s\S]+?\*\*)/g;
   let cursor = 0;
   let index = 0;
   let match: RegExpExecArray | null;
@@ -1224,14 +1224,15 @@ function renderRichInline(text: string, key: string): ReactNode[] {
     } else if (token.startsWith("`") && token.endsWith("`")) {
       nodes.push(<code key={`${key}-code-${index}`}>{token.slice(1, -1)}</code>);
     } else {
-      const markdownLink = token.match(/^\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)$/);
-      const href = markdownLink ? markdownLink[2] : token;
-      const label = markdownLink ? markdownLink[1] : token;
+      const markdownLink = token.match(/^\[([^\]]+)\]\(((?:https?:\/\/|www\.)[^\s)]+)\)$/);
+      const rawHref = markdownLink ? markdownLink[2] : token;
+      const { href, label, suffix } = linkParts(rawHref, markdownLink ? markdownLink[1] : token);
       nodes.push(
         <a href={href} key={`${key}-link-${index}`} rel="noreferrer" target="_blank">
           {label}
         </a>
       );
+      if (suffix) nodes.push(suffix);
     }
     cursor = match.index + token.length;
     index += 1;
@@ -1240,6 +1241,37 @@ function renderRichInline(text: string, key: string): ReactNode[] {
     nodes.push(text.slice(cursor));
   }
   return nodes;
+}
+
+function linkParts(rawHref: string, rawLabel: string) {
+  let href = rawHref;
+  let label = rawLabel;
+  let suffix = "";
+  const labelTracksHref = rawLabel === rawHref;
+  while (/[.,!?;:]$/.test(href)) {
+    suffix = `${href.slice(-1)}${suffix}`;
+    href = href.slice(0, -1);
+  }
+  while (/[)\]}»”]$/.test(href) && closingUrlPunctuationLooksExtra(href)) {
+    suffix = `${href.slice(-1)}${suffix}`;
+    href = href.slice(0, -1);
+  }
+  if (labelTracksHref) label = href;
+  const normalizedHref = href.startsWith("www.") ? `https://${href}` : href;
+  return { href: normalizedHref, label, suffix };
+}
+
+function closingUrlPunctuationLooksExtra(value: string) {
+  const last = value.slice(-1);
+  const pairs: Record<string, [string, string]> = {
+    ")": ["(", ")"],
+    "]": ["[", "]"],
+    "}": ["{", "}"]
+  };
+  const pair = pairs[last];
+  if (!pair) return true;
+  const [open, close] = pair;
+  return value.split(open).length <= value.split(close).length;
 }
 
 function isConsoleCodeBlock(language: string, code: string) {
@@ -1334,6 +1366,7 @@ export default function CommandCenter() {
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const voiceBaseInputRef = useRef("");
   const chatFileInputRef = useRef<HTMLInputElement | null>(null);
+  const chatPanelRef = useRef<HTMLElement | null>(null);
   const transcriptRef = useRef<HTMLDivElement | null>(null);
   const vitalsRequestInFlightRef = useRef(false);
   const telemetryRequestInFlightRef = useRef(false);
@@ -2136,7 +2169,7 @@ export default function CommandCenter() {
 
   function beginChatResize(event: ReactPointerEvent<HTMLDivElement>) {
     const startY = event.clientY;
-    const startHeight = chatHeight;
+    const startHeight = chatPanelRef.current?.getBoundingClientRect().height ?? chatHeight;
     const onMove = (moveEvent: PointerEvent) => {
       setChatHeight(clampChatHeight(startHeight + moveEvent.clientY - startY));
     };
@@ -3559,6 +3592,7 @@ export default function CommandCenter() {
           <section
             className="chatPanel"
             id="dialog"
+            ref={chatPanelRef}
             aria-label="Диалог"
             style={{ "--chat-target-height": `${chatHeight}px` } as CSSProperties}
           >
@@ -4268,7 +4302,7 @@ export default function CommandCenter() {
             </div>
             <div className="policyPanel">
               <div className="segmentedControl" role="group" aria-label="Режим браузера">
-                {(["approval-only", "local-safe", "locked"] as BrowserPolicy["mode"][]).map(
+                {(["open", "approval-only", "local-safe", "locked"] as BrowserPolicy["mode"][]).map(
                   (mode) => (
                     <button
                       className={browserPolicy?.mode === mode ? "active" : ""}

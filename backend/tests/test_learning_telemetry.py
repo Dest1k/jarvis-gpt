@@ -55,6 +55,38 @@ def test_learning_tick_deduplicates_lessons(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_learning_journal_survives_chat_deletion_and_feeds_lessons(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    conversation_id = storage.create_conversation("Learning source")
+    storage.add_message(
+        conversation_id=conversation_id,
+        role="user",
+        content="Запомни: мне важны тихие фоновые проверки без лишних вкладок.",
+    )
+    storage.record_tool_run(
+        tool="web.search",
+        ok=True,
+        summary="Search completed",
+        arguments={"query": "quiet background browsing"},
+        data={"results": [{"url": "https://example.com"}]},
+    )
+
+    assert storage.delete_conversation(conversation_id) is True
+    result = LearningEngine(storage).tick(limit=20)
+    observations = storage.list_learning_observations(limit=20)
+
+    assert result["examined"]["learning_observations"] >= 3
+    assert any(item["kind"] == "conversation.message" for item in observations)
+    assert any(item["kind"] == "conversation.deleted" for item in observations)
+    assert any(item["kind"] == "tool.web.search" for item in observations)
+    assert storage.search_memory("фоновые проверки", limit=10)
+    storage.close()
+
+
 def test_telemetry_performance_plan_and_host_bridge_status(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
     settings = load_settings("gemma4-turbo")

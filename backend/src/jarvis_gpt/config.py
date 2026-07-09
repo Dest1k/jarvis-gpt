@@ -217,7 +217,7 @@ def load_settings(profile_name: str | None = None) -> JarvisSettings:
         autonomy_enabled=_bool_env("JARVIS_AUTONOMY_ENABLED", True),
         telemetry_interval_sec=_int_env("JARVIS_TELEMETRY_INTERVAL_SEC", 120),
         health_interval_sec=_int_env("JARVIS_HEALTH_INTERVAL_SEC", 300),
-        learning_interval_sec=_int_env("JARVIS_LEARNING_INTERVAL_SEC", 600),
+        learning_interval_sec=_int_env("JARVIS_LEARNING_INTERVAL_SEC", 120),
         api_host=os.environ.get("JARVIS_API_HOST", "0.0.0.0"),
         api_port=_int_env("JARVIS_API_PORT", 8000),
     )

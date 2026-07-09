@@ -347,6 +347,7 @@ class JarvisStorage:
             "files",
             "file_chunks",
             "tool_runs",
+            "learning_observations",
             "approvals",
             "telemetry_snapshots",
             "audit_log",
@@ -498,6 +499,17 @@ class JarvisStorage:
                 "UPDATE conversations SET updated_at = ? WHERE id = ?",
                 (now, conversation_id),
             )
+            self._insert_learning_observation(
+                conn,
+                kind="conversation.message",
+                source_id=mid,
+                conversation_id=conversation_id,
+                role=role,
+                content=content,
+                summary=f"{role} message captured for learning",
+                payload={"metadata": metadata or {}},
+                ts=now,
+            )
             conn.commit()
         return mid
 
@@ -549,8 +561,20 @@ class JarvisStorage:
             ).fetchone()
             if existing is None:
                 return False
+            message_count = conn.execute(
+                "SELECT COUNT(*) AS c FROM messages WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()["c"]
             conn.execute("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
             conn.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
+            self._insert_learning_observation(
+                conn,
+                kind="conversation.deleted",
+                source_id=conversation_id,
+                conversation_id=conversation_id,
+                summary=f"Conversation deleted from UI history with {message_count} message(s).",
+                payload={"message_count": int(message_count)},
+            )
             conn.commit()
         return True
 
@@ -1087,7 +1111,8 @@ class JarvisStorage:
             "task_id": task_id,
         }
         with self._lock:
-            self.connect().execute(
+            conn = self.connect()
+            conn.execute(
                 """
                 INSERT INTO tool_runs(
                     id, ts, tool, ok, summary, arguments, data, mission_id, task_id
@@ -1106,7 +1131,23 @@ class JarvisStorage:
                     row["task_id"],
                 ),
             )
-            self.connect().commit()
+            self._insert_learning_observation(
+                conn,
+                kind=f"tool.{row['tool']}",
+                source_id=row["id"],
+                content=row["summary"],
+                summary=row["summary"],
+                payload={
+                    "tool": row["tool"],
+                    "ok": bool(row["ok"]),
+                    "arguments": row["arguments"],
+                    "data": row["data"],
+                    "mission_id": row["mission_id"],
+                    "task_id": row["task_id"],
+                },
+                ts=row["ts"],
+            )
+            conn.commit()
         result = {**row, "ok": bool(row["ok"])}
         self.record_audit(
             actor="agent",
@@ -1138,6 +1179,120 @@ class JarvisStorage:
             }
             for row in rows
         ]
+
+    def record_learning_observation(
+        self,
+        *,
+        kind: str,
+        source_id: str | None = None,
+        conversation_id: str | None = None,
+        role: str | None = None,
+        content: str = "",
+        summary: str = "",
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        row = self._learning_observation_row(
+            kind=kind,
+            source_id=source_id,
+            conversation_id=conversation_id,
+            role=role,
+            content=content,
+            summary=summary,
+            payload=payload,
+        )
+        with self._lock:
+            conn = self.connect()
+            self._insert_learning_observation(conn, **row)
+            conn.commit()
+        return row
+
+    def list_learning_observations(
+        self,
+        *,
+        limit: int = 50,
+        kind: str | None = None,
+    ) -> list[dict[str, Any]]:
+        params: list[Any] = []
+        where = ""
+        if kind:
+            where = "WHERE kind = ?"
+            params.append(kind)
+        params.append(limit)
+        with self._lock:
+            rows = self.connect().execute(
+                f"""
+                SELECT
+                    id, ts, kind, source_id, conversation_id, role,
+                    content, summary, payload
+                FROM learning_observations
+                {where}
+                ORDER BY ts DESC, rowid DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [
+            {
+                **dict(row),
+                "payload": _loads(row["payload"], {}),
+            }
+            for row in rows
+        ]
+
+    def _learning_observation_row(
+        self,
+        *,
+        kind: str,
+        source_id: str | None = None,
+        conversation_id: str | None = None,
+        role: str | None = None,
+        content: str = "",
+        summary: str = "",
+        payload: dict[str, Any] | None = None,
+        ts: str | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "id": new_id("learn"),
+            "ts": ts or utc_now(),
+            "kind": kind[:120],
+            "source_id": source_id,
+            "conversation_id": conversation_id,
+            "role": role[:40] if role else None,
+            "content": str(content or "")[:20000],
+            "summary": str(summary or "")[:1000],
+            "payload": payload or {},
+        }
+
+    def _insert_learning_observation(
+        self,
+        conn: sqlite3.Connection,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        row = (
+            kwargs
+            if "id" in kwargs
+            else self._learning_observation_row(**kwargs)
+        )
+        conn.execute(
+            """
+            INSERT INTO learning_observations(
+                id, ts, kind, source_id, conversation_id, role, content, summary, payload
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                row["id"],
+                row["ts"],
+                row["kind"],
+                row["source_id"],
+                row["conversation_id"],
+                row["role"],
+                row["content"],
+                row["summary"],
+                _json(row["payload"]),
+            ),
+        )
+        return row
 
     def record_audit(
         self,
@@ -1818,6 +1973,18 @@ CREATE TABLE IF NOT EXISTS tool_runs (
     task_id TEXT REFERENCES mission_tasks(id) ON DELETE SET NULL
 );
 
+CREATE TABLE IF NOT EXISTS learning_observations (
+    id TEXT PRIMARY KEY,
+    ts TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    source_id TEXT,
+    conversation_id TEXT,
+    role TEXT,
+    content TEXT NOT NULL DEFAULT '',
+    summary TEXT NOT NULL DEFAULT '',
+    payload TEXT NOT NULL DEFAULT '{}'
+);
+
 CREATE TABLE IF NOT EXISTS approvals (
     id TEXT PRIMARY KEY,
     created_at TEXT NOT NULL,
@@ -1859,6 +2026,10 @@ CREATE INDEX IF NOT EXISTS idx_file_chunks_file ON file_chunks(file_id, position
 CREATE INDEX IF NOT EXISTS idx_health_component ON health_snapshots(component, ts);
 CREATE INDEX IF NOT EXISTS idx_tool_runs_ts ON tool_runs(ts);
 CREATE INDEX IF NOT EXISTS idx_tool_runs_mission ON tool_runs(mission_id, task_id);
+CREATE INDEX IF NOT EXISTS idx_learning_observations_ts ON learning_observations(ts);
+CREATE INDEX IF NOT EXISTS idx_learning_observations_kind ON learning_observations(kind, ts);
+CREATE INDEX IF NOT EXISTS idx_learning_observations_conversation
+ON learning_observations(conversation_id, ts);
 CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_telemetry_ts ON telemetry_snapshots(ts);
 CREATE INDEX IF NOT EXISTS idx_audit_log_target ON audit_log(target_type, target_id, ts);

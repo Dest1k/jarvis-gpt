@@ -544,7 +544,7 @@ class BenchmarkResponse(BaseModel):
 
 
 class BrowserPolicyResponse(BaseModel):
-    mode: Literal["approval-only", "local-safe", "locked"]
+    mode: Literal["open", "approval-only", "local-safe", "locked"]
     allow_localhost: bool
     allowed_hosts: list[str] = Field(default_factory=list)
     blocked_schemes: list[str] = Field(default_factory=list)
@@ -553,7 +553,7 @@ class BrowserPolicyResponse(BaseModel):
 
 
 class BrowserPolicyUpdateRequest(BaseModel):
-    mode: Literal["approval-only", "local-safe", "locked"] | None = None
+    mode: Literal["open", "approval-only", "local-safe", "locked"] | None = None
     allow_localhost: bool | None = None
     allowed_hosts: list[str] | None = None
     blocked_schemes: list[str] | None = None

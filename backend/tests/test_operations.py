@@ -17,6 +17,8 @@ def _manager(monkeypatch, tmp_path) -> tuple[OperationsManager, JarvisStorage]:
 def test_browser_and_docker_policy_persist(monkeypatch, tmp_path):
     manager, storage = _manager(monkeypatch, tmp_path)
 
+    assert manager.browser_policy()["mode"] == "open"
+    assert manager.browser_policy()["require_approval_for_external"] is False
     browser = manager.update_browser_policy({"mode": "local-safe", "max_urls_per_action": 3})
     docker = manager.update_docker_policy(
         {"allowed_prefixes": ["jarvis-", "lab-"], "max_log_tail": 120}

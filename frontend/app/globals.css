@@ -117,6 +117,7 @@ button:disabled {
   flex-direction: column;
   gap: 18px;
   min-width: 0;
+  min-height: 100vh;
   padding: 24px;
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0.025), rgba(255, 255, 255, 0) 360px),
@@ -359,6 +360,7 @@ h3 {
   align-items: start;
   grid-template-columns: minmax(360px, 1.35fr) minmax(320px, 0.75fr);
   gap: 16px;
+  flex: 1;
   min-height: 0;
 }
 
@@ -375,9 +377,9 @@ h3 {
   position: sticky;
   top: 18px;
   grid-template-rows: auto auto minmax(0, 1fr) auto 14px;
-  height: clamp(460px, min(var(--chat-target-height, 620px), calc(100vh - 360px)), 760px);
+  height: max(520px, var(--chat-target-height, 620px), calc(100vh - 380px));
   min-height: 460px;
-  max-height: 760px;
+  max-height: none;
   overflow: hidden;
 }
 
@@ -2683,7 +2685,7 @@ h3 {
 
   .chatPanel {
     position: static;
-    height: min(720px, max(520px, calc(100vh - 220px)));
+    height: max(520px, var(--chat-target-height, 620px), calc(100vh - 220px));
     min-height: 520px;
     max-height: none;
   }
@@ -2737,7 +2739,7 @@ h3 {
 
   .chatPanel {
     grid-template-rows: auto auto minmax(300px, 1fr) auto 14px;
-    height: min(680px, max(520px, calc(100vh - 160px)));
+    height: max(520px, var(--chat-target-height, 620px), calc(100vh - 160px));
     min-height: 520px;
   }
 

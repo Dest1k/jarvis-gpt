@@ -14,11 +14,11 @@ AUTONOMY_JOBS_KEY = "operations.autonomy.jobs"
 ROUTINE_RUNS_KEY = "operations.routine_runs"
 
 DEFAULT_BROWSER_POLICY: dict[str, Any] = {
-    "mode": "approval-only",
+    "mode": "open",
     "allow_localhost": True,
     "allowed_hosts": ["localhost", "127.0.0.1"],
     "blocked_schemes": ["file", "javascript", "data"],
-    "require_approval_for_external": True,
+    "require_approval_for_external": False,
     "max_urls_per_action": 5,
 }
 
@@ -273,9 +273,14 @@ def docker_container_allowed(policy: dict[str, Any], container: str) -> bool:
 
 
 def _normalize_browser_policy(value: dict[str, Any]) -> dict[str, Any]:
-    mode = str(value.get("mode") or "approval-only")
-    if mode not in {"approval-only", "local-safe", "locked"}:
-        mode = "approval-only"
+    mode = str(value.get("mode") or "open")
+    if mode not in {"open", "approval-only", "local-safe", "locked"}:
+        mode = "open"
+    require_approval_for_external = bool(value.get("require_approval_for_external", False))
+    if mode == "open":
+        require_approval_for_external = False
+    elif mode == "approval-only":
+        require_approval_for_external = True
     return {
         "mode": mode,
         "allow_localhost": bool(value.get("allow_localhost", True)),
@@ -284,7 +289,7 @@ def _normalize_browser_policy(value: dict[str, Any]) -> dict[str, Any]:
             value.get("blocked_schemes"),
             ["file", "javascript", "data"],
         ),
-        "require_approval_for_external": bool(value.get("require_approval_for_external", True)),
+        "require_approval_for_external": require_approval_for_external,
         "max_urls_per_action": _bounded_int(value.get("max_urls_per_action"), 1, 20, 5),
     }
 

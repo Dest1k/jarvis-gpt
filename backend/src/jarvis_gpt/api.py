@@ -344,6 +344,11 @@ async def learning_tick() -> LearningTickResponse:
     return result
 
 
+@app.get("/api/learning/journal")
+async def learning_journal(limit: int = Query(default=50, ge=1, le=200)) -> list[dict[str, Any]]:
+    return app.state.storage.list_learning_observations(limit=limit)
+
+
 @app.get("/api/host-bridge", response_model=HostBridgeResponse)
 async def host_bridge() -> HostBridgeResponse:
     return app.state.host_bridge.snapshot()

@@ -1,5 +1,25 @@
 # Runtime
 
+## 2026-07-09 handoff - open browsing and durable learning journal
+
+For the operator and the second model:
+
+- Browser policy default is `open`: validated HTTP(S) URLs can be opened without
+  approval. The validator still rejects non-http schemes and policy-locked URLs.
+- `browser.open` and `browser.open_many` are intentionally denied from the
+  autonomous tool loop. Background/current-data research should use backend
+  `web.search` and `web.fetch`, which do not touch the operator's desktop browser.
+- Added `learning_observations`: an append-only journal for dialogue messages,
+  tool runs, web/browser observations, and conversation deletion markers. Deleting
+  a chat removes visible history but leaves the learning journal intact.
+- Learning tick now derives lessons from the journal as well as audit/tool/approval
+  history. Supervisor runs learning immediately on startup and then every 120s by
+  default.
+- `GET /api/learning/journal` exposes recent learning observations for inspection.
+- Command Center chat links are clickable for Markdown links, bare `http(s)` URLs,
+  and `www.` URLs. Chat height now adapts to the viewport and the resize handle is
+  no longer capped at 760px.
+
 ## 2026-07-09 handoff - operator queue and generation resilience
 
 For the operator and the second model. This pass adds a thin runtime kernel
