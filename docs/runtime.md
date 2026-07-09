@@ -1,5 +1,25 @@
 # Runtime
 
+## 2026-07-10 handoff - document intelligence tools
+
+For the operator and the second model:
+
+- Uploaded chat files and local paths can now go through the same safe document
+  layer. Use `file_id` for chat uploads or `path` for local files under the
+  workspace, `JARVIS_HOME`, or the user home directory.
+- New tools: `documents.inspect`, `documents.read`, `documents.compare`,
+  `documents.edit.plan`, and `documents.apply_replacements`.
+- DOCX extraction reads paragraphs, tables, comments, and style names. XLSX
+  extraction reads sheet previews, shared strings, and formulas. PDF extraction
+  uses `pypdf` if available and otherwise a basic text fallback. Text/html/json/
+  csv are read directly.
+- Ingestion now indexes DOCX/XLSX/PDF/text-like uploads into file chunks, so
+  attachment context and `files.search` can find Office/PDF content.
+- `documents.apply_replacements` writes an edited copy to
+  `data/document-outputs`, registers it as a file, and never overwrites the
+  original. Use it only for exact replacements; larger formatting/layout work
+  should be planned first and visually verified before delivery.
+
 ## 2026-07-10 handoff - internet production surface
 
 For the operator and the second model:

@@ -35,6 +35,14 @@ from .browser_cdp import (
 from .config import JarvisSettings
 from .diagnostics import run_diagnostics
 from .dispatcher import DispatcherManager
+from .document_runtime import (
+    DocumentRuntimeError,
+    apply_document_replacements,
+    compare_documents,
+    document_mime_type,
+    extract_document,
+    is_supported_document,
+)
 from .host_bridge import HostBridgeClient, HostBridgeStatus
 from .learning import LearningEngine
 from .llm import LLMRouter
@@ -126,6 +134,7 @@ WEB_RATE_MAX_REQUESTS = 12
 WEB_RATE_BLOCKED_COOLDOWN_SEC = 900
 WEB_DOCUMENT_READ_MAX_BYTES = 50_000_000
 WEB_DOCUMENT_ZIP_MEMBER_MAX_BYTES = 2_000_000
+DOCUMENT_OUTPUT_DIRNAME = "document-outputs"
 WEB_VERIFY_STOPWORDS = {
     "a",
     "an",
@@ -712,6 +721,86 @@ class ToolRegistry:
                 category="memory",
                 input_schema={"query": "Text query", "limit": "Maximum chunk hits"},
                 handler=_files_search,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="documents.inspect",
+                description=(
+                    "Inspect an uploaded or local Word/Excel/PDF/text document by file_id or path."
+                ),
+                category="documents",
+                input_schema={
+                    "file_id": "Uploaded/indexed file id",
+                    "path": "Local path under the workspace, JARVIS_HOME, or user home",
+                    "max_chars": "Maximum extracted preview characters",
+                },
+                handler=_documents_inspect,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="documents.read",
+                description=(
+                    "Extract bounded text and structure from Word/Excel/PDF/text documents."
+                ),
+                category="documents",
+                input_schema={
+                    "file_id": "Uploaded/indexed file id",
+                    "path": "Local path under the workspace, JARVIS_HOME, or user home",
+                    "max_chars": "Maximum extracted text characters",
+                },
+                handler=_documents_read,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="documents.compare",
+                description="Compare two uploaded/local documents and return a compact diff.",
+                category="documents",
+                input_schema={
+                    "left_file_id": "First uploaded/indexed file id",
+                    "right_file_id": "Second uploaded/indexed file id",
+                    "left_path": "First local path",
+                    "right_path": "Second local path",
+                    "max_diffs": "Maximum diff lines",
+                },
+                handler=_documents_compare,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="documents.edit.plan",
+                description=(
+                    "Prepare a document editing plan from a target document, optional reference, "
+                    "and operator instruction."
+                ),
+                category="documents",
+                input_schema={
+                    "instruction": "What to edit, fix, compare, or imitate",
+                    "file_id": "Target uploaded/indexed file id",
+                    "path": "Target local path",
+                    "reference_file_id": "Optional reference file id",
+                    "reference_path": "Optional reference path",
+                },
+                handler=_documents_edit_plan,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="documents.apply_replacements",
+                description=(
+                    "Create an edited copy of a DOCX/XLSX/text document by exact replacements; "
+                    "the original is never overwritten."
+                ),
+                category="documents",
+                input_schema={
+                    "file_id": "Target uploaded/indexed file id",
+                    "path": "Target local path",
+                    "replacements": "List of {old,new} exact replacements",
+                    "output_name": "Optional output filename",
+                },
+                handler=_documents_apply_replacements,
             )
         )
         self.add(
@@ -1796,6 +1885,148 @@ def _files_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
         ok=True,
         summary=f"File search returned {len(hits)} chunk(s).",
         data={"hits": hits, "query": query, "limit": limit},
+    )
+
+
+def _documents_inspect(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    max_chars = _int_arg(args.get("max_chars"), default=8000, minimum=200, maximum=50000)
+    try:
+        target = _document_target(ctx, args, max_chars=max_chars)
+    except ValueError as exc:
+        return ToolRunResponse(tool="documents.inspect", ok=False, summary=str(exc))
+    payload = dict(target["document"])
+    text = str(payload.pop("text", "") or "")
+    summary = _document_summary_text(payload)
+    return ToolRunResponse(
+        tool="documents.inspect",
+        ok=True,
+        summary=f"Inspected {payload['kind']} document: {payload['name']}.",
+        data={
+            "target": _document_target_payload(target),
+            "document": payload,
+            "text_preview": _short_text(text, 1600),
+            "summary": summary,
+        },
+    )
+
+
+def _documents_read(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    max_chars = _int_arg(args.get("max_chars"), default=30000, minimum=500, maximum=200000)
+    try:
+        target = _document_target(ctx, args, max_chars=max_chars)
+    except ValueError as exc:
+        return ToolRunResponse(tool="documents.read", ok=False, summary=str(exc))
+    document = target["document"]
+    text = str(document.get("text") or "")
+    return ToolRunResponse(
+        tool="documents.read",
+        ok=bool(text.strip()),
+        summary=f"Read {len(text)} character(s) from {document['name']}.",
+        data={
+            "target": _document_target_payload(target),
+            "document": document,
+            "text": text,
+        },
+    )
+
+
+def _documents_compare(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    max_diffs = _int_arg(args.get("max_diffs"), default=120, minimum=20, maximum=500)
+    try:
+        left = _document_target(
+            ctx,
+            {"file_id": args.get("left_file_id"), "path": args.get("left_path")},
+            max_chars=80000,
+        )
+        right = _document_target(
+            ctx,
+            {"file_id": args.get("right_file_id"), "path": args.get("right_path")},
+            max_chars=80000,
+        )
+    except ValueError as exc:
+        return ToolRunResponse(tool="documents.compare", ok=False, summary=str(exc))
+    comparison = compare_documents(left["document"], right["document"], max_diffs=max_diffs)
+    return ToolRunResponse(
+        tool="documents.compare",
+        ok=True,
+        summary=(
+            "Compared documents: "
+            f"{comparison['stats']['additions']} addition(s), "
+            f"{comparison['stats']['deletions']} deletion(s)."
+        ),
+        data={
+            "left": _document_target_payload(left),
+            "right": _document_target_payload(right),
+            "comparison": comparison,
+        },
+    )
+
+
+def _documents_edit_plan(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    instruction = " ".join(str(args.get("instruction") or "").split())
+    if not instruction:
+        return ToolRunResponse(
+            tool="documents.edit.plan",
+            ok=False,
+            summary="Instruction is required.",
+        )
+    try:
+        target = _document_target(ctx, args, max_chars=50000)
+        reference = None
+        if args.get("reference_file_id") or args.get("reference_path"):
+            reference = _document_target(
+                ctx,
+                {
+                    "file_id": args.get("reference_file_id"),
+                    "path": args.get("reference_path"),
+                },
+                max_chars=50000,
+            )
+    except ValueError as exc:
+        return ToolRunResponse(tool="documents.edit.plan", ok=False, summary=str(exc))
+    target_doc = target["document"]
+    reference_doc = reference["document"] if reference else None
+    comparison = (
+        compare_documents(target_doc, reference_doc, max_diffs=80) if reference_doc else None
+    )
+    plan = _document_edit_plan_payload(instruction, target_doc, reference_doc, comparison)
+    return ToolRunResponse(
+        tool="documents.edit.plan",
+        ok=True,
+        summary=f"Prepared document edit plan for {target_doc['name']}.",
+        data={
+            "target": _document_target_payload(target),
+            "reference": _document_target_payload(reference) if reference else None,
+            "plan": plan,
+            "comparison": comparison,
+        },
+    )
+
+
+def _documents_apply_replacements(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    try:
+        target = _document_target(ctx, args, max_chars=30000)
+        replacements = _replacement_list_arg(args.get("replacements"))
+        output_path = _document_output_path(ctx.settings, target["path"], args.get("output_name"))
+        result = apply_document_replacements(target["path"], replacements, output_path)
+        file_record = _record_generated_document(ctx, output_path)
+    except (ValueError, DocumentRuntimeError, OSError, zipfile.BadZipFile) as exc:
+        return ToolRunResponse(tool="documents.apply_replacements", ok=False, summary=str(exc))
+    return ToolRunResponse(
+        tool="documents.apply_replacements",
+        ok=True,
+        summary=(
+            f"Created edited copy with {result['changed']} replacement(s): "
+            f"{output_path.name}."
+        ),
+        data={
+            "source": _document_target_payload(target),
+            "output": {
+                "path": str(output_path),
+                "file": file_record,
+                "changed": result["changed"],
+            },
+        },
     )
 
 
@@ -3578,6 +3809,224 @@ def _resolve_allowed_path(settings: JarvisSettings, raw_path: str) -> Path:
             continue
     roots_text = ", ".join(str(root) for root in roots)
     raise ValueError(f"Path is outside allowed roots: {roots_text}")
+
+
+def _resolve_document_path(settings: JarvisSettings, raw_path: str) -> Path:
+    if not raw_path:
+        raise ValueError("Document path is required.")
+    candidate = Path(raw_path).expanduser()
+    windows_candidate = PureWindowsPath(raw_path)
+    if not candidate.is_absolute() and windows_candidate.drive:
+        raise ValueError("Windows-style absolute paths are outside allowed roots.")
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+    candidate = candidate.resolve(strict=False)
+    roots = [
+        Path.cwd().resolve(strict=False),
+        settings.home.resolve(strict=False),
+        Path.home().resolve(strict=False),
+    ]
+    for root in roots:
+        try:
+            candidate.relative_to(root)
+            return candidate
+        except ValueError:
+            continue
+    roots_text = ", ".join(str(root) for root in roots)
+    raise ValueError(f"Document path is outside allowed roots: {roots_text}")
+
+
+def _document_target(
+    ctx: ToolContext,
+    args: dict[str, Any],
+    *,
+    max_chars: int,
+) -> dict[str, Any]:
+    file_id = str(args.get("file_id") or "").strip()
+    raw_path = str(args.get("path") or "").strip()
+    file_record = None
+    if file_id:
+        file_record = ctx.storage.get_file(file_id)
+        if file_record is None:
+            raise ValueError(f"File not found: {file_id}")
+        path = Path(str(file_record["stored_path"])).resolve(strict=False)
+    elif raw_path:
+        path = _resolve_document_path(ctx.settings, raw_path)
+    else:
+        raise ValueError("file_id or path is required.")
+    if not path.exists() or not path.is_file():
+        raise ValueError(f"Document does not exist: {path}")
+    if not is_supported_document(path):
+        raise ValueError(f"Unsupported document type: {path.suffix or path.name}")
+    try:
+        document = extract_document(path, max_chars=max_chars)
+    except DocumentRuntimeError as exc:
+        raise ValueError(str(exc)) from exc
+    return {"path": path, "file": file_record, "document": document}
+
+
+def _document_target_payload(target: dict[str, Any] | None) -> dict[str, Any] | None:
+    if target is None:
+        return None
+    file_record = target.get("file") if isinstance(target.get("file"), dict) else None
+    return {
+        "file_id": file_record.get("id") if file_record else None,
+        "name": (target.get("document") or {}).get("name"),
+        "path": str(target.get("path")),
+        "kind": (target.get("document") or {}).get("kind"),
+        "mime_type": (target.get("document") or {}).get("mime_type"),
+    }
+
+
+def _document_summary_text(document: dict[str, Any]) -> str:
+    structure = document.get("structure") if isinstance(document.get("structure"), dict) else {}
+    kind = str(document.get("kind") or "document")
+    if kind == "docx":
+        return (
+            f"DOCX: {structure.get('paragraph_count', 0)} paragraph(s), "
+            f"{structure.get('table_count', 0)} table(s), "
+            f"{structure.get('comment_count', 0)} comment(s)."
+        )
+    if kind == "xlsx":
+        return (
+            f"Workbook: {structure.get('sheet_count', 0)} sheet(s), "
+            f"{structure.get('formula_count', 0)} formula(s)."
+        )
+    if kind == "pdf":
+        return f"PDF: {structure.get('page_count', 0)} page(s)."
+    return f"{kind.upper()}: {document.get('size', 0)} byte(s)."
+
+
+def _document_edit_plan_payload(
+    instruction: str,
+    target: dict[str, Any],
+    reference: dict[str, Any] | None,
+    comparison: dict[str, Any] | None,
+) -> dict[str, Any]:
+    steps = [
+        "Inspect target structure and preserve existing layout unless the instruction requires it.",
+        (
+            "Use extracted text as evidence; do not invent content that is not in the "
+            "document/reference."
+        ),
+    ]
+    if reference is not None:
+        steps.append(
+            "Compare target with reference and copy only the requested style/content pattern."
+        )
+    if target.get("kind") == "docx":
+        steps.append(
+            "For exact text edits, use documents.apply_replacements to create a DOCX copy."
+        )
+        steps.append(
+            "For major formatting work, render the DOCX and visually verify pages before delivery."
+        )
+    elif target.get("kind") == "xlsx":
+        steps.append(
+            "Preserve formulas and workbook structure; exact shared-string edits can be copied."
+        )
+        steps.append(
+            "For formula/layout changes, inspect key ranges and verify formulas before delivery."
+        )
+    elif target.get("kind") == "pdf":
+        steps.append(
+            "Treat PDF as source/review material; create a new DOCX/PDF artifact for edits."
+        )
+    else:
+        steps.append("For text-like files, exact replacements can create an edited copy.")
+    return {
+        "instruction": instruction,
+        "target_summary": _document_summary_text(target),
+        "reference_summary": _document_summary_text(reference) if reference else None,
+        "recommended_steps": steps,
+        "candidate_replacements": [],
+        "comparison_stats": comparison.get("stats") if comparison else None,
+        "tools": [
+            "documents.inspect",
+            "documents.read",
+            "documents.compare",
+            "documents.apply_replacements",
+        ],
+    }
+
+
+def _replacement_list_arg(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, list) or not value:
+        raise ValueError("replacements must be a non-empty list of {old,new} objects.")
+    replacements: list[dict[str, str]] = []
+    for item in value[:50]:
+        if not isinstance(item, dict):
+            continue
+        old = str(item.get("old") or "")
+        new = str(item.get("new") or "")
+        if old:
+            replacements.append({"old": old[:10000], "new": new[:10000]})
+    if not replacements:
+        raise ValueError("No valid replacements were provided.")
+    return replacements
+
+
+def _document_output_path(settings: JarvisSettings, source: Path, output_name: Any) -> Path:
+    output_dir = settings.data_dir / DOCUMENT_OUTPUT_DIRNAME
+    suffix = source.suffix or ".txt"
+    raw_name = str(output_name or "").strip()
+    if raw_name:
+        safe_name = re.sub(r"[^\w.\- ()\[\]]+", "_", Path(raw_name).name).strip(" .")
+        if not Path(safe_name).suffix:
+            safe_name = f"{safe_name}{suffix}"
+    else:
+        safe_name = f"{source.stem}.edited{suffix}"
+    safe_name = safe_name[:180] or f"edited{suffix}"
+    candidate = output_dir / safe_name
+    if not candidate.exists():
+        return candidate
+    return output_dir / f"{candidate.stem}.{new_id('doc')}{candidate.suffix}"
+
+
+def _record_generated_document(ctx: ToolContext, path: Path) -> dict[str, Any]:
+    data = path.read_bytes()
+    digest = hashlib.sha256(data).hexdigest()
+    try:
+        document = extract_document(path, max_chars=200000)
+        chunks = _document_chunks(str(document.get("text") or ""))
+        status = "indexed" if chunks else "stored"
+        error = None
+    except (DocumentRuntimeError, OSError, zipfile.BadZipFile) as exc:
+        chunks = []
+        status = "stored"
+        error = f"Generated document indexing skipped: {exc}"
+    file_record = ctx.storage.create_file_record(
+        name=path.name,
+        source_path=None,
+        stored_path=path,
+        sha256=digest,
+        size=len(data),
+        mime_type=document_mime_type(path),
+        status=status,
+        error=error,
+        chunk_count=len(chunks),
+    )
+    if chunks:
+        ctx.storage.add_file_chunks(file_record["id"], chunks)
+        file_record = ctx.storage.get_file(file_record["id"]) or file_record
+    return file_record
+
+
+def _document_chunks(text: str, *, chunk_size: int = 1800, overlap: int = 180) -> list[str]:
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not normalized:
+        return []
+    chunks: list[str] = []
+    start = 0
+    while start < len(normalized):
+        end = min(len(normalized), start + chunk_size)
+        chunk = normalized[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        if end >= len(normalized):
+            break
+        start = max(start + 1, end - overlap)
+    return chunks
 
 
 def _run_docker(args: list[str], *, timeout: int) -> dict[str, Any]:

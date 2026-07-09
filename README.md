@@ -7,7 +7,7 @@
 - FastAPI backend с `/health`, `/api/status`, `/api/models`, `/api/chat`, `/api/chat/stream`, `/api/missions`, `/api/memory`, `/api/files`, `/api/approvals`, `/api/audit`, `/api/diagnostics`.
 - Offline-first агент: сохраняет диалоги, создаёт mission plans и деградирует корректно, если локальная LLM не поднята.
 - Safe tools runtime: диагностика, статус, память, публичный web fetch/search/render/download с SSRF-защитой, evidence ledger/extract/verify, schema.org/OpenGraph/readability extraction, quarantine download inspection, semantic review-gated Chrome CDP read/click/type/select/screenshot plus human handoff status, validated browser open без approval для явных запросов открыть URL, Docker ps/logs для Jarvis-контейнеров, файловое чтение в разрешённых корнях, approval-gated sandbox write, token-auth host bridge и execution brief для миссий.
-- File ingestion: загрузка текстовых файлов, хранение в `D:\jarvis\data\jarvis-gpt\files`, chunk search и audit trail.
+- File ingestion: загрузка текстовых, Word/Excel/PDF файлов, хранение в `D:\jarvis\data\jarvis-gpt\files`, document extraction, chunk search и audit trail.
 - Model catalog: активные профили знают реальные Gemma 4 веса в `D:\jarvis\data\models`.
 - HITL approvals: опасные действия оформляются как durable approval gates, а не выполняются молча.
 - Telemetry/performance: CPU/RAM/disk/GPU/Docker snapshots, performance profile и host bridge status.
@@ -181,6 +181,11 @@ docker compose --profile llm up -d dispatcher
   status shows internet handoff, evidence/research counts, recent blocked pages,
   cooldowns, top domain/provider, and can run a smoke check from the web URL
   draft.
+- Document intelligence surface: uploaded files or local paths can use
+  `documents.inspect`, `documents.read`, `documents.compare`,
+  `documents.edit.plan`, and `documents.apply_replacements` for Word/Excel/PDF
+  and text-like files. Edited copies are written under `data/document-outputs`
+  without overwriting originals.
 - Unified launcher `.\jarvis.cmd` provides keyboard-menu start/stop/restart/status/logs/doctor/open flows plus `gemma4-turbo` and `gemma4-mono` startup shortcuts.
 - Experience API persists operator preferences, autonomy policy, daily briefing, self-heal reports and benchmark history in SQLite.
 - Operator persona (`/api/persona`) is a first-class understanding layer: the agent injects it into every LLM turn, uses `location` as the generic place fallback (weather/local/geo) instead of a weather-only cache, and surfaces `current_focus` in the daily briefing. Editable from Command Center → «Профиль оператора» and via `jarvis persona` / `persona-set`.
@@ -197,7 +202,8 @@ docker compose --profile llm up -d dispatcher
 - Conversation history is durable and can be restored from Command Center after reload.
 - Command Center has browser voice input for the chat composer where the Web Speech API is available.
 - Command Center registers a service worker and keeps the local UI shell available after the first successful load.
-- Command Center can run safe public web fetches and show the clipped result inline.
+- Command Center can upload Office/PDF/text attachments for document extraction
+  and can run safe public web fetches with clipped results inline.
 - Command Center can create host-command approval gates and execute them after approval.
 - Native host bridge now has a bundled local RPC script, token detection, CLI execution, and a `danger` tool for approved host commands.
 - Safe tools include `web.fetch` for public HTTP(S) context with private-network and redirect guards.

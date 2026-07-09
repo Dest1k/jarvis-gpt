@@ -4,11 +4,18 @@ import hashlib
 import mimetypes
 import os
 import re
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO
 
 from .config import JarvisSettings
+from .document_runtime import (
+    DOCUMENT_EXTENSION_MIME_TYPES,
+    DocumentRuntimeError,
+    extract_document,
+    is_supported_document,
+)
 from .storage import JarvisStorage, new_id
 
 TEXT_EXTENSIONS = {
@@ -37,6 +44,7 @@ TEXT_MIME_TYPES = {
 }
 EXTENSION_MIME_TYPES = {
     ".csv": "text/csv",
+    **DOCUMENT_EXTENSION_MIME_TYPES,
     ".json": "application/json",
     ".md": "text/markdown",
     ".toml": "text/toml",
@@ -196,6 +204,18 @@ class FileIngestor:
                 except OSError as exc:
                     status = "failed"
                     error = str(exc)
+        elif is_supported_document(stored.name, stored.mime_type):
+            try:
+                document = extract_document(stored.path, max_chars=200_000)
+                chunks = _chunk_text(str(document.get("text") or ""))
+                status = "indexed" if chunks else "stored"
+                warnings = (
+                    document.get("warnings") if isinstance(document.get("warnings"), list) else []
+                )
+                error = "; ".join(str(item) for item in warnings[:3]) or None
+            except (DocumentRuntimeError, OSError, zipfile.BadZipFile) as exc:
+                status = "failed"
+                error = f"Document indexing failed: {exc}"
         else:
             error = "Binary or unsupported text format; file stored without chunks."
 
@@ -247,7 +267,7 @@ def _is_text_file(stored: StoredFile) -> bool:
 
 def _looks_indexable_path(path: Path) -> bool:
     suffix = path.suffix.lower()
-    if suffix in TEXT_EXTENSIONS or suffix in EXTENSION_MIME_TYPES:
+    if suffix in TEXT_EXTENSIONS or suffix in EXTENSION_MIME_TYPES or is_supported_document(path):
         return True
     mime_type = mimetypes.guess_type(path.name)[0] or ""
     return mime_type.startswith("text/") or mime_type in TEXT_MIME_TYPES

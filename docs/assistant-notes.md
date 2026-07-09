@@ -9,6 +9,29 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-10 - Codex (document intelligence tools)
+
+- Added shared `document_runtime` extraction for uploaded/local documents:
+  DOCX paragraphs/tables/comments/styles, XLSX sheets/shared strings/formulas,
+  PDF text/page count with optional `pypdf` fallback, and text/html/json/csv.
+  Legacy `.doc/.xls` are recognized with a clear conversion-needed error.
+- File ingestion now indexes DOCX/XLSX/PDF/text-like uploads into searchable
+  chunks instead of storing Office/PDF files as opaque binaries when extraction
+  succeeds.
+- Added safe document tools accepting either `file_id` from chat upload or a
+  local `path` under workspace, `JARVIS_HOME`, or user home:
+  `documents.inspect`, `documents.read`, `documents.compare`,
+  `documents.edit.plan`, and `documents.apply_replacements`.
+- `documents.apply_replacements` creates an edited copy under
+  `data/document-outputs`; it never overwrites the original. It supports exact
+  replacements in DOCX, XLSX/XLSM shared strings/sheets, and text-like files,
+  then registers/indexes the generated copy in file storage.
+- Agent attachment prompts and mission guidance now point Word/Excel/PDF work
+  through `documents.*` tools for reading, comparison, edit planning, and safe
+  edited copies.
+- Verified: `pytest -q backend\tests --tb=short` (234 pass), backend ruff,
+  backend compileall, and frontend `npm run typecheck`.
+
 ### 2026-07-10 - Codex (internet production surface)
 
 - Added safe `web.research`: one call now searches, fetches, optionally renders,

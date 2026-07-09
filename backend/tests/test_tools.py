@@ -9,6 +9,8 @@ from types import SimpleNamespace
 import httpx
 from jarvis_gpt.browser_cdp import BrowserActionResult, BrowserPageSnapshot
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
+from jarvis_gpt.document_runtime import extract_document
+from jarvis_gpt.ingest import FileIngestor
 from jarvis_gpt.llm import LLMRouter
 from jarvis_gpt.models import ToolRunResponse
 from jarvis_gpt.storage import JarvisStorage
@@ -19,6 +21,55 @@ from jarvis_gpt.tools import (
     _PublicOnlyAsyncNetworkBackend,
     _windows_native_command,
 )
+
+
+def _write_minimal_docx(path: Path, text: str) -> None:
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            "word/document.xml",
+            (
+                '<w:document xmlns:w="http://schemas.openxmlformats.org/'
+                'wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>'
+                f"{text}"
+                "</w:t></w:r></w:p></w:body></w:document>"
+            ),
+        )
+
+
+def _write_minimal_xlsx(path: Path, text: str) -> None:
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            "xl/workbook.xml",
+            (
+                '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+                'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/'
+                'relationships"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/>'
+                "</sheets></workbook>"
+            ),
+        )
+        archive.writestr(
+            "xl/_rels/workbook.xml.rels",
+            (
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/'
+                'relationships"><Relationship Id="rId1" Target="worksheets/sheet1.xml"/>'
+                "</Relationships>"
+            ),
+        )
+        archive.writestr(
+            "xl/sharedStrings.xml",
+            (
+                '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                f"<si><t>{text}</t></si></sst>"
+            ),
+        )
+        archive.writestr(
+            "xl/worksheets/sheet1.xml",
+            (
+                '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                '<sheetData><row r="1"><c r="A1" t="s"><v>0</v></c>'
+                '<c r="B1"><f>1+1</f><v>2</v></c></row></sheetData></worksheet>'
+            ),
+        )
 
 
 def test_tool_registry_runs_memory_tools(monkeypatch, tmp_path):
@@ -295,6 +346,105 @@ def test_filesystem_write_text_is_sandboxed_and_gated(monkeypatch, tmp_path):
     assert target.read_text(encoding="utf-8") == "hello"
     assert denied.ok is False
     assert "outside allowed roots" in denied.summary
+    storage.close()
+
+
+def test_documents_tools_read_compare_and_plan_paths(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+    docs_dir = settings.home / "docs"
+    docs_dir.mkdir(parents=True)
+    left_path = docs_dir / "left.docx"
+    right_path = docs_dir / "right.docx"
+    _write_minimal_docx(left_path, "Alpha document draft")
+    _write_minimal_docx(right_path, "Alpha document final")
+
+    inspected = asyncio.run(tools.run("documents.inspect", {"path": str(left_path)}))
+    read = asyncio.run(tools.run("documents.read", {"path": str(left_path)}))
+    compared = asyncio.run(
+        tools.run(
+            "documents.compare",
+            {"left_path": str(left_path), "right_path": str(right_path)},
+        )
+    )
+    plan = asyncio.run(
+        tools.run(
+            "documents.edit.plan",
+            {
+                "path": str(left_path),
+                "reference_path": str(right_path),
+                "instruction": "Make target match reference wording",
+            },
+        )
+    )
+
+    assert inspected.ok is True
+    assert inspected.data["document"]["kind"] == "docx"
+    assert inspected.data["document"]["structure"]["paragraph_count"] == 1
+    assert read.ok is True
+    assert "Alpha document draft" in read.data["text"]
+    assert compared.ok is True
+    assert "Alpha document final" in compared.data["comparison"]["additions"]
+    assert plan.ok is True
+    assert plan.data["comparison"]["stats"]["additions"] == 1
+    storage.close()
+
+
+def test_documents_tools_use_file_id_and_create_edited_copy(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+    source = tmp_path / "source.docx"
+    _write_minimal_docx(source, "Replace Alpha with Beta")
+    ingested = FileIngestor(settings=settings, storage=storage).ingest_path(source)
+
+    result = asyncio.run(
+        tools.run(
+            "documents.apply_replacements",
+            {
+                "file_id": ingested["file"]["id"],
+                "replacements": [{"old": "Alpha", "new": "Beta"}],
+                "output_name": "source-fixed.docx",
+            },
+        )
+    )
+
+    output_path = Path(result.data["output"]["path"])
+    output_doc = extract_document(output_path)
+    assert result.ok is True
+    assert output_path.exists()
+    assert output_path.parent == settings.data_dir / "document-outputs"
+    assert "Replace Beta with Beta" in output_doc["text"]
+    assert result.data["output"]["file"]["chunk_count"] == 1
+    storage.close()
+
+
+def test_documents_inspect_reads_xlsx_by_path(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+    workbook = settings.home / "budget.xlsx"
+    _write_minimal_xlsx(workbook, "Revenue Alpha")
+
+    result = asyncio.run(tools.run("documents.inspect", {"path": str(workbook)}))
+
+    assert result.ok is True
+    assert result.data["document"]["kind"] == "xlsx"
+    assert result.data["document"]["structure"]["sheet_count"] == 1
+    assert "Revenue Alpha" in result.data["text_preview"]
     storage.close()
 
 

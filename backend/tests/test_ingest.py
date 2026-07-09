@@ -1,8 +1,59 @@
 from __future__ import annotations
 
+import zipfile
+
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
 from jarvis_gpt.ingest import FileIngestor
 from jarvis_gpt.storage import JarvisStorage
+
+
+def _write_minimal_docx(path, text: str) -> None:
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            "word/document.xml",
+            (
+                '<w:document xmlns:w="http://schemas.openxmlformats.org/'
+                'wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>'
+                f"{text}"
+                "</w:t></w:r></w:p></w:body></w:document>"
+            ),
+        )
+
+
+def _write_minimal_xlsx(path, text: str) -> None:
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            "xl/workbook.xml",
+            (
+                '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+                'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/'
+                'relationships"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/>'
+                "</sheets></workbook>"
+            ),
+        )
+        archive.writestr(
+            "xl/_rels/workbook.xml.rels",
+            (
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/'
+                'relationships"><Relationship Id="rId1" Target="worksheets/sheet1.xml"/>'
+                "</Relationships>"
+            ),
+        )
+        archive.writestr(
+            "xl/sharedStrings.xml",
+            (
+                '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                f"<si><t>{text}</t></si></sst>"
+            ),
+        )
+        archive.writestr(
+            "xl/worksheets/sheet1.xml",
+            (
+                '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                '<sheetData><row r="1"><c r="A1" t="s"><v>0</v></c>'
+                '<c r="B1"><f>1+1</f><v>2</v></c></row></sheetData></worksheet>'
+            ),
+        )
 
 
 def test_file_ingestor_indexes_text_and_records_audit(monkeypatch, tmp_path):
@@ -55,6 +106,33 @@ def test_file_ingestor_indexes_directory_with_limits(monkeypatch, tmp_path):
     assert result["files_indexed"] == 1
     assert result["files_failed"] == 0
     assert hits
+    storage.close()
+
+
+def test_file_ingestor_indexes_office_documents(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    source_docx = tmp_path / "brief.docx"
+    source_xlsx = tmp_path / "budget.xlsx"
+    _write_minimal_docx(source_docx, "Jarvis Word attachment alpha")
+    _write_minimal_xlsx(source_xlsx, "Jarvis Excel attachment beta")
+
+    ingestor = FileIngestor(settings=settings, storage=storage)
+    docx_result = ingestor.ingest_path(source_docx)
+    xlsx_result = ingestor.ingest_path(source_xlsx)
+    hits = storage.search_file_chunks("attachment", limit=10)
+
+    assert docx_result["file"]["status"] == "indexed"
+    assert xlsx_result["file"]["status"] == "indexed"
+    assert docx_result["chunks_indexed"] == 1
+    assert xlsx_result["chunks_indexed"] == 1
+    assert {item["file_id"] for item in hits} == {
+        docx_result["file"]["id"],
+        xlsx_result["file"]["id"],
+    }
     storage.close()
 
 

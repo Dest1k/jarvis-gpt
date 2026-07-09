@@ -155,6 +155,8 @@ MISSION_EXECUTOR_PROMPT = (
     "доступные инструменты, чтобы реально продвинуть шаг: собери данные, проверь систему, "
     "прочитай файлы, посмотри статус. Для интернет-шагов предпочитай web.research, "
     "web.extract, web.verify и web.document.read, чтобы получить источники и citations. "
+    "Для Word/Excel/PDF используй documents.inspect/read/compare/edit.plan и создавай "
+    "edited copy через documents.apply_replacements, не перезаписывая оригинал. "
     "Не выдумывай результаты — опирайся на observation "
     "инструментов. Опасные действия автономно недоступны и станут approval-гейтом; в этом "
     "случае честно скажи, что шаг требует подтверждения оператора. В конце дай краткий "
@@ -330,7 +332,8 @@ def _message_with_attachments(message: str, attachments: list[dict[str, Any]]) -
         "",
         (
             "Attached files already uploaded to Jarvis storage. "
-            "Use indexed file context or file tools when content is needed:"
+            "Use indexed file context or documents.* tools when Word/Excel/PDF/text "
+            "content, comparison, or edits are needed:"
         ),
     ]
     for item in attachments:
@@ -2417,10 +2420,17 @@ class AgentRuntime:
                 mode=task_mode,
                 intent="attached_file_context",
                 confidence=0.78,
-                tools=("file_context",),
+                tools=(
+                    "documents.inspect",
+                    "documents.read",
+                    "documents.compare",
+                    "documents.edit.plan",
+                    "documents.apply_replacements",
+                ),
                 completion_criteria=(
-                    "use indexed attachment context when relevant",
-                    "ask for missing file content only if indexing is insufficient",
+                    "inspect/read uploaded documents when relevant",
+                    "compare or prepare an edit plan before changing document copies",
+                    "ask for missing file content only if document extraction is insufficient",
                 ),
                 rationale="The turn includes uploaded file context.",
             )
@@ -3257,6 +3267,7 @@ class AgentRuntime:
                     "- durable_capabilities: memory search/save, file ingestion/search, "
                     "mission planning/execution, learning journal/tick, "
                     "web.search/web.fetch/web.research/web.verify/web.document.read, "
+                    "documents.inspect/read/compare/edit.plan/apply_replacements, "
                     "telemetry, diagnostics, Docker/dispatcher inspection, host bridge gates."
                 ),
                 (

@@ -245,6 +245,7 @@ def test_agent_passes_chat_attachments_to_llm_context(monkeypatch, tmp_path):
     assert user_message["content"] == "разбери вложение"
     assert user_message["metadata"]["attachments"][0]["id"] == file_record["id"]
     assert "Attached files already uploaded" in rendered_prompt
+    assert "documents.* tools" in rendered_prompt
     assert "brief.txt" in rendered_prompt
     assert "alpha attached content from upload" in rendered_prompt
     storage.close()
