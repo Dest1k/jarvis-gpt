@@ -67,6 +67,45 @@ def test_semantic_order_uses_remote_dense_vectors_when_available():
     assert order[0] == 1
 
 
+def test_hybrid_files_reranks_chunks_by_semantic_closeness(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    stored = tmp_path / "gpu-notes.txt"
+    stored.write_text("gpu notes", encoding="utf-8")
+    record = storage.create_file_record(
+        name="gpu-notes.txt",
+        stored_path=stored,
+        sha256="abc",
+        size=stored.stat().st_size,
+        mime_type="text/plain",
+        status="indexed",
+        chunk_count=2,
+    )
+    hot = "Видеокарта греется под нагрузкой в играх, чистить кулер и термопасту."
+    unrelated = "Видеокарта используется для рендеринга видео и монтажа роликов."
+    storage.add_file_chunks(record["id"], [unrelated, hot])
+    agent = AgentRuntime(
+        settings=settings,
+        storage=storage,
+        llm=LLMRouter(settings),
+        bus=EventBus(),
+    )
+
+    context = agent._prepare_context("почему видеокарта перегревается в играх?", None)
+    context.file_hits = storage.list_file_chunks(record["id"], limit=10)
+    asyncio.run(
+        agent._augment_semantic_files(context, "почему видеокарта перегревается в играх?")
+    )
+
+    assert context.file_hits[0]["content"] == hot
+    assert context.file_hits[0].get("retrieval") == "hybrid"
+    storage.close()
+
+
 def test_hybrid_memory_surfaces_paraphrase_missed_by_keywords(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")

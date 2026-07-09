@@ -439,6 +439,7 @@ class AgentRuntime:
                 context.file_hits,
             )
         await self._augment_semantic_memory(context, context_message)
+        await self._augment_semantic_files(context, context_message)
         task_plan = self._plan_task(
             context_message,
             context,
@@ -624,6 +625,7 @@ class AgentRuntime:
                 context.file_hits,
             )
         await self._augment_semantic_memory(context, context_message)
+        await self._augment_semantic_files(context, context_message)
         task_plan = self._plan_task(
             context_message,
             context,
@@ -1887,38 +1889,31 @@ class AgentRuntime:
             file_hits=file_hits,
         )
 
-    async def _augment_semantic_memory(
+    async def _hybrid_rerank(
         self,
-        context: AgentContext,
-        message: str,
+        query: str,
+        lexical_hits: list[dict[str, Any]],
+        extra_pool: list[dict[str, Any]],
         *,
-        limit: int = 8,
-    ) -> None:
-        """Re-rank memory with a hybrid lexical + semantic signal.
+        id_key: str,
+        limit: int,
+    ) -> list[dict[str, Any]] | None:
+        """Fuse a lexical order with a semantic order over a bounded pool.
 
-        Fuses the lexical order from ``_prepare_context`` with a semantic order
-        over a bounded candidate pool (lexical hits plus recent/important
-        memories), so paraphrased or differently-inflected memories surface even
-        when they share no keywords with the query. Degrades to the existing
-        lexical order on any failure.
+        Returns the re-ranked hits, or None when there is nothing to improve or
+        anything fails — retrieval must never break a turn. Shared by memory and
+        file-chunk retrieval so both get semantic recall that keyword search
+        misses (paraphrase, inflection, word order).
         """
 
-        query = " ".join(str(message or "").split())
-        if not query:
-            return
         pool: dict[str, dict[str, Any]] = {}
-        for item in context.memory_hits:
-            item_id = str(item.get("id") or "")
-            if item_id:
-                pool.setdefault(item_id, item)
-        recent_pool = self.storage.search_memory(None, limit=60)
-        for item in recent_pool:
-            item_id = str(item.get("id") or "")
-            if item_id:
-                pool.setdefault(item_id, item)
+        for item in (*lexical_hits, *extra_pool):
+            key = str(item.get(id_key) or "")
+            if key:
+                pool.setdefault(key, item)
         candidates = list(pool.values())
         if len(candidates) < 2:
-            return
+            return None
         try:
             semantic_order = await semantic_similarity_order(
                 self.embeddings,
@@ -1926,23 +1921,75 @@ class AgentRuntime:
                 [str(item.get("content") or "") for item in candidates],
             )
         except Exception:  # noqa: BLE001 - retrieval must never break a turn
-            return
-        semantic_ranking = [str(candidates[index].get("id") or "") for index in semantic_order]
-        lexical_ranking = [str(item.get("id") or "") for item in context.memory_hits]
+            return None
+        semantic_ranking = [str(candidates[index].get(id_key) or "") for index in semantic_order]
+        lexical_ranking = [str(item.get(id_key) or "") for item in lexical_hits]
         fused = reciprocal_rank_fusion([lexical_ranking, semantic_ranking])
         if not fused:
-            return
+            return None
         top_score = max(fused.values()) or 1.0
+        # Order candidates by semantic closeness first so equal fused scores
+        # break toward the stronger paraphrase signal (stable sort keeps it).
+        semantic_first = [candidates[index] for index in semantic_order]
         ranked = sorted(
-            candidates,
-            key=lambda item: fused.get(str(item.get("id") or ""), 0.0),
+            semantic_first,
+            key=lambda item: fused.get(str(item.get(id_key) or ""), 0.0),
             reverse=True,
         )[:limit]
         for item in ranked:
-            score = fused.get(str(item.get("id") or ""), 0.0)
+            score = fused.get(str(item.get(id_key) or ""), 0.0)
             item["relevance"] = round(min(1.0, score / top_score), 4)
             item.setdefault("retrieval", "hybrid")
-        context.memory_hits = ranked
+        return ranked
+
+    async def _augment_semantic_memory(
+        self,
+        context: AgentContext,
+        message: str,
+        *,
+        limit: int = 8,
+    ) -> None:
+        """Hybrid re-rank of durable memory (lexical hits + recent/important pool)."""
+
+        query = " ".join(str(message or "").split())
+        if not query:
+            return
+        ranked = await self._hybrid_rerank(
+            query,
+            context.memory_hits,
+            self.storage.search_memory(None, limit=60),
+            id_key="id",
+            limit=limit,
+        )
+        if ranked is not None:
+            context.memory_hits = ranked
+
+    async def _augment_semantic_files(
+        self,
+        context: AgentContext,
+        message: str,
+        *,
+        limit: int = 5,
+    ) -> None:
+        """Hybrid re-rank of indexed file chunks over an oversampled lexical pool.
+
+        Promotes the semantically closest chunk even when keyword ranking buried
+        it, so paraphrased questions about uploaded/indexed files still land the
+        right passage.
+        """
+
+        query = " ".join(str(message or "").split())
+        if not query:
+            return
+        ranked = await self._hybrid_rerank(
+            query,
+            context.file_hits,
+            self.storage.search_file_chunks(query[:160], limit=30),
+            id_key="chunk_id",
+            limit=limit,
+        )
+        if ranked is not None:
+            context.file_hits = ranked
 
     def _attached_file_hits(self, attachments: list[dict[str, Any]]) -> list[dict[str, Any]]:
         hits: list[dict[str, Any]] = []
