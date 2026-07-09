@@ -584,6 +584,7 @@ def test_browser_read_is_gated_and_uses_chrome_session(monkeypatch, tmp_path):
     assert read.data["text"] == "session-backed text"
     assert read.data["forms"]["values_read"] is False
     assert read.data["forms"]["password_input_count"] == 1
+    assert read.data["handoff"]["reason"] == "login_or_password_form"
     assert read.data["safety"]["trusted_as_instruction"] is False
     storage.close()
 
@@ -614,6 +615,10 @@ def test_browser_read_reports_human_verification(monkeypatch, tmp_path):
 
     assert result.ok is False
     assert result.data["needs_human_verification"] is True
+    assert result.data["handoff"]["reason"] == "human_verification"
+    status = asyncio.run(tools.run("browser.handoff.status", {}))
+    assert status.ok is True
+    assert status.data["handoff"]["url"] == "https://example.com/"
     assert "human verification" in result.summary
     storage.close()
 
@@ -698,6 +703,53 @@ def test_browser_click_is_gated_and_saves_evidence(monkeypatch, tmp_path):
     assert clicked.data["evidence_id"].startswith("ev_")
     evidence = asyncio.run(tools.run("web.evidence.list", {"limit": 5}))
     assert evidence.data["records"][0]["source"] == "browser.click"
+    storage.close()
+
+
+def test_browser_click_accepts_semantic_target(monkeypatch, tmp_path):
+    async def fake_run_chrome_action(**kwargs):
+        assert kwargs["selector"] == ""
+        assert kwargs["target"] == "Next page"
+        return BrowserActionResult(
+            action="click",
+            url=kwargs["url"],
+            title="Clicked page",
+            ready_state="complete",
+            ok=True,
+            summary="Clicked target.",
+            snapshot=BrowserPageSnapshot(
+                title="Clicked page",
+                url=kwargs["url"],
+                ready_state="complete",
+                text="next result text",
+                truncated=False,
+                needs_human_verification=False,
+            ),
+            selector="button:nth-of-type(1)",
+            target="Next page",
+            target_info={"label": "Next page"},
+        )
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr("jarvis_gpt.tools.run_chrome_action", fake_run_chrome_action)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    result = asyncio.run(
+        tools.run(
+            "browser.click",
+            {"url": "https://example.com/", "target": "Next page"},
+            allow_danger=True,
+        )
+    )
+
+    assert result.ok is True
+    assert result.data["selector"] == "button:nth-of-type(1)"
+    assert result.data["target"] == "Next page"
     storage.close()
 
 
@@ -1048,6 +1100,136 @@ def test_web_extract_uses_saved_evidence(monkeypatch, tmp_path):
     assert result.data["extraction"]["kind"] == "product"
     assert "$19.99" in result.data["extraction"]["prices"]
     assert "sales@example.com" in result.data["extraction"]["emails"]
+    storage.close()
+
+
+def test_web_extract_reads_schema_org_metadata(monkeypatch, tmp_path):
+    html = b"""
+    <html>
+      <head>
+        <title>Widget Pro</title>
+        <meta name="description" content="Fast widget">
+        <meta property="og:title" content="Widget Pro OG">
+        <script type="application/ld+json">
+        {
+          "@context": "https://schema.org",
+          "@type": "Product",
+          "name": "Widget Pro",
+          "brand": {"@type": "Brand", "name": "Acme"},
+          "offers": {
+            "@type": "Offer",
+            "price": "19.99",
+            "priceCurrency": "USD",
+            "availability": "https://schema.org/InStock"
+          }
+        }
+        </script>
+      </head>
+      <body><h1>Widget Pro</h1><p>Widget Pro costs $19.99 and is in stock now.</p></body>
+    </html>
+    """
+
+    class FakeResponse:
+        status_code = 200
+        headers = {"content-type": "text/html; charset=utf-8"}
+
+        async def aiter_bytes(self):
+            yield html
+
+    class FakeStream:
+        async def __aenter__(self):
+            return FakeResponse()
+
+        async def __aexit__(self, _exc_type, _exc, _traceback):
+            return None
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, _exc_type, _exc, _traceback):
+            return None
+
+        def stream(self, method, url, *, headers, follow_redirects):
+            assert method == "GET"
+            assert url == "https://example.com/product"
+            return FakeStream()
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr(
+        "jarvis_gpt.tools._public_resolved_addresses",
+        lambda _hostname: [ipaddress.ip_address("93.184.216.34")],
+    )
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    result = asyncio.run(
+        tools.run("web.extract", {"url": "https://example.com/product", "kind": "auto"})
+    )
+
+    assert result.ok is True
+    extraction = result.data["extraction"]
+    assert extraction["kind"] == "product"
+    assert extraction["metadata"]["title"] == "Widget Pro"
+    assert extraction["schema_products"][0]["name"] == "Widget Pro"
+    assert extraction["schema_products"][0]["price"] == "19.99"
+    storage.close()
+
+
+def test_web_verify_scores_saved_evidence(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+    storage.set_runtime_value(
+        "web.evidence.records",
+        [
+            {
+                "id": "ev_a",
+                "url": "https://one.example/widget",
+                "domain": "one.example",
+                "title": "Widget Pro",
+                "excerpt": "Widget Pro is in stock and costs 19.99 USD.",
+                "source": "web.fetch",
+            },
+            {
+                "id": "ev_b",
+                "url": "https://two.example/review",
+                "domain": "two.example",
+                "title": "Widget Pro review",
+                "excerpt": "The Widget Pro availability is in stock at 19.99 USD.",
+                "source": "web.fetch",
+            },
+        ],
+    )
+
+    result = asyncio.run(
+        tools.run(
+            "web.verify",
+            {
+                "claim": "Widget Pro is in stock and costs 19.99 USD",
+                "evidence_ids": ["ev_a", "ev_b"],
+            },
+        )
+    )
+
+    assert result.ok is True
+    assert result.data["verification"]["verdict"] == "supported"
+    assert set(result.data["verification"]["independent_domains"]) == {
+        "one.example",
+        "two.example",
+    }
     storage.close()
 
 

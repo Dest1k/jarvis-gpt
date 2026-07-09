@@ -118,10 +118,46 @@ POTENTIALLY_EXECUTABLE_CONTENT_TYPES = {
     "application/x-sh",
 }
 WEB_EVIDENCE_KEY = "web.evidence.records"
+WEB_HANDOFF_KEY = "browser.handoff.current"
 WEB_RATE_KEY_PREFIX = "web.rate."
 WEB_RATE_WINDOW_SEC = 600
 WEB_RATE_MAX_REQUESTS = 12
 WEB_RATE_BLOCKED_COOLDOWN_SEC = 900
+WEB_VERIFY_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "by",
+    "for",
+    "from",
+    "in",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "to",
+    "with",
+    "а",
+    "в",
+    "для",
+    "и",
+    "или",
+    "к",
+    "на",
+    "о",
+    "об",
+    "от",
+    "по",
+    "с",
+    "у",
+    "что",
+}
 
 
 @dataclass(frozen=True)
@@ -513,7 +549,8 @@ class ToolRegistry:
                 category="browser",
                 input_schema={
                     "url": "HTTP(S) URL to open",
-                    "selector": "CSS selector to click",
+                    "selector": "Optional CSS selector to click",
+                    "target": "Optional visible text/aria/name hint to find semantically",
                     "wait_ms": "Milliseconds to wait for page load",
                 },
                 handler=_browser_click,
@@ -527,7 +564,8 @@ class ToolRegistry:
                 category="browser",
                 input_schema={
                     "url": "HTTP(S) URL to open",
-                    "selector": "CSS selector to type into",
+                    "selector": "Optional CSS selector to type into",
+                    "target": "Optional visible text/aria/name hint to find semantically",
                     "text": "Text to type",
                     "allow_sensitive": "Allow typing into password/card/token-like fields",
                 },
@@ -542,7 +580,8 @@ class ToolRegistry:
                 category="browser",
                 input_schema={
                     "url": "HTTP(S) URL to open",
-                    "selector": "CSS selector to select",
+                    "selector": "Optional CSS selector to select",
+                    "target": "Optional visible text/aria/name hint to find semantically",
                     "value": "Option value",
                 },
                 handler=_browser_select,
@@ -560,6 +599,18 @@ class ToolRegistry:
                 },
                 handler=_browser_screenshot,
                 danger_level="review",
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="browser.handoff.status",
+                description=(
+                    "Return the current browser human-handoff checkpoint for CAPTCHA, "
+                    "login, or sensitive-form continuation."
+                ),
+                category="browser",
+                input_schema={},
+                handler=_browser_handoff_status,
             )
         )
         self.add(
@@ -695,6 +746,23 @@ class ToolRegistry:
                     "kind": "article, product, contact, table, or auto",
                 },
                 handler=_web_extract,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="web.verify",
+                description=(
+                    "Check a claim against saved evidence, supplied URLs, or a search query "
+                    "and return source coverage/confidence."
+                ),
+                category="web",
+                input_schema={
+                    "claim": "Claim or question to verify",
+                    "query": "Optional search query when no evidence/URL is enough",
+                    "evidence_ids": "Optional list of web evidence ids",
+                    "urls": "Optional public URLs to fetch and compare",
+                },
+                handler=_web_verify,
             )
         )
         self.add(
@@ -1284,6 +1352,16 @@ async def _browser_read(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
         summary = "Browser page loaded but no visible text was found."
     if ok and safety["prompt_injection_detected"]:
         summary = f"{summary}. Remote prompt-injection markers detected."
+    handoff = _browser_handoff_from_snapshot(
+        ctx.storage,
+        source="browser.read",
+        snapshot=snapshot,
+        debug_url=debug_url,
+    )
+    if handoff and not snapshot.needs_human_verification:
+        summary = f"{summary}. Human handoff may be needed for login or sensitive form."
+    elif not handoff:
+        _clear_browser_handoff(ctx.storage, url=snapshot.url, source="browser.read")
     evidence = _store_web_evidence(
         ctx.storage,
         source="browser.read",
@@ -1314,6 +1392,7 @@ async def _browser_read(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
                 "values_read": False,
             },
             "safety": safety,
+            "handoff": handoff,
             "evidence_id": evidence["id"],
             "debug_url": debug_url,
         },
@@ -1336,6 +1415,22 @@ async def _browser_screenshot(ctx: ToolContext, args: dict[str, Any]) -> ToolRun
     return await _browser_action(ctx, args, action="screenshot")
 
 
+def _browser_handoff_status(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunResponse:
+    handoff = ctx.storage.get_runtime_value(WEB_HANDOFF_KEY, None)
+    if not isinstance(handoff, dict) or handoff.get("status") == "cleared":
+        handoff = None
+    return ToolRunResponse(
+        tool="browser.handoff.status",
+        ok=True,
+        summary=(
+            "Browser handoff is waiting for operator action."
+            if handoff
+            else "No browser human handoff is pending."
+        ),
+        data={"handoff": handoff},
+    )
+
+
 async def _browser_action(
     ctx: ToolContext,
     args: dict[str, Any],
@@ -1346,7 +1441,11 @@ async def _browser_action(
     try:
         url = _validate_browser_url(str(args.get("url") or ""), policy=policy)
         debug_url = normalize_debug_url(str(args.get("debug_url") or DEFAULT_CHROME_DEBUG_URL))
-        selector = _browser_selector_arg(args.get("selector"), required=action != "screenshot")
+        target = _browser_target_arg(args.get("target"))
+        selector = _browser_selector_arg(
+            args.get("selector"),
+            required=action != "screenshot" and not target,
+        )
     except (BrowserCdpError, ValueError) as exc:
         return ToolRunResponse(tool=f"browser.{action}", ok=False, summary=str(exc))
 
@@ -1367,6 +1466,7 @@ async def _browser_action(
             url=url,
             action=action,
             selector=selector,
+            target=target,
             text=text,
             value=value,
             max_chars=max_chars,
@@ -1414,6 +1514,16 @@ async def _browser_action(
     summary = result.summary
     if safety["prompt_injection_detected"]:
         summary = f"{summary} Remote prompt-injection markers detected."
+    handoff = _browser_handoff_from_snapshot(
+        ctx.storage,
+        source=f"browser.{action}",
+        snapshot=result.snapshot,
+        debug_url=debug_url,
+    )
+    if handoff and not result.snapshot.needs_human_verification:
+        summary = f"{summary} Human handoff may be needed for login or sensitive form."
+    elif not handoff:
+        _clear_browser_handoff(ctx.storage, url=result.snapshot.url, source=f"browser.{action}")
     return ToolRunResponse(
         tool=f"browser.{action}",
         ok=result.ok,
@@ -1422,7 +1532,9 @@ async def _browser_action(
             "url": result.url,
             "requested_url": url,
             "action": action,
-            "selector": selector,
+            "selector": result.selector or selector,
+            "target": target,
+            "target_info": result.target_info,
             "title": result.title,
             "ready_state": result.ready_state,
             "text": result.snapshot.text,
@@ -1435,6 +1547,7 @@ async def _browser_action(
             },
             "screenshot_path": str(screenshot_path) if screenshot_path else None,
             "safety": safety,
+            "handoff": handoff,
             "evidence_id": evidence["id"],
             "debug_url": debug_url,
         },
@@ -1634,16 +1747,12 @@ async def _web_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
     if len(query) > 300:
         query = query[:300].rstrip()
 
-    url = f"https://duckduckgo.com/html/?q={quote_plus(query)}"
-    rate_block = _web_rate_limit_block(ctx.storage, url)
-    if rate_block is not None:
-        return ToolRunResponse(
-            tool="web.search",
-            ok=False,
-            summary=rate_block["summary"],
-            data=rate_block,
-        )
+    providers = [
+        ("duckduckgo_html", f"https://duckduckgo.com/html/?q={quote_plus(query)}"),
+        ("bing_html", f"https://www.bing.com/search?q={quote_plus(query)}"),
+    ]
     headers = WEB_HEADERS
+    last_failure: dict[str, Any] | None = None
     try:
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(20.0),
@@ -1651,35 +1760,70 @@ async def _web_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
             trust_env=False,
             transport=_PublicOnlyAsyncHTTPTransport(),
         ) as client:
-            response = await client.get(url, headers=headers)
-            response.raise_for_status()
+            for source, url in providers:
+                rate_block = _web_rate_limit_block(ctx.storage, url)
+                if rate_block is not None:
+                    last_failure = {"source": source, **rate_block}
+                    continue
+                try:
+                    response = await client.get(url, headers=headers)
+                    response.raise_for_status()
+                except httpx.HTTPError as exc:
+                    last_failure = {"source": source, "summary": str(exc), "url": url}
+                    continue
+                html = _decode_response_text(response)
+                if source == "bing_html":
+                    results = _parse_bing_results(html, limit=limit)
+                else:
+                    results = _parse_duckduckgo_results(html, limit=limit)
+                if not results and source != providers[-1][0]:
+                    _web_rate_limit_record(ctx.storage, url, ok=True)
+                    continue
+                evidence_text = "\n".join(
+                    f"{item.get('title', '')}\n{item.get('url', '')}\n{item.get('snippet', '')}"
+                    for item in results
+                )
+                safety = _web_content_safety(
+                    source="web.search",
+                    url=url,
+                    text=evidence_text,
+                )
+                evidence = _store_web_evidence(
+                    ctx.storage,
+                    source="web.search",
+                    url=url,
+                    title=query,
+                    text=evidence_text,
+                    content_type=response.headers.get("content-type"),
+                    safety=safety,
+                    confidence=0.45 if results else 0.1,
+                    extra={"query": query, "provider": source, "result_count": len(results)},
+                )
+                _web_rate_limit_record(ctx.storage, url, ok=True)
+                return ToolRunResponse(
+                    tool="web.search",
+                    ok=True,
+                    summary=f"Web search returned {len(results)} result(s) via {source}.",
+                    data={
+                        "query": query,
+                        "results": results,
+                        "source": source,
+                        "safety": safety,
+                        "evidence_id": evidence["id"],
+                    },
+                )
     except httpx.HTTPError as exc:
         return ToolRunResponse(
             tool="web.search",
             ok=False,
             summary=f"Search request failed: {exc}",
-            data={"query": query, "url": url},
+            data={"query": query, "last_failure": last_failure},
         )
-
-    results = _parse_duckduckgo_results(_decode_response_text(response), limit=limit)
-    safety = _web_content_safety(
-        source="web.search",
-        url=url,
-        text="\n".join(
-            f"{item.get('title', '')}\n{item.get('snippet', '')}" for item in results
-        ),
-    )
-    _web_rate_limit_record(ctx.storage, url, ok=True)
     return ToolRunResponse(
         tool="web.search",
-        ok=True,
-        summary=f"Web search returned {len(results)} result(s).",
-        data={
-            "query": query,
-            "results": results,
-            "source": "duckduckgo_html",
-            "safety": safety,
-        },
+        ok=False,
+        summary="Search request failed for all providers.",
+        data={"query": query, "providers": providers, "last_failure": last_failure},
     )
 
 
@@ -1701,6 +1845,7 @@ async def _web_extract(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespons
         return ToolRunResponse(tool="web.extract", ok=False, summary="Unsupported extract kind.")
     text = str(args.get("text") or "")
     source: dict[str, Any] = {"kind": "inline"}
+    html_metadata: dict[str, Any] | None = None
     evidence_id = str(args.get("evidence_id") or "").strip()
     raw_url = str(args.get("url") or "").strip()
     if evidence_id:
@@ -1712,31 +1857,213 @@ async def _web_extract(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespons
                 summary="Evidence record not found.",
             )
         text = str(record.get("excerpt") or "")
+        extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
+        metadata = extra.get("html_metadata")
+        if isinstance(metadata, dict):
+            html_metadata = metadata
         source = {"kind": "evidence", "id": evidence_id, "url": record.get("url")}
     elif raw_url:
-        fetched = await _web_fetch(ctx, {"url": raw_url, "max_chars": 20000})
-        if not fetched.ok:
+        document = await _fetch_public_document(ctx, raw_url, max_chars=20000, source="web.extract")
+        if not document["ok"]:
             return ToolRunResponse(
                 tool="web.extract",
                 ok=False,
-                summary=f"Could not fetch URL before extraction: {fetched.summary}",
-                data={"fetch": fetched.data},
+                summary=f"Could not fetch URL before extraction: {document['summary']}",
+                data={"fetch": document.get("data", {})},
             )
-        text = str(fetched.data.get("text") or "")
+        data = document["data"]
+        text = str(data.get("text") or "")
+        raw_text = str(data.get("raw_text") or "")
+        html_metadata = (
+            _extract_html_metadata(raw_text) if _looks_like_html(raw_text, data) else None
+        )
+        safety = _web_content_safety(
+            source="web.extract",
+            url=str(data.get("url") or ""),
+            text=text,
+        )
+        evidence = _store_web_evidence(
+            ctx.storage,
+            source="web.extract",
+            url=str(data.get("url") or ""),
+            title=str((html_metadata or {}).get("title") or ""),
+            text=text,
+            content_type=str(data.get("content_type") or ""),
+            safety=safety,
+            confidence=0.76 if int(data.get("status_code") or 500) < 400 else 0.25,
+            extra={
+                "status_code": data.get("status_code"),
+                "redirects": data.get("redirects", []),
+                "html_metadata": html_metadata or {},
+            },
+        )
         source = {
             "kind": "url",
-            "url": fetched.data.get("url"),
-            "evidence_id": fetched.data.get("evidence_id"),
+            "url": data.get("url"),
+            "evidence_id": evidence["id"],
         }
     if not text.strip():
         return ToolRunResponse(tool="web.extract", ok=False, summary="Text or URL is required.")
-    extraction = _extract_web_structured(text, kind=kind)
+    extraction = _extract_web_structured(text, kind=kind, html_metadata=html_metadata)
     return ToolRunResponse(
         tool="web.extract",
         ok=True,
         summary=f"Extracted web {extraction['kind']} hints.",
         data={"source": source, "extraction": extraction},
     )
+
+
+async def _web_verify(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    claim = " ".join(str(args.get("claim") or "").split())
+    query = " ".join(str(args.get("query") or "").split())
+    if not claim and not query:
+        return ToolRunResponse(tool="web.verify", ok=False, summary="Claim or query is required.")
+    evidence_ids = _string_list_arg(args.get("evidence_ids"), limit=8)
+    urls = _string_list_arg(args.get("urls"), limit=4)
+    sources: list[dict[str, Any]] = []
+    for evidence_id in evidence_ids:
+        record = _get_web_evidence(ctx.storage, evidence_id)
+        if record is None:
+            continue
+        sources.append(
+            {
+                "kind": "evidence",
+                "id": evidence_id,
+                "url": record.get("url"),
+                "title": record.get("title"),
+                "text": record.get("excerpt"),
+            }
+        )
+    for url in urls:
+        fetched = await _web_fetch(ctx, {"url": url, "max_chars": 8000})
+        if fetched.ok:
+            sources.append(
+                {
+                    "kind": "url",
+                    "id": fetched.data.get("evidence_id"),
+                    "url": fetched.data.get("url"),
+                    "title": "",
+                    "text": fetched.data.get("text"),
+                }
+            )
+    if query and len(sources) < 2:
+        searched = await _web_search(ctx, {"query": query or claim, "limit": 4})
+        if searched.ok:
+            for item in searched.data.get("results", [])[:4]:
+                if not isinstance(item, dict):
+                    continue
+                sources.append(
+                    {
+                        "kind": "search_result",
+                        "id": searched.data.get("evidence_id"),
+                        "url": item.get("url"),
+                        "title": item.get("title"),
+                        "text": item.get("snippet"),
+                    }
+                )
+    verification = _verify_claim_against_sources(claim or query, sources)
+    return ToolRunResponse(
+        tool="web.verify",
+        ok=True,
+        summary=(
+            f"Verification verdict: {verification['verdict']} "
+            f"({verification['confidence']:.2f} confidence)."
+        ),
+        data={
+            "claim": claim or query,
+            "query": query or None,
+            "verification": verification,
+            "sources": _verification_source_payload(sources),
+        },
+    )
+
+
+async def _fetch_public_document(
+    ctx: ToolContext,
+    raw_url: str,
+    *,
+    max_chars: int,
+    source: str,
+) -> dict[str, Any]:
+    try:
+        current_url = _validate_public_http_url(raw_url)
+    except ValueError as exc:
+        return {"ok": False, "summary": str(exc), "data": {"url": raw_url}}
+    rate_block = _web_rate_limit_block(ctx.storage, current_url)
+    if rate_block is not None:
+        return {"ok": False, "summary": rate_block["summary"], "data": rate_block}
+
+    redirects: list[dict[str, Any]] = []
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(20.0),
+            trust_env=False,
+            transport=_PublicOnlyAsyncHTTPTransport(),
+        ) as client:
+            for _ in range(6):
+                async with client.stream(
+                    "GET",
+                    current_url,
+                    headers=WEB_HEADERS,
+                    follow_redirects=False,
+                ) as response:
+                    location = response.headers.get("location")
+                    if response.status_code in {301, 302, 303, 307, 308} and location:
+                        next_url = str(httpx.URL(current_url).join(location))
+                        redirects.append(
+                            {
+                                "from": current_url,
+                                "to": next_url,
+                                "status_code": response.status_code,
+                            }
+                        )
+                        try:
+                            current_url = _validate_public_http_url(next_url)
+                        except ValueError as exc:
+                            return {
+                                "ok": False,
+                                "summary": f"Blocked redirect target: {exc}",
+                                "data": {"redirects": redirects},
+                            }
+                        continue
+                    text, raw_text, truncated = await _read_limited_response_document(
+                        response,
+                        max_chars,
+                    )
+                    blocked = _web_response_blocked(response.status_code, text)
+                    _web_rate_limit_record(
+                        ctx.storage,
+                        current_url,
+                        ok=response.status_code < 400 and not blocked,
+                        blocked=blocked,
+                    )
+                    return {
+                        "ok": response.status_code < 400 and not blocked,
+                        "summary": (
+                            f"Fetched document for {source} with HTTP {response.status_code}."
+                        ),
+                        "data": {
+                            "url": current_url,
+                            "status_code": response.status_code,
+                            "content_type": response.headers.get("content-type"),
+                            "text": text,
+                            "raw_text": raw_text,
+                            "truncated": truncated,
+                            "redirects": redirects,
+                            "blocked": blocked,
+                        },
+                    }
+    except httpx.HTTPError as exc:
+        return {
+            "ok": False,
+            "summary": f"HTTP request failed: {exc}",
+            "data": {"url": current_url, "redirects": redirects},
+        }
+    return {
+        "ok": False,
+        "summary": "Too many redirects.",
+        "data": {"url": current_url, "redirects": redirects},
+    }
 
 
 async def _web_fetch(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
@@ -1792,7 +2119,16 @@ async def _web_fetch(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
                             )
                         continue
 
-                    text, truncated = await _read_limited_response_text(response, max_chars)
+                    text, raw_text, truncated = await _read_limited_response_document(
+                        response,
+                        max_chars,
+                    )
+                    content_type = response.headers.get("content-type")
+                    html_metadata = (
+                        _extract_html_metadata(raw_text)
+                        if _looks_like_html(raw_text, {"content_type": content_type})
+                        else None
+                    )
                     blocked = _web_response_blocked(response.status_code, text)
                     safety = _web_content_safety(
                         source="web.fetch",
@@ -1813,10 +2149,13 @@ async def _web_fetch(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
                         url=current_url,
                         title="",
                         text=text,
-                        content_type=response.headers.get("content-type"),
+                        content_type=content_type,
                         safety=safety,
                         confidence=0.72 if response.status_code < 400 and not blocked else 0.25,
-                        extra={"status_code": response.status_code},
+                        extra={
+                            "status_code": response.status_code,
+                            "html_metadata": html_metadata or {},
+                        },
                     )
                     _web_rate_limit_record(
                         ctx.storage,
@@ -1831,11 +2170,12 @@ async def _web_fetch(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
                         data={
                             "url": current_url,
                             "status_code": response.status_code,
-                            "content_type": response.headers.get("content-type"),
+                            "content_type": content_type,
                             "text": text,
                             "truncated": truncated,
                             "redirects": redirects,
                             "safety": safety,
+                            "html_metadata": html_metadata or {},
                             "evidence_id": evidence["id"],
                         },
                     )
@@ -2850,6 +3190,15 @@ def _browser_selector_arg(value: Any, *, required: bool) -> str:
     return text
 
 
+def _browser_target_arg(value: Any) -> str:
+    text = " ".join(str(value or "").split())
+    if any(char in text for char in ("\r", "\n", "\0")):
+        raise ValueError("Browser target contains unsupported control characters.")
+    if len(text) > 240:
+        raise ValueError("Browser target is too long.")
+    return text
+
+
 def _parse_native_stdout(stdout: str) -> dict[str, Any]:
     for line in reversed(stdout.splitlines()):
         candidate = line.strip()
@@ -3110,6 +3459,39 @@ def _parse_duckduckgo_results(html: str, *, limit: int) -> list[dict[str, Any]]:
     return results
 
 
+def _parse_bing_results(html: str, *, limit: int) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    pattern = re.compile(
+        r'<li[^>]+class="[^"]*\bb_algo\b[^"]*"[^>]*>.*?'
+        r"<h2[^>]*>\s*<a[^>]+href=\"(?P<href>[^\"]+)\"[^>]*>"
+        r"(?P<title>.*?)</a>.*?</h2>(?P<body>.*?)</li>",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    for match in pattern.finditer(html):
+        url = unescape(match.group("href")).strip()
+        title = _html_to_text(match.group("title"))
+        if not url or not title or url in seen:
+            continue
+        if urlparse(url).scheme not in {"http", "https"}:
+            continue
+        body = match.group("body")
+        snippet_match = re.search(r"<p[^>]*>(?P<snippet>.*?)</p>", body, re.I | re.S)
+        snippet = _html_to_text(snippet_match.group("snippet")) if snippet_match else ""
+        results.append(
+            {
+                "title": title,
+                "url": url,
+                "snippet": snippet,
+                "rank": len(results) + 1,
+            }
+        )
+        seen.add(url)
+        if len(results) >= limit:
+            break
+    return results
+
+
 def _unwrap_duckduckgo_url(raw_url: str) -> str:
     parsed = urlparse(raw_url)
     if parsed.netloc.endswith("duckduckgo.com") and parsed.path.startswith("/l/"):
@@ -3212,6 +3594,59 @@ def _prompt_injection_markers(text: str) -> list[str]:
         if len(found) >= 8:
             break
     return found
+
+
+def _browser_handoff_from_snapshot(
+    storage: JarvisStorage,
+    *,
+    source: str,
+    snapshot: Any,
+    debug_url: str,
+) -> dict[str, Any] | None:
+    reason = ""
+    if bool(getattr(snapshot, "needs_human_verification", False)):
+        reason = "human_verification"
+    elif int(getattr(snapshot, "password_input_count", 0) or 0) > 0:
+        reason = "login_or_password_form"
+    elif int(getattr(snapshot, "sensitive_input_count", 0) or 0) > 0:
+        reason = "sensitive_form"
+    if not reason:
+        return None
+    handoff = {
+        "id": new_id("handoff"),
+        "status": "waiting_for_operator",
+        "reason": reason,
+        "source": source,
+        "url": str(getattr(snapshot, "url", "") or ""),
+        "domain": _url_domain(str(getattr(snapshot, "url", "") or "")),
+        "title": str(getattr(snapshot, "title", "") or "")[:240],
+        "debug_url": debug_url,
+        "created_at": utc_now(),
+        "instruction": (
+            "Complete the CAPTCHA/login/2FA or sensitive form in the opened Chrome window, "
+            "then retry browser.read or the same browser action with this URL."
+        ),
+    }
+    storage.set_runtime_value(WEB_HANDOFF_KEY, handoff)
+    return handoff
+
+
+def _clear_browser_handoff(storage: JarvisStorage, *, url: str, source: str) -> None:
+    current = storage.get_runtime_value(WEB_HANDOFF_KEY, None)
+    if not isinstance(current, dict):
+        return
+    current_domain = str(current.get("domain") or "")
+    if current_domain and current_domain != _url_domain(url):
+        return
+    storage.set_runtime_value(
+        WEB_HANDOFF_KEY,
+        {
+            **current,
+            "status": "cleared",
+            "cleared_at": utc_now(),
+            "cleared_by": source,
+        },
+    )
 
 
 def _store_web_evidence(
@@ -3356,9 +3791,15 @@ def _epoch_seconds() -> float:
     return time.time()
 
 
-def _extract_web_structured(text: str, *, kind: str) -> dict[str, Any]:
+def _extract_web_structured(
+    text: str,
+    *,
+    kind: str,
+    html_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     cleaned = " ".join(text.split())
-    detected_kind = kind if kind != "auto" else _detect_extract_kind(cleaned)
+    detected_kind = kind if kind != "auto" else _detect_extract_kind(cleaned, html_metadata)
+    metadata = html_metadata or {}
     data: dict[str, Any] = {
         "kind": detected_kind,
         "title_candidates": _extract_title_candidates(text),
@@ -3368,23 +3809,241 @@ def _extract_web_structured(text: str, *, kind: str) -> dict[str, Any]:
         "dates": _extract_dates(cleaned),
         "tables": _extract_table_like_lines(text),
     }
+    if metadata:
+        data["metadata"] = {
+            "title": metadata.get("title"),
+            "description": metadata.get("description"),
+            "canonical": metadata.get("canonical"),
+            "open_graph": metadata.get("open_graph", {}),
+        }
+        data["schema"] = {
+            "types": _json_ld_types(metadata.get("json_ld", [])),
+            "products": _schema_product_hints(metadata.get("json_ld", [])),
+            "articles": _schema_article_hints(metadata.get("json_ld", [])),
+        }
+        readability = metadata.get("readability")
+        if isinstance(readability, dict):
+            data["readability"] = readability
     if detected_kind == "article":
         data["headings"] = _extract_heading_lines(text)
         data["summary_hint"] = cleaned[:800]
+        if metadata.get("description"):
+            data["description"] = metadata["description"]
     if detected_kind == "product":
         data["availability_markers"] = _extract_availability_markers(cleaned)
+        schema_products = _schema_product_hints(metadata.get("json_ld", []))
+        if schema_products:
+            data["schema_products"] = schema_products
     if detected_kind == "contact":
         data["address_hints"] = _extract_address_hints(text)
     return data
 
 
-def _detect_extract_kind(text: str) -> str:
+def _detect_extract_kind(text: str, html_metadata: dict[str, Any] | None = None) -> str:
+    schema_types = _json_ld_types((html_metadata or {}).get("json_ld", []))
+    if any("product" in item.lower() or "offer" in item.lower() for item in schema_types):
+        return "product"
+    if any("article" in item.lower() or "news" in item.lower() for item in schema_types):
+        return "article"
     lowered = text.lower()
     if re.search(r"[$€£₽]\s?\d|\d[\d\s.,]*(руб|₽|usd|eur|€|\\$)", lowered):
         return "product"
     if "@" in text or re.search(r"\+?\d[\d\s().-]{8,}", text):
         return "contact"
     return "article"
+
+
+def _looks_like_html(raw_text: str, data: dict[str, Any]) -> bool:
+    content_type = str(data.get("content_type") or "").lower()
+    prefix = raw_text[:1000].lower()
+    return "html" in content_type or "<html" in prefix or "<meta" in prefix
+
+
+def _extract_html_metadata(html: str) -> dict[str, Any]:
+    title_match = re.search(r"(?is)<title[^>]*>(?P<title>.*?)</title>", html)
+    title = _html_to_text(title_match.group("title")) if title_match else ""
+    meta: dict[str, str] = {}
+    open_graph: dict[str, str] = {}
+    for match in re.finditer(r"(?is)<meta\b(?P<attrs>[^>]*)>", html[:300_000]):
+        attrs = _html_tag_attrs(match.group("attrs"))
+        key = str(attrs.get("name") or attrs.get("property") or "").strip().lower()
+        content = str(attrs.get("content") or "").strip()
+        if not key or not content:
+            continue
+        if key.startswith("og:"):
+            open_graph[key[3:]] = content[:1000]
+        else:
+            meta[key] = content[:1000]
+    canonical = ""
+    for match in re.finditer(r"(?is)<link\b(?P<attrs>[^>]*)>", html[:300_000]):
+        attrs = _html_tag_attrs(match.group("attrs"))
+        if str(attrs.get("rel") or "").lower() == "canonical":
+            canonical = str(attrs.get("href") or "").strip()
+            break
+    json_ld = _extract_json_ld(html)
+    return {
+        "title": title or open_graph.get("title") or meta.get("twitter:title") or "",
+        "description": (
+            meta.get("description")
+            or open_graph.get("description")
+            or meta.get("twitter:description")
+            or ""
+        ),
+        "canonical": canonical,
+        "open_graph": open_graph,
+        "meta": meta,
+        "json_ld": json_ld,
+        "readability": _extract_readability(html),
+    }
+
+
+def _html_tag_attrs(attrs: str) -> dict[str, str]:
+    result: dict[str, str] = {}
+    pattern = re.compile(
+        r"""([A-Za-z_:][-A-Za-z0-9_:.]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))""",
+        flags=re.DOTALL,
+    )
+    for name, double, single, bare in pattern.findall(attrs):
+        result[name.lower()] = unescape(double or single or bare or "")
+    return result
+
+
+def _extract_json_ld(html: str) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    pattern = re.compile(
+        r'(?is)<script[^>]+type=["\']application/ld\+json["\'][^>]*>(?P<body>.*?)</script>'
+    )
+    for match in pattern.finditer(html[:1_000_000]):
+        body = unescape(match.group("body")).strip()
+        if not body:
+            continue
+        try:
+            parsed = json.loads(body)
+        except json.JSONDecodeError:
+            continue
+        for item in _flatten_json_ld(parsed):
+            records.append(item)
+            if len(records) >= 20:
+                return records
+    return records
+
+
+def _flatten_json_ld(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, list):
+        result: list[dict[str, Any]] = []
+        for item in value:
+            result.extend(_flatten_json_ld(item))
+        return result
+    if not isinstance(value, dict):
+        return []
+    result = [value]
+    graph = value.get("@graph")
+    if isinstance(graph, list):
+        for item in graph:
+            result.extend(_flatten_json_ld(item))
+    return result
+
+
+def _json_ld_types(json_ld: Any) -> list[str]:
+    types: list[str] = []
+    for item in json_ld if isinstance(json_ld, list) else []:
+        if not isinstance(item, dict):
+            continue
+        raw_type = item.get("@type")
+        values = raw_type if isinstance(raw_type, list) else [raw_type]
+        for value in values:
+            text = str(value or "").strip()
+            if text and text not in types:
+                types.append(text)
+    return types[:30]
+
+
+def _schema_product_hints(json_ld: Any) -> list[dict[str, Any]]:
+    products = []
+    for item in json_ld if isinstance(json_ld, list) else []:
+        if not isinstance(item, dict):
+            continue
+        type_text = " ".join(_json_ld_types([item])).lower()
+        if "product" not in type_text and "offer" not in type_text:
+            continue
+        offer = item.get("offers")
+        if isinstance(offer, list):
+            offer = offer[0] if offer else {}
+        if not isinstance(offer, dict):
+            offer = {}
+        products.append(
+            {
+                "name": item.get("name"),
+                "brand": _schema_text(item.get("brand")),
+                "sku": item.get("sku"),
+                "price": offer.get("price") or item.get("price"),
+                "price_currency": offer.get("priceCurrency"),
+                "availability": offer.get("availability"),
+                "url": offer.get("url") or item.get("url"),
+            }
+        )
+        if len(products) >= 10:
+            break
+    return products
+
+
+def _schema_article_hints(json_ld: Any) -> list[dict[str, Any]]:
+    articles = []
+    for item in json_ld if isinstance(json_ld, list) else []:
+        if not isinstance(item, dict):
+            continue
+        type_text = " ".join(_json_ld_types([item])).lower()
+        if (
+            "article" not in type_text
+            and "news" not in type_text
+            and "blogposting" not in type_text
+        ):
+            continue
+        articles.append(
+            {
+                "headline": item.get("headline") or item.get("name"),
+                "date_published": item.get("datePublished"),
+                "date_modified": item.get("dateModified"),
+                "author": _schema_text(item.get("author")),
+                "publisher": _schema_text(item.get("publisher")),
+            }
+        )
+        if len(articles) >= 10:
+            break
+    return articles
+
+
+def _schema_text(value: Any) -> str:
+    if isinstance(value, dict):
+        return str(value.get("name") or value.get("@id") or "").strip()
+    if isinstance(value, list):
+        return ", ".join(_schema_text(item) for item in value if _schema_text(item))[:300]
+    return str(value or "").strip()
+
+
+def _extract_readability(html: str) -> dict[str, Any]:
+    body = re.sub(
+        r"(?is)<(script|style|noscript|svg|form|nav|header|footer)[^>]*>.*?</\1>",
+        " ",
+        html,
+    )
+    paragraphs = []
+    for match in re.finditer(r"(?is)<p\b[^>]*>(?P<body>.*?)</p>", body[:1_000_000]):
+        text = _html_to_text(match.group("body"))
+        if len(text) >= 40:
+            paragraphs.append(text)
+        if len(paragraphs) >= 24:
+            break
+    heading_matches = re.finditer(r"(?is)<h[1-3]\b[^>]*>(?P<body>.*?)</h[1-3]>", body[:300_000])
+    headings = [_html_to_text(match.group("body")) for match in heading_matches]
+    headings = [item for item in headings if item][:12]
+    article_text = "\n\n".join(paragraphs[:12])[:5000]
+    return {
+        "headings": headings,
+        "paragraphs": paragraphs[:12],
+        "text": article_text,
+        "paragraph_count": len(paragraphs),
+    }
 
 
 def _extract_title_candidates(text: str) -> list[str]:
@@ -3497,6 +4156,84 @@ def _extract_address_hints(text: str) -> list[str]:
         if len(hints) >= 10:
             break
     return hints
+
+
+def _verify_claim_against_sources(claim: str, sources: list[dict[str, Any]]) -> dict[str, Any]:
+    claim_terms = _verify_terms(claim)
+    scored = []
+    for source in sources[:12]:
+        text = " ".join(
+            str(source.get(key) or "")
+            for key in ("title", "url", "text")
+        )
+        source_terms = _verify_terms(text)
+        overlap = sorted(claim_terms & source_terms)
+        coverage = len(overlap) / max(1, len(claim_terms))
+        scored.append(
+            {
+                "url": source.get("url"),
+                "domain": _url_domain(str(source.get("url") or "")),
+                "coverage": round(coverage, 3),
+                "matched_terms": overlap[:20],
+                "excerpt": _verification_excerpt(str(source.get("text") or ""), claim_terms),
+            }
+        )
+    useful = [item for item in scored if float(item["coverage"]) >= 0.28]
+    strong = [item for item in scored if float(item["coverage"]) >= 0.55]
+    domains = {str(item.get("domain") or "") for item in useful if item.get("domain")}
+    if len(strong) >= 1 and len(domains) >= 2:
+        verdict = "supported"
+        confidence = min(0.92, 0.55 + 0.12 * len(domains) + 0.06 * len(strong))
+    elif useful:
+        verdict = "partially_supported"
+        confidence = min(0.72, 0.32 + 0.1 * len(useful) + 0.05 * len(domains))
+    else:
+        verdict = "insufficient_evidence"
+        confidence = 0.2 if sources else 0.0
+    matched = set().union(*(set(item["matched_terms"]) for item in scored)) if scored else set()
+    missing_terms = sorted(claim_terms - matched)[:30]
+    return {
+        "verdict": verdict,
+        "confidence": round(confidence, 3),
+        "source_count": len(sources),
+        "independent_domains": sorted(domains),
+        "missing_terms": missing_terms,
+        "coverage": scored,
+    }
+
+
+def _verify_terms(text: str) -> set[str]:
+    terms = {
+        item.lower()
+        for item in re.findall(r"[A-Za-zА-Яа-яЁё0-9]{3,}", text)
+        if item.lower() not in WEB_VERIFY_STOPWORDS
+    }
+    return {item for item in terms if not item.isdigit() or len(item) >= 4}
+
+
+def _verification_excerpt(text: str, claim_terms: set[str]) -> str:
+    compact = " ".join(text.split())
+    if not compact:
+        return ""
+    lowered = compact.lower()
+    positions = [lowered.find(term) for term in claim_terms if lowered.find(term) >= 0]
+    start = max(0, min(positions) - 120) if positions else 0
+    return compact[start : start + 360].strip()
+
+
+def _verification_source_payload(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    payload = []
+    for source in sources[:12]:
+        payload.append(
+            {
+                "kind": source.get("kind"),
+                "id": source.get("id"),
+                "url": source.get("url"),
+                "title": source.get("title"),
+                "excerpt": _verification_excerpt(str(source.get("text") or ""), set()),
+            }
+        )
+    return payload
 
 
 def _content_length(value: str | None) -> int | None:
@@ -3803,10 +4540,10 @@ def _timestamp_slug() -> str:
     return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
 
 
-async def _read_limited_response_text(
+async def _read_limited_response_document(
     response: httpx.Response,
     max_chars: int,
-) -> tuple[str, bool]:
+) -> tuple[str, str, bool]:
     byte_limit = max(4096, min(1_000_000, max_chars * 4))
     content = bytearray()
     truncated = False
@@ -3822,13 +4559,22 @@ async def _read_limited_response_text(
         content.extend(chunk)
 
     encoding = _charset_from_content_type(response.headers.get("content-type")) or "utf-8"
-    text = _repair_mojibake(bytes(content).decode(encoding, errors="replace"))
+    raw_text = _repair_mojibake(bytes(content).decode(encoding, errors="replace"))
+    text = raw_text
     content_type = response.headers.get("content-type", "").lower()
     if "html" in content_type or "<html" in text[:500].lower():
         text = _html_to_text(text)
     if len(text) > max_chars:
         text = text[:max_chars]
         truncated = True
+    return text, raw_text, truncated
+
+
+async def _read_limited_response_text(
+    response: httpx.Response,
+    max_chars: int,
+) -> tuple[str, bool]:
+    text, _raw_text, truncated = await _read_limited_response_document(response, max_chars)
     return text, truncated
 
 
@@ -3869,3 +4615,19 @@ def _float_arg(value: Any, *, default: float, minimum: float, maximum: float) ->
     if math.isnan(parsed):
         parsed = default
     return max(minimum, min(maximum, parsed))
+
+
+def _string_list_arg(value: Any, *, limit: int) -> list[str]:
+    if isinstance(value, str):
+        raw_items = [item.strip() for item in re.split(r"[\n,]+", value) if item.strip()]
+    elif isinstance(value, list):
+        raw_items = [str(item).strip() for item in value if str(item).strip()]
+    else:
+        raw_items = []
+    result: list[str] = []
+    for item in raw_items:
+        if item not in result:
+            result.append(item[:1000])
+        if len(result) >= limit:
+            break
+    return result

@@ -1,5 +1,26 @@
 # Runtime
 
+## 2026-07-10 handoff - internet surfing quality
+
+For the operator and the second model:
+
+- `browser.click`, `browser.type`, and `browser.select` can now use semantic
+  `target` hints instead of brittle CSS selectors. The resolved selector and
+  target info are returned in tool data. These tools remain review-gated.
+- `browser.handoff.status` exposes the current CAPTCHA/login/sensitive-form
+  checkpoint. If a page needs human work, finish it in the Chrome CDP window and
+  retry `browser.read` or the same browser action.
+- `web.search` falls back from DuckDuckGo HTML to Bing HTML when needed and
+  stores an evidence id for the result page.
+- `web.fetch` and URL-based `web.extract` now keep parsed HTML metadata in
+  evidence: JSON-LD/schema.org, OpenGraph/meta, canonical URL, and simple
+  readability paragraphs/headings.
+- `web.verify` checks a claim against saved evidence, URLs, or search snippets
+  and reports coverage, independent domains, missing terms, and confidence.
+- Agent tool-loop guidance now points web tasks through
+  `web.search` -> `web.fetch`/`web.render` -> `web.extract` -> `web.verify`
+  when the claim needs current source-backed evidence.
+
 ## 2026-07-10 handoff - internet workflow tools
 
 For the operator and the second model:

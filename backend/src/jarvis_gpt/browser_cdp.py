@@ -60,6 +60,9 @@ class BrowserActionResult:
     summary: str
     snapshot: BrowserPageSnapshot
     screenshot_png: bytes | None = None
+    selector: str = ""
+    target: str = ""
+    target_info: dict[str, Any] | None = None
 
 
 async def chrome_debugger_status(debug_url: str = DEFAULT_CHROME_DEBUG_URL) -> dict[str, Any]:
@@ -121,6 +124,7 @@ async def run_chrome_action(
     url: str,
     action: str,
     selector: str = "",
+    target: str = "",
     text: str = "",
     value: str = "",
     max_chars: int,
@@ -153,6 +157,7 @@ async def run_chrome_action(
                 cdp,
                 action=action,
                 selector=selector,
+                target=target,
                 text=text,
                 value=value,
                 allow_sensitive=allow_sensitive,
@@ -172,6 +177,9 @@ async def run_chrome_action(
                 summary=str(action_payload.get("summary") or f"Browser action {action} finished."),
                 snapshot=snapshot,
                 screenshot_png=screenshot,
+                selector=str(action_payload.get("selector") or selector),
+                target=target,
+                target_info=action_payload,
             )
     except (OSError, WebSocketException, TimeoutError) as exc:
         raise BrowserCdpError(f"Chrome DevTools websocket failed: {exc}") from exc
@@ -312,6 +320,7 @@ async def _run_action_expression(
     *,
     action: str,
     selector: str,
+    target: str,
     text: str,
     value: str,
     allow_sensitive: bool,
@@ -321,6 +330,7 @@ async def _run_action_expression(
     expression = _action_expression(
         action=action,
         selector=selector,
+        target=target,
         text=text,
         value=value,
         allow_sensitive=allow_sensitive,
@@ -352,18 +362,21 @@ def _action_expression(
     *,
     action: str,
     selector: str,
+    target: str,
     text: str,
     value: str,
     allow_sensitive: bool,
 ) -> str:
     action_json = json.dumps(action)
     selector_json = json.dumps(selector)
+    target_json = json.dumps(target)
     text_json = json.dumps(text)
     value_json = json.dumps(value)
     allow_sensitive_json = "true" if allow_sensitive else "false"
     return f"""(() => {{
   const action = {action_json};
   const selector = {selector_json};
+  const targetQuery = {target_json};
   const text = {text_json};
   const value = {value_json};
   const allowSensitive = {allow_sensitive_json};
@@ -371,9 +384,103 @@ def _action_expression(
     /pay|purchase|buy|order|delete|remove|submit|confirm|transfer|checkout/i;
   const sensitiveWords = /password|passcode|otp|token|secret|card|cc-|credit|cvv|cvc|ssn|passport/i;
   const event = (name) => new Event(name, {{ bubbles: true, cancelable: true }});
-  const target = selector ? document.querySelector(selector) : null;
+  const normalize = (value) => String(value || "")
+    .toLowerCase()
+    .replace(/[^a-zа-яё0-9]+/gi, " ")
+    .trim();
+  const isVisible = (element) => {{
+    if (!element || element.disabled) return false;
+    const style = window.getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+    return style.display !== "none" && style.visibility !== "hidden"
+      && Number(style.opacity || "1") > 0 && rect.width > 0 && rect.height > 0;
+  }};
+  const cssPath = (element) => {{
+    if (!element) return "";
+    if (element.id && /^[A-Za-z][\\w:-]*$/.test(element.id)) return `#${{element.id}}`;
+    const parts = [];
+    let current = element;
+    while (current && current.nodeType === 1 && current !== document.body) {{
+      const tag = current.tagName.toLowerCase();
+      const siblings = Array.from(current.parentElement?.children || [])
+        .filter((item) => item.tagName === current.tagName);
+      const index = siblings.indexOf(current) + 1;
+      parts.unshift(siblings.length > 1 ? `${{tag}}:nth-of-type(${{index}})` : tag);
+      current = current.parentElement;
+      if (parts.length >= 6) break;
+    }}
+    return parts.join(" > ");
+  }};
+  const labelFor = (element) => {{
+    const id = element.id || "";
+    const labels = [];
+    if (id) {{
+      document.querySelectorAll(`label[for="${{CSS.escape(id)}}"]`).forEach((label) => {{
+        labels.push(label.innerText || "");
+      }});
+    }}
+    if (element.labels) {{
+      Array.from(element.labels).forEach((label) => labels.push(label.innerText || ""));
+    }}
+    return labels.join(" ");
+  }};
+  const textFor = (element) => [
+    element.innerText || element.value || "",
+    element.getAttribute("aria-label") || "",
+    element.getAttribute("title") || "",
+    element.getAttribute("placeholder") || "",
+    element.getAttribute("name") || "",
+    element.getAttribute("id") || "",
+    element.getAttribute("role") || "",
+    labelFor(element),
+  ].join(" ").trim();
+  const scoreElement = (element, query) => {{
+    const normalized = normalize(textFor(element));
+    const wanted = normalize(query);
+    if (!wanted || !normalized) return 0;
+    let score = normalized.includes(wanted) ? 20 : 0;
+    for (const token of wanted.split(" ").filter(Boolean)) {{
+      if (normalized.includes(token)) score += 2;
+    }}
+    const role = normalize(element.getAttribute("role") || element.tagName);
+    if (wanted.includes(role)) score += 3;
+    return score;
+  }};
+  const findTarget = () => {{
+    if (selector) return document.querySelector(selector);
+    if (!targetQuery) return null;
+    const selectorPool = action === "type"
+      ? "input, textarea, [contenteditable=true]"
+      : action === "select"
+        ? "select, [role=listbox], input"
+        : [
+            "button",
+            "a",
+            "input",
+            "textarea",
+            "select",
+            "[role=button]",
+            "[role=link]",
+            "[aria-label]",
+            "[title]",
+            "label",
+          ].join(", ");
+    let best = null;
+    for (const element of Array.from(document.querySelectorAll(selectorPool))) {{
+      if (!isVisible(element)) continue;
+      const score = scoreElement(element, targetQuery);
+      if (score > 0 && (!best || score > best.score)) {{
+        best = {{ element, score }};
+      }}
+    }}
+    return best ? best.element : null;
+  }};
+  const target = action === "screenshot" ? null : findTarget();
   if (action !== "screenshot" && !target) {{
-    return {{ ok: false, summary: `Selector not found: ${{selector}}` }};
+    const missing = selector
+      ? `Selector not found: ${{selector}}`
+      : `Target not found: ${{targetQuery}}`;
+    return {{ ok: false, summary: missing, selector, target: targetQuery }};
   }}
   const hint = target
     ? [
@@ -409,21 +516,49 @@ def _action_expression(
       sensitive,
       dangerous,
       label: label.slice(0, 160),
+      selector: cssPath(target),
+      target: targetQuery,
     }};
   }}
   if (action === "type") {{
     target.focus();
-    target.value = text;
+    if ("value" in target) {{
+      target.value = text;
+    }} else {{
+      target.textContent = text;
+    }}
     target.dispatchEvent(event("input"));
     target.dispatchEvent(event("change"));
-    return {{ ok: true, summary: "Typed text into target.", sensitive, dangerous }};
+    return {{
+      ok: true,
+      summary: "Typed text into target.",
+      sensitive,
+      dangerous,
+      selector: cssPath(target),
+      target: targetQuery,
+    }};
   }}
   if (action === "select") {{
     target.focus();
-    target.value = value || text;
+    const wanted = normalize(value || text);
+    if (target.tagName && target.tagName.toLowerCase() === "select") {{
+      const option = Array.from(target.options || []).find((item) =>
+        normalize(item.value) === wanted || normalize(item.textContent).includes(wanted)
+      );
+      target.value = option ? option.value : (value || text);
+    }} else {{
+      target.value = value || text;
+    }}
     target.dispatchEvent(event("input"));
     target.dispatchEvent(event("change"));
-    return {{ ok: true, summary: "Selected value on target.", sensitive, dangerous }};
+    return {{
+      ok: true,
+      summary: "Selected value on target.",
+      sensitive,
+      dangerous,
+      selector: cssPath(target),
+      target: targetQuery,
+    }};
   }}
   return {{ ok: false, summary: `Unsupported browser action: ${{action}}` }};
 }})()"""

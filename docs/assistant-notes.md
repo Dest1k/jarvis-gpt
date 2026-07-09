@@ -9,6 +9,27 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-10 - Codex (internet surfing quality)
+
+- Browser action tools now accept semantic `target` hints in addition to CSS
+  selectors. Chrome-side JS scores visible buttons/links/inputs/selects by text,
+  aria/title/placeholder/name/id/label, returns the resolved selector, and keeps
+  review gating for mutations.
+- Added `browser.handoff.status` and runtime handoff checkpoints for CAPTCHA,
+  login/password forms, and sensitive forms. The operator can complete the
+  step in Chrome, then retry `browser.read` or the same browser action.
+- `web.search` now has a Bing HTML fallback when DuckDuckGo returns no usable
+  results and now stores a real search evidence record.
+- `web.fetch`/`web.extract` preserve parsed HTML metadata in evidence:
+  JSON-LD/schema.org, OpenGraph/meta, canonical URL, and readability-style
+  paragraphs/headings. `web.extract` uses schema hints to detect products and
+  articles.
+- Added `web.verify` for deterministic claim/source coverage over evidence ids,
+  URLs, or search snippets. The agent tool prompt now recommends
+  search -> fetch/render -> extract -> verify for web research.
+- Verified: `pytest -q backend\tests --tb=short` (225 pass), backend
+  `ruff check`, and `python -m compileall -q backend\src\jarvis_gpt`.
+
 ### 2026-07-10 - Codex (internet workflow tools)
 
 - Added review-gated Chrome CDP actions: `browser.click`, `browser.type`,
