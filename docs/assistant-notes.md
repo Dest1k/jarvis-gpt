@@ -19,6 +19,9 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
   "какой вывод?" reuse the saved evidence without opening the operator browser.
 - The synthesis layer rejects router-shaped JSON or weak model output and falls
   back to the deterministic formatter, so offline/degraded behavior is preserved.
+- While restarting the backend, found stale launcher-state PIDs can point at
+  unrelated processes. `jarvis-launcher.ps1 stop/restart` now verifies the saved
+  PID command line matches the expected Jarvis service before killing it.
 - Regression tests cover successful synthesis, JSON fallback, and follow-up
   synthesis from previous evidence.
 

@@ -780,6 +780,46 @@ function Test-JarvisProcess {
   return $false
 }
 
+function Test-ManagedServiceProcess {
+  param(
+    [object]$ProcessInfo,
+    [string]$Service
+  )
+
+  if (-not $ProcessInfo) {
+    return $false
+  }
+
+  $text = ("{0} {1}" -f $ProcessInfo.CommandLine, $ProcessInfo.ExecutablePath).ToLowerInvariant()
+  if ([string]::IsNullOrWhiteSpace($text)) {
+    return $false
+  }
+
+  $repoNeedle = $RepoRoot.ToLowerInvariant()
+  $frontendNeedle = $FrontendRoot.ToLowerInvariant()
+
+  switch ($Service) {
+    "backend" {
+      return (
+        $text.Contains($repoNeedle) -and
+        $text.Contains("jarvis.py") -and
+        $text.Contains("serve")
+      )
+    }
+    "frontend" {
+      return $text.Contains($frontendNeedle) -and (
+        $text.Contains("next") -or $text.Contains("npm")
+      )
+    }
+    "bridge" {
+      return $text.Contains($repoNeedle) -and $text.Contains("windows_rpc_bridge.py")
+    }
+    default {
+      return Test-JarvisProcess -ProcessInfo $ProcessInfo
+    }
+  }
+}
+
 function Stop-JarvisProcessesBySignature {
   $snapshot = Get-ProcessSnapshot
   $protected = Get-CurrentProcessFamilyIds
@@ -1139,11 +1179,23 @@ function Stop-JarvisStack {
     foreach ($service in @("frontend", "backend", "bridge")) {
       $entry = $state.services.$service
       if ($entry -and $entry.pid) {
-        Stop-ProcessTree `
-          -ProcessId ([int]$entry.pid) `
-          -Reason ("{0} state file" -f $service) `
-          -Snapshot $snapshot `
-          -ProtectedProcessIds $protected | Out-Null
+        $statePid = [int]$entry.pid
+        $processInfo = $snapshot |
+          Where-Object { [int]$_.ProcessId -eq $statePid } |
+          Select-Object -First 1
+        if (Test-ManagedServiceProcess -ProcessInfo $processInfo -Service $service) {
+          Stop-ProcessTree `
+            -ProcessId $statePid `
+            -Reason ("{0} state file" -f $service) `
+            -Snapshot $snapshot `
+            -ProtectedProcessIds $protected | Out-Null
+        } else {
+          Write-Host (
+            "Skipped stale {0} state pid={1}; command line no longer matches Jarvis." -f
+            $service,
+            $statePid
+          ) -ForegroundColor DarkYellow
+        }
       }
     }
   }

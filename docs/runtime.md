@@ -18,6 +18,9 @@ For the operator and the second model:
 - Source payloads include a small quality label (`primary-or-vendor`,
   `vendor-docs`, `fetched-page`, `snippet-only`, etc.) so the synthesis prompt can
   treat snippets as weak and fetched official/vendor pages as stronger evidence.
+- Launcher stop/restart now guards stale `launcher-state.json` PIDs: a saved
+  backend/frontend/bridge PID is stopped only if its command line still matches
+  the expected Jarvis service. Port/signature cleanup still handles real leftovers.
 
 ## 2026-07-09 handoff - open browsing and durable learning journal
 
