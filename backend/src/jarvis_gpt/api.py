@@ -66,6 +66,7 @@ from .models import (
     HostBridgeResponse,
     LearningTickResponse,
     MemoryCreateRequest,
+    MemoryHygieneResponse,
     MemoryItem,
     MemoryVaultResponse,
     MessageItem,
@@ -78,10 +79,12 @@ from .models import (
     ModelActivateRequest,
     ModelCatalogResponse,
     ModelDownloadRequest,
+    ModelProfilesResponse,
     ModelSearchResponse,
     OperatorPersonaInsightRequest,
     OperatorPersonaResponse,
     OperatorPersonaUpdateRequest,
+    OperatorQueueResponse,
     RoutineResponse,
     RoutineRunResponse,
     RuntimePreferencesResponse,
@@ -94,6 +97,7 @@ from .models import (
     ToolRunResponse,
 )
 from .operations import OperationsManager
+from .operator_queue import memory_hygiene_report, model_profile_plan, operator_queue_snapshot
 from .persona import PersonaManager
 from .storage import JarvisStorage
 from .supervisor import RuntimeSupervisor
@@ -201,6 +205,16 @@ async def status() -> StatusResponse:
         health=health_checks,
         recent_events=app.state.storage.list_events(limit=25),
     )
+
+
+@app.get("/api/operator/queue", response_model=OperatorQueueResponse)
+async def operator_queue() -> OperatorQueueResponse:
+    return operator_queue_snapshot(app.state.settings, app.state.storage)
+
+
+@app.get("/api/model-profiles", response_model=ModelProfilesResponse)
+async def model_profiles() -> ModelProfilesResponse:
+    return model_profile_plan(app.state.settings)
 
 
 @app.get("/api/agent/trace/{conversation_id}")
@@ -639,6 +653,16 @@ async def add_memory(request: MemoryCreateRequest) -> MemoryItem:
 @app.get("/api/memory/vault", response_model=MemoryVaultResponse)
 async def memory_vault() -> MemoryVaultResponse:
     return app.state.storage.memory_graph()
+
+
+@app.get("/api/memory/hygiene", response_model=MemoryHygieneResponse)
+async def memory_hygiene() -> MemoryHygieneResponse:
+    return memory_hygiene_report(app.state.storage)
+
+
+@app.post("/api/memory/consolidate")
+async def memory_consolidate() -> dict[str, int]:
+    return app.state.storage.consolidate_memories()
 
 
 @app.get("/api/files", response_model=list[FileItem])

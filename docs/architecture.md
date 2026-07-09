@@ -27,6 +27,9 @@ Agent Runtime
   |-- diagnostics
   |-- event stream
   |-- model catalog
+  |-- operator queue
+  |-- memory hygiene
+  |-- model profile roadmap
   |
 LLM Router
   |
@@ -69,6 +72,17 @@ External host runtime
 - Mission approvals resume in-place: a gated mission tool stores a compact
   agentic snapshot, and the approval executor feeds the approved tool observation
   back into that same step before marking the task done/blocked.
+- Operator queue is the shared runtime inbox: approvals, blocked missions,
+  health warnings, generation truncation, memory hygiene, and future model-profile
+  work are surfaced through `GET /api/operator/queue` and the Command Center queue
+  tab instead of being scattered across separate panels.
+- Generation resilience is backend-owned: when the LLM reports
+  `finish_reason=length`, chat and stream paths request continuation internally
+  and only show the old token-limit warning if the continuation budget is also
+  exhausted.
+- Model-profile planning is a roadmap layer for now. `GET /api/model-profiles`
+  describes future planner/reviewer and fast-executor roles, but live routing
+  remains on the current Gemma profile until stronger hardware and endpoints exist.
 
 ## Runtime profiles
 

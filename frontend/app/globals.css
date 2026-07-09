@@ -1446,9 +1446,72 @@ h3 {
   background: var(--surface-2);
 }
 
+.approvalMeta,
+.queueMeta,
+.queueContext {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 6px;
+}
+
+.approvalMeta span,
+.queueMeta span,
+.queueContext span {
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--muted);
+  font-size: 11px;
+}
+
 .approvalControls {
   display: flex;
   gap: 4px;
+}
+
+.operatorQueue {
+  display: grid;
+  gap: 8px;
+}
+
+.queueRow {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 10px;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.queueRow.high {
+  border-color: color-mix(in srgb, var(--coral) 42%, var(--line));
+}
+
+.queueRow.medium {
+  border-color: color-mix(in srgb, var(--amber) 36%, var(--line));
+}
+
+.queueRow svg {
+  color: var(--teal);
+}
+
+.queueRow strong {
+  display: block;
+  color: var(--ink);
+  font-weight: 650;
+}
+
+.queueRow p {
+  margin-top: 3px;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
 }
 
 .healthRow {

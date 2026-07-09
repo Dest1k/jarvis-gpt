@@ -157,6 +157,12 @@ class MemoryVaultResponse(BaseModel):
     stats: dict[str, int] = Field(default_factory=dict)
 
 
+class MemoryHygieneResponse(BaseModel):
+    stats: dict[str, int | float] = Field(default_factory=dict)
+    recommendations: list[str] = Field(default_factory=list)
+    duplicate_groups: list[dict[str, Any]] = Field(default_factory=list)
+
+
 class FileItem(BaseModel):
     id: str
     name: str
@@ -222,6 +228,21 @@ class ModelSearchResponse(BaseModel):
     items: list[dict[str, Any]]
     vram: dict[str, Any] = Field(default_factory=dict)
     token_available: bool = False
+
+
+class ModelProfilePlan(BaseModel):
+    id: str
+    title: str
+    role: str
+    status: Literal["active", "available", "future"]
+    model_hint: str
+    notes: list[str] = Field(default_factory=list)
+
+
+class ModelProfilesResponse(BaseModel):
+    active_profile: str
+    active_model: str
+    profiles: list[ModelProfilePlan] = Field(default_factory=list)
 
 
 class ModelDownloadRequest(BaseModel):
@@ -391,6 +412,26 @@ class MissionRunResponse(BaseModel):
     completed: bool = False
     stopped_reason: Literal["completed", "blocked", "budget", "empty"] = "completed"
     executed_steps: int = 0
+
+
+class OperatorQueueItem(BaseModel):
+    id: str
+    kind: Literal["approval", "mission", "health", "generation", "memory", "model"]
+    status: str
+    title: str
+    detail: str = ""
+    priority: Literal["high", "medium", "low"] = "medium"
+    action: str | None = None
+    updated_at: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class OperatorQueueResponse(BaseModel):
+    summary: dict[str, int] = Field(default_factory=dict)
+    context: dict[str, Any] = Field(default_factory=dict)
+    items: list[OperatorQueueItem] = Field(default_factory=list)
+    memory_hygiene: MemoryHygieneResponse
+    model_profiles: ModelProfilesResponse
 
 
 class DiagnosticCheck(BaseModel):

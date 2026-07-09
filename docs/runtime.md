@@ -1,5 +1,30 @@
 # Runtime
 
+## 2026-07-09 handoff - operator queue and generation resilience
+
+For the operator and the second model. This pass adds a thin runtime kernel
+surface instead of another one-off UI rule:
+
+- `GET /api/operator/queue` merges pending/executable approvals, blocked/running
+  mission tasks, health warnings, lingering generation truncation, memory hygiene,
+  and the future model-profile roadmap into one operator queue.
+- `operator_context()` now exposes local runtime facts for prompts and UI:
+  local time, active profile/model, operator name, home location, working roots,
+  active missions, and pending approvals.
+- Answers stopped by `finish_reason=length` are auto-continued internally for
+  chat and stream paths. The old token-limit warning only appears if continuation
+  still cannot finish the answer.
+- Memory hygiene has explicit API surfaces: `GET /api/memory/hygiene` and
+  `POST /api/memory/consolidate`. The report highlights duplicates, missing
+  source tags, and low-confidence/stale notes.
+- Model profiles are deliberately only scaffolded: `GET /api/model-profiles`
+  reports current Gemma profiles plus future planner/reviewer and fast-executor
+  roles, but no multi-model routing is active yet.
+- Command Center opens on the new queue tab, shows mission/task links on approvals,
+  and has one-click approve+execute for approved-gate recovery.
+- Tests added: `test_agentic_answer_auto_continues_after_length_finish` and
+  `backend/tests/test_operator_queue.py`.
+
 ## 2026-07-09 handoff - mission approval resume
 
 For the operator and the second model. This closes the deeper approval follow-up

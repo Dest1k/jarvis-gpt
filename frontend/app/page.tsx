@@ -269,6 +269,33 @@ type ApprovalExecution = {
   data: Record<string, unknown>;
 };
 
+type OperatorQueueItem = {
+  id: string;
+  kind: "approval" | "mission" | "health" | "generation" | "memory" | "model";
+  status: string;
+  title: string;
+  detail: string;
+  priority: "high" | "medium" | "low";
+  action?: string | null;
+  updated_at?: string | null;
+  payload: Record<string, unknown>;
+};
+
+type OperatorQueue = {
+  summary: Record<string, number>;
+  context: Record<string, unknown>;
+  items: OperatorQueueItem[];
+  memory_hygiene: {
+    stats: Record<string, number>;
+    recommendations: string[];
+  };
+  model_profiles: {
+    active_profile: string;
+    active_model: string;
+    profiles: { id: string; title: string; role: string; status: string; model_hint: string; notes: string[] }[];
+  };
+};
+
 type ModelArtifact = {
   id: string;
   path: string;
@@ -567,7 +594,7 @@ type CommandTab =
   | "resources"
   | "audit";
 
-const CHAT_SIDE_TABS = ["status", "missions", "approvals", "briefing", "history"] as const;
+const CHAT_SIDE_TABS = ["queue", "status", "missions", "approvals", "briefing", "history"] as const;
 
 type ChatSideTab = (typeof CHAT_SIDE_TABS)[number];
 
@@ -977,6 +1004,10 @@ function splitList(value: string): string[] {
     .filter((item) => item.length > 0);
 }
 
+function stringValue(value: unknown) {
+  return typeof value === "string" ? value : "";
+}
+
 function personaDraftFrom(persona: OperatorPersona) {
   return {
     display_name: persona.display_name ?? "",
@@ -1272,12 +1303,13 @@ export default function CommandCenter() {
   const [directoryDraft, setDirectoryDraft] = useState("D:\\jarvis");
   const [directoryIngest, setDirectoryIngest] = useState<DirectoryIngestResult | null>(null);
   const [activeTab, setActiveTab] = useState<CommandTab>("chat");
-  const [chatSideTab, setChatSideTab] = useState<ChatSideTab>("status");
+  const [chatSideTab, setChatSideTab] = useState<ChatSideTab>("queue");
   const [chatHeight, setChatHeight] = useState(DEFAULT_CHAT_HEIGHT);
   const [chatWindows, setChatWindows] = useState<ChatWindow[]>(() => [
     createInitialChatWindow()
   ]);
   const [activeChatWindowId, setActiveChatWindowId] = useState(DEFAULT_CHAT_WINDOW_ID);
+  const [operatorQueue, setOperatorQueue] = useState<OperatorQueue | null>(null);
   const [approvals, setApprovals] = useState<ApprovalItem[]>([]);
   const [voiceAvailable, setVoiceAvailable] = useState(false);
   const [voiceState, setVoiceState] = useState<VoiceState>("idle");
@@ -1385,6 +1417,7 @@ export default function CommandCenter() {
         dockerContainersData,
         autonomyJobData,
         routineData,
+        operatorQueueData,
         approvalData
       ] = await Promise.all([
           api<RuntimeStatus>("/api/status"),
@@ -1409,6 +1442,7 @@ export default function CommandCenter() {
           api<DockerContainers>("/api/docker/containers"),
           api<AutonomyJob[]>("/api/autonomy/jobs"),
           api<Routine[]>("/api/routines"),
+          api<OperatorQueue>("/api/operator/queue"),
           api<ApprovalItem[]>("/api/approvals?limit=8")
         ]);
       setStatus(statusData);
@@ -1440,6 +1474,7 @@ export default function CommandCenter() {
       setDockerContainers(dockerContainersData);
       setAutonomyJobs(autonomyJobData);
       setRoutines(routineData);
+      setOperatorQueue(operatorQueueData);
       setApprovals(approvalData);
       if (statusData.health.length) {
         setDiagnostics(statusData.health);
@@ -1781,6 +1816,7 @@ export default function CommandCenter() {
     audit: "Аудит"
   };
   const chatSideTabTitle: Record<ChatSideTab, string> = {
+    queue: "Очередь",
     status: "Состояние",
     missions: "Миссии",
     approvals: "Допуски",
@@ -1788,6 +1824,7 @@ export default function CommandCenter() {
     history: "История"
   };
   const chatSideTabs: Array<{ id: ChatSideTab; label: string; badge: string }> = [
+    { id: "queue", label: "Очередь", badge: `${operatorQueue?.summary.total ?? 0}` },
     { id: "status", label: "Состояние", badge: llmReady ? "OK" : "..." },
     { id: "missions", label: "Миссии", badge: `${missions.length}` },
     { id: "approvals", label: "Допуски", badge: `${activeApprovals.length}` },
@@ -2910,6 +2947,45 @@ export default function CommandCenter() {
     }
   }
 
+  async function approveAndExecuteApproval(approvalId: string) {
+    const approval = approvals.find((item) => item.id === approvalId);
+    setActiveOperation({
+      title: "Допуск и выполнение",
+      detail: approval?.title ?? approvalId
+    });
+    setBusy(true);
+    try {
+      const updated = await api<ApprovalItem>(`/api/approvals/${approvalId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ status: "approved", result: { source: "command-center" } })
+      });
+      setApprovals((current) =>
+        current.map((approval) => (approval.id === approvalId ? updated : approval))
+      );
+      const result = await api<ApprovalExecution>(`/api/approvals/${approvalId}/execute`, {
+        method: "POST",
+        body: "{}"
+      });
+      setApprovals((current) =>
+        current.map((approval) => (approval.id === approvalId ? result.approval : approval))
+      );
+      setLines((current) => [
+        ...current,
+        {
+          id: crypto.randomUUID(),
+          role: "system",
+          content: result.summary
+        }
+      ]);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Не удалось выполнить допуск");
+    } finally {
+      setBusy(false);
+      setActiveOperation(null);
+    }
+  }
+
   async function runLearningTick() {
     setActiveOperation({
       title: "Самообучение",
@@ -3144,6 +3220,37 @@ export default function CommandCenter() {
       )}
     </div>
   );
+  const queuePanel = (
+    <div className="operatorQueue">
+      {!operatorQueue || operatorQueue.items.length === 0 ? (
+        <div className="emptyState compact">Очередь пуста</div>
+      ) : (
+        operatorQueue.items.slice(0, 8).map((item) => (
+          <article className={`queueRow ${item.priority}`} key={item.id}>
+            <Activity size={15} />
+            <div>
+              <strong>{item.title}</strong>
+              <p>{item.detail || item.action || item.status}</p>
+              <div className="queueMeta">
+                <span>{item.kind}</span>
+                <span>{item.status}</span>
+                {item.action ? <span>{item.action}</span> : null}
+              </div>
+            </div>
+          </article>
+        ))
+      )}
+      {operatorQueue && (
+        <div className="queueContext">
+          <span>{String(operatorQueue.context.active_profile ?? "profile")}</span>
+          <span>{operatorQueue.memory_hygiene.stats.total ?? 0} memories</span>
+          <span>
+            {operatorQueue.model_profiles.profiles.filter((item) => item.status === "future").length} future profiles
+          </span>
+        </div>
+      )}
+    </div>
+  );
   const approvalsPanel = (
     <div className="approvalList">
       {activeApprovals.length === 0 ? (
@@ -3155,9 +3262,28 @@ export default function CommandCenter() {
             <div>
               <strong>{approval.title}</strong>
               <p>{approval.description}</p>
+              {(stringValue(approval.payload?.mission_id) || stringValue(approval.payload?.task_id)) && (
+                <div className="approvalMeta">
+                  {stringValue(approval.payload?.mission_id) && (
+                    <span>mission {stringValue(approval.payload?.mission_id).slice(-6)}</span>
+                  )}
+                  {stringValue(approval.payload?.task_id) && (
+                    <span>task {stringValue(approval.payload?.task_id).slice(-6)}</span>
+                  )}
+                </div>
+              )}
             </div>
             <span>{approval.risk}</span>
             <div className="approvalControls">
+              <button
+                type="button"
+                title="Одобрить и выполнить"
+                aria-label="Одобрить и выполнить"
+                disabled={busy || approval.status !== "pending"}
+                onClick={() => approveAndExecuteApproval(approval.id)}
+              >
+                <Zap size={14} />
+              </button>
               <button
                 type="button"
                 title="Одобрить"
@@ -3660,6 +3786,7 @@ export default function CommandCenter() {
                       {healthPanel}
                     </>
                   )}
+                  {chatSideTab === "queue" && queuePanel}
                   {chatSideTab === "missions" && missionsPanel}
                   {chatSideTab === "approvals" && approvalsPanel}
                   {chatSideTab === "briefing" && briefingPanel}

@@ -11,8 +11,9 @@ from jarvis_gpt.llm import LLMStreamChunk
 from jarvis_gpt.storage import JarvisStorage
 
 
-def _result(content: str, ok: bool = True):
-    return type("Result", (), {"ok": ok, "content": content, "error": None})()
+def _result(content: str, ok: bool = True, finish_reason: str | None = None):
+    raw = {"choices": [{"finish_reason": finish_reason}]} if finish_reason else None
+    return type("Result", (), {"ok": ok, "content": content, "error": None, "raw": raw})()
 
 
 def _agent(monkeypatch, tmp_path, llm):
@@ -66,6 +67,31 @@ def test_agentic_loop_runs_safe_tool_then_answers(monkeypatch, tmp_path):
         event.type == "tool_call" and event.payload.get("autonomous")
         for event in response.events
     )
+    storage.close()
+
+
+def test_agentic_answer_auto_continues_after_length_finish(monkeypatch, tmp_path):
+    class LengthThenDoneLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, messages, *, temperature=None, max_tokens=None, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return _result("Первая часть", finish_reason="length")
+            return _result("и нормальный финал.", finish_reason="stop")
+
+    llm = LengthThenDoneLLM()
+    agent, storage = _agent(monkeypatch, tmp_path, llm)
+
+    response = asyncio.run(agent.chat("Объясни устройство локального runtime", mode="chat"))
+
+    assert llm.calls == 2
+    assert "Первая часть" in response.answer
+    assert "нормальный финал" in response.answer
+    assert "лимиту" not in response.answer
+    done = [event for event in response.events if event.type == "assistant_done"][-1]
+    assert done.payload["continuations"] == 1
     storage.close()
 
 

@@ -34,6 +34,7 @@ from .models import (
     ToolInfo,
     ToolRunResponse,
 )
+from .operator_queue import operator_context
 from .storage import JarvisStorage
 from .tools import ToolRegistry
 
@@ -104,6 +105,13 @@ FINAL_ANSWER_PROMPT = (
     "Лимит шагов с инструментами исчерпан. Дай финальный ответ оператору по-русски на "
     "основе собранных observation. Не вызывай больше инструменты и не выводи JSON. Если "
     "данных не хватило, честно скажи, что именно не подтверждено."
+)
+
+
+CONTINUE_AFTER_LENGTH_PROMPT = (
+    "The previous assistant message ended because of a token limit. Continue the same answer "
+    "from the exact point where it stopped. Do not restart, do not apologize, do not repeat "
+    "completed text, and finish naturally in Russian."
 )
 
 
@@ -211,6 +219,7 @@ class _AgenticResult:
     error: str | None = None
     blocked_by_approval: bool = False
     approval_ids: tuple[str, ...] = ()
+    continuation_count: int = 0
     used_tools: int = 0
 
 
@@ -577,6 +586,7 @@ class AgentRuntime:
                         "source": "llm",
                         "finish_reason": finish_reason,
                         "tool_steps": agentic.used_tools,
+                        "continuations": agentic.continuation_count,
                     },
                 )
             )
@@ -837,6 +847,7 @@ class AgentRuntime:
             stream_finish_reason = round_finish
             break
 
+        continuation_count = 0
         if answer_parts:
             answer = _clean_assistant_answer("".join(answer_parts).strip())
             if stream_error:
@@ -844,13 +855,28 @@ class AgentRuntime:
                 answer = f"{answer}{interruption}"
                 yield {"type": "delta", "content": interruption}
             elif stream_finish_reason == "length":
-                effective_max_tokens = max_tokens or self.settings.llm_max_tokens
-                interruption = (
-                    f"\n\n[ответ остановлен по лимиту {effective_max_tokens} токенов; "
-                    "увеличь лимит токенов или попроси продолжить]"
+                continued_answer, continuation_count, stream_finish_reason = (
+                    await self._auto_continue_answer(
+                        messages,
+                        answer,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        thinking_enabled=thinking_enabled,
+                    )
                 )
-                answer = f"{answer}{interruption}"
-                yield {"type": "delta", "content": interruption}
+                if continuation_count:
+                    addition = continued_answer[len(answer) :]
+                    answer = continued_answer
+                    if addition:
+                        yield {"type": "delta", "content": addition}
+                if stream_finish_reason == "length":
+                    effective_max_tokens = max_tokens or self.settings.llm_max_tokens
+                    interruption = (
+                        f"\n\n[ответ остановлен по лимиту {effective_max_tokens} токенов; "
+                        "увеличь лимит токенов или попроси продолжить]"
+                    )
+                    answer = f"{answer}{interruption}"
+                    yield {"type": "delta", "content": interruption}
             events.append(
                 ChatEvent(
                     type="assistant_done",
@@ -860,6 +886,7 @@ class AgentRuntime:
                         "stream": True,
                         "finish_reason": stream_finish_reason,
                         "tool_steps": used_tools,
+                        "continuations": continuation_count,
                     },
                 )
             )
@@ -2141,6 +2168,50 @@ class AgentRuntime:
             kwargs["thinking_enabled"] = thinking_enabled
         return await self.llm.complete(messages, **kwargs)
 
+    async def _auto_continue_answer(
+        self,
+        messages: list[dict[str, str]],
+        partial_answer: str,
+        *,
+        temperature: float | None,
+        max_tokens: int | None,
+        thinking_enabled: bool,
+        max_continuations: int = 2,
+    ) -> tuple[str, int, str | None]:
+        answer = partial_answer
+        finish_reason: str | None = "length"
+        continuation_count = 0
+        if not hasattr(self.llm, "complete"):
+            return answer, continuation_count, finish_reason
+        for _ in range(max(0, max_continuations)):
+            if finish_reason != "length":
+                break
+            continuation_max_tokens = max(
+                max_tokens or 0,
+                self.settings.llm_max_tokens,
+                1024,
+            )
+            continuation_messages = [
+                *messages,
+                {"role": "assistant", "content": answer},
+                {"role": "system", "content": CONTINUE_AFTER_LENGTH_PROMPT},
+            ]
+            result = await self._complete_llm(
+                continuation_messages,
+                temperature=temperature,
+                max_tokens=continuation_max_tokens,
+                thinking_enabled=thinking_enabled,
+            )
+            if not result.ok or not result.content:
+                break
+            addition = _clean_assistant_answer(result.content)
+            if not addition:
+                break
+            answer = _join_continuation(answer, addition)
+            continuation_count += 1
+            finish_reason = _finish_reason_from_llm_result(result) or "stop"
+        return answer, continuation_count, finish_reason
+
     def _stream_llm(
         self,
         messages: list[dict[str, str]],
@@ -2270,11 +2341,23 @@ class AgentRuntime:
             )
             if not result.ok or not result.content:
                 return _AgenticResult(ok=False, answer="", events=events, error=result.error)
+            answer = _clean_assistant_answer(result.content)
+            finish_reason = _finish_reason_from_llm_result(result)
+            continuation_count = 0
+            if finish_reason == "length":
+                answer, continuation_count, finish_reason = await self._auto_continue_answer(
+                    base_messages,
+                    answer,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    thinking_enabled=thinking_enabled,
+                )
             return _AgenticResult(
                 ok=True,
-                answer=_clean_assistant_answer(result.content),
+                answer=answer,
                 events=events,
-                finish_reason=_finish_reason_from_llm_result(result),
+                finish_reason=finish_reason,
+                continuation_count=continuation_count,
             )
 
         messages = [*base_messages, {"role": "system", "content": _tool_protocol_prompt(tools)}]
@@ -2316,13 +2399,25 @@ class AgentRuntime:
                 break
             action = _parse_tool_action(result.content)
             if action is None:
+                answer = _clean_assistant_answer(result.content)
+                finish_reason = _finish_reason_from_llm_result(result)
+                continuation_count = 0
+                if finish_reason == "length":
+                    answer, continuation_count, finish_reason = await self._auto_continue_answer(
+                        messages,
+                        answer,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        thinking_enabled=thinking_enabled,
+                    )
                 return _AgenticResult(
                     ok=True,
-                    answer=_clean_assistant_answer(result.content),
+                    answer=answer,
                     events=events,
-                    finish_reason=_finish_reason_from_llm_result(result),
+                    finish_reason=finish_reason,
                     blocked_by_approval=bool(approval_ids),
                     approval_ids=tuple(approval_ids),
+                    continuation_count=continuation_count,
                     used_tools=used_tools,
                 )
             resume = {
@@ -2359,13 +2454,25 @@ class AgentRuntime:
             thinking_enabled=thinking_enabled,
         )
         if result.ok and result.content:
+            answer = _clean_assistant_answer(result.content)
+            finish_reason = _finish_reason_from_llm_result(result)
+            continuation_count = 0
+            if finish_reason == "length":
+                answer, continuation_count, finish_reason = await self._auto_continue_answer(
+                    messages,
+                    answer,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    thinking_enabled=thinking_enabled,
+                )
             return _AgenticResult(
                 ok=True,
-                answer=_clean_assistant_answer(result.content),
+                answer=answer,
                 events=events,
-                finish_reason=_finish_reason_from_llm_result(result),
+                finish_reason=finish_reason,
                 blocked_by_approval=bool(approval_ids),
                 approval_ids=tuple(approval_ids),
+                continuation_count=continuation_count,
                 used_tools=used_tools,
             )
         return _AgenticResult(
@@ -2600,6 +2707,16 @@ class AgentRuntime:
             f"- model_root: {self.settings.model_root}",
             f"- llm_endpoint: {self.settings.llm_base_url}",
         ]
+        local_context = operator_context(self.settings, self.storage)
+        lines.extend(
+            [
+                f"- local_time: {local_context.get('now')}",
+                f"- pending_approvals: {local_context.get('pending_approvals')}",
+                f"- active_missions: {local_context.get('active_missions')}",
+            ]
+        )
+        if local_context.get("home_location"):
+            lines.append(f"- home_location: {local_context['home_location']}")
         working_roots = preferences.get("working_roots")
         if isinstance(working_roots, list) and working_roots:
             roots = [str(item) for item in working_roots[:6] if str(item).strip()]
@@ -3155,6 +3272,17 @@ def _short_value(value: Any, max_chars: int = 100) -> str:
     if len(text) <= max_chars:
         return text
     return f"{text[:max_chars].rstrip()}..."
+
+
+def _join_continuation(answer: str, addition: str) -> str:
+    left = answer.rstrip()
+    right = addition.lstrip()
+    if not left:
+        return right
+    if not right:
+        return left
+    separator = "" if left.endswith(("-", "/", "\\")) else " "
+    return f"{left}{separator}{right}"
 
 
 def _optional_text(value: Any) -> str | None:

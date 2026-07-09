@@ -11,6 +11,25 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ### 2026-07-09 - Codex
 
+- Added an operator queue/kernel surface: `GET /api/operator/queue` combines
+  pending/executable approvals, blocked/running mission tasks, health warnings,
+  generation truncation signals, memory hygiene, and future model-profile notes.
+- Added lightweight model-profile roadmap via `GET /api/model-profiles`; current
+  Gemma profiles stay active/available, 70B/80B planner and fast executor roles
+  are scaffolded as future/inactive.
+- Added memory hygiene reporting (`GET /api/memory/hygiene`) and consolidation
+  endpoint (`POST /api/memory/consolidate`). Learning tick still performs
+  consolidation automatically.
+- Added auto-continuation for LLM answers stopped by `finish_reason=length`,
+  including streamed answers. The assistant continues internally before exposing
+  the old "token limit" warning.
+- Command Center now has an operator queue tab, shows linked mission/task ids
+  on approvals, and adds one-click approve+execute for pending gates.
+- Regression tests: `test_agentic_answer_auto_continues_after_length_finish`
+  and `backend/tests/test_operator_queue.py`.
+
+### 2026-07-09 - Codex
+
 - Added mission approval resume: when an agentic mission step asks for a gated
   tool, the approval payload now stores `mission_id`, `task_id`, and a compact
   tool-loop resume snapshot.
