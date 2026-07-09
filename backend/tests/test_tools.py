@@ -39,6 +39,102 @@ def test_tool_registry_runs_memory_tools(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_system_inspect_runs_read_only_wmi_query(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+    captured = {}
+
+    async def fake_execute(self, *, command, cwd=None, timeout_sec=30):
+        captured["command"] = command
+        return {
+            "ok": True,
+            "summary": "bridge ok",
+            "data": {
+                "stdout": (
+                    '{"ok": true, "summary": "Battery 87%", "action": "wmi.query", '
+                    '"data": {"rows": [{"EstimatedChargeRemaining": 87}]}}'
+                )
+            },
+        }
+
+    monkeypatch.setattr("jarvis_gpt.host_bridge.HostBridgeClient.execute", fake_execute)
+
+    result = asyncio.run(
+        tools.run(
+            "system.inspect",
+            {
+                "action": "wmi.query",
+                "payload": {
+                    "class_name": "Win32_Battery",
+                    "properties": ["EstimatedChargeRemaining"],
+                },
+            },
+        )
+    )
+
+    assert result.ok is True
+    assert result.data["action"] == "wmi.query"
+    assert "Battery 87%" in result.summary
+    assert "Win32_Battery" in captured["command"]
+    storage.close()
+
+
+def test_system_inspect_refuses_desktop_mutating_action(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    async def forbidden_execute(self, *, command, cwd=None, timeout_sec=30):
+        raise AssertionError("system.inspect must never reach the bridge for a mutating action")
+
+    monkeypatch.setattr("jarvis_gpt.host_bridge.HostBridgeClient.execute", forbidden_execute)
+
+    result = asyncio.run(
+        tools.run(
+            "system.inspect",
+            {"action": "process.start", "payload": {"executable": "calc.exe"}},
+        )
+    )
+
+    assert result.ok is False
+    assert "read-only" in result.summary
+    assert "windows.native" in result.summary
+    storage.close()
+
+
+def test_system_inspect_is_a_safe_autonomous_tool(monkeypatch, tmp_path):
+    from jarvis_gpt.agent import AgentRuntime
+    from jarvis_gpt.event_bus import EventBus
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "1")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    agent = AgentRuntime(
+        settings=settings, storage=storage, llm=LLMRouter(settings), bus=EventBus()
+    )
+
+    spec = agent.tools.get("system.inspect")
+    assert spec is not None
+    assert spec.danger_level == "safe"
+    autonomous = {info.name for info in agent._autonomous_tools()}
+    assert "system.inspect" in autonomous
+    # The mutating native tool stays out of the autonomous loop.
+    assert "windows.native" not in autonomous
+    storage.close()
+
+
 def test_persona_insight_tool_learns_deduplicates_and_validates(monkeypatch, tmp_path):
     from jarvis_gpt.persona import load_persona
 

@@ -197,6 +197,7 @@ docker compose --profile llm up -d dispatcher
 - Native host bridge now has a bundled local RPC script, token detection, CLI execution, and a `danger` tool for approved host commands.
 - Safe tools include `web.fetch` for public HTTP(S) context with private-network and redirect guards.
 - Safe tools include read-only `docker.ps` and restricted `docker.logs` for Jarvis container diagnostics.
+- Safe tool `system.inspect` даёт агенту read-only инспекцию машины через WMI/CIM (и список окон): модель сама выбирает Win32_* класс по своему знанию для бытовых вопросов о железе/ОС/дисках/оперативке/батарее/службах/автозагрузке/принтерах/сети, без слова «wmi». Мутирующие native-действия остаются на approval-gated `windows.native`.
 - Dispatcher status/logs are tools, while dispatcher start/stop are approval-gated tool actions.
 - `browser.open` can open validated HTTP(S) URLs through the host bridge without approval for explicit open requests; it is excluded from the autonomous background tool loop.
 - `filesystem.write_text` is sandboxed to the repository or `D:\jarvis` and requires approval.

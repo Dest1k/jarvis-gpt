@@ -1,5 +1,47 @@
 # Runtime
 
+## 2026-07-09 handoff - system.inspect: unlock the model's WMI/WinAPI understanding
+
+Для оператора и второй модели. Ответ на вопрос «что мешает 26-31B модели
+понимать бытовые Windows-запросы с полуслова». Диагноз: не знание модели (Gemma
+хорошо знает Win32_* и PowerShell), а то, что нативный маршрут решают
+детерминированные keyword-эвристики ДО модели, и единственная read-only
+инспекция, покрывающая большинство бытовых вопросов о машине — WMI — была
+недоступна модели:
+- `_wmi_action_from_message` срабатывал только на литеральном слове «wmi»/«cim»
+  и мапил в жёсткую таблицу из 5 классов (process/service/gpu/bios/disk).
+  «Сколько оперативки», «заряд батареи», «что в автозагрузке», «список
+  принтеров» туда не попадали.
+- `wmi.query` жил внутри `windows.native` (danger, т.к. тот же инструмент делает
+  process.start/keyboard.send), поэтому агентный tool-loop — где модель применяет
+  своё понимание — был от него отрезан.
+
+Фикс (хирургический, на-тезис «понимание вместо затычек», «у модели есть руки»):
+- Новый safe read-only инструмент `system.inspect` (danger_level=safe,
+  category=host): действия только из allowlist `SAFE_INSPECT_ACTIONS`
+  ({capabilities, window.list, wmi.query}). Мутирующие действия (process.start,
+  keyboard.send, app.open_and_type, window.focus) отклоняются с подсказкой уйти
+  на approval-gated `windows.native`. Переиспользует уже валидированный путь
+  `wmi.query` (SELECT-only, алфавит-валидация класса/свойств, без вызова методов)
+  через общий `_run_native_bridge_command`.
+- Так как инструмент safe и не в `AGENTIC_TOOL_DENYLIST`, он автоматически в
+  `_autonomous_tools()` и в tool-protocol-промпте каждого хода. Модель сама
+  выбирает Win32_* класс и свойства по своему знанию на любой бытовой запрос —
+  без слова «wmi» и без keyword-таблицы. Эвристика остаётся офлайн-фолбэком.
+- SYSTEM_PROMPT: добавлен явный указатель использовать system.inspect для
+  вопросов о состоянии машины и не ждать слова «wmi».
+- Деградация честная: нет host bridge → tool возвращает ok=False с понятным
+  сообщением, модель говорит про деградацию, а не выдумывает.
+- Тесты: `test_system_inspect_runs_read_only_wmi_query`,
+  `test_system_inspect_refuses_desktop_mutating_action`,
+  `test_system_inspect_is_a_safe_autonomous_tool`,
+  `test_agentic_loop_inspects_system_without_the_word_wmi`. Прогон — 188 pass,
+  ruff clean, frontend clean.
+- Кандидат на будущее (не сделано, выше риск против покрытых тестами эвристик):
+  провести весь local_action-маршрут через reasoning-first арбитр, как уже
+  сделано для web_research; и symmetричный safe read-only инструмент для WinAPI
+  (окна/фокус read) шире, чем window.list.
+
 ## 2026-07-09 handoff - hardening pass (API smoke, verify timeout, config sync)
 
 Для оператора и второй модели. Не фича, а закрытие насущных пробелов после трёх

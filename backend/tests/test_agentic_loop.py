@@ -112,6 +112,54 @@ def test_agentic_loop_learns_persona_insight_from_dialogue(monkeypatch, tmp_path
     storage.close()
 
 
+def test_agentic_loop_inspects_system_without_the_word_wmi(monkeypatch, tmp_path):
+    # An everyday phrasing with no "wmi"/"cim" keyword: the deterministic native
+    # heuristics do not fire, so the model itself reaches for the safe
+    # system.inspect tool and picks the WMI class from its own understanding.
+    class InspectThenAnswerLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, messages, *, temperature=None, max_tokens=None, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return _result(
+                    '{"tool": "system.inspect", "arguments": {"action": "wmi.query", '
+                    '"payload": {"class_name": "Win32_Battery", '
+                    '"properties": ["EstimatedChargeRemaining"]}}}'
+                )
+            return _result("Заряд батареи: 87%.")
+
+    llm = InspectThenAnswerLLM()
+    agent, storage = _agent(monkeypatch, tmp_path, llm)
+    storage.set_runtime_value("experience.autonomy_policy", {"verify_answers": False})
+    captured = {}
+
+    async def fake_run(name, arguments=None, **kwargs):
+        captured["tool"] = name
+        captured["arguments"] = arguments
+        return type(
+            "R",
+            (),
+            {
+                "tool": name,
+                "ok": True,
+                "summary": "Battery 87%",
+                "data": {"action": "wmi.query"},
+            },
+        )()
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+
+    response = asyncio.run(agent.chat("сколько заряда осталось на ноуте?"))
+
+    assert llm.calls == 2
+    assert captured["tool"] == "system.inspect"
+    assert captured["arguments"]["payload"]["class_name"] == "Win32_Battery"
+    assert "87%" in response.answer
+    storage.close()
+
+
 def test_agentic_answer_auto_continues_after_length_finish(monkeypatch, tmp_path):
     class LengthThenDoneLLM:
         def __init__(self) -> None:

@@ -9,6 +9,29 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-09 - Claude (system.inspect: unlock WMI understanding)
+
+- Diagnosis for "why doesn't a 26-31B model get everyday Windows requests": the
+  model's WMI/WinAPI knowledge is fine, but the native route is decided by
+  keyword heuristics before the model, and the read-only WMI path was fused into
+  the danger-level windows.native tool — so the agentic loop could never use it.
+  The 5-class keyword map only fired on the literal word "wmi"/"cim".
+- Added safe read-only tool `system.inspect` (danger_level=safe) with an action
+  allowlist `SAFE_INSPECT_ACTIONS` = {capabilities, window.list, wmi.query};
+  mutating actions are refused with a pointer to approval-gated windows.native.
+  Shares `_run_native_bridge_command` with windows.native; reuses the already
+  validated wmi.query payload (SELECT-only, alnum class/props, no methods).
+- Because it is safe and not in AGENTIC_TOOL_DENYLIST, it is auto-listed in the
+  agentic tool protocol every turn; the model picks the Win32_* class itself for
+  any everyday machine-state question. Heuristics stay as the offline fallback.
+  SYSTEM_PROMPT nudges toward it and says not to wait for the word "wmi".
+- Tests (4): read-only wmi run, mutating-action refusal, safe-autonomous
+  membership, and an agentic test where the model calls system.inspect on
+  "сколько заряда осталось на ноуте?" with no "wmi" keyword. 188 pass, ruff
+  clean, frontend clean.
+- Future candidates: run the whole local_action route through the reasoning-first
+  arbiter (as web_research already does); a broader safe WinAPI read tool.
+
 ### 2026-07-09 - Claude (hardening pass)
 
 - Audit of critical paths after three feature layers; fixed the real gaps,

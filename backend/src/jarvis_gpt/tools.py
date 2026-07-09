@@ -333,6 +333,33 @@ class ToolRegistry:
         )
         self.add(
             ToolSpec(
+                name="system.inspect",
+                description=(
+                    "Read-only inspection of the operator's Windows machine through WMI/CIM "
+                    "(and the visible-window list). YOU choose the Win32_* class and properties "
+                    "from your own knowledge, e.g. Win32_OperatingSystem, Win32_Processor, "
+                    "Win32_PhysicalMemory, Win32_LogicalDisk, Win32_Battery, "
+                    "Win32_VideoController, Win32_Service, Win32_Process, "
+                    "Win32_StartupCommand, Win32_Printer, "
+                    "Win32_NetworkAdapterConfiguration, Win32_PnPEntity. Use it for everyday "
+                    "questions about hardware, OS, disks, memory, battery, services, startup, "
+                    "printers or network. Non-mutating and safe to run autonomously; runs through "
+                    "the local host bridge and degrades honestly if the bridge is offline."
+                ),
+                category="host",
+                input_schema={
+                    "action": "wmi.query (default), window.list, or capabilities",
+                    "payload": (
+                        "wmi.query: {class_name, properties[], filter?, limit?}; "
+                        "window.list: {limit}"
+                    ),
+                    "timeout_sec": "1-120 second timeout",
+                },
+                handler=_system_inspect,
+            )
+        )
+        self.add(
+            ToolSpec(
                 name="browser.open",
                 description="Open a validated HTTP(S) URL through the native host browser.",
                 category="browser",
@@ -749,17 +776,21 @@ async def _host_bridge_execute(ctx: ToolContext, args: dict[str, Any]) -> ToolRu
     )
 
 
-async def _windows_native(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
-    action = str(args.get("action") or "capabilities").strip().lower()
-    payload = args.get("payload")
-    if not isinstance(payload, dict):
-        payload = {}
-    try:
-        command = _windows_native_command(action, payload)
-    except ValueError as exc:
-        return ToolRunResponse(tool="windows.native", ok=False, summary=str(exc))
+# Read-only native actions that never change desktop/host state, so the agentic
+# loop may drive them without approval. wmi.query is a WMI SELECT, window.list
+# enumerates visible windows, capabilities reports what the bridge supports.
+SAFE_INSPECT_ACTIONS = frozenset({"capabilities", "window.list", "wmi.query"})
 
-    timeout_sec = _int_arg(args.get("timeout_sec"), default=30, minimum=1, maximum=120)
+
+async def _run_native_bridge_command(
+    ctx: ToolContext,
+    action: str,
+    payload: dict[str, Any],
+    timeout_sec: int,
+) -> tuple[dict[str, Any], bool, str, Any]:
+    """Build, run and parse one native host-bridge command. May raise ValueError."""
+
+    command = _windows_native_command(action, payload)
     result = await HostBridgeClient(ctx.settings).execute(
         command=command,
         timeout_sec=timeout_sec,
@@ -771,8 +802,23 @@ async def _windows_native(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResp
     summary = str(
         native.get("summary")
         or result.get("summary")
-        or f"Native Windows action {action} finished."
+        or f"Native action {action} finished."
     )
+    return native, ok, summary, bridge_data
+
+
+async def _windows_native(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    action = str(args.get("action") or "capabilities").strip().lower()
+    payload = args.get("payload")
+    if not isinstance(payload, dict):
+        payload = {}
+    timeout_sec = _int_arg(args.get("timeout_sec"), default=30, minimum=1, maximum=120)
+    try:
+        native, ok, summary, bridge_data = await _run_native_bridge_command(
+            ctx, action, payload, timeout_sec
+        )
+    except ValueError as exc:
+        return ToolRunResponse(tool="windows.native", ok=False, summary=str(exc))
     return ToolRunResponse(
         tool="windows.native",
         ok=ok,
@@ -783,6 +829,46 @@ async def _windows_native(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResp
             "native": native,
             "bridge": bridge_data,
         },
+    )
+
+
+async def _system_inspect(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    """Read-only inspection of the operator's machine (WMI/CIM, visible windows).
+
+    This is the safe, autonomous counterpart of windows.native: the model picks
+    the WMI class and properties from its own knowledge and reads system/hardware
+    state without an approval gate, because a WMI SELECT changes nothing. Actions
+    that touch the desktop stay on the approval-gated windows.native tool.
+    """
+
+    action = str(args.get("action") or "wmi.query").strip().lower()
+    if action not in SAFE_INSPECT_ACTIONS:
+        allowed = ", ".join(sorted(SAFE_INSPECT_ACTIONS))
+        return ToolRunResponse(
+            tool="system.inspect",
+            ok=False,
+            summary=(
+                f"system.inspect is read-only; '{action}' is not allowed here "
+                f"(use one of: {allowed}). Desktop-changing actions such as "
+                "process.start, app.open_and_type, keyboard.send or window.focus "
+                "must go through the approval-gated windows.native tool."
+            ),
+        )
+    payload = args.get("payload")
+    if not isinstance(payload, dict):
+        payload = {}
+    timeout_sec = _int_arg(args.get("timeout_sec"), default=30, minimum=1, maximum=120)
+    try:
+        native, ok, summary, bridge_data = await _run_native_bridge_command(
+            ctx, action, payload, timeout_sec
+        )
+    except ValueError as exc:
+        return ToolRunResponse(tool="system.inspect", ok=False, summary=str(exc))
+    return ToolRunResponse(
+        tool="system.inspect",
+        ok=ok,
+        summary=summary,
+        data={"action": action, "native": native, "bridge": bridge_data},
     )
 
 
