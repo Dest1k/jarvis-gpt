@@ -2097,6 +2097,80 @@ def test_agent_uses_web_answer_engine_for_google_like_query(monkeypatch, tmp_pat
     storage.close()
 
 
+def test_agent_non_shopping_web_answer_does_not_poison_shopping_followup(
+    monkeypatch,
+    tmp_path,
+):
+    calls = []
+
+    async def fake_web_answer(_ctx, args):
+        calls.append(args)
+        shopping = "5090" in args["question"]
+        return ToolRunResponse(
+            tool="web.answer",
+            ok=True,
+            summary="Answer engine ranked 1 source(s).",
+            data={
+                "query": args["query"],
+                "answer": "DNS RTX 5090 search" if shopping else "World news summary",
+                "confidence": 0.5,
+                "sources": [
+                    {
+                        "title": "DNS search" if shopping else "World news",
+                        "url": (
+                            "https://www.dns-shop.ru/search/?q=rtx+5090"
+                            if shopping
+                            else "https://ria.ru/lenta/"
+                        ),
+                        "snippet": "RTX 5090 DNS" if shopping else "World news feed",
+                        "excerpt": "RTX 5090 DNS" if shopping else "World news feed",
+                        "fetched": False,
+                        "quality": "snippet-only",
+                    }
+                ],
+            },
+        )
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr("jarvis_gpt.tools._web_answer", fake_web_answer)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    agent = AgentRuntime(
+        settings=settings,
+        storage=storage,
+        llm=LLMRouter(settings),
+        bus=EventBus(),
+    )
+
+    first = asyncio.run(agent.chat("погугли мировые новости за 9-10 июля 2026 года"))
+    from jarvis_gpt.agent import _shopping_followup_intent, _shopping_research_key
+
+    assert storage.get_runtime_value(_shopping_research_key(first.conversation_id), None) is None
+    assert (
+        _shopping_followup_intent(
+            "и всё-таки покажи мне самую дешёвую позицию в днс на rtx 5090 в Москве",
+            has_previous_search=True,
+        )
+        is None
+    )
+
+    second = asyncio.run(
+        agent.chat(
+            "и всё-таки покажи мне самую дешёвую позицию в днс на rtx 5090 в Москве",
+            first.conversation_id,
+        )
+    )
+
+    assert len(calls) == 2
+    assert "5090" in calls[1]["question"]
+    assert "DNS RTX 5090 search" in second.answer
+    assert not any(event.title == "shopping.followup" for event in second.events)
+    storage.close()
+
+
 def test_web_research_synthesizes_fetched_evidence(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "1")

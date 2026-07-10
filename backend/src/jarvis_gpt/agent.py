@@ -2052,11 +2052,13 @@ class AgentRuntime:
             )
             candidates = _shopping_candidates_from_evidence(evidence)
             criterion = _ranking_criterion_from_message(message)
-            self._remember_shopping_research(
-                conversation_id=conversation_id,
-                query=query,
-                candidates=candidates,
-            )
+            shopping_context = _looks_like_shopping_query(f"{message} {query}".lower())
+            if shopping_context and candidates:
+                self._remember_shopping_research(
+                    conversation_id=conversation_id,
+                    query=query,
+                    candidates=candidates,
+                )
             if _shopping_open_requested(normalized) and candidates:
                 open_action = await self._open_shopping_candidate(
                     candidates,
@@ -2118,11 +2120,13 @@ class AgentRuntime:
                 answer=answer,
             )
             candidates = _shopping_candidates_from_evidence(evidence)
-            self._remember_shopping_research(
-                conversation_id=conversation_id,
-                query=str(result.data.get("query") or query),
-                candidates=candidates,
-            )
+            answer_query = str(result.data.get("query") or query)
+            if _looks_like_shopping_query(f"{message} {answer_query}".lower()) and candidates:
+                self._remember_shopping_research(
+                    conversation_id=conversation_id,
+                    query=answer_query,
+                    candidates=candidates,
+                )
         return DirectAction(answer=answer, events=[event])
 
     async def _run_web_research_followup(
@@ -5974,6 +5978,12 @@ def _shopping_followup_intent(
     criterion = _ranking_criterion_from_message(message)
     if criterion is None:
         return None
+    explicit_previous_context = _contains_any(
+        normalized,
+        ("из них", "из списка", "из найден", "последний поиск", "прошлый поиск", "результат"),
+    )
+    if _looks_like_shopping_query(normalized) and not explicit_previous_context:
+        return None
     followup_context = _contains_any(
         normalized,
         (
@@ -5994,13 +6004,10 @@ def _shopping_followup_intent(
     )
     if not followup_context:
         return None
-    if not has_previous_search and not _contains_any(
-        normalized,
-        ("из них", "из списка", "из найден", "последний поиск", "прошлый поиск", "результат"),
-    ):
+    if not has_previous_search and not explicit_previous_context:
         return None
     explicit_new_search = _contains_any(normalized, ("найди", "поищи", "загугли"))
-    if explicit_new_search and not _contains_any(normalized, ("из них", "из списка", "из найден")):
+    if explicit_new_search and not explicit_previous_context:
         return None
     return {
         "criterion": criterion,

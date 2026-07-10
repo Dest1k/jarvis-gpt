@@ -9,6 +9,16 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-10 - Codex (shopping follow-up state isolation)
+
+- Fixed a bad reuse path where every `web.answer` result was saved as
+  shopping-state. Generic/news web answers no longer poison later shopping
+  follow-ups.
+- Self-contained shopping requests like "покажи самую дешёвую RTX 5090 в DNS"
+  now force a fresh web answer/search even if a previous shopping state exists;
+  state reuse is reserved for explicit "из найденных/из списка/прошлый поиск"
+  style follow-ups.
+
 ### 2026-07-10 - Codex (runtime restart discipline)
 
 - Operator preference: do not restart the LLM/dispatcher when a change only
