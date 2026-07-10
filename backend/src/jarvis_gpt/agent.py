@@ -1953,7 +1953,8 @@ class AgentRuntime:
             )
 
         results = _search_results_from_response(search)
-        if not results:
+        needs_product_retry = _shopping_search_needs_product_retry(message, results)
+        if not results or needs_product_retry:
             for fallback_query in _fallback_web_research_queries(message, query):
                 fallback = await self.tools.run("web.search", {"query": fallback_query, "limit": 6})
                 events.append(
@@ -1970,11 +1971,21 @@ class AgentRuntime:
                     )
                 )
                 if fallback.ok:
-                    query = fallback_query
-                    search = fallback
-                    results = _search_results_from_response(search)
-                    if results:
+                    fallback_results = _search_results_from_response(fallback)
+                    if not fallback_results:
+                        continue
+                    if not results:
+                        query = fallback_query
+                        search = fallback
+                        results = fallback_results
                         break
+                    if _shopping_results_have_product_link(fallback_results):
+                        query = fallback_query
+                        search = fallback
+                        results = _merge_search_results(fallback_results, results)
+                        break
+        if _looks_like_shopping_query(message.lower()):
+            results = _rank_shopping_search_results(results, message)
         fetches: list[ToolRunResponse] = []
         for item in results[:3]:
             fetched = await self.tools.run(
@@ -5920,9 +5931,11 @@ def _should_skip_web_synthesis(message: str, evidence: list[dict[str, str]]) -> 
     normalized = message.lower()
     if not _looks_like_shopping_query(normalized) or not evidence:
         return False
-    has_store_link = any(urlparse(str(item.get("url") or "")).hostname for item in evidence)
-    has_fetched_source = any(str(item.get("fetched") or "") == "true" for item in evidence)
-    return has_store_link and not has_fetched_source
+    # Shopping answers are link-sensitive: the deterministic formatter preserves
+    # found store URLs and clearly separates snippets from confirmed prices.
+    # Letting the LLM resynthesize this evidence can turn "I found this link but
+    # did not confirm the price" into a false "specific link is impossible".
+    return any(urlparse(str(item.get("url") or "")).hostname for item in evidence)
 
 
 def _source_quality_label(url: str, *, fetched: bool) -> str:
@@ -6158,6 +6171,115 @@ def _shopping_candidates_from_evidence(evidence: list[dict[str, str]]) -> list[d
     return candidates
 
 
+def _shopping_search_needs_product_retry(message: str, results: list[dict[str, Any]]) -> bool:
+    normalized = message.lower()
+    if not results or not _looks_like_shopping_query(normalized):
+        return False
+    if _shopping_results_have_product_link(results):
+        return False
+    for item in results:
+        text = f"{item.get('title') or ''} {item.get('snippet') or ''}"
+        if _extract_price_texts(text):
+            return False
+    return True
+
+
+def _shopping_results_have_product_link(results: list[dict[str, Any]]) -> bool:
+    return any(_is_likely_product_url(str(item.get("url") or "")) for item in results)
+
+
+def _merge_search_results(
+    primary: list[dict[str, Any]],
+    secondary: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in [*primary, *secondary]:
+        url = str(item.get("url") or "")
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        merged.append(item)
+    return merged[:6]
+
+
+def _rank_shopping_search_results(
+    results: list[dict[str, Any]],
+    message: str,
+) -> list[dict[str, Any]]:
+    normalized = message.lower()
+    return sorted(
+        results,
+        key=lambda item: _shopping_result_sort_key(item, normalized),
+    )
+
+
+def _shopping_result_sort_key(item: dict[str, Any], normalized: str) -> tuple[int, int]:
+    url = str(item.get("url") or "")
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    path = parsed.path.lower().rstrip("/")
+    text = f"{item.get('title') or ''} {item.get('snippet') or ''}"
+    score = 0
+    if _is_likely_product_url(url):
+        score -= 50
+    if _shopping_domain_hint(normalized) and host.endswith(_shopping_domain_hint(normalized)):
+        score -= 12
+    if _extract_price_texts(text):
+        score -= 8
+    if _extract_availability_texts(text):
+        score -= 4
+    if _is_likely_category_url(url):
+        score += 10
+    if path in {"", "/"}:
+        score += 30
+    try:
+        rank = int(item.get("rank") or 999)
+    except (TypeError, ValueError):
+        rank = 999
+    return score, rank
+
+
+def _is_likely_product_url(url: str) -> bool:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    path = parsed.path.lower()
+    if not host or not path:
+        return False
+    if host.endswith("dns-shop.ru"):
+        return "/product/" in path
+    if host.endswith("ozon.ru"):
+        return "/product/" in path
+    if host.endswith("wildberries.ru"):
+        return bool(re.search(r"/catalog/\d+/(?:detail|.*detail\.aspx)", path))
+    if host.endswith("market.yandex.ru"):
+        return "/product--" in path or "/card/" in path
+    if host.endswith("citilink.ru"):
+        return "/product/" in path
+    if host.endswith("mvideo.ru"):
+        return "/products/" in path
+    if host.endswith("eldorado.ru"):
+        return "/cat/detail/" in path
+    if host.endswith("avito.ru"):
+        return bool(re.search(r"_[0-9]{6,}(?:$|[/?#])", path))
+    return any(marker in path for marker in ("/product/", "/products/", "/p/", "/item/"))
+
+
+def _is_likely_category_url(url: str) -> bool:
+    path = urlparse(url).path.lower()
+    return any(
+        marker in path
+        for marker in (
+            "/catalog/",
+            "/category/",
+            "/catalogue/",
+            "/search",
+            "/recipe/",
+            "/catalog/recipe/",
+        )
+    )
+
+
 def _sort_shopping_candidates(
     candidates: list[dict[str, Any]],
     *,
@@ -6289,6 +6411,19 @@ def _extract_price_texts(text: str) -> list[str]:
         [
             " ".join(match.split())
             for match in _SHOPPING_PRICE_RE.findall(text)
+        ]
+    )
+
+
+def _extract_availability_texts(text: str) -> list[str]:
+    return _dedupe(
+        [
+            " ".join(match.split())
+            for match in re.findall(
+                r"(?:в наличии|нет в наличии|доступно к заказу|под заказ|самовывоз|доставка\s+\w+)",
+                text,
+                flags=re.IGNORECASE,
+            )
         ]
     )
 

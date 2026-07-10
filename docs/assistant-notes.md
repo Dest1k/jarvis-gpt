@@ -9,6 +9,20 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-10 - Codex (shopping search link fidelity)
+
+- Fixed the shopping web path that could still answer "no concrete link" after
+  search had found store URLs. Shopping evidence now stays deterministic instead
+  of going through LLM synthesis, so found DNS/Ozon/product links are preserved
+  while prices/availability remain explicitly qualified.
+- Shopping search now retries with the domain-hint query when the first result
+  set is only store shells/categories with no product URL and no price snippet,
+  then ranks product-card URLs above home/category/search pages.
+- Added regressions for DNS shell/category results followed by a product card,
+  and for successful product fetches that must not be overwritten by synthesis.
+- Verified: `py -3.11 -m ruff check backend/src/jarvis_gpt/agent.py
+  backend/tests/test_agent.py`; `py -3.11 -m pytest backend/tests` (212 pass).
+
 ### 2026-07-10 - Codex (shopping follow-up state isolation)
 
 - Fixed a bad reuse path where every `web.answer` result was saved as

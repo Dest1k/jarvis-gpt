@@ -1381,6 +1381,139 @@ def test_agent_returns_dns_links_when_store_blocks_automation(monkeypatch, tmp_p
     storage.close()
 
 
+def test_agent_retries_shopping_search_when_results_are_only_store_shells(monkeypatch, tmp_path):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    searches = []
+
+    async def fake_run(name, arguments=None, **kwargs):
+        if name == "web.search":
+            searches.append(arguments["query"])
+            if len(searches) == 1:
+                return _tool_response(
+                    name,
+                    True,
+                    "Web search returned 2 result(s).",
+                    {
+                        "results": [
+                            {
+                                "title": "DNS",
+                                "url": "https://www.dns-shop.ru/",
+                                "snippet": "Интернет-магазин DNS",
+                                "rank": 1,
+                            },
+                            {
+                                "title": "Видеокарты DNS",
+                                "url": "https://www.dns-shop.ru/catalog/17a89aab16404e77/videokarty/",
+                                "snippet": "Каталог видеокарт",
+                                "rank": 2,
+                            },
+                        ]
+                    },
+                )
+            return _tool_response(
+                name,
+                True,
+                "Web search returned 1 result(s).",
+                {
+                    "results": [
+                        {
+                            "title": "RTX 5090 DNS",
+                            "url": "https://www.dns-shop.ru/product/rtx-5090",
+                            "snippet": "RTX 5090 399 999 ₽ В наличии",
+                            "rank": 1,
+                        }
+                    ]
+                },
+            )
+        if name == "web.fetch":
+            return _tool_response(
+                name,
+                True,
+                "Fetched URL with HTTP 200.",
+                {"url": arguments["url"], "text": "RTX 5090 399 999 ₽ В наличии"},
+            )
+        raise AssertionError(f"unexpected tool {name}")
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+
+    response = asyncio.run(agent.chat("дай мне ссылку на самую дешёвую 5090 в днс"))
+
+    assert len(searches) == 2
+    assert searches[0] == "rtx 5090 site:dns-shop.ru купить цена наличие"
+    assert searches[1] == "rtx 5090 dns-shop.ru купить цена наличие"
+    assert "https://www.dns-shop.ru/product/rtx-5090" in response.answer
+    assert "\n1. RTX 5090 DNS" in response.answer
+    storage.close()
+
+
+def test_agent_skips_shopping_synthesis_even_when_product_fetch_succeeds(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "1")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+
+    class ResearchLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None, **kwargs):
+            rendered = "\n".join(item["content"] for item in messages)
+            if "intent-router" in rendered:
+                return type(
+                    "Result",
+                    (),
+                    {
+                        "ok": True,
+                        "content": (
+                            '{"route":"web_research","confidence":0.9,'
+                            '"query":"rtx 5090 site:dns-shop.ru купить цена наличие",'
+                            '"rationale":"shopping link request"}'
+                        ),
+                        "error": None,
+                    },
+                )()
+            raise AssertionError("shopping evidence should not be resynthesized by the LLM")
+
+    agent = AgentRuntime(settings=settings, storage=storage, llm=ResearchLLM(), bus=EventBus())
+
+    async def fake_run(name, arguments=None, **kwargs):
+        if name == "web.search":
+            return _tool_response(
+                name,
+                True,
+                "Web search returned 1 result(s).",
+                {
+                    "results": [
+                        {
+                            "title": "RTX 5090 DNS",
+                            "url": "https://www.dns-shop.ru/product/rtx-5090",
+                            "snippet": "RTX 5090 399 999 ₽ В наличии",
+                        }
+                    ]
+                },
+            )
+        if name == "web.fetch":
+            return _tool_response(
+                name,
+                True,
+                "Fetched URL with HTTP 200.",
+                {
+                    "url": arguments["url"],
+                    "text": "RTX 5090 399 999 ₽ В наличии, доставка завтра",
+                },
+            )
+        raise AssertionError(f"unexpected tool {name}")
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+
+    response = asyncio.run(agent.chat("выдай ссылку на самую дешёвую 5090 в днс"))
+
+    assert "https://www.dns-shop.ru/product/rtx-5090" in response.answer
+    assert "399 999" in response.answer
+    assert "невозможно" not in response.answer.lower()
+    assert not any(event.title == "web.synthesis" for event in response.events)
+    storage.close()
+
+
 def test_agent_sorts_previous_shopping_results_and_opens_cheapest(monkeypatch, tmp_path):
     agent, storage = _agent_without_llm(monkeypatch, tmp_path)
     calls = []
