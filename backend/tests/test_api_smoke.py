@@ -10,6 +10,7 @@ status -> chat -> feedback -> mission -> report -> queue -> tools/memory/approva
 from __future__ import annotations
 
 from pathlib import Path
+from threading import Event
 
 import pytest
 from jarvis_gpt.api import (
@@ -114,6 +115,33 @@ def test_operator_quality_and_autonomy_cancel(client):
     cancelled = client.post(f"/api/autonomy/jobs/{job['id']}/cancel")
     assert cancelled.status_code == 200
     assert cancelled.json()["status"] == "cancelled"
+
+
+def test_autonomy_start_runs_detached(client, monkeypatch):
+    created = client.post(
+        "/api/autonomy/jobs",
+        json={
+            "title": "Detached diagnostics",
+            "kind": "diagnostics",
+            "cadence": "manual",
+            "budget": {"max_runs": 3, "max_minutes": 5},
+        },
+    )
+    assert created.status_code == 200
+    job = created.json()
+    entered = Event()
+
+    async def fake_run_job(started_job):
+        entered.set()
+        return {"job": started_job, "ok": True, "summary": "ok", "data": {}}
+
+    monkeypatch.setattr(app.state.autonomy_executor, "run_job", fake_run_job)
+
+    started = client.post(f"/api/autonomy/jobs/{job['id']}/start")
+
+    assert started.status_code == 200
+    assert started.json()["id"] == job["id"]
+    assert entered.wait(1)
 
 
 def test_cors_is_loopback_only(client):

@@ -1777,6 +1777,19 @@ export default function CommandCenter() {
   const conversationId = activeChatWindow?.conversationId ?? null;
   const lines = activeChatWindow?.lines ?? bootLines();
   const latestLine = lines[lines.length - 1];
+  const activeMissionJobs = useMemo(() => {
+    const byMissionId = new Map<string, AutonomyJob>();
+    for (const job of autonomyJobs) {
+      if (job.kind !== "mission" || job.status !== "enabled") continue;
+      const missionId = stringValue(job.payload?.mission_id);
+      if (!missionId) continue;
+      const current = byMissionId.get(missionId);
+      if (!current || (!current.running_lease_id && job.running_lease_id)) {
+        byMissionId.set(missionId, job);
+      }
+    }
+    return byMissionId;
+  }, [autonomyJobs]);
 
   const updateChatWindow = useCallback((id: string, updater: (window: ChatWindow) => ChatWindow) => {
     setChatWindows((current) => current.map((window) => (window.id === id ? updater(window) : window)));
@@ -2938,6 +2951,62 @@ export default function CommandCenter() {
     }
   }
 
+  function upsertAutonomyJob(job: AutonomyJob) {
+    setAutonomyJobs((current) => [job, ...current.filter((item) => item.id !== job.id)].slice(0, 10));
+  }
+
+  async function ensureMissionAutonomyJob(
+    missionId: string,
+    maxSteps: number,
+    options: { forceMaxSteps?: boolean } = {}
+  ) {
+    const mission = missions.find((item) => item.id === missionId);
+    const existing = autonomyJobs.find(
+      (job) =>
+        job.kind === "mission" &&
+        job.status === "enabled" &&
+        stringValue(job.payload?.mission_id) === missionId
+    );
+    if (existing) {
+      const currentMaxSteps = Number(existing.payload?.max_steps);
+      if (
+        options.forceMaxSteps &&
+        !existing.running_lease_id &&
+        (!Number.isFinite(currentMaxSteps) || currentMaxSteps < maxSteps)
+      ) {
+        const updated = await api<AutonomyJob>(`/api/autonomy/jobs/${existing.id}`, {
+          method: "PATCH",
+          body: JSON.stringify({
+            status: "enabled",
+            cadence: "background",
+            budget: {
+              max_runs: Math.max(existing.budget.max_runs ?? 0, 100),
+              max_minutes: Math.max(existing.budget.max_minutes ?? 0, 60)
+            },
+            payload: { ...existing.payload, mission_id: missionId, max_steps: maxSteps }
+          })
+        });
+        upsertAutonomyJob(updated);
+        return updated;
+      }
+      return existing;
+    }
+
+    const created = await api<AutonomyJob>("/api/autonomy/jobs", {
+      method: "POST",
+      body: JSON.stringify({
+        title: `mission: ${mission?.title ?? missionId}`.slice(0, 120),
+        kind: "mission",
+        cadence: "background",
+        priority: 60,
+        budget: { max_runs: 100, max_minutes: 60 },
+        payload: { mission_id: missionId, max_steps: maxSteps }
+      })
+    });
+    upsertAutonomyJob(created);
+    return created;
+  }
+
   async function runAutonomyJob(jobId: string) {
     const jobTitle = autonomyJobs.find((job) => job.id === jobId)?.title ?? jobId;
     setActiveOperation({
@@ -3320,6 +3389,36 @@ export default function CommandCenter() {
   }
 
   async function runMissionToCompletion(missionId: string) {
+    const MAX_STEPS = 24;
+    const mission = missions.find((item) => item.id === missionId);
+    setRunningMissionId(missionId);
+    setBusy(true);
+    setActiveOperation({
+      title: "Mission",
+      detail: mission?.title ?? missionId
+    });
+    try {
+      const job = await ensureMissionAutonomyJob(missionId, MAX_STEPS, { forceMaxSteps: true });
+      const started = await api<AutonomyJob>(`/api/autonomy/jobs/${job.id}/start`, {
+        method: "POST",
+        body: "{}"
+      });
+      upsertAutonomyJob(started);
+      setLines((current) => [
+        ...current,
+        { role: "system", content: `Mission started in backend: ${mission?.title ?? missionId}` }
+      ]);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Mission was not started");
+    } finally {
+      setBusy(false);
+      setRunningMissionId(null);
+      setActiveOperation(null);
+    }
+  }
+
+  async function runMissionToCompletionLegacy(missionId: string) {
     // Chain execute-next on the client so each step's progress lands in the UI
     // live (progress bar + per-task status), stopping on completion, a blocked
     // step, or a safety cap. The server /run endpoint stays for headless use.
@@ -3932,7 +4031,11 @@ export default function CommandCenter() {
       ) : (
         missions.slice(0, 5).map((mission) => (
           <article
-            className={`missionItem${runningMissionId === mission.id ? " running" : ""}`}
+            className={`missionItem${
+              runningMissionId === mission.id || activeMissionJobs.get(mission.id)?.running_lease_id
+                ? " running"
+                : ""
+            }`}
             key={mission.id}
           >
             <div className="missionTitle">
@@ -3989,7 +4092,11 @@ export default function CommandCenter() {
                 className="iconText compact"
                 type="button"
                 onClick={() => executeNextMissionStep(mission.id)}
-                disabled={busy || mission.status === "done"}
+                disabled={
+                  busy ||
+                  mission.status === "done" ||
+                  Boolean(activeMissionJobs.get(mission.id)?.running_lease_id)
+                }
               >
                 <Play size={15} />
                 <span>Шаг</span>
@@ -3998,10 +4105,15 @@ export default function CommandCenter() {
                 className="iconText compact"
                 type="button"
                 onClick={() => runMissionToCompletion(mission.id)}
-                disabled={busy || mission.status === "done"}
+                disabled={
+                  busy ||
+                  mission.status === "done" ||
+                  Boolean(activeMissionJobs.get(mission.id)?.running_lease_id)
+                }
                 title="Выполнять шаги до завершения или блокировки"
               >
-                {runningMissionId === mission.id ? (
+                {runningMissionId === mission.id ||
+                activeMissionJobs.get(mission.id)?.running_lease_id ? (
                   <Loader2 className="spin" size={15} />
                 ) : (
                   <Zap size={15} />
@@ -4027,12 +4139,7 @@ export default function CommandCenter() {
                 disabled={
                   busy ||
                   mission.status === "done" ||
-                  autonomyJobs.some(
-                    (job) =>
-                      job.kind === "mission" &&
-                      job.status === "enabled" &&
-                      stringValue(job.payload?.mission_id) === mission.id
-                  )
+                  activeMissionJobs.has(mission.id)
                 }
                 title="Поставить миссию в фоновое выполнение"
               >

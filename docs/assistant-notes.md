@@ -693,3 +693,17 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
   decimal separators, so cheapest sorting works for foreign marketplace snippets.
 - `web.answer` now caches direct store-search answers even when sources are empty,
   and weak-shopping detection reuses structured price extraction for non-RUB prices.
+
+### 2026-07-10 - Codex
+
+- `Запустить всё` for missions now starts a persisted autonomy mission job through
+  `POST /api/autonomy/jobs/{job_id}/start` instead of chaining all mission steps
+  from the browser tab. Reloading the Command Center page no longer cancels the
+  current mission run.
+- The new autonomy start endpoint schedules `AutonomyExecutor.run_job` as a
+  detached backend task and returns immediately; existing `/run` remains the
+  awaited/manual path.
+- Command Center derives active mission UI state from the persisted job lease, so
+  a page reload can still show that a mission job is running.
+- Regression coverage: `test_autonomy_start_runs_detached`; frontend typecheck
+  passes.

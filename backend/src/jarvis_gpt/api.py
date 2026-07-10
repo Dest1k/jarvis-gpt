@@ -180,11 +180,19 @@ async def lifespan(app: FastAPI):
     app.state.autonomy_executor = autonomy_executor
     app.state.supervisor = supervisor
     app.state.approval_executor = approval_executor
+    app.state.autonomy_background_tasks = set()
     storage.add_event(kind="runtime.start", title="Jarvis backend started")
     await supervisor.start()
     try:
         yield
     finally:
+        detached_tasks = [
+            task for task in getattr(app.state, "autonomy_background_tasks", set()) if not task.done()
+        ]
+        for task in detached_tasks:
+            task.cancel()
+        if detached_tasks:
+            await asyncio.gather(*detached_tasks, return_exceptions=True)
         await supervisor.stop()
         storage.add_event(kind="runtime.stop", title="Jarvis backend stopped")
         storage.close()
@@ -249,6 +257,33 @@ def _header_token(headers: Any) -> str:
 def _token_allowed(token: str) -> bool:
     expected = _api_token()
     return bool(expected and token and secrets.compare_digest(token, expected))
+
+
+def _track_detached_autonomy_task(task: asyncio.Task[Any], job_id: str) -> None:
+    tasks = getattr(app.state, "autonomy_background_tasks", None)
+    if tasks is None:
+        tasks = set()
+        app.state.autonomy_background_tasks = tasks
+    tasks.add(task)
+
+    def _discard(done: asyncio.Task[Any]) -> None:
+        tasks.discard(done)
+        try:
+            done.result()
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:  # noqa: BLE001
+            try:
+                app.state.storage.add_event(
+                    kind="autonomy.job.detached_error",
+                    title=f"Detached autonomy job failed: {job_id}",
+                    level="error",
+                    payload={"job_id": job_id, "error": repr(exc)},
+                )
+            except Exception:
+                return
+
+    task.add_done_callback(_discard)
 
 
 def _strict_loopback_token_required() -> bool:
@@ -791,6 +826,20 @@ async def run_autonomy_job(job_id: str) -> AutonomyJobRunResponse:
     if job is None:
         raise HTTPException(status_code=404, detail="Autonomy job not found")
     return await app.state.autonomy_executor.run_job(job)
+
+
+@app.post("/api/autonomy/jobs/{job_id}/start", response_model=AutonomyJobResponse)
+async def start_autonomy_job(job_id: str) -> AutonomyJobResponse:
+    job = next((item for item in app.state.operations.list_jobs() if item["id"] == job_id), None)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Autonomy job not found")
+    task = asyncio.create_task(
+        app.state.autonomy_executor.run_job(job),
+        name=f"jarvis-autonomy-job-{job_id}",
+    )
+    _track_detached_autonomy_task(task, job_id)
+    await app.state.bus.publish({"channel": "autonomy.jobs", "action": "started", "job_id": job_id})
+    return job
 
 
 @app.get("/api/routines", response_model=list[RoutineResponse])
