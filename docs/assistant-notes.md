@@ -9,6 +9,27 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-10 - Codex (Google replacement production surface)
+
+- Added optional real Search API providers to `web.search`: Brave Search,
+  Tavily, and Serper. They are auto-used only when their env keys are present
+  (`JARVIS_BRAVE_SEARCH_API_KEY`/`BRAVE_SEARCH_API_KEY`,
+  `JARVIS_TAVILY_API_KEY`/`TAVILY_API_KEY`,
+  `JARVIS_SERPER_API_KEY`/`SERPER_API_KEY`); otherwise existing
+  DuckDuckGo/Bing/Yandex HTML fallback remains unchanged.
+- `web.search`, `web.research`, and `web.answer` now carry verticals:
+  `web`, `news`, `images`, `shopping`, `places`, and `scholar`. Serper covers
+  all verticals; Brave covers web/news/images; Tavily covers web/news.
+- Deep crawl got practical controls: `depth`, `follow_text`, `include`,
+  `exclude`, `render_fallback`, and `archive_fallback`.
+- Added `web.transcript` for public caption/transcript extraction (YouTube
+  `captionTracks` first, HTML transcript fallback) and `web.eval` for bounded
+  answer-quality checks over `web.answer` cases.
+- Agent `web.answer` events now carry `cards`, `synthesis`, `cache`, and
+  `vertical`; internet observability reports Search API readiness, supported
+  verticals, and answer-cache count. Command Center internet panel displays
+  those readiness signals.
+
 ### 2026-07-10 - Codex (Google replacement quality layers)
 
 - Extended `web.answer` beyond deterministic ranking: it now has answer-level

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import json
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -2097,6 +2098,147 @@ def test_web_crawl_follows_bounded_same_site_links(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_web_crawl_respects_depth_and_follow_filters(monkeypatch, tmp_path):
+    async def fake_fetch(_ctx, args):
+        if args["url"].endswith("/start"):
+            links = [
+                {"url": "https://example.com/docs/page2", "text": "Docs next", "rel": "next"},
+                {"url": "https://example.com/blog/page2", "text": "Blog next", "rel": "next"},
+            ]
+            text = "Start"
+            evidence_id = "ev_start"
+        else:
+            links = [{"url": "https://example.com/docs/page3", "text": "Docs next", "rel": "next"}]
+            text = "Second"
+            evidence_id = "ev_second"
+        return ToolRunResponse(
+            tool="web.fetch",
+            ok=True,
+            summary="Fetched.",
+            data={"url": args["url"], "text": text, "evidence_id": evidence_id, "links": links},
+        )
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr(
+        "jarvis_gpt.tools._public_resolved_addresses",
+        lambda _hostname: [ipaddress.ip_address("93.184.216.34")],
+    )
+    monkeypatch.setattr("jarvis_gpt.tools._web_fetch", fake_fetch)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    result = asyncio.run(
+        tools.run(
+            "web.crawl",
+            {
+                "url": "https://example.com/start",
+                "max_pages": 5,
+                "depth": 1,
+                "include": "/docs/",
+                "follow_text": "Docs",
+            },
+        )
+    )
+
+    urls = [page["url"] for page in result.data["pages"]]
+    assert urls == ["https://example.com/start", "https://example.com/docs/page2"]
+    assert result.data["pages"][1]["depth"] == 1
+    storage.close()
+
+
+def test_web_transcript_extracts_youtube_caption(monkeypatch, tmp_path):
+    async def fake_fetch_document(_ctx, raw_url, *, max_chars, source):
+        if "timedtext" in raw_url:
+            return {
+                "ok": True,
+                "summary": "caption",
+                "data": {
+                    "url": raw_url,
+                    "text": "<transcript><text>Hello</text><text>world</text></transcript>",
+                    "raw_text": "<transcript><text>Hello</text><text>world</text></transcript>",
+                },
+            }
+        return {
+            "ok": True,
+            "summary": "page",
+            "data": {
+                "url": raw_url,
+                "text": "video page",
+                "raw_text": (
+                    '"captionTracks":[{"baseUrl":'
+                    '"https://www.youtube.com/api/timedtext?v=abc\\u0026lang=en",'
+                    '"languageCode":"en","name":{"simpleText":"English"}}],"audioTracks"'
+                ),
+            },
+        }
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr("jarvis_gpt.tools._fetch_public_document", fake_fetch_document)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    result = asyncio.run(
+        tools.run("web.transcript", {"url": "https://www.youtube.com/watch?v=abc", "lang": "en"})
+    )
+
+    assert result.ok is True
+    assert result.data["source"] == "youtube_caption"
+    assert result.data["text"] == "Hello world"
+    assert result.data["track"]["language"] == "en"
+    storage.close()
+
+
+def test_web_eval_scores_answer_cases(monkeypatch, tmp_path):
+    async def fake_web_answer(_ctx, args):
+        return ToolRunResponse(
+            tool="web.answer",
+            ok=True,
+            summary="Answer ok.",
+            data={
+                "answer": (
+                    "Python answer with source https://www.python.org/downloads/ "
+                    "and official release context."
+                ),
+                "sources": [{"url": "https://www.python.org/downloads/"}],
+                "confidence": 0.8,
+                "vertical": args.get("vertical") or "web",
+            },
+        )
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr("jarvis_gpt.tools._web_answer", fake_web_answer)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    result = asyncio.run(
+        tools.run(
+            "web.eval",
+            {
+                "cases": [
+                    {"question": "latest Python", "expected_terms": ["python"], "vertical": "web"}
+                ]
+            },
+        )
+    )
+
+    assert result.ok is True
+    assert result.data["average_score"] >= 0.7
+    assert result.data["results"][0]["matched_terms"] == ["python"]
+    storage.close()
+
+
 def test_web_document_read_reads_quarantined_text(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
@@ -2597,6 +2739,13 @@ def test_web_render_marks_forbidden_dom_as_blocked(monkeypatch, tmp_path):
 
 
 def test_web_search_parses_public_results(monkeypatch, tmp_path):
+    monkeypatch.delenv("JARVIS_BRAVE_SEARCH_API_KEY", raising=False)
+    monkeypatch.delenv("BRAVE_SEARCH_API_KEY", raising=False)
+    monkeypatch.delenv("JARVIS_TAVILY_API_KEY", raising=False)
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    monkeypatch.delenv("JARVIS_SERPER_API_KEY", raising=False)
+    monkeypatch.delenv("SERPER_API_KEY", raising=False)
+
     class FakeResponse:
         text = """
         <html>
@@ -2651,6 +2800,12 @@ def test_web_search_parses_public_results(monkeypatch, tmp_path):
 
 
 def test_web_search_uses_region_freshness_pagination_and_yandex(monkeypatch, tmp_path):
+    monkeypatch.delenv("JARVIS_BRAVE_SEARCH_API_KEY", raising=False)
+    monkeypatch.delenv("BRAVE_SEARCH_API_KEY", raising=False)
+    monkeypatch.delenv("JARVIS_TAVILY_API_KEY", raising=False)
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    monkeypatch.delenv("JARVIS_SERPER_API_KEY", raising=False)
+    monkeypatch.delenv("SERPER_API_KEY", raising=False)
     requested_urls = []
 
     class FakeResponse:
@@ -2725,6 +2880,131 @@ def test_web_search_uses_region_freshness_pagination_and_yandex(monkeypatch, tmp
         "yandex.ru/search/" in url and "lr=213" in url and "within=2" in url
         for url in requested_urls
     )
+    storage.close()
+
+
+def test_web_search_uses_brave_api_provider(monkeypatch, tmp_path):
+    requested = {}
+
+    class FakeResponse:
+        status_code = 200
+        headers = {"content-type": "application/json"}
+        content = json.dumps(
+            {
+                "web": {
+                    "results": [
+                        {
+                            "title": "API Result",
+                            "url": "https://example.com/api",
+                            "description": "Structured API snippet",
+                        }
+                    ]
+                }
+            }
+        ).encode()
+
+        def raise_for_status(self):
+            return None
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, _exc_type, _exc, _traceback):
+            return None
+
+        async def get(self, url, *, headers):
+            requested["url"] = url
+            requested["headers"] = headers
+            return FakeResponse()
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setenv("JARVIS_BRAVE_SEARCH_API_KEY", "brave-key")
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    result = asyncio.run(
+        tools.run(
+            "web.search",
+            {"query": "structured search", "provider": "brave", "limit": 1},
+        )
+    )
+
+    assert result.ok is True
+    assert "api.search.brave.com/res/v1/web/search" in requested["url"]
+    assert requested["headers"]["X-Subscription-Token"] == "brave-key"
+    assert result.data["results"][0]["provider"] == "brave_api"
+    assert result.data["results"][0]["url"] == "https://example.com/api"
+    storage.close()
+
+
+def test_web_search_uses_serper_vertical_endpoint(monkeypatch, tmp_path):
+    requested = {}
+
+    class FakeResponse:
+        status_code = 200
+        headers = {"content-type": "application/json"}
+        content = json.dumps(
+            {
+                "places": [
+                    {
+                        "title": "Cafe Example",
+                        "link": "https://example.com/cafe",
+                        "address": "Example street",
+                    }
+                ]
+            }
+        ).encode()
+
+        def raise_for_status(self):
+            return None
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, _exc_type, _exc, _traceback):
+            return None
+
+        async def post(self, url, *, headers, json):
+            requested["url"] = url
+            requested["headers"] = headers
+            requested["json"] = json
+            return FakeResponse()
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setenv("JARVIS_SERPER_API_KEY", "serper-key")
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    result = asyncio.run(
+        tools.run(
+            "web.search",
+            {"query": "coffee kazan", "provider": "serper", "vertical": "places", "limit": 1},
+        )
+    )
+
+    assert result.ok is True
+    assert requested["url"] == "https://google.serper.dev/places"
+    assert requested["headers"]["X-API-KEY"] == "serper-key"
+    assert "address hours phone" in requested["json"]["q"]
+    assert result.data["results"][0]["vertical"] == "places"
     storage.close()
 
 

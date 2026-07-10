@@ -2101,6 +2101,10 @@ class AgentRuntime:
                 "query": query,
                 "confidence": result.data.get("confidence"),
                 "sources": len(result.data.get("sources") or []),
+                "cards": result.data.get("cards"),
+                "synthesis": result.data.get("synthesis"),
+                "cache": result.data.get("cache"),
+                "vertical": result.data.get("vertical"),
             },
         )
         evidence = _answer_sources_to_research_evidence(result.data.get("sources"))
@@ -3376,7 +3380,8 @@ class AgentRuntime:
                 (
                     "- durable_capabilities: memory search/save, file ingestion/search, "
                     "mission planning/execution, learning journal/tick, "
-                    "web.answer/web.search/web.fetch/web.research/web.verify/web.document.read, "
+                    "web.answer/web.search/web.fetch/web.research/web.verify/web.transcript/"
+                    "web.eval/web.document.read, "
                     "documents.inspect/read/compare/edit.plan/apply_replacements, "
                     "telemetry, diagnostics, Docker/dispatcher inspection, host bridge gates."
                 ),
@@ -4593,7 +4598,9 @@ def _tool_protocol_prompt(tools: list[ToolInfo]) -> str:
         (
             "For web research, prefer this flow when useful: web.search -> web.fetch/render -> "
             "web.extract for structured page data -> web.verify before factual claims. "
-            "Use web.evidence.list to reuse recent evidence instead of refetching."
+            "Use vertical web.search/web.answer modes for news/images/shopping/places/scholar, "
+            "web.transcript for public captions, web.crawl for multipage docs/threads, and "
+            "web.evidence.list to reuse recent evidence instead of refetching."
         ),
     )
     for tool in tools:

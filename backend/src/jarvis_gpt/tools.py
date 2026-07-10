@@ -6,6 +6,7 @@ import inspect
 import ipaddress
 import json
 import math
+import os
 import re
 import shutil
 import socket
@@ -868,7 +869,10 @@ class ToolRegistry:
                     "region": "Search region, default ru-ru",
                     "freshness": "day, week, month, year, or empty",
                     "pages": "Search result pages to inspect",
-                    "provider": "auto, duckduckgo, bing, or yandex",
+                    "provider": (
+                        "auto, api, brave, tavily, serper, duckduckgo, bing, or yandex"
+                    ),
+                    "vertical": "web, news, images, shopping, places, scholar, or auto",
                 },
                 handler=_web_search,
             )
@@ -886,6 +890,12 @@ class ToolRegistry:
                     "max_pages": "Maximum pages to fetch",
                     "max_chars": "Maximum text characters per page",
                     "same_site": "Keep crawl on the same host",
+                    "depth": "Maximum link depth from the start URL",
+                    "follow_text": "Optional text hints for links to follow",
+                    "include": "Optional regex/list; only matching URLs are followed",
+                    "exclude": "Optional regex/list; matching URLs are skipped",
+                    "render_fallback": "Try web.render for thin pages",
+                    "archive_fallback": "Try web.archive for blocked pages",
                 },
                 handler=_web_crawl,
             )
@@ -931,6 +941,22 @@ class ToolRegistry:
                     "limit": "Maximum entries to return (default 10)",
                 },
                 handler=_web_feed,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="web.transcript",
+                description=(
+                    "Extract a public video/audio transcript when a page exposes captions "
+                    "(YouTube caption tracks first; HTML transcript fallback otherwise)."
+                ),
+                category="web",
+                input_schema={
+                    "url": "Public video/audio/page URL",
+                    "lang": "Preferred transcript language (default ru, then en)",
+                    "max_chars": "Maximum transcript characters",
+                },
+                handler=_web_transcript,
             )
         )
         self.add(
@@ -1016,6 +1042,8 @@ class ToolRegistry:
                     "query": "Search query or research question",
                     "claim": "Optional concrete claim to verify",
                     "max_sources": "Maximum sources to inspect",
+                    "provider": "Optional search provider override",
+                    "vertical": "Optional vertical: web, news, images, shopping, places, scholar",
                     "render_fallback": "Try web.render when web.fetch is blocked/thin",
                 },
                 handler=_web_research,
@@ -1036,6 +1064,7 @@ class ToolRegistry:
                     "region": "Search region, default ru-ru",
                     "freshness": "day, week, month, year, empty, or inferred from question",
                     "query_variants": "Optional extra focused queries",
+                    "vertical": "web, news, images, shopping, places, scholar, or inferred",
                     "use_cache": "Use the short answer TTL cache, default true",
                     "synthesis": "Use grounded LLM synthesis when available, default true",
                 },
@@ -1057,6 +1086,22 @@ class ToolRegistry:
                     "urls": "Optional public URLs to fetch and compare",
                 },
                 handler=_web_verify,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="web.eval",
+                description=(
+                    "Run a bounded quality check over web.answer questions and score "
+                    "source coverage, confidence, URLs, and expected answer terms."
+                ),
+                category="web",
+                input_schema={
+                    "cases": "Optional list of {question, expected_terms, vertical, freshness}",
+                    "limit": "Maximum cases to run",
+                    "use_cache": "Whether answer cache may be used",
+                },
+                handler=_web_eval,
             )
         )
         self.add(
@@ -2337,16 +2382,20 @@ async def _web_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
     freshness = _normalize_search_freshness(args.get("freshness"))
     pages = _int_arg(args.get("pages"), default=1, minimum=1, maximum=5)
     provider = str(args.get("provider") or "auto").strip().lower()
+    vertical = _normalize_search_vertical(args.get("vertical"))
     if not query:
         return ToolRunResponse(tool="web.search", ok=False, summary="Search query is required.")
     if len(query) > 300:
         query = query[:300].rstrip()
+    search_query = _vertical_search_query(query, vertical)
     providers = _web_search_requests(
-        query,
+        search_query,
         region=region,
         freshness=freshness,
         pages=pages,
         provider=provider,
+        vertical=vertical,
+        limit=limit,
     )
     if not providers:
         return ToolRunResponse(tool="web.search", ok=False, summary="Unsupported search provider.")
@@ -2365,20 +2414,51 @@ async def _web_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
             for request in providers:
                 source = str(request["source"])
                 url = str(request["url"])
+                if request.get("missing_key"):
+                    last_failure = {
+                        "source": source,
+                        "summary": "Search provider API key is not configured.",
+                        "env": request.get("env"),
+                    }
+                    provider_stats.append(
+                        {
+                            "source": source,
+                            "page": request.get("page"),
+                            "url": url,
+                            "parsed": 0,
+                            "added": 0,
+                            "missing_key": True,
+                        }
+                    )
+                    continue
                 rate_block = _web_rate_limit_block(ctx.storage, url)
                 if rate_block is not None:
                     last_failure = {"source": source, **rate_block}
                     continue
                 try:
-                    response = await client.get(url, headers=headers)
+                    request_headers = {**headers, **dict(request.get("headers") or {})}
+                    if request.get("method") == "POST":
+                        json_body = (
+                            request.get("json") if isinstance(request.get("json"), dict) else None
+                        )
+                        response = await client.post(
+                            url,
+                            headers=request_headers,
+                            json=json_body,
+                        )
+                    else:
+                        response = await client.get(url, headers=request_headers)
                     response.raise_for_status()
                 except httpx.HTTPError as exc:
                     last_failure = {"source": source, "summary": str(exc), "url": url}
                     _web_rate_limit_record(ctx.storage, url, ok=False)
                     continue
-                html = _decode_response_text(response)
+                raw_text = _decode_response_text(response)
                 status_code = int(getattr(response, "status_code", 200) or 200)
-                if _web_response_blocked(status_code, _html_to_text(html)):
+                blocked_text = raw_text
+                if not bool(request.get("json_response")):
+                    blocked_text = _html_to_text(raw_text)
+                if _web_response_blocked(status_code, blocked_text):
                     last_failure = {
                         "source": source,
                         "summary": "Search provider returned a blocked page.",
@@ -2386,7 +2466,12 @@ async def _web_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
                     }
                     _web_rate_limit_record(ctx.storage, url, ok=False, blocked=True)
                     continue
-                parsed = _web_parse_search_results(source, html, limit=limit)
+                parsed = _web_parse_search_results(
+                    source,
+                    raw_text,
+                    limit=limit,
+                    vertical=vertical,
+                )
                 added = 0
                 for item in parsed:
                     result_url = str(item.get("url") or "")
@@ -2398,6 +2483,7 @@ async def _web_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
                             **item,
                             "rank": len(collected) + 1,
                             "provider": source,
+                            "vertical": item.get("vertical") or vertical,
                             "provider_page": request.get("page"),
                             "provider_rank": item.get("rank"),
                         }
@@ -2442,6 +2528,7 @@ async def _web_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
                         "region": region,
                         "freshness": freshness,
                         "pages": pages,
+                        "vertical": vertical,
                         "providers": provider_stats,
                         "result_count": len(results),
                     },
@@ -2459,6 +2546,7 @@ async def _web_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
                         "source": results[0].get("provider") if results else None,
                         "region": region,
                         "freshness": freshness,
+                        "vertical": vertical,
                         "pages": pages,
                         "providers": provider_stats,
                         "safety": safety,
@@ -2571,18 +2659,24 @@ async def _web_crawl(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     max_pages = _int_arg(args.get("max_pages"), default=4, minimum=1, maximum=12)
     max_chars = _int_arg(args.get("max_chars"), default=6000, minimum=512, maximum=12000)
     same_site = _bool_arg(args.get("same_site"), default=True)
+    max_depth = _int_arg(args.get("depth"), default=2, minimum=0, maximum=5)
+    render_fallback = _bool_arg(args.get("render_fallback"), default=False)
+    archive_fallback = _bool_arg(args.get("archive_fallback"), default=True)
+    follow_hints = _string_list_arg(args.get("follow_text"), limit=8)
+    include_patterns = _string_list_arg(args.get("include"), limit=8)
+    exclude_patterns = _string_list_arg(args.get("exclude"), limit=8)
     try:
         start_url = _validate_public_http_url(raw_url)
     except ValueError as exc:
         return ToolRunResponse(tool="web.crawl", ok=False, summary=str(exc))
 
     start_host = _url_domain(start_url)
-    queue: list[str] = [start_url]
+    queue: list[tuple[str, int]] = [(start_url, 0)]
     seen: set[str] = set()
     pages: list[dict[str, Any]] = []
     steps: list[dict[str, Any]] = []
     while queue and len(pages) < max_pages:
-        url = queue.pop(0)
+        url, depth = queue.pop(0)
         if url in seen:
             continue
         seen.add(url)
@@ -2590,26 +2684,67 @@ async def _web_crawl(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
         steps.append(
             {"tool": "web.fetch", "ok": fetched.ok, "summary": fetched.summary, "url": url}
         )
+        fetched_text = str(fetched.data.get("text") or "") if isinstance(fetched.data, dict) else ""
+        if render_fallback and (
+            not fetched.ok
+            or len(fetched_text) < 600
+            or bool((fetched.data or {}).get("consent_wall"))
+        ):
+            rendered = await _web_render(
+                ctx,
+                {"url": url, "max_chars": max_chars, "wait_ms": 2500, "scroll_passes": 2},
+            )
+            steps.append(
+                {"tool": "web.render", "ok": rendered.ok, "summary": rendered.summary, "url": url}
+            )
+            if rendered.ok and str(rendered.data.get("text") or "").strip():
+                fetched = rendered
+                fetched_text = str(rendered.data.get("text") or "")
+        if archive_fallback and (
+            not fetched.ok
+            or bool((fetched.data or {}).get("blocked"))
+            or bool((fetched.data or {}).get("consent_wall"))
+        ):
+            archived = await _web_archive(ctx, {"url": url, "max_chars": max_chars})
+            steps.append(
+                {"tool": "web.archive", "ok": archived.ok, "summary": archived.summary, "url": url}
+            )
+            if archived.ok and str(archived.data.get("text") or "").strip():
+                fetched = archived
+                fetched_text = str(archived.data.get("text") or "")
         if not fetched.ok or not isinstance(fetched.data, dict):
             continue
-        text = str(fetched.data.get("text") or "")
+        text = fetched_text or str(fetched.data.get("text") or "")
         links = fetched.data.get("links") if isinstance(fetched.data.get("links"), list) else []
         evidence_id = str(fetched.data.get("evidence_id") or "")
         pages.append(
             {
                 "url": fetched.data.get("url") or url,
+                "depth": depth,
                 "text": _short_text(text, 1200),
                 "evidence_id": evidence_id or None,
                 "links_found": len(links),
             }
         )
+        if depth >= max_depth:
+            continue
         for link in _prioritize_crawl_links(links):
             next_url = str(link.get("url") or "")
-            if not next_url or next_url in seen or next_url in queue:
+            if not next_url or next_url in seen:
+                continue
+            if any(next_url == queued_url for queued_url, _queued_depth in queue):
                 continue
             if same_site and _url_domain(next_url) != start_host:
                 continue
-            queue.append(next_url)
+            if not _crawl_url_allowed(
+                next_url,
+                link,
+                include_patterns=include_patterns,
+                exclude_patterns=exclude_patterns,
+                follow_hints=follow_hints,
+            ):
+                continue
+            queue.append((next_url, depth + 1))
             if len(queue) >= max_pages * 3:
                 break
 
@@ -2621,6 +2756,9 @@ async def _web_crawl(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
             "url": start_url,
             "same_site": same_site,
             "max_pages": max_pages,
+            "depth": max_depth,
+            "render_fallback": render_fallback,
+            "archive_fallback": archive_fallback,
             "pages": pages,
             "steps": steps,
         },
@@ -2638,6 +2776,7 @@ async def _web_research(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
     render_fallback = _bool_arg(args.get("render_fallback"), default=True)
     archive_fallback = _bool_arg(args.get("archive_fallback"), default=True)
     search_pages = _int_arg(args.get("pages"), default=2, minimum=1, maximum=5)
+    vertical = _normalize_search_vertical(args.get("vertical"))
     search = await _web_search(
         ctx,
         {
@@ -2647,6 +2786,7 @@ async def _web_research(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
             "freshness": args.get("freshness") or "",
             "pages": search_pages,
             "provider": args.get("provider") or "auto",
+            "vertical": vertical,
         },
     )
     steps: list[dict[str, Any]] = [
@@ -2723,6 +2863,10 @@ async def _web_research(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
             "title": result.get("title"),
             "url": result.get("url"),
             "snippet": result.get("snippet"),
+            "vertical": result.get("vertical"),
+            "published": result.get("published"),
+            "price": result.get("price"),
+            "rating": result.get("rating"),
             "fetched": fetched.ok,
             "tool": fetched.tool,
             "evidence_id": evidence_id or None,
@@ -2764,6 +2908,7 @@ async def _web_research(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
             "id": record["id"],
             "query": query,
             "claim": claim or None,
+            "vertical": vertical,
             "report": report,
             "sources": sources,
             "citations": _research_citations(sources),
@@ -2787,6 +2932,9 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
     freshness = _normalize_search_freshness(args.get("freshness")) or _web_answer_infer_freshness(
         question
     )
+    vertical = _normalize_search_vertical(
+        args.get("vertical") or _web_answer_infer_vertical(question)
+    )
     query_variants = _string_list_arg(
         args.get("query_variants", args.get("queries")),
         limit=4,
@@ -2805,6 +2953,7 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
         queries=queries,
         region=region,
         freshness=freshness,
+        vertical=vertical,
         max_sources=max_sources,
     )
     if use_cache:
@@ -2836,6 +2985,7 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
                 "max_sources": per_query_sources,
                 "region": region,
                 "freshness": freshness,
+                "vertical": vertical,
                 "pages": 2 if index == 0 else 1,
                 "render_fallback": True,
                 "archive_fallback": True,
@@ -2945,6 +3095,7 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
         "queries": queries,
         "region": region,
         "freshness": freshness or None,
+        "vertical": vertical,
         "answer": answer,
         "sources": ranked_sources,
         "citations": _research_citations(ranked_sources),
@@ -3613,6 +3764,207 @@ async def _web_feed(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
             "evidence_id": evidence["id"],
         },
     )
+
+
+async def _web_transcript(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    raw_url = str(args.get("url") or "").strip()
+    preferred_lang = str(args.get("lang") or "ru").strip().lower()[:12] or "ru"
+    max_chars = _int_arg(args.get("max_chars"), default=12000, minimum=1000, maximum=50000)
+    document = await _fetch_public_document(
+        ctx,
+        raw_url,
+        max_chars=300_000,
+        source="web.transcript",
+    )
+    if not document["ok"]:
+        return ToolRunResponse(
+            tool="web.transcript",
+            ok=False,
+            summary=f"Transcript page fetch failed: {document['summary']}",
+            data={"url": raw_url, "fetch": document.get("data", {})},
+        )
+    page = document["data"]
+    raw_text = str(page.get("raw_text") or page.get("text") or "")
+    page_url = str(page.get("url") or raw_url)
+    tracks = _youtube_caption_tracks(raw_text)
+    selected_track = _select_caption_track(tracks, preferred_lang)
+    transcript = ""
+    transcript_source = "html"
+    track_payload: dict[str, Any] | None = None
+    if selected_track:
+        track_url = _caption_track_url(str(selected_track.get("base_url") or ""))
+        if track_url:
+            caption_doc = await _fetch_public_document(
+                ctx,
+                track_url,
+                max_chars=max_chars * 4,
+                source="web.transcript",
+            )
+            if caption_doc["ok"]:
+                caption_raw = str(
+                    caption_doc["data"].get("raw_text") or caption_doc["data"].get("text") or ""
+                )
+                transcript = _parse_caption_transcript(
+                    caption_raw
+                )
+                transcript_source = "youtube_caption"
+                track_payload = {
+                    "language": selected_track.get("language"),
+                    "name": selected_track.get("name"),
+                    "kind": selected_track.get("kind"),
+                    "url": track_url,
+                }
+    if not transcript:
+        transcript = _extract_html_transcript(raw_text)
+    transcript = _short_text(transcript, max_chars)
+    safety = _web_content_safety(source="web.transcript", url=page_url, text=transcript)
+    evidence = _store_web_evidence(
+        ctx.storage,
+        source="web.transcript",
+        url=page_url,
+        title=str(page.get("title") or "transcript"),
+        text=transcript,
+        content_type="text/plain",
+        safety=safety,
+        confidence=0.72 if transcript else 0.2,
+        extra={"source": transcript_source, "track": track_payload or {}, "tracks": len(tracks)},
+    )
+    return ToolRunResponse(
+        tool="web.transcript",
+        ok=bool(transcript),
+        summary=(
+            f"Extracted transcript from {transcript_source}."
+            if transcript
+            else "No public transcript or caption track was found."
+        ),
+        data={
+            "url": page_url,
+            "text": transcript,
+            "source": transcript_source,
+            "track": track_payload,
+            "tracks": tracks,
+            "safety": safety,
+            "evidence_id": evidence["id"],
+        },
+    )
+
+
+def _youtube_caption_tracks(html: str) -> list[dict[str, str]]:
+    tracks: list[dict[str, str]] = []
+    fragment_match = re.search(
+        r'"captionTracks"\s*:\s*(?P<tracks>\[.*?\])\s*,\s*"audioTracks"',
+        html,
+        flags=re.DOTALL,
+    ) or re.search(
+        r'"captionTracks"\s*:\s*(?P<tracks>\[.*?\])',
+        html,
+        flags=re.DOTALL,
+    )
+    if fragment_match:
+        try:
+            raw_tracks = json.loads(fragment_match.group("tracks"))
+        except json.JSONDecodeError:
+            raw_tracks = []
+        if isinstance(raw_tracks, list):
+            for raw in raw_tracks:
+                if not isinstance(raw, dict):
+                    continue
+                name = raw.get("name") if isinstance(raw.get("name"), dict) else {}
+                tracks.append(
+                    {
+                        "language": str(raw.get("languageCode") or ""),
+                        "name": str(name.get("simpleText") or raw.get("name") or ""),
+                        "kind": str(raw.get("kind") or ""),
+                        "base_url": str(raw.get("baseUrl") or raw.get("base_url") or ""),
+                    }
+                )
+    if tracks:
+        return [item for item in tracks if item.get("base_url")]
+
+    pattern = re.compile(
+        r'"baseUrl"\s*:\s*"(?P<url>(?:\\.|[^"\\])+)".{0,500}?'
+        r'"languageCode"\s*:\s*"(?P<lang>[^"]+)"',
+        flags=re.DOTALL,
+    )
+    for match in pattern.finditer(html):
+        tracks.append(
+            {
+                "language": match.group("lang"),
+                "name": match.group("lang"),
+                "kind": "",
+                "base_url": _json_string_unescape(match.group("url")),
+            }
+        )
+    return tracks
+
+
+def _select_caption_track(
+    tracks: list[dict[str, str]],
+    preferred_lang: str,
+) -> dict[str, str] | None:
+    if not tracks:
+        return None
+    preferred = [preferred_lang, preferred_lang.split("-", 1)[0], "ru", "en"]
+    for lang in preferred:
+        for track in tracks:
+            language = str(track.get("language") or "").lower()
+            if language == lang or language.startswith(f"{lang}-"):
+                return track
+    return tracks[0]
+
+
+def _caption_track_url(base_url: str) -> str:
+    if not base_url:
+        return ""
+    url = unescape(_json_string_unescape(base_url))
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        return ""
+    if "fmt=" in parsed.query:
+        return url
+    separator = "&" if parsed.query else "?"
+    return f"{url}{separator}fmt=srv3"
+
+
+def _json_string_unescape(value: str) -> str:
+    try:
+        return json.loads(f'"{value}"')
+    except json.JSONDecodeError:
+        return value.replace("\\u0026", "&").replace("\\/", "/")
+
+
+def _parse_caption_transcript(text: str) -> str:
+    raw = text.strip()
+    if not raw:
+        return ""
+    try:
+        root = ElementTree.fromstring(raw)
+    except ElementTree.ParseError:
+        return _html_to_text(raw)
+    parts: list[str] = []
+    for node in root.iter():
+        tag = str(node.tag).rsplit("}", 1)[-1].lower()
+        if tag in {"text", "s", "p"}:
+            content = " ".join("".join(node.itertext()).split())
+            if content:
+                parts.append(content)
+    return _repair_mojibake(" ".join(parts))
+
+
+def _extract_html_transcript(html: str) -> str:
+    candidates = re.findall(
+        r'<(?:div|section|article|main)[^>]+(?:id|class)="[^"]*transcript[^"]*"[^>]*>'
+        r"(?P<body>.*?)</(?:div|section|article|main)>",
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not candidates and "transcript" in html[:20_000].lower():
+        candidates = [html]
+    for candidate in candidates:
+        text = _html_to_text(candidate)
+        if len(text) >= 80:
+            return text
+    return ""
 
 
 def _parse_feed_entries(text: str, *, limit: int) -> tuple[str, list[dict[str, str]]]:
@@ -4448,6 +4800,128 @@ async def _internet_smoke(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResp
             "chrome_required": False,
         },
     )
+
+
+async def _web_eval(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    cases = _web_eval_cases(args.get("cases"))
+    limit = _int_arg(args.get("limit"), default=min(len(cases), 5), minimum=1, maximum=10)
+    use_cache = _bool_arg(args.get("use_cache"), default=False)
+    results: list[dict[str, Any]] = []
+    for case in cases[:limit]:
+        question = str(case.get("question") or "").strip()
+        if not question:
+            continue
+        answered = await _web_answer(
+            ctx,
+            {
+                "question": question,
+                "max_sources": case.get("max_sources") or 4,
+                "freshness": case.get("freshness") or "",
+                "vertical": case.get("vertical") or "web",
+                "use_cache": use_cache,
+            },
+        )
+        data = answered.data if isinstance(answered.data, dict) else {}
+        answer = str(data.get("answer") or "")
+        expected_terms = [
+            str(item).lower()
+            for item in case.get("expected_terms", [])
+            if str(item).strip()
+        ]
+        matched_terms = [term for term in expected_terms if term in answer.lower()]
+        source_count = (
+            len(data.get("sources") or []) if isinstance(data.get("sources"), list) else 0
+        )
+        url_retained = bool(re.search(r"https?://", answer))
+        confidence = _float_from_any(data.get("confidence"), default=0.0)
+        score = 0.0
+        if answered.ok:
+            score += 0.25
+        if source_count >= 2:
+            score += 0.2
+        elif source_count == 1:
+            score += 0.1
+        if url_retained:
+            score += 0.2
+        score += min(0.25, confidence * 0.25)
+        if expected_terms:
+            score += 0.1 * len(matched_terms) / len(expected_terms)
+        else:
+            score += 0.1
+        results.append(
+            {
+                "question": question,
+                "ok": answered.ok,
+                "summary": answered.summary,
+                "score": round(min(1.0, score), 3),
+                "source_count": source_count,
+                "confidence": confidence,
+                "url_retained": url_retained,
+                "expected_terms": expected_terms,
+                "matched_terms": matched_terms,
+                "vertical": data.get("vertical") or case.get("vertical") or "web",
+            }
+        )
+    average = (
+        round(sum(float(item["score"]) for item in results) / len(results), 3)
+        if results
+        else 0.0
+    )
+    return ToolRunResponse(
+        tool="web.eval",
+        ok=bool(results) and average >= 0.55,
+        summary=f"Web answer eval score {average:.2f} across {len(results)} case(s).",
+        data={"average_score": average, "results": results, "limit": limit},
+    )
+
+
+def _web_eval_cases(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, str) and value.strip():
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            value = [{"question": item.strip()} for item in value.splitlines() if item.strip()]
+    if isinstance(value, list):
+        cases: list[dict[str, Any]] = []
+        for item in value:
+            if isinstance(item, dict):
+                question = str(item.get("question") or item.get("query") or "").strip()
+                if question:
+                    cases.append(
+                        {
+                            "question": question,
+                            "expected_terms": _string_list_arg(
+                                item.get("expected_terms") or item.get("terms"),
+                                limit=8,
+                            ),
+                            "vertical": _normalize_search_vertical(item.get("vertical")),
+                            "freshness": _normalize_search_freshness(item.get("freshness")),
+                            "max_sources": item.get("max_sources"),
+                        }
+                    )
+            elif str(item).strip():
+                cases.append({"question": str(item).strip(), "expected_terms": []})
+        if cases:
+            return cases
+    return [
+        {
+            "question": "latest Python release official source",
+            "expected_terms": ["python"],
+            "freshness": "month",
+            "vertical": "web",
+        },
+        {
+            "question": "OpenAI API documentation responses API official source",
+            "expected_terms": ["openai"],
+            "vertical": "web",
+        },
+        {
+            "question": "NVIDIA latest driver release notes",
+            "expected_terms": ["nvidia"],
+            "freshness": "month",
+            "vertical": "news",
+        },
+    ]
 
 
 def _mission_brief(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
@@ -5596,6 +6070,46 @@ def _normalize_search_freshness(value: Any) -> str:
     return aliases.get(raw, "")
 
 
+def _normalize_search_vertical(value: Any) -> str:
+    raw = str(value or "web").strip().lower().replace("_", "-")
+    aliases = {
+        "": "web",
+        "auto": "web",
+        "default": "web",
+        "web": "web",
+        "search": "web",
+        "news": "news",
+        "image": "images",
+        "images": "images",
+        "picture": "images",
+        "pictures": "images",
+        "shopping": "shopping",
+        "shop": "shopping",
+        "products": "shopping",
+        "product": "shopping",
+        "places": "places",
+        "place": "places",
+        "maps": "places",
+        "local": "places",
+        "scholar": "scholar",
+        "academic": "scholar",
+        "papers": "scholar",
+    }
+    return aliases.get(raw, "web")
+
+
+def _vertical_search_query(query: str, vertical: str) -> str:
+    if vertical == "news" and not re.search(r"(?i)\b(news|latest|breaking)\b", query):
+        return f"{query} news"
+    if vertical == "shopping" and not re.search(r"(?i)\b(price|buy|shop|store|reviews?)\b", query):
+        return f"{query} price buy reviews"
+    if vertical == "places" and not re.search(r"(?i)\b(address|hours|phone|map|near)\b", query):
+        return f"{query} address hours phone"
+    if vertical == "scholar" and not re.search(r"(?i)\b(paper|study|research|scholar)\b", query):
+        return f"{query} paper study"
+    return query
+
+
 def _web_search_requests(
     query: str,
     *,
@@ -5603,15 +6117,31 @@ def _web_search_requests(
     freshness: str,
     pages: int,
     provider: str,
+    vertical: str,
+    limit: int,
 ) -> list[dict[str, Any]]:
     selected = (
-        ["duckduckgo_html", "bing_html", "yandex_html"]
+        [*_available_api_search_providers(vertical), "duckduckgo_html", "bing_html", "yandex_html"]
         if provider in {"", "auto", "all"}
+        else _available_api_search_providers(vertical)
+        if provider == "api"
         else [_search_provider_name(provider)]
     )
     selected = [item for item in selected if item]
     requests: list[dict[str, Any]] = []
     for source in selected:
+        if source in {"brave_api", "tavily_api", "serper_api"}:
+            requests.append(
+                _api_search_request(
+                    source,
+                    query,
+                    region=region,
+                    freshness=freshness,
+                    vertical=vertical,
+                    limit=limit,
+                )
+            )
+            continue
         for page in range(max(1, pages)):
             requests.append(
                 {
@@ -5623,6 +6153,7 @@ def _web_search_requests(
                         region=region,
                         freshness=freshness,
                         page=page,
+                        vertical=vertical,
                     ),
                 }
             )
@@ -5631,6 +6162,14 @@ def _web_search_requests(
 
 def _search_provider_name(provider: str) -> str:
     return {
+        "api": "api",
+        "brave": "brave_api",
+        "brave_api": "brave_api",
+        "tavily": "tavily_api",
+        "tavily_api": "tavily_api",
+        "serper": "serper_api",
+        "google": "serper_api",
+        "serper_api": "serper_api",
         "duck": "duckduckgo_html",
         "ddg": "duckduckgo_html",
         "duckduckgo": "duckduckgo_html",
@@ -5643,6 +6182,146 @@ def _search_provider_name(provider: str) -> str:
     }.get(provider, "")
 
 
+def _available_api_search_providers(vertical: str) -> list[str]:
+    providers: list[str] = []
+    if _env_secret("BRAVE_SEARCH_API_KEY") and vertical in {"web", "news", "images"}:
+        providers.append("brave_api")
+    if _env_secret("TAVILY_API_KEY") and vertical in {"web", "news"}:
+        providers.append("tavily_api")
+    if _env_secret("SERPER_API_KEY"):
+        providers.append("serper_api")
+    return providers
+
+
+def _search_api_readiness() -> dict[str, Any]:
+    providers = {
+        "brave_api": {
+            "configured": bool(_env_secret("BRAVE_SEARCH_API_KEY")),
+            "verticals": ["web", "news", "images"],
+        },
+        "tavily_api": {
+            "configured": bool(_env_secret("TAVILY_API_KEY")),
+            "verticals": ["web", "news"],
+        },
+        "serper_api": {
+            "configured": bool(_env_secret("SERPER_API_KEY")),
+            "verticals": ["web", "news", "images", "shopping", "places", "scholar"],
+        },
+    }
+    return {
+        "configured": [name for name, item in providers.items() if item["configured"]],
+        "providers": providers,
+        "fallback": ["duckduckgo_html", "bing_html", "yandex_html"],
+    }
+
+
+def _env_secret(name: str) -> str:
+    return os.environ.get(f"JARVIS_{name}", os.environ.get(name, "")).strip()
+
+
+def _api_search_request(
+    source: str,
+    query: str,
+    *,
+    region: str,
+    freshness: str,
+    vertical: str,
+    limit: int,
+) -> dict[str, Any]:
+    if source == "brave_api":
+        key = _env_secret("BRAVE_SEARCH_API_KEY")
+        endpoint = {
+            "news": "news/search",
+            "images": "images/search",
+        }.get(vertical, "web/search")
+        params: dict[str, str] = {
+            "q": query,
+            "count": str(min(limit, 20)),
+            "country": _search_country(region),
+            "search_lang": _search_language(region),
+        }
+        brave_freshness = {"day": "pd", "week": "pw", "month": "pm", "year": "py"}.get(
+            freshness
+        )
+        if brave_freshness:
+            params["freshness"] = brave_freshness
+        return {
+            "source": source,
+            "page": 1,
+            "url": f"https://api.search.brave.com/res/v1/{endpoint}?{urlencode(params)}",
+            "headers": {"Accept": "application/json", "X-Subscription-Token": key},
+            "json_response": True,
+            "missing_key": not key,
+            "env": "BRAVE_SEARCH_API_KEY",
+        }
+    if source == "tavily_api":
+        key = _env_secret("TAVILY_API_KEY")
+        return {
+            "source": source,
+            "page": 1,
+            "url": "https://api.tavily.com/search",
+            "method": "POST",
+            "headers": {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {key}",
+            },
+            "json": {
+                "query": query,
+                "max_results": min(limit, 10),
+                "search_depth": "advanced" if freshness else "basic",
+                "topic": "news" if vertical == "news" else "general",
+                "include_answer": False,
+            },
+            "json_response": True,
+            "missing_key": not key,
+            "env": "TAVILY_API_KEY",
+        }
+    if source == "serper_api":
+        key = _env_secret("SERPER_API_KEY")
+        endpoint = {
+            "news": "news",
+            "images": "images",
+            "shopping": "shopping",
+            "places": "places",
+            "scholar": "scholar",
+        }.get(vertical, "search")
+        body: dict[str, Any] = {
+            "q": query,
+            "num": min(limit, 20),
+            "gl": _search_country(region).lower(),
+            "hl": _search_language(region),
+        }
+        if freshness:
+            body["tbs"] = {
+                "day": "qdr:d",
+                "week": "qdr:w",
+                "month": "qdr:m",
+                "year": "qdr:y",
+            }.get(freshness, "")
+        return {
+            "source": source,
+            "page": 1,
+            "url": f"https://google.serper.dev/{endpoint}",
+            "method": "POST",
+            "headers": {"Content-Type": "application/json", "X-API-KEY": key},
+            "json": body,
+            "json_response": True,
+            "missing_key": not key,
+            "env": "SERPER_API_KEY",
+        }
+    return {"source": source, "page": 1, "url": "", "missing_key": True}
+
+
+def _search_country(region: str) -> str:
+    if "-" in region:
+        return region.split("-", 1)[1].upper()
+    return "RU"
+
+
+def _search_language(region: str) -> str:
+    return region.split("-", 1)[0] if "-" in region else "ru"
+
+
 def _web_search_url(
     source: str,
     query: str,
@@ -5650,6 +6329,7 @@ def _web_search_url(
     region: str,
     freshness: str,
     page: int,
+    vertical: str = "web",
 ) -> str:
     if source == "duckduckgo_html":
         params = {"q": query, "kl": region}
@@ -5688,12 +6368,143 @@ def _yandex_region_id(region: str) -> str:
     }.get(region, "213")
 
 
-def _web_parse_search_results(source: str, html: str, *, limit: int) -> list[dict[str, Any]]:
+def _web_parse_search_results(
+    source: str,
+    body: str,
+    *,
+    limit: int,
+    vertical: str = "web",
+) -> list[dict[str, Any]]:
+    if source == "brave_api":
+        return _parse_brave_api_results(body, limit=limit, vertical=vertical)
+    if source == "tavily_api":
+        return _parse_tavily_api_results(body, limit=limit, vertical=vertical)
+    if source == "serper_api":
+        return _parse_serper_api_results(body, limit=limit, vertical=vertical)
     if source == "bing_html":
-        return _parse_bing_results(html, limit=limit)
+        return _parse_bing_results(body, limit=limit)
     if source == "yandex_html":
-        return _parse_yandex_results(html, limit=limit)
-    return _parse_duckduckgo_results(html, limit=limit)
+        return _parse_yandex_results(body, limit=limit)
+    return _parse_duckduckgo_results(body, limit=limit)
+
+
+def _parse_brave_api_results(
+    body: str,
+    *,
+    limit: int,
+    vertical: str,
+) -> list[dict[str, Any]]:
+    data = _json_object(body)
+    if not data:
+        return []
+    if vertical == "news":
+        raw_results = (data.get("results") or data.get("news", {}).get("results") or [])
+    elif vertical == "images":
+        raw_results = (data.get("results") or data.get("images", {}).get("results") or [])
+    else:
+        raw_results = (data.get("web") or {}).get("results") or data.get("results") or []
+    return _search_api_items(raw_results, limit=limit, vertical=vertical)
+
+
+def _parse_tavily_api_results(
+    body: str,
+    *,
+    limit: int,
+    vertical: str,
+) -> list[dict[str, Any]]:
+    data = _json_object(body)
+    if not data:
+        return []
+    return _search_api_items(data.get("results") or [], limit=limit, vertical=vertical)
+
+
+def _parse_serper_api_results(
+    body: str,
+    *,
+    limit: int,
+    vertical: str,
+) -> list[dict[str, Any]]:
+    data = _json_object(body)
+    if not data:
+        return []
+    keys = {
+        "news": ("news",),
+        "images": ("images",),
+        "shopping": ("shopping",),
+        "places": ("places",),
+        "scholar": ("organic", "scholars"),
+    }.get(vertical, ("organic",))
+    raw_results: list[Any] = []
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, list):
+            raw_results.extend(value)
+    return _search_api_items(raw_results, limit=limit, vertical=vertical)
+
+
+def _search_api_items(
+    raw_results: Any,
+    *,
+    limit: int,
+    vertical: str,
+) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    if not isinstance(raw_results, list):
+        return results
+    for raw in raw_results:
+        if not isinstance(raw, dict):
+            continue
+        url = str(
+            raw.get("url")
+            or raw.get("link")
+            or raw.get("source")
+            or raw.get("imageUrl")
+            or raw.get("thumbnailUrl")
+            or ""
+        ).strip()
+        title = str(raw.get("title") or raw.get("name") or raw.get("headline") or "").strip()
+        snippet = str(
+            raw.get("description")
+            or raw.get("snippet")
+            or raw.get("content")
+            or raw.get("summary")
+            or raw.get("caption")
+            or ""
+        ).strip()
+        if not title and snippet:
+            title = _short_text(snippet, 100)
+        if not url or not title or url in seen:
+            continue
+        if urlparse(url).scheme not in {"http", "https"}:
+            continue
+        item: dict[str, Any] = {
+            "title": title,
+            "url": url,
+            "snippet": snippet,
+            "rank": len(results) + 1,
+            "vertical": vertical,
+        }
+        published = raw.get("published") or raw.get("date") or raw.get("age")
+        if published:
+            item["published"] = str(published)
+        if raw.get("price"):
+            item["price"] = str(raw.get("price"))
+        if raw.get("rating"):
+            item["rating"] = str(raw.get("rating"))
+        results.append(item)
+        seen.add(url)
+        if len(results) >= limit:
+            break
+    return results
+
+
+def _json_object(body: str) -> dict[str, Any]:
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def _parse_duckduckgo_results(html: str, *, limit: int) -> list[dict[str, Any]]:
@@ -6205,6 +7016,34 @@ def _prioritize_crawl_links(links: Any) -> list[dict[str, Any]]:
     return [item for _score, item in sorted(scored, key=lambda pair: pair[0])]
 
 
+def _crawl_url_allowed(
+    url: str,
+    link: dict[str, Any],
+    *,
+    include_patterns: list[str],
+    exclude_patterns: list[str],
+    follow_hints: list[str],
+) -> bool:
+    haystack = f"{url} {link.get('text') or ''} {link.get('rel') or ''}".lower()
+    if follow_hints and not any(str(hint).lower() in haystack for hint in follow_hints):
+        return False
+    if include_patterns and not any(
+        _safe_regex_search(pattern, url) for pattern in include_patterns
+    ):
+        return False
+    return not (
+        exclude_patterns
+        and any(_safe_regex_search(pattern, url) for pattern in exclude_patterns)
+    )
+
+
+def _safe_regex_search(pattern: str, value: str) -> bool:
+    try:
+        return re.search(pattern, value, flags=re.IGNORECASE) is not None
+    except re.error:
+        return pattern.lower() in value.lower()
+
+
 def _search_results_for_tools(search: ToolRunResponse) -> list[dict[str, Any]]:
     if not isinstance(search.data, dict):
         return []
@@ -6222,6 +7061,7 @@ def _web_answer_cache_key(
     queries: list[str],
     region: str,
     freshness: str,
+    vertical: str,
     max_sources: int,
 ) -> str:
     payload = {
@@ -6231,6 +7071,7 @@ def _web_answer_cache_key(
         "queries": queries,
         "region": region,
         "freshness": freshness,
+        "vertical": vertical,
         "max_sources": max_sources,
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
@@ -6321,6 +7162,21 @@ def _web_answer_infer_freshness(question: str) -> str:
     ) or _looks_like_freshness_question(normalized):
         return "month"
     return ""
+
+
+def _web_answer_infer_vertical(question: str) -> str:
+    normalized = _repair_mojibake(question).lower()
+    if any(marker in normalized for marker in ("news", "breaking", "headline")):
+        return "news"
+    if any(marker in normalized for marker in ("image", "photo", "picture", "фото", "картин")):
+        return "images"
+    if _web_answer_looks_like_shopping(normalized):
+        return "shopping"
+    if _looks_like_place_lookup_text(normalized):
+        return "places"
+    if any(marker in normalized for marker in ("paper", "study", "research", "scholar", "doi")):
+        return "scholar"
+    return "web"
 
 
 def _web_answer_queries(
@@ -7657,6 +8513,7 @@ def _internet_observability_snapshot(storage: JarvisStorage, *, limit: int) -> d
             )
     evidence = storage.get_runtime_value(WEB_EVIDENCE_KEY, [])
     research = storage.get_runtime_value(WEB_RESEARCH_KEY, [])
+    answer_cache = storage.get_runtime_value(WEB_ANSWER_CACHE_KEY, [])
     handoff = storage.get_runtime_value(WEB_HANDOFF_KEY, None)
     rates = [
         item
@@ -7675,11 +8532,14 @@ def _internet_observability_snapshot(storage: JarvisStorage, *, limit: int) -> d
             "failed_runs": sum(1 for item in web_runs if not item.get("ok")),
             "evidence_records": len(evidence) if isinstance(evidence, list) else 0,
             "research_records": len(research) if isinstance(research, list) else 0,
+            "answer_cache_records": len(answer_cache) if isinstance(answer_cache, list) else 0,
             "rate_domains": len(rates),
             "cooldowns": len(cooldowns),
         },
         "by_tool": by_tool,
         "search_providers": providers,
+        "search_api": _search_api_readiness(),
+        "verticals": ["web", "news", "images", "shopping", "places", "scholar"],
         "top_domains": sorted(domains.items(), key=lambda item: item[1], reverse=True)[:12],
         "blocked_recent": blocked[:12],
         "handoff": handoff if isinstance(handoff, dict) else None,
@@ -8217,6 +9077,16 @@ def _float_arg(value: Any, *, default: float, minimum: float, maximum: float) ->
     if math.isnan(parsed):
         parsed = default
     return max(minimum, min(maximum, parsed))
+
+
+def _float_from_any(value: Any, *, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    if math.isnan(parsed):
+        return default
+    return parsed
 
 
 def _bool_arg(value: Any, *, default: bool = False) -> bool:

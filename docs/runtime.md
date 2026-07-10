@@ -23,6 +23,23 @@ For the operator and the second model:
   cited report if it is ungrounded, JSON/tool-like, or too short.
 - `cards` is the UI/agent-friendly structured layer: source mix, top sources,
   compact fact excerpts, verification gaps, and follow-up queries.
+- `web.search` supports optional Search API providers before HTML fallback:
+  Brave (`JARVIS_BRAVE_SEARCH_API_KEY`/`BRAVE_SEARCH_API_KEY`), Tavily
+  (`JARVIS_TAVILY_API_KEY`/`TAVILY_API_KEY`), and Serper
+  (`JARVIS_SERPER_API_KEY`/`SERPER_API_KEY`). With no keys configured it keeps
+  the existing DuckDuckGo/Bing/Yandex path.
+- Search/research/answer now accept verticals: `web`, `news`, `images`,
+  `shopping`, `places`, `scholar`. Serper covers all listed verticals, Brave
+  covers web/news/images, and Tavily covers web/news.
+- `web.crawl` now has deeper bounded traversal controls: `depth`,
+  `follow_text`, `include`, `exclude`, `render_fallback`, and
+  `archive_fallback`.
+- `web.transcript` extracts public caption/transcript text when available
+  (YouTube caption tracks first, HTML transcript fallback). `web.eval` runs a
+  bounded answer-quality harness over `web.answer` cases.
+- `internet.observability` exposes Search API readiness, supported verticals,
+  and answer-cache count; Command Center shows those signals in the internet
+  panel.
 
 ## 2026-07-10 handoff - internet coverage: archive, feeds, weather, page watches
 

@@ -710,11 +710,18 @@ type InternetObservability = {
     failed_runs: number;
     evidence_records: number;
     research_records: number;
+    answer_cache_records?: number;
     rate_domains: number;
     cooldowns: number;
   };
   by_tool: Record<string, InternetToolCounts>;
   search_providers: Record<string, number>;
+  search_api?: {
+    configured?: string[];
+    providers?: Record<string, { configured?: boolean; verticals?: string[] }>;
+    fallback?: string[];
+  };
+  verticals?: string[];
   top_domains: [string, number][];
   blocked_recent: Array<{
     tool?: string;
@@ -3549,6 +3556,10 @@ export default function CommandCenter() {
       : "ok";
   const topInternetDomain = internetObservability?.top_domains?.[0];
   const searchProviders = Object.keys(internetObservability?.search_providers ?? {}).join(", ");
+  const configuredSearchApis = internetObservability?.search_api?.configured ?? [];
+  const searchApiLabel =
+    configuredSearchApis.length > 0 ? configuredSearchApis.join(", ") : "HTML fallback";
+  const verticalLabel = (internetObservability?.verticals ?? []).slice(0, 6).join(", ");
   const smokeChecks = Array.isArray(internetSmokeResult?.data.checks)
     ? internetSmokeResult.data.checks.filter(
         (item): item is { tool?: string; ok?: boolean; summary?: string } =>
@@ -3589,6 +3600,10 @@ export default function CommandCenter() {
           <strong>{internetSummary?.research_records ?? 0}</strong>
         </div>
         <div>
+          <span>Answer cache</span>
+          <strong>{internetSummary?.answer_cache_records ?? 0}</strong>
+        </div>
+        <div>
           <span>Cooldown</span>
           <strong>{internetSummary?.cooldowns ?? 0}</strong>
         </div>
@@ -3597,6 +3612,18 @@ export default function CommandCenter() {
           <strong>{searchProviders || "нет"}</strong>
         </div>
       </div>
+      <div className="internetLine">
+        <Wrench size={14} />
+        <span>{compactText(searchApiLabel, 74)}</span>
+        <strong>API</strong>
+      </div>
+      {verticalLabel && (
+        <div className="internetLine">
+          <Globe size={14} />
+          <span>{compactText(verticalLabel, 90)}</span>
+          <strong>verticals</strong>
+        </div>
+      )}
       {topInternetDomain && (
         <div className="internetLine">
           <Search size={14} />
