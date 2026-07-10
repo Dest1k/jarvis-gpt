@@ -57,6 +57,18 @@ def test_launcher_requires_explicit_lan_and_preserves_foreign_listeners() -> Non
 
     assert "$script:LanMode = [bool]$Lan" in launcher
     assert 'Label = "Start with LAN"' in launcher
+    assert 'Label = "Start app without LLM"' in launcher
+    assert '"app" { $script:NoDispatcher = $true; Start-JarvisStack }' in launcher
+    assert "function Get-LlmStartDecision" in launcher
+    assert 'return "reuse"' in launcher
+    assert 'return "conflict"' in launcher
+    assert "LLM is already started" in launcher
+    assert "started_by_launcher = $true" in launcher
+    assert "function Test-LauncherOwnsDispatcher" in launcher
+    assert "function Test-ReusedDispatcherOwnership" in launcher
+    assert 'container_id = [string]$llmReadiness.container.id' in launcher
+    assert '$phase = "external-ready"' in launcher
+    assert "Preserving LLM runtime" in launcher
     assert "Get-OrCreateApiToken" in launcher
     assert "Protect-ApiTokenFile" in launcher
     assert "Get-FrontendEnvironmentSha256" in launcher

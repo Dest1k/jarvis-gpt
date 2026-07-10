@@ -1,6 +1,6 @@
 param(
   [Parameter(Position = 0)]
-  [ValidateSet("menu", "start", "lan", "stop", "restart", "status", "llm", "logs", "doctor", "open")]
+  [ValidateSet("menu", "start", "app", "lan", "stop", "restart", "status", "llm", "logs", "doctor", "open")]
   [string]$Action = "menu",
 
   [ValidateSet("gemma4-turbo", "gemma4-mono")]
@@ -641,7 +641,10 @@ function Get-LlmReadiness {
 
   $phase = "offline"
   $ready = $false
-  if (-not $container.docker_available) {
+  if ($servedModels.Count -gt 0 -and -not $container.running) {
+    $phase = "external-ready"
+    $ready = $true
+  } elseif (-not $container.docker_available) {
     $phase = "docker-missing"
   } elseif (-not $container.exists) {
     $phase = "container-missing"
@@ -685,6 +688,7 @@ function Write-LlmReadinessBlock {
   $phase = [string]$Readiness.phase
   $color = switch ($phase) {
     "ready" { "Green" }
+    "external-ready" { "Green" }
     "http-warming" { "Yellow" }
     "port-open-loading" { "Yellow" }
     "loading" { "Yellow" }
@@ -913,6 +917,28 @@ function Test-ManagedServiceProcess {
   }
 }
 
+function Get-LlmStartDecision {
+  param([System.Collections.IDictionary]$Readiness)
+
+  if (-not $Readiness) {
+    return "start"
+  }
+  $container = $Readiness["container"]
+  $containerRunning = [bool]($container -and $container["running"])
+  $containerState = if ($container) { [string]$container["state"] } else { "" }
+  if (
+    [bool]$Readiness["models_ok"] -or
+    $containerRunning -or
+    $containerState -match "(?i)^(running|restarting)$"
+  ) {
+    return "reuse"
+  }
+  if ([bool]$Readiness["port_open"]) {
+    return "conflict"
+  }
+  return "start"
+}
+
 function Test-ManagedPortOwner {
   param(
     [int]$Port,
@@ -1095,6 +1121,45 @@ function Read-LauncherState {
   }
 }
 
+function Test-LauncherOwnsDispatcher {
+  param($State)
+
+  if (-not $State -or -not $State.services) {
+    return $true
+  }
+  $entry = $State.services.dispatcher
+  if (-not $entry) {
+    return $false
+  }
+  $ownership = $entry.PSObject.Properties["started_by_launcher"]
+  if ($ownership) {
+    return [bool]$ownership.Value
+  }
+  return -not ([bool]$entry.reused -or [bool]$entry.skipped)
+}
+
+function Test-ReusedDispatcherOwnership {
+  param(
+    $State,
+    [System.Collections.IDictionary]$Readiness
+  )
+
+  if (
+    -not $State -or
+    -not $State.services -or
+    -not $State.services.dispatcher -or
+    -not $Readiness -or
+    -not $Readiness["container"] -or
+    -not [bool]$Readiness["container"]["running"] -or
+    -not (Test-LauncherOwnsDispatcher -State $State)
+  ) {
+    return $false
+  }
+  $previousId = [string]$State.services.dispatcher.container_id
+  $currentId = [string]$Readiness["container"]["id"]
+  return -not ($previousId -and $currentId -and $previousId -ne $currentId)
+}
+
 function Get-LatestWriteTimeUtc {
   param([string[]]$Paths)
 
@@ -1218,15 +1283,61 @@ function Start-JarvisStack {
   $services = @{}
 
   if (-not $NoDispatcher) {
-    if (Ensure-DockerReady -TimeoutSec $DockerWaitSec) {
+    $llmReadiness = Get-LlmReadiness
+    $llmStartDecision = Get-LlmStartDecision -Readiness $llmReadiness
+    if ($llmStartDecision -eq "reuse") {
+      $runningModel = [string]$llmReadiness.container.runtime.model_id
+      $modelText = if ($runningModel) { ", model=$runningModel" } else { "" }
+      $dispatcherOwnershipContinues = Test-ReusedDispatcherOwnership `
+        -State $previousState `
+        -Readiness $llmReadiness
+      Write-Host (
+        "LLM is already started (phase={0}{1}); dispatcher launch skipped." -f
+        $llmReadiness.phase,
+        $modelText
+      ) -ForegroundColor Green
+      $services.dispatcher = @{
+        profile = $Profile
+        docker = [bool]$llmReadiness.container.running
+        reused = $true
+        started_by_launcher = $dispatcherOwnershipContinues
+        container_id = [string]$llmReadiness.container.id
+        phase = [string]$llmReadiness.phase
+      }
+    } elseif ($llmStartDecision -eq "conflict") {
+      throw (
+        "TCP 8001 is occupied, but no running Jarvis dispatcher or valid " +
+        "OpenAI-compatible /v1/models endpoint was detected. The LLM may still be " +
+        "warming; wait for it or free the port before full start."
+      )
+    } elseif (Ensure-DockerReady -TimeoutSec $DockerWaitSec) {
       Write-Host "Starting dispatcher for $Profile..." -ForegroundColor Yellow
       Invoke-JarvisCommand -FilePath "py.exe" -Arguments @("-3.11", ".\jarvis.py", "--profile", $Profile, "dispatcher-up")
-      $services.dispatcher = @{ profile = $Profile; docker = $true }
+      $startedDispatcher = Get-DispatcherContainerSnapshot
+      $services.dispatcher = @{
+        profile = $Profile
+        docker = $true
+        reused = $false
+        started_by_launcher = $true
+        container_id = [string]$startedDispatcher.id
+      }
       Write-Host "LLM readiness monitor: .\jarvis.cmd llm -WatchLlm" -ForegroundColor Cyan
     } else {
-      $services.dispatcher = @{ profile = $Profile; docker = $true; skipped = "docker-not-ready" }
+      $services.dispatcher = @{
+        profile = $Profile
+        docker = $true
+        skipped = "docker-not-ready"
+        started_by_launcher = $false
+      }
       Write-Host "Dispatcher was not started because Docker is not ready. Backend and UI will still start." -ForegroundColor Red
     }
+  } else {
+    $services.dispatcher = @{
+      profile = $Profile
+      skipped = "app-without-llm-launch"
+      started_by_launcher = $false
+    }
+    Write-Host "App mode: dispatcher launch skipped; any existing LLM remains untouched." -ForegroundColor Cyan
   }
 
   if (-not $NoBridge) {
@@ -1371,8 +1482,12 @@ function Stop-JarvisStack {
   Stop-PortOwner -Port 8000 -ManagedOnly -Service "backend"
   Stop-PortOwner -Port 8765 -ManagedOnly -Service "bridge"
 
-  Stop-DispatcherRuntime
-  Stop-PortOwner -Port 8001 -SkipDockerEngineOwner
+  if (Test-LauncherOwnsDispatcher -State $state) {
+    Stop-DispatcherRuntime
+    Stop-PortOwner -Port 8001 -SkipDockerEngineOwner
+  } else {
+    Write-Host "Preserving LLM runtime because this launcher state did not start it." -ForegroundColor Cyan
+  }
 
   if (Test-Path $StateFile) {
     Remove-Item -LiteralPath $StateFile -Force
@@ -1480,8 +1595,9 @@ function Open-CommandCenter {
 function Invoke-Menu {
   $main = @(
     @{ Label = "Start full stack"; Value = "start"; Hint = "loopback-only: dispatcher + bridge + backend + UI" },
+    @{ Label = "Start app without LLM"; Value = "app"; Hint = "bridge + backend + UI; preserve existing LLM" },
     @{ Label = "Start with LAN"; Value = "lan"; Hint = "token-auth UI/API on the private network" },
-    @{ Label = "Stop stack"; Value = "stop"; Hint = "stop UI/backend/bridge/dispatcher" },
+    @{ Label = "Stop stack"; Value = "stop"; Hint = "stop services owned by current launcher state" },
     @{ Label = "Restart stack"; Value = "restart"; Hint = "stop then start" },
     @{ Label = "Status"; Value = "status"; Hint = "show service ports" },
     @{ Label = "LLM readiness"; Value = "llm"; Hint = "watch real model startup" },
@@ -1495,7 +1611,7 @@ function Invoke-Menu {
     return
   }
 
-  if ($choice.Value -in @("start", "restart", "lan")) {
+  if ($choice.Value -in @("start", "app", "restart", "lan")) {
     $profiles = @(
       @{ Label = "gemma4-turbo"; Value = "gemma4-turbo"; Hint = "26B A4B NVFP4, fast warmed runtime" },
       @{ Label = "gemma4-mono"; Value = "gemma4-mono"; Hint = "31B IT NVFP4, stable baseline" }
@@ -1506,25 +1622,30 @@ function Invoke-Menu {
     }
     $script:Profile = $profileChoice.Value
 
-    $presets = @(
-      @{ Label = "Full stack"; Value = "full"; Hint = "recommended" },
-      @{ Label = "App only"; Value = "app"; Hint = "bridge + backend + UI, no dispatcher" },
-      @{ Label = "Backend only"; Value = "backend"; Hint = "API only" },
-      @{ Label = "Dispatcher only"; Value = "dispatcher"; Hint = "LLM container only" }
-    )
-    $presetChoice = Select-Menu -Title "Select startup preset" -Items $presets
-    if (-not $presetChoice) {
-      return
-    }
+    if ($choice.Value -eq "app") {
+      $script:NoDispatcher = $true
+    } else {
+      $presets = @(
+        @{ Label = "Full stack"; Value = "full"; Hint = "recommended" },
+        @{ Label = "App only"; Value = "app"; Hint = "bridge + backend + UI, no dispatcher" },
+        @{ Label = "Backend only"; Value = "backend"; Hint = "API only" },
+        @{ Label = "Dispatcher only"; Value = "dispatcher"; Hint = "LLM container only" }
+      )
+      $presetChoice = Select-Menu -Title "Select startup preset" -Items $presets
+      if (-not $presetChoice) {
+        return
+      }
 
-    $script:NoDispatcher = $presetChoice.Value -in @("app", "backend")
-    $script:NoBridge = $presetChoice.Value -eq "dispatcher"
-    $script:NoBackend = $presetChoice.Value -eq "dispatcher"
-    $script:NoFrontend = $presetChoice.Value -in @("backend", "dispatcher")
+      $script:NoDispatcher = $presetChoice.Value -in @("app", "backend")
+      $script:NoBridge = $presetChoice.Value -eq "dispatcher"
+      $script:NoBackend = $presetChoice.Value -eq "dispatcher"
+      $script:NoFrontend = $presetChoice.Value -in @("backend", "dispatcher")
+    }
   }
 
   switch ($choice.Value) {
     "start" { Start-JarvisStack }
+    "app" { $script:NoDispatcher = $true; Start-JarvisStack }
     "lan" { $script:LanMode = $true; Start-JarvisStack }
     "stop" { Stop-JarvisStack }
     "restart" { Stop-JarvisStack; Start-JarvisStack }
@@ -1544,6 +1665,7 @@ function Invoke-Menu {
 switch ($Action) {
   "menu" { Invoke-Menu }
   "start" { Start-JarvisStack }
+  "app" { $script:NoDispatcher = $true; Start-JarvisStack }
   "lan" { $script:LanMode = $true; Start-JarvisStack }
   "stop" { Stop-JarvisStack }
   "restart" { Stop-JarvisStack; Start-JarvisStack }

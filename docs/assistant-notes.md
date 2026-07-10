@@ -818,3 +818,39 @@ Claude Sync Note
 - Claude: review/commit the patch as one coordinated migration; then run target
   host GPU/vLLM model-load and real LAN-client launcher smoke. Do not reintroduce
   public backend binding or browser-visible root credentials.
+
+### 2026-07-10 - Codex (launcher app mode and LLM reuse)
+
+Claude Sync Note
+
+[Измененные файлы и новые зависимости]
+
+- `scripts/jarvis-launcher.ps1`, `README.md`,
+  `backend/tests/test_deployment_contracts.py`, `docs/assistant-notes.md`.
+- New dependencies: none.
+
+[Что конкретно исправлено / какие заглушки устранены]
+
+- Added first-class app-only startup: bridge + backend + UI without starting the
+  dispatcher. Existing configured LLM connectivity remains usable.
+- Full start now probes the current dispatcher/container and `/v1/models` before
+  Docker startup. Running/warming managed dispatcher or valid existing endpoint
+  is reused; unknown listener on 8001 is rejected instead of collided with.
+- Dispatcher ownership and container ID are persisted. `stop/restart` preserves
+  app-external/reused LLM runtimes, retains ownership across repeated full-start
+  for the same container, and stops only a dispatcher owned by that state.
+
+[Изменения в API-контрактах, сигнатурах функций и структурах данных]
+
+- New CLI/menu action: `jarvis.cmd app [-Profile ...]`.
+- New internal decisions: `Get-LlmStartDecision` -> `reuse|conflict|start`,
+  `Test-LauncherOwnsDispatcher`, and `Test-ReusedDispatcherOwnership`.
+- `services.dispatcher` state adds `started_by_launcher`, `container_id`,
+  `reused`, `skipped`, and optional `phase`.
+
+[Pending: Текущие точки сборки и что Claude должен делать/проверить дальше]
+
+- Verified PowerShell parse, decision/ownership matrix, direct `jarvis.cmd app`
+  smoke with temporary runtime, deployment tests, and full repository gates.
+- On the target host, confirm full start prints the reuse message while a real
+  vLLM container is loading/ready; it must not recreate that container.

@@ -51,6 +51,7 @@ One-command start/stop/status:
 ```powershell
 .\jarvis.cmd start -Profile gemma4-turbo
 .\jarvis.cmd start -Profile gemma4-mono
+.\jarvis.cmd app -Profile gemma4-turbo
 .\jarvis.cmd stop
 .\jarvis.cmd restart -Profile gemma4-turbo
 .\jarvis.cmd restart -Profile gemma4-turbo -BuildFrontend
@@ -59,7 +60,7 @@ One-command start/stop/status:
 .\jarvis.cmd llm -WatchLlm
 ```
 
-The launcher auto-rebuilds the production frontend when `frontend/app`, `public`, config or lock files are newer than `.next/BUILD_ID`. Full-stack start also attempts to start Docker Desktop and waits for the Docker API before starting the LLM dispatcher; use `-NoDockerStart` only for manual Docker diagnostics.
+The launcher auto-rebuilds the production frontend when `frontend/app`, `public`, config or lock files are newer than `.next/BUILD_ID`. `jarvis.cmd app` starts the bridge, backend, and UI without starting or later stopping the LLM dispatcher. Full-stack start first reuses an already running dispatcher/OpenAI-compatible endpoint; only when no LLM is active does it start Docker Desktop and the dispatcher. Use `-NoDockerStart` only for manual Docker diagnostics.
 
 Profile shortcuts:
 
