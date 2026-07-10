@@ -3324,6 +3324,13 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
             url = str(source.get("url") or "")
             if not url:
                 continue
+            if not _web_answer_source_relevant(
+                question,
+                source,
+                preferred_domains=preferred_domains,
+                vertical=vertical,
+            ):
+                continue
             ranked = {
                 **source,
                 "answer_query": query,
@@ -3378,6 +3385,15 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
         else {}
     )
     verification_dict = verification_data if isinstance(verification_data, dict) else {}
+    if _web_answer_looks_like_shopping(_repair_mojibake(question).lower()) and (
+        _web_answer_price_sensitive_question(question)
+        or _web_answer_weak_shopping_sources(ranked_sources, verification_dict)
+    ):
+        ranked_sources = _web_answer_strong_shopping_sources(
+            question,
+            ranked_sources,
+            require_price=_web_answer_price_sensitive_question(question),
+        )
     direct_links = _web_answer_direct_links(
         question,
         preferred_domains=preferred_domains,
@@ -8013,7 +8029,9 @@ def _web_search_cached_results_from_evidence(
     if not records:
         return []
     preferred_domains = _web_answer_preferred_domains([query])
-    query_terms = set(_web_answer_terms(re.sub(r"(?i)\bsite:\S+", " ", query)))
+    query_terms = set(_web_answer_subject_terms(re.sub(r"(?i)\bsite:\S+", " ", query)))
+    if not query_terms:
+        query_terms = set(_web_answer_terms(re.sub(r"(?i)\bsite:\S+", " ", query)))
     candidates: list[tuple[float, dict[str, Any]]] = []
     seen: set[str] = set()
     for recency_index, record in enumerate(records):
@@ -8027,7 +8045,7 @@ def _web_search_cached_results_from_evidence(
                 str(item.get(part) or "") for part in ("title", "url", "snippet")
             )
             item_terms = set(_web_answer_terms(text))
-            overlap = len(query_terms & item_terms)
+            overlap = _web_answer_term_overlap_count(query_terms, item_terms)
             domain_match = bool(
                 preferred_domains and _web_answer_domain_matches(url, preferred_domains)
             )
@@ -8316,6 +8334,11 @@ def _web_answer_preferred_domains(texts: list[str]) -> list[str]:
             "dns-shop.ru",
             (
                 r"\bdns-?shop\b",
+                r"\b\u043d\u0430\s+dns\b",
+                r"\b\u0432\s+dns\b",
+                r"\b\u043d\u0430\s+\u0434\u043d\u0441\b",
+                r"\b\u0432\s+\u0434\u043d\u0441\b",
+                r"\b\u0434\u043d\u0441-?\u0448\u043e\u043f\b",
                 r"\bна\s+dns\b",
                 r"\bв\s+dns\b",
                 r"\bна\s+днс\b",
@@ -8403,7 +8426,10 @@ def _web_answer_site_search_terms(question: str) -> str:
     tokens = re.findall(r"[a-zа-яё0-9]{2,}", normalized, flags=re.IGNORECASE)
     stopwords = set(WEB_VERIFY_STOPWORDS) | {
         "найди",
+        "\u0434\u0430\u0439",
         "мне",
+        "\u0441\u0441\u044b\u043b\u043a\u0443",
+        "\u0441\u0441\u044b\u043b\u043a\u0430",
         "покажи",
         "выдай",
         "подбери",
@@ -8428,6 +8454,15 @@ def _web_answer_site_search_terms(question: str) -> str:
         "цена",
         "купить",
         "наличие",
+        "\u043c\u043e\u0449\u043d\u044b\u0439",
+        "\u043c\u043e\u0449\u043d\u0443\u044e",
+        "\u043c\u043e\u0449\u043d\u044b\u0435",
+        "\u043c\u043e\u0449\u043d\u043e\u0441\u0442\u044c",
+        "\u0434\u043e\u0441\u0442\u0443\u043f\u043d\u044b\u0445",
+        "\u0434\u043e\u0441\u0442\u0443\u043f\u043d\u044b\u0439",
+        "\u043a\u043e\u0442\u043e\u0440\u044b\u0435",
+        "\u043c\u043e\u0436\u043d\u043e",
+        "\u0442\u0443\u0442",
         "днс",
         "dns",
         "на",
@@ -8520,12 +8555,139 @@ def _web_answer_looks_like_shopping(normalized: str) -> bool:
             "магазин",
             "заказать",
             "buy",
+            "\u0446\u0435\u043d",
+            "\u0434\u0435\u0448\u0435\u0432",
+            "\u0434\u0435\u0448\u0451\u0432",
+            "\u0441\u0442\u043e\u0438\u043c\u043e\u0441\u0442",
             "price",
             "in stock",
             "shop",
             "store",
         )
     )
+
+
+def _web_answer_price_sensitive_question(question: str) -> bool:
+    normalized = _repair_mojibake(question).lower()
+    if re.search(r"\u0434\u0435\u0448[\u0435\u0451]\u0432", normalized):
+        return True
+    if any(
+        marker in normalized
+        for marker in (
+            "\u0446\u0435\u043d",
+            "\u0441\u0442\u043e\u0438\u043c\u043e\u0441\u0442",
+        )
+    ):
+        return True
+    return any(
+        marker in normalized
+        for marker in (
+            "С†РµРЅ",
+            "РґРµС€РµРІ",
+            "РґРµС€С‘РІ",
+            "СЃС‚РѕРёРјРѕСЃС‚",
+            "price",
+            "cheap",
+            "cheapest",
+            "cost",
+        )
+    )
+
+
+def _web_answer_subject_terms(text: str) -> list[str]:
+    return _web_answer_terms(_web_answer_site_search_terms(text))
+
+
+def _web_answer_term_overlap_count(
+    left_terms: set[str] | list[str],
+    right_terms: set[str] | list[str],
+) -> int:
+    right = list(right_terms)
+    count = 0
+    for left in left_terms:
+        if any(_web_answer_terms_match(str(left), str(term)) for term in right):
+            count += 1
+    return count
+
+
+def _web_answer_terms_match(left: str, right: str) -> bool:
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    if left.isdigit() or right.isdigit():
+        return False
+    prefix = min(len(left), len(right), 5)
+    return prefix >= 4 and left[:prefix] == right[:prefix]
+
+
+def _web_answer_source_relevant(
+    question: str,
+    source: dict[str, Any],
+    *,
+    preferred_domains: list[str],
+    vertical: str,
+) -> bool:
+    subject_terms = set(_web_answer_subject_terms(question))
+    if not subject_terms:
+        return True
+    url = str(source.get("url") or "")
+    text = " ".join(
+        str(source.get(key) or "")
+        for key in ("title", "url", "snippet", "excerpt")
+    )
+    source_terms = set(_web_answer_terms(text))
+    overlap = _web_answer_term_overlap_count(subject_terms, source_terms)
+    domain_match = bool(
+        preferred_domains and _web_answer_domain_matches(url, preferred_domains)
+    )
+    shopping = vertical == "shopping" or _web_answer_looks_like_shopping(
+        _repair_mojibake(question).lower()
+    )
+    if shopping:
+        return overlap > 0
+    return overlap > 0 or domain_match
+
+
+def _web_answer_source_has_price(source: dict[str, Any]) -> bool:
+    return bool(
+        source.get("price")
+        or _source_extraction_has_price(source)
+        or _extract_prices(
+            " ".join(str(source.get(key) or "") for key in ("title", "snippet", "excerpt"))
+        )
+    )
+
+
+def _web_answer_strong_shopping_sources(
+    question: str,
+    sources: list[dict[str, Any]],
+    *,
+    require_price: bool,
+) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    for source in sources:
+        if require_price and not _web_answer_source_has_price(source):
+            continue
+        url = str(source.get("url") or "")
+        if (
+            _web_answer_source_has_price(source)
+            or _web_answer_likely_product_url(url)
+            or (source.get("fetched") and not _web_answer_price_sensitive_question(question))
+        ):
+            selected.append(source)
+    return selected
+
+
+def _web_answer_likely_product_url(url: str) -> bool:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    path = parsed.path.lower()
+    if not host or not path:
+        return False
+    if host.endswith("dns-shop.ru"):
+        return "/product/" in path
+    return any(marker in path for marker in ("/product/", "/products/", "/item/", "/p/"))
 
 
 def _looks_like_freshness_question(normalized: str) -> bool:
@@ -8654,6 +8816,77 @@ def _web_answer_terms(text: str) -> list[str]:
         "with",
         "latest",
         "official",
+        "find",
+        "search",
+        "show",
+        "give",
+        "link",
+        "buy",
+        "price",
+        "shop",
+        "store",
+        "cheap",
+        "cheapest",
+        "best",
+        "most",
+        "powerful",
+        "available",
+        "\u043d\u0430\u0439\u0434\u0438",
+        "\u043f\u043e\u0438\u0449\u0438",
+        "\u0434\u0430\u0439",
+        "\u043c\u043d\u0435",
+        "\u0441\u0441\u044b\u043b\u043a\u0443",
+        "\u0441\u0441\u044b\u043b\u043a\u0430",
+        "\u043f\u043e\u043a\u0430\u0436\u0438",
+        "\u0441\u0430\u043c\u044b\u0439",
+        "\u0441\u0430\u043c\u0443\u044e",
+        "\u0441\u0430\u043c\u043e\u0435",
+        "\u0441\u0430\u043c\u044b\u0435",
+        "\u0434\u0435\u0448\u0435\u0432\u0443\u044e",
+        "\u0434\u0435\u0448\u0451\u0432\u0443\u044e",
+        "\u0434\u0435\u0448\u0435\u0432\u044b\u0439",
+        "\u0434\u0435\u0448\u0451\u0432\u044b\u0439",
+        "\u043a\u0443\u043f\u0438\u0442\u044c",
+        "\u0446\u0435\u043d\u0430",
+        "\u0446\u0435\u043d\u0435",
+        "\u043d\u0430\u043b\u0438\u0447\u0438\u0435",
+        "\u043c\u043e\u0449\u043d\u044b\u0439",
+        "\u043c\u043e\u0449\u043d\u0443\u044e",
+        "\u043c\u043e\u0449\u043d\u044b\u0435",
+        "\u043c\u043e\u0449\u043d\u043e\u0441\u0442\u044c",
+        "\u0434\u043e\u0441\u0442\u0443\u043f\u043d\u044b\u0445",
+        "\u0434\u043e\u0441\u0442\u0443\u043f\u043d\u044b\u0439",
+        "\u043a\u043e\u0442\u043e\u0440\u044b\u0435",
+        "\u043c\u043e\u0436\u043d\u043e",
+        "\u0442\u0443\u0442",
+        "РЅР°Р№РґРё",
+        "РїРѕРёС‰Рё",
+        "РґР°Р№",
+        "РјРЅРµ",
+        "СЃСЃС‹Р»РєСѓ",
+        "СЃСЃС‹Р»РєР°",
+        "РїРѕРєР°Р¶Рё",
+        "СЃР°РјС‹Р№",
+        "СЃР°РјСѓСЋ",
+        "СЃР°РјРѕРµ",
+        "СЃР°РјС‹Рµ",
+        "РґРµС€РµРІСѓСЋ",
+        "РґРµС€С‘РІСѓСЋ",
+        "РґРµС€РµРІС‹Р№",
+        "РґРµС€С‘РІС‹Р№",
+        "РєСѓРїРёС‚СЊ",
+        "С†РµРЅР°",
+        "С†РµРЅРµ",
+        "РЅР°Р»РёС‡РёРµ",
+        "РјРѕС‰РЅС‹Р№",
+        "РјРѕС‰РЅСѓСЋ",
+        "РјРѕС‰РЅС‹Рµ",
+        "РјРѕС‰РЅРѕСЃС‚СЊ",
+        "РґРѕСЃС‚СѓРїРЅС‹С…",
+        "РґРѕСЃС‚СѓРїРЅС‹Р№",
+        "РєРѕС‚РѕСЂС‹Рµ",
+        "РјРѕР¶РЅРѕ",
+        "С‚СѓС‚",
     }
     result: list[str] = []
     for token in tokens:

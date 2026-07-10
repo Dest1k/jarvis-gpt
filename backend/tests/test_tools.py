@@ -2120,6 +2120,7 @@ def test_web_answer_site_specific_blocked_returns_direct_link(monkeypatch, tmp_p
     assert result.data["sources"] == []
     assert result.data["preferred_domains"] == ["dns-shop.ru"]
     assert result.data["direct_links"][0]["url"].startswith("https://www.dns-shop.ru/search/")
+    assert "catalog/recipe" not in result.data["answer"]
     assert "rtx+5090" in result.data["direct_links"][0]["url"].lower()
     assert "NVIDIA" not in result.data["answer"]
     assert "Основной запрос" not in result.data["answer"]
@@ -2144,6 +2145,55 @@ def test_web_answer_direct_link_terms_drop_noisy_shopping_words():
             "url": "https://www.dns-shop.ru/search/?q=rtx+5090",
         }
     ]
+
+
+def test_web_answer_relevance_handles_utf8_russian_shopping_terms():
+    from jarvis_gpt.tools import (
+        _web_answer_price_sensitive_question,
+        _web_answer_source_relevant,
+        _web_answer_subject_terms,
+    )
+
+    price_query = (
+        "\u0434\u0430\u0439 \u043c\u043d\u0435 \u0441\u0441\u044b\u043b\u043a\u0443 "
+        "\u043d\u0430 \u0434\u043d\u0441 \u043d\u0430 \u0441\u0430\u043c\u0443\u044e "
+        "\u0434\u0435\u0448\u0451\u0432\u0443\u044e 5090"
+    )
+    laser_query = (
+        "\u043d\u0430\u0439\u0434\u0438 \u043c\u043d\u0435 \u0441\u0430\u043c\u044b\u0439 "
+        "\u043c\u043e\u0449\u043d\u044b\u0439 \u0438\u0437 "
+        "\u0434\u043e\u0441\u0442\u0443\u043f\u043d\u044b\u0445 "
+        "\u0440\u0443\u0447\u043d\u044b\u0445 \u043b\u0430\u0437\u0435\u0440\u043e\u0432 "
+        "\u043a\u043e\u0442\u043e\u0440\u044b\u0435 \u0442\u0443\u0442 "
+        "\u043c\u043e\u0436\u043d\u043e \u043a\u0443\u043f\u0438\u0442\u044c"
+    )
+
+    assert _web_answer_subject_terms(price_query) == ["rtx", "5090"]
+    assert _web_answer_price_sensitive_question(price_query) is True
+    assert _web_answer_subject_terms(laser_query) == [
+        "\u0440\u0443\u0447\u043d\u044b\u0445",
+        "\u043b\u0430\u0437\u0435\u0440\u043e\u0432",
+    ]
+    assert not _web_answer_source_relevant(
+        laser_query,
+        {"title": "Google Earth", "url": "https://earth.google.com/", "snippet": "Earth maps"},
+        preferred_domains=[],
+        vertical="shopping",
+    )
+    assert _web_answer_source_relevant(
+        laser_query,
+        {
+            "title": "\u0420\u0443\u0447\u043d\u043e\u0439 \u043b\u0430\u0437\u0435\u0440 5000mW",
+            "url": "https://example.com/laser",
+            "snippet": (
+                "\u041a\u0443\u043f\u0438\u0442\u044c "
+                "\u0440\u0443\u0447\u043d\u043e\u0439 "
+                "\u043b\u0430\u0437\u0435\u0440"
+            ),
+        },
+        preferred_domains=[],
+        vertical="shopping",
+    )
 
 
 def test_web_answer_caches_direct_store_search_link(monkeypatch, tmp_path):
@@ -2241,9 +2291,11 @@ def test_web_answer_weak_shopping_source_keeps_dns_search_link(monkeypatch, tmp_
     )
 
     assert result.ok is True
+    assert result.data["sources"] == []
     assert result.data["direct_links"][0]["title"] == "Поиск на dns-shop.ru"
     assert result.data["direct_links"][0]["url"].startswith("https://www.dns-shop.ru/search/")
-    assert "Проверь напрямую" in result.data["answer"]
+    assert "catalog/recipe" not in result.data["answer"]
+    assert "прямая ссылка" in result.data["answer"]
     assert "Поиск на dns-shop.ru" in result.data["answer"]
     assert result.data["synthesis"]["reason"] == "weak_shopping_sources"
     storage.close()
@@ -3197,6 +3249,76 @@ def test_web_search_falls_back_to_evidence_cache_on_provider_failure(monkeypatch
     assert result.data["results"][0]["url"] == target
     assert result.data["results"][0]["provider"] == "evidence_cache"
     assert not any("nvidia.com" in item["url"] for item in result.data["results"])
+    storage.close()
+
+
+def test_web_search_cache_rejects_irrelevant_shopping_results(monkeypatch, tmp_path):
+    monkeypatch.delenv("JARVIS_BRAVE_SEARCH_API_KEY", raising=False)
+    monkeypatch.delenv("BRAVE_SEARCH_API_KEY", raising=False)
+    monkeypatch.delenv("JARVIS_TAVILY_API_KEY", raising=False)
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    monkeypatch.delenv("JARVIS_SERPER_API_KEY", raising=False)
+    monkeypatch.delenv("SERPER_API_KEY", raising=False)
+
+    class FakeResponse:
+        status_code = 200
+        headers = {"content-type": "text/html; charset=utf-8"}
+        content = b"<html><body>captcha access denied</body></html>"
+
+        def raise_for_status(self):
+            return None
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, _exc_type, _exc, _traceback):
+            return None
+
+        async def get(self, url, *, headers):
+            return FakeResponse()
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    _store_web_evidence(
+        storage,
+        source="web.search",
+        url="https://www.bing.com/search?q=old+shopping",
+        title="old shopping search",
+        text=(
+            "Naydi aluminum systems\n"
+            "https://naidy.com/\n"
+            "Aluminum systems, furniture supports and shelving.\n"
+            "DNS RTX 5090 video cards\n"
+            "https://www.dns-shop.ru/catalog/17a89aab16404e77/videokarty/\n"
+            "Video card catalog.\n"
+            "Google Earth\n"
+            "https://earth.google.com/\n"
+            "Earth maps and imagery."
+        ),
+        content_type="text/plain",
+        safety={},
+        confidence=0.45,
+    )
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    result = asyncio.run(
+        tools.run(
+            "web.search",
+            {"query": "handheld laser buy price", "limit": 3, "vertical": "shopping"},
+        )
+    )
+
+    assert result.ok is False
+    assert result.summary == "Search request failed for all providers."
     storage.close()
 
 

@@ -707,3 +707,17 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
   a page reload can still show that a mission job is running.
 - Regression coverage: `test_autonomy_start_runs_detached`; frontend typecheck
   passes.
+
+### 2026-07-10 - Codex
+
+- Tightened internet shopping/search relevance. `web.search` evidence-cache
+  fallback now matches cached results against meaningful subject terms instead of
+  generic words like buy/price, so stale DNS/Google Earth/etc. pages are not
+  reused for unrelated shopping requests.
+- `web.answer` filters irrelevant sources before ranking and, for price-sensitive
+  shopping requests, only treats product/price-bearing sources as usable. Weak DNS
+  category/recipe pages now fall back to a direct store search link instead of
+  being presented as a concrete product answer.
+- Regression coverage: `test_web_search_cache_rejects_irrelevant_shopping_results`
+  plus stricter DNS weak-source assertions. `backend/tests/test_tools.py` and
+  `backend/tests/test_agent.py` pass.
