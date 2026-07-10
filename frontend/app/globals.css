@@ -1301,6 +1301,29 @@ h3 {
   text-decoration: underline;
 }
 
+.richMessage a.compactLink {
+  display: inline-block;
+  max-width: min(260px, 100%);
+  margin: 0 1px;
+  padding: 1px 7px;
+  overflow: hidden;
+  border: 1px solid rgba(64, 215, 196, 0.24);
+  border-radius: 999px;
+  background: rgba(64, 215, 196, 0.09);
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  vertical-align: -0.18em;
+  white-space: nowrap;
+  word-break: normal;
+  overflow-wrap: normal;
+}
+
+.richMessage a.compactLink:hover {
+  border-color: rgba(64, 215, 196, 0.46);
+  background: rgba(64, 215, 196, 0.14);
+  text-decoration: none;
+}
+
 .richMessage :not(pre) > code {
   border: 1px solid rgba(64, 215, 196, 0.22);
   border-radius: 5px;

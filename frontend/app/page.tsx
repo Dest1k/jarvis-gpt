@@ -1527,9 +1527,16 @@ function renderRichInline(text: string, key: string): ReactNode[] {
     } else {
       const markdownLink = token.match(/^\[([^\]]+)\]\(((?:https?:\/\/|www\.)[^\s)]+)\)$/);
       const rawHref = markdownLink ? markdownLink[2] : token;
-      const { href, label, suffix } = linkParts(rawHref, markdownLink ? markdownLink[1] : token);
+      const { href, label, suffix, compact } = linkParts(rawHref, markdownLink ? markdownLink[1] : token);
       nodes.push(
-        <a href={href} key={`${key}-link-${index}`} rel="noreferrer" target="_blank">
+        <a
+          className={compact ? "compactLink" : undefined}
+          href={href}
+          key={`${key}-link-${index}`}
+          rel="noreferrer"
+          target="_blank"
+          title={compact ? href : undefined}
+        >
           {label}
         </a>
       );
@@ -1548,7 +1555,6 @@ function linkParts(rawHref: string, rawLabel: string) {
   let href = rawHref;
   let label = rawLabel;
   let suffix = "";
-  const labelTracksHref = rawLabel === rawHref;
   while (/[.,!?;:]$/.test(href)) {
     suffix = `${href.slice(-1)}${suffix}`;
     href = href.slice(0, -1);
@@ -1557,9 +1563,41 @@ function linkParts(rawHref: string, rawLabel: string) {
     suffix = `${href.slice(-1)}${suffix}`;
     href = href.slice(0, -1);
   }
-  if (labelTracksHref) label = href;
   const normalizedHref = href.startsWith("www.") ? `https://${href}` : href;
-  return { href: normalizedHref, label, suffix };
+  const compact = rawLabel === rawHref || looksLikeUrlLabel(rawLabel);
+  if (compact) label = compactUrlLabel(normalizedHref);
+  return { href: normalizedHref, label, suffix, compact };
+}
+
+function looksLikeUrlLabel(value: string) {
+  return /^(?:https?:\/\/|www\.)\S+$/i.test(value.trim());
+}
+
+function compactUrlLabel(value: string) {
+  try {
+    const parsed = new URL(value.startsWith("www.") ? `https://${value}` : value);
+    const host = parsed.hostname.replace(/^www\./i, "");
+    const segments = parsed.pathname
+      .split("/")
+      .filter(Boolean)
+      .slice(0, 2)
+      .map(shortUrlSegment);
+    if (!segments.length) return host;
+    const more = parsed.pathname.split("/").filter(Boolean).length > segments.length ? "/..." : "";
+    return `${host}/${segments.join("/")}${more}`;
+  } catch {
+    return value.replace(/^https?:\/\//i, "").replace(/^www\./i, "");
+  }
+}
+
+function shortUrlSegment(value: string) {
+  let decoded = value;
+  try {
+    decoded = decodeURIComponent(value);
+  } catch {
+    decoded = value;
+  }
+  return decoded.length > 18 ? `${decoded.slice(0, 15)}...` : decoded;
 }
 
 function closingUrlPunctuationLooksExtra(value: string) {

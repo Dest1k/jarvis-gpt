@@ -9,6 +9,14 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-10 - Codex (compact chat links)
+
+- Updated Command Center rich-message rendering so raw URL labels and
+  `[URL](URL)` markdown display as compact inline link pills like
+  `domain/path/...`; the full URL remains in `href` and hover `title`.
+- Added CSS to keep those links on one visual unit with ellipsis instead of
+  wrapping long URLs through assistant text.
+
 ### 2026-07-10 - Codex (GUI brand cleanup)
 
 - Removed visible `GPT`/`JARVIS GPT` branding from the Command Center shell,
