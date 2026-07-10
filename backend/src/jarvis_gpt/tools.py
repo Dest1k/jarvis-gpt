@@ -3452,7 +3452,7 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
         },
         "steps": steps,
     }
-    if use_cache and ranked_sources:
+    if use_cache and (ranked_sources or direct_links):
         _web_answer_cache_store(ctx.storage, cache_key, data)
     return ToolRunResponse(
         tool="web.answer",
@@ -8404,13 +8404,25 @@ def _web_answer_site_search_terms(question: str) -> str:
     stopwords = set(WEB_VERIFY_STOPWORDS) | {
         "найди",
         "мне",
+        "покажи",
+        "выдай",
+        "подбери",
+        "посмотри",
+        "открой",
+        "позицию",
+        "позиции",
+        "вариант",
+        "варианты",
         "самую",
         "самый",
         "самое",
+        "самые",
         "дешевую",
         "дешёвую",
         "дешевый",
         "дешёвый",
+        "дешевые",
+        "дешёвые",
         "низкой",
         "цене",
         "цена",
@@ -8421,6 +8433,12 @@ def _web_answer_site_search_terms(question: str) -> str:
         "на",
         "в",
         "по",
+        "все",
+        "всё",
+        "таки",
+        "москва",
+        "москве",
+        "спб",
     }
     result = [token for token in tokens if token not in stopwords]
     if "5090" in result and "rtx" not in result:
@@ -8600,13 +8618,8 @@ def _web_answer_weak_shopping_sources(
     has_price = any(
         source.get("price")
         or _source_extraction_has_price(source)
-        or re.search(
-            r"(?:\d[\d\s]{2,}(?:₽|руб|р\.|р\b)|₽\s*\d|price)",
-            " ".join(
-                str(source.get(key) or "")
-                for key in ("title", "snippet", "excerpt")
-            ).lower(),
-            flags=re.IGNORECASE,
+        or _extract_prices(
+            " ".join(str(source.get(key) or "") for key in ("title", "snippet", "excerpt"))
         )
         for source in sources
     )
@@ -9481,9 +9494,12 @@ def _extract_title_candidates(text: str) -> list[str]:
 
 
 def _extract_prices(text: str) -> list[str]:
+    amount = r"(?:\d{1,3}(?:[\s.,]\d{3})+(?:[,.]\d{1,2})?|\d+(?:[,.]\d{1,2})?)"
     patterns = [
-        r"(?:[$€£₽]\s?\d[\d\s.,]*)",
-        r"(?:\d[\d\s.,]*\s?(?:руб\.?|₽|usd|eur|dollars?|€|\$))",
+        rf"(?:[$€£₽]\s?{amount})",
+        rf"(?:(?:usd|eur|rub)\s?{amount})",
+        rf"(?:{amount}\s?(?:руб\.?|₽|usd|eur|dollars?))",
+        rf"(?:{amount}\s?[$€£](?!\s?\d))",
     ]
     found: list[str] = []
     for pattern in patterns:

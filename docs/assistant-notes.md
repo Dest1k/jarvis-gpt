@@ -667,3 +667,15 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 - Fixed mission task updates to verify `mission_id` before mutating a task.
 - Added regression coverage for both fixes.
 - Current agreement: this file is the shared notebook for future assistant notes.
+
+### 2026-07-10 - Codex
+
+- Shopping audit/polish pass: cleaned noisy store queries like "покажи позицию в
+  днс на rtx 5090 в Москве" down to product terms before adding `site:dns-shop.ru`.
+- Shopping follow-up detection no longer treats bare "результат" as previous
+  shopping context; explicit "из результатов/из выдачи/прошлый поиск" still reuses
+  prior ranked state.
+- Candidate price parsing now understands RUB plus USD/EUR/$/€/£ formats and
+  decimal separators, so cheapest sorting works for foreign marketplace snippets.
+- `web.answer` now caches direct store-search answers even when sources are empty,
+  and weak-shopping detection reuses structured price extraction for non-RUB prices.

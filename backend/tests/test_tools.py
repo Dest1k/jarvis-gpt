@@ -2129,6 +2129,65 @@ def test_web_answer_site_specific_blocked_returns_direct_link(monkeypatch, tmp_p
     storage.close()
 
 
+def test_web_answer_direct_link_terms_drop_noisy_shopping_words():
+    from jarvis_gpt.tools import _web_answer_direct_links
+
+    links = _web_answer_direct_links(
+        "и всё-таки покажи мне самую дешёвую позицию в днс на rtx 5090 в Москве",
+        preferred_domains=["dns-shop.ru"],
+        sources=[],
+    )
+
+    assert links == [
+        {
+            "title": "Поиск на dns-shop.ru",
+            "url": "https://www.dns-shop.ru/search/?q=rtx+5090",
+        }
+    ]
+
+
+def test_web_answer_caches_direct_store_search_link(monkeypatch, tmp_path):
+    calls = []
+
+    async def fake_research(_ctx, args):
+        calls.append(args["query"])
+        return ToolRunResponse(
+            tool="web.research",
+            ok=True,
+            summary="Research ok.",
+            data={"sources": []},
+        )
+
+    async def fake_verify(_ctx, args):
+        return ToolRunResponse(
+            tool="web.verify",
+            ok=True,
+            summary="Verification verdict: insufficient_evidence.",
+            data={"verification": {"verdict": "insufficient_evidence", "confidence": 0.0}},
+        )
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr("jarvis_gpt.tools._web_research", fake_research)
+    monkeypatch.setattr("jarvis_gpt.tools._web_verify", fake_verify)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    first = asyncio.run(tools.run("web.answer", {"question": "найди 5090 на днс"}))
+    calls_after_first = len(calls)
+    second = asyncio.run(tools.run("web.answer", {"question": "найди 5090 на днс"}))
+
+    assert first.ok is True
+    assert second.ok is True
+    assert calls_after_first > 0
+    assert len(calls) == calls_after_first
+    assert second.summary.startswith("Answer engine returned cached answer")
+    storage.close()
+
+
 def test_web_answer_weak_shopping_source_keeps_dns_search_link(monkeypatch, tmp_path):
     async def fake_research(_ctx, args):
         return ToolRunResponse(

@@ -1294,6 +1294,17 @@ def test_agent_expands_bare_gpu_model_for_dns_shop(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_agent_cleans_noisy_dns_shopping_subject_for_new_search():
+    from jarvis_gpt.agent import _shopping_search_query
+
+    message = "и всё-таки покажи мне самую дешёвую позицию в днс на rtx 5090 в Москве"
+
+    assert (
+        _shopping_search_query(message, message.lower())
+        == "rtx 5090 site:dns-shop.ru купить цена наличие"
+    )
+
+
 def test_agent_returns_dns_links_when_store_blocks_automation(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "1")
@@ -1433,6 +1444,31 @@ def test_agent_sorts_previous_shopping_results_and_opens_cheapest(monkeypatch, t
     assert "399 000" in response.answer
     assert "https://shop.example/cheap" in response.answer
     storage.close()
+
+
+def test_agent_sorts_shopping_candidates_with_usd_prices():
+    from jarvis_gpt.agent import _shopping_candidates_from_evidence, _sort_shopping_candidates
+
+    candidates = _shopping_candidates_from_evidence(
+        [
+            {
+                "title": "RTX 5090 expensive",
+                "url": "https://shop.example/expensive",
+                "snippet": "RTX 5090 $2,199.99 in stock",
+            },
+            {
+                "title": "RTX 5090 cheap",
+                "url": "https://shop.example/cheap",
+                "snippet": "RTX 5090 1999 USD in stock",
+            },
+        ]
+    )
+
+    sorted_candidates = _sort_shopping_candidates(candidates, criterion="price_asc")
+
+    assert sorted_candidates[0]["url"] == "https://shop.example/cheap"
+    assert sorted_candidates[0]["price_value"] == 1999.0
+    assert sorted_candidates[1]["price_value"] == 2199.99
 
 
 def test_agent_researches_marketplace_product_without_osint(monkeypatch, tmp_path):

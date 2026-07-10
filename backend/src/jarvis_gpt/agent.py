@@ -5435,6 +5435,71 @@ def _unique_search_queries(candidates: list[str], current_query: str) -> list[st
     return queries
 
 
+_SHOPPING_SUBJECT_STOPWORDS = {
+    "а",
+    "и",
+    "во",
+    "в",
+    "на",
+    "по",
+    "у",
+    "для",
+    "мне",
+    "ну",
+    "все",
+    "всё",
+    "таки",
+    "найди",
+    "поищи",
+    "покажи",
+    "выдай",
+    "подбери",
+    "посмотри",
+    "открой",
+    "пожалуйста",
+    "плиз",
+    "самую",
+    "самый",
+    "самое",
+    "самые",
+    "дешевую",
+    "дешёвую",
+    "дешевый",
+    "дешёвый",
+    "дешевые",
+    "дешёвые",
+    "недорогую",
+    "недорогой",
+    "позицию",
+    "позиции",
+    "вариант",
+    "варианты",
+    "предложение",
+    "предложения",
+    "товар",
+    "товары",
+    "москва",
+    "москве",
+    "спб",
+}
+
+
+_SHOPPING_AMOUNT_RE = (
+    r"(?:\d{1,3}(?:[\s.,]\d{3})+(?:[,.]\d{1,2})?|\d+(?:[,.]\d{1,2})?)"
+)
+
+
+_SHOPPING_PRICE_RE = re.compile(
+    r"(?:от\s*)?(?:"
+    rf"(?:[₽$€£]\s*{_SHOPPING_AMOUNT_RE})|"
+    rf"(?:(?:rub|usd|eur)\s*{_SHOPPING_AMOUNT_RE})|"
+    rf"(?:{_SHOPPING_AMOUNT_RE}\s*(?:₽|руб\.?|rub|usd|eur|долл\.?|евро))|"
+    rf"(?:{_SHOPPING_AMOUNT_RE}\s*[$€£](?!\s*\d))"
+    r")",
+    flags=re.IGNORECASE,
+)
+
+
 def _clean_shopping_subject(query: str) -> str:
     cleaned = _clean_research_subject(query)
     store_names = (
@@ -5462,7 +5527,13 @@ def _clean_shopping_subject(query: str) -> str:
     cleaned = re.sub(r"\bсам(?:ую|ый|ое|ые)\s+деш[её]в\w*\b", " ", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\bсам(?:ую|ый|ое|ые)\s+недорог\w*\b", " ", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\b(?:купить|цена|стоимость|наличие)\b", " ", cleaned, flags=re.IGNORECASE)
-    cleaned = _normalize_search_query(cleaned)
+    cleaned = re.sub(r"\b(?:все|всё)[-\s]*таки\b", " ", cleaned, flags=re.IGNORECASE)
+    tokens = [
+        token
+        for token in re.findall(r"[\w.+-]+", cleaned, flags=re.IGNORECASE)
+        if token.lower() not in _SHOPPING_SUBJECT_STOPWORDS
+    ]
+    cleaned = _normalize_search_query(" ".join(tokens))
     if cleaned:
         return cleaned
     return _normalize_search_query(query) or query
@@ -5978,10 +6049,7 @@ def _shopping_followup_intent(
     criterion = _ranking_criterion_from_message(message)
     if criterion is None:
         return None
-    explicit_previous_context = _contains_any(
-        normalized,
-        ("из них", "из списка", "из найден", "последний поиск", "прошлый поиск", "результат"),
-    )
+    explicit_previous_context = _shopping_mentions_previous_context(normalized)
     if _looks_like_shopping_query(normalized) and not explicit_previous_context:
         return None
     followup_context = _contains_any(
@@ -6014,6 +6082,23 @@ def _shopping_followup_intent(
         "open": _shopping_open_requested(normalized),
         "sort": True,
     }
+
+
+def _shopping_mentions_previous_context(normalized: str) -> bool:
+    return _contains_any(
+        normalized,
+        (
+            "из них",
+            "из списка",
+            "из найден",
+            "из выдачи",
+            "из результатов",
+            "в результатах",
+            "по результатам",
+            "последний поиск",
+            "прошлый поиск",
+        ),
+    )
 
 
 def _ranking_criterion_from_message(message: str) -> str | None:
@@ -6203,17 +6288,28 @@ def _extract_price_texts(text: str) -> list[str]:
     return _dedupe(
         [
             " ".join(match.split())
-            for match in re.findall(
-                r"(?:от\s*)?\d[\d\s]{2,}\s*(?:₽|руб\.?|rub)",
-                text,
-                flags=re.IGNORECASE,
-            )
+            for match in _SHOPPING_PRICE_RE.findall(text)
         ]
     )
 
 
 def _price_value(price: str) -> float | None:
-    digits = re.sub(r"[^\d]", "", price)
+    raw = re.sub(r"(?i)(?:от|руб\.?|rub|usd|eur|долл\.?|евро)", " ", price)
+    raw = raw.translate(str.maketrans({"₽": " ", "$": " ", "€": " ", "£": " "}))
+    match = re.search(r"\d[\d\s.,]*", raw)
+    if not match:
+        return None
+    number = re.sub(r"\s+", "", match.group(0))
+    last_dot = number.rfind(".")
+    last_comma = number.rfind(",")
+    separator = "." if last_dot > last_comma else "," if last_comma >= 0 else ""
+    if separator:
+        whole, fraction = number.rsplit(separator, 1)
+        fraction_digits = re.sub(r"\D", "", fraction)
+        if 0 < len(fraction_digits) <= 2:
+            whole_digits = re.sub(r"\D", "", whole) or "0"
+            return float(f"{whole_digits}.{fraction_digits}")
+    digits = re.sub(r"[^\d]", "", number)
     return float(digits) if digits else None
 
 
