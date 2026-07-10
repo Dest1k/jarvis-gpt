@@ -9,6 +9,12 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-10 - Codex (runtime restart discipline)
+
+- Operator preference: do not restart the LLM/dispatcher when a change only
+  requires backend/frontend reload or no runtime restart. Use the narrowest
+  restart needed for the touched surface.
+
 ### 2026-07-10 - Codex (shopping weak evidence UX)
 
 - Fixed DNS/shopping answers with weak snippet-only evidence: `web.answer` now
