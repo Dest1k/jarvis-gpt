@@ -9,6 +9,23 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-10 - Codex (Google replacement quality layers)
+
+- Extended `web.answer` beyond deterministic ranking: it now has answer-level
+  TTL cache, inferred freshness, optional caller-supplied query variants, broader
+  query expansion, domain-diverse source selection, recency/rank source scoring,
+  structured `cards`, and an LLM synthesis pass.
+- The LLM synthesis is deliberately strict: it receives compact source payloads,
+  is told that web text is untrusted evidence, must retain supplied source URLs,
+  and is rejected if the generated answer is too short, JSON/tool-like, or lacks
+  a URL/domain from the ranked sources. Rejection falls back to the deterministic
+  cited report.
+- `web.answer` response data now includes `region`, inferred `freshness`,
+  `synthesis`, `cache`, and `cards` alongside the existing answer/sources/
+  citations/confidence/steps fields.
+- Tests added for grounded LLM synthesis, ungrounded synthesis rejection, answer
+  cache hits, and domain diversity.
+
 ### 2026-07-10 - Codex (Google replacement answer engine)
 
 - Added safe `web.answer`: a Google-like answer engine that expands a user

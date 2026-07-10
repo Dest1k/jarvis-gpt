@@ -5,18 +5,24 @@
 For the operator and the second model:
 
 - Use `web.answer` as the first-choice "replace Google" tool for ordinary
-  internet questions. It expands the question, calls `web.research`, ranks
-  fetched/cited sources, verifies coverage, and returns `answer`, `sources`,
-  `citations`, `confidence`, and `steps`.
+  internet questions. It expands the question, infers freshness when needed,
+  calls `web.research`, ranks fetched/cited sources, diversifies domains,
+  verifies coverage, and returns `answer`, `sources`, `citations`,
+  `confidence`, `cards`, `synthesis`, `cache`, and `steps`.
 - `AgentRuntime._run_web_research` now tries `web.answer` first when the real
   ToolRegistry is active. If `web.answer` is unavailable or fails, the old
   `web.search` -> `web.fetch`/`web.render` path still handles the request.
 - `web.answer` deliberately builds on the existing guarded stack instead of
   bypassing it: public-only URL validation, fetch cache, consent detection,
   render/archive fallback, evidence storage, and verification still apply.
-- Current limitation: the deterministic `web.answer` report summarizes top
-  excerpts and source ranking. The next quality layer should add an LLM synthesis
-  pass inside `web.answer` itself, with strict source-grounding and URL retention.
+- `web.answer` now has a short answer-level TTL cache for repeated same-question
+  calls. Use `use_cache=false` for testing or when the answer must be recomputed.
+- LLM synthesis is optional and strict. When enabled and the local LLM is live,
+  it receives only compact ranked-source payloads, must keep supplied source
+  URLs/domains in the visible answer, and is rejected back to the deterministic
+  cited report if it is ungrounded, JSON/tool-like, or too short.
+- `cards` is the UI/agent-friendly structured layer: source mix, top sources,
+  compact fact excerpts, verification gaps, and follow-up queries.
 
 ## 2026-07-10 handoff - internet coverage: archive, feeds, weather, page watches
 

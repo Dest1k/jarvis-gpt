@@ -1770,6 +1770,284 @@ def test_web_answer_expands_queries_and_ranks_sources(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_web_answer_uses_grounded_llm_synthesis(monkeypatch, tmp_path):
+    async def fake_research(_ctx, args):
+        return ToolRunResponse(
+            tool="web.research",
+            ok=True,
+            summary="Research ok.",
+            data={
+                "sources": [
+                    {
+                        "rank": 1,
+                        "title": "Widget official docs",
+                        "url": "https://docs.vendor.example/widget",
+                        "snippet": "Widget 2.0 release notes",
+                        "excerpt": "Widget 2.0 is documented in official release notes.",
+                        "fetched": True,
+                        "tool": "web.fetch",
+                        "quality": "vendor-docs",
+                        "evidence_id": "ev_docs",
+                    }
+                ]
+            },
+        )
+
+    async def fake_verify(_ctx, _args):
+        return ToolRunResponse(
+            tool="web.verify",
+            ok=True,
+            summary="Verification verdict: supported.",
+            data={"verification": {"verdict": "supported", "confidence": 0.86}},
+        )
+
+    class GroundedLLM:
+        def __init__(self):
+            self.thinking_enabled = None
+
+        async def complete(
+            self,
+            _messages,
+            *,
+            temperature=None,
+            max_tokens=None,
+            thinking_enabled=True,
+        ):
+            self.thinking_enabled = thinking_enabled
+            return SimpleNamespace(
+                ok=True,
+                content=(
+                    "Widget 2.0 is confirmed in the official release notes at "
+                    "https://docs.vendor.example/widget. The available evidence is "
+                    "enough for the release-status answer."
+                ),
+            )
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "1")
+    monkeypatch.setattr("jarvis_gpt.tools._web_research", fake_research)
+    monkeypatch.setattr("jarvis_gpt.tools._web_verify", fake_verify)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    llm = GroundedLLM()
+    tools = ToolRegistry(settings, storage, llm)
+
+    result = asyncio.run(
+        tools.run(
+            "web.answer",
+            {"question": "Widget 2.0 release status", "max_sources": 2, "use_cache": False},
+        )
+    )
+
+    assert result.ok is True
+    assert result.data["synthesis"]["used"] is True
+    assert result.data["answer"].startswith("Widget 2.0 is confirmed")
+    assert "https://docs.vendor.example/widget" in result.data["answer"]
+    assert result.data["cards"]["source_mix"]["official_like_count"] == 1
+    assert llm.thinking_enabled is False
+    storage.close()
+
+
+def test_web_answer_rejects_ungrounded_llm_synthesis(monkeypatch, tmp_path):
+    async def fake_research(_ctx, _args):
+        return ToolRunResponse(
+            tool="web.research",
+            ok=True,
+            summary="Research ok.",
+            data={
+                "sources": [
+                    {
+                        "rank": 1,
+                        "title": "Widget official docs",
+                        "url": "https://docs.vendor.example/widget",
+                        "snippet": "Widget 2.0 release notes",
+                        "excerpt": "Widget 2.0 is documented in official release notes.",
+                        "fetched": True,
+                        "tool": "web.fetch",
+                        "quality": "vendor-docs",
+                        "evidence_id": "ev_docs",
+                    }
+                ]
+            },
+        )
+
+    async def fake_verify(_ctx, _args):
+        return ToolRunResponse(
+            tool="web.verify",
+            ok=True,
+            summary="Verification verdict: supported.",
+            data={"verification": {"verdict": "supported", "confidence": 0.86}},
+        )
+
+    class UngroundedLLM:
+        async def complete(self, _messages, *, temperature=None, max_tokens=None):
+            return SimpleNamespace(
+                ok=True,
+                content=(
+                    "Widget 2.0 is confirmed by the supplied source material, "
+                    "but this deliberately omits any retained source URL."
+                ),
+            )
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "1")
+    monkeypatch.setattr("jarvis_gpt.tools._web_research", fake_research)
+    monkeypatch.setattr("jarvis_gpt.tools._web_verify", fake_verify)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, UngroundedLLM())
+
+    result = asyncio.run(
+        tools.run(
+            "web.answer",
+            {"question": "Widget 2.0 release status", "max_sources": 2, "use_cache": False},
+        )
+    )
+
+    assert result.ok is True
+    assert result.data["synthesis"]["used"] is False
+    assert result.data["synthesis"]["rejection"] == "missing_source_url"
+    assert "https://docs.vendor.example/widget" in result.data["answer"]
+    storage.close()
+
+
+def test_web_answer_uses_answer_cache(monkeypatch, tmp_path):
+    calls = {"research": 0}
+
+    async def fake_research(_ctx, _args):
+        calls["research"] += 1
+        return ToolRunResponse(
+            tool="web.research",
+            ok=True,
+            summary="Research ok.",
+            data={
+                "sources": [
+                    {
+                        "rank": 1,
+                        "title": "Widget official docs",
+                        "url": "https://docs.vendor.example/widget",
+                        "snippet": "Widget 2.0 release notes",
+                        "excerpt": "Widget 2.0 is documented in official release notes.",
+                        "fetched": True,
+                        "tool": "web.fetch",
+                        "quality": "vendor-docs",
+                        "evidence_id": "ev_docs",
+                    }
+                ]
+            },
+        )
+
+    async def fake_verify(_ctx, _args):
+        return ToolRunResponse(
+            tool="web.verify",
+            ok=True,
+            summary="Verification verdict: supported.",
+            data={"verification": {"verdict": "supported", "confidence": 0.82}},
+        )
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr("jarvis_gpt.tools._web_research", fake_research)
+    monkeypatch.setattr("jarvis_gpt.tools._web_verify", fake_verify)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    first = asyncio.run(tools.run("web.answer", {"question": "Widget 2.0 cache check"}))
+    first_call_count = calls["research"]
+    second = asyncio.run(tools.run("web.answer", {"question": "Widget 2.0 cache check"}))
+
+    assert first.ok is True
+    assert second.ok is True
+    assert first.data["cache"]["hit"] is False
+    assert second.data["cache"]["hit"] is True
+    assert calls["research"] == first_call_count
+    storage.close()
+
+
+def test_web_answer_diversifies_domains(monkeypatch, tmp_path):
+    async def fake_research(_ctx, _args):
+        return ToolRunResponse(
+            tool="web.research",
+            ok=True,
+            summary="Research ok.",
+            data={
+                "sources": [
+                    {
+                        "rank": 1,
+                        "title": "Same domain A",
+                        "url": "https://same.example/a",
+                        "snippet": "Widget release source",
+                        "excerpt": "Widget release source from same domain A.",
+                        "fetched": True,
+                        "tool": "web.fetch",
+                        "quality": "web-source",
+                        "evidence_id": "ev_a",
+                    },
+                    {
+                        "rank": 1,
+                        "title": "Same domain B",
+                        "url": "https://same.example/b",
+                        "snippet": "Widget release source",
+                        "excerpt": "Widget release source from same domain B.",
+                        "fetched": True,
+                        "tool": "web.fetch",
+                        "quality": "web-source",
+                        "evidence_id": "ev_b",
+                    },
+                    {
+                        "rank": 9,
+                        "title": "Other domain",
+                        "url": "https://other.example/widget",
+                        "snippet": "Widget release source",
+                        "excerpt": "Widget release source from another domain.",
+                        "fetched": True,
+                        "tool": "web.fetch",
+                        "quality": "web-source",
+                        "evidence_id": "ev_other",
+                    },
+                ]
+            },
+        )
+
+    async def fake_verify(_ctx, _args):
+        return ToolRunResponse(
+            tool="web.verify",
+            ok=True,
+            summary="Verification verdict: partial.",
+            data={"verification": {"verdict": "partial", "confidence": 0.55}},
+        )
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr("jarvis_gpt.tools._web_research", fake_research)
+    monkeypatch.setattr("jarvis_gpt.tools._web_verify", fake_verify)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    result = asyncio.run(
+        tools.run(
+            "web.answer",
+            {"question": "Widget release source", "max_sources": 3, "use_cache": False},
+        )
+    )
+
+    urls = [source["url"] for source in result.data["sources"]]
+    assert urls[0].startswith("https://same.example/")
+    assert urls[1] == "https://other.example/widget"
+    assert result.data["cards"]["source_mix"]["domain_count"] == 2
+    storage.close()
+
+
 def test_web_crawl_follows_bounded_same_site_links(monkeypatch, tmp_path):
     async def fake_fetch(_ctx, args):
         if args["url"].endswith("/start"):
