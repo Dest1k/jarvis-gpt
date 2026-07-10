@@ -261,6 +261,7 @@ def _extract_xlsx(path: Path) -> dict[str, Any]:
     with zipfile.ZipFile(path) as archive:
         shared_strings = _xlsx_shared_strings(archive)
         sheet_map = _xlsx_sheet_map(archive)
+        style_count = _xlsx_style_count(archive)
         sheets: list[dict[str, Any]] = []
         for sheet_name, member_name in sheet_map[:20]:
             xml = _read_zip_text_member(archive, member_name)
@@ -281,6 +282,7 @@ def _extract_xlsx(path: Path) -> dict[str, Any]:
             "sheet_count": len(sheets),
             "sheets": sheets,
             "formula_count": sum(len(sheet["formulas"]) for sheet in sheets),
+            "style_count": style_count,
         },
         "warnings": [],
     }
@@ -432,6 +434,17 @@ def _xlsx_sheet_map(archive: zipfile.ZipFile) -> list[tuple[str, str]]:
         if member:
             result.append((name, member))
     return result
+
+
+def _xlsx_style_count(archive: zipfile.ZipFile) -> int:
+    xml = _read_zip_text_member(archive, "xl/styles.xml")
+    if not xml:
+        return 0
+    try:
+        root = _parse_xml(xml, "XLSX styles")
+    except DocumentRuntimeError:
+        return 0
+    return len(root.findall(f".//{{{_A_NS}}}cellXfs/{{{_A_NS}}}xf"))
 
 
 def _xlsx_sheet_payload(

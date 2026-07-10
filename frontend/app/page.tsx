@@ -122,6 +122,31 @@ type ChatAttachment = {
   url?: string | null;
 };
 
+type WebAnswerSourceCard = {
+  id?: string;
+  title?: string;
+  url?: string;
+  domain?: string;
+  quality?: string;
+};
+
+type WebAnswerClaimCitation = {
+  claim?: string;
+  source_ids?: string[];
+  urls?: string[];
+  confidence?: number;
+};
+
+type WebAnswerSummary = {
+  confidence?: number | null;
+  vertical?: string | null;
+  cacheHit?: boolean;
+  sourceCount?: number;
+  domainCount?: number;
+  topSources: WebAnswerSourceCard[];
+  claimCitations: WebAnswerClaimCitation[];
+};
+
 type ChatLine = {
   id?: string;
   role: "user" | "assistant" | "system";
@@ -132,6 +157,7 @@ type ChatLine = {
   startedAt?: number | null;
   feedback?: "up" | "down" | null;
   verification?: { verdict: string; repaired?: boolean } | null;
+  webAnswer?: WebAnswerSummary | null;
 };
 
 type ChatWindow = {
@@ -718,9 +744,10 @@ type InternetObservability = {
   search_providers: Record<string, number>;
   search_api?: {
     configured?: string[];
-    providers?: Record<string, { configured?: boolean; verticals?: string[] }>;
+    providers?: Record<string, { configured?: boolean; verticals?: string[]; env?: string; key?: string | null }>;
     fallback?: string[];
   };
+  search_provider_stats?: Record<string, Record<string, unknown>>;
   verticals?: string[];
   top_domains: [string, number][];
   blocked_recent: Array<{
@@ -979,6 +1006,81 @@ function verificationFromEvents(
     }
   }
   return null;
+}
+
+function webAnswerFromEvents(events?: unknown): WebAnswerSummary | null {
+  if (!Array.isArray(events)) return null;
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (!event || typeof event !== "object") continue;
+    const record = event as Record<string, unknown>;
+    const payload = (record.payload ?? {}) as Record<string, unknown>;
+    if (payload.tool !== "web.answer" && record.title !== "web.answer") continue;
+    const cards = payload.cards && typeof payload.cards === "object"
+      ? (payload.cards as Record<string, unknown>)
+      : {};
+    const sourceMix = cards.source_mix && typeof cards.source_mix === "object"
+      ? (cards.source_mix as Record<string, unknown>)
+      : {};
+    const topSources = normalizeWebAnswerSources(cards.top_sources);
+    const claimCitations = normalizeClaimCitations(
+      cards.claim_citations ?? payload.claim_citations
+    );
+    const cache = payload.cache && typeof payload.cache === "object"
+      ? (payload.cache as Record<string, unknown>)
+      : {};
+    return {
+      confidence: typeof payload.confidence === "number" ? payload.confidence : null,
+      vertical: typeof payload.vertical === "string" ? payload.vertical : null,
+      cacheHit: cache.hit === true,
+      sourceCount: numericValue(sourceMix.source_count),
+      domainCount: numericValue(sourceMix.domain_count),
+      topSources,
+      claimCitations
+    };
+  }
+  return null;
+}
+
+function normalizeWebAnswerSources(value: unknown): WebAnswerSourceCard[] {
+  if (!Array.isArray(value)) return [];
+  const sources: WebAnswerSourceCard[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") continue;
+    const record = item as Record<string, unknown>;
+    sources.push({
+      id: typeof record.id === "string" ? record.id : undefined,
+      title: typeof record.title === "string" ? record.title : undefined,
+      url: typeof record.url === "string" ? record.url : undefined,
+      domain: typeof record.domain === "string" ? record.domain : undefined,
+      quality: typeof record.quality === "string" ? record.quality : undefined
+    });
+    if (sources.length >= 4) break;
+  }
+  return sources;
+}
+
+function normalizeClaimCitations(value: unknown): WebAnswerClaimCitation[] {
+  if (!Array.isArray(value)) return [];
+  const claims: WebAnswerClaimCitation[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") continue;
+    const record = item as Record<string, unknown>;
+    claims.push({
+      claim: typeof record.claim === "string" ? record.claim : undefined,
+      source_ids: Array.isArray(record.source_ids)
+        ? record.source_ids.map((source) => String(source)).slice(0, 3)
+        : [],
+      urls: Array.isArray(record.urls) ? record.urls.map((url) => String(url)).slice(0, 3) : [],
+      confidence: typeof record.confidence === "number" ? record.confidence : undefined
+    });
+    if (claims.length >= 4) break;
+  }
+  return claims;
+}
+
+function numericValue(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 function attachmentHref(attachment: ChatAttachment) {
@@ -1472,6 +1574,52 @@ function isConsoleCodeBlock(language: string, code: string) {
   const normalized = language.trim().toLowerCase();
   if (CONSOLE_LANGUAGES.has(normalized)) return true;
   return /(^|\n)\s*(PS\s+[A-Z]:\\[^>]*>|[A-Z]:\\[^>]*>|[$#>]\s+)/i.test(code);
+}
+
+function WebAnswerPanel({ summary }: { summary: WebAnswerSummary }) {
+  const confidence =
+    typeof summary.confidence === "number" ? `${Math.round(summary.confidence * 100)}%` : null;
+  return (
+    <aside className="webAnswerPanel">
+      <div className="webAnswerHead">
+        <Globe size={13} />
+        <span>{summary.vertical ?? "web"}</span>
+        {confidence && <strong>{confidence}</strong>}
+        {summary.cacheHit && <small>cache</small>}
+      </div>
+      <div className="webAnswerStats">
+        <span>{summary.sourceCount ?? summary.topSources.length} sources</span>
+        {typeof summary.domainCount === "number" && <span>{summary.domainCount} domains</span>}
+        {summary.claimCitations.length > 0 && <span>{summary.claimCitations.length} claims</span>}
+      </div>
+      {summary.topSources.length > 0 && (
+        <div className="webAnswerSources">
+          {summary.topSources.map((source) => (
+            <a
+              href={source.url}
+              key={`${source.id ?? source.domain ?? source.title}-${source.url}`}
+              rel="noreferrer"
+              target="_blank"
+              title={source.title ?? source.url}
+            >
+              <Search size={12} />
+              <span>{compactText(source.domain || source.title || source.url || "source", 36)}</span>
+            </a>
+          ))}
+        </div>
+      )}
+      {summary.claimCitations.length > 0 && (
+        <div className="webAnswerClaims">
+          {summary.claimCitations.slice(0, 2).map((claim, index) => (
+            <p key={`${claim.claim ?? "claim"}-${index}`}>
+              <ShieldCheck size={12} />
+              <span>{compactText(claim.claim ?? "", 130)}</span>
+            </p>
+          ))}
+        </div>
+      )}
+    </aside>
+  );
 }
 
 export default function CommandCenter() {
@@ -2329,7 +2477,8 @@ export default function CommandCenter() {
                       durationMs,
                       pending: false,
                       startedAt: null,
-                      verification: verificationFromEvents(item.events) ?? line.verification ?? null
+                      verification: verificationFromEvents(item.events) ?? line.verification ?? null,
+                      webAnswer: webAnswerFromEvents(item.events) ?? line.webAnswer ?? null
                     }
                   : line
               )
@@ -2513,7 +2662,8 @@ export default function CommandCenter() {
             pending: false,
             startedAt: null,
             feedback: feedbackFromMetadata(message.metadata),
-            verification: verificationFromEvents(message.metadata?.events)
+            verification: verificationFromEvents(message.metadata?.events),
+            webAnswer: webAnswerFromEvents(message.metadata?.events)
           }))
       );
     } catch (err) {
@@ -3560,6 +3710,12 @@ export default function CommandCenter() {
   const searchApiLabel =
     configuredSearchApis.length > 0 ? configuredSearchApis.join(", ") : "HTML fallback";
   const verticalLabel = (internetObservability?.verticals ?? []).slice(0, 6).join(", ");
+  const providerStats = Object.entries(internetObservability?.search_provider_stats ?? {});
+  const failingProviderStats = providerStats.filter(([, value]) => {
+    const ok = typeof value.ok === "number" ? value.ok : 0;
+    const failed = typeof value.failed === "number" ? value.failed : 0;
+    return failed > ok;
+  });
   const smokeChecks = Array.isArray(internetSmokeResult?.data.checks)
     ? internetSmokeResult.data.checks.filter(
         (item): item is { tool?: string; ok?: boolean; summary?: string } =>
@@ -3622,6 +3778,13 @@ export default function CommandCenter() {
           <Globe size={14} />
           <span>{compactText(verticalLabel, 90)}</span>
           <strong>verticals</strong>
+        </div>
+      )}
+      {failingProviderStats.length > 0 && (
+        <div className="internetLine">
+          <ShieldAlert size={14} />
+          <span>{compactText(failingProviderStats.map(([name]) => name).join(", "), 90)}</span>
+          <strong>api fail</strong>
         </div>
       )}
       {topInternetDomain && (
@@ -4321,6 +4484,9 @@ export default function CommandCenter() {
                       </div>
                     </div>
                     {renderRichMessage(line.content, line.role)}
+                    {line.role === "assistant" && line.webAnswer && (
+                      <WebAnswerPanel summary={line.webAnswer} />
+                    )}
                     {line.attachments && line.attachments.length > 0 && (
                       <div className="bubbleAttachments">
                         {line.attachments.map((attachment) => (

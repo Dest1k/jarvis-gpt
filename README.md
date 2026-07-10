@@ -15,7 +15,7 @@
 - Operator persona: durable structured profile (роль, домашний город, языки, стек, увлечения, текущий фокус, постоянные правила «всегда/никогда», глоссарий) читается агентом в каждом ответе.
 - Persona auto-learning: модель сама сохраняет устойчивые факты об операторе через safe-инструмент `persona.insight` (один факт за вызов, дедуп, капы, аудит) — без regex-извлечения.
 - Reasoning-first понимание задачи: для fuzzy web-запросов И для запросов о состоянии/действиях на машине оператора агент спрашивает модель (`_understand_intent`), которая понимает интент по смыслу и профилю оператора, а не по ключевым словам; `_looks_like_*`-эвристики остаются детерминированным офлайн-фолбэком. Арбитр может повышать задачу до миссии и уводить локальные запросы в нативные инструменты: решение `local_action` направляет к system.inspect (чтение состояния) и windows.native (мутации под approval) вместо интернет-поиска локального состояния.
-- Web evidence synthesis: `web.answer` is the first-choice Google-like route with optional Search API providers (Brave/Tavily/Serper), vertical search modes, research/fetch/render/archive fallback, verification, grounded LLM synthesis with URL retention, answer TTL cache, source diversity, transcripts/eval hooks, and structured cards for follow-up/UI use.
+- Web evidence synthesis: `web.answer` is the first-choice Google-like route with optional Search API providers (Brave/Tavily/Serper), vertical search modes, research/fetch/render/archive fallback, verification, grounded LLM synthesis with URL retention, answer TTL cache, source diversity, claim-level citations, transcripts/eval hooks, and structured cards for follow-up/UI use.
 - Агентный tool-loop: на пути ответа модель сама вызывает безопасные инструменты (web.search/fetch, filesystem/docker/runtime read, ...), видит observation и продолжает до готовности; опасные инструменты уходят в HITL-approval, бюджет шагов — из autonomy policy. Протокол JSON-act поверх обычных completions, деградирует без нативного tool-calling.
 - Гибридная семантическая память и файлы: retrieval фьюзит лексический BM25/LIKE с семантическим re-ranking (чистый Python fuzzy-вектор по умолчанию, опциональный remote `/embeddings` для настоящей семантики) через RRF — и для долговременной памяти, и для индексированных файловых чанков — поэтому релевантное находится даже при перефразировании и иной словоформе. Деградирует до лексики без потерь. При полном отсутствии лексического пересечения файловый retrieval падает на ограниченный recent-chunk пул с порогом связности, а не молчит.
 - Реальное исполнение миссий: шаг миссии при живом LLM выполняется агентным tool-loop (реальные инструменты, approval для опасного, аудит), а не статичным brief; офлайн — прежний детерминированный brief.
@@ -177,10 +177,11 @@ docker compose --profile llm up -d dispatcher
 ## Current readiness
 
 - Internet production surface: `web.answer`, `web.research`, `web.document.read`,
+  `internet.search_api.status`, `browser.session.diagnose`,
   `internet.observability`, and `internet.smoke` are safe tools. Command Center
-  status shows internet handoff, evidence/research counts, recent blocked pages,
-  cooldowns, top domain/provider, and can run a smoke check from the web URL
-  draft.
+  status shows internet handoff, evidence/research counts, answer cache, Search
+  API readiness/stats, recent blocked pages, cooldowns, top domain/provider, and
+  can run a smoke check from the web URL draft.
 - Internet everyday coverage: `web.archive` читает Wayback-копию заблокированных
   или исчезнувших страниц (blocked-ответ `web.fetch` сам подсказывает этот
   фолбэк), `web.feed` читает RSS/Atom вместо скрейпинга, `web.weather` даёт
@@ -189,9 +190,11 @@ docker compose --profile llm up -d dispatcher
   фоновый job kind `web.watch` следят за изменением страницы (цена, наличие,
   статус) и при изменении поднимают событие и durable-память.
 - Document intelligence surface: uploaded files or local paths can use
-  `documents.inspect`, `documents.read`, `documents.compare`,
-  `documents.edit.plan`, and `documents.apply_replacements` for Word/Excel/PDF
-  and text-like files. Edited copies are written under `data/document-outputs`
+  `documents.inspect`, `documents.review`, `documents.read`,
+  `documents.compare`, `documents.edit.plan`, and
+  `documents.apply_replacements` for Word/Excel/PDF and text-like files.
+  `documents.review` reports OCR need, Word redline readiness, and Excel
+  formula/style audit. Edited copies are written under `data/document-outputs`
   without overwriting originals.
 - Unified launcher `.\jarvis.cmd` provides keyboard-menu start/stop/restart/status/logs/doctor/open flows plus `gemma4-turbo` and `gemma4-mono` startup shortcuts.
 - Experience API persists operator preferences, autonomy policy, daily briefing, self-heal reports and benchmark history in SQLite.

@@ -137,6 +137,7 @@ WEB_FETCH_CACHE_MAX_RECORDS = 100
 WEB_ANSWER_CACHE_KEY = "web.answer.cache"
 WEB_ANSWER_CACHE_TTL_SEC = 600
 WEB_ANSWER_CACHE_MAX_RECORDS = 80
+WEB_SEARCH_PROVIDER_STATS_KEY = "web.search.provider.stats"
 WEB_RATE_KEY_PREFIX = "web.rate."
 WEB_RATE_WINDOW_SEC = 600
 WEB_RATE_MAX_REQUESTS = 12
@@ -144,6 +145,20 @@ WEB_RATE_BLOCKED_COOLDOWN_SEC = 900
 WEB_DOCUMENT_READ_MAX_BYTES = 50_000_000
 WEB_DOCUMENT_ZIP_MEMBER_MAX_BYTES = 2_000_000
 DOCUMENT_OUTPUT_DIRNAME = "document-outputs"
+MEDIA_TRANSCRIPT_EXTENSIONS = {
+    ".aac",
+    ".flac",
+    ".m4a",
+    ".mkv",
+    ".mov",
+    ".mp3",
+    ".mp4",
+    ".mpeg",
+    ".mpg",
+    ".ogg",
+    ".wav",
+    ".webm",
+}
 CONSENT_WALL_MARKERS = (
     "accept cookies",
     "allow cookies",
@@ -679,6 +694,22 @@ class ToolRegistry:
         )
         self.add(
             ToolSpec(
+                name="browser.session.diagnose",
+                description=(
+                    "Diagnose the operator Chrome/CDP session and current handoff state, "
+                    "then recommend autonomous read, scroll, login/consent/CAPTCHA handoff, "
+                    "or Chrome launch."
+                ),
+                category="browser",
+                input_schema={
+                    "url": "Optional HTTP(S) URL to read through operator Chrome before diagnosing",
+                    "debug_url": "Optional Chrome DevTools URL",
+                },
+                handler=_browser_session_diagnose,
+            )
+        )
+        self.add(
+            ToolSpec(
                 name="browser.open_many",
                 description="Open multiple validated HTTP(S) URLs through the native host browser.",
                 category="browser",
@@ -788,6 +819,25 @@ class ToolRegistry:
                     "max_chars": "Maximum extracted preview characters",
                 },
                 handler=_documents_inspect,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="documents.review",
+                description=(
+                    "Review a document for OCR need, Word redline/edit readiness, Excel formulas/"
+                    "styles, and optional reference comparison."
+                ),
+                category="documents",
+                input_schema={
+                    "file_id": "Target uploaded/indexed file id",
+                    "path": "Target local path",
+                    "reference_file_id": "Optional reference file id",
+                    "reference_path": "Optional reference path",
+                    "instruction": "Optional edit/review instruction",
+                    "max_chars": "Maximum extracted text characters",
+                },
+                handler=_documents_review,
             )
         )
         self.add(
@@ -953,8 +1003,12 @@ class ToolRegistry:
                 category="web",
                 input_schema={
                     "url": "Public video/audio/page URL",
+                    "path": "Optional local/quarantine media path for local transcription",
                     "lang": "Preferred transcript language (default ru, then en)",
                     "max_chars": "Maximum transcript characters",
+                    "allow_download": (
+                        "Download public media URL to quarantine for local transcription"
+                    ),
                 },
                 handler=_web_transcript,
             )
@@ -1190,6 +1244,19 @@ class ToolRegistry:
                 category="web",
                 input_schema={"limit": "Recent tool runs to inspect"},
                 handler=_internet_observability,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="internet.search_api.status",
+                description=(
+                    "Report configured Search API providers, masked key presence, supported "
+                    "verticals, and recent provider success/failure stats. Optional live check "
+                    "uses a tiny provider query."
+                ),
+                category="web",
+                input_schema={"check": "Run live provider health probes, default false"},
+                handler=_internet_search_api_status,
             )
         )
         self.add(
@@ -1925,6 +1992,131 @@ def _browser_handoff_status(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunR
     )
 
 
+async def _browser_session_diagnose(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    debug_url = normalize_debug_url(str(args.get("debug_url") or DEFAULT_CHROME_DEBUG_URL))
+    raw_url = str(args.get("url") or "").strip()
+    chrome = await _browser_chrome_status(ctx, {"debug_url": debug_url})
+    handoff_response = _browser_handoff_status(ctx, {})
+    handoff = (
+        handoff_response.data.get("handoff")
+        if isinstance(handoff_response.data, dict)
+        else None
+    )
+    read_result: ToolRunResponse | None = None
+    if raw_url and chrome.ok:
+        read_result = await _browser_read(
+            ctx,
+            {"url": raw_url, "max_chars": 5000, "debug_url": debug_url},
+        )
+
+    diagnosis = _browser_session_recommendation(chrome, handoff, read_result)
+    data = {
+        "diagnosis": diagnosis,
+        "chrome": {
+            "ok": chrome.ok,
+            "summary": chrome.summary,
+            "data": chrome.data,
+        },
+        "handoff": handoff if isinstance(handoff, dict) else None,
+        "read": (
+            {
+                "ok": read_result.ok,
+                "summary": read_result.summary,
+                "url": read_result.data.get("url") if isinstance(read_result.data, dict) else None,
+                "title": (
+                    read_result.data.get("title")
+                    if isinstance(read_result.data, dict)
+                    else None
+                ),
+                "needs_human_verification": (
+                    read_result.data.get("needs_human_verification")
+                    if isinstance(read_result.data, dict)
+                    else None
+                ),
+                "forms": (
+                    read_result.data.get("forms")
+                    if isinstance(read_result.data, dict)
+                    else {}
+                ),
+                "safety": (
+                    read_result.data.get("safety")
+                    if isinstance(read_result.data, dict)
+                    else {}
+                ),
+            }
+            if read_result is not None
+            else None
+        ),
+    }
+    return ToolRunResponse(
+        tool="browser.session.diagnose",
+        ok=chrome.ok or isinstance(handoff, dict),
+        summary=diagnosis["summary"],
+        data=data,
+    )
+
+
+def _browser_session_recommendation(
+    chrome: ToolRunResponse,
+    handoff: Any,
+    read_result: ToolRunResponse | None,
+) -> dict[str, Any]:
+    if isinstance(handoff, dict) and handoff:
+        reason = str(handoff.get("reason") or handoff.get("status") or "handoff")
+        return {
+            "route": "operator_handoff",
+            "summary": f"Browser handoff is pending: {reason}.",
+            "actions": ["operator_complete_handoff", "browser.handoff.status"],
+        }
+    if not chrome.ok:
+        return {
+            "route": "launch_chrome",
+            "summary": "Chrome CDP is unavailable; launch or attach operator Chrome first.",
+            "actions": ["browser.chrome.launch", "browser.chrome.status"],
+        }
+    if read_result is None:
+        return {
+            "route": "ready",
+            "summary": "Operator Chrome CDP is ready.",
+            "actions": ["browser.read", "browser.scroll", "browser.click"],
+        }
+    data = read_result.data if isinstance(read_result.data, dict) else {}
+    safety = data.get("safety") if isinstance(data.get("safety"), dict) else {}
+    forms = data.get("forms") if isinstance(data.get("forms"), dict) else {}
+    needs_human = bool(data.get("needs_human_verification"))
+    if needs_human or safety.get("consent_wall_detected"):
+        return {
+            "route": "human_verification",
+            "summary": "The page needs human verification or cookie/consent handling.",
+            "actions": ["browser.read", "browser.click", "browser.handoff.status"],
+        }
+    if int(forms.get("password_input_count") or 0) > 0:
+        return {
+            "route": "login_required",
+            "summary": "The page appears to require login in operator Chrome.",
+            "actions": ["browser.type", "browser.click", "browser.handoff.status"],
+        }
+    if int(forms.get("sensitive_input_count") or 0) > 0:
+        return {
+            "route": "sensitive_form",
+            "summary": "Sensitive form inputs are present; keep operator approval in the loop.",
+            "actions": ["browser.type", "browser.click"],
+        }
+    if read_result.ok:
+        return {
+            "route": "autonomous_read",
+            "summary": (
+                "Page is readable through operator Chrome; autonomous scroll/read can continue."
+            ),
+            "actions": ["browser.read", "browser.scroll"],
+        }
+    return {
+        "route": "browser_retry",
+        "summary": f"Chrome is attached but read failed: {read_result.summary}",
+        "actions": ["browser.scroll", "web.render", "web.archive"],
+    }
+
+
 async def _browser_action(
     ctx: ToolContext,
     args: dict[str, Any],
@@ -2241,6 +2433,7 @@ def _documents_inspect(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespons
         return ToolRunResponse(tool="documents.inspect", ok=False, summary=str(exc))
     payload = dict(target["document"])
     text = str(payload.pop("text", "") or "")
+    capabilities = _document_capabilities(payload, text=text, path=target["path"])
     summary = _document_summary_text(payload)
     return ToolRunResponse(
         tool="documents.inspect",
@@ -2251,6 +2444,59 @@ def _documents_inspect(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespons
             "document": payload,
             "text_preview": _short_text(text, 1600),
             "summary": summary,
+            "capabilities": capabilities,
+        },
+    )
+
+
+def _documents_review(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    max_chars = _int_arg(args.get("max_chars"), default=60000, minimum=1000, maximum=150000)
+    instruction = " ".join(str(args.get("instruction") or "").split())
+    try:
+        target = _document_target(ctx, args, max_chars=max_chars)
+        reference = None
+        if args.get("reference_file_id") or args.get("reference_path"):
+            reference = _document_target(
+                ctx,
+                {
+                    "file_id": args.get("reference_file_id"),
+                    "path": args.get("reference_path"),
+                },
+                max_chars=max_chars,
+            )
+    except ValueError as exc:
+        return ToolRunResponse(tool="documents.review", ok=False, summary=str(exc))
+    target_doc = target["document"]
+    text = str(target_doc.get("text") or "")
+    capabilities = _document_capabilities(target_doc, text=text, path=target["path"])
+    comparison = (
+        compare_documents(target_doc, reference["document"], max_diffs=100)
+        if reference is not None
+        else None
+    )
+    review = {
+        "capabilities": capabilities,
+        "recommendations": _document_review_recommendations(
+            target_doc,
+            capabilities=capabilities,
+            instruction=instruction,
+            comparison=comparison,
+        ),
+        "redline": _document_redline_readiness(target_doc, comparison=comparison),
+        "excel": _document_excel_audit(target_doc),
+        "ocr": _document_ocr_readiness(target_doc, capabilities=capabilities),
+    }
+    return ToolRunResponse(
+        tool="documents.review",
+        ok=True,
+        summary=f"Reviewed {target_doc['kind']} document: {target_doc['name']}.",
+        data={
+            "target": _document_target_payload(target),
+            "reference": _document_target_payload(reference) if reference else None,
+            "document": {key: value for key, value in target_doc.items() if key != "text"},
+            "text_preview": _short_text(text, 2000),
+            "comparison": comparison,
+            "review": review,
         },
     )
 
@@ -2430,10 +2676,24 @@ async def _web_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
                             "missing_key": True,
                         }
                     )
+                    _web_provider_stats_record(
+                        ctx.storage,
+                        source,
+                        ok=False,
+                        vertical=vertical,
+                        error="missing_api_key",
+                    )
                     continue
                 rate_block = _web_rate_limit_block(ctx.storage, url)
                 if rate_block is not None:
                     last_failure = {"source": source, **rate_block}
+                    _web_provider_stats_record(
+                        ctx.storage,
+                        source,
+                        ok=False,
+                        vertical=vertical,
+                        error=rate_block["summary"],
+                    )
                     continue
                 try:
                     request_headers = {**headers, **dict(request.get("headers") or {})}
@@ -2452,6 +2712,13 @@ async def _web_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
                 except httpx.HTTPError as exc:
                     last_failure = {"source": source, "summary": str(exc), "url": url}
                     _web_rate_limit_record(ctx.storage, url, ok=False)
+                    _web_provider_stats_record(
+                        ctx.storage,
+                        source,
+                        ok=False,
+                        vertical=vertical,
+                        error=str(exc),
+                    )
                     continue
                 raw_text = _decode_response_text(response)
                 status_code = int(getattr(response, "status_code", 200) or 200)
@@ -2465,6 +2732,13 @@ async def _web_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
                         "url": url,
                     }
                     _web_rate_limit_record(ctx.storage, url, ok=False, blocked=True)
+                    _web_provider_stats_record(
+                        ctx.storage,
+                        source,
+                        ok=False,
+                        vertical=vertical,
+                        error="blocked",
+                    )
                     continue
                 parsed = _web_parse_search_results(
                     source,
@@ -2501,6 +2775,7 @@ async def _web_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
                     }
                 )
                 _web_rate_limit_record(ctx.storage, url, ok=True)
+                _web_provider_stats_record(ctx.storage, source, ok=True, vertical=vertical)
                 if len(collected) >= limit:
                     break
             results = collected[:limit]
@@ -3073,11 +3348,13 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
         )
         if bool(synthesis.get("used")) and str(synthesis.get("answer") or "").strip():
             answer = str(synthesis["answer"]).strip()
+    claim_citations = _web_answer_claim_citations(answer, ranked_sources)
     cards = _web_answer_cards(
         question=question,
         queries=queries,
         sources=ranked_sources,
         verification=verification_dict,
+        claim_citations=claim_citations,
     )
     confidence = _web_answer_confidence(ranked_sources, verification_dict)
     record = _store_web_research_record(
@@ -3099,6 +3376,7 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
         "answer": answer,
         "sources": ranked_sources,
         "citations": _research_citations(ranked_sources),
+        "claim_citations": claim_citations,
         "verification": verification_dict,
         "confidence": confidence,
         "cards": cards,
@@ -3768,8 +4046,25 @@ async def _web_feed(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
 
 async def _web_transcript(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     raw_url = str(args.get("url") or "").strip()
+    raw_path = str(args.get("path") or "").strip()
     preferred_lang = str(args.get("lang") or "ru").strip().lower()[:12] or "ru"
     max_chars = _int_arg(args.get("max_chars"), default=12000, minimum=1000, maximum=50000)
+    allow_download = _bool_arg(args.get("allow_download"), default=False)
+    if raw_path:
+        return _web_transcript_local_media(
+            ctx,
+            raw_path,
+            lang=preferred_lang,
+            max_chars=max_chars,
+            source_url=raw_url,
+        )
+    if not raw_url:
+        return ToolRunResponse(
+            tool="web.transcript",
+            ok=False,
+            summary="A public URL or local media path is required.",
+            data={"local_transcription": _media_transcription_status()},
+        )
     document = await _fetch_public_document(
         ctx,
         raw_url,
@@ -3816,6 +4111,24 @@ async def _web_transcript(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResp
                 }
     if not transcript:
         transcript = _extract_html_transcript(raw_text)
+    if not transcript and allow_download and _url_looks_like_media(raw_url):
+        downloaded = await _web_download(
+            ctx,
+            {
+                "url": raw_url,
+                "max_bytes": 50_000_000,
+                "filename": Path(urlparse(raw_url).path).name,
+            },
+        )
+        if downloaded.ok and isinstance(downloaded.data, dict):
+            return _web_transcript_local_media(
+                ctx,
+                str(downloaded.data.get("path") or ""),
+                lang=preferred_lang,
+                max_chars=max_chars,
+                source_url=raw_url,
+                download=downloaded.data,
+            )
     transcript = _short_text(transcript, max_chars)
     safety = _web_content_safety(source="web.transcript", url=page_url, text=transcript)
     evidence = _store_web_evidence(
@@ -3845,8 +4158,152 @@ async def _web_transcript(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResp
             "tracks": tracks,
             "safety": safety,
             "evidence_id": evidence["id"],
+            "local_transcription": _media_transcription_status(),
         },
     )
+
+
+def _web_transcript_local_media(
+    ctx: ToolContext,
+    raw_path: str,
+    *,
+    lang: str,
+    max_chars: int,
+    source_url: str = "",
+    download: dict[str, Any] | None = None,
+) -> ToolRunResponse:
+    status = _media_transcription_status()
+    try:
+        path = _resolve_document_path(ctx.settings, raw_path)
+    except ValueError as exc:
+        return ToolRunResponse(
+            tool="web.transcript",
+            ok=False,
+            summary=str(exc),
+            data={"local_transcription": status},
+        )
+    if not path.exists() or not path.is_file():
+        return ToolRunResponse(
+            tool="web.transcript",
+            ok=False,
+            summary="Media file does not exist.",
+            data={"path": str(path), "local_transcription": status},
+        )
+    if path.suffix.lower() not in MEDIA_TRANSCRIPT_EXTENSIONS:
+        return ToolRunResponse(
+            tool="web.transcript",
+            ok=False,
+            summary="Local transcription supports common audio/video media extensions only.",
+            data={"path": str(path), "local_transcription": status},
+        )
+    if not status["available"]:
+        return ToolRunResponse(
+            tool="web.transcript",
+            ok=False,
+            summary="Local media transcription is unavailable; install the whisper CLI.",
+            data={"path": str(path), "local_transcription": status, "download": download or None},
+        )
+    try:
+        transcript = _run_whisper_transcription(path, lang=lang, max_chars=max_chars)
+    except (OSError, subprocess.SubprocessError, TimeoutError, ValueError) as exc:
+        return ToolRunResponse(
+            tool="web.transcript",
+            ok=False,
+            summary=f"Local media transcription failed: {exc}",
+            data={"path": str(path), "local_transcription": status, "download": download or None},
+        )
+    safety = _web_content_safety(
+        source="web.transcript",
+        url=source_url or str(path),
+        text=transcript,
+    )
+    evidence = _store_web_evidence(
+        ctx.storage,
+        source="web.transcript",
+        url=source_url or str(path),
+        title=path.name,
+        text=transcript,
+        content_type="text/plain",
+        safety=safety,
+        confidence=0.72 if transcript else 0.2,
+        extra={"source": "local_whisper", "path": str(path), "download": download or None},
+    )
+    return ToolRunResponse(
+        tool="web.transcript",
+        ok=bool(transcript.strip()),
+        summary=(
+            "Extracted transcript from local media."
+            if transcript
+            else "Local media had no transcript text."
+        ),
+        data={
+            "url": source_url or None,
+            "path": str(path),
+            "text": transcript,
+            "source": "local_whisper",
+            "track": None,
+            "tracks": [],
+            "safety": safety,
+            "evidence_id": evidence["id"],
+            "local_transcription": status,
+            "download": download or None,
+        },
+    )
+
+
+def _media_transcription_status() -> dict[str, Any]:
+    whisper = shutil.which("whisper")
+    return {
+        "available": bool(whisper),
+        "engine": "whisper" if whisper else None,
+        "command": whisper,
+        "supported_extensions": sorted(MEDIA_TRANSCRIPT_EXTENSIONS),
+    }
+
+
+def _run_whisper_transcription(path: Path, *, lang: str, max_chars: int) -> str:
+    whisper = shutil.which("whisper")
+    if not whisper:
+        raise ValueError("whisper CLI not found")
+    with tempfile.TemporaryDirectory(prefix="jarvis-whisper-") as tmp_dir:
+        command = [
+            whisper,
+            str(path),
+            "--output_format",
+            "txt",
+            "--output_dir",
+            tmp_dir,
+            "--fp16",
+            "False",
+        ]
+        if lang and lang != "auto":
+            command.extend(["--language", lang])
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=600,
+        )
+        if result.returncode != 0:
+            raise subprocess.SubprocessError(_short_text(result.stderr or result.stdout, 500))
+        output_path = Path(tmp_dir) / f"{path.stem}.txt"
+        if not output_path.exists():
+            candidates = sorted(Path(tmp_dir).glob("*.txt"))
+            output_path = candidates[0] if candidates else output_path
+        text = (
+            output_path.read_text(encoding="utf-8", errors="replace")
+            if output_path.exists()
+            else ""
+        )
+    return _short_text(text, max_chars)
+
+
+def _url_looks_like_media(raw_url: str) -> bool:
+    suffix = Path(urlparse(raw_url).path).suffix.lower()
+    return suffix in MEDIA_TRANSCRIPT_EXTENSIONS
 
 
 def _youtube_caption_tracks(html: str) -> list[dict[str, str]]:
@@ -4760,6 +5217,95 @@ async def _internet_observability(ctx: ToolContext, args: dict[str, Any]) -> Too
     )
 
 
+async def _internet_search_api_status(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    check = _bool_arg(args.get("check"), default=False)
+    readiness = _search_api_readiness()
+    live_checks: list[dict[str, Any]] = []
+    if check:
+        for provider in readiness.get("configured", []):
+            result = await _web_search(
+                ctx,
+                {
+                    "query": "search provider health",
+                    "provider": _search_provider_public_name(str(provider)),
+                    "limit": 1,
+                    "vertical": "web",
+                    "pages": 1,
+                },
+            )
+            live_checks.append(
+                {
+                    "provider": provider,
+                    "ok": result.ok,
+                    "summary": result.summary,
+                    "source": result.data.get("source") if isinstance(result.data, dict) else None,
+                }
+            )
+    stats = _web_provider_stats_snapshot(ctx.storage)
+    configured = (
+        readiness.get("configured") if isinstance(readiness.get("configured"), list) else []
+    )
+    return ToolRunResponse(
+        tool="internet.search_api.status",
+        ok=bool(configured) or bool(readiness.get("fallback")),
+        summary=(
+            f"Configured Search API provider(s): {', '.join(str(item) for item in configured)}."
+            if configured
+            else "No Search API keys configured; HTML fallback providers remain available."
+        ),
+        data={
+            "readiness": readiness,
+            "stats": stats,
+            "live_checks": live_checks,
+            "guidance": _search_api_guidance(readiness, stats),
+        },
+    )
+
+
+def _search_provider_public_name(provider: str) -> str:
+    return {
+        "brave_api": "brave",
+        "tavily_api": "tavily",
+        "serper_api": "serper",
+    }.get(provider, provider)
+
+
+def _search_api_guidance(readiness: dict[str, Any], stats: dict[str, Any]) -> list[str]:
+    guidance: list[str] = []
+    configured = (
+        readiness.get("configured") if isinstance(readiness.get("configured"), list) else []
+    )
+    if not configured:
+        guidance.append(
+            "Set JARVIS_BRAVE_SEARCH_API_KEY, JARVIS_TAVILY_API_KEY, "
+            "or JARVIS_SERPER_API_KEY for stable search APIs."
+        )
+    provider_map = (
+        readiness.get("providers") if isinstance(readiness.get("providers"), dict) else {}
+    )
+    serper = (
+        provider_map.get("serper_api")
+        if isinstance(provider_map.get("serper_api"), dict)
+        else {}
+    )
+    if not serper.get("configured"):
+        guidance.append(
+            "Serper is the broadest vertical provider for images/shopping/places/scholar."
+        )
+    for name, item in stats.items():
+        if not isinstance(item, dict):
+            continue
+        if int(item.get("failed") or 0) > int(item.get("ok") or 0):
+            guidance.append(
+                f"{name} has more failures than successes recently; inspect last_error."
+            )
+    if not guidance:
+        guidance.append(
+            "Search API layer is configured; keep HTML fallback enabled for resilience."
+        )
+    return guidance[:6]
+
+
 async def _internet_smoke(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     url = str(args.get("url") or "https://example.com/").strip()
     checks: list[dict[str, Any]] = []
@@ -4804,7 +5350,7 @@ async def _internet_smoke(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResp
 
 async def _web_eval(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     cases = _web_eval_cases(args.get("cases"))
-    limit = _int_arg(args.get("limit"), default=min(len(cases), 5), minimum=1, maximum=10)
+    limit = _int_arg(args.get("limit"), default=min(len(cases), 8), minimum=1, maximum=30)
     use_cache = _bool_arg(args.get("use_cache"), default=False)
     results: list[dict[str, Any]] = []
     for case in cases[:limit]:
@@ -4871,7 +5417,12 @@ async def _web_eval(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
         tool="web.eval",
         ok=bool(results) and average >= 0.55,
         summary=f"Web answer eval score {average:.2f} across {len(results)} case(s).",
-        data={"average_score": average, "results": results, "limit": limit},
+        data={
+            "average_score": average,
+            "results": results,
+            "limit": limit,
+            "catalog_size": len(cases),
+        },
     )
 
 
@@ -4920,6 +5471,114 @@ def _web_eval_cases(value: Any) -> list[dict[str, Any]]:
             "expected_terms": ["nvidia"],
             "freshness": "month",
             "vertical": "news",
+        },
+        {
+            "question": "latest Chrome stable release official blog",
+            "expected_terms": ["chrome"],
+            "freshness": "month",
+            "vertical": "news",
+        },
+        {
+            "question": "Microsoft Windows release health official dashboard",
+            "expected_terms": ["microsoft", "windows"],
+            "freshness": "month",
+            "vertical": "web",
+        },
+        {
+            "question": "Apple latest iOS security update official support",
+            "expected_terms": ["apple", "ios"],
+            "freshness": "month",
+            "vertical": "web",
+        },
+        {
+            "question": "GitHub status incidents official page",
+            "expected_terms": ["github"],
+            "freshness": "week",
+            "vertical": "web",
+        },
+        {
+            "question": "current Moscow weather official forecast",
+            "expected_terms": ["weather", "forecast"],
+            "freshness": "day",
+            "vertical": "web",
+        },
+        {
+            "question": "best price Samsung Galaxy S latest shopping results",
+            "expected_terms": ["samsung", "galaxy"],
+            "freshness": "week",
+            "vertical": "shopping",
+        },
+        {
+            "question": "restaurants near Red Square Moscow places results",
+            "expected_terms": ["moscow"],
+            "freshness": "",
+            "vertical": "places",
+        },
+        {
+            "question": "recent arxiv retrieval augmented generation survey",
+            "expected_terms": ["retrieval", "generation"],
+            "freshness": "year",
+            "vertical": "scholar",
+        },
+        {
+            "question": "WHO latest pandemic disease outbreak news",
+            "expected_terms": ["who"],
+            "freshness": "week",
+            "vertical": "news",
+        },
+        {
+            "question": "Central Bank of Russia key rate latest official",
+            "expected_terms": ["bank", "rate"],
+            "freshness": "month",
+            "vertical": "web",
+        },
+        {
+            "question": "Docker compose latest release notes official",
+            "expected_terms": ["docker", "compose"],
+            "freshness": "month",
+            "vertical": "web",
+        },
+        {
+            "question": "Node.js latest LTS release official",
+            "expected_terms": ["node"],
+            "freshness": "month",
+            "vertical": "web",
+        },
+        {
+            "question": "Tesla latest quarterly deliveries investor relations",
+            "expected_terms": ["tesla"],
+            "freshness": "month",
+            "vertical": "news",
+        },
+        {
+            "question": "OpenAI latest model documentation official",
+            "expected_terms": ["openai"],
+            "freshness": "month",
+            "vertical": "web",
+        },
+        {
+            "question": "Yandex weather Moscow hourly forecast",
+            "expected_terms": ["moscow"],
+            "freshness": "day",
+            "vertical": "web",
+        },
+        {
+            "question": "latest CVE OpenSSL advisory official",
+            "expected_terms": ["openssl", "cve"],
+            "freshness": "month",
+            "vertical": "web",
+        },
+        {
+            "question": "official PostgreSQL latest minor release notes",
+            "expected_terms": ["postgresql"],
+            "freshness": "month",
+            "vertical": "web",
+        },
+        {
+            "question": "new electric vehicles images 2026",
+            "expected_terms": ["electric"],
+            "freshness": "year",
+            "vertical": "images",
         },
     ]
 
@@ -5714,6 +6373,151 @@ def _document_summary_text(document: dict[str, Any]) -> str:
     return f"{kind.upper()}: {document.get('size', 0)} byte(s)."
 
 
+def _document_capabilities(
+    document: dict[str, Any],
+    *,
+    text: str,
+    path: Path,
+) -> dict[str, Any]:
+    kind = str(document.get("kind") or path.suffix.lower().lstrip(".") or "document")
+    structure = document.get("structure") if isinstance(document.get("structure"), dict) else {}
+    page_count = int(structure.get("page_count") or 0)
+    ocr_needed = kind == "pdf" and len(" ".join(text.split())) < max(120, page_count * 80)
+    tesseract = shutil.which("tesseract")
+    pdftoppm = shutil.which("pdftoppm")
+    whisper = shutil.which("whisper")
+    styles = structure.get("styles") if isinstance(structure.get("styles"), list) else []
+    return {
+        "kind": kind,
+        "text_chars": len(text),
+        "has_text": bool(text.strip()),
+        "ocr": {
+            "needed": ocr_needed,
+            "available": bool(tesseract and (pdftoppm or kind != "pdf")),
+            "tesseract": bool(tesseract),
+            "pdftoppm": bool(pdftoppm),
+        },
+        "word": {
+            "redline_plan_supported": kind == "docx",
+            "exact_replacements_supported": kind in {"docx", "txt", "md", "html", "csv", "tsv"},
+            "comments_detected": int(structure.get("comment_count") or 0),
+            "style_count": len(styles),
+        },
+        "excel": {
+            "supported": kind in {"xlsx", "xlsm"},
+            "sheet_count": int(structure.get("sheet_count") or 0),
+            "formula_count": int(structure.get("formula_count") or 0),
+            "style_count": int(structure.get("style_count") or 0),
+        },
+        "diff": {
+            "text_diff_supported": True,
+            "visual_diff_supported": bool(shutil.which("soffice") or shutil.which("libreoffice")),
+        },
+        "media_transcription": {
+            "supported_extension": path.suffix.lower() in MEDIA_TRANSCRIPT_EXTENSIONS,
+            "whisper_available": bool(whisper),
+        },
+    }
+
+
+def _document_review_recommendations(
+    document: dict[str, Any],
+    *,
+    capabilities: dict[str, Any],
+    instruction: str,
+    comparison: dict[str, Any] | None,
+) -> list[str]:
+    recommendations: list[str] = []
+    kind = str(document.get("kind") or "document")
+    ocr = capabilities.get("ocr") if isinstance(capabilities.get("ocr"), dict) else {}
+    excel = capabilities.get("excel") if isinstance(capabilities.get("excel"), dict) else {}
+    word = capabilities.get("word") if isinstance(capabilities.get("word"), dict) else {}
+    if ocr.get("needed"):
+        if ocr.get("available"):
+            recommendations.append("Run OCR before answering detailed questions about this PDF.")
+        else:
+            recommendations.append(
+                "PDF looks scanned or text-poor; install tesseract + pdftoppm for OCR fallback."
+            )
+    if kind == "docx" and (instruction or comparison):
+        recommendations.append(
+            "Use documents.compare + documents.edit.plan before applying replacements."
+        )
+    if kind in {"xlsx", "xlsm"} and int(excel.get("formula_count") or 0) > 0:
+        recommendations.append(
+            "Preserve formulas; answer with sheet/formula references when editing."
+        )
+    if word.get("comments_detected"):
+        recommendations.append("Review embedded Word comments before final edits.")
+    if comparison:
+        stats = comparison.get("stats") if isinstance(comparison.get("stats"), dict) else {}
+        if int(stats.get("diff_lines") or 0) > 0:
+            recommendations.append(
+                "Reference comparison has differences; expose additions/deletions first."
+            )
+    if not recommendations:
+        recommendations.append(
+            "Document is text-readable; standard inspect/read/compare flow is enough."
+        )
+    return recommendations[:8]
+
+
+def _document_redline_readiness(
+    document: dict[str, Any],
+    *,
+    comparison: dict[str, Any] | None,
+) -> dict[str, Any]:
+    kind = str(document.get("kind") or "")
+    stats = comparison.get("stats") if isinstance(comparison, dict) else {}
+    return {
+        "supported": kind == "docx",
+        "mode": "planned_text_redline" if kind == "docx" else "text_diff_only",
+        "reference_diff_lines": int(stats.get("diff_lines") or 0) if isinstance(stats, dict) else 0,
+        "can_apply_exact_replacements": kind in {"docx", "txt", "md", "html", "csv", "tsv"},
+        "track_changes_native": False,
+    }
+
+
+def _document_excel_audit(document: dict[str, Any]) -> dict[str, Any]:
+    structure = document.get("structure") if isinstance(document.get("structure"), dict) else {}
+    sheets = structure.get("sheets") if isinstance(structure.get("sheets"), list) else []
+    formulas: list[str] = []
+    for sheet in sheets:
+        if not isinstance(sheet, dict):
+            continue
+        for formula in sheet.get("formulas") or []:
+            text = str(formula).strip()
+            if text:
+                formulas.append(text)
+            if len(formulas) >= 20:
+                break
+        if len(formulas) >= 20:
+            break
+    return {
+        "supported": str(document.get("kind") or "") in {"xlsx", "xlsm"},
+        "sheet_count": int(structure.get("sheet_count") or 0),
+        "formula_count": int(structure.get("formula_count") or 0),
+        "style_count": int(structure.get("style_count") or 0),
+        "sample_formulas": formulas,
+    }
+
+
+def _document_ocr_readiness(
+    document: dict[str, Any],
+    *,
+    capabilities: dict[str, Any],
+) -> dict[str, Any]:
+    ocr = capabilities.get("ocr") if isinstance(capabilities.get("ocr"), dict) else {}
+    structure = document.get("structure") if isinstance(document.get("structure"), dict) else {}
+    return {
+        "needed": bool(ocr.get("needed")),
+        "available": bool(ocr.get("available")),
+        "page_count": int(structure.get("page_count") or 0),
+        "text_chars": int(capabilities.get("text_chars") or 0),
+        "engine": "tesseract+pdftoppm" if ocr.get("available") else None,
+    }
+
+
 def _document_edit_plan_payload(
     instruction: str,
     target: dict[str, Any],
@@ -6197,14 +7001,20 @@ def _search_api_readiness() -> dict[str, Any]:
     providers = {
         "brave_api": {
             "configured": bool(_env_secret("BRAVE_SEARCH_API_KEY")),
+            "env": "BRAVE_SEARCH_API_KEY",
+            "key": _masked_env_secret("BRAVE_SEARCH_API_KEY"),
             "verticals": ["web", "news", "images"],
         },
         "tavily_api": {
             "configured": bool(_env_secret("TAVILY_API_KEY")),
+            "env": "TAVILY_API_KEY",
+            "key": _masked_env_secret("TAVILY_API_KEY"),
             "verticals": ["web", "news"],
         },
         "serper_api": {
             "configured": bool(_env_secret("SERPER_API_KEY")),
+            "env": "SERPER_API_KEY",
+            "key": _masked_env_secret("SERPER_API_KEY"),
             "verticals": ["web", "news", "images", "shopping", "places", "scholar"],
         },
     }
@@ -6217,6 +7027,47 @@ def _search_api_readiness() -> dict[str, Any]:
 
 def _env_secret(name: str) -> str:
     return os.environ.get(f"JARVIS_{name}", os.environ.get(name, "")).strip()
+
+
+def _masked_env_secret(name: str) -> str | None:
+    value = _env_secret(name)
+    if not value:
+        return None
+    return f"set:{len(value)}:{value[-4:].rjust(4, '*')}"
+
+
+def _web_provider_stats_record(
+    storage: JarvisStorage,
+    source: str,
+    *,
+    ok: bool,
+    vertical: str,
+    error: str = "",
+) -> None:
+    if not source:
+        return
+    now = utc_now()
+    records = storage.get_runtime_value(WEB_SEARCH_PROVIDER_STATS_KEY, {})
+    if not isinstance(records, dict):
+        records = {}
+    current = records.get(source)
+    if not isinstance(current, dict):
+        current = {"ok": 0, "failed": 0}
+    current["ok" if ok else "failed"] = int(current.get("ok" if ok else "failed") or 0) + 1
+    current["last_at"] = now
+    current["last_vertical"] = vertical
+    current["last_ok"] = bool(ok)
+    if error:
+        current["last_error"] = _short_text(error, 240)
+    elif ok:
+        current.pop("last_error", None)
+    records[source] = current
+    storage.set_runtime_value(WEB_SEARCH_PROVIDER_STATS_KEY, records)
+
+
+def _web_provider_stats_snapshot(storage: JarvisStorage) -> dict[str, Any]:
+    records = storage.get_runtime_value(WEB_SEARCH_PROVIDER_STATS_KEY, {})
+    return records if isinstance(records, dict) else {}
 
 
 def _api_search_request(
@@ -7528,6 +8379,7 @@ def _web_answer_cards(
     queries: list[str],
     sources: list[dict[str, Any]],
     verification: dict[str, Any],
+    claim_citations: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     domains = [_url_domain(str(item.get("url") or "")) for item in sources]
     domains = [domain for domain in domains if domain]
@@ -7552,6 +8404,8 @@ def _web_answer_cards(
         },
         "top_sources": _web_answer_top_source_cards(sources),
         "facts": _web_answer_fact_cards(sources),
+        "claim_citations": claim_citations or [],
+        "vertical_cards": _web_answer_vertical_cards(sources),
         "gaps": _web_answer_verification_gaps(verification),
         "followup_queries": queries[1:4],
     }
@@ -7589,6 +8443,123 @@ def _web_answer_fact_cards(sources: list[dict[str, Any]]) -> list[dict[str, Any]
             }
         )
     return facts
+
+
+def _web_answer_claim_citations(
+    answer: str,
+    sources: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    claims = _web_answer_claim_units(answer)
+    citations: list[dict[str, Any]] = []
+    source_terms = []
+    for index, source in enumerate(sources[:8], start=1):
+        text = " ".join(
+            str(source.get(key) or "")
+            for key in ("title", "url", "snippet", "excerpt", "text")
+        )
+        source_terms.append((index, source, set(_verify_terms(text))))
+    for claim in claims[:10]:
+        claim_terms = set(_verify_terms(claim))
+        if not claim_terms:
+            continue
+        scored: list[tuple[float, int, dict[str, Any]]] = []
+        lowered_claim = claim.lower()
+        for index, source, terms in source_terms:
+            if not terms:
+                continue
+            overlap = claim_terms & terms
+            score = len(overlap) / max(1, len(claim_terms))
+            url = str(source.get("url") or "")
+            domain = _url_domain(url)
+            if url and url.lower() in lowered_claim:
+                score += 0.8
+            elif domain and domain in lowered_claim:
+                score += 0.35
+            if score > 0:
+                scored.append((score, index, source))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        top = scored[:2]
+        if not top:
+            continue
+        citations.append(
+            {
+                "claim": claim,
+                "source_ids": [str(item[1]) for item in top],
+                "urls": [str(item[2].get("url") or "") for item in top if item[2].get("url")],
+                "confidence": round(min(0.95, max(item[0] for item in top)), 2),
+            }
+        )
+    return citations[:8]
+
+
+def _web_answer_claim_units(answer: str) -> list[str]:
+    clean = re.sub(r"https?://\S+", " ", answer)
+    units: list[str] = []
+    for line in answer.splitlines():
+        line = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", line).strip()
+        if not line:
+            continue
+        parts = re.split(r"(?<=[.!?])\s+", line)
+        for part in parts:
+            claim = " ".join(part.split())
+            if 35 <= len(claim) <= 360 and not claim.endswith(":"):
+                units.append(claim)
+            if len(units) >= 12:
+                return units
+    if not units and clean.strip():
+        fallback = _short_text(clean, 320)
+        if len(fallback) >= 35:
+            units.append(fallback)
+    return units
+
+
+def _web_answer_vertical_cards(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    cards: list[dict[str, Any]] = []
+    for index, source in enumerate(sources[:6], start=1):
+        extraction = source.get("extraction")
+        if not isinstance(extraction, dict):
+            text = " ".join(
+                str(source.get(key) or "") for key in ("title", "snippet", "excerpt")
+            )
+            extraction = _extract_web_structured(text, kind="auto")
+        kind = str(extraction.get("kind") or "article")
+        compact = _compact_vertical_extraction(kind, extraction)
+        if compact:
+            cards.append(
+                {
+                    "source_id": str(index),
+                    "url": source.get("url"),
+                    "kind": kind,
+                    **compact,
+                }
+            )
+    return cards[:6]
+
+
+def _compact_vertical_extraction(kind: str, extraction: dict[str, Any]) -> dict[str, Any]:
+    if kind == "product":
+        return {
+            "prices": (extraction.get("prices") or [])[:4],
+            "availability": (extraction.get("availability_markers") or [])[:4],
+            "schema_products": (extraction.get("schema_products") or [])[:3],
+        }
+    if kind == "contact":
+        return {
+            "emails": (extraction.get("emails") or [])[:3],
+            "phones": (extraction.get("phones") or [])[:3],
+            "addresses": (extraction.get("address_hints") or [])[:3],
+        }
+    if kind == "table":
+        return {"tables": (extraction.get("tables") or [])[:2]}
+    metadata = extraction.get("metadata") if isinstance(extraction.get("metadata"), dict) else {}
+    schema = extraction.get("schema") if isinstance(extraction.get("schema"), dict) else {}
+    articles = schema.get("articles") if isinstance(schema.get("articles"), list) else []
+    return {
+        "title": metadata.get("title") or (extraction.get("title_candidates") or [None])[0],
+        "description": metadata.get("description") or extraction.get("description"),
+        "dates": (extraction.get("dates") or [])[:4],
+        "schema_articles": articles[:3],
+    }
 
 
 def _web_answer_verification_gaps(verification: dict[str, Any]) -> list[str]:
@@ -8539,6 +9510,7 @@ def _internet_observability_snapshot(storage: JarvisStorage, *, limit: int) -> d
         "by_tool": by_tool,
         "search_providers": providers,
         "search_api": _search_api_readiness(),
+        "search_provider_stats": _web_provider_stats_snapshot(storage),
         "verticals": ["web", "news", "images", "shopping", "places", "scholar"],
         "top_domains": sorted(domains.items(), key=lambda item: item[1], reverse=True)[:12],
         "blocked_recent": blocked[:12],

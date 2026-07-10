@@ -1,5 +1,30 @@
 # Runtime
 
+## 2026-07-10 handoff - Google replacement quality pass
+
+For the operator and the second model:
+
+- Use `internet.search_api.status` to check Search API setup without exposing
+  secrets. It reports masked key presence, supported verticals, recent
+  provider ok/fail stats, and optional live probes with `check=true`.
+- `web.answer` now includes claim-level citation data in `claim_citations` and
+  `cards.claim_citations`; Command Center renders a compact source/citation
+  panel under answers produced by the answer engine.
+- `cards.vertical_cards` is the structured extractor layer for vertical search
+  results: product prices/availability, contact hints, article dates, and
+  schema hints when sources expose them.
+- `web.eval` has a broader default catalog (20+ web/news/shopping/places/
+  scholar/images cases) but remains bounded by `limit` (default 8, max 30).
+- Use `documents.review` before serious Office/PDF edits. It reports OCR need,
+  OCR binary availability, Word redline/edit readiness, Excel formula/style
+  audit, optional reference comparison, and recommended next steps.
+- `web.transcript` can transcribe local/quarantined media paths and explicit
+  `allow_download=true` media URLs when the local `whisper` CLI exists. If not,
+  it returns `local_transcription.available=false` rather than fabricating text.
+- Use `browser.session.diagnose` before hard web tasks in operator Chrome. It
+  combines CDP status, active handoff, optional page read, consent/login/forms,
+  and recommended route.
+
 ## 2026-07-10 handoff - Google replacement answer engine
 
 For the operator and the second model:

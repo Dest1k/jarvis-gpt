@@ -17,6 +17,7 @@ from jarvis_gpt.models import ToolRunResponse
 from jarvis_gpt.storage import JarvisStorage
 from jarvis_gpt.tools import (
     WEB_RESEARCH_KEY,
+    WEB_SEARCH_PROVIDER_STATS_KEY,
     WEB_USER_AGENT,
     ToolRegistry,
     _PublicOnlyAsyncNetworkBackend,
@@ -441,11 +442,16 @@ def test_documents_inspect_reads_xlsx_by_path(monkeypatch, tmp_path):
     _write_minimal_xlsx(workbook, "Revenue Alpha")
 
     result = asyncio.run(tools.run("documents.inspect", {"path": str(workbook)}))
+    review = asyncio.run(tools.run("documents.review", {"path": str(workbook)}))
 
     assert result.ok is True
     assert result.data["document"]["kind"] == "xlsx"
     assert result.data["document"]["structure"]["sheet_count"] == 1
+    assert result.data["capabilities"]["excel"]["formula_count"] == 1
     assert "Revenue Alpha" in result.data["text_preview"]
+    assert review.ok is True
+    assert review.data["review"]["excel"]["formula_count"] == 1
+    assert review.data["review"]["redline"]["supported"] is False
     storage.close()
 
 
@@ -1768,6 +1774,10 @@ def test_web_answer_expands_queries_and_ranks_sources(monkeypatch, tmp_path):
     assert result.data["confidence"] >= 0.7
     assert "Ответ по веб-источникам" in result.data["answer"]
     assert result.data["citations"][0]["url"] == "https://docs.vendor.example/widget"
+    assert result.data["claim_citations"]
+    assert "https://docs.vendor.example/widget" in result.data["claim_citations"][0]["urls"]
+    assert result.data["cards"]["claim_citations"] == result.data["claim_citations"]
+    assert result.data["cards"]["vertical_cards"]
     storage.close()
 
 
@@ -2239,6 +2249,81 @@ def test_web_eval_scores_answer_cases(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_web_eval_default_catalog_is_broader(monkeypatch, tmp_path):
+    async def fake_web_answer(_ctx, args):
+        return ToolRunResponse(
+            tool="web.answer",
+            ok=True,
+            summary="Answer ok.",
+            data={
+                "answer": "Answer with source https://example.com/source and expected context.",
+                "sources": [{"url": "https://example.com/source"}],
+                "confidence": 0.7,
+                "vertical": args.get("vertical") or "web",
+            },
+        )
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr("jarvis_gpt.tools._web_answer", fake_web_answer)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    result = asyncio.run(tools.run("web.eval", {"limit": 1}))
+
+    assert result.ok is True
+    assert result.data["catalog_size"] >= 20
+    assert result.data["limit"] == 1
+    storage.close()
+
+
+def test_internet_search_api_status_masks_keys_and_reads_stats(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setenv("JARVIS_BRAVE_SEARCH_API_KEY", "brave-secret-1234")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    storage.set_runtime_value(
+        WEB_SEARCH_PROVIDER_STATS_KEY,
+        {"brave_api": {"ok": 2, "failed": 1, "last_ok": True}},
+    )
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    result = asyncio.run(tools.run("internet.search_api.status", {"check": False}))
+
+    assert result.ok is True
+    assert "brave_api" in result.data["readiness"]["configured"]
+    assert result.data["readiness"]["providers"]["brave_api"]["key"] == "set:17:1234"
+    assert "brave-secret" not in json.dumps(result.data)
+    assert result.data["stats"]["brave_api"]["ok"] == 2
+    storage.close()
+
+
+def test_web_transcript_reports_local_whisper_unavailable(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr("jarvis_gpt.tools.shutil.which", lambda _name: None)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    media_path = settings.home / "clip.mp3"
+    media_path.write_bytes(b"not real audio")
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    result = asyncio.run(tools.run("web.transcript", {"path": str(media_path)}))
+
+    assert result.ok is False
+    assert result.data["local_transcription"]["available"] is False
+    assert "whisper" in result.summary.lower()
+    storage.close()
+
+
 def test_web_document_read_reads_quarantined_text(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
@@ -2391,6 +2476,37 @@ def test_internet_smoke_reports_live_checks(monkeypatch, tmp_path):
     assert checks["browser.chrome.status"]["ok"] is False
     assert checks["web.fetch"]["ok"] is True
     assert result.data["observability"]["summary"]["total_runs"] >= 0
+    storage.close()
+
+
+def test_browser_session_diagnose_prefers_active_handoff(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    storage.set_runtime_value(
+        "browser.handoff.current",
+        {"id": "handoff_login", "status": "pending", "reason": "login"},
+    )
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    async def fake_chrome(_ctx, _args):
+        return ToolRunResponse(
+            tool="browser.chrome.status",
+            ok=False,
+            summary="Chrome unavailable.",
+            data={"ok": False},
+        )
+
+    monkeypatch.setattr("jarvis_gpt.tools._browser_chrome_status", fake_chrome)
+
+    result = asyncio.run(tools.run("browser.session.diagnose", {}))
+
+    assert result.ok is True
+    assert result.data["diagnosis"]["route"] == "operator_handoff"
+    assert result.data["handoff"]["id"] == "handoff_login"
     storage.close()
 
 

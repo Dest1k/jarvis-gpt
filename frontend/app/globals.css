@@ -1373,6 +1373,80 @@ h3 {
   color: #98f5cb;
 }
 
+.webAnswerPanel {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+  border: 1px solid var(--chat-line);
+  border-radius: var(--radius);
+  padding: 9px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--chat-muted);
+  font-size: 12px;
+}
+
+.webAnswerHead,
+.webAnswerStats,
+.webAnswerSources,
+.webAnswerClaims p {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.webAnswerHead span,
+.webAnswerHead strong,
+.webAnswerHead small,
+.webAnswerStats span {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--chat-line);
+  border-radius: 999px;
+  padding: 2px 7px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.webAnswerHead strong {
+  color: var(--chat-text);
+}
+
+.webAnswerStats,
+.webAnswerSources {
+  flex-wrap: wrap;
+}
+
+.webAnswerSources a {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  max-width: 170px;
+  border: 1px solid rgba(64, 215, 196, 0.18);
+  border-radius: var(--radius);
+  padding: 5px 7px;
+  color: var(--chat-accent);
+  text-decoration: none;
+}
+
+.webAnswerSources span,
+.webAnswerClaims span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.webAnswerClaims {
+  display: grid;
+  gap: 5px;
+}
+
+.webAnswerClaims p {
+  margin: 0;
+}
+
 .bubbleAttachments {
   display: flex;
   flex-wrap: wrap;

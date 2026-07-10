@@ -9,6 +9,31 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-10 - Codex (Google replacement quality pass)
+
+- Added `internet.search_api.status`: reports Search API readiness with masked
+  key presence, supported verticals, recent per-provider ok/fail stats, and an
+  optional live health probe (`check=true`). `internet.observability` now also
+  exposes `search_provider_stats`.
+- `web.answer` now returns `claim_citations` and includes them in `cards`; the
+  chat event payload carries them too. Command Center renders a compact source
+  panel under `web.answer` replies with confidence, source/domain counts, top
+  sources, and claim citation snippets.
+- `web.answer` cards now include `vertical_cards` extracted from source
+  snippets/evidence (product prices/availability, contact hints, article dates,
+  schema-derived hints where present).
+- Expanded the built-in `web.eval` catalog from 3 to 20+ mixed cases while
+  keeping default execution bounded (`limit` defaults to 8, max 30).
+- Added `documents.review`: OCR/readiness, Word redline/edit readiness, Excel
+  formula/style audit, optional reference comparison, and recommendations. XLSX
+  extraction now counts workbook styles.
+- `web.transcript` now supports local/quarantined media paths and explicit
+  `allow_download=true` media URL fallback through local `whisper` when the CLI
+  is installed. Without `whisper`, it returns an honest availability status.
+- Added `browser.session.diagnose`: combines Chrome CDP status, active handoff,
+  optional page read, consent/login/sensitive-form signals, and recommended next
+  route (`autonomous_read`, `operator_handoff`, `login_required`, etc.).
+
 ### 2026-07-10 - Codex (Google replacement production surface)
 
 - Added optional real Search API providers to `web.search`: Brave Search,

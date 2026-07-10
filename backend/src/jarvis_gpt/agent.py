@@ -2101,6 +2101,7 @@ class AgentRuntime:
                 "query": query,
                 "confidence": result.data.get("confidence"),
                 "sources": len(result.data.get("sources") or []),
+                "claim_citations": result.data.get("claim_citations"),
                 "cards": result.data.get("cards"),
                 "synthesis": result.data.get("synthesis"),
                 "cache": result.data.get("cache"),
