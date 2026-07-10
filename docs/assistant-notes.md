@@ -9,6 +9,85 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-10 - Claude (web_surfer.py — isolated Playwright surfer)
+
+New standalone module `backend/src/jarvis_gpt/web_surfer.py`. Zero imports from
+the rest of `jarvis_gpt`; drop-in. NOT yet wired into the tool registry — Codex
+integrates it. Complements (does not replace) `browser_cdp.py`/`web_orchestrator`:
+CDP layer drives the operator's real Chrome; this module owns a throwaway
+Playwright Chromium with stealth/proxy for autonomous scraping.
+
+New pip deps (must be installed in the D:\jarvis runtime, not yet in
+requirements.txt): `playwright`, `beautifulsoup4`, `lxml`, `playwright-stealth`
+(optional — degrades if absent). Post-install: `playwright install chromium`.
+`playwright-stealth` is imported lazily via `_apply_stealth()`; missing lib =>
+no crash, just no stealth. `lxml` optional (falls back to `html.parser`).
+
+Public class `JarvisWebSurfer`. Async context manager: `async with
+JarvisWebSurfer(config=None, *, proxies=None, user_agents=None, headless=None,
+logger=None) as s:` OR explicit `await s.start()` / `await s.close()`. Calling a
+public method before `start()` raises `WebSurferError`. Config via dataclass
+`SurferConfig` (headless, proxies:list[str] `http://user:pass@host:port`,
+user_agents, extra_headers, locale=ru-RU, timezone_id=Europe/Moscow, viewport,
+*_budget_sec, max_concurrency<=8, pacing/typing delays, max_chars_per_page,
+use_stealth). Proxy strings rotate round-robin; UA rotates round-robin.
+
+Method signatures + return JSON schemas:
+
+- `async def fast_fact(self, query: str) -> dict`
+  `{ok:bool, query:str, answer:str, snippets:[{title:str,url:str,snippet:str}],
+    source:"duckduckgo", elapsed_ms:int, error:str|None}`
+  API-first (DuckDuckGo instant-answer JSON + html.duckduckgo.com snippets) via
+  a Playwright APIRequestContext, hard-bounded by `fast_fact_budget_sec` (2.0s)
+  with `asyncio.wait_for`. Never raises; timeout/error => `ok=False`, `error` set.
+
+- `async def deep_research(self, query: str, max_depth: int = 3) -> str`
+  Returns a Markdown report (string). Seeds links from `fast_fact`, fetches top
+  `max_depth` (clamped 1..8) links in parallel (Semaphore=max_concurrency), each
+  page sanitized to Markdown and paragraph-deduped. Bounded by
+  `deep_research_budget_sec` (45s). Never raises; on failure returns a Markdown
+  string explaining the gap.
+
+- `async def aggressive_shopping(self, product_url: str) -> dict`
+  `{ok:bool, url:str, title:str,
+    price:{text:str,value:float|None,currency:str},
+    availability:str, specs:{name:value},
+    rating:{value:float|None,count:int|None},
+    negative_reviews:[{rating:int|None,text:str,cons:str}],
+    captured_api:[str], app_state_keys:[str], error:str|None}`
+  Renders card, intercepts XHR/Fetch JSON (`captured_api`), pulls
+  `__NEXT_DATA__`/`__INITIAL_STATE__`/`__NUXT__`/`__APOLLO_STATE__`
+  (`app_state_keys`), resilient selectors CSS->XPath->text->JSON-LD for
+  price/availability/specs/rating, then opens reviews, prefers a
+  low-rating/"Сначала отрицательные" filter, paginates (Показать ещё / wheel),
+  and returns ONLY 1-3★ reviews plus any with an explicit "Минусы/Недостатки"
+  block (5★ spam dropped by `_filter_negative_reviews`). Bounded by
+  `shopping_budget_sec` (60s).
+
+Exceptions (all subclass `WebSurferError(RuntimeError)`): `BrowserLaunchError`,
+`ProxyError`, `NavigationError`, `AntiBotError`, `ParsingError`,
+`SurferTimeoutError`. IMPORTANT for the caller: the three PUBLIC methods swallow
+`WebSurferError` internally and always return their dict/str with `ok=False` +
+`error` (or a Markdown gap string) — safe to call without try/except for control
+flow. `start()`/`close()` and internal calls CAN raise `BrowserLaunchError`/
+`ProxyError`; wrap `start()` if you want to fall back to the CDP path. Anti-bot
+walls raise `AntiBotError` internally and surface as `error` on the shopping/
+research result (route those to the operator-Chrome handoff instead).
+
+Integration sketch for the tool loop: register safe tools
+`web.surf.fact`/`web.surf.research`/`web.surf.shopping` that instantiate one
+`JarvisWebSurfer` per call (or pool one), pass `settings`-derived proxies, and
+map results into the existing evidence-ledger/`web.answer` shapes. Note
+`negative_reviews[*].cons` + low ratings are exactly the "real user downsides"
+signal the shopping answer path lacks today.
+
+Verification done here: `py_compile` OK, `ruff` clean, AST check (no TODO/`pass`
+stubs, public API + exceptions present), and functional unit checks of every
+pure helper with a stubbed `playwright` (proxy parse incl. URL-encoded creds,
+price parse, negative-review filter/cons, HTML->Markdown noise stripping, DDG
+HTML parse, JSON-LD offer extraction, config clamping). Live browser runs need
+the operator's environment + `playwright install chromium` (+ proxies).
+
 ### 2026-07-10 - Codex (shopping search link fidelity)
 
 - Fixed the shopping web path that could still answer "no concrete link" after
