@@ -9,6 +9,14 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-10 - Codex (search cooldown evidence fallback)
+
+- Fixed a regression where `web.answer` could return `0 sources` during search
+  provider cooldowns even when Jarvis had relevant previous web evidence.
+- `web.search` now falls back to the evidence ledger after all live providers
+  fail, reconstructing cached search results and preserving preferred-domain
+  filtering such as `dns-shop.ru`.
+
 ### 2026-07-10 - Codex (compact chat links)
 
 - Updated Command Center rich-message rendering so raw URL labels and

@@ -2838,6 +2838,42 @@ async def _web_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
             summary=f"Search request failed: {exc}",
             data={"query": query, "last_failure": last_failure},
         )
+    cached_results = _web_search_cached_results_from_evidence(
+        ctx.storage,
+        query=search_query,
+        limit=limit,
+        vertical=vertical,
+    )
+    if cached_results:
+        return ToolRunResponse(
+            tool="web.search",
+            ok=True,
+            summary=(
+                f"Web search returned {len(cached_results)} cached result(s) "
+                "from evidence after provider failure."
+            ),
+            data={
+                "query": query,
+                "results": cached_results,
+                "source": "evidence_cache",
+                "region": region,
+                "freshness": freshness,
+                "vertical": vertical,
+                "pages": pages,
+                "providers": [
+                    *provider_stats,
+                    {
+                        "source": "evidence_cache",
+                        "page": None,
+                        "url": None,
+                        "parsed": len(cached_results),
+                        "added": len(cached_results),
+                    },
+                ],
+                "last_failure": last_failure,
+                "cache": {"hit": True, "kind": "evidence"},
+            },
+        )
     return ToolRunResponse(
         tool="web.search",
         ok=False,
@@ -7958,6 +7994,131 @@ def _search_results_for_tools(search: ToolRunResponse) -> list[dict[str, Any]]:
         for item in search.data.get("results", [])
         if isinstance(item, dict) and item.get("url")
     ][:12]
+
+
+def _web_search_cached_results_from_evidence(
+    storage: JarvisStorage,
+    *,
+    query: str,
+    limit: int,
+    vertical: str,
+) -> list[dict[str, Any]]:
+    records = _list_web_evidence(storage, limit=120)
+    if not records:
+        return []
+    preferred_domains = _web_answer_preferred_domains([query])
+    query_terms = set(_web_answer_terms(re.sub(r"(?i)\bsite:\S+", " ", query)))
+    candidates: list[tuple[float, dict[str, Any]]] = []
+    seen: set[str] = set()
+    for recency_index, record in enumerate(records):
+        for item in _web_search_items_from_evidence_record(record):
+            url = str(item.get("url") or "")
+            if not url:
+                continue
+            if preferred_domains and not _web_answer_domain_matches(url, preferred_domains):
+                continue
+            text = " ".join(
+                str(item.get(part) or "") for part in ("title", "url", "snippet")
+            )
+            item_terms = set(_web_answer_terms(text))
+            overlap = len(query_terms & item_terms)
+            domain_match = bool(
+                preferred_domains and _web_answer_domain_matches(url, preferred_domains)
+            )
+            if query_terms and overlap == 0 and not domain_match:
+                continue
+            score = (
+                overlap * 3.0
+                + (4.0 if domain_match else 0.0)
+                + float(record.get("confidence") or 0.0)
+                + max(0.0, 1.5 - recency_index / 40)
+            )
+            if score <= 0:
+                continue
+            normalized_url = _canonical_cached_search_url(url)
+            if normalized_url in seen:
+                continue
+            seen.add(normalized_url)
+            candidates.append(
+                (
+                    score,
+                    {
+                        "title": _short_text(item.get("title") or _url_domain(url) or url, 120),
+                        "url": normalized_url,
+                        "snippet": _short_text(item.get("snippet") or "", 300),
+                        "provider": "evidence_cache",
+                        "vertical": vertical,
+                        "provider_page": None,
+                        "provider_rank": None,
+                        "evidence_id": record.get("id"),
+                    },
+                )
+            )
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    results: list[dict[str, Any]] = []
+    for rank, (_score, item) in enumerate(candidates[:limit], start=1):
+        results.append({**item, "rank": rank})
+    return results
+
+
+def _web_search_items_from_evidence_record(record: dict[str, Any]) -> list[dict[str, str]]:
+    source = str(record.get("source") or "")
+    excerpt = str(record.get("excerpt") or "")
+    if source == "web.search":
+        items = _parse_cached_web_search_excerpt(excerpt)
+        if items:
+            return items
+    url = _canonical_cached_search_url(str(record.get("url") or ""))
+    if not url or not url.startswith(("http://", "https://")):
+        return []
+    return [
+        {
+            "title": str(record.get("title") or _url_domain(url) or url),
+            "url": url,
+            "snippet": excerpt,
+        }
+    ]
+
+
+def _parse_cached_web_search_excerpt(excerpt: str) -> list[dict[str, str]]:
+    lines = [line.strip() for line in str(excerpt or "").splitlines()]
+    items: list[dict[str, str]] = []
+    last_title = ""
+    for index, line in enumerate(lines):
+        if not line:
+            continue
+        url_match = re.search(r"https?://[^\s<>\]]+", line)
+        if not url_match:
+            last_title = line
+            continue
+        url = _canonical_cached_search_url(url_match.group(0))
+        if not url:
+            continue
+        snippet = ""
+        for next_line in lines[index + 1 : index + 4]:
+            candidate = next_line.strip()
+            if candidate and not re.search(r"https?://", candidate):
+                snippet = candidate
+                break
+        items.append(
+            {
+                "title": last_title or _url_domain(url) or url,
+                "url": url,
+                "snippet": snippet,
+            }
+        )
+        last_title = ""
+    return items
+
+
+def _canonical_cached_search_url(url: str) -> str:
+    cleaned = str(url or "").strip().strip(".,!?;:)]}»”")
+    if not cleaned:
+        return ""
+    cleaned = _unwrap_duckduckgo_url(cleaned)
+    cleaned = _unwrap_bing_url(cleaned)
+    cleaned = _unwrap_yandex_url(cleaned)
+    return cleaned
 
 
 def _web_answer_cache_key(

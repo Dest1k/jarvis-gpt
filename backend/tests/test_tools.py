@@ -23,6 +23,7 @@ from jarvis_gpt.tools import (
     ToolRegistry,
     _parse_bing_results,
     _PublicOnlyAsyncNetworkBackend,
+    _store_web_evidence,
     _windows_native_command,
 )
 
@@ -3008,6 +3009,75 @@ def test_bing_parser_unwraps_ck_redirect_urls():
             "rank": 1,
         }
     ]
+
+
+def test_web_search_falls_back_to_evidence_cache_on_provider_failure(monkeypatch, tmp_path):
+    monkeypatch.delenv("JARVIS_BRAVE_SEARCH_API_KEY", raising=False)
+    monkeypatch.delenv("BRAVE_SEARCH_API_KEY", raising=False)
+    monkeypatch.delenv("JARVIS_TAVILY_API_KEY", raising=False)
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    monkeypatch.delenv("JARVIS_SERPER_API_KEY", raising=False)
+    monkeypatch.delenv("SERPER_API_KEY", raising=False)
+
+    class FakeResponse:
+        status_code = 200
+        headers = {"content-type": "text/html; charset=utf-8"}
+        content = b"<html><body>captcha access denied</body></html>"
+
+        def raise_for_status(self):
+            return None
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, _exc_type, _exc, _traceback):
+            return None
+
+        async def get(self, url, *, headers):
+            return FakeResponse()
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    target = "https://www.dns-shop.ru/product/example-rtx-5090/"
+    encoded = "a1" + base64.urlsafe_b64encode(target.encode()).decode().rstrip("=")
+    _store_web_evidence(
+        storage,
+        source="web.search",
+        url="https://www.bing.com/search?q=rtx+5090",
+        title="rtx 5090 search",
+        text=(
+            "DNS RTX 5090\n"
+            f"https://www.bing.com/ck/a?!&&p=abc&u={encoded}&ntb=1\n"
+            "Видеокарта RTX 5090 в каталоге DNS.\n"
+            "NVIDIA RTX 5090\n"
+            "https://www.nvidia.com/en-us/geforce/graphics-cards/50-series/rtx-5090/\n"
+            "Official NVIDIA product page."
+        ),
+        content_type="text/plain",
+        safety={},
+        confidence=0.45,
+    )
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    result = asyncio.run(
+        tools.run("web.search", {"query": "rtx 5090 site:dns-shop.ru", "limit": 3})
+    )
+
+    assert result.ok is True
+    assert result.data["source"] == "evidence_cache"
+    assert result.data["results"][0]["url"] == target
+    assert result.data["results"][0]["provider"] == "evidence_cache"
+    assert not any("nvidia.com" in item["url"] for item in result.data["results"])
+    storage.close()
 
 
 def test_web_search_uses_region_freshness_pagination_and_yandex(monkeypatch, tmp_path):
