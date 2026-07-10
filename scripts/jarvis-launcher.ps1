@@ -103,7 +103,7 @@ function Ensure-LauncherFolders {
 function Write-Banner {
   Clear-Host
   Write-Host "+--------------------------------------------------------------+" -ForegroundColor DarkCyan
-  Write-Host "|                       JARVIS GPT LAUNCHER                    |" -ForegroundColor Cyan
+  Write-Host "|                            JARVIS                            |" -ForegroundColor Cyan
   Write-Host "+--------------------------------------------------------------+" -ForegroundColor DarkCyan
   Write-Host ("| Repo:    {0}" -f $RepoRoot)
   Write-Host ("| Home:    {0}" -f $HomePath)
@@ -199,7 +199,7 @@ function Ensure-LanFirewallRules {
   }
 
   foreach ($port in @(3000, 8000)) {
-    $name = "Jarvis GPT LAN $port"
+    $name = "Jarvis LAN $port"
     try {
       $existing = Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue
       if (-not $existing) {
@@ -210,7 +210,7 @@ function Ensure-LanFirewallRules {
           -Protocol TCP `
           -LocalPort $port `
           -Profile Private `
-          -Description "Allow Jarvis GPT LAN access on TCP $port." | Out-Null
+          -Description "Allow Jarvis LAN access on TCP $port." | Out-Null
       }
     } catch {
       Write-Host ("Could not create firewall rule for TCP {0}: {1}" -f $port, $_.Exception.Message) -ForegroundColor DarkYellow

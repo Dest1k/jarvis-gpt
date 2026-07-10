@@ -9,6 +9,15 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-10 - Codex (GUI brand cleanup)
+
+- Removed visible `GPT`/`JARVIS GPT` branding from the Command Center shell,
+  manifest, backend API metadata, CLI/help text, launcher banner, and smoke text.
+  Public-facing labels now use `Jarvis`.
+- Reworded surfaced `OS`/`OSINT` terminology in tool descriptions and
+  deterministic web answers to neutral Jarvis/system/public-source language.
+- Updated tests for the renamed public-source search frame.
+
 ### 2026-07-10 - Codex (web answer bugfix: links over guts)
 
 - Fixed `web.answer` fallback UX: deterministic answers no longer expose

@@ -348,7 +348,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="jarvis-gpt", description="JARVIS GPT runtime CLI")
+    parser = argparse.ArgumentParser(prog="jarvis", description="Jarvis runtime CLI")
     parser.add_argument("--profile", choices=sorted(PROFILES), default=None)
     sub = parser.add_subparsers(dest="command", required=True)
 

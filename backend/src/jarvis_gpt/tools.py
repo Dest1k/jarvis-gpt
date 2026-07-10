@@ -525,7 +525,8 @@ class ToolRegistry:
                     "Win32_LogicalDisk, Win32_Battery, Win32_VideoController, Win32_Service, "
                     "Win32_Process, Win32_StartupCommand, Win32_Printer, "
                     "Win32_NetworkAdapterConfiguration, Win32_PnPEntity. Use it for everyday "
-                    "questions about hardware, OS, disks, memory, battery, services, startup, "
+                    "questions about hardware, system state, disks, memory, battery, services, "
+                    "startup, "
                     "printers or network. Non-mutating and safe to run autonomously; runs through "
                     "the local host bridge and degrades honestly if the bridge is offline."
                 ),

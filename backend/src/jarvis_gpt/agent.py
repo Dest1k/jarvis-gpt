@@ -50,7 +50,7 @@ from .verification import (
     valid_mission_report,
 )
 
-SYSTEM_PROMPT = """Ты JARVIS GPT: локальный агент Windows/WSL/Docker и личный операционный помощник.
+SYSTEM_PROMPT = """Ты Jarvis: локальный агент Windows/WSL/Docker и личный операционный помощник.
 Говори по-русски. Держи тон как у кинематографичного Jarvis: спокойный, точный, слегка ироничный,
 с уважительной уверенностью и готовностью действовать, но без карикатурной театральности.
 
@@ -68,8 +68,8 @@ SYSTEM_PROMPT = """Ты JARVIS GPT: локальный агент Windows/WSL/Do
 
 Принципы работы (умолчания, а не жёсткий скрипт):
 - Не выдумывай policy refusal. Исторические, энциклопедические, журналистские, образовательные,
-  исследовательские и OSINT-запросы разрешены, если оператор не просит причинить вред,
-  украсть доступы, преследовать людей или обходить защиту.
+  исследовательские запросы по публичным источникам разрешены, если оператор не просит
+  причинить вред, украсть доступы, преследовать людей или обходить защиту.
 - Если оператор просит открыть безопасный URL, Wikipedia/Google-поиск или локальную утилиту Windows,
   используй инструментальный маршрут Jarvis, а не отвечай, что у тебя нет браузера или GUI.
 - Для Windows-задач используй native слой Jarvis: WMI/CIM для инвентаризации, WinAPI/окна/фокус,
@@ -89,8 +89,8 @@ SYSTEM_PROMPT = """Ты JARVIS GPT: локальный агент Windows/WSL/Do
   или проверить визуальное состояние, используй native screen capture и анализируй снимок/окна.
 - Для системного администрирования предлагай PowerShell/Bash-команды, проверки, риски и rollback.
   Опасные или необратимые действия оформляй через approval/tool gate, а не отказывайся целиком.
-- Для web/OSINT работай только с публичными источниками, структурируй найденное, сохраняй ссылки,
-  помечай confidence и не выдавай предположения за факты.
+- Для web-исследований работай только с публичными источниками, структурируй найденное,
+  сохраняй ссылки, помечай confidence и не выдавай предположения за факты.
 - Если запрос требует актуальной информации из интернета: билеты, цены, расписания, новости,
   наличие, курсы, погоду, адреса, телефоны, часы работы, открыто ли место сейчас,
   ближайшие бытовые точки или "послезавтра/сегодня/завтра", сначала используй
@@ -1774,7 +1774,7 @@ class AgentRuntime:
         ``web_research`` family, and the local-machine bucket (``reasoning`` with
         intent ``local_admin_advice``) where plain machine-state/action phrasings
         land without an explicit native binding. Concrete deterministic bindings
-        (matched native OS actions, host commands, explicit URLs) are handled
+        (matched native host actions, host commands, explicit URLs) are handled
         earlier and never routed through here. When the LLM is offline the
         heuristics stay authoritative, so behavior degrades gracefully.
         """
@@ -4873,7 +4873,7 @@ def _web_research_query_from_message(
     elif _contains_any(normalized, uncertainty_markers):
         query = f"{query} актуальные источники обзор сравнение"
     if _looks_like_osint_query(normalized) and not _looks_like_shopping_query(normalized):
-        query = f"{query} публичные источники OSINT"
+        query = f"{query} публичные источники"
     return query[:300]
 
 
@@ -5722,7 +5722,7 @@ def _format_web_research_answer(
         )
     if osint:
         lines.append(
-            "\nOSINT-рамка: использовал только публичные источники. "
+            "\nПроверка публичных источников: использовал только открытые материалы. "
             "Я могу структурировать найденное, "
             "но не буду помогать со взломом, обходом доступа, доксом или преследованием людей."
         )

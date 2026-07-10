@@ -1,6 +1,6 @@
 {
-  "name": "JARVIS GPT Command Center",
-  "short_name": "JARVIS GPT",
+  "name": "Jarvis",
+  "short_name": "Jarvis",
   "id": "/",
   "start_url": "/",
   "scope": "/",

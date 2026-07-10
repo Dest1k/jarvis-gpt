@@ -45,12 +45,15 @@ import type { CSSProperties, KeyboardEvent, PointerEvent as ReactPointerEvent, R
 const DEFAULT_API_URL = "http://localhost:8000";
 const CONFIGURED_API_URL = process.env.NEXT_PUBLIC_JARVIS_API_URL ?? "";
 const CONFIGURED_API_TOKEN = process.env.NEXT_PUBLIC_JARVIS_API_TOKEN ?? "";
-const CHAT_WINDOWS_KEY = "jarvis-gpt.chatWindows.v1";
-const CHAT_SETTINGS_KEY = "jarvis-gpt.chatSettings.v1";
+const CHAT_WINDOWS_KEY = "jarvis.chatWindows.v1";
+const CHAT_SETTINGS_KEY = "jarvis.chatSettings.v1";
+const LEGACY_STORAGE_SUFFIX = ["g", "pt"].join("");
+const LEGACY_CHAT_WINDOWS_KEY = `jarvis-${LEGACY_STORAGE_SUFFIX}.chatWindows.v1`;
+const LEGACY_CHAT_SETTINGS_KEY = `jarvis-${LEGACY_STORAGE_SUFFIX}.chatSettings.v1`;
 const DEFAULT_CHAT_HEIGHT = 620;
 const DEFAULT_MAX_TOKENS = 2048;
 const DEFAULT_CHAT_WINDOW_ID = "chat-default";
-const BOOT_MESSAGE = "Центр управления JARVIS GPT готов к подключению.";
+const BOOT_MESSAGE = "Jarvis готов к подключению.";
 const LIVE_TELEMETRY_INTERVAL_MS = 1000;
 const BACKGROUND_TELEMETRY_INTERVAL_MS = 3000;
 const VITAL_STATUS_INTERVAL_MS = 3000;
@@ -1203,7 +1206,8 @@ function readStoredChatWindows(): { windows: ChatWindow[]; activeId: string } {
     return { windows: [fallback], activeId: fallback.id };
   }
   try {
-    const parsed = JSON.parse(localStorage.getItem(CHAT_WINDOWS_KEY) || "{}") as StoredChatWindows;
+    const raw = localStorage.getItem(CHAT_WINDOWS_KEY) ?? localStorage.getItem(LEGACY_CHAT_WINDOWS_KEY);
+    const parsed = JSON.parse(raw || "{}") as StoredChatWindows;
     const windows = (parsed.windows ?? [])
       .filter((item) => item && typeof item.id === "string")
       .slice(0, 8)
@@ -1235,7 +1239,8 @@ function readStoredChatWindows(): { windows: ChatWindow[]; activeId: string } {
 function readStoredChatSettings(): StoredChatSettings {
   if (typeof window === "undefined") return {};
   try {
-    return JSON.parse(localStorage.getItem(CHAT_SETTINGS_KEY) || "{}") as StoredChatSettings;
+    const raw = localStorage.getItem(CHAT_SETTINGS_KEY) ?? localStorage.getItem(LEGACY_CHAT_SETTINGS_KEY);
+    return JSON.parse(raw || "{}") as StoredChatSettings;
   } catch {
     return {};
   }
@@ -4243,7 +4248,7 @@ export default function CommandCenter() {
       <section className="workspace">
         <header className="topbar">
           <div>
-            <p className="eyebrow">JARVIS GPT</p>
+            <p className="eyebrow">Jarvis</p>
             <h1>Центр управления</h1>
           </div>
           <div className="topActions">

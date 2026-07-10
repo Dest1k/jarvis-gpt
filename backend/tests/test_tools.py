@@ -2974,7 +2974,7 @@ def test_web_search_parses_public_results(monkeypatch, tmp_path):
     storage.initialize()
     tools = ToolRegistry(settings, storage, LLMRouter(settings))
 
-    result = asyncio.run(tools.run("web.search", {"query": "Dest1k OSINT", "limit": 2}))
+    result = asyncio.run(tools.run("web.search", {"query": "Dest1k public sources", "limit": 2}))
 
     assert result.ok is True
     assert result.data["results"][0]["url"] == "https://example.com/profile"

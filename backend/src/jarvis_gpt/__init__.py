@@ -1,4 +1,4 @@
-"""JARVIS GPT local-first agent runtime."""
+"""Jarvis local-first agent runtime."""
 
 __all__ = ["__version__"]
 

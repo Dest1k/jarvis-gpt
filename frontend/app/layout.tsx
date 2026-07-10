@@ -3,8 +3,8 @@ import type { ReactNode } from "react";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "JARVIS GPT",
-  description: "Local Command Center for JARVIS GPT",
+  title: "Jarvis",
+  description: "Local interface for Jarvis",
   icons: [{ rel: "icon", url: "/icon.svg" }],
   manifest: "/manifest.webmanifest"
 };

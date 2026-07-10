@@ -1,4 +1,4 @@
-const CACHE_VERSION = "jarvis-gpt-v2";
+const CACHE_VERSION = "jarvis-v3";
 const SHELL_CACHE = `${CACHE_VERSION}:shell`;
 const STATIC_CACHE = `${CACHE_VERSION}:static`;
 const SHELL_URLS = ["/", "/manifest.webmanifest", "/icon.svg"];

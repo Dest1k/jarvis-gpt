@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Repository-local launcher for the JARVIS GPT CLI."""
+"""Repository-local launcher for the Jarvis CLI."""
 
 from __future__ import annotations
 

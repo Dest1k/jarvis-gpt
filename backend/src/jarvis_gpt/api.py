@@ -180,13 +180,13 @@ async def lifespan(app: FastAPI):
     app.state.autonomy_executor = autonomy_executor
     app.state.supervisor = supervisor
     app.state.approval_executor = approval_executor
-    storage.add_event(kind="runtime.start", title="JARVIS GPT backend started")
+    storage.add_event(kind="runtime.start", title="Jarvis backend started")
     await supervisor.start()
     try:
         yield
     finally:
         await supervisor.stop()
-        storage.add_event(kind="runtime.stop", title="JARVIS GPT backend stopped")
+        storage.add_event(kind="runtime.stop", title="Jarvis backend stopped")
         storage.close()
 
 
@@ -255,7 +255,7 @@ def _strict_loopback_token_required() -> bool:
     return bool(app.state.settings.api_require_token_on_loopback)
 
 
-app = FastAPI(title="JARVIS GPT", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="Jarvis", version="0.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins(),
@@ -289,7 +289,7 @@ def storage(request_app: FastAPI) -> JarvisStorage:
 
 @app.get("/")
 async def index() -> dict[str, str]:
-    return {"name": "JARVIS GPT", "status": "online"}
+    return {"name": "Jarvis", "status": "online"}
 
 
 @app.get("/health")

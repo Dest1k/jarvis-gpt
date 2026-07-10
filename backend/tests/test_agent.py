@@ -1063,7 +1063,7 @@ def test_agent_researches_current_ticket_request(monkeypatch, tmp_path):
     storage.close()
 
 
-def test_agent_researches_public_osint_self_lookup(monkeypatch, tmp_path):
+def test_agent_researches_public_sources_self_lookup(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
     settings = load_settings()
@@ -1079,7 +1079,7 @@ def test_agent_researches_public_osint_self_lookup(monkeypatch, tmp_path):
 
     async def fake_run(name, arguments=None, **kwargs):
         if name == "web.search":
-            assert "OSINT" in arguments["query"]
+            assert "публичные источники" in arguments["query"]
             return _tool_response(
                 name,
                 True,
@@ -1109,13 +1109,13 @@ def test_agent_researches_public_osint_self_lookup(monkeypatch, tmp_path):
 
     assert "Источники" in response.answer
     assert "https://example.com/dest1k" in response.answer
-    assert "OSINT-рамка" in response.answer
+    assert "Проверка публичных источников" in response.answer
     assert "не буду помогать" in response.answer
     assert "не могу" not in response.answer.lower()
     storage.close()
 
 
-def test_agent_researches_dns_shop_product_without_osint_suffix(monkeypatch, tmp_path):
+def test_agent_researches_dns_shop_product_without_public_sources_suffix(monkeypatch, tmp_path):
     agent, storage = _agent_without_llm(monkeypatch, tmp_path)
     captured = {}
 
@@ -1157,16 +1157,16 @@ def test_agent_researches_dns_shop_product_without_osint_suffix(monkeypatch, tmp
     assert "site:dns-shop.ru" in captured["query"]
     assert captured["query"].startswith("rtx 5090")
     assert "найди" not in captured["query"]
-    assert "OSINT" not in captured["query"]
+    assert "публичные источники" not in captured["query"]
     assert "399 999" in response.answer
     assert "https://www.dns-shop.ru/product/rtx-5090" in response.answer
     assert "Приоритетно проверял выдачу магазина DNS" in response.answer
     assert "билет" not in response.answer.lower()
-    assert "OSINT-рамка" not in response.answer
+    assert "Проверка публичных источников" not in response.answer
     storage.close()
 
 
-def test_agent_keeps_dns_records_in_osint_context(monkeypatch, tmp_path):
+def test_agent_keeps_dns_records_in_public_sources_context(monkeypatch, tmp_path):
     agent, storage = _agent_without_llm(monkeypatch, tmp_path)
     captured = {}
 
@@ -1200,10 +1200,10 @@ def test_agent_keeps_dns_records_in_osint_context(monkeypatch, tmp_path):
 
     response = asyncio.run(agent.chat("проверь DNS записи домена example.com"))
 
-    assert "OSINT" in captured["query"]
+    assert "публичные источники" in captured["query"]
     assert "site:dns-shop.ru" not in captured["query"]
     assert "example.com DNS records" in response.answer
-    assert "OSINT-рамка" in response.answer
+    assert "Проверка публичных источников" in response.answer
     storage.close()
 
 
@@ -1474,7 +1474,7 @@ def test_agent_researches_marketplace_product_without_osint(monkeypatch, tmp_pat
 
     assert "site:ozon.ru" in captured["query"]
     assert captured["query"].startswith("iphone 16")
-    assert "OSINT" not in captured["query"]
+    assert "публичные источники" not in captured["query"]
     assert "89 990" in response.answer
     assert "доступно к заказу" in response.answer
     assert "билет" not in response.answer.lower()
@@ -1522,7 +1522,7 @@ def test_agent_researches_nearby_pharmacy_as_place_lookup(monkeypatch, tmp_path)
     response = asyncio.run(agent.chat("найди ближайшую круглосуточную аптеку"))
 
     assert "адрес телефон часы работы официальный сайт карта" in captured["query"]
-    assert "OSINT" not in captured["query"]
+    assert "публичные источники" not in captured["query"]
     assert "+7 (343) 123-45-67" in response.answer
     assert "круглосуточно" in response.answer
     assert "улица Ленина 10" in response.answer
@@ -1568,10 +1568,10 @@ def test_agent_researches_public_office_phone_without_osint(monkeypatch, tmp_pat
     response = asyncio.run(agent.chat("узнай телефон и часы работы МФЦ на Ленинградской 10"))
 
     assert "адрес телефон часы работы официальный сайт" in captured["query"]
-    assert "OSINT" not in captured["query"]
+    assert "публичные источники" not in captured["query"]
     assert "8 800 100-00-00" in response.answer
     assert "09:00-18:00" in response.answer
-    assert "OSINT-рамка" not in response.answer
+    assert "Проверка публичных источников" not in response.answer
     storage.close()
 
 

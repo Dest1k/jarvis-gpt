@@ -8,7 +8,7 @@ $ErrorActionPreference = "Stop"
 $env:JARVIS_HOME = $HomePath
 $env:JARVIS_PROFILE = $Profile
 
-Write-Host "Starting JARVIS GPT backend on http://localhost:8000"
+Write-Host "Starting Jarvis backend on http://localhost:8000"
 Start-Process powershell -WindowStyle Hidden -ArgumentList @(
   "-NoExit",
   "-Command",

@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="JARVIS GPT local readiness smoke check")
+    parser = argparse.ArgumentParser(description="Jarvis local readiness smoke check")
     parser.add_argument("--skip-frontend", action="store_true")
     parser.add_argument("--skip-http", action="store_true")
     args = parser.parse_args()
