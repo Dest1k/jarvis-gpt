@@ -9,6 +9,22 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-10 - Codex (web answer bugfix: links over guts)
+
+- Fixed `web.answer` fallback UX: deterministic answers no longer expose
+  internal query/confidence/gap sections in the chat bubble. They now return
+  concise markdown links; detailed source/citation metadata stays in cards/trace.
+- Site-specific shopping intent now filters to explicitly requested domains
+  instead of mixing in unrelated sources. Example: "на ДНС" maps to
+  `dns-shop.ru`; if DNS is blocked/thin, Jarvis returns a direct DNS search link
+  instead of ranking NVIDIA/Bing/Wikipedia as the answer.
+- Bing HTML parser now unwraps `/ck/a` redirect links into real destination
+  URLs before storing/ranking evidence.
+- Bumped `web.answer` cache key version to avoid serving old verbose cached
+  answers.
+- Fixed chat layout overflow: long URLs/links/list items wrap inside assistant
+  bubbles instead of creating a horizontal transcript scroll.
+
 ### 2026-07-10 - Codex (Google replacement quality pass)
 
 - Added `internet.search_api.status`: reports Search API readiness with masked

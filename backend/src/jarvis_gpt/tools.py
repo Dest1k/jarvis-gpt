@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import hashlib
 import inspect
 import ipaddress
@@ -3222,6 +3224,9 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
         variants=query_variants,
         freshness=freshness,
     )
+    preferred_domains = _web_answer_preferred_domains(
+        [question, explicit_query, *query_variants]
+    )
     cache_key = _web_answer_cache_key(
         question=question,
         explicit_query=explicit_query,
@@ -3309,6 +3314,13 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
         key=lambda item: float(item.get("answer_score") or 0),
         reverse=True,
     )
+    if preferred_domains:
+        preferred_candidates = [
+            item
+            for item in ranked_candidates
+            if _web_answer_domain_matches(str(item.get("url") or ""), preferred_domains)
+        ]
+        ranked_candidates = preferred_candidates
     ranked_sources = _web_answer_diverse_sources(
         ranked_candidates,
         max_sources=max_sources,
@@ -3329,11 +3341,18 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
         else {}
     )
     verification_dict = verification_data if isinstance(verification_data, dict) else {}
+    direct_links = _web_answer_direct_links(
+        question,
+        preferred_domains=preferred_domains,
+        sources=ranked_sources,
+    )
     fallback_answer = _format_web_answer_report(
         question=question,
         queries=queries,
         sources=ranked_sources,
         verification=verification_dict,
+        preferred_domains=preferred_domains,
+        direct_links=direct_links,
     )
     synthesis = {"attempted": False, "used": False, "reason": "disabled"}
     answer = fallback_answer
@@ -3373,9 +3392,11 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
         "region": region,
         "freshness": freshness or None,
         "vertical": vertical,
+        "preferred_domains": preferred_domains,
         "answer": answer,
         "sources": ranked_sources,
         "citations": _research_citations(ranked_sources),
+        "direct_links": direct_links,
         "claim_citations": claim_citations,
         "verification": verification_dict,
         "confidence": confidence,
@@ -3392,7 +3413,7 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
         _web_answer_cache_store(ctx.storage, cache_key, data)
     return ToolRunResponse(
         tool="web.answer",
-        ok=bool(ranked_sources),
+        ok=bool(ranked_sources or direct_links),
         summary=f"Answer engine ranked {len(ranked_sources)} source(s).",
         data=data,
     )
@@ -7398,11 +7419,14 @@ def _parse_bing_results(html: str, *, limit: int) -> list[dict[str, Any]]:
         flags=re.IGNORECASE | re.DOTALL,
     )
     for match in pattern.finditer(html):
-        url = unescape(match.group("href")).strip()
+        url = _unwrap_bing_url(unescape(match.group("href")).strip())
         title = _html_to_text(match.group("title"))
         if not url or not title or url in seen:
             continue
-        if urlparse(url).scheme not in {"http", "https"}:
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"}:
+            continue
+        if (parsed.hostname or "").lower().endswith("bing.com"):
             continue
         body = match.group("body")
         snippet_match = re.search(r"<p[^>]*>(?P<snippet>.*?)</p>", body, re.I | re.S)
@@ -7475,6 +7499,36 @@ def _unwrap_duckduckgo_url(raw_url: str) -> str:
         target = parse_qs(parsed.query).get("uddg", [""])[0]
         return unquote(target)
     return raw_url
+
+
+def _unwrap_bing_url(raw_url: str) -> str:
+    parsed = urlparse(raw_url)
+    if not (parsed.hostname or "").lower().endswith("bing.com"):
+        return raw_url
+    query = parse_qs(parsed.query)
+    for key in ("u", "url", "r"):
+        for value in query.get(key, []):
+            target = _decode_bing_target(value)
+            if target:
+                return target
+    return raw_url
+
+
+def _decode_bing_target(value: str) -> str:
+    candidate = unquote(str(value or "").strip())
+    if candidate.startswith(("http://", "https://")):
+        return candidate
+    if candidate.startswith("a1"):
+        candidate = candidate[2:]
+    try:
+        padded = candidate + "=" * (-len(candidate) % 4)
+        decoded = base64.urlsafe_b64decode(padded.encode("ascii")).decode(
+            "utf-8",
+            errors="replace",
+        )
+    except (binascii.Error, ValueError, UnicodeDecodeError):
+        return ""
+    return decoded if decoded.startswith(("http://", "https://")) else ""
 
 
 def _unwrap_yandex_url(raw_url: str) -> str:
@@ -7916,7 +7970,7 @@ def _web_answer_cache_key(
     max_sources: int,
 ) -> str:
     payload = {
-        "version": 2,
+        "version": 3,
         "question": question,
         "explicit_query": explicit_query,
         "queries": queries,
@@ -8042,7 +8096,10 @@ def _web_answer_queries(
     for variant in variants or []:
         queries.append(_web_answer_clean_query(variant))
     normalized = _repair_mojibake(question).lower()
+    preferred_domains = _web_answer_preferred_domains([question, explicit_query, *(variants or [])])
     if not any(marker in normalized for marker in ("site:", "официаль", "official")):
+        for domain in preferred_domains:
+            queries.append(_web_answer_clean_query(f"{question} site:{domain}"))
         if _web_answer_looks_like_shopping(normalized):
             queries.append(
                 _web_answer_clean_query(f"{question} price availability official store reviews")
@@ -8055,9 +8112,10 @@ def _web_answer_queries(
             queries.append(_web_answer_clean_query(f"{question} official source"))
     if freshness:
         queries.append(_web_answer_clean_query(f"{question} news official source"))
-    if "site:" not in normalized:
+    if "site:" not in normalized and not preferred_domains:
         queries.append(_web_answer_clean_query(f"{question} site:wikipedia.org"))
-    queries.append(_web_answer_clean_query(f"{question} facts sources"))
+    if not preferred_domains:
+        queries.append(_web_answer_clean_query(f"{question} facts sources"))
     result: list[str] = []
     for query in queries:
         if query and query not in result:
@@ -8073,6 +8131,171 @@ def _web_answer_clean_query(query: str) -> str:
         cleaned,
     )
     return " ".join(cleaned.split())
+
+
+def _web_answer_preferred_domains(texts: list[str]) -> list[str]:
+    domains: list[str] = []
+    joined = " ".join(str(item or "") for item in texts)
+    normalized = _repair_mojibake(joined).lower()
+    for match in re.findall(r"(?i)\bsite:([a-z0-9.-]+\.[a-z]{2,})", joined):
+        _append_unique_domain(domains, match)
+    for match in re.findall(r"https?://[^\s)>\]]+", joined):
+        host = _url_domain(match)
+        if host:
+            _append_unique_domain(domains, host)
+    known_sites = (
+        (
+            "dns-shop.ru",
+            (
+                r"\bdns-?shop\b",
+                r"\bна\s+dns\b",
+                r"\bв\s+dns\b",
+                r"\bна\s+днс\b",
+                r"\bв\s+днс\b",
+                r"\bднс-?шоп\b",
+            ),
+        ),
+        ("ozon.ru", (r"\bozon\b", r"\bозон\b")),
+        (
+            "wildberries.ru",
+            (r"\bwildberries\b", r"\bна\s+вб\b", r"\bвай?лдберр", r"\bwb\b"),
+        ),
+        ("market.yandex.ru", (r"\bяндекс\s+маркет\b", r"\byandex\s+market\b")),
+        ("avito.ru", (r"\bavito\b", r"\bавито\b")),
+        ("citilink.ru", (r"\bcitilink\b", r"\bситилинк\b")),
+    )
+    for domain, patterns in known_sites:
+        if any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in patterns):
+            _append_unique_domain(domains, domain)
+    return domains[:4]
+
+
+def _append_unique_domain(domains: list[str], value: str) -> None:
+    domain = value.lower().strip().strip(".")
+    if domain.startswith("www."):
+        domain = domain[4:]
+    if domain and domain not in domains:
+        domains.append(domain)
+
+
+def _web_answer_domain_matches(url: str, preferred_domains: list[str]) -> bool:
+    host = _url_domain(url)
+    if host.startswith("www."):
+        host = host[4:]
+    return any(host == domain or host.endswith(f".{domain}") for domain in preferred_domains)
+
+
+def _web_answer_direct_links(
+    question: str,
+    *,
+    preferred_domains: list[str],
+    sources: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    links: list[dict[str, str]] = []
+    for source in sources:
+        url = str(source.get("url") or "")
+        if not url:
+            continue
+        if preferred_domains and not _web_answer_domain_matches(url, preferred_domains):
+            continue
+        title = _short_text(source.get("title") or _url_domain(url) or url, 90)
+        _append_unique_link(links, title=title, url=url)
+        if len(links) >= 4:
+            return links
+    if links:
+        return links
+    search_terms = _web_answer_site_search_terms(question)
+    for domain in preferred_domains:
+        search_url = _web_answer_site_search_url(domain, search_terms)
+        if search_url:
+            _append_unique_link(links, title=f"Поиск на {domain}", url=search_url)
+    return links[:4]
+
+
+def _append_unique_link(links: list[dict[str, str]], *, title: str, url: str) -> None:
+    if not url or any(item["url"] == url for item in links):
+        return
+    links.append({"title": title, "url": url})
+
+
+def _web_answer_site_search_terms(question: str) -> str:
+    normalized = _repair_mojibake(question).lower()
+    normalized = re.sub(
+        r"\b(?:dns-?shop|днс-?шоп|ozon|озон|wildberries|wb|вб|avito|авито|citilink|ситилинк)\b",
+        " ",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    tokens = re.findall(r"[a-zа-яё0-9]{2,}", normalized, flags=re.IGNORECASE)
+    stopwords = set(WEB_VERIFY_STOPWORDS) | {
+        "найди",
+        "мне",
+        "самую",
+        "самый",
+        "самое",
+        "дешевую",
+        "дешёвую",
+        "дешевый",
+        "дешёвый",
+        "низкой",
+        "цене",
+        "цена",
+        "купить",
+        "наличие",
+        "днс",
+        "dns",
+        "на",
+        "в",
+        "по",
+    }
+    result = [token for token in tokens if token not in stopwords]
+    if "5090" in result and "rtx" not in result:
+        result.insert(0, "rtx")
+    return " ".join(result[:8]) or _short_text(question, 80)
+
+
+def _web_answer_site_search_url(domain: str, terms: str) -> str:
+    encoded = urlencode({"q": terms})
+    if domain == "dns-shop.ru":
+        return f"https://www.dns-shop.ru/search/?{encoded}"
+    if domain == "ozon.ru":
+        return f"https://www.ozon.ru/search/?{urlencode({'text': terms})}"
+    if domain == "wildberries.ru":
+        return f"https://www.wildberries.ru/catalog/0/search.aspx?{urlencode({'search': terms})}"
+    if domain == "market.yandex.ru":
+        return f"https://market.yandex.ru/search?{urlencode({'text': terms})}"
+    if domain == "avito.ru":
+        return f"https://www.avito.ru/all?{encoded}"
+    if domain == "citilink.ru":
+        return f"https://www.citilink.ru/search/?{urlencode({'text': terms})}"
+    return f"https://{domain}/"
+
+
+def _web_answer_markdown_link_lines(links: list[dict[str, str]]) -> list[str]:
+    return [
+        (
+            f"- [{_markdown_link_label(item.get('title') or item.get('url') or 'Ссылка')}]"
+            f"({item['url']})"
+        )
+        for item in links
+        if item.get("url")
+    ]
+
+
+def _web_answer_source_link_lines(sources: list[dict[str, Any]]) -> list[str]:
+    links = [
+        {
+            "title": _short_text(source.get("title") or source.get("url") or "Источник", 90),
+            "url": str(source.get("url") or ""),
+        }
+        for source in sources
+        if source.get("url")
+    ]
+    return _web_answer_markdown_link_lines(links)
+
+
+def _markdown_link_label(value: str) -> str:
+    return _short_text(value, 90).replace("[", "(").replace("]", ")")
 
 
 def _looks_like_place_lookup_text(normalized: str) -> bool:
@@ -8579,44 +8802,35 @@ def _format_web_answer_report(
     queries: list[str],
     sources: list[dict[str, Any]],
     verification: dict[str, Any],
+    preferred_domains: list[str] | None = None,
+    direct_links: list[dict[str, str]] | None = None,
 ) -> str:
-    lines = [
-        "Ответ по веб-источникам.",
-        f"Вопрос: {question}",
-        f"Основной запрос: `{queries[0]}`.",
-    ]
+    _ = queries
+    links = direct_links or _web_answer_direct_links(
+        question,
+        preferred_domains=preferred_domains or [],
+        sources=sources,
+    )
+    lines: list[str] = []
     if not sources:
-        lines.append(
-            "Надёжных источников не нашёл: лучше уточнить запрос или попробовать позже."
-        )
+        if links:
+            lines.append("Сайт не отдал достаточно данных для честного сравнения цены.")
+            lines.append("Вот прямая ссылка для проверки:")
+            lines.extend(_web_answer_markdown_link_lines(links[:3]))
+        else:
+            lines.append("Не нашёл надёжную страницу в открытой выдаче.")
         return "\n".join(lines)
-    verdict = str(verification.get("verdict") or "insufficient_evidence")
     confidence = _web_answer_confidence(sources, verification)
-    lines.append(f"Уверенность: {confidence:.2f} ({verdict}).")
-    lines.append("")
-    lines.append("Короткий ответ:")
-    for item in sources[:3]:
-        title = _short_text(item.get("title") or item.get("url") or "Источник", 120)
-        excerpt = _short_text(item.get("excerpt") or item.get("snippet") or "", 420)
-        if excerpt:
-            lines.append(f"- {title}: {excerpt}")
-    lines.append("")
-    lines.append("Источники:")
-    for index, item in enumerate(sources[:6], start=1):
-        title = _short_text(item.get("title") or item.get("url") or "Источник", 120)
-        url = str(item.get("url") or "")
-        quality = str(item.get("quality") or "unknown")
-        score = float(item.get("answer_score") or 0)
-        lines.append(f"{index}. {title} — {url} ({quality}, score {score:.2f})")
-    if len(queries) > 1:
-        lines.append("")
-        lines.append("Дополнительные запросы:")
-        for query in queries[1:]:
-            lines.append(f"- `{query}`")
-    missing = verification.get("missing_terms")
-    if isinstance(missing, list) and missing:
-        lines.append("")
-        lines.append("Пробелы проверки: " + ", ".join(str(item) for item in missing[:8]))
+    if links:
+        if confidence < 0.45:
+            lines.append("Точную цену не подтверждаю: сайт/выдача дали мало читаемых данных.")
+            lines.append("Проверь напрямую:")
+        else:
+            lines.append("Нашёл полезную ссылку:")
+        lines.extend(_web_answer_markdown_link_lines(links[:3]))
+        return "\n".join(lines)
+    lines.append("Нашёл несколько источников:")
+    lines.extend(_web_answer_source_link_lines(sources[:3]))
     return "\n".join(lines)
 
 

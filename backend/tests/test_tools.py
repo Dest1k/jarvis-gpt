@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import ipaddress
 import json
 import zipfile
@@ -20,6 +21,7 @@ from jarvis_gpt.tools import (
     WEB_SEARCH_PROVIDER_STATS_KEY,
     WEB_USER_AGENT,
     ToolRegistry,
+    _parse_bing_results,
     _PublicOnlyAsyncNetworkBackend,
     _windows_native_command,
 )
@@ -1772,7 +1774,9 @@ def test_web_answer_expands_queries_and_ranks_sources(monkeypatch, tmp_path):
     assert len(calls) >= 2
     assert result.data["sources"][0]["url"] == "https://docs.vendor.example/widget"
     assert result.data["confidence"] >= 0.7
-    assert "Ответ по веб-источникам" in result.data["answer"]
+    assert "[Widget official docs](https://docs.vendor.example/widget)" in result.data["answer"]
+    assert "Основной запрос" not in result.data["answer"]
+    assert "Пробелы проверки" not in result.data["answer"]
     assert result.data["citations"][0]["url"] == "https://docs.vendor.example/widget"
     assert result.data["claim_citations"]
     assert "https://docs.vendor.example/widget" in result.data["claim_citations"][0]["urls"]
@@ -2056,6 +2060,71 @@ def test_web_answer_diversifies_domains(monkeypatch, tmp_path):
     assert urls[0].startswith("https://same.example/")
     assert urls[1] == "https://other.example/widget"
     assert result.data["cards"]["source_mix"]["domain_count"] == 2
+    storage.close()
+
+
+def test_web_answer_site_specific_blocked_returns_direct_link(monkeypatch, tmp_path):
+    calls = []
+
+    async def fake_research(_ctx, args):
+        calls.append(args["query"])
+        return ToolRunResponse(
+            tool="web.research",
+            ok=True,
+            summary="Research ok.",
+            data={
+                "sources": [
+                    {
+                        "rank": 1,
+                        "title": "NVIDIA GeForce RTX",
+                        "url": "https://www.nvidia.com/en-us/geforce/graphics-cards/50-series/rtx-5090/",
+                        "snippet": "Official NVIDIA product page.",
+                        "excerpt": "NVIDIA product page, not a DNS store listing.",
+                        "fetched": True,
+                        "tool": "web.fetch",
+                        "quality": "primary-official",
+                        "evidence_id": "ev_nvidia",
+                    }
+                ]
+            },
+        )
+
+    async def fake_verify(_ctx, args):
+        assert args["evidence_ids"] == []
+        return ToolRunResponse(
+            tool="web.verify",
+            ok=True,
+            summary="Verification verdict: insufficient_evidence.",
+            data={"verification": {"verdict": "insufficient_evidence", "confidence": 0.0}},
+        )
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr("jarvis_gpt.tools._web_research", fake_research)
+    monkeypatch.setattr("jarvis_gpt.tools._web_verify", fake_verify)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    result = asyncio.run(
+        tools.run(
+            "web.answer",
+            {"question": "найди мне самую дешёвую 5090 на днс", "use_cache": False},
+        )
+    )
+
+    assert result.ok is True
+    assert result.data["sources"] == []
+    assert result.data["preferred_domains"] == ["dns-shop.ru"]
+    assert result.data["direct_links"][0]["url"].startswith("https://www.dns-shop.ru/search/")
+    assert "rtx+5090" in result.data["direct_links"][0]["url"].lower()
+    assert "NVIDIA" not in result.data["answer"]
+    assert "Основной запрос" not in result.data["answer"]
+    assert "[Поиск на dns-shop.ru]" in result.data["answer"]
+    assert any("site:dns-shop.ru" in query for query in calls)
+    assert not any("site:wikipedia.org" in query for query in calls)
     storage.close()
 
 
@@ -2913,6 +2982,32 @@ def test_web_search_parses_public_results(monkeypatch, tmp_path):
     assert result.data["results"][0]["snippet"] == "Public profile snippet"
     assert result.data["results"][1]["url"] == "https://example.org/news"
     storage.close()
+
+
+def test_bing_parser_unwraps_ck_redirect_urls():
+    target = "https://www.dns-shop.ru/product/example-rtx-5090/"
+    encoded = "a1" + base64.urlsafe_b64encode(target.encode()).decode().rstrip("=")
+    html = f"""
+    <li class="b_algo">
+      <h2>
+        <a href="https://www.bing.com/ck/a?!&&p=abc&u={encoded}&ntb=1">
+          DNS RTX 5090
+        </a>
+      </h2>
+      <p>Карточка товара DNS.</p>
+    </li>
+    """
+
+    results = _parse_bing_results(html, limit=3)
+
+    assert results == [
+        {
+            "title": "DNS RTX 5090",
+            "url": target,
+            "snippet": "Карточка товара DNS.",
+            "rank": 1,
+        }
+    ]
 
 
 def test_web_search_uses_region_freshness_pagination_and_yandex(monkeypatch, tmp_path):

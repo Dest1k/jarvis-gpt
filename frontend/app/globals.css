@@ -945,11 +945,14 @@ h3 {
 }
 
 .bubble {
+  min-width: 0;
   width: min(720px, 92%);
+  max-width: min(720px, 92%);
   padding: 12px 14px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
   background: var(--surface-2);
+  overflow-wrap: anywhere;
 }
 
 .bubble.user {
@@ -1266,9 +1269,11 @@ h3 {
   display: grid;
   gap: 9px;
   min-width: 0;
+  max-width: 100%;
   color: inherit;
   font-size: 13px;
   line-height: 1.55;
+  overflow-wrap: anywhere;
 }
 
 .richMessage.empty {
@@ -1288,6 +1293,8 @@ h3 {
 .richMessage a {
   color: var(--chat-accent);
   text-decoration: none;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .richMessage a:hover {
@@ -1323,8 +1330,16 @@ h3 {
 .richList {
   display: grid;
   gap: 5px;
+  min-width: 0;
+  max-width: 100%;
   margin: 0;
   padding-left: 18px;
+}
+
+.richList li {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
 }
 
 .richCodeBlock {

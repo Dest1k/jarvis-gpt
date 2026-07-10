@@ -1,5 +1,19 @@
 # Runtime
 
+## 2026-07-10 handoff - web answer bugfix
+
+For the operator and the second model:
+
+- `web.answer` fallback output is now user-facing, not a research dump. Chat
+  bubbles should contain concise markdown links; confidence, source scoring,
+  gaps, and claim citations belong in cards/trace.
+- Explicit site intent is respected. Known aliases such as "на ДНС" map to
+  `dns-shop.ru`; unrelated sources are filtered out. If the named site is
+  blocked or thin, Jarvis can still answer with a direct site search link.
+- Bing `/ck/a` result URLs are unwrapped before evidence storage/ranking.
+- Answer-cache version was bumped so old verbose cached answers are ignored.
+- Long URLs now wrap in the chat UI instead of widening the transcript.
+
 ## 2026-07-10 handoff - Google replacement quality pass
 
 For the operator and the second model:
