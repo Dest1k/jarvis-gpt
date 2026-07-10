@@ -3393,7 +3393,11 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
     )
     synthesis = {"attempted": False, "used": False, "reason": "disabled"}
     answer = fallback_answer
-    if synthesis_enabled:
+    if synthesis_enabled and _web_answer_should_synthesize(
+        question,
+        sources=ranked_sources,
+        verification=verification_dict,
+    ):
         synthesis = await _web_answer_synthesis(
             ctx,
             question=question,
@@ -3404,6 +3408,8 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
         )
         if bool(synthesis.get("used")) and str(synthesis.get("answer") or "").strip():
             answer = str(synthesis["answer"]).strip()
+    elif synthesis_enabled:
+        synthesis = {"attempted": False, "used": False, "reason": "weak_shopping_sources"}
     claim_citations = _web_answer_claim_citations(answer, ranked_sources)
     cards = _web_answer_cards(
         question=question,
@@ -8132,7 +8138,7 @@ def _web_answer_cache_key(
     max_sources: int,
 ) -> str:
     payload = {
-        "version": 3,
+        "version": 4,
         "question": question,
         "explicit_query": explicit_query,
         "queries": queries,
@@ -8354,6 +8360,13 @@ def _web_answer_direct_links(
     sources: list[dict[str, Any]],
 ) -> list[dict[str, str]]:
     links: list[dict[str, str]] = []
+    search_terms = _web_answer_site_search_terms(question)
+    shopping = _web_answer_looks_like_shopping(_repair_mojibake(question).lower())
+    if shopping:
+        for domain in preferred_domains:
+            search_url = _web_answer_site_search_url(domain, search_terms)
+            if search_url:
+                _append_unique_link(links, title=f"Поиск на {domain}", url=search_url)
     for source in sources:
         url = str(source.get("url") or "")
         if not url:
@@ -8366,7 +8379,6 @@ def _web_answer_direct_links(
             return links
     if links:
         return links
-    search_terms = _web_answer_site_search_terms(question)
     for domain in preferred_domains:
         search_url = _web_answer_site_search_url(domain, search_terms)
         if search_url:
@@ -8484,6 +8496,8 @@ def _web_answer_looks_like_shopping(normalized: str) -> bool:
             "купить",
             "цена",
             "стоимость",
+            "дешев",
+            "дешёв",
             "наличие",
             "магазин",
             "заказать",
@@ -8557,6 +8571,60 @@ def _web_answer_source_score(question: str, source: dict[str, Any]) -> float:
     if question_terms:
         score += min(2.0, 3.0 * len(question_terms & source_terms) / len(question_terms))
     return round(score, 3)
+
+
+def _web_answer_should_synthesize(
+    question: str,
+    *,
+    sources: list[dict[str, Any]],
+    verification: dict[str, Any],
+) -> bool:
+    normalized = _repair_mojibake(question).lower()
+    return not (
+        _web_answer_looks_like_shopping(normalized)
+        and _web_answer_weak_shopping_sources(sources, verification)
+    )
+
+
+def _web_answer_weak_shopping_sources(
+    sources: list[dict[str, Any]],
+    verification: dict[str, Any],
+) -> bool:
+    if not sources:
+        return True
+    try:
+        verification_confidence = float(verification.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        verification_confidence = 0.0
+    has_fetched = any(bool(source.get("fetched")) for source in sources)
+    has_price = any(
+        source.get("price")
+        or _source_extraction_has_price(source)
+        or re.search(
+            r"(?:\d[\d\s]{2,}(?:₽|руб|р\.|р\b)|₽\s*\d|price)",
+            " ".join(
+                str(source.get(key) or "")
+                for key in ("title", "snippet", "excerpt")
+            ).lower(),
+            flags=re.IGNORECASE,
+        )
+        for source in sources
+    )
+    if has_price:
+        return False
+    snippet_only = all(
+        str(source.get("quality") or "") == "snippet-only" or not source.get("fetched")
+        for source in sources
+    )
+    return snippet_only or (not has_fetched and verification_confidence < 0.35)
+
+
+def _source_extraction_has_price(source: dict[str, Any]) -> bool:
+    extraction = source.get("extraction")
+    if not isinstance(extraction, dict):
+        return False
+    prices = extraction.get("prices")
+    return isinstance(prices, list) and bool(prices)
 
 
 def _web_answer_terms(text: str) -> list[str]:

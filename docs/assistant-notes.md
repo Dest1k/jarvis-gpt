@@ -9,6 +9,14 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-10 - Codex (shopping weak evidence UX)
+
+- Fixed DNS/shopping answers with weak snippet-only evidence: `web.answer` now
+  keeps the direct store search link first and skips LLM synthesis that was
+  rewriting the deterministic fallback into "no data" prose.
+- Bumped the `web.answer` cache key version to avoid serving the stale bad
+  answer shape from the short TTL cache.
+
 ### 2026-07-10 - Codex (search cooldown evidence fallback)
 
 - Fixed a regression where `web.answer` could return `0 sources` during search

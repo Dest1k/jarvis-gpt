@@ -2129,6 +2129,67 @@ def test_web_answer_site_specific_blocked_returns_direct_link(monkeypatch, tmp_p
     storage.close()
 
 
+def test_web_answer_weak_shopping_source_keeps_dns_search_link(monkeypatch, tmp_path):
+    async def fake_research(_ctx, args):
+        return ToolRunResponse(
+            tool="web.research",
+            ok=True,
+            summary="Research ok.",
+            data={
+                "sources": [
+                    {
+                        "rank": 1,
+                        "title": "www.dns-shop.ru",
+                        "url": "https://www.dns-shop.ru/catalog/recipe/f514c6945d8e5ef9/rtx-5090/",
+                        "snippet": "Категория RTX 5090 в DNS.",
+                        "excerpt": "Категория RTX 5090 в DNS без цен.",
+                        "fetched": False,
+                        "tool": "web.search",
+                        "quality": "snippet-only",
+                        "evidence_id": "ev_dns",
+                    }
+                ]
+            },
+        )
+
+    async def fake_verify(_ctx, args):
+        return ToolRunResponse(
+            tool="web.verify",
+            ok=True,
+            summary="Verification verdict: insufficient_evidence.",
+            data={"verification": {"verdict": "insufficient_evidence", "confidence": 0.2}},
+        )
+
+    async def fake_synthesis(*args, **kwargs):
+        raise AssertionError("weak shopping evidence should use deterministic links")
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "1")
+    monkeypatch.setattr("jarvis_gpt.tools._web_research", fake_research)
+    monkeypatch.setattr("jarvis_gpt.tools._web_verify", fake_verify)
+    monkeypatch.setattr("jarvis_gpt.tools._web_answer_synthesis", fake_synthesis)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    result = asyncio.run(
+        tools.run(
+            "web.answer",
+            {"question": "найди мне самую дешёвую 5090 на днс", "use_cache": False},
+        )
+    )
+
+    assert result.ok is True
+    assert result.data["direct_links"][0]["title"] == "Поиск на dns-shop.ru"
+    assert result.data["direct_links"][0]["url"].startswith("https://www.dns-shop.ru/search/")
+    assert "Проверь напрямую" in result.data["answer"]
+    assert "Поиск на dns-shop.ru" in result.data["answer"]
+    assert result.data["synthesis"]["reason"] == "weak_shopping_sources"
+    storage.close()
+
+
 def test_web_crawl_follows_bounded_same_site_links(monkeypatch, tmp_path):
     async def fake_fetch(_ctx, args):
         if args["url"].endswith("/start"):
