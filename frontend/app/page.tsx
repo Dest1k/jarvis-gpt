@@ -3679,24 +3679,35 @@ export default function CommandCenter() {
 
   async function requestHostCommandApproval(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const command = hostCommandDraft.trim();
-    if (!command || busy) return;
+    const actionJson = hostCommandDraft.trim();
+    if (!actionJson || busy) return;
+    let payload: Record<string, unknown>;
+    try {
+      const parsed: unknown = JSON.parse(actionJson);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("Typed execution payload must be a JSON object");
+      }
+      payload = parsed as Record<string, unknown>;
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Invalid execution JSON");
+      return;
+    }
     setActiveOperation({
-      title: "Запрос допуска",
-      detail: command
+      title: "Запрос typed execution",
+      detail: actionJson
     });
     setBusy(true);
     try {
       const approval = await api<ApprovalItem>("/api/approvals", {
         method: "POST",
         body: JSON.stringify({
-          title: "Команда хоста",
-          description: command,
+          title: "Typed execution action",
+          description: actionJson,
           requested_action: "tool.run",
           risk: "danger",
           payload: {
-            tool: "host.bridge.execute",
-            arguments: { command }
+            tool: "execution.apply",
+            arguments: { payload }
           }
         })
       });
@@ -3704,7 +3715,7 @@ export default function CommandCenter() {
       setApprovals((current) => [approval, ...current].slice(0, 8));
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Не удалось запросить допуск для команды");
+      setError(err instanceof Error ? err.message : "Не удалось запросить допуск для action");
     } finally {
       setBusy(false);
       setActiveOperation(null);
@@ -5085,10 +5096,10 @@ export default function CommandCenter() {
               )}
               <form className="hostCommandForm" onSubmit={requestHostCommandApproval}>
                 <input
-                  aria-label="Команда хоста"
+                  aria-label="Typed execution JSON"
                   value={hostCommandDraft}
                   onChange={(event) => setHostCommandDraft(event.target.value)}
-                  placeholder="Get-Date"
+                  placeholder='{"protocol":"jarvis.execution.v1","action":{"kind":"fs.mkdir","path":"D:\\jarvis\\data\\example"}}'
                 />
                 <button
                   type="submit"

@@ -23,11 +23,26 @@ def test_operator_queue_collects_approvals_missions_and_future_profiles(monkeypa
     task = mission["tasks"][0]
     storage.update_mission_task(task["id"], mission_id=mission["id"], status="blocked")
     approval = storage.create_approval(
-        title="Run host command",
+        title="Apply structured write",
         description="Needs operator approval",
         requested_action="tool.run",
         risk="danger",
-        payload={"tool": "host.bridge.execute", "mission_id": mission["id"], "task_id": task["id"]},
+        payload={
+            "tool": "execution.apply",
+            "arguments": {
+                "payload": {
+                    "protocol": "jarvis.execution.v1",
+                    "action": {
+                        "kind": "fs.write",
+                        "action_id": "queued-write",
+                        "path": str(tmp_path / "queued.txt"),
+                        "content_base64": "cXVldWVk",
+                    },
+                }
+            },
+            "mission_id": mission["id"],
+            "task_id": task["id"],
+        },
     )
     storage.record_health(component="dispatcher", status="warn", message="warming up")
 

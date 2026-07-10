@@ -48,6 +48,14 @@ from .document_runtime import (
     extract_document,
     is_supported_document,
 )
+from .execution_config import build_execution_kernel, execution_capabilities_snapshot
+from .execution_kernel import ExecutionKernel
+from .execution_protocol import (
+    ActionClass,
+    action_json_schema,
+    classify_payload,
+)
+from .execution_session import SessionStatus, StepStatus
 from .host_bridge import HostBridgeClient, HostBridgeStatus
 from .learning import LearningEngine
 from .llm import LLMRouter
@@ -69,6 +77,12 @@ ToolHandler = Callable[
     ["ToolContext", dict[str, Any]],
     ToolRunResponse | Awaitable[ToolRunResponse],
 ]
+
+_SENSITIVE_PROCESS_ARGUMENT_RE = re.compile(
+    r"(?i)(?:^|[-_.])(api[-_]?key|authorization|bearer|credential(?:s)?|"
+    r"pass(?:word|wd)?|pwd|secret|token)(?:$|[-_.])"
+)
+_URL_USERINFO_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)([^/\s@]+)@")
 
 WEB_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -231,6 +245,7 @@ class ToolContext:
     settings: JarvisSettings
     storage: JarvisStorage
     llm: LLMRouter
+    execution: ExecutionKernel
     mission_id: str | None = None
     task_id: str | None = None
 
@@ -259,6 +274,7 @@ class ToolRegistry:
         self.settings = settings
         self.storage = storage
         self.llm = llm
+        self.execution = build_execution_kernel(settings)
         self._tools: dict[str, ToolSpec] = {}
         self._register_defaults()
 
@@ -308,6 +324,7 @@ class ToolRegistry:
                 settings=self.settings,
                 storage=self.storage,
                 llm=self.llm,
+                execution=self.execution,
                 mission_id=mission_id,
                 task_id=task_id,
             )
@@ -349,6 +366,88 @@ class ToolRegistry:
                 category="runtime",
                 input_schema={},
                 handler=_runtime_status,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="execution.capabilities",
+                description=(
+                    "Return the deterministic execution protocol schema, configured filesystem "
+                    "roots, and explicit process/network/registry capability boundaries."
+                ),
+                category="execution",
+                input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+                handler=_execution_capabilities,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="execution.inspect",
+                description=(
+                    "Run one read-only jarvis.execution.v1 action after strict JSON-schema, path, "
+                    "network, registry, and idempotency validation."
+                ),
+                category="execution",
+                input_schema=_execution_action_tool_schema(),
+                handler=_execution_inspect,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="execution.apply",
+                description=(
+                    "Run one approval-gated typed mutation, process, or owned-process control "
+                    "action through the deterministic execution kernel."
+                ),
+                category="execution",
+                input_schema=_execution_action_tool_schema(),
+                handler=_execution_apply,
+                danger_level="danger",
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="execution.transaction",
+                description=(
+                    "Apply an approval-gated atomic batch of reversible typed filesystem/registry "
+                    "mutations with checkpoint and automatic rollback."
+                ),
+                category="execution",
+                input_schema=_execution_transaction_tool_schema(),
+                handler=_execution_transaction,
+                danger_level="danger",
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="execution.session",
+                description=(
+                    "Create, inspect, list, or explicitly finish an in-memory execution session "
+                    "with bounded dry-fact history compression and owned-process state."
+                ),
+                category="execution",
+                input_schema=_execution_session_tool_schema(),
+                handler=_execution_session,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="execution.cancel",
+                description=(
+                    "Cancel one execution session and gracefully interrupt only the exact "
+                    "processes owned by that session, escalating to tree termination if needed."
+                ),
+                category="execution",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "string", "minLength": 1, "maxLength": 128}
+                    },
+                    "required": ["session_id"],
+                    "additionalProperties": False,
+                },
+                handler=_execution_cancel,
+                danger_level="review",
             )
         )
         self.add(
@@ -483,23 +582,6 @@ class ToolRegistry:
                 category="host",
                 input_schema={},
                 handler=_host_bridge_status,
-            )
-        )
-        self.add(
-            ToolSpec(
-                name="host.bridge.execute",
-                description=(
-                    "Execute a token-authenticated PowerShell command through the "
-                    "local host bridge."
-                ),
-                category="host",
-                input_schema={
-                    "command": "PowerShell command",
-                    "cwd": "Optional working directory",
-                    "timeout_sec": "1-120 second timeout",
-                },
-                handler=_host_bridge_execute,
-                danger_level="danger",
             )
         )
         self.add(
@@ -1338,6 +1420,358 @@ class ToolRegistry:
         )
 
 
+def _execution_action_tool_schema() -> dict[str, Any]:
+    action_schema = action_json_schema()
+    definitions = action_schema.pop("$defs", {})
+    return {
+        "type": "object",
+        "$defs": definitions,
+        "properties": {
+            "payload": action_schema,
+            "session_id": {"type": ["string", "null"], "minLength": 1, "maxLength": 128},
+            "finalize_session": {"type": "boolean", "default": False},
+        },
+        "required": ["payload"],
+        "additionalProperties": False,
+    }
+
+
+def _execution_transaction_tool_schema() -> dict[str, Any]:
+    action_schema = action_json_schema()
+    definitions = action_schema.pop("$defs", {})
+    return {
+        "type": "object",
+        "$defs": definitions,
+        "properties": {
+            "actions": {
+                "type": "array",
+                "items": action_schema,
+                "minItems": 1,
+                "maxItems": 128,
+            },
+            "idempotency_key": {
+                "type": "string",
+                "pattern": "^[A-Za-z][A-Za-z0-9_.:-]{0,127}$",
+            },
+            "session_id": {"type": ["string", "null"], "minLength": 1, "maxLength": 128},
+        },
+        "required": ["actions", "idempotency_key"],
+        "additionalProperties": False,
+    }
+
+
+def _execution_session_tool_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "operation": {
+                "type": "string",
+                "enum": ["list", "create", "get", "transition"],
+                "default": "list",
+            },
+            "session_id": {"type": ["string", "null"], "minLength": 1, "maxLength": 128},
+            "status": {
+                "type": ["string", "null"],
+                "enum": [None, *[item.value for item in SessionStatus]],
+            },
+            "max_history_entries": {"type": "integer", "minimum": 8, "maximum": 100000},
+            "max_history_bytes": {
+                "type": "integer",
+                "minimum": 4096,
+                "maximum": 64 * 1024 * 1024,
+            },
+        },
+        "additionalProperties": False,
+    }
+
+
+def _execution_capabilities(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunResponse:
+    return ToolRunResponse(
+        tool="execution.capabilities",
+        ok=True,
+        summary="Deterministic execution protocol and capability policy loaded.",
+        data={
+            "protocol": "jarvis.execution.v1",
+            "action_schema": action_json_schema(),
+            "capabilities": execution_capabilities_snapshot(ctx.execution),
+            "interfaces": {
+                "read_only": "execution.inspect",
+                "approved_action": "execution.apply",
+                "atomic_batch": "execution.transaction",
+                "session_state": "execution.session",
+                "session_cancel": "execution.cancel",
+                "external_subsystems": "ToolRegistry adapters; subsystem internals remain isolated",
+            },
+        },
+    )
+
+
+async def _execution_inspect(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    return await _execution_action(
+        ctx,
+        args,
+        expected=ActionClass.READ_ONLY,
+        tool="execution.inspect",
+    )
+
+
+async def _execution_apply(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    return await _execution_action(ctx, args, expected=None, tool="execution.apply")
+
+
+async def _execution_action(
+    ctx: ToolContext,
+    args: dict[str, Any],
+    *,
+    expected: ActionClass | None,
+    tool: str,
+) -> ToolRunResponse:
+    payload = args.get("payload")
+    if not isinstance(payload, dict):
+        return ToolRunResponse(tool=tool, ok=False, summary="A typed payload object is required.")
+    try:
+        action_class = classify_payload(payload)
+    except (TypeError, ValueError) as exc:
+        return ToolRunResponse(tool=tool, ok=False, summary=f"Invalid execution payload: {exc}")
+    if expected is not None and action_class is not expected:
+        return ToolRunResponse(
+            tool=tool,
+            ok=False,
+            summary=(
+                f"{tool} accepts only {expected.value} actions; received {action_class.value}."
+            ),
+            data={"action_class": action_class.value},
+        )
+    if tool == "execution.apply" and action_class is ActionClass.READ_ONLY:
+        return ToolRunResponse(
+            tool=tool,
+            ok=False,
+            summary="Read-only actions must use execution.inspect.",
+            data={"action_class": action_class.value},
+        )
+    session_id = str(args.get("session_id") or "").strip() or None
+    action_body = payload.get("action") if isinstance(payload.get("action"), dict) else {}
+    embedded_session_id = str(action_body.get("session_id") or "").strip() or None
+    process_action = action_class is ActionClass.PROCESS
+    if process_action and session_id != embedded_session_id:
+        return ToolRunResponse(
+            tool=tool,
+            ok=False,
+            summary=(
+                "process.run requires the same session_id in the wrapper and typed action "
+                "for owned-process tracking."
+            ),
+        )
+    session = None
+    if session_id is not None and not process_action:
+        session = ctx.execution.sessions.get(session_id)
+        if session is None:
+            return ToolRunResponse(tool=tool, ok=False, summary=f"Unknown session: {session_id}")
+        if session.status is SessionStatus.CREATED:
+            session.transition(SessionStatus.RUNNING)
+        elif session.status is not SessionStatus.RUNNING:
+            return ToolRunResponse(
+                tool=tool,
+                ok=False,
+                summary=f"Execution session is not runnable: {session.status.value}.",
+            )
+    try:
+        result = await ctx.execution.execute_payload(payload)
+    except asyncio.CancelledError:
+        if session is not None and session.status is SessionStatus.RUNNING:
+            session.add_step(
+                action=str(action_body.get("kind") or "execution.action"),
+                status=StepStatus.CANCELLED,
+                summary="Execution action was cancelled and rolled back.",
+            )
+            session.transition(SessionStatus.CANCELLED)
+        raise
+    except (TypeError, ValueError) as exc:
+        return ToolRunResponse(tool=tool, ok=False, summary=f"Execution rejected: {exc}")
+    if session is not None and not result.replayed:
+        session.add_step(
+            action=result.feedback.kind,
+            status=StepStatus.SUCCEEDED if result.ok else StepStatus.FAILED,
+            summary=result.feedback.summary,
+            facts={
+                "action_id": result.feedback.action_id,
+                "action_class": result.action_class.value,
+                "error": result.feedback.error,
+                "checkpoint_id": result.checkpoint_id,
+                "transaction_status": result.transaction_status,
+            },
+        )
+        if bool(args.get("finalize_session")):
+            session.transition(SessionStatus.SUCCEEDED if result.ok else SessionStatus.FAILED)
+    snapshot = ctx.execution.sessions.snapshot(session_id) if session_id is not None else None
+    return ToolRunResponse(
+        tool=tool,
+        ok=result.ok,
+        summary=result.feedback.summary,
+        data={"result": result.to_dict(), "session": snapshot},
+    )
+
+
+async def _execution_transaction(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    raw_actions = args.get("actions")
+    idempotency_key = str(args.get("idempotency_key") or "").strip()
+    session_id = str(args.get("session_id") or "").strip() or None
+    if not isinstance(raw_actions, list) or not raw_actions or len(raw_actions) > 128:
+        return ToolRunResponse(
+            tool="execution.transaction",
+            ok=False,
+            summary="actions must contain between 1 and 128 typed payload objects.",
+        )
+    if not all(isinstance(item, dict) for item in raw_actions):
+        return ToolRunResponse(
+            tool="execution.transaction",
+            ok=False,
+            summary="Every transaction action must be a JSON object.",
+        )
+    try:
+        result = await ctx.execution.execute_transaction_payloads(
+            tuple(raw_actions),
+            idempotency_key=idempotency_key,
+            session_id=session_id,
+        )
+    except asyncio.CancelledError:
+        session = ctx.execution.sessions.get(session_id) if session_id else None
+        if session is not None and session.status is SessionStatus.RUNNING:
+            session.add_step(
+                action="execution.transaction",
+                status=StepStatus.CANCELLED,
+                summary="Execution transaction was cancelled and rolled back.",
+            )
+            session.transition(SessionStatus.ROLLING_BACK)
+            session.transition(SessionStatus.CANCELLED)
+        raise
+    except (KeyError, TypeError, ValueError) as exc:
+        return ToolRunResponse(
+            tool="execution.transaction",
+            ok=False,
+            summary=f"Transaction rejected: {exc}",
+        )
+    return ToolRunResponse(
+        tool="execution.transaction",
+        ok=result.ok,
+        summary=(
+            "Execution transaction committed."
+            if result.ok
+            else f"Execution transaction ended with status {result.transaction_status}."
+        ),
+        data={
+            "result": {
+                "ok": result.ok,
+                "idempotency_key": result.idempotency_key,
+                "feedback": [item.to_dict() for item in result.feedback],
+                "transaction_status": result.transaction_status,
+                "checkpoint_id": result.checkpoint_id,
+                "replayed": result.replayed,
+            },
+            "session": ctx.execution.sessions.snapshot(session_id) if session_id else None,
+        },
+    )
+
+
+def _execution_session(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    operation = str(args.get("operation") or "list").strip().lower()
+    session_id = str(args.get("session_id") or "").strip()
+    if operation == "list":
+        sessions = list(ctx.execution.sessions.list())
+        return ToolRunResponse(
+            tool="execution.session",
+            ok=True,
+            summary=f"Listed {len(sessions)} execution session(s).",
+            data={"sessions": sessions},
+        )
+    if operation == "create":
+        kwargs: dict[str, Any] = {}
+        if session_id:
+            kwargs["session_id"] = session_id
+        if args.get("max_history_entries") is not None:
+            kwargs["max_history_entries"] = args["max_history_entries"]
+        if args.get("max_history_bytes") is not None:
+            kwargs["max_history_bytes"] = args["max_history_bytes"]
+        try:
+            session = ctx.execution.create_session(**kwargs)
+        except (TypeError, ValueError) as exc:
+            return ToolRunResponse(
+                tool="execution.session", ok=False, summary=f"Session rejected: {exc}"
+            )
+        return ToolRunResponse(
+            tool="execution.session",
+            ok=True,
+            summary=f"Created execution session {session.session_id}.",
+            data={"session": session.snapshot()},
+        )
+    if not session_id:
+        return ToolRunResponse(
+            tool="execution.session", ok=False, summary="session_id is required."
+        )
+    session = ctx.execution.sessions.get(session_id)
+    if session is None:
+        return ToolRunResponse(
+            tool="execution.session", ok=False, summary=f"Unknown session: {session_id}"
+        )
+    if operation == "get":
+        return ToolRunResponse(
+            tool="execution.session",
+            ok=True,
+            summary=f"Loaded execution session {session_id}.",
+            data={"session": session.snapshot()},
+        )
+    if operation != "transition":
+        return ToolRunResponse(
+            tool="execution.session", ok=False, summary=f"Unsupported operation: {operation}"
+        )
+    raw_status = str(args.get("status") or "").strip().lower()
+    try:
+        target = SessionStatus(raw_status)
+        if target is SessionStatus.CANCELLED and session.running_pids():
+            return ToolRunResponse(
+                tool="execution.session",
+                ok=False,
+                summary=(
+                    "Session owns running processes; terminate them through an approved "
+                    "process.terminate action before cancellation."
+                ),
+                data={"running_pids": list(session.running_pids())},
+            )
+        session.transition(target)
+    except ValueError as exc:
+        return ToolRunResponse(
+            tool="execution.session", ok=False, summary=f"Session transition rejected: {exc}"
+        )
+    return ToolRunResponse(
+        tool="execution.session",
+        ok=True,
+        summary=f"Execution session transitioned to {target.value}.",
+        data={"session": session.snapshot()},
+    )
+
+
+async def _execution_cancel(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    session_id = str(args.get("session_id") or "").strip()
+    if not session_id:
+        return ToolRunResponse(
+            tool="execution.cancel", ok=False, summary="session_id is required."
+        )
+    try:
+        result = await ctx.execution.cancel_session(session_id)
+    except (KeyError, RuntimeError, ValueError) as exc:
+        return ToolRunResponse(
+            tool="execution.cancel",
+            ok=False,
+            summary=f"Session cancellation rejected: {exc}",
+        )
+    return ToolRunResponse(
+        tool="execution.cancel",
+        ok=bool(result.get("ok")),
+        summary=str(result.get("summary") or "Execution session cancellation completed."),
+        data=result,
+    )
+
+
 def _runtime_status(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunResponse:
     data = {
         "settings": ctx.settings.public_dict(),
@@ -1547,29 +1981,15 @@ def _host_bridge_status(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunRespo
     status = HostBridgeStatus(ctx.settings).snapshot()
     return ToolRunResponse(
         tool="host.bridge.status",
-        ok=bool(status["script_available"]),
-        summary="Host bridge is listening."
+        ok=bool(status["script_available"] and status["action_v1_ready"]),
+        summary="Structured host bridge action.v1 is ready."
+        if status["action_v1_ready"]
+        else "Host bridge is running with a stale contract; restart Jarvis."
         if status["port_open"]
         else "Host bridge script found but port is offline."
         if status["script_available"]
         else "Host bridge script is missing.",
         data=status,
-    )
-
-
-async def _host_bridge_execute(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
-    timeout_sec = _int_arg(args.get("timeout_sec"), default=30, minimum=1, maximum=120)
-    result = await HostBridgeClient(ctx.settings).execute(
-        command=str(args.get("command") or ""),
-        cwd=str(args["cwd"]) if args.get("cwd") else None,
-        timeout_sec=timeout_sec,
-    )
-    data = result.get("data") if isinstance(result.get("data"), dict) else result
-    return ToolRunResponse(
-        tool="host.bridge.execute",
-        ok=bool(result.get("ok")),
-        summary=str(result.get("summary") or "Host bridge command finished."),
-        data=data,
     )
 
 
@@ -1586,16 +2006,16 @@ async def _run_native_bridge_command(
     payload: dict[str, Any],
     timeout_sec: int,
 ) -> tuple[dict[str, Any], bool, str, Any]:
-    """Build, run and parse one native host-bridge command. May raise ValueError."""
+    """Validate and run one structured host-bridge action. May raise ValueError."""
 
-    command = _windows_native_command(action, payload)
-    result = await HostBridgeClient(ctx.settings).execute(
-        command=command,
+    clean_payload = _validate_native_payload(action, payload)
+    result = await HostBridgeClient(ctx.settings).action(
+        action=action,
+        payload=clean_payload,
         timeout_sec=timeout_sec,
     )
     bridge_data = result.get("data") if isinstance(result.get("data"), dict) else result
-    stdout = bridge_data.get("stdout", "") if isinstance(bridge_data, dict) else ""
-    native = _parse_native_stdout(stdout)
+    native = bridge_data if isinstance(bridge_data, dict) else {}
     ok = bool(result.get("ok")) and bool(native.get("ok", True))
     summary = str(
         native.get("summary")
@@ -1684,8 +2104,11 @@ async def _browser_open(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
         url = _validate_browser_url(str(args.get("url") or ""), policy=policy)
     except ValueError as exc:
         return ToolRunResponse(tool="browser.open", ok=False, summary=str(exc))
-    command = f"Start-Process -FilePath {_powershell_quote(url)}"
-    result = await HostBridgeClient(ctx.settings).execute(command=command, timeout_sec=10)
+    result = await HostBridgeClient(ctx.settings).action(
+        action="url.open",
+        payload={"url": url},
+        timeout_sec=10,
+    )
     data = result.get("data") if isinstance(result.get("data"), dict) else result
     return ToolRunResponse(
         tool="browser.open",
@@ -1742,28 +2165,16 @@ async def _browser_chrome_launch(ctx: ToolContext, args: dict[str, Any]) -> Tool
     except ValueError as exc:
         return ToolRunResponse(tool="browser.chrome.launch", ok=False, summary=str(exc))
 
-    args_list = [
-        f"--remote-debugging-port={debug_port}",
-        f"--user-data-dir={profile_dir}",
-        "--no-first-run",
-        "--no-default-browser-check",
-        start_url,
-    ]
-    ps_args = ", ".join(_powershell_quote(item) for item in args_list)
-    command = (
-        "$candidates = @("
-        "\"$env:ProgramFiles\\Google\\Chrome\\Application\\chrome.exe\", "
-        "\"${env:ProgramFiles(x86)}\\Google\\Chrome\\Application\\chrome.exe\", "
-        "\"$env:LOCALAPPDATA\\Google\\Chrome\\Application\\chrome.exe\""
-        "); "
-        "$chrome = $candidates | Where-Object { $_ -and (Test-Path $_) } | "
-        "Select-Object -First 1; "
-        "if (-not $chrome) { throw 'Chrome executable was not found.' }; "
-        f"New-Item -ItemType Directory -Force -Path {_powershell_quote(str(profile_dir))} "
-        "| Out-Null; "
-        f"Start-Process -FilePath $chrome -ArgumentList @({ps_args})"
+    result = await HostBridgeClient(ctx.settings).action(
+        action="chrome.launch",
+        payload={
+            "debug_port": debug_port,
+            "profile_dir": str(profile_dir),
+            "start_url": start_url,
+            "headless": False,
+        },
+        timeout_sec=15,
     )
-    result = await HostBridgeClient(ctx.settings).execute(command=command, timeout_sec=15)
     data = result.get("data") if isinstance(result.get("data"), dict) else result
     return ToolRunResponse(
         tool="browser.chrome.launch",
@@ -2320,16 +2731,28 @@ async def _browser_open_many(ctx: ToolContext, args: dict[str, Any]) -> ToolRunR
             )
     if not urls:
         return ToolRunResponse(tool="browser.open_many", ok=False, summary="No URLs provided.")
-    commands = "; ".join(
-        f"Start-Process -FilePath {_powershell_quote(url)}" for url in urls
-    )
-    result = await HostBridgeClient(ctx.settings).execute(command=commands, timeout_sec=20)
-    data = result.get("data") if isinstance(result.get("data"), dict) else result
+    client = HostBridgeClient(ctx.settings)
+    concurrency = asyncio.Semaphore(min(4, len(urls)))
+
+    async def open_url(url: str) -> dict[str, Any]:
+        async with concurrency:
+            return await client.action(
+                action="url.open",
+                payload={"url": url},
+                timeout_sec=10,
+            )
+
+    results = list(await asyncio.gather(*(open_url(url) for url in urls)))
+    ok = all(bool(item.get("ok")) for item in results)
     return ToolRunResponse(
         tool="browser.open_many",
-        ok=bool(result.get("ok")),
-        summary=str(result.get("summary") or f"Requested {len(urls)} browser tab(s)."),
-        data={"urls": urls, "bridge": data},
+        ok=ok,
+        summary=(
+            f"Requested {len(urls)} browser tab(s)."
+            if ok
+            else "One or more structured browser-open actions failed."
+        ),
+        data={"urls": urls, "bridge_results": results},
     )
 
 
@@ -6316,418 +6739,24 @@ def _filesystem_write_text(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRes
     )
 
 
-WINDOWS_NATIVE_ACTIONS = {
-    "capabilities",
-    "process.start",
-    "app.open_and_type",
-    "screen.capture",
-    "window.focus",
-    "window.list",
-    "keyboard.send",
-    "wmi.query",
-}
-
-WINDOWS_NATIVE_SCRIPT = r"""
-function Out($Ok, $Summary, $Data) {
-  [pscustomobject]@{
-    ok = $Ok
-    summary = $Summary
-    action = $Action
-    data = $Data
-  } | ConvertTo-Json -Depth 8 -Compress
-}
-
-try {
-  if ($Action -eq 'capabilities') {
-    Out $true 'Native Windows layer is available.' @{
-      wmi = $true
-      cim = $true
-      winapi = $true
-      windowFocus = $true
-      keyboard = $true
-      clipboard = $true
-      process = $true
-      screenshot = $true
-    }
-    exit 0
-  }
-
-  Add-Type -AssemblyName System.Windows.Forms
-  Add-Type -AssemblyName System.Drawing
-  Add-Type @'
-using System;
-using System.Runtime.InteropServices;
-public static class JWin {
-  [DllImport("user32.dll")]
-  public static extern bool SetForegroundWindow(IntPtr hWnd);
-  [DllImport("user32.dll")]
-  public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
-  [DllImport("user32.dll")]
-  public static extern IntPtr GetForegroundWindow();
-  [DllImport("user32.dll")]
-  public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
-  [DllImport("kernel32.dll")]
-  public static extern uint GetCurrentThreadId();
-  [DllImport("user32.dll")]
-  public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
-  [DllImport("user32.dll")]
-  public static extern bool BringWindowToTop(IntPtr hWnd);
-  [DllImport("user32.dll")]
-  public static extern IntPtr SetFocus(IntPtr hWnd);
-}
-'@
-
-  function Val($Value, $Default) {
-    if ($null -eq $Value -or $Value -eq '') {
-      return $Default
-    }
-    return $Value
-  }
-
-  function SplitTargets($Value) {
-    if ($null -eq $Value -or [string]$Value -eq '') {
-      return @()
-    }
-    return @(([string]$Value -split '\|') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-  }
-
-  function ForegroundPid() {
-    $foreground = [JWin]::GetForegroundWindow()
-    if ($foreground -eq [IntPtr]::Zero) {
-      return 0
-    }
-    $foregroundPid = 0
-    [void][JWin]::GetWindowThreadProcessId($foreground, [ref]$foregroundPid)
-    return [int]$foregroundPid
-  }
-
-  function IsForeground($Process) {
-    if (-not $Process) {
-      return $false
-    }
-    return (ForegroundPid) -eq [int]$Process.Id
-  }
-
-  function TryActivate($Process, $Title) {
-    if (-not $Process -or $Process.MainWindowHandle -eq 0) {
-      return $false
-    }
-    $targetPid = 0
-    $targetThread = [JWin]::GetWindowThreadProcessId($Process.MainWindowHandle, [ref]$targetPid)
-    $foregroundPid = 0
-    $foregroundThread = [JWin]::GetWindowThreadProcessId(
-      [JWin]::GetForegroundWindow(),
-      [ref]$foregroundPid
-    )
-    $currentThread = [JWin]::GetCurrentThreadId()
-    if ($foregroundThread -ne 0) {
-      [void][JWin]::AttachThreadInput($currentThread, $foregroundThread, $true)
-    }
-    if ($targetThread -ne 0) {
-      [void][JWin]::AttachThreadInput($currentThread, $targetThread, $true)
-    }
-    try {
-      [void][JWin]::ShowWindowAsync($Process.MainWindowHandle, 9)
-      Start-Sleep -Milliseconds 120
-      [void][JWin]::BringWindowToTop($Process.MainWindowHandle)
-      [void][JWin]::SetForegroundWindow($Process.MainWindowHandle)
-      [void][JWin]::SetFocus($Process.MainWindowHandle)
-    } finally {
-      if ($targetThread -ne 0) {
-        [void][JWin]::AttachThreadInput($currentThread, $targetThread, $false)
-      }
-      if ($foregroundThread -ne 0) {
-        [void][JWin]::AttachThreadInput($currentThread, $foregroundThread, $false)
-      }
-    }
-    Start-Sleep -Milliseconds 220
-    if (IsForeground $Process) {
-      return $true
-    }
-    try {
-      $shell = New-Object -ComObject WScript.Shell
-      [void]$shell.AppActivate([int]$Process.Id)
-      Start-Sleep -Milliseconds 160
-      if (IsForeground $Process) {
-        return $true
-      }
-      foreach ($targetTitle in (SplitTargets $Title)) {
-        [void]$shell.AppActivate($targetTitle)
-        Start-Sleep -Milliseconds 160
-        if (IsForeground $Process) {
-          return $true
-        }
-      }
-    } catch {
-      return $false
-    }
-    return $false
-  }
-
-  function Focus($TargetPid, $Name, $Title) {
-    $p = $null
-    for ($attempt = 0; $attempt -lt 12; $attempt++) {
-      if ($TargetPid) {
-        $candidate = Get-Process -Id $TargetPid -ErrorAction SilentlyContinue
-        if ($candidate -and $candidate.MainWindowHandle -ne 0) {
-          $p = $candidate
-        }
-      }
-      if (-not $p) {
-        foreach ($targetTitle in (SplitTargets $Title)) {
-          $p = Get-Process -ErrorAction SilentlyContinue |
-            Where-Object {
-              $_.MainWindowTitle -like "*$targetTitle*" -and $_.MainWindowHandle -ne 0
-            } |
-            Select-Object -First 1
-          if ($p) {
-            break
-          }
-        }
-      }
-      if (-not $p) {
-        foreach ($targetName in (SplitTargets $Name)) {
-          $p = Get-Process -Name $targetName -ErrorAction SilentlyContinue |
-            Where-Object { $_.MainWindowHandle -ne 0 } |
-            Select-Object -First 1
-          if ($p) {
-            break
-          }
-        }
-      }
-      if ($p -and $p.MainWindowHandle -ne 0) {
-        break
-      }
-      Start-Sleep -Milliseconds 250
-    }
-    return (TryActivate $p $Title)
-  }
-
-  function SendInput($Keys, $Text) {
-    if ($Text) {
-      Set-Clipboard -Value ([string]$Text)
-      Start-Sleep -Milliseconds 80
-      [System.Windows.Forms.SendKeys]::SendWait('^v')
-      Start-Sleep -Milliseconds 80
-    }
-    if ($Keys) {
-      [System.Windows.Forms.SendKeys]::SendWait([string]$Keys)
-    }
-  }
-
-  function HasExplicitTarget($Payload) {
-    return [bool](
-      $Payload.process_id -or
-      $Payload.process_name -or
-      $Payload.window_title
-    )
-  }
-
-  function StartNativeProcess($Executable, $Arguments) {
-    $parameters = @{
-      FilePath = $Executable
-      PassThru = $true
-    }
-    if ($null -ne $Arguments -and [string]$Arguments -ne '') {
-      $parameters.ArgumentList = [string]$Arguments
-    }
-    return Start-Process @parameters
-  }
-
-  function VisibleWindows($Limit) {
-    return Get-Process -ErrorAction SilentlyContinue |
-      Where-Object { $_.MainWindowHandle -ne 0 } |
-      Select-Object -First ([int](Val $Limit 30)) Id, ProcessName, MainWindowTitle
-  }
-
-  function ReadScreenOcr($OutputPath) {
-    $tesseract = Get-Command tesseract -ErrorAction SilentlyContinue
-    if (-not $tesseract) {
-      return @{ available = $false; text = ''; error = 'tesseract not found' }
-    }
-    try {
-      $text = & $tesseract.Source $OutputPath stdout --psm 6 2>$null | Out-String
-      return @{ available = $true; text = ([string]$text).Trim(); error = '' }
-    } catch {
-      return @{ available = $false; text = ''; error = $_.Exception.Message }
-    }
-  }
-
-  function CaptureScreen($OutputPath, $Limit, $Ocr) {
-    $directory = Split-Path -Parent $OutputPath
-    if ($directory) {
-      New-Item -ItemType Directory -Path $directory -Force | Out-Null
-    }
-    $bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
-    $bitmap = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
-    $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
-    try {
-      $graphics.CopyFromScreen($bounds.Left, $bounds.Top, 0, 0, $bounds.Size)
-      $bitmap.Save($OutputPath, [System.Drawing.Imaging.ImageFormat]::Png)
-    } finally {
-      $graphics.Dispose()
-      $bitmap.Dispose()
-    }
-    $foreground = [JWin]::GetForegroundWindow()
-    $foregroundPid = 0
-    if ($foreground -ne [IntPtr]::Zero) {
-      [void][JWin]::GetWindowThreadProcessId($foreground, [ref]$foregroundPid)
-    }
-    $active = $null
-    if ($foregroundPid -gt 0) {
-      $active = Get-Process -Id $foregroundPid -ErrorAction SilentlyContinue |
-        Select-Object -First 1 Id, ProcessName, MainWindowTitle
-    }
-    $ocrResult = @{ available = $false; text = ''; error = '' }
-    if ([bool]$Ocr) {
-      $ocrResult = ReadScreenOcr $OutputPath
-    }
-    Out $true "Screen captured." @{
-      path = $OutputPath
-      width = $bounds.Width
-      height = $bounds.Height
-      left = $bounds.Left
-      top = $bounds.Top
-      activeWindow = $active
-      ocrRequested = [bool]$Ocr
-      ocrAvailable = [bool]$ocrResult.available
-      ocrText = $ocrResult.text
-      ocrError = $ocrResult.error
-      windows = @(VisibleWindows $Limit)
-    }
-  }
-
-  switch ($Action) {
-    'process.start' {
-      $p = StartNativeProcess $Payload.executable $Payload.arguments
-      Out $true "Started $($Payload.executable)." @{
-        pid = $p.Id
-        processName = $p.ProcessName
-      }
-      break
-    }
-    'app.open_and_type' {
-      $p = StartNativeProcess $Payload.executable $Payload.arguments
-      Start-Sleep -Milliseconds ([int](Val $Payload.wait_ms 700))
-      $focused = Focus $p.Id $Payload.process_name $Payload.window_title
-      if (-not $focused) {
-        Out $false "Target window was not focused; native input was not sent." @{
-          pid = $p.Id
-          focused = $focused
-        }
-        break
-      }
-      SendInput $Payload.keys $Payload.text
-      Out $true "Opened $($Payload.executable) and sent native input." @{
-        pid = $p.Id
-        focused = $focused
-      }
-      break
-    }
-    'screen.capture' {
-      CaptureScreen $Payload.path $Payload.limit $Payload.ocr
-      break
-    }
-    'window.focus' {
-      $focused = Focus `
-        $Payload.process_id `
-        $Payload.process_name `
-        $Payload.window_title
-      if ($focused) {
-        $summary = 'Window focused through WinAPI.'
-      } else {
-        $summary = 'Window was not found.'
-      }
-      Out $focused $summary @{ focused = $focused }
-      break
-    }
-    'keyboard.send' {
-      $hasTarget = HasExplicitTarget $Payload
-      $focused = $false
-      if ($hasTarget) {
-        $focused = Focus `
-          $Payload.process_id `
-          $Payload.process_name `
-          $Payload.window_title
-        if (-not $focused) {
-          Out $false 'Target window was not focused; native input was not sent.' @{
-            focused = $focused
-          }
-          break
-        }
-      }
-      SendInput $Payload.keys $Payload.text
-      Out $true 'Native keyboard input sent.' @{ focused = $focused }
-      break
-    }
-    'window.list' {
-      $items = VisibleWindows $Payload.limit
-      Out $true "Listed $(@($items).Count) visible window(s)." @{
-        windows = $items
-      }
-      break
-    }
-    'wmi.query' {
-      $limit = [int](Val $Payload.limit 20)
-      $props = @($Payload.properties)
-      $base = @{
-        Namespace = $Payload.namespace
-        ClassName = $Payload.class_name
-      }
-      if ($Payload.filter) {
-        $base.Filter = $Payload.filter
-      }
-      $q = Get-CimInstance @base | Select-Object -First $limit
-      if ($props.Count -gt 0) {
-        $q = $q | Select-Object -Property $props
-      }
-      Out $true "WMI/CIM query returned $(@($q).Count) item(s)." @{
-        items = $q
-        className = $Payload.class_name
-        namespace = $Payload.namespace
-      }
-      break
-    }
-    default {
-      throw "Unsupported native action: $Action"
-    }
-  }
-} catch {
-  Out $false $_.Exception.Message @{ error = $_.Exception.Message }
-  exit 1
-}
-"""
-
-
-def _windows_native_command(action: str, payload: dict[str, Any]) -> str:
-    if action not in WINDOWS_NATIVE_ACTIONS:
-        allowed = ", ".join(sorted(WINDOWS_NATIVE_ACTIONS))
-        raise ValueError(f"Unsupported native action: {action}. Allowed: {allowed}.")
-    clean_payload = _validate_native_payload(action, payload)
-    payload_json = json.dumps(clean_payload, ensure_ascii=False, default=str)
-    return "\n".join(
-        [
-            "$utf8=New-Object System.Text.UTF8Encoding -ArgumentList $false",
-            "[Console]::OutputEncoding=$utf8",
-            "$OutputEncoding=$utf8",
-            "$ErrorActionPreference='Stop'",
-            f"$Action={_powershell_quote(action)}",
-            f"$Payload={_powershell_quote(payload_json)} | ConvertFrom-Json",
-            WINDOWS_NATIVE_SCRIPT.strip(),
-        ]
-    )
-
-
 def _validate_native_payload(action: str, payload: dict[str, Any]) -> dict[str, Any]:
     clean = dict(payload)
     if action in {"process.start", "app.open_and_type"}:
         executable = _native_string(clean.get("executable"), "executable", max_length=260)
         clean["executable"] = executable
-        clean["arguments"] = _native_string(
-            clean.get("arguments", ""),
-            "arguments",
-            max_length=4000,
-        )
+        raw_arguments = clean.get("arguments", [])
+        if not isinstance(raw_arguments, list) or len(raw_arguments) > 128:
+            raise ValueError("arguments must be a JSON list with at most 128 strings.")
+        arguments: list[str] = []
+        for index, item in enumerate(raw_arguments):
+            if not isinstance(item, str):
+                raise ValueError(f"arguments[{index}] must be a string.")
+            if "\x00" in item or len(item) > 4000:
+                raise ValueError(f"arguments[{index}] is invalid or too long.")
+            arguments.append(item)
+        clean["arguments"] = arguments
+        if clean.get("cwd") is not None:
+            clean["cwd"] = _native_string(clean.get("cwd"), "cwd", max_length=500)
     if action == "app.open_and_type":
         clean["keys"] = _native_string(clean.get("keys", ""), "keys", max_length=1000)
         clean["text"] = _native_string(clean.get("text", ""), "text", max_length=4000)
@@ -6835,26 +6864,53 @@ def _browser_target_arg(value: Any) -> str:
     return text
 
 
-def _parse_native_stdout(stdout: str) -> dict[str, Any]:
-    for line in reversed(stdout.splitlines()):
-        candidate = line.strip()
-        if not candidate.startswith("{"):
-            continue
-        try:
-            parsed = json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
-        return parsed if isinstance(parsed, dict) else {}
-    return {}
-
-
 def _redact_native_payload(payload: dict[str, Any]) -> dict[str, Any]:
     redacted = dict(payload)
+    arguments = redacted.get("arguments")
+    if isinstance(arguments, list):
+        redacted["arguments"] = _redact_process_arguments(arguments)
     for key in ("text", "keys"):
         value = redacted.get(key)
         if isinstance(value, str) and len(value) > 120:
             redacted[key] = f"{value[:120]}..."
     return redacted
+
+
+def _redact_process_arguments(arguments: list[Any]) -> list[Any]:
+    redacted: list[Any] = []
+    redact_next = False
+    for raw in arguments:
+        if not isinstance(raw, str):
+            redacted.append(raw)
+            redact_next = False
+            continue
+        if redact_next:
+            redacted.append("[REDACTED]")
+            redact_next = False
+            continue
+
+        value = _URL_USERINFO_RE.sub(r"\1[REDACTED]@", raw)
+        prefix, separator, _secret = _split_sensitive_process_assignment(value)
+        if separator:
+            redacted.append(f"{prefix}{separator}[REDACTED]")
+            continue
+        redacted.append(value)
+        if _is_sensitive_process_flag(value):
+            redact_next = True
+    return redacted
+
+
+def _split_sensitive_process_assignment(value: str) -> tuple[str, str, str]:
+    for separator in ("=", ":"):
+        prefix, found, secret = value.partition(separator)
+        if found and _is_sensitive_process_flag(prefix):
+            return prefix, separator, secret
+    return value, "", ""
+
+
+def _is_sensitive_process_flag(value: str) -> bool:
+    normalized = value.strip().lstrip("-/").casefold()
+    return bool(normalized and _SENSITIVE_PROCESS_ARGUMENT_RE.search(normalized))
 
 
 def _resolve_allowed_path(settings: JarvisSettings, raw_path: str) -> Path:
@@ -7464,10 +7520,6 @@ class _PublicOnlyAsyncHTTPTransport(httpx.AsyncHTTPTransport):
             retries=0,
             network_backend=_PublicOnlyAsyncNetworkBackend(),
         )
-
-
-def _powershell_quote(value: str) -> str:
-    return "'" + value.replace("'", "''") + "'"
 
 
 def _validate_public_http_url(raw_url: str) -> str:

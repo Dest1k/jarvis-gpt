@@ -887,3 +887,143 @@ Claude Sync Note
 - Verified: anonymous localhost GET=200 without `WWW-Authenticate`; missing
   server token API=503; Next typecheck/build; Compose config; PowerShell parser;
   backend `337 passed`; Ruff clean.
+
+### 2026-07-10 - Codex (legacy execution test migration)
+
+Claude Sync Note
+
+[Измененные файлы и новые зависимости]
+
+- Updated `backend/tests/test_agent.py`, `test_agentic_loop.py`,
+  `test_approval_executor.py`, `test_api_smoke.py`, and `test_operator_queue.py`.
+- New dependencies: none. No `src` or web changes in this test-only migration.
+
+[Что конкретно исправлено / какие заглушки устранены]
+
+- Removed obsolete assertions for the deleted raw host bridge and heuristic
+  console/PowerShell command recipes. Raw console text now has a regression test
+  proving that it creates no approval and reaches neither native nor structured
+  execution.
+- Migrated agentic, mission-resume, approval-executor, API-smoke, and operator
+  queue fixtures to typed `execution.apply` payloads. Approved execution is
+  verified with a real bounded `fs.write`; pre-approval paths leave files absent.
+- Native inspection mocks now exercise `HostBridgeClient.action(action, payload,
+  timeout_sec)` and assert structured action/payload fields.
+
+[Изменения в API-контрактах, сигнатурах функций и структурах данных]
+
+- Legacy tests now treat `host.bridge.execute` as unregistered even when a danger
+  override is supplied.
+- Mutations use danger-gated `execution.apply` with protocol
+  `jarvis.execution.v1`; native desktop actions remain structured
+  `windows.native` approvals.
+
+[Pending: Текущие точки сборки и что Claude должен делать/проверить дальше]
+
+- Targeted legacy suite: `109 passed`.
+- Ruff on all five migrated files: clean.
+
+### 2026-07-10 - Codex (deterministic execution substrate and structured host bridge)
+
+Claude Sync Note
+
+[Измененные/созданные файлы, новые зависимости и структуры данных]
+
+- Added `backend/src/jarvis_gpt/execution_actions.py`, `execution_config.py`,
+  `execution_kernel.py`, `execution_models.py`, `execution_process.py`,
+  `execution_protocol.py`, `execution_session.py`, and `execution_transaction.py`.
+- Added execution/kernel/process/transaction/session/tool/client regression suites and
+  `docs/execution-capabilities.example.json`; updated agent, ToolRegistry, CLI, storage,
+  Host Bridge, launcher, Command Center, runtime documentation, environment template,
+  deployment contracts, and migrated approval/agent tests.
+- New dependencies: none. New primary data structures: strict discriminated Pydantic action
+  envelopes; `ActionFeedback`/`ExecutionFeedback` snapshots; durable checkpoint manifests;
+  bounded `ExecutionSession` state/history/process records; capability policy records.
+- Web-surfing internals were not modified. Existing web tools remain an isolated black box;
+  only their structured host/browser launch adapter is connected to the substrate.
+
+[Спецификация разработанных системных JSON-интерфейсов для вызова инструментов]
+
+- Protocol `jarvis.execution.v1`: `{"protocol":"jarvis.execution.v1","action":{...}}`.
+  Supported discriminators: `fs.stat`, `fs.list`, `fs.read`, `fs.mkdir`, `fs.write`,
+  `fs.copy`, `fs.move`, `fs.delete`, `process.run`, `process.terminate`,
+  `network.resolve`, `network.tcp_probe`, `registry.get`, `registry.set`, and
+  `registry.delete`. Unknown/extra fields and non-absolute filesystem paths fail closed.
+- `execution.capabilities {}` returns action JSON Schema, effective roots, deny paths, and
+  process/network/registry policy. `execution.inspect {payload, session_id?,
+  finalize_session?}` accepts read-only actions. Approval-gated `execution.apply` uses the
+  same wrapper for mutation/process/control actions.
+- Approval-gated `execution.transaction {actions[1..128], idempotency_key, session_id?}`
+  executes only reversible filesystem/registry mutations under one durable checkpoint.
+  `execution.session {operation:list|create|get|transition,...}` exposes the state machine;
+  `execution.cancel {session_id}` interrupts only exact session-owned process trees.
+- Result envelope: protocol, `ok`, action id/class, replay marker, transaction/checkpoint
+  status, and `ActionFeedback`; process feedback additionally contains redacted argv, PID,
+  exit/termination reason, bounded stdout/stderr, PID tree, permission snapshot, observed
+  filesystem diff, timing, interrupt/kill flags, and error.
+- Host bridge contract `action.v1`: authenticated `POST /action` request
+  `{"action":string,"payload":object,"timeout_sec":integer}`. Allowed actions are
+  `capabilities`, `app.open_and_type`, `process.start`, `chrome.launch`, `url.open`,
+  `window.list`, `window.focus`, `keyboard.send`, `screen.capture`, and `wmi.query`.
+  `/execute` returns 410 and `host.bridge.execute` is no longer registered.
+- Policy environment: `JARVIS_EXECUTION_ROOTS`,
+  `JARVIS_EXECUTION_CAPABILITIES_FILE`, and `JARVIS_BRIDGE_APP_PATHS_JSON`. Bridge
+  capabilities publish `policy_revision=native-app-v1` plus the exact app-path configuration
+  SHA-256; launcher/backend readiness requires both values to match.
+
+[Что конкретно исправлено / какие заглушки устранены]
+
+- Replaced heuristic raw console/PowerShell recipes with typed atomic OS actions and strict
+  capability validation. Process/network/registry capabilities are deny-by-default;
+  executable argv and explicit environment values are regex-constrained; inherited
+  environment is opt-in; protected Jarvis state, secrets, logs, policy files, and executable
+  paths are excluded from writable roots.
+- Implemented nonblocking process streams, output tails, total-byte/truncation metadata,
+  timeout/stall detection, graceful interrupt followed by tree kill, exact PID birth-marker
+  ownership, and cancellation-safe session registration. Windows children start suspended,
+  enter a Job Object, then resume; POSIX uses a new process group with portable process-tree
+  fallback where `/proc` is absent.
+- Implemented durable filesystem/registry checkpoints, atomic manifests, startup recovery,
+  hierarchical resource locking, automatic reverse rollback, commit durability barriers,
+  and in-process action/transaction idempotent replay. Session history compresses older
+  entries into dry facts under entry/byte limits.
+- Closed concurrent sibling-path/action-id races, cancel-before-register and concurrent-root
+  process races, false timeout-after-exit, ignored interrupt ownership, cancelled-task session
+  leaks, explicit-environment injection, cwd escape, partial-commit cancellation, registry
+  new-key rollback, and secret leakage in argv/tool-run persistence.
+- Hardened Host Bridge to token-authenticated structured actions only. Executables resolve to
+  canonical fixed locations or operator-pinned exact existing non-symlink paths; shells,
+  script hosts, PATH/HKCU shadowing, malformed app paths, wildcards, ADS/device paths, and
+  unrestricted native argv are rejected. Token creation is atomic and its Windows DACL is
+  repaired/verified on every use. Launcher command-line quoting and stale-contract restart
+  checks are deterministic.
+
+[Изменения в API-контрактах, сигнатурах функций и структурах данных]
+
+- `HostBridgeClient.execute(command, ...)`/raw `/execute` were replaced by
+  `HostBridgeClient.action(*, action, payload, timeout_sec)`/`POST /action`.
+- Agent/tool approvals now carry typed execution envelopes. Frontend manual host input accepts
+  execution JSON and creates `execution.apply` approvals. CLI adds `host-bridge-action` and
+  does not expose raw command execution.
+- Process execution now requires a session id in both wrapper and `process.run` action; only
+  one root process may run per session. Terminal session states, process reservations, exact
+  owned-process records, compressed facts, and checkpoint/transaction status are observable.
+- Browser and external subsystems retain their internal APIs and enter the kernel through
+  ToolRegistry adapters; browser multi-open retains bounded concurrency.
+
+[Pending: Текущие точки сборки и что Claude должен делать/проверить дальше]
+
+- Verified on Windows: backend `392 passed, 1 skipped`; full Ruff and compileall clean;
+  PowerShell parser clean; frontend typecheck and production build pass; npm production audit
+  reports 0 vulnerabilities; Python environment has 33 compatible packages; Compose config,
+  CLI help, and `git diff --check` pass.
+- A bridge process already running before this revision may still expose the stale contract;
+  the launcher will authenticate/probe and replace it on the next Jarvis stack start. It was
+  intentionally not interrupted during this session.
+- Idempotency replay cache is process-local, not cross-restart exactly-once. Durable recovery
+  covers incomplete checkpoint rollback. Path TOCTOU is reduced by canonical validation,
+  identity checks, temporary files, and atomic replace, but not implemented with handle-relative
+  traversal on every OS.
+- macOS/BSD portable `ps` fallback is unit-covered but not exercised on a native macOS/BSD CI
+  runner here. Custom app paths remain an operator-owned ACL/policy concern and must be pinned
+  explicitly; verify their `available_apps` capability on the target machine.

@@ -30,6 +30,7 @@ $LogDir = Join-Path $HomePath "logs\jarvis-gpt"
 $StateDir = Join-Path $HomePath "data\jarvis-gpt\state"
 $StateFile = Join-Path $StateDir "launcher-state.json"
 $BridgeTokenFile = Join-Path $HomePath ".jarvis\bridge.token"
+$BridgePolicyRevision = "native-app-v1"
 $ApiTokenFile = Join-Path $HomePath ".jarvis\api.token"
 $script:ConfiguredApiToken = [string]$env:JARVIS_API_TOKEN
 $script:ConfiguredCorsOrigins = [string]$env:JARVIS_CORS_ORIGINS
@@ -173,6 +174,9 @@ function Get-BackendEnvironmentSha256 {
     [string]$env:JARVIS_API_TOKEN
     [string]$env:JARVIS_API_REQUIRE_TOKEN_ON_LOOPBACK
     [string]$env:JARVIS_CORS_ORIGINS
+    [string]$env:JARVIS_EXECUTION_ROOTS
+    [string]$env:JARVIS_EXECUTION_CAPABILITIES_FILE
+    [string]$env:JARVIS_BRIDGE_APP_PATHS_JSON
   )
   return Get-StringSha256 -Value ($values -join "`n")
 }
@@ -913,6 +917,77 @@ function Test-ManagedServiceProcess {
   }
 }
 
+function Invoke-BridgeCapabilitiesProbe {
+  param([int]$TimeoutSec = 3)
+
+  if (-not (Test-Path -LiteralPath $BridgeTokenFile)) {
+    return @{ ok = $false; status = $null; data = $null; error = "bridge token is missing" }
+  }
+  try {
+    $token = (Get-Content -LiteralPath $BridgeTokenFile -Raw).Trim()
+    if ([string]::IsNullOrWhiteSpace($token)) {
+      return @{ ok = $false; status = $null; data = $null; error = "bridge token is empty" }
+    }
+    $body = @{
+      action = "capabilities"
+      payload = @{}
+      timeout_sec = [Math]::Max(1, [Math]::Min(120, $TimeoutSec))
+    } | ConvertTo-Json -Depth 4 -Compress
+    $data = Invoke-RestMethod `
+      -Uri "http://127.0.0.1:8765/action" `
+      -Method Post `
+      -Headers @{ Authorization = "Bearer $token" } `
+      -ContentType "application/json" `
+      -Body $body `
+      -TimeoutSec $TimeoutSec
+    $hasRawExecutionFlag = $null -ne $data.PSObject.Properties["raw_command_execution"]
+    $expectedAppPathsSha256 = Get-StringSha256 -Value ([string]$env:JARVIS_BRIDGE_APP_PATHS_JSON)
+    $ready = [bool](
+      $data.ok -and
+      [string]$data.contract -eq "action.v1" -and
+      $hasRawExecutionFlag -and
+      -not [bool]$data.raw_command_execution -and
+      [string]$data.policy_revision -eq $BridgePolicyRevision -and
+      [string]$data.app_paths_sha256 -eq $expectedAppPathsSha256
+    )
+    return @{
+      ok = $ready
+      status = 200
+      data = $data
+      error = if ($ready) { "" } else { "capabilities response failed action.v1 validation" }
+    }
+  } catch {
+    $statusCode = $null
+    if ($_.Exception.Response) {
+      try { $statusCode = [int]$_.Exception.Response.StatusCode } catch { $statusCode = $null }
+    }
+    return @{ ok = $false; status = $statusCode; data = $null; error = $_.Exception.Message }
+  }
+}
+
+function Wait-BridgeReady {
+  param([int]$TimeoutSec = 15)
+
+  $deadline = (Get-Date).AddSeconds([Math]::Max(1, $TimeoutSec))
+  $lastError = "bridge did not become ready"
+  while ((Get-Date) -lt $deadline) {
+    $health = Invoke-HttpProbe -Uri "http://127.0.0.1:8765/health" -TimeoutSec 2 -Json
+    if ($health.ok -and [string]$health.data.contract -eq "action.v1") {
+      $capabilities = Invoke-BridgeCapabilitiesProbe -TimeoutSec 3
+      if ($capabilities.ok) {
+        return @{ ok = $true; health = $health; capabilities = $capabilities; error = "" }
+      }
+      $lastError = [string]$capabilities.error
+    } elseif ($health.error) {
+      $lastError = [string]$health.error
+    } else {
+      $lastError = "health endpoint did not advertise action.v1"
+    }
+    Start-Sleep -Milliseconds 250
+  }
+  return @{ ok = $false; health = $null; capabilities = $null; error = $lastError }
+}
+
 function Get-LlmStartDecision {
   param([System.Collections.IDictionary]$Readiness)
 
@@ -1065,6 +1140,41 @@ function Invoke-JarvisCommand {
   }
 }
 
+function ConvertTo-WindowsCommandLineArgument {
+  param([AllowEmptyString()][string]$Argument)
+
+  if ($Argument.Length -gt 0 -and $Argument -notmatch '[\s"&|<>^()%!]') {
+    return $Argument
+  }
+  $builder = [System.Text.StringBuilder]::new()
+  [void]$builder.Append('"')
+  $backslashes = 0
+  foreach ($character in $Argument.ToCharArray()) {
+    if ($character -eq '\') {
+      $backslashes += 1
+      continue
+    }
+    if ($character -eq '"') {
+      if ($backslashes -gt 0) {
+        [void]$builder.Append((('\' * ($backslashes * 2)) -join ''))
+      }
+      [void]$builder.Append('\"')
+      $backslashes = 0
+      continue
+    }
+    if ($backslashes -gt 0) {
+      [void]$builder.Append((('\' * $backslashes) -join ''))
+      $backslashes = 0
+    }
+    [void]$builder.Append($character)
+  }
+  if ($backslashes -gt 0) {
+    [void]$builder.Append((('\' * ($backslashes * 2)) -join ''))
+  }
+  [void]$builder.Append('"')
+  return $builder.ToString()
+}
+
 function Start-ManagedProcess {
   param(
     [string]$Name,
@@ -1075,14 +1185,20 @@ function Start-ManagedProcess {
     [string]$Stderr
   )
 
-  $process = Start-Process `
-    -FilePath $FilePath `
-    -ArgumentList $Arguments `
-    -WorkingDirectory $WorkingDirectory `
-    -RedirectStandardOutput $Stdout `
-    -RedirectStandardError $Stderr `
-    -WindowStyle Hidden `
-    -PassThru
+  $startParameters = @{
+    FilePath = $FilePath
+    WorkingDirectory = $WorkingDirectory
+    RedirectStandardOutput = $Stdout
+    RedirectStandardError = $Stderr
+    WindowStyle = "Hidden"
+    PassThru = $true
+  }
+  if ($Arguments.Count -gt 0) {
+    $startParameters.ArgumentList = (
+      @($Arguments | ForEach-Object { ConvertTo-WindowsCommandLineArgument -Argument ([string]$_) }) -join " "
+    )
+  }
+  $process = Start-Process @startParameters
 
   Write-Host ("Started {0} pid={1}" -f $Name, $process.Id) -ForegroundColor Green
   return [int]$process.Id
@@ -1322,22 +1438,67 @@ function Start-JarvisStack {
   }
 
   if (-not $NoBridge) {
+    $startBridge = $true
     if (Test-PortOpen -Port 8765) {
       if (-not (Test-ManagedPortOwner -Port 8765 -Service "bridge")) {
         throw "TCP 8765 is occupied by a process not managed by Jarvis. Stop it or choose another port."
       }
-      $services.bridge = @{ port = 8765; pid = Get-PortOwner -Port 8765; reused = $true }
-      Write-Host "Host bridge already listening on 127.0.0.1:8765" -ForegroundColor DarkYellow
-    } else {
+      $bridgeHealth = Invoke-HttpProbe -Uri "http://127.0.0.1:8765/health" -TimeoutSec 2 -Json
+      $bridgeCapabilities = if (
+        $bridgeHealth.ok -and [string]$bridgeHealth.data.contract -eq "action.v1"
+      ) {
+        Invoke-BridgeCapabilitiesProbe -TimeoutSec 3
+      } else {
+        @{ ok = $false; error = "health endpoint did not advertise action.v1" }
+      }
+      if ($bridgeCapabilities.ok) {
+        $services.bridge = @{
+          port = 8765
+          pid = Get-PortOwner -Port 8765
+          reused = $true
+          contract = "action.v1"
+          policy_revision = $BridgePolicyRevision
+        }
+        $startBridge = $false
+        Write-Host "Host bridge action.v1/$BridgePolicyRevision already listening on 127.0.0.1:8765" -ForegroundColor DarkYellow
+      } else {
+        Write-Host "Restarting stale or unauthenticated host bridge..." -ForegroundColor Yellow
+        Stop-PortOwner -Port 8765 -ManagedOnly -Service "bridge"
+        if (-not (Wait-PortClosed -Port 8765)) {
+          throw "Stale host bridge did not release TCP 8765."
+        }
+      }
+    }
+    if ($startBridge) {
+      $bridgePid = Start-ManagedProcess `
+        -Name "host bridge" `
+        -FilePath "py.exe" `
+        -Arguments @("-3.11", (Join-Path $RepoRoot "scripts\windows_rpc_bridge.py"), "--host", "127.0.0.1", "--port", "8765", "--token-file", $BridgeTokenFile) `
+        -WorkingDirectory $RepoRoot `
+        -Stdout (Join-Path $LogDir "host-bridge.out.log") `
+        -Stderr (Join-Path $LogDir "host-bridge.err.log")
+      $bridgeReady = Wait-BridgeReady -TimeoutSec 15
+      if (-not $bridgeReady.ok) {
+        $bridgeSnapshot = Get-ProcessSnapshot
+        $bridgeProcess = $bridgeSnapshot |
+          Where-Object { [int]$_.ProcessId -eq $bridgePid } |
+          Select-Object -First 1
+        if (Test-ManagedServiceProcess -ProcessInfo $bridgeProcess -Service "bridge") {
+          Stop-ProcessTree `
+            -ProcessId $bridgePid `
+            -Reason "failed authenticated bridge readiness" `
+            -Snapshot $bridgeSnapshot `
+            -ProtectedProcessIds (Get-CurrentProcessFamilyIds) | Out-Null
+        }
+        Stop-PortOwner -Port 8765 -ManagedOnly -Service "bridge"
+        throw ("Host bridge failed authenticated action.v1 readiness: {0}" -f $bridgeReady.error)
+      }
       $services.bridge = @{
         port = 8765
-        pid = Start-ManagedProcess `
-          -Name "host bridge" `
-          -FilePath "py.exe" `
-          -Arguments @("-3.11", (Join-Path $RepoRoot "scripts\windows_rpc_bridge.py"), "--host", "127.0.0.1", "--port", "8765", "--token-file", $BridgeTokenFile) `
-          -WorkingDirectory $RepoRoot `
-          -Stdout (Join-Path $LogDir "host-bridge.out.log") `
-          -Stderr (Join-Path $LogDir "host-bridge.err.log")
+        contract = "action.v1"
+        policy_revision = $BridgePolicyRevision
+        pid = $bridgePid
+        reused = $false
       }
     }
   }

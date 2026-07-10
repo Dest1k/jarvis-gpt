@@ -24,8 +24,9 @@ from jarvis_gpt.tools import (
     ToolRegistry,
     _parse_bing_results,
     _PublicOnlyAsyncNetworkBackend,
+    _redact_native_payload,
     _store_web_evidence,
-    _windows_native_command,
+    _validate_native_payload,
 )
 
 
@@ -118,13 +119,26 @@ def test_tool_run_storage_redacts_secrets(monkeypatch, tmp_path):
         tool="web.fetch",
         ok=True,
         summary="authorization=Bearer super-secret-token",
-        arguments={"api_token": "super-secret-token", "query": "status"},
+        arguments={
+            "api_token": "super-secret-token",
+            "query": "status",
+            "arguments": ["--password", "split-secret", "--api-key=inline-secret"],
+            "content_base64": "c2Vuc2l0aXZl",
+            "environment": {"PRIVATE_VALUE": "secret-value"},
+        },
         data={"headers": {"Authorization": "Bearer abcdefghijklmnop"}},
     )
     listed = storage.list_tool_runs(limit=1)[0]
 
     assert "super-secret-token" not in stored["summary"]
     assert stored["arguments"]["api_token"] == "[redacted]"
+    assert stored["arguments"]["arguments"] == [
+        "--password",
+        "[redacted]",
+        "--api-key=[redacted]",
+    ]
+    assert stored["arguments"]["content_base64"].startswith("[redacted:")
+    assert stored["arguments"]["environment"] == {"PRIVATE_VALUE": "[redacted]"}
     assert listed["data"]["headers"]["Authorization"] == "[redacted]"
     storage.close()
 
@@ -139,20 +153,15 @@ def test_system_inspect_runs_read_only_wmi_query(monkeypatch, tmp_path):
     tools = ToolRegistry(settings, storage, LLMRouter(settings))
     captured = {}
 
-    async def fake_execute(self, *, command, cwd=None, timeout_sec=30):
-        captured["command"] = command
+    async def fake_action(self, *, action, payload=None, timeout_sec=30):
+        captured.update({"action": action, "payload": payload, "timeout_sec": timeout_sec})
         return {
             "ok": True,
-            "summary": "bridge ok",
-            "data": {
-                "stdout": (
-                    '{"ok": true, "summary": "Battery 87%", "action": "wmi.query", '
-                    '"data": {"rows": [{"EstimatedChargeRemaining": 87}]}}'
-                )
-            },
+            "summary": "Battery 87%",
+            "data": {"ok": True, "summary": "Battery 87%", "action": "wmi.query"},
         }
 
-    monkeypatch.setattr("jarvis_gpt.host_bridge.HostBridgeClient.execute", fake_execute)
+    monkeypatch.setattr("jarvis_gpt.host_bridge.HostBridgeClient.action", fake_action)
 
     result = asyncio.run(
         tools.run(
@@ -170,7 +179,8 @@ def test_system_inspect_runs_read_only_wmi_query(monkeypatch, tmp_path):
     assert result.ok is True
     assert result.data["action"] == "wmi.query"
     assert "Battery 87%" in result.summary
-    assert "Win32_Battery" in captured["command"]
+    assert captured["action"] == "wmi.query"
+    assert captured["payload"]["class_name"] == "Win32_Battery"
     storage.close()
 
 
@@ -183,10 +193,10 @@ def test_system_inspect_refuses_desktop_mutating_action(monkeypatch, tmp_path):
     storage.initialize()
     tools = ToolRegistry(settings, storage, LLMRouter(settings))
 
-    async def forbidden_execute(self, *, command, cwd=None, timeout_sec=30):
+    async def forbidden_action(self, *, action, payload=None, timeout_sec=30):
         raise AssertionError("system.inspect must never reach the bridge for a mutating action")
 
-    monkeypatch.setattr("jarvis_gpt.host_bridge.HostBridgeClient.execute", forbidden_execute)
+    monkeypatch.setattr("jarvis_gpt.host_bridge.HostBridgeClient.action", forbidden_action)
 
     result = asyncio.run(
         tools.run(
@@ -211,27 +221,22 @@ def test_system_inspect_can_capture_screen_to_cache(monkeypatch, tmp_path):
     tools = ToolRegistry(settings, storage, LLMRouter(settings))
     captured = {}
 
-    async def fake_execute(self, *, command, cwd=None, timeout_sec=30):
-        captured["command"] = command
+    async def fake_action(self, *, action, payload=None, timeout_sec=30):
+        captured.update({"action": action, "payload": payload, "timeout_sec": timeout_sec})
         return {
             "ok": True,
-            "summary": "bridge ok",
-            "data": {
-                "stdout": (
-                    '{"ok":true,"summary":"Screen captured.","action":"screen.capture",'
-                    '"data":{"path":"screen.png","width":1920,"height":1080}}'
-                )
-            },
+            "summary": "Screen captured.",
+            "data": {"ok": True, "summary": "Screen captured.", "action": action},
         }
 
-    monkeypatch.setattr("jarvis_gpt.host_bridge.HostBridgeClient.execute", fake_execute)
+    monkeypatch.setattr("jarvis_gpt.host_bridge.HostBridgeClient.action", fake_action)
 
     result = asyncio.run(tools.run("system.inspect", {"action": "screen.capture"}))
 
     assert result.ok is True
     assert result.data["action"] == "screen.capture"
-    assert "screen.capture" in captured["command"]
-    assert str(settings.cache_dir / "screens").replace("\\", "\\\\") in captured["command"]
+    assert captured["action"] == "screen.capture"
+    assert Path(captured["payload"]["path"]).parent == settings.cache_dir / "screens"
     storage.close()
 
 
@@ -459,10 +464,9 @@ def test_documents_inspect_reads_xlsx_by_path(monkeypatch, tmp_path):
     storage.close()
 
 
-def test_host_bridge_execute_requires_token(monkeypatch, tmp_path):
+def test_raw_host_bridge_execute_is_not_model_facing(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
-    monkeypatch.setattr("jarvis_gpt.host_bridge.bridge_token_path", lambda _settings: None)
     settings = load_settings()
     ensure_runtime_dirs(settings)
     storage = JarvisStorage(settings.database_path)
@@ -471,19 +475,11 @@ def test_host_bridge_execute_requires_token(monkeypatch, tmp_path):
 
     info = {tool.name: tool for tool in tools.list()}
     blocked = asyncio.run(tools.run("host.bridge.execute", {"command": "Write-Output ok"}))
-    result = asyncio.run(
-        tools.run(
-            "host.bridge.execute",
-            {"command": "Write-Output ok"},
-            allow_danger=True,
-        )
-    )
 
-    assert info["host.bridge.execute"].danger_level == "danger"
+    assert "host.bridge.execute" not in info
+    assert info["execution.apply"].danger_level == "danger"
     assert blocked.ok is False
-    assert "requires approval" in blocked.summary
-    assert result.ok is False
-    assert "token is missing" in result.summary
+    assert "not registered" in blocked.summary
     storage.close()
 
 
@@ -492,20 +488,17 @@ def test_windows_native_is_gated_and_uses_winapi_wmi(monkeypatch, tmp_path):
         def __init__(self, _settings):
             return None
 
-        async def execute(self, *, command, cwd=None, timeout_sec=30):
-            assert cwd is None
+        async def action(self, *, action, payload=None, timeout_sec=30):
             assert timeout_sec == 30
-            assert "SetForegroundWindow" in command
-            assert "Get-CimInstance" in command
-            assert "Win32_Process" in command
+            assert action == "wmi.query"
+            assert payload["class_name"] == "Win32_Process"
             return {
                 "ok": True,
-                "summary": "native ok",
+                "summary": "WMI/CIM query returned 1 item(s).",
                 "data": {
-                    "stdout": (
-                        '{"ok":true,"summary":"WMI/CIM query returned 1 item(s).",'
-                        '"data":{"items":[{"Name":"python.exe"}]}}'
-                    )
+                    "ok": True,
+                    "summary": "WMI/CIM query returned 1 item(s).",
+                    "items": [{"Name": "python.exe"}],
                 },
             }
 
@@ -555,56 +548,53 @@ def test_windows_native_is_gated_and_uses_winapi_wmi(monkeypatch, tmp_path):
     storage.close()
 
 
-def test_windows_native_process_start_omits_empty_argument_list():
-    command = _windows_native_command("process.start", {"executable": "calc.exe"})
+def test_windows_native_process_start_uses_typed_empty_argv():
+    payload = _validate_native_payload("process.start", {"executable": "calc.exe"})
 
-    assert "[Console]::OutputEncoding=$utf8" in command
-    assert "$OutputEncoding=$utf8" in command
-    assert "function StartNativeProcess" in command
-    assert "function Focus($TargetPid" in command
-    assert "function ForegroundPid" in command
-    assert "function TryActivate" in command
-    assert "AttachThreadInput" in command
-    assert "BringWindowToTop" in command
-    assert "function SplitTargets" in command
-    assert "function HasExplicitTarget" in command
-    assert "function Focus($Pid" not in command
-    assert "WScript.Shell" in command
-    assert "Target window was not focused; native input was not sent." in command
-    assert "Start-Process @parameters" in command
-    assert "-ArgumentList @($Payload.arguments)" not in command
+    assert payload == {"executable": "calc.exe", "arguments": []}
 
 
-def test_windows_native_process_start_preserves_nonempty_arguments():
-    command = _windows_native_command(
+def test_windows_native_process_start_preserves_nonempty_argv():
+    payload = _validate_native_payload(
         "process.start",
         {
-            "executable": "powershell.exe",
-            "arguments": '-NoExit -Command "Get-Process | Select-Object -First 10"',
+            "executable": "example.exe",
+            "arguments": ["--mode", "inspect"],
         },
     )
 
-    assert "powershell.exe" in command
-    assert "Get-Process | Select-Object -First 10" in command
-    assert "$parameters.ArgumentList = [string]$Arguments" in command
+    assert payload["arguments"] == ["--mode", "inspect"]
 
 
-def test_windows_native_screen_capture_command_is_structured(tmp_path):
+def test_windows_native_process_response_payload_redacts_split_and_url_secrets():
+    payload = _redact_native_payload(
+        {
+            "executable": "example.exe",
+            "arguments": [
+                "--password",
+                "TOPSECRET",
+                "--api-key=INLINESECRET",
+                "https://user:url-secret@example.test/path",
+            ],
+        }
+    )
+
+    assert payload["arguments"] == [
+        "--password",
+        "[REDACTED]",
+        "--api-key=[REDACTED]",
+        "https://[REDACTED]@example.test/path",
+    ]
+
+
+def test_windows_native_screen_capture_payload_is_structured(tmp_path):
     path = tmp_path / "screen.png"
-    command = _windows_native_command(
+    payload = _validate_native_payload(
         "screen.capture",
         {"path": str(path), "limit": 8, "ocr": True},
     )
 
-    assert "screen.capture" in command
-    assert "System.Drawing" in command
-    assert "CopyFromScreen" in command
-    assert "tesseract" in command
-    assert "ocrText" in command
-    assert "Screen captured." in command
-    assert "screen.png" in command
-    assert "test_windows_native_screen_cap" in command
-    assert "VisibleWindows $Limit" in command
+    assert payload == {"path": str(path), "limit": 8, "ocr": True}
 
 
 def test_browser_open_requires_approval_and_validates_after_override(monkeypatch, tmp_path):
@@ -612,11 +602,11 @@ def test_browser_open_requires_approval_and_validates_after_override(monkeypatch
         def __init__(self, _settings):
             return None
 
-        async def execute(self, *, command, cwd=None, timeout_sec=30):
-            assert cwd is None
+        async def action(self, *, action, payload=None, timeout_sec=30):
             assert timeout_sec == 10
-            assert command == "Start-Process -FilePath 'https://example.com/path?q=1'"
-            return {"ok": True, "summary": "opened", "data": {"command": command}}
+            assert action == "url.open"
+            assert payload == {"url": "https://example.com/path?q=1"}
+            return {"ok": True, "summary": "opened", "data": {"ok": True}}
 
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
@@ -656,16 +646,23 @@ def test_browser_open_requires_approval_and_validates_after_override(monkeypatch
 
 
 def test_browser_policy_and_open_many(monkeypatch, tmp_path):
+    active_calls = 0
+    max_active_calls = 0
+
     class FakeBridgeClient:
         def __init__(self, _settings):
             return None
 
-        async def execute(self, *, command, cwd=None, timeout_sec=30):
-            assert cwd is None
-            assert timeout_sec == 20
-            assert "https://example.com/a" in command
-            assert "https://example.com/b" in command
-            return {"ok": True, "summary": "opened many", "data": {"command": command}}
+        async def action(self, *, action, payload=None, timeout_sec=30):
+            nonlocal active_calls, max_active_calls
+            assert action == "url.open"
+            assert timeout_sec == 10
+            assert payload["url"] in {"https://example.com/a", "https://example.com/b"}
+            active_calls += 1
+            max_active_calls = max(max_active_calls, active_calls)
+            await asyncio.sleep(0.01)
+            active_calls -= 1
+            return {"ok": True, "summary": "opened", "data": {"ok": True}}
 
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
@@ -687,6 +684,7 @@ def test_browser_policy_and_open_many(monkeypatch, tmp_path):
     assert policy.ok is True
     assert opened.ok is True
     assert opened.data["urls"] == ["https://example.com/a", "https://example.com/b"]
+    assert max_active_calls == 2
     storage.close()
 
 
@@ -855,12 +853,12 @@ def test_browser_chrome_launch_uses_dedicated_profile(monkeypatch, tmp_path):
         def __init__(self, _settings):
             return None
 
-        async def execute(self, *, command, cwd=None, timeout_sec=30):
-            assert cwd is None
+        async def action(self, *, action, payload=None, timeout_sec=30):
+            assert action == "chrome.launch"
             assert timeout_sec == 15
-            assert "--remote-debugging-port=9222" in command
-            assert "chrome-profile" in command
-            return {"ok": True, "summary": "launched", "data": {"command": command}}
+            assert payload["debug_port"] == 9222
+            assert "chrome-profile" in payload["profile_dir"]
+            return {"ok": True, "summary": "launched", "data": {"ok": True}}
 
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
@@ -3678,15 +3676,15 @@ def test_system_inspect_screen_capture_ignores_operator_supplied_path(monkeypatc
     tools = ToolRegistry(settings, storage, LLMRouter(settings))
     captured = {}
 
-    async def fake_execute(self, *, command, cwd=None, timeout_sec=30):
-        captured["command"] = command
+    async def fake_action(self, *, action, payload=None, timeout_sec=30):
+        captured.update({"action": action, "payload": payload, "timeout_sec": timeout_sec})
         return {
             "ok": True,
             "summary": "captured",
-            "data": {"stdout": '{"ok":true,"summary":"captured"}'},
+            "data": {"ok": True, "summary": "captured", "action": action},
         }
 
-    monkeypatch.setattr("jarvis_gpt.host_bridge.HostBridgeClient.execute", fake_execute)
+    monkeypatch.setattr("jarvis_gpt.host_bridge.HostBridgeClient.action", fake_action)
     outside = "D:\\outside\\owned.png"
 
     result = asyncio.run(
@@ -3697,8 +3695,8 @@ def test_system_inspect_screen_capture_ignores_operator_supplied_path(monkeypatc
     )
 
     assert result.ok is True
-    assert "outside" not in captured["command"]
-    assert str(settings.cache_dir / "screens").replace("\\", "\\\\") in captured["command"]
+    assert "outside" not in captured["payload"]["path"]
+    assert Path(captured["payload"]["path"]).parent == settings.cache_dir / "screens"
     storage.close()
 
 

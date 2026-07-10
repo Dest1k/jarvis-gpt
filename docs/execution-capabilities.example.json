@@ -1,0 +1,22 @@
+{
+  "executables": [
+    {
+      "path": "C:\\Windows\\System32\\whoami.exe",
+      "argument_patterns": [],
+      "additional_argument_pattern": null,
+      "environment_patterns": {}
+    }
+  ],
+  "network_hosts": [
+    "example.com"
+  ],
+  "allow_private_network": false,
+  "registry_read_prefixes": [
+    [
+      "HKEY_CURRENT_USER",
+      "Software\\Jarvis"
+    ]
+  ],
+  "registry_write_prefixes": [],
+  "allow_inherited_process_environment": false
+}

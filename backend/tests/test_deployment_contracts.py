@@ -75,12 +75,29 @@ def test_launcher_is_local_only_and_preserves_foreign_listeners() -> None:
     assert "Get-OrCreateApiToken" in launcher
     assert "Protect-ApiTokenFile" in launcher
     assert "Get-FrontendEnvironmentSha256" in launcher
+    assert "JARVIS_EXECUTION_CAPABILITIES_FILE" in launcher
+    assert "JARVIS_BRIDGE_APP_PATHS_JSON" in launcher
     assert '$env:JARVIS_API_HOST = "127.0.0.1"' in launcher
     assert "password source:" not in launcher
     assert "Command Center Basic auth" not in dev_script
     assert 'Stop-PortOwner -Port 3000 -ManagedOnly -Service "frontend"' in launcher
     assert 'Stop-PortOwner -Port 8000 -ManagedOnly -Service "backend"' in launcher
     assert 'Stop-PortOwner -Port 8765 -ManagedOnly -Service "bridge"' in launcher
+    assert 'Invoke-HttpProbe -Uri "http://127.0.0.1:8765/health"' in launcher
+    assert '[string]$bridgeHealth.data.contract -eq "action.v1"' in launcher
+    assert "function Invoke-BridgeCapabilitiesProbe" in launcher
+    assert '-Headers @{ Authorization = "Bearer $token" }' in launcher
+    assert 'action = "capabilities"' in launcher
+    assert "function Wait-BridgeReady" in launcher
+    assert "Wait-BridgeReady -TimeoutSec 15" in launcher
+    assert '$BridgePolicyRevision = "native-app-v1"' in launcher
+    assert "data.policy_revision -eq $BridgePolicyRevision" in launcher
+    assert "data.app_paths_sha256 -eq $expectedAppPathsSha256" in launcher
+    assert "Restarting stale or unauthenticated host bridge" in launcher
+    assert "failed authenticated action.v1 readiness" in launcher
+    assert "function ConvertTo-WindowsCommandLineArgument" in launcher
+    assert "ConvertTo-WindowsCommandLineArgument -Argument" in launcher
+    assert "-ArgumentList $Arguments" not in launcher
     assert 'Join-Path $RepoRoot "jarvis.py"' in launcher
     assert '"jarvis-gpt-command-center"' not in launcher
 

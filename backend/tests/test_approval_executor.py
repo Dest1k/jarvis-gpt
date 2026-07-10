@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 
 import pytest
 from jarvis_gpt.approval_executor import ApprovalExecutor
@@ -76,24 +77,29 @@ def test_approval_executor_rejects_unknown_action(monkeypatch, tmp_path):
     storage.close()
 
 
-def test_approval_executor_can_run_danger_tool_after_approval(monkeypatch, tmp_path):
-    async def fake_execute(self, *, command, cwd=None, timeout_sec=30):
-        return {
-            "ok": True,
-            "summary": f"fake bridge: {command}",
-            "data": {"stdout": "approved\n", "cwd": cwd, "timeout_sec": timeout_sec},
-        }
-
-    monkeypatch.setattr("jarvis_gpt.host_bridge.HostBridgeClient.execute", fake_execute)
+def test_approval_executor_can_run_structured_danger_tool_after_approval(
+    monkeypatch, tmp_path
+):
     executor, storage = _runtime(monkeypatch, tmp_path)
+    target = tmp_path / "approved.txt"
     approval = storage.create_approval(
-        title="Run host command",
+        title="Write approved file",
         description="Danger tool requires an approved gate.",
         requested_action="tool.run",
         risk="danger",
         payload={
-            "tool": "host.bridge.execute",
-            "arguments": {"command": "Write-Output approved"},
+            "tool": "execution.apply",
+            "arguments": {
+                "payload": {
+                    "protocol": "jarvis.execution.v1",
+                    "action": {
+                        "kind": "fs.write",
+                        "action_id": "approval-write",
+                        "path": str(target),
+                        "content_base64": base64.b64encode(b"approved").decode("ascii"),
+                    },
+                }
+            },
         },
     )
     storage.update_approval(approval["id"], status="approved", result={"operator": "test"})
@@ -103,8 +109,9 @@ def test_approval_executor_can_run_danger_tool_after_approval(monkeypatch, tmp_p
     assert result.ok is True
     assert result.approval is not None
     assert result.approval["status"] == "executed"
-    assert result.data["tool_run"]["tool"] == "host.bridge.execute"
+    assert result.data["tool_run"]["tool"] == "execution.apply"
     assert result.data["tool_run"]["ok"] is True
+    assert target.read_bytes() == b"approved"
     storage.close()
 
 

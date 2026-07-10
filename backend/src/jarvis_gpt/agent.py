@@ -1538,21 +1538,9 @@ class AgentRuntime:
         context: AgentContext | None = None,
     ) -> DirectAction | None:
         task_plan = context.task_plan if context is not None else None
-        history_text = ""
-        if context is not None:
-            history_text = "\n".join(
-                item["content"]
-                for item in self.storage.recent_messages(context.conversation_id, limit=8)
-                if item["role"] == "user"
-            )
-        active_console = None
-        if context is not None:
-            active_console = self._active_console_target(context.conversation_id)
         native_action = _native_action_from_message(
             message,
             self.settings,
-            history_text,
-            active_console,
         )
         if native_action is not None:
             arguments = {
@@ -1589,15 +1577,6 @@ class AgentRuntime:
             return DirectAction(
                 answer=f"{status}: {native_action.answer}\n\n{result.summary}{details}",
                 events=[event],
-            )
-
-        command = _host_command_from_message(message)
-        if command is not None:
-            return self._request_direct_tool_approval(
-                "host.bridge.execute",
-                {"command": command, "timeout_sec": 20},
-                context=context,
-                description=f"Direct host command requested by the operator: {command}",
             )
 
         # Reasoning-first arbiter: before any fuzzy web-ish branch (shopping,
@@ -1823,7 +1802,7 @@ class AgentRuntime:
         ``web_research`` family, and the local-machine bucket (``reasoning`` with
         intent ``local_admin_advice``) where plain machine-state/action phrasings
         land without an explicit native binding. Concrete deterministic bindings
-        (matched native host actions, host commands, explicit URLs) are handled
+        (matched typed native host actions and explicit URLs) are handled
         earlier and never routed through here. When the LLM is offline the
         heuristics stay authoritative, so behavior degrades gracefully.
         """
@@ -2496,17 +2475,9 @@ class AgentRuntime:
                 rationale="Explicit mission mode or a large implementation goal.",
             )
 
-        history_text = "\n".join(
-            item["content"]
-            for item in self.storage.recent_messages(context.conversation_id, limit=8)
-            if item["role"] == "user"
-        )
-        active_console = self._active_console_target(context.conversation_id)
         native_action = _native_action_from_message(
             message,
             self.settings,
-            history_text,
-            active_console,
         )
         if native_action is not None:
             return TaskKernelPlan(
@@ -2521,23 +2492,6 @@ class AgentRuntime:
                     "return only the operational outcome",
                 ),
                 rationale="The request maps to a supported Windows/native action.",
-            )
-
-        host_command = _host_command_from_message(message)
-        if host_command is not None:
-            return TaskKernelPlan(
-                route="local_action",
-                mode=task_mode,
-                intent="host_command",
-                confidence=0.88,
-                query=host_command,
-                tools=("host.bridge.execute",),
-                completion_criteria=(
-                    "run the recognized host command",
-                    "preserve stdout/stderr in the tool log",
-                    "report success or failure without inventing output",
-                ),
-                rationale="The request contains an explicit command for the local console.",
             )
 
         if _looks_like_weather_query(normalized):
@@ -3719,21 +3673,6 @@ class AgentRuntime:
     def _operator_home_location(self) -> str | None:
         return persona_module.home_location(self._persona())
 
-    def _active_console_target(self, conversation_id: str) -> dict[str, Any] | None:
-        value = self.storage.get_runtime_value(_console_target_key(conversation_id), None)
-        return value if isinstance(value, dict) else None
-
-    def _remember_console_target(
-        self,
-        conversation_id: str,
-        action: NativeAction,
-        result: ToolRunResponse,
-    ) -> None:
-        target = _console_target_from_result(action, result)
-        if target is None:
-            return
-        self.storage.set_runtime_value(_console_target_key(conversation_id), target)
-
     @staticmethod
     def _looks_like_mission(message: str) -> bool:
         normalized = message.lower()
@@ -4404,10 +4343,17 @@ def _local_action_plan_from_intent(
         intent="understood_local_action",
         confidence=decision.confidence,
         query=decision.query,
-        tools=("system.inspect", "windows.native"),
+        tools=(
+            "system.inspect",
+            "execution.inspect",
+            "execution.apply",
+            "execution.transaction",
+            "windows.native",
+        ),
         completion_criteria=(
             "read real machine state via system.inspect (choose the WMI class yourself) "
             "instead of web-searching local state",
+            "use jarvis.execution.v1 actions for filesystem/process/network/registry work",
             "for desktop-changing actions request the native tool and respect its approval gate",
             "report the actual tool result, not a guess or a bare command suggestion",
         ),
@@ -6687,9 +6633,6 @@ APP_ALIASES: tuple[tuple[tuple[str, ...], str, str], ...] = (
     (("vscode", "vs code", "visual studio code"), "Code.exe", "Visual Studio Code"),
     (("telegram", "телеграм"), "Telegram.exe", "Telegram"),
     (("диспетчер задач", "task manager", "taskmgr"), "taskmgr.exe", "диспетчер задач"),
-    (("командную строку", "командной строк", "cmd", "консол"), "cmd.exe", "командную строку"),
-    (("powershell", "power shell", "пауэршелл"), "powershell.exe", "PowerShell"),
-    (("terminal", "windows terminal", "терминал"), "wt.exe", "Windows Terminal"),
     (("службы", "services.msc"), "services.msc", "службы"),
     (("панель управления", "control panel"), "control.exe", "панель управления"),
     (
@@ -6703,44 +6646,11 @@ APP_ALIASES: tuple[tuple[tuple[str, ...], str, str], ...] = (
 def _native_action_from_message(
     message: str,
     settings: JarvisSettings | None = None,
-    history_text: str = "",
-    active_console: dict[str, Any] | None = None,
 ) -> NativeAction | None:
     normalized = message.lower()
     screen_capture = _screen_capture_action(normalized)
     if screen_capture is not None:
         return screen_capture
-
-    same_console = _same_console_action(message, history_text, active_console)
-    if same_console is not None:
-        return same_console
-
-    system_info_console = _system_info_console_action(message, history_text)
-    if system_info_console is not None:
-        return system_info_console
-
-    largest_file_console = _largest_file_console_action(message, history_text)
-    if largest_file_console is not None:
-        return largest_file_console
-
-    if _wants_top_process_console(normalized):
-        return NativeAction(
-            action="process.start",
-            payload={
-                "executable": "powershell.exe",
-                "arguments": (
-                    "-NoExit -Command "
-                    '"Get-Process | Sort-Object CPU -Descending | '
-                    "Select-Object -First 10 Name,Id,CPU,WorkingSet | "
-                    'Format-Table -AutoSize"'
-                ),
-            },
-            answer="открыл консоль с топ-10 процессов по CPU",
-        )
-
-    console_guard = _console_target_guard_action(message, history_text)
-    if console_guard is not None:
-        return console_guard
 
     if _contains_any(normalized, ("wmi", "cim", "через wmi", "через cim")):
         return _wmi_action_from_message(message)
@@ -6764,6 +6674,10 @@ def _native_action_from_message(
     if app is None:
         return None
     markers, executable, label = app
+    if _is_console_executable(executable):
+        # Shell text is never converted into a native action. Console work must
+        # use the typed execution protocol with an administrator-defined argv grammar.
+        return None
     wants_open = _contains_any(
         normalized,
         ("открой", "открыть", "запусти", "запустить", "open", "start", "посчитай"),
@@ -6780,7 +6694,7 @@ def _native_action_from_message(
         keys = _calculator_keys_from_message(message)
         payload = {
             "executable": "explorer.exe",
-            "arguments": r"shell:AppsFolder\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App",
+            "arguments": [r"shell:AppsFolder\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"],
             "keys": keys,
             "wait_ms": 1800,
         }
@@ -6800,7 +6714,7 @@ def _native_action_from_message(
         payload.update(_native_focus_hint(executable))
         if executable == "notepad.exe" and settings is not None:
             scratch_path = _notepad_scratch_file(settings)
-            payload["arguments"] = f'"{scratch_path}"'
+            payload["arguments"] = [str(scratch_path)]
             payload["window_title"] = Path(scratch_path).name
         return NativeAction(
             action="app.open_and_type",
@@ -6889,665 +6803,13 @@ def _screen_capture_action(
     )
 
 
-def _system_info_console_action(message: str, history_text: str = "") -> NativeAction | None:
-    normalized = message.lower()
-    history = history_text.lower()
-    wants_console = _wants_console_target(normalized)
-    current_mentions_system = _mentions_system_info(normalized)
-    followup_mentions_console = wants_console and _contains_any(
-        normalized,
-        ("именно", "туда", "там", "открой", "запусти", "сделай", "вывод"),
-    )
-    if not current_mentions_system and not (
-        followup_mentions_console and _mentions_system_info(history)
-    ):
-        return None
-    if not wants_console and not _contains_any(normalized, ("открой", "запусти", "сделай")):
-        return None
-
-    return NativeAction(
-        action="process.start",
-        payload={
-            "executable": "powershell.exe",
-            "arguments": _powershell_noexit_arguments(_system_info_script()),
-        },
-        answer="открыл PowerShell и вывел информацию о системе",
-    )
-
-
-def _mentions_system_info(text: str) -> bool:
-    if _contains_any(text, ("system information", "systeminfo", "computerinfo")):
-        return True
-    if _contains_any(text, ("о системе", "про систему")):
-        return True
-    return _contains_any(text, ("систем",)) and _contains_any(
-        text,
-        ("информац", "инфу", "сведен", "сводк", "характерист", "спецификац", "конфигурац"),
-    )
-
-
-def _system_info_script() -> str:
-    return (
-        "$ErrorActionPreference='SilentlyContinue'; "
-        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
-        "Write-Host '--- SYSTEM INFORMATION ---' -ForegroundColor Cyan; "
-        "Get-ComputerInfo | Select-Object OsName,OsVersion,OsArchitecture,CsName,"
-        "CsManufacturer,CsModel,CsProcessors,CsTotalPhysicalMemory | Format-List; "
-        "Write-Host '--- CPU ---' -ForegroundColor Cyan; "
-        "Get-CimInstance Win32_Processor | Select-Object Name,NumberOfCores,"
-        "NumberOfLogicalProcessors,MaxClockSpeed | Format-List; "
-        "Write-Host '--- MEMORY ---' -ForegroundColor Cyan; "
-        "Get-CimInstance Win32_PhysicalMemory | Measure-Object Capacity -Sum | "
-        "ForEach-Object { Write-Host ('Total RAM: {0:n2} GB' -f ($_.Sum / 1GB)) }; "
-        "Write-Host '--- DISKS ---' -ForegroundColor Cyan; "
-        "Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | "
-        "Select-Object DeviceID,@{Name='SizeGB';Expression={[math]::Round($_.Size/1GB,2)}},"
-        "@{Name='FreeGB';Expression={[math]::Round($_.FreeSpace/1GB,2)}} | "
-        "Format-Table -AutoSize; "
-        "Write-Host '--- GPU ---' -ForegroundColor Cyan; "
-        "Get-CimInstance Win32_VideoController | Select-Object Name,DriverVersion | "
-        "Format-Table -AutoSize"
-    )
-
-
-def _largest_file_console_action(message: str, history_text: str = "") -> NativeAction | None:
-    normalized = message.lower()
-    history = history_text.lower()
-    wants_console = _wants_console_target(normalized)
-    current_mentions_largest = _mentions_largest_file(normalized)
-    followup_mentions_scan = _contains_any(
-        normalized,
-        ("это сканирование", "это проскан", "сканирование"),
-    )
-    history_mentions_largest = _mentions_largest_file(history)
-    if not current_mentions_largest and not (
-        wants_console and followup_mentions_scan and history_mentions_largest
-    ):
-        return None
-    if not wants_console and not _contains_any(normalized, ("открой", "запусти", "сделай")):
-        return None
-
-    drive = _drive_from_largest_file_request(message, history_text)
-    script = _largest_file_scan_script(drive)
-    return NativeAction(
-        action="process.start",
-        payload={
-            "executable": "powershell.exe",
-            "arguments": _powershell_noexit_arguments(script),
-        },
-        answer=f"открыл PowerShell и запустил поиск самого крупного файла на диске {drive}",
-    )
-
-
-def _mentions_largest_file(text: str) -> bool:
-    return _contains_any(
-        text,
-        (
-            "самый крупный файл",
-            "самого крупного файла",
-            "самый большой файл",
-            "самого большого файла",
-            "largest file",
-            "biggest file",
-        ),
-    )
-
-
-def _drive_from_largest_file_request(message: str, history_text: str = "") -> str:
-    match = re.search(r"\b([a-zA-Z]):", f"{message}\n{history_text}")
-    if match:
-        return f"{match.group(1).upper()}:\\"
-    return "C:\\"
-
-
-def _largest_file_scan_script(drive: str) -> str:
-    quoted_drive = drive.replace("'", "''")
-    return (
-        "$ErrorActionPreference='SilentlyContinue'; "
-        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
-        f"$root='{quoted_drive}'; "
-        "Write-Host ('Сканирую ' + $root + ' ...') -ForegroundColor Cyan; "
-        "$largest=$null; $count=0; "
-        "Get-ChildItem -LiteralPath $root -File -Recurse -Force -ErrorAction SilentlyContinue | "
-        "ForEach-Object { "
-        "$count++; "
-        "if ($null -eq $largest -or $_.Length -gt $largest.Length) { $largest=$_ }; "
-        "if (($count % 10000) -eq 0) { "
-        "Write-Host ('Проверено файлов: {0:n0}; текущий лидер: {1:n2} GB {2}' -f "
-        "$count, ($largest.Length / 1GB), $largest.FullName) -ForegroundColor DarkGray "
-        "} "
-        "}; "
-        "Write-Host ''; "
-        "if ($largest) { "
-        "Write-Host '--- Результат ---' -ForegroundColor Green; "
-        "Write-Host ('Путь: ' + $largest.FullName) -ForegroundColor White; "
-        "Write-Host ('Размер: {0:n2} GB ({1:n0} bytes)' -f "
-        "($largest.Length / 1GB), $largest.Length) "
-        "-ForegroundColor Yellow; "
-        "Write-Host ('Проверено файлов: {0:n0}' -f $count) -ForegroundColor DarkGray "
-        "} else { "
-        "Write-Host 'Файлы не найдены или доступ ко всем каталогам запрещён.' -ForegroundColor Red "
-        "}"
-    )
-
-
-def _same_console_action(
-    message: str,
-    history_text: str,
-    active_console: dict[str, Any] | None,
-) -> NativeAction | None:
-    if not active_console:
-        return None
-    normalized = message.lower()
-    if not _wants_existing_console_target(normalized):
-        return None
-
-    shell = _console_shell_from_target(active_console)
-    command = _existing_console_command(message, history_text, shell)
-    payload = _console_keyboard_payload(active_console, command)
-    fallback = _console_process_fallback(command, shell)
-    return NativeAction(
-        action="keyboard.send",
-        payload=payload,
-        answer="отправил команду в уже открытую консоль",
-        fallback=fallback,
-    )
-
-
-def _wants_existing_console_target(normalized: str) -> bool:
-    same_target = _contains_any(
-        normalized,
-        (
-            "этой же",
-            "той же",
-            "эту же",
-            "ту же",
-            "в этой",
-            "в той",
-            "там же",
-            "туда же",
-            "сюда же",
-            "в ней",
-            "в него",
-            "текущ",
-            "уже открыт",
-            "same console",
-            "same terminal",
-        ),
-    )
-    console_word = _contains_any(
-        normalized,
-        (
-            "консол",
-            "косол",
-            "терминал",
-            "terminal",
-            "powershell",
-            "cmd",
-            "командн",
-        ),
-    )
-    if same_target and (console_word or _contains_any(normalized, ("там же", "туда же"))):
-        return True
-    return _contains_any(normalized, ("теперь", "сейчас", "следом")) and _wants_console_target(
-        normalized
-    )
-
-
-def _existing_console_command(message: str, history_text: str, shell: str) -> str:
-    explicit = _extract_explicit_console_command(message)
-    if explicit:
-        return explicit
-
-    normalized = message.lower()
-    combined = f"{normalized}\n{history_text.lower()}"
-    if _mentions_system_info(combined):
-        return _system_info_existing_console_command(shell)
-    if _mentions_network_info(combined):
-        return _network_existing_console_command(shell)
-    if _mentions_largest_file(combined):
-        drive = _drive_from_largest_file_request(message, history_text)
-        return _shell_command_for_existing_console(_largest_file_scan_script(drive), shell)
-    if _mentions_top_processes(combined):
-        script = (
-            "Get-Process | Sort-Object CPU -Descending | "
-            "Select-Object -First 10 Name,Id,CPU,WorkingSet | Format-Table -AutoSize"
-        )
-        return _shell_command_for_existing_console(script, shell)
-    return _same_console_guard_command(message, shell)
-
-
-def _system_info_existing_console_command(shell: str) -> str:
-    if shell == "cmd":
-        return "systeminfo"
-    return _system_info_script()
-
-
-def _network_existing_console_command(shell: str) -> str:
-    if shell == "cmd":
-        return "ipconfig /all"
-    return _network_info_script()
-
-
-def _shell_command_for_existing_console(script: str, shell: str) -> str:
-    if shell == "cmd":
-        return _powershell_invocation_for_cmd(script)
-    return script
-
-
-def _powershell_invocation_for_cmd(script: str) -> str:
-    escaped = script.replace('"', '`"')
-    return f'powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "{escaped}"'
-
-
-def _same_console_guard_command(message: str, shell: str) -> str:
-    text = (
-        "Jarvis: запрос нацелен на эту же консоль, "
-        "но команда или готовый рецепт не распознаны."
-    )
-    if shell == "cmd":
-        return f"echo {text}"
-    return f"Write-Host {_ps_single_quoted(text)} -ForegroundColor Yellow"
-
-
-def _console_keyboard_payload(target: dict[str, Any], command: str) -> dict[str, Any]:
-    return {
-        "process_id": _int_or_zero(target.get("pid")),
-        "process_name": str(target.get("process_name") or ""),
-        "window_title": str(target.get("window_title") or ""),
-        "text": command,
-        "keys": "{ENTER}",
-    }
-
-
-def _console_process_fallback(command: str, shell: str) -> NativeAction:
-    if shell == "cmd":
-        return NativeAction(
-            action="process.start",
-            payload={"executable": "cmd.exe", "arguments": f"/k {command}"},
-            answer="не смог сфокусировать прежнюю консоль, открыл новую cmd и выполнил команду",
-        )
-    return NativeAction(
-        action="process.start",
-        payload={
-            "executable": "powershell.exe",
-            "arguments": _powershell_noexit_arguments(command),
-        },
-        answer=(
-            "не смог сфокусировать прежнюю консоль, "
-            "открыл новый PowerShell и выполнил команду"
-        ),
-    )
-
-
 def _mission_report_key(mission_id: str) -> str:
     return f"mission.report.{mission_id}"
-
-
-def _console_target_key(conversation_id: str) -> str:
-    return f"ui.target.console.{conversation_id}"
-
-
-def _console_target_from_result(
-    action: NativeAction,
-    result: ToolRunResponse,
-) -> dict[str, Any] | None:
-    if not result.ok:
-        return None
-    payload = action.payload
-    if action.action == "keyboard.send" and _payload_targets_console(payload):
-        shell = _console_shell_from_target(payload)
-        return {
-            "pid": _int_or_zero(payload.get("process_id")),
-            "process_name": str(payload.get("process_name") or ""),
-            "window_title": str(payload.get("window_title") or ""),
-            "executable": "",
-            "shell": shell,
-        }
-    if action.action not in {"process.start", "app.open_and_type"}:
-        return None
-
-    executable = str(payload.get("executable") or "")
-    if not _is_console_executable(executable):
-        return None
-    native_data = _native_result_data(result)
-    process_name = str(native_data.get("processName") or native_data.get("ProcessName") or "")
-    hints = _native_focus_hint(executable)
-    if not process_name:
-        process_name = str(hints.get("process_name") or Path(executable).stem)
-    shell = _console_shell_from_executable(executable, process_name)
-    return {
-        "pid": _int_or_zero(native_data.get("pid") or native_data.get("Id")),
-        "process_name": str(hints.get("process_name") or process_name),
-        "window_title": str(hints.get("window_title") or ""),
-        "executable": executable,
-        "shell": shell,
-    }
-
-
-def _native_result_data(result: ToolRunResponse) -> dict[str, Any]:
-    if not isinstance(result.data, dict):
-        return {}
-    native = result.data.get("native")
-    if not isinstance(native, dict):
-        return {}
-    data = native.get("data")
-    return data if isinstance(data, dict) else {}
-
-
-def _payload_targets_console(payload: dict[str, Any]) -> bool:
-    text = " ".join(
-        str(payload.get(key) or "").lower()
-        for key in ("process_name", "window_title", "executable")
-    )
-    return _contains_any(
-        text,
-        ("cmd", "powershell", "pwsh", "windowsterminal", "terminal", "команд", "терминал"),
-    )
 
 
 def _is_console_executable(executable: str) -> bool:
     name = Path(executable).name.lower()
     return name in {"cmd.exe", "powershell.exe", "pwsh.exe", "wt.exe"}
-
-
-def _console_shell_from_target(target: dict[str, Any]) -> str:
-    shell = str(target.get("shell") or "").lower()
-    if shell in {"cmd", "powershell", "terminal"}:
-        return "powershell" if shell == "terminal" else shell
-    executable = str(target.get("executable") or "")
-    process_name = str(target.get("process_name") or "")
-    return _console_shell_from_executable(executable, process_name)
-
-
-def _console_shell_from_executable(executable: str, process_name: str = "") -> str:
-    text = f"{Path(executable).name} {process_name}".lower()
-    if "cmd" in text:
-        return "cmd"
-    return "powershell"
-
-
-def _int_or_zero(value: Any) -> int:
-    try:
-        return int(value or 0)
-    except (TypeError, ValueError):
-        return 0
-
-
-def _mentions_top_processes(text: str) -> bool:
-    wants_processes = _contains_any(text, ("процесс", "process"))
-    wants_top = bool(re.search(r"\btop\s*10\b", text)) or _contains_any(
-        text,
-        ("топ 10", "топ-10", "top-10"),
-    )
-    return wants_processes and wants_top
-
-
-def _console_target_guard_action(message: str, history_text: str = "") -> NativeAction | None:
-    normalized = message.lower()
-    if not _wants_console_target(normalized):
-        return None
-    if _is_plain_console_open_request(normalized):
-        return None
-
-    explicit_command = _extract_explicit_console_command(message)
-    if explicit_command:
-        script = _console_command_script(explicit_command)
-        return NativeAction(
-            action="process.start",
-            payload={
-                "executable": "powershell.exe",
-                "arguments": _powershell_noexit_arguments(script),
-            },
-            answer="открыл PowerShell и выполнил распознанную команду в консоли",
-        )
-
-    combined = f"{normalized}\n{history_text.lower()}"
-    if _mentions_network_info(combined):
-        script = _network_info_script()
-        return NativeAction(
-            action="process.start",
-            payload={
-                "executable": "powershell.exe",
-                "arguments": _powershell_noexit_arguments(script),
-            },
-            answer="открыл PowerShell и вывел сетевую диагностику в консоли",
-        )
-
-    script = _console_guard_fallback_script(message)
-    return NativeAction(
-        action="process.start",
-        payload={
-            "executable": "powershell.exe",
-            "arguments": _powershell_noexit_arguments(script),
-        },
-        answer="открыл PowerShell с диагностикой console target guard",
-    )
-
-
-def _is_plain_console_open_request(normalized: str) -> bool:
-    wants_open = _contains_any(
-        normalized,
-        ("открой", "открыть", "запусти", "запустить", "open", "start"),
-    )
-    if not wants_open:
-        return False
-    task_markers = (
-        "выполни",
-        "сделай",
-        "покажи",
-        "выведи",
-        "найди",
-        "провер",
-        "диагност",
-        "информац",
-        "сведен",
-        "скан",
-        "топ",
-        "top",
-        "процесс",
-        "сет",
-        "ip",
-        "dns",
-        "wmi",
-        "cim",
-        "список",
-        "настрой",
-    )
-    return not _contains_any(normalized, task_markers)
-
-
-def _extract_explicit_console_command(message: str) -> str:
-    fenced = re.search(r"```(?:[a-zA-Z0-9_-]+)?\s*(.*?)```", message, flags=re.DOTALL)
-    if fenced:
-        command = _compact_shell_command(fenced.group(1))
-        if _looks_like_shell_command(command):
-            return command
-
-    for quoted in re.finditer(r"`([^`\r\n]{2,1800})`", message):
-        command = _compact_shell_command(quoted.group(1))
-        if _looks_like_shell_command(command):
-            return command
-
-    markers = r"(?:консол\w*|powershell|power shell|пауэршелл|терминал\w*|terminal|cmd)"
-    patterns = (
-        rf"(?:выполни|запусти|введи|набери)\s+(?:в\s+)?{markers}\s+(.+)$",
-        rf"(?:выполни|запусти|введи|набери)\s+(.+?)\s+(?:в\s+)?{markers}\s*$",
-        rf"(?:в\s+)?{markers}\s*[:\-]\s*(.+)$",
-        rf"(?:в\s+)?{markers}\s+(.+)$",
-    )
-    for pattern in patterns:
-        match = re.search(pattern, message, flags=re.IGNORECASE)
-        if not match:
-            continue
-        command = _compact_shell_command(match.group(1).strip(" \"'«».,;"))
-        if _looks_like_shell_command(command):
-            return command
-    return ""
-
-
-def _compact_shell_command(command: str) -> str:
-    lines = [line.strip() for line in command.replace("\r", "\n").split("\n") if line.strip()]
-    return "; ".join(lines)[:1800]
-
-
-def _looks_like_shell_command(command: str) -> bool:
-    stripped = command.strip()
-    if not stripped:
-        return False
-    lowered = stripped.lower()
-    first = re.split(r"\s+", lowered, maxsplit=1)[0].strip("&.")
-    prefixes = (
-        "$",
-        "cd",
-        "choco",
-        "cmd",
-        "curl",
-        "dir",
-        "dism",
-        "docker",
-        "git",
-        "get-",
-        "gwmi",
-        "hostname",
-        "ipconfig",
-        "invoke-",
-        "ls",
-        "net",
-        "netstat",
-        "new-",
-        "node",
-        "npm",
-        "nslookup",
-        "ping",
-        "pnpm",
-        "powershell",
-        "pwsh",
-        "py",
-        "python",
-        "reg",
-        "remove-",
-        "resolve-",
-        "restart-",
-        "route",
-        "sc",
-        "set-",
-        "sfc",
-        "start-",
-        "stop-",
-        "systeminfo",
-        "taskkill",
-        "tasklist",
-        "test-",
-        "tracert",
-        "where",
-        "where-object",
-        "whoami",
-        "winget",
-        "write-",
-        "wsl",
-    )
-    if first.endswith((".exe", ".bat", ".cmd", ".ps1")):
-        return True
-    has_command_prefix = any(
-        first.startswith(prefix) for prefix in prefixes if prefix.endswith("-")
-    )
-    if first in prefixes or has_command_prefix:
-        return True
-    has_cyrillic = bool(re.search(r"[а-яё]", lowered))
-    if re.search(r"[|;&<>]", stripped) and not has_cyrillic:
-        return True
-    return bool(re.search(r"\s[-/][A-Za-z?]", stripped) and not has_cyrillic)
-
-
-def _mentions_network_info(text: str) -> bool:
-    has_network_word = _contains_any(
-        text,
-        (
-            "network",
-            "netadapter",
-            "netipconfiguration",
-            "ipconfig",
-            "dns",
-            "сет",
-            "интернет",
-            "адаптер",
-            "ip адрес",
-            "айпи",
-            "шлюз",
-            "маршрут",
-        ),
-    )
-    if not has_network_word:
-        return False
-    return _contains_any(
-        text,
-        (
-            "диагност",
-            "информац",
-            "настрой",
-            "покажи",
-            "выведи",
-            "проверь",
-            "сведен",
-            "ipconfig",
-            "dns",
-            "сет",
-            "интернет",
-        ),
-    )
-
-
-def _console_command_script(command: str) -> str:
-    quoted = _ps_single_quoted(command)
-    return (
-        "$ErrorActionPreference='Continue'; "
-        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
-        "Write-Host '--- JARVIS CONSOLE TARGET ---' -ForegroundColor Cyan; "
-        f"Write-Host ('Command: ' + {quoted}) -ForegroundColor DarkGray; "
-        f"{command}"
-    )
-
-
-def _network_info_script() -> str:
-    return (
-        "$ErrorActionPreference='Continue'; "
-        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
-        "Write-Host '--- NETWORK DIAGNOSTICS ---' -ForegroundColor Cyan; "
-        "Write-Host '--- IPCONFIG ---' -ForegroundColor DarkCyan; "
-        "ipconfig /all; "
-        "Write-Host '--- ADAPTERS ---' -ForegroundColor DarkCyan; "
-        "Get-NetAdapter | Select-Object Name,Status,LinkSpeed,MacAddress | Format-Table -AutoSize; "
-        "Write-Host '--- IP CONFIGURATION ---' -ForegroundColor DarkCyan; "
-        "Get-NetIPConfiguration | Format-List; "
-        "Write-Host '--- DNS CLIENT ---' -ForegroundColor DarkCyan; "
-        "Get-DnsClientServerAddress | Format-Table -AutoSize"
-    )
-
-
-def _console_guard_fallback_script(message: str) -> str:
-    request = _ps_single_quoted(message.strip()[:600])
-    return (
-        "$ErrorActionPreference='Continue'; "
-        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
-        "Write-Host '--- JARVIS CONSOLE TARGET GUARD ---' -ForegroundColor Yellow; "
-        "Write-Host 'Запрос явно нацелен на консоль, поэтому я не отвечаю "
-        "примером команды в чате.'; "
-        f"Write-Host ('Запрос: ' + {request}) -ForegroundColor DarkGray; "
-        "Write-Host 'Команда или готовый рецепт не распознаны однозначно.' "
-        "-ForegroundColor Yellow; "
-        "Write-Host 'Сформулируйте конкретную команду в обратных кавычках "
-        "или назовите тип диагностики.'"
-    )
-
-
-def _ps_single_quoted(value: str) -> str:
-    return "'" + value.replace("'", "''") + "'"
-
-
-def _powershell_noexit_arguments(script: str) -> str:
-    escaped = script.replace('"', '`"')
-    return f'-NoExit -ExecutionPolicy Bypass -Command "{escaped}"'
 
 
 def _app_from_message(normalized: str) -> tuple[tuple[str, ...], str, str] | None:
@@ -7567,18 +6829,6 @@ def _native_focus_hint(executable: str) -> dict[str, str]:
         "mspaint.exe": {
             "process_name": "mspaint",
             "window_title": "Paint",
-        },
-        "cmd.exe": {
-            "process_name": "cmd",
-            "window_title": "Command Prompt|Командная строка",
-        },
-        "powershell.exe": {
-            "process_name": "powershell",
-            "window_title": "Windows PowerShell|PowerShell",
-        },
-        "wt.exe": {
-            "process_name": "WindowsTerminal",
-            "window_title": "Windows PowerShell|PowerShell|Terminal|Терминал",
         },
     }
     return dict(hints.get(executable.lower(), {}))
@@ -7658,61 +6908,12 @@ def _sendkeys_for_calculator(expression: str) -> str:
     return "".join(replacements.get(char, char) for char in expression)
 
 
-def _host_command_from_message(message: str) -> str | None:
-    normalized = message.lower()
-    if not _contains_any(normalized, ("открой", "открыть", "запусти", "open", "start")):
-        return None
-    if not _contains_any(normalized, ("калькулятор", "calculator", "calc.exe", "calc")):
-        return None
-    command = "Start-Process calc.exe"
-    if _contains_any(normalized, ("набери", "введи", "напечат", "type")):
-        command += (
-            "; Start-Sleep -Milliseconds 900"
-            "; Add-Type -AssemblyName System.Windows.Forms"
-            "; [System.Windows.Forms.SendKeys]::SendWait('123{+}456')"
-        )
-    return command
-
-
 def _contains_any(text: str, markers: tuple[str, ...]) -> bool:
     return any(marker in text for marker in markers)
 
 
 def _elapsed_ms(started_at: float) -> int:
     return max(0, round((time.perf_counter() - started_at) * 1000))
-
-
-def _wants_console_target(normalized: str) -> bool:
-    return _contains_any(
-        normalized,
-        (
-            "в консоли",
-            "консол",
-            "powershell",
-            "power shell",
-            "пауэршелл",
-            "терминал",
-            "terminal",
-            "командн",
-            "cmd",
-            "вывод там же",
-            "там же",
-        ),
-    )
-
-
-def _wants_top_process_console(normalized: str) -> bool:
-    wants_console = _wants_console_target(normalized)
-    wants_processes = _contains_any(normalized, ("процесс", "process"))
-    wants_top = bool(re.search(r"\btop\s*10\b", normalized)) or _contains_any(
-        normalized,
-        ("топ 10", "топ-10", "top-10"),
-    )
-    wants_open = _contains_any(
-        normalized,
-        ("открой", "открыть", "запусти", "запустить", "open", "start"),
-    )
-    return wants_console and wants_processes and wants_top and wants_open
 
 
 def _dedupe(items: list[str]) -> list[str]:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+from pathlib import Path
 from typing import Any
 
 import uvicorn
@@ -180,12 +181,22 @@ def cmd_host_bridge(args: argparse.Namespace) -> None:
     storage.close()
 
 
-def cmd_host_bridge_exec(args: argparse.Namespace) -> None:
+def cmd_host_bridge_action(args: argparse.Namespace) -> None:
     async def run() -> None:
         settings, storage, _llm, _agent = _runtime(args.profile)
-        result = await HostBridgeClient(settings).execute(
-            command=args.command,
-            cwd=args.cwd,
+        payload = _json_argument(args.payload_json, option="--payload-json")
+        if args.payload_file:
+            path = Path(args.payload_file).expanduser().resolve(strict=True)
+            if not path.is_file() or path.stat().st_size > 1024 * 1024:
+                storage.close()
+                raise SystemExit("--payload-file must be a JSON file no larger than 1 MiB")
+            payload = _json_argument(
+                path.read_text(encoding="utf-8"), option="--payload-file"
+            )
+        payload.update(_set_arguments(args.sets))
+        result = await HostBridgeClient(settings).action(
+            action=args.action,
+            payload=payload,
             timeout_sec=args.timeout,
         )
         _print_json(result)
@@ -416,14 +427,22 @@ def build_parser() -> argparse.ArgumentParser:
     host_bridge_parser = sub.add_parser("host-bridge", help="Show native host bridge status")
     host_bridge_parser.set_defaults(func=cmd_host_bridge)
 
-    host_bridge_exec_parser = sub.add_parser(
-        "host-bridge-exec",
-        help="Execute a token-authenticated command through the native host bridge",
+    host_bridge_action_parser = sub.add_parser(
+        "host-bridge-action",
+        help="Run a typed action.v1 request through the native host bridge",
     )
-    host_bridge_exec_parser.add_argument("command")
-    host_bridge_exec_parser.add_argument("--cwd", default=None)
-    host_bridge_exec_parser.add_argument("--timeout", type=int, default=30)
-    host_bridge_exec_parser.set_defaults(func=cmd_host_bridge_exec)
+    host_bridge_action_parser.add_argument("action")
+    host_bridge_action_parser.add_argument("--payload-json", default="{}")
+    host_bridge_action_parser.add_argument("--payload-file", default=None)
+    host_bridge_action_parser.add_argument(
+        "--set",
+        dest="sets",
+        action="append",
+        default=[],
+        help="Set one payload field as key=value. Can be repeated.",
+    )
+    host_bridge_action_parser.add_argument("--timeout", type=int, default=30)
+    host_bridge_action_parser.set_defaults(func=cmd_host_bridge_action)
 
     autonomy_parser = sub.add_parser("autonomy", help="Show autonomous supervisor settings")
     autonomy_parser.set_defaults(func=cmd_autonomy)
@@ -531,15 +550,15 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _json_argument(raw: str | None) -> dict[str, Any]:
+def _json_argument(raw: str | None, *, option: str = "--arguments") -> dict[str, Any]:
     if not raw:
         return {}
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise SystemExit(f"Invalid JSON for --arguments: {exc}") from exc
+        raise SystemExit(f"Invalid JSON for {option}: {exc}") from exc
     if not isinstance(data, dict):
-        raise SystemExit("--arguments must be a JSON object")
+        raise SystemExit(f"{option} must be a JSON object")
     return data
 
 

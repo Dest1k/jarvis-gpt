@@ -27,7 +27,9 @@ DEFAULT_AUTONOMY_POLICY: dict[str, Any] = {
     "allow_background_learning": True,
     "allow_self_healing_suggestions": True,
     "approval_required_for": [
-        "host.bridge.execute",
+        "execution.apply",
+        "execution.transaction",
+        "execution.cancel",
         "filesystem.write_text",
         "dispatcher.start",
         "dispatcher.stop",
@@ -345,7 +347,7 @@ def _normalize_policy(value: dict[str, Any]) -> dict[str, Any]:
         ),
         "approval_required_for": _clean_string_list(
             value.get("approval_required_for"),
-            "host.bridge.execute",
+            "execution.apply",
             limit=20,
         ),
         "max_autonomous_steps": _bounded_int(value.get("max_autonomous_steps"), 1, 24, 3),

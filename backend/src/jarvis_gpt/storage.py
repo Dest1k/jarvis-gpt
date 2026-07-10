@@ -129,6 +129,10 @@ _SECRET_VALUE_RE = re.compile(
     r"(?i)\b(api[_-]?key|authorization|cookie|password|secret|token)\b\s*[:=]\s*[^,\s;]+"
 )
 _OPENAI_KEY_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b")
+_URL_CREDENTIAL_RE = re.compile(r"(?i)([a-z][a-z0-9+.-]*://)[^/@\s]+:[^/@\s]+@")
+_SENSITIVE_FLAG_RE = re.compile(
+    r"(?i)^--?(?:password|passwd|secret|token|credential|api[-_]?key|private[-_]?key)$"
+)
 
 
 def _redact_sensitive(value: Any) -> Any:
@@ -138,6 +142,12 @@ def _redact_sensitive(value: Any) -> Any:
             text_key = str(key)
             if _sensitive_key(text_key):
                 redacted[text_key] = "[redacted]"
+            elif text_key.casefold() in {"content_base64", "value_base64"}:
+                redacted[text_key] = f"[redacted:{len(str(item))} chars]"
+            elif text_key.casefold() == "arguments" and isinstance(item, list | tuple):
+                redacted[text_key] = _redact_argument_list(item)
+            elif text_key.casefold() == "environment" and isinstance(item, dict):
+                redacted[text_key] = {str(name): "[redacted]" for name in item}
             else:
                 redacted[text_key] = _redact_sensitive(item)
         return redacted
@@ -153,7 +163,30 @@ def _redact_sensitive(value: Any) -> Any:
 def _redact_sensitive_text(text: str) -> str:
     text = _BEARER_RE.sub(r"\1[redacted]", text)
     text = _OPENAI_KEY_RE.sub("sk-[redacted]", text)
+    text = _URL_CREDENTIAL_RE.sub(r"\1[redacted]@", text)
     return _SECRET_VALUE_RE.sub(lambda match: f"{match.group(1)}=[redacted]", text)
+
+
+def _redact_argument_list(value: list[Any] | tuple[Any, ...]) -> list[Any]:
+    result: list[Any] = []
+    redact_next = False
+    for item in value:
+        if not isinstance(item, str):
+            result.append(_redact_sensitive(item))
+            redact_next = False
+            continue
+        if redact_next:
+            result.append("[redacted]")
+            redact_next = False
+            continue
+        redacted = _redact_sensitive_text(item)
+        prefix, separator, _secret = redacted.partition("=")
+        if separator and _SENSITIVE_FLAG_RE.fullmatch(prefix):
+            result.append(f"{prefix}=[redacted]")
+            continue
+        result.append(redacted)
+        redact_next = bool(_SENSITIVE_FLAG_RE.fullmatch(item))
+    return result
 
 
 def _sensitive_key(key: str) -> bool:

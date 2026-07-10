@@ -846,7 +846,7 @@ to retry from scratch.
 
 - Раньше семантический роутер вызывался только в узкой калитке `_should_use_semantic_router` (когда эвристика уже выбрала `web_research` И совпали маркеры) и работал лишь как вето в research-ветке. Это и была корневая «затычечность».
 - Теперь в `agent.py` есть **reasoning-first арбитр** `_understand_intent(message, context)`: он вызывается для всей fuzzy web-семьи (гейт — `task_plan.route == "web_research"`, куда эвристика и так сводит weather/shopping/travel/place/osint/generic-research), обогащён operator-контекстом (`_intent_operator_context`: role, home_location, tech_stack, interests) и решает по смыслу: `reasoning|chat|web_research|local_action|mission`.
-- Место вызова: `_try_direct_action`, ПОСЛЕ детерминированных fast-path (native OS action, host command, URL) и ПЕРЕД fuzzy-ветками. Если арбитр уверенно (`confidence >= 0.6`) говорит `reasoning`/`chat` — возвращаем None, и основной LLM отвечает рассуждением; при этом `context.task_plan` переписывается `_reroute_plan(...)`, чтобы промпт был когерентным (не «execution contract web_research»). Решение кэшируется на context (`intent_consulted`/`intent_decision`) — ровно один вызов роутера за ход.
+- Место вызова: `_try_direct_action`, ПОСЛЕ детерминированных fast-path (typed native OS action, URL) и ПЕРЕД fuzzy-ветками. Произвольные host-command строки больше не являются fast-path. Если арбитр уверенно (`confidence >= 0.6`) говорит `reasoning`/`chat` — возвращаем None, и основной LLM отвечает рассуждением; при этом `context.task_plan` переписывается `_reroute_plan(...)`, чтобы промпт был когерентным (не «execution contract web_research»). Решение кэшируется на context (`intent_consulted`/`intent_decision`) — ровно один вызов роутера за ход.
 - Детерминированные fast-path и офлайн-режим не тронуты: арбитр гейтится на `settings.llm_enabled`, поэтому при выключенном LLM эвристики остаются авторитетом (все офлайн-тесты неизменны).
 - Удалён мёртвый `_should_use_semantic_router` (узкая калитка). `_intent_router_messages` переписан в reasoning-first формулировку (сохранена подстрока `intent-router`, которую пинят тесты).
 - Промпты: SYSTEM_PROMPT теперь начинается с «сначала пойми задачу и рассуждай по контексту; правила — умолчания, а не скрипт»; task-kernel prompt смягчён с «execution contract» на «стартовая гипотеза, следуй задаче, а не ярлыку».
@@ -915,7 +915,7 @@ py -3.11 .\jarvis.py dispatcher-down
 py -3.11 .\jarvis.py telemetry --persist
 py -3.11 .\jarvis.py host-bridge
 py -3.11 .\scripts\windows_rpc_bridge.py
-py -3.11 .\jarvis.py host-bridge-exec "Get-Date"
+py -3.11 .\jarvis.py host-bridge-action window.list --payload-json '{"limit":10}'
 py -3.11 .\jarvis.py autonomy
 py -3.11 .\jarvis.py persona
 py -3.11 .\jarvis.py persona-set --set location=Kazan --set tech_stack=Proxmox,Debian
@@ -1013,18 +1013,59 @@ Chrome is launched with a dedicated profile under `D:\jarvis\cache\jarvis-gpt\ch
 
 ## Host Bridge
 
-`scripts/windows_rpc_bridge.py` is a local-only bridge for Windows host actions. It binds to `127.0.0.1:8765`, creates or reads `D:\jarvis\.jarvis\bridge.token`, exposes unauthenticated `/health`, and requires `Authorization: Bearer <token>` for `/execute`.
+`scripts/windows_rpc_bridge.py` is a local-only bridge for Windows host actions. It binds to `127.0.0.1:8765`, creates or reads `D:\jarvis\.jarvis\bridge.token`, exposes unauthenticated `/health`, and requires `Authorization: Bearer <token>` for typed `POST /action` requests. The legacy arbitrary-command `/execute` endpoint returns `410 Gone`.
 
-The normal safe path is:
+The bridge contract is `action.v1`: `{action, payload, timeout_sec}`. Action and payload fields are allowlisted; process launch uses direct argv with `shell=False`, accepts only a fixed native desktop-app/argument grammar, and rejects shell/script hosts and general-purpose native executables. WMI/window/keyboard/screen actions can invoke only the bridge's fixed bundled implementation. Startup and reuse require an authenticated `capabilities` probe with the current protected token and exact `policy_revision`, not only the public health response. `capabilities.process_policy` reports allowed apps, actually available canonical paths, and grammar IDs.
+
+Apps installed outside canonical Windows/System32/Program Files locations are not inferred from user-writable PATH or HKCU App Paths. An operator may pin an exact reviewed path with `JARVIS_BRIDGE_APP_PATHS_JSON`, for example `{"code.exe":"D:\\VS Code\\Microsoft VS Code\\Code.exe"}`. The variable belongs in the protected launch environment; unsupported app names and basename/path mismatches fail closed.
+
+Example read-only bridge diagnostic:
 
 ```powershell
 py -3.11 .\scripts\windows_rpc_bridge.py
-py -3.11 .\jarvis.py approval-request "Host command" "Run approved local command" --action tool.run --risk danger --payload "{\"tool\":\"host.bridge.execute\",\"arguments\":{\"command\":\"Get-Date\"}}"
-py -3.11 .\jarvis.py approval-update <approval_id> --status approved
-py -3.11 .\jarvis.py approval-execute <approval_id>
+py -3.11 .\jarvis.py host-bridge-action window.list --payload-json '{"limit":10}'
 ```
 
-For manual diagnostics, `host-bridge-exec` calls the same token-auth bridge directly.
+Model-facing OS work does not use the bridge as a shell. It goes through the `jarvis.execution.v1` substrate tools described below.
+
+## Deterministic Execution Substrate
+
+The public execution envelope is strictly schema validated:
+
+```json
+{
+  "protocol": "jarvis.execution.v1",
+  "action": {
+    "kind": "fs.stat",
+    "action_id": "inspect_state",
+    "path": "D:\\jarvis\\data"
+  }
+}
+```
+
+Tool boundaries:
+
+- `execution.capabilities`: schema and effective capability policy.
+- `execution.inspect`: safe read-only actions.
+- `execution.apply`: approval-gated mutations, argv-only process runs, and owned-process control.
+- `execution.transaction`: approval-gated reversible FS/registry batch with durable checkpoint/WAL and rollback.
+- `execution.session`: create/list/inspect/transition bounded in-memory session state.
+- `execution.cancel`: approval-gated cancellation of exact processes owned by a session.
+
+Actions cover typed FS stat/list/read/mkdir/write/copy/move/delete, process run/terminate, DNS/TCP inspection, and registry get/set/delete. Paths must be absolute and stay under configured roots; runtime state, logs, `.jarvis` secrets, and the repository `.env` remain denied even when a parent root is allowed. Shell interpreters are not process actions. Processes are disabled until an administrator supplies per-executable argv regex rules; explicit environment variables require per-executable value regexes and environment inheritance is disabled by default. Network hosts and registry prefixes are also deny-by-default.
+
+Optional configuration:
+
+```text
+JARVIS_EXECUTION_ROOTS=D:\jarvis;D:\jarvis-gpt
+JARVIS_EXECUTION_CAPABILITIES_FILE=D:\jarvis\execution-capabilities.json
+```
+
+The capabilities file is strict JSON. It may define `executables` (`path`, positional `argument_patterns`, optional `additional_argument_pattern`, and an `environment_patterns` object), `network_hosts`, `allow_private_network`, registry read/write prefixes, and `allow_inherited_process_environment`. Unknown fields fail startup. Start from `docs/execution-capabilities.example.json`, replace paths and regexes for the deployment, then point `JARVIS_EXECUTION_CAPABILITIES_FILE` at the reviewed copy. Crash recovery scans durable active checkpoints when the kernel starts.
+
+Single actions use `action_id` for in-process replay protection; transaction batches use `idempotency_key`. Resource locks cover action IDs, filesystem ancestor scopes, registry keys, and process working directories, preventing rollback from racing a committed sibling operation. Idempotency caches are intentionally memory-bounded; durable checkpoint recovery covers filesystem/registry crash rollback, not cross-restart exactly-once delivery.
+
+Session-bound process starts reserve ownership before spawn, reject concurrent roots in one session, track stable PID birth identity, and cancel only owned process groups/Job Objects. Process output is drained asynchronously with total/stall deadlines, bounded tails, permissions, PID tree, and observed filesystem diff. When history limits are exceeded, old steps are compressed into bounded dry facts and failure counts.
 
 ## Storage
 

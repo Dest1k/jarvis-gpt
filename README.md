@@ -135,7 +135,7 @@ py -3.11 .\jarvis.py dispatcher-status
 py -3.11 .\jarvis.py telemetry --persist
 py -3.11 .\jarvis.py host-bridge
 py -3.11 .\scripts\windows_rpc_bridge.py
-py -3.11 .\jarvis.py host-bridge-exec "Get-Date"
+py -3.11 .\jarvis.py host-bridge-action window.list --payload-json '{"limit":10}'
 py -3.11 .\jarvis.py autonomy
 py -3.11 .\jarvis.py persona
 py -3.11 .\jarvis.py persona-set --set location=Kazan --set tech_stack=Proxmox,Debian
@@ -215,8 +215,9 @@ docker compose --profile llm up -d dispatcher
 - Command Center registers a service worker and keeps the local UI shell available after the first successful load.
 - Command Center can upload Office/PDF/text attachments for document extraction
   and can run safe public web fetches with clipped results inline.
-- Command Center can create host-command approval gates and execute them after approval.
-- Native host bridge now has a bundled local RPC script, token detection, CLI execution, and a `danger` tool for approved host commands.
+- Command Center can create typed `jarvis.execution.v1` approval gates and execute them after approval.
+- Deterministic execution tools provide typed OS actions, rich process feedback, durable rollback checkpoints, idempotency, exact process ownership, and bounded session history. Process/network/registry capabilities are deny-by-default.
+- Native host bridge uses token-authenticated `action.v1`; arbitrary command execution is removed, `/execute` returns `410 Gone`, and process launch is restricted to a fixed desktop-app/argument grammar.
 - Safe tools include `web.fetch` for public HTTP(S) context with private-network and redirect guards.
 - Web tools mark remote content as untrusted evidence, flag prompt-injection markers, and quarantine downloads without auto-opening files.
 - Browser tools include local-only Chrome CDP status/launch/read flows for reading pages through a dedicated user browser session without exporting cookies.

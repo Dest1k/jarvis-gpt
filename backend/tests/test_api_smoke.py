@@ -414,26 +414,56 @@ def test_operator_queue_and_memory_and_tools(client):
     assert tools.status_code == 200
     names = {tool["name"] for tool in tools.json()}
     assert {"runtime.status", "persona.get", "memory.search"}.issubset(names)
+    assert "host.bridge.execute" not in names
+    assert "execution.apply" in names
 
     run = client.post("/api/tools/runtime.status/run", json={"arguments": {}})
     assert run.status_code == 200
     assert run.json()["ok"] is True
 
-    # A dangerous tool without approval must be refused, not executed.
-    denied = client.post(
-        "/api/tools/host.bridge.execute/run",
-        json={"arguments": {"command": "Get-Date"}, "allow_danger": False},
-    )
-    assert denied.status_code == 200
-    assert denied.json()["ok"] is False
+    approvals_before = len(app.state.storage.list_approvals(limit=200))
+    raw_target = app.state.settings.data_dir / "raw-command-should-not-run.txt"
+    raw_command = f"Set-Content -LiteralPath '{raw_target}' -Value raw"
 
-    bypass = client.post(
+    # Removed raw-command tools stay unavailable even with a danger override.
+    denied_raw = client.post(
         "/api/tools/host.bridge.execute/run",
-        json={"arguments": {"command": "Get-Date"}, "allow_danger": True},
+        json={"arguments": {"command": raw_command}, "allow_danger": False},
     )
-    assert bypass.status_code == 200
-    assert bypass.json()["ok"] is False
-    assert bypass.json()["data"]["approval_action"] == "tool.run"
+    bypass_raw = client.post(
+        "/api/tools/host.bridge.execute/run",
+        json={"arguments": {"command": raw_command}, "allow_danger": True},
+    )
+
+    assert denied_raw.status_code == 200
+    assert bypass_raw.status_code == 200
+    assert denied_raw.json()["ok"] is False
+    assert bypass_raw.json()["ok"] is False
+    assert "not registered" in denied_raw.json()["summary"]
+    assert "not registered" in bypass_raw.json()["summary"]
+    assert not raw_target.exists()
+    assert len(app.state.storage.list_approvals(limit=200)) == approvals_before
+
+    structured_target = app.state.settings.data_dir / "structured-gated.txt"
+    structured_payload = {
+        "protocol": "jarvis.execution.v1",
+        "action": {
+            "kind": "fs.write",
+            "action_id": "api-gated-write",
+            "path": str(structured_target),
+            "content_base64": base64.b64encode(b"gated").decode("ascii"),
+        },
+    }
+    gated = client.post(
+        "/api/tools/execution.apply/run",
+        json={"arguments": {"payload": structured_payload}, "allow_danger": False},
+    )
+    assert gated.status_code == 200
+    assert gated.json()["ok"] is False
+    assert gated.json()["data"]["danger_level"] == "danger"
+    assert gated.json()["data"]["approval_action"] == "tool.run"
+    assert gated.json()["data"]["approval_payload"]["tool"] == "execution.apply"
+    assert not structured_target.exists()
 
 
 def test_approvals_and_persona(client):

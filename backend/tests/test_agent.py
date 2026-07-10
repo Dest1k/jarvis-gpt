@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import date, timedelta
+from pathlib import Path
 
 from jarvis_gpt.agent import AgentRuntime
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
@@ -14,29 +15,6 @@ from jarvis_gpt.storage import JarvisStorage
 
 def _tool_response(tool: str, ok: bool, summary: str, data: dict):
     return ToolRunResponse(tool=tool, ok=ok, summary=summary, data=data)
-
-
-def _agent_with_native_capture(monkeypatch, tmp_path):
-    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
-    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
-    captured = {}
-
-    async def fake_execute(self, command, cwd=None, timeout_sec=30):
-        captured["command"] = command
-        return {"ok": True, "summary": "executed", "data": {"command": command}}
-
-    monkeypatch.setattr("jarvis_gpt.tools.HostBridgeClient.execute", fake_execute)
-    settings = load_settings()
-    ensure_runtime_dirs(settings)
-    storage = JarvisStorage(settings.database_path)
-    storage.initialize()
-    agent = AgentRuntime(
-        settings=settings,
-        storage=storage,
-        llm=LLMRouter(settings),
-        bus=EventBus(),
-    )
-    return agent, storage, captured
 
 
 def _agent_without_llm(monkeypatch, tmp_path):
@@ -426,13 +404,6 @@ def test_agent_requests_approval_before_opening_wiki(monkeypatch, tmp_path):
 def test_agent_opens_calculator_with_host_bridge(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
-    captured = {}
-
-    async def fake_execute(self, command, cwd=None, timeout_sec=30):
-        captured["command"] = command
-        return {"ok": True, "summary": "executed", "data": {"command": command}}
-
-    monkeypatch.setattr("jarvis_gpt.tools.HostBridgeClient.execute", fake_execute)
     settings = load_settings()
     ensure_runtime_dirs(settings)
     storage = JarvisStorage(settings.database_path)
@@ -448,11 +419,13 @@ def test_agent_opens_calculator_with_host_bridge(monkeypatch, tmp_path):
     runs = storage.list_tool_runs()
 
     approval, arguments = _pending_native_request(storage)
-    assert captured == {}
     assert runs == []
     assert arguments["action"] == "app.open_and_type"
     assert arguments["payload"]["executable"] == "explorer.exe"
-    assert "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App" in arguments["payload"]["arguments"]
+    assert any(
+        "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App" in item
+        for item in arguments["payload"]["arguments"]
+    )
     assert arguments["payload"]["keys"] == "123{+}456="
     assert response.events[-1].type == "approval"
     assert response.events[-1].payload["approval_id"] == approval["id"]
@@ -463,13 +436,6 @@ def test_agent_opens_calculator_with_host_bridge(monkeypatch, tmp_path):
 def test_agent_calculator_understands_russian_multiply_sign(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
-    captured = {}
-
-    async def fake_execute(self, command, cwd=None, timeout_sec=30):
-        captured["command"] = command
-        return {"ok": True, "summary": "executed", "data": {"command": command}}
-
-    monkeypatch.setattr("jarvis_gpt.tools.HostBridgeClient.execute", fake_execute)
     settings = load_settings()
     ensure_runtime_dirs(settings)
     storage = JarvisStorage(settings.database_path)
@@ -485,219 +451,22 @@ def test_agent_calculator_understands_russian_multiply_sign(monkeypatch, tmp_pat
     runs = storage.list_tool_runs()
 
     _approval, arguments = _pending_native_request(storage)
-    assert captured == {}
     assert runs == []
     assert arguments["action"] == "app.open_and_type"
     assert arguments["payload"]["executable"] == "explorer.exe"
-    assert "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App" in arguments["payload"]["arguments"]
+    assert any(
+        "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App" in item
+        for item in arguments["payload"]["arguments"]
+    )
     assert arguments["payload"]["keys"] == "10{*}10="
     assert arguments["payload"]["window_title"] == "Calculator|Калькулятор"
     assert "Подтвердите approval" in response.answer
     storage.close()
 
 
-def test_agent_opens_console_with_top_processes(monkeypatch, tmp_path):
-    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
-    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
-    captured = {}
-
-    async def fake_execute(self, command, cwd=None, timeout_sec=30):
-        captured["command"] = command
-        return {"ok": True, "summary": "executed", "data": {"command": command}}
-
-    monkeypatch.setattr("jarvis_gpt.tools.HostBridgeClient.execute", fake_execute)
-    settings = load_settings()
-    ensure_runtime_dirs(settings)
-    storage = JarvisStorage(settings.database_path)
-    storage.initialize()
-    agent = AgentRuntime(
-        settings=settings,
-        storage=storage,
-        llm=LLMRouter(settings),
-        bus=EventBus(),
-    )
-
-    response = asyncio.run(agent.chat("открой мне консоль с топ 10 процессов"))
-    runs = storage.list_tool_runs()
-
-    _approval, arguments = _pending_native_request(storage)
-    payload = arguments["payload"]
-    assert captured == {}
-    assert runs == []
-    assert arguments["action"] == "process.start"
-    assert payload["executable"] == "powershell.exe"
-    assert "Get-Process" in payload["arguments"]
-    assert "Select-Object -First 10" in payload["arguments"]
-    assert "Sort-Object CPU -Descending" in payload["arguments"]
-    assert "Подтвердите approval" in response.answer
-    storage.close()
-
-
-def test_agent_opens_system_info_in_console(monkeypatch, tmp_path):
-    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
-    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
-    captured = {}
-
-    async def fake_execute(self, command, cwd=None, timeout_sec=30):
-        captured["command"] = command
-        return {"ok": True, "summary": "executed", "data": {"command": command}}
-
-    monkeypatch.setattr("jarvis_gpt.tools.HostBridgeClient.execute", fake_execute)
-    settings = load_settings()
-    ensure_runtime_dirs(settings)
-    storage = JarvisStorage(settings.database_path)
-    storage.initialize()
-    agent = AgentRuntime(
-        settings=settings,
-        storage=storage,
-        llm=LLMRouter(settings),
-        bus=EventBus(),
-    )
-
-    response = asyncio.run(agent.chat("открой мне в консоли информацию о системе"))
-    runs = storage.list_tool_runs()
-
-    _approval, arguments = _pending_native_request(storage)
-    payload = arguments["payload"]
-    assert captured == {}
-    assert runs == []
-    assert arguments["action"] == "process.start"
-    assert payload["executable"] == "powershell.exe"
-    assert "-NoExit" in payload["arguments"]
-    assert "Get-ComputerInfo" in payload["arguments"]
-    assert "Win32_Processor" in payload["arguments"]
-    assert "Win32_LogicalDisk" in payload["arguments"]
-    assert "Подтвердите approval" in response.answer
-    storage.close()
-
-
-def test_agent_understands_system_info_console_followup(monkeypatch, tmp_path):
-    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
-    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
-    captured = {}
-
-    async def fake_execute(self, command, cwd=None, timeout_sec=30):
-        captured["command"] = command
-        return {"ok": True, "summary": "executed", "data": {"command": command}}
-
-    monkeypatch.setattr("jarvis_gpt.tools.HostBridgeClient.execute", fake_execute)
-    settings = load_settings()
-    ensure_runtime_dirs(settings)
-    storage = JarvisStorage(settings.database_path)
-    storage.initialize()
-    conversation_id = storage.create_conversation("system info")
-    storage.add_message(
-        conversation_id=conversation_id,
-        role="user",
-        content="открой мне информацию о системе",
-    )
-    agent = AgentRuntime(
-        settings=settings,
-        storage=storage,
-        llm=LLMRouter(settings),
-        bus=EventBus(),
-    )
-
-    response = asyncio.run(agent.chat("так ты именно в консоли открой", conversation_id))
-    runs = storage.list_tool_runs()
-
-    _approval, arguments = _pending_native_request(storage)
-    payload = arguments["payload"]
-    assert captured == {}
-    assert runs == []
-    assert arguments["action"] == "process.start"
-    assert payload["executable"] == "powershell.exe"
-    assert "Get-ComputerInfo" in payload["arguments"]
-    assert "Win32_VideoController" in payload["arguments"]
-    assert "Подтвердите approval" in response.answer
-    storage.close()
-
-
-def test_agent_runs_largest_file_scan_in_console(monkeypatch, tmp_path):
-    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
-    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
-    captured = {}
-
-    async def fake_execute(self, command, cwd=None, timeout_sec=30):
-        captured["command"] = command
-        return {"ok": True, "summary": "executed", "data": {"command": command}}
-
-    monkeypatch.setattr("jarvis_gpt.tools.HostBridgeClient.execute", fake_execute)
-    settings = load_settings()
-    ensure_runtime_dirs(settings)
-    storage = JarvisStorage(settings.database_path)
-    storage.initialize()
-    agent = AgentRuntime(
-        settings=settings,
-        storage=storage,
-        llm=LLMRouter(settings),
-        bus=EventBus(),
-    )
-
-    response = asyncio.run(
-        agent.chat("открой консоль и найди самый крупный файл на диске C:")
-    )
-    runs = storage.list_tool_runs()
-
-    _approval, arguments = _pending_native_request(storage)
-    payload = arguments["payload"]
-    assert captured == {}
-    assert runs == []
-    assert arguments["action"] == "process.start"
-    assert payload["executable"] == "powershell.exe"
-    assert "-NoExit" in payload["arguments"]
-    assert "Get-ChildItem" in payload["arguments"]
-    assert "Sort-Object" not in payload["arguments"]
-    assert "Проверено файлов" in payload["arguments"]
-    assert "Подтвердите approval" in response.answer
-    storage.close()
-
-
-def test_agent_understands_largest_file_console_followup(monkeypatch, tmp_path):
-    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
-    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
-    captured = {}
-
-    async def fake_execute(self, command, cwd=None, timeout_sec=30):
-        captured["command"] = command
-        return {"ok": True, "summary": "executed", "data": {"command": command}}
-
-    monkeypatch.setattr("jarvis_gpt.tools.HostBridgeClient.execute", fake_execute)
-    settings = load_settings()
-    ensure_runtime_dirs(settings)
-    storage = JarvisStorage(settings.database_path)
-    storage.initialize()
-    conversation_id = storage.create_conversation("scan")
-    storage.add_message(
-        conversation_id=conversation_id,
-        role="user",
-        content="какой самый крупный файл у меня сейчас на диске C: ?",
-    )
-    agent = AgentRuntime(
-        settings=settings,
-        storage=storage,
-        llm=LLMRouter(settings),
-        bus=EventBus(),
-    )
-
-    response = asyncio.run(
-        agent.chat("сделай это сканирование в консоли, и вывод там же", conversation_id)
-    )
-    runs = storage.list_tool_runs()
-
-    _approval, arguments = _pending_native_request(storage)
-    payload = arguments["payload"]
-    assert captured == {}
-    assert runs == []
-    assert arguments["action"] == "process.start"
-    assert payload["executable"] == "powershell.exe"
-    assert "Get-ChildItem" in payload["arguments"]
-    assert "C:\\" in payload["arguments"]
-    assert "Подтвердите approval" in response.answer
-    storage.close()
-
-
-def test_agent_gates_followup_command_to_same_console(monkeypatch, tmp_path):
+def test_agent_ignores_raw_console_commands_without_approval_or_execution(
+    monkeypatch, tmp_path
+):
     agent, storage = _agent_without_llm(monkeypatch, tmp_path)
     conversation_id = storage.create_conversation("active console")
     storage.set_runtime_value(
@@ -711,18 +480,23 @@ def test_agent_gates_followup_command_to_same_console(monkeypatch, tmp_path):
         },
     )
 
-    response = asyncio.run(
-        agent.chat("а теперь в этой же консоли дай мне инфу о системе", conversation_id)
+    async def forbidden_action(self, *, action, payload=None, timeout_sec=30):
+        raise AssertionError(f"raw console text reached native action {action}")
+
+    monkeypatch.setattr("jarvis_gpt.host_bridge.HostBridgeClient.action", forbidden_action)
+
+    first = asyncio.run(agent.chat("run in console `ipconfig /all`"))
+    second = asyncio.run(
+        agent.chat(
+            "in the same console run `Write-Host RawShouldNotRun`",
+            conversation_id,
+        )
     )
 
-    _approval, arguments = _pending_native_request(storage)
-    assert storage.list_tool_runs() == []
-    assert arguments["action"] == "keyboard.send"
-    assert arguments["payload"]["process_id"] == 4242
-    assert arguments["payload"]["process_name"] == "cmd"
-    assert arguments["payload"]["text"] == "systeminfo"
-    assert arguments["payload"]["keys"] == "{ENTER}"
-    assert "Подтвердите approval" in response.answer
+    assert all(event.type != "approval" for event in [*first.events, *second.events])
+    assert storage.list_approvals(limit=10) == []
+    executed_tools = {run["tool"] for run in storage.list_tool_runs()}
+    assert executed_tools.isdisjoint({"execution.apply", "windows.native"})
     storage.close()
 
 
@@ -756,138 +530,9 @@ def test_agent_gates_explicit_active_window_input(monkeypatch, tmp_path):
     storage.close()
 
 
-def test_agent_gates_direct_host_command_without_execution(monkeypatch, tmp_path):
-    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
-    monkeypatch.setattr("jarvis_gpt.agent._native_action_from_message", lambda *args: None)
-    monkeypatch.setattr(
-        "jarvis_gpt.agent._host_command_from_message",
-        lambda message: "Start-Process calc.exe",
-    )
-
-    response = asyncio.run(agent.chat("открой калькулятор"))
-    approvals = storage.list_approvals(limit=10, status="pending")
-
-    assert len(approvals) == 1
-    approval = approvals[0]
-    assert approval["requested_action"] == "tool.run"
-    assert approval["risk"] == "danger"
-    assert approval["payload"]["tool"] == "host.bridge.execute"
-    assert approval["payload"]["arguments"]["command"] == "Start-Process calc.exe"
-    assert storage.list_tool_runs() == []
-    assert response.events[-1].type == "approval"
-    assert response.events[-1].payload["approval_id"] == approval["id"]
-    storage.close()
-
-
-def test_agent_runs_explicit_console_command_in_console(monkeypatch, tmp_path):
-    agent, storage, captured = _agent_with_native_capture(monkeypatch, tmp_path)
-
-    response = asyncio.run(agent.chat("выполни в консоли `ipconfig /all`"))
-    runs = storage.list_tool_runs()
-
-    _approval, arguments = _pending_native_request(storage)
-    payload = arguments["payload"]
-    assert captured == {}
-    assert runs == []
-    assert arguments["action"] == "process.start"
-    assert payload["executable"] == "powershell.exe"
-    assert "JARVIS CONSOLE TARGET" in payload["arguments"]
-    assert "ipconfig /all" in payload["arguments"]
-    assert "Подтвердите approval" in response.answer
-    storage.close()
-
-
-def test_agent_runs_explicit_powershell_verb_command(monkeypatch, tmp_path):
-    agent, storage, captured = _agent_with_native_capture(monkeypatch, tmp_path)
-
-    response = asyncio.run(agent.chat("выполни в консоли `Write-Host JarvisConsoleGuardOk`"))
-    runs = storage.list_tool_runs()
-
-    _approval, arguments = _pending_native_request(storage)
-    payload = arguments["payload"]
-    assert captured == {}
-    assert runs == []
-    assert arguments["action"] == "process.start"
-    assert payload["executable"] == "powershell.exe"
-    assert "JARVIS CONSOLE TARGET" in payload["arguments"]
-    assert "JARVIS CONSOLE TARGET GUARD" not in payload["arguments"]
-    assert "Write-Host JarvisConsoleGuardOk" in payload["arguments"]
-    assert "Подтвердите approval" in response.answer
-    storage.close()
-
-
-def test_agent_runs_network_console_recipe(monkeypatch, tmp_path):
-    agent, storage, captured = _agent_with_native_capture(monkeypatch, tmp_path)
-
-    response = asyncio.run(agent.chat("открой в консоли диагностику сети"))
-    runs = storage.list_tool_runs()
-
-    _approval, arguments = _pending_native_request(storage)
-    payload = arguments["payload"]
-    assert captured == {}
-    assert runs == []
-    assert arguments["action"] == "process.start"
-    assert payload["executable"] == "powershell.exe"
-    assert "NETWORK DIAGNOSTICS" in payload["arguments"]
-    assert "ipconfig /all" in payload["arguments"]
-    assert "Get-NetAdapter" in payload["arguments"]
-    assert "JARVIS CONSOLE TARGET GUARD" not in payload["arguments"]
-    assert "Подтвердите approval" in response.answer
-    storage.close()
-
-
-def test_agent_uses_console_guard_for_unknown_console_targets(monkeypatch, tmp_path):
-    agent, storage, captured = _agent_with_native_capture(monkeypatch, tmp_path)
-
-    response = asyncio.run(agent.chat("открой в консоли загадочную проверку состояния"))
-    runs = storage.list_tool_runs()
-
-    _approval, arguments = _pending_native_request(storage)
-    payload = arguments["payload"]
-    assert captured == {}
-    assert runs == []
-    assert arguments["action"] == "process.start"
-    assert payload["executable"] == "powershell.exe"
-    assert "JARVIS CONSOLE TARGET GUARD" in payload["arguments"]
-    assert "примером команды в чате" in payload["arguments"]
-    assert "Подтвердите approval" in response.answer
-    storage.close()
-
-
-def test_agent_understands_network_console_followup(monkeypatch, tmp_path):
-    agent, storage, captured = _agent_with_native_capture(monkeypatch, tmp_path)
-    conversation_id = storage.create_conversation("network info")
-    storage.add_message(
-        conversation_id=conversation_id,
-        role="user",
-        content="покажи сетевые настройки",
-    )
-
-    response = asyncio.run(agent.chat("теперь именно в консоли", conversation_id))
-    runs = storage.list_tool_runs()
-
-    _approval, arguments = _pending_native_request(storage)
-    payload = arguments["payload"]
-    assert captured == {}
-    assert runs == []
-    assert arguments["action"] == "process.start"
-    assert payload["executable"] == "powershell.exe"
-    assert "NETWORK DIAGNOSTICS" in payload["arguments"]
-    assert "Get-NetIPConfiguration" in payload["arguments"]
-    assert "Подтвердите approval" in response.answer
-    storage.close()
-
-
 def test_agent_opens_named_programs_through_native_layer(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
-    captured = {}
-
-    async def fake_execute(self, command, cwd=None, timeout_sec=30):
-        captured["command"] = command
-        return {"ok": True, "summary": "executed", "data": {"command": command}}
-
-    monkeypatch.setattr("jarvis_gpt.tools.HostBridgeClient.execute", fake_execute)
     settings = load_settings()
     ensure_runtime_dirs(settings)
     storage = JarvisStorage(settings.database_path)
@@ -903,7 +548,6 @@ def test_agent_opens_named_programs_through_native_layer(monkeypatch, tmp_path):
     runs = storage.list_tool_runs()
 
     _approval, arguments = _pending_native_request(storage)
-    assert captured == {}
     assert runs == []
     assert arguments["action"] == "process.start"
     assert arguments["payload"]["executable"] == "msedge.exe"
@@ -916,22 +560,31 @@ def test_agent_captures_screen_when_asked_to_look(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
     captured = {}
 
-    async def fake_execute(self, command, cwd=None, timeout_sec=30):
-        captured["command"] = command
+    async def fake_action(self, *, action, payload=None, timeout_sec=30):
+        captured.update({"action": action, "payload": payload, "timeout_sec": timeout_sec})
         return {
             "ok": True,
             "summary": "captured",
             "data": {
-                "stdout": (
-                    '{"ok":true,"summary":"Screen captured.","action":"screen.capture",'
-                    '"data":{"path":"C:/tmp/screen.png","width":1920,"height":1080,'
-                    '"activeWindow":{"ProcessName":"chrome","MainWindowTitle":"Jarvis"},'
-                    '"windows":[{"ProcessName":"chrome","MainWindowTitle":"Jarvis"}]}}'
-                )
+                "ok": True,
+                "summary": "Screen captured.",
+                "action": action,
+                "data": {
+                    "path": "C:/tmp/screen.png",
+                    "width": 1920,
+                    "height": 1080,
+                    "activeWindow": {
+                        "ProcessName": "chrome",
+                        "MainWindowTitle": "Jarvis",
+                    },
+                    "windows": [
+                        {"ProcessName": "chrome", "MainWindowTitle": "Jarvis"}
+                    ],
+                },
             },
         }
 
-    monkeypatch.setattr("jarvis_gpt.tools.HostBridgeClient.execute", fake_execute)
+    monkeypatch.setattr("jarvis_gpt.host_bridge.HostBridgeClient.action", fake_action)
     settings = load_settings()
     ensure_runtime_dirs(settings)
     storage = JarvisStorage(settings.database_path)
@@ -946,8 +599,9 @@ def test_agent_captures_screen_when_asked_to_look(monkeypatch, tmp_path):
     response = asyncio.run(agent.chat("посмотри моими глазами, что сейчас на экране"))
     runs = storage.list_tool_runs()
 
-    assert "screen.capture" in captured["command"]
-    assert str(settings.cache_dir / "screens").replace("\\", "\\\\") in captured["command"]
+    assert captured["action"] == "screen.capture"
+    assert Path(captured["payload"]["path"]).parent == settings.cache_dir / "screens"
+    assert captured["timeout_sec"] == 30
     assert runs[0]["tool"] == "system.inspect"
     assert storage.list_approvals(limit=10) == []
     assert "Визуальная проверка" in response.answer
@@ -959,13 +613,6 @@ def test_agent_captures_screen_when_asked_to_look(monkeypatch, tmp_path):
 def test_agent_types_into_general_windows_app(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
-    captured = {}
-
-    async def fake_execute(self, command, cwd=None, timeout_sec=30):
-        captured["command"] = command
-        return {"ok": True, "summary": "native input", "data": {"command": command}}
-
-    monkeypatch.setattr("jarvis_gpt.tools.HostBridgeClient.execute", fake_execute)
     settings = load_settings()
     ensure_runtime_dirs(settings)
     storage = JarvisStorage(settings.database_path)
@@ -982,13 +629,13 @@ def test_agent_types_into_general_windows_app(monkeypatch, tmp_path):
 
     _approval, arguments = _pending_native_request(storage)
     payload = arguments["payload"]
-    assert captured == {}
     assert runs == []
     assert arguments["action"] == "app.open_and_type"
     assert payload["executable"] == "notepad.exe"
     assert payload["text"] == "Jarvis online"
-    assert "scratch-notepad-" in payload["arguments"]
-    assert payload["arguments"].endswith('.txt"')
+    assert len(payload["arguments"]) == 1
+    assert "scratch-notepad-" in payload["arguments"][0]
+    assert payload["arguments"][0].endswith(".txt")
     assert not list(settings.data_dir.glob("scratch-notepad-*.txt"))
     assert "Подтвердите approval" in response.answer
     storage.close()
@@ -999,20 +646,20 @@ def test_agent_routes_wmi_requests_to_native_layer(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
     captured = {}
 
-    async def fake_execute(self, command, cwd=None, timeout_sec=30):
-        captured["command"] = command
+    async def fake_action(self, *, action, payload=None, timeout_sec=30):
+        captured.update({"action": action, "payload": payload, "timeout_sec": timeout_sec})
         return {
             "ok": True,
             "summary": "wmi ok",
             "data": {
-                "stdout": (
-                    '{"ok":true,"summary":"WMI/CIM query returned 1 item(s).",'
-                    '"data":{"items":[{"Name":"python.exe"}]}}'
-                )
+                "ok": True,
+                "summary": "WMI/CIM query returned 1 item(s).",
+                "action": action,
+                "data": {"items": [{"Name": "python.exe"}]},
             },
         }
 
-    monkeypatch.setattr("jarvis_gpt.tools.HostBridgeClient.execute", fake_execute)
+    monkeypatch.setattr("jarvis_gpt.host_bridge.HostBridgeClient.action", fake_action)
     settings = load_settings()
     ensure_runtime_dirs(settings)
     storage = JarvisStorage(settings.database_path)
@@ -1027,8 +674,9 @@ def test_agent_routes_wmi_requests_to_native_layer(monkeypatch, tmp_path):
     response = asyncio.run(agent.chat("покажи процессы через WMI"))
     runs = storage.list_tool_runs()
 
-    assert "wmi.query" in captured["command"]
-    assert "Win32_Process" in captured["command"]
+    assert captured["action"] == "wmi.query"
+    assert captured["payload"]["class_name"] == "Win32_Process"
+    assert captured["timeout_sec"] == 30
     assert runs[0]["tool"] == "system.inspect"
     assert storage.list_approvals(limit=10) == []
     assert "WMI/CIM query returned" in response.answer

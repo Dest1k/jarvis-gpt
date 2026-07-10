@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 
 from jarvis_gpt.agent import AgentRuntime
 from jarvis_gpt.approval_executor import ApprovalExecutor
@@ -14,6 +16,25 @@ from jarvis_gpt.storage import JarvisStorage
 def _result(content: str, ok: bool = True, finish_reason: str | None = None):
     raw = {"choices": [{"finish_reason": finish_reason}]} if finish_reason else None
     return type("Result", (), {"ok": ok, "content": content, "error": None, "raw": raw})()
+
+
+def _execution_write_call(path, *, action_id: str, content: bytes = b"approved") -> str:
+    return json.dumps(
+        {
+            "tool": "execution.apply",
+            "arguments": {
+                "payload": {
+                    "protocol": "jarvis.execution.v1",
+                    "action": {
+                        "kind": "fs.write",
+                        "action_id": action_id,
+                        "path": str(path),
+                        "content_base64": base64.b64encode(content).decode("ascii"),
+                    },
+                }
+            },
+        }
+    )
 
 
 def _agent(monkeypatch, tmp_path, llm):
@@ -186,6 +207,9 @@ def test_agentic_answer_auto_continues_after_length_finish(monkeypatch, tmp_path
 
 
 def test_agentic_loop_gates_dangerous_tool_with_approval(monkeypatch, tmp_path):
+    target = tmp_path / "agentic-approved.txt"
+    tool_call = _execution_write_call(target, action_id="agentic-approved-write")
+
     class DangerThenAnswerLLM:
         def __init__(self) -> None:
             self.calls = 0
@@ -193,9 +217,7 @@ def test_agentic_loop_gates_dangerous_tool_with_approval(monkeypatch, tmp_path):
         async def complete(self, messages, *, temperature=None, max_tokens=None, **kwargs):
             self.calls += 1
             if self.calls == 1:
-                return _result(
-                    '{"tool": "host.bridge.execute", "arguments": {"command": "Get-Date"}}'
-                )
+                return _result(tool_call)
             return _result("Нужно ваше подтверждение, чтобы выполнить команду на хосте.")
 
     llm = DangerThenAnswerLLM()
@@ -213,6 +235,10 @@ def test_agentic_loop_gates_dangerous_tool_with_approval(monkeypatch, tmp_path):
     pending = storage.list_approvals(limit=10, status="pending")
     assert len(pending) == 1
     assert pending[0]["requested_action"] == "tool.run"
+    assert pending[0]["risk"] == "danger"
+    assert pending[0]["payload"]["tool"] == "execution.apply"
+    assert pending[0]["payload"]["arguments"]["payload"]["protocol"] == "jarvis.execution.v1"
+    assert not target.exists()
     assert any(event.type == "approval" for event in response.events)
     storage.close()
 
@@ -344,6 +370,9 @@ def test_mission_step_executes_with_tools_when_llm_enabled(monkeypatch, tmp_path
 
 
 def test_mission_step_approval_carries_mission_id(monkeypatch, tmp_path):
+    target = tmp_path / "mission-gated.txt"
+    tool_call = _execution_write_call(target, action_id="mission-gated-write")
+
     class MissionDangerLLM:
         def __init__(self) -> None:
             self.calls = 0
@@ -351,9 +380,7 @@ def test_mission_step_approval_carries_mission_id(monkeypatch, tmp_path):
         async def complete(self, messages, *, temperature=None, max_tokens=None, **kwargs):
             self.calls += 1
             if self.calls == 1:
-                return _result(
-                    '{"tool": "host.bridge.execute", "arguments": {"command": "Get-Date"}}'
-                )
+                return _result(tool_call)
             return _result("Шаг требует подтверждения оператора для действия на хосте.")
 
     agent, storage = _agent(monkeypatch, tmp_path, MissionDangerLLM())
@@ -378,17 +405,15 @@ def test_mission_step_approval_carries_mission_id(monkeypatch, tmp_path):
 
         payload = _json.loads(payload)
     assert payload.get("mission_id") == mission["id"]
-    assert payload.get("tool") == "host.bridge.execute"
+    assert payload.get("tool") == "execution.apply"
+    assert payload["arguments"]["payload"]["protocol"] == "jarvis.execution.v1"
+    assert not target.exists()
     storage.close()
 
 
 def test_approval_execution_resumes_blocked_mission_step(monkeypatch, tmp_path):
-    async def fake_execute(self, *, command, cwd=None, timeout_sec=30):
-        return {
-            "ok": True,
-            "summary": f"fake bridge: {command}",
-            "data": {"stdout": "approved\n", "cwd": cwd, "timeout_sec": timeout_sec},
-        }
+    target = tmp_path / "mission-approved.txt"
+    tool_call = _execution_write_call(target, action_id="mission-approved-write")
 
     class MissionDangerThenResumeLLM:
         def __init__(self) -> None:
@@ -397,14 +422,11 @@ def test_approval_execution_resumes_blocked_mission_step(monkeypatch, tmp_path):
         async def complete(self, messages, *, temperature=None, max_tokens=None, **kwargs):
             self.calls += 1
             if self.calls == 1:
-                return _result(
-                    '{"tool": "host.bridge.execute", "arguments": {"command": "Get-Date"}}'
-                )
+                return _result(tool_call)
             if self.calls == 2:
                 return _result("Шаг требует допуска оператора.")
             return _result("Шаг завершён после допуска: команда на хосте выполнена.")
 
-    monkeypatch.setattr("jarvis_gpt.host_bridge.HostBridgeClient.execute", fake_execute)
     llm = MissionDangerThenResumeLLM()
     agent, storage = _agent(monkeypatch, tmp_path, llm)
     mission = agent.create_mission("Проверить дату на хосте")
@@ -430,8 +452,9 @@ def test_approval_execution_resumes_blocked_mission_step(monkeypatch, tmp_path):
     assert result.ok is True
     assert result.approval is not None
     assert result.approval["status"] == "executed"
-    assert result.data["tool_run"]["tool"] == "host.bridge.execute"
+    assert result.data["tool_run"]["tool"] == "execution.apply"
     assert result.data["mission_resume"]["ok"] is True
+    assert target.read_bytes() == b"approved"
     assert task["status"] == "done"
     assert "после допуска" in task["notes"]
     assert hits
