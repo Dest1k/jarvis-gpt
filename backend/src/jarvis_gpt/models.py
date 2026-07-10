@@ -363,7 +363,7 @@ class ApprovalCreateRequest(BaseModel):
 
 
 class ApprovalUpdateRequest(BaseModel):
-    status: Literal["approved", "rejected", "executed", "cancelled"]
+    status: Literal["approved", "rejected", "cancelled"]
     result: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -422,7 +422,7 @@ class MissionRunResponse(BaseModel):
     mission: Mission
     steps: list[MissionStepOutcome] = Field(default_factory=list)
     completed: bool = False
-    stopped_reason: Literal["completed", "blocked", "budget", "empty"] = "completed"
+    stopped_reason: Literal["completed", "blocked", "budget", "busy", "empty"] = "completed"
     executed_steps: int = 0
     final_report: str | None = None
 

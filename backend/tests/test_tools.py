@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
+import pytest
 from jarvis_gpt.browser_cdp import BrowserActionResult, BrowserPageSnapshot
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
 from jarvis_gpt.document_runtime import extract_document
@@ -489,7 +490,7 @@ def test_host_bridge_execute_requires_token(monkeypatch, tmp_path):
 def test_windows_native_is_gated_and_uses_winapi_wmi(monkeypatch, tmp_path):
     class FakeBridgeClient:
         def __init__(self, _settings):
-            pass
+            return None
 
         async def execute(self, *, command, cwd=None, timeout_sec=30):
             assert cwd is None
@@ -606,10 +607,10 @@ def test_windows_native_screen_capture_command_is_structured(tmp_path):
     assert "VisibleWindows $Limit" in command
 
 
-def test_browser_open_is_validated_without_operator_approval(monkeypatch, tmp_path):
+def test_browser_open_requires_approval_and_validates_after_override(monkeypatch, tmp_path):
     class FakeBridgeClient:
         def __init__(self, _settings):
-            pass
+            return None
 
         async def execute(self, *, command, cwd=None, timeout_sec=30):
             assert cwd is None
@@ -626,14 +627,27 @@ def test_browser_open_is_validated_without_operator_approval(monkeypatch, tmp_pa
     storage.initialize()
     tools = ToolRegistry(settings, storage, LLMRouter(settings))
 
-    opened = asyncio.run(tools.run("browser.open", {"url": "https://example.com/path?q=1"}))
+    blocked = asyncio.run(
+        tools.run("browser.open", {"url": "https://example.com/path?q=1"})
+    )
+    opened = asyncio.run(
+        tools.run(
+            "browser.open",
+            {"url": "https://example.com/path?q=1"},
+            allow_danger=True,
+        )
+    )
     invalid = asyncio.run(
         tools.run(
             "browser.open",
             {"url": "file:///C:/Windows/win.ini"},
+            allow_danger=True,
         )
     )
 
+    assert blocked.ok is False
+    assert "requires approval" in blocked.summary
+    assert tools.get("browser.open").danger_level == "review"
     assert invalid.ok is False
     assert "http and https" in invalid.summary
     assert opened.ok is True
@@ -644,7 +658,7 @@ def test_browser_open_is_validated_without_operator_approval(monkeypatch, tmp_pa
 def test_browser_policy_and_open_many(monkeypatch, tmp_path):
     class FakeBridgeClient:
         def __init__(self, _settings):
-            pass
+            return None
 
         async def execute(self, *, command, cwd=None, timeout_sec=30):
             assert cwd is None
@@ -703,11 +717,12 @@ def test_browser_chrome_status_uses_local_cdp(monkeypatch, tmp_path):
 
 
 def test_browser_read_is_gated_and_uses_chrome_session(monkeypatch, tmp_path):
-    async def fake_read_chrome_page(*, url, max_chars, wait_ms, debug_url):
+    async def fake_read_chrome_page(*, url, max_chars, wait_ms, debug_url, url_validator):
         assert url == "https://example.com/private"
         assert max_chars == 1024
         assert wait_ms == 2000
         assert debug_url == "http://127.0.0.1:9222"
+        assert url_validator(url) == url
         return BrowserPageSnapshot(
             title="Private page",
             url=url,
@@ -838,7 +853,7 @@ def test_browser_scroll_loads_lazy_page_after_review(monkeypatch, tmp_path):
 def test_browser_chrome_launch_uses_dedicated_profile(monkeypatch, tmp_path):
     class FakeBridgeClient:
         def __init__(self, _settings):
-            pass
+            return None
 
         async def execute(self, *, command, cwd=None, timeout_sec=30):
             assert cwd is None
@@ -2540,7 +2555,8 @@ def test_internet_search_api_status_masks_keys_and_reads_stats(monkeypatch, tmp_
 
     assert result.ok is True
     assert "brave_api" in result.data["readiness"]["configured"]
-    assert result.data["readiness"]["providers"]["brave_api"]["key"] == "set:17:1234"
+    assert "key" not in result.data["readiness"]["providers"]["brave_api"]
+    assert "brave-secret-1234" not in json.dumps(result.data)
     assert "brave-secret" not in json.dumps(result.data)
     assert result.data["stats"]["brave_api"]["ok"] == 2
     storage.close()
@@ -2997,19 +3013,31 @@ def test_public_network_backend_pins_to_validated_ip(monkeypatch):
 
 
 def test_web_render_uses_isolated_headless_browser(monkeypatch, tmp_path):
-    class FakeCompleted:
-        returncode = 0
-        stdout = "<html><body><main>Hello <b>rendered</b> world</main></body></html>"
-        stderr = ""
-
-    def fake_run(command, **kwargs):
-        joined = " ".join(command)
-        assert "--headless=new" in command
-        assert "--dump-dom" in command
-        assert "--user-data-dir=" in joined
-        assert "MAP example.com 93.184.216.34" in joined
-        assert kwargs["timeout"] == 25
-        return FakeCompleted()
+    async def fake_cdp_render(
+        browser,
+        url,
+        *,
+        addresses,
+        wait_ms,
+        timeout_sec,
+        max_chars,
+        scroll_passes,
+    ):
+        assert browser == Path("chrome.exe")
+        assert url == "https://example.com/"
+        assert addresses == [ipaddress.ip_address("93.184.216.34")]
+        assert wait_ms == 2500
+        assert timeout_sec == 25
+        assert max_chars == 8000
+        assert scroll_passes == 0
+        return {
+            "ok": True,
+            "summary": "Headless CDP rendered page.",
+            "html": "",
+            "text": "Hello rendered world",
+            "url": url,
+            "stderr": "",
+        }
 
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
@@ -3018,7 +3046,7 @@ def test_web_render_uses_isolated_headless_browser(monkeypatch, tmp_path):
         "jarvis_gpt.tools._public_resolved_addresses",
         lambda _hostname: [ipaddress.ip_address("93.184.216.34")],
     )
-    monkeypatch.setattr("jarvis_gpt.tools.subprocess.run", fake_run)
+    monkeypatch.setattr("jarvis_gpt.tools._run_headless_cdp_render", fake_cdp_render)
     settings = load_settings()
     ensure_runtime_dirs(settings)
     storage = JarvisStorage(settings.database_path)
@@ -3069,10 +3097,15 @@ def test_web_render_can_scroll_headless_page(monkeypatch, tmp_path):
 
 
 def test_web_render_marks_forbidden_dom_as_blocked(monkeypatch, tmp_path):
-    class FakeCompleted:
-        returncode = 0
-        stdout = "<html><body>HTTP 403 Error Forbidden Доступ к сайту запрещен</body></html>"
-        stderr = ""
+    async def fake_cdp_render(browser, url, **_kwargs):
+        return {
+            "ok": True,
+            "summary": "Headless CDP rendered page.",
+            "html": "",
+            "text": "HTTP 403 Error Forbidden Доступ к сайту запрещен",
+            "url": url,
+            "stderr": "",
+        }
 
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
@@ -3081,7 +3114,7 @@ def test_web_render_marks_forbidden_dom_as_blocked(monkeypatch, tmp_path):
         "jarvis_gpt.tools._public_resolved_addresses",
         lambda _hostname: [ipaddress.ip_address("93.184.216.34")],
     )
-    monkeypatch.setattr("jarvis_gpt.tools.subprocess.run", lambda *args, **kwargs: FakeCompleted())
+    monkeypatch.setattr("jarvis_gpt.tools._run_headless_cdp_render", fake_cdp_render)
     settings = load_settings()
     ensure_runtime_dirs(settings)
     storage = JarvisStorage(settings.database_path)
@@ -3201,7 +3234,7 @@ def test_web_search_falls_back_to_evidence_cache_on_provider_failure(monkeypatch
 
     class FakeClient:
         def __init__(self, *args, **kwargs):
-            pass
+            return None
 
         async def __aenter__(self):
             return self
@@ -3270,7 +3303,7 @@ def test_web_search_cache_rejects_irrelevant_shopping_results(monkeypatch, tmp_p
 
     class FakeClient:
         def __init__(self, *args, **kwargs):
-            pass
+            return None
 
         async def __aenter__(self):
             return self
@@ -3383,6 +3416,7 @@ def test_web_search_uses_region_freshness_pagination_and_yandex(monkeypatch, tmp
                 "region": "ru-ru",
                 "freshness": "week",
                 "pages": 2,
+                "mode": "DEEP_RESEARCH",
             },
         )
     )
@@ -3595,7 +3629,7 @@ def test_docker_logs_restricts_non_jarvis_containers(monkeypatch, tmp_path):
 def test_dispatcher_tools_are_safe_or_gated(monkeypatch, tmp_path):
     class FakeDispatcher:
         def __init__(self, _settings):
-            pass
+            return None
 
         def status(self):
             return {"docker_available": True, "port_open": True}
@@ -3631,4 +3665,345 @@ def test_dispatcher_tools_are_safe_or_gated(monkeypatch, tmp_path):
     assert "requires approval" in blocked.summary
     assert started.ok is True
     assert started.summary == "dispatcher up"
+    storage.close()
+
+
+def test_system_inspect_screen_capture_ignores_operator_supplied_path(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+    captured = {}
+
+    async def fake_execute(self, *, command, cwd=None, timeout_sec=30):
+        captured["command"] = command
+        return {
+            "ok": True,
+            "summary": "captured",
+            "data": {"stdout": '{"ok":true,"summary":"captured"}'},
+        }
+
+    monkeypatch.setattr("jarvis_gpt.host_bridge.HostBridgeClient.execute", fake_execute)
+    outside = "D:\\outside\\owned.png"
+
+    result = asyncio.run(
+        tools.run(
+            "system.inspect",
+            {"action": "screen.capture", "payload": {"path": outside, "ocr": False}},
+        )
+    )
+
+    assert result.ok is True
+    assert "outside" not in captured["command"]
+    assert str(settings.cache_dir / "screens").replace("\\", "\\\\") in captured["command"]
+    storage.close()
+
+
+def test_public_browser_navigation_blocks_private_metadata_and_lan_per_hop(monkeypatch):
+    from jarvis_gpt.tools import _browser_navigation_validator
+
+    addresses = {
+        "public.example": [ipaddress.ip_address("93.184.216.34")],
+        "localhost": [ipaddress.ip_address("127.0.0.1")],
+        "192.168.1.1": [ipaddress.ip_address("192.168.1.1")],
+        "169.254.169.254": [ipaddress.ip_address("169.254.169.254")],
+    }
+    monkeypatch.setattr(
+        "jarvis_gpt.tools._resolved_ip_addresses",
+        lambda host: addresses[host],
+    )
+    policy = {
+        "mode": "open",
+        "allow_localhost": True,
+        "allowed_hosts": ["localhost", "127.0.0.1"],
+        "blocked_schemes": [],
+        "require_approval_for_external": False,
+    }
+    public_validator = _browser_navigation_validator(
+        "https://public.example/start",
+        policy=policy,
+    )
+
+    assert public_validator("https://public.example/final") == (
+        "https://public.example/final"
+    )
+    with pytest.raises(ValueError, match="private host"):
+        public_validator("http://192.168.1.1/router")
+    with pytest.raises(ValueError, match="forbidden network range"):
+        public_validator("http://169.254.169.254/latest/meta-data")
+
+    local_validator = _browser_navigation_validator(
+        "http://localhost:3000/",
+        policy=policy,
+    )
+    assert local_validator("http://localhost:3000/health") == (
+        "http://localhost:3000/health"
+    )
+    with pytest.raises(ValueError, match="not explicitly allowed"):
+        local_validator("http://192.168.1.1/router")
+
+
+def test_negation_aware_verifier_does_not_support_a_debunked_claim():
+    from jarvis_gpt.tools import _verify_claim_against_sources
+
+    verification = _verify_claim_against_sources(
+        "Earth is flat",
+        [
+            {
+                "url": "https://science.example/shape",
+                "title": "Earth shape",
+                "text": "Earth is not flat; measurements show a curved surface.",
+            },
+            {
+                "url": "https://space.example/evidence",
+                "title": "Flat Earth claim is false",
+                "text": "The statement that Earth is flat is false and contradicted by evidence.",
+            },
+        ],
+    )
+
+    assert verification["verdict"] in {"contradicted", "mixed"}
+    assert verification["verdict"] != "supported"
+    assert verification["contradicting_source_count"] >= 1
+
+
+def test_search_evidence_cache_rejects_one_generic_overlapping_term(monkeypatch, tmp_path):
+    from jarvis_gpt.tools import _web_search_cached_results_from_evidence
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    _store_web_evidence(
+        storage,
+        source="web.search",
+        url="https://example.com/search",
+        title="Example documentation",
+        text=(
+            "Example official documentation\n"
+            "https://example.com/docs\n"
+            "Official documentation and guides for Example Domain."
+        ),
+        content_type="text/plain",
+        safety={},
+        confidence=0.9,
+    )
+
+    cached = _web_search_cached_results_from_evidence(
+        storage,
+        query="OpenAI official documentation",
+        limit=5,
+        vertical="web",
+    )
+
+    assert cached == []
+    storage.close()
+
+
+def test_web_search_streaming_response_honors_shared_network_byte_budget(
+    monkeypatch,
+    tmp_path,
+):
+    class FakeResponse:
+        status_code = 200
+        headers = {"content-type": "text/html; charset=utf-8"}
+
+        def raise_for_status(self):
+            return None
+
+        async def aiter_bytes(self):
+            yield b"x" * 600_000
+            yield b"y" * 600_000
+
+    class FakeStream:
+        async def __aenter__(self):
+            return FakeResponse()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            return None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def stream(self, _method, _url, **_kwargs):
+            return FakeStream()
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    for key in (
+        "JARVIS_BRAVE_SEARCH_API_KEY",
+        "JARVIS_TAVILY_API_KEY",
+        "JARVIS_SERPER_API_KEY",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    result = asyncio.run(tools.run("web.search", {"query": "oversized provider"}))
+
+    assert result.ok is False
+    budget = result.data["orchestration"]["budget"]
+    assert budget["consumed"]["network_bytes"] <= budget["limits"]["network_bytes"]
+    assert any("network_bytes" in warning for warning in budget["warnings"])
+    storage.close()
+
+
+def test_web_search_never_returns_provider_credentials_in_errors(monkeypatch, tmp_path):
+    secret = "TOPSECRET-provider-token"
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            return None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, url, *, headers):
+            request = httpx.Request("GET", url, headers=headers)
+            raise httpx.RequestError(f"upstream rejected {secret}", request=request)
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setenv("JARVIS_BRAVE_SEARCH_API_KEY", secret)
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    result = asyncio.run(
+        tools.run(
+            "web.search",
+            {"query": "provider failure", "provider": "duckduckgo"},
+        )
+    )
+
+    serialized = json.dumps({"summary": result.summary, "data": result.data})
+    assert secret not in serialized
+    assert "[REDACTED]" in serialized
+    storage.close()
+
+
+def test_deep_research_fetches_sources_in_bounded_parallel(monkeypatch, tmp_path):
+    active = 0
+    maximum_active = 0
+
+    async def fake_search(_ctx, _args):
+        return ToolRunResponse(
+            tool="web.search",
+            ok=True,
+            summary="search ok",
+            data={
+                "results": [
+                    {
+                        "rank": index + 1,
+                        "title": f"Source {index}",
+                        "url": f"https://source{index}.example/fact",
+                        "snippet": "Widget launch date evidence",
+                    }
+                    for index in range(4)
+                ]
+            },
+        )
+
+    async def fake_fetch(_ctx, args):
+        nonlocal active, maximum_active
+        active += 1
+        maximum_active = max(maximum_active, active)
+        await asyncio.sleep(0.02)
+        active -= 1
+        index = args["url"].split("source", 1)[1].split(".", 1)[0]
+        return ToolRunResponse(
+            tool="web.fetch",
+            ok=True,
+            summary="fetch ok",
+            data={
+                "url": args["url"],
+                "content_type": "text/html",
+                "text": "Widget launch date evidence from an independent source.",
+                "evidence_id": f"ev_{index}",
+            },
+        )
+
+    async def fake_extract(_ctx, _args):
+        return ToolRunResponse(
+            tool="web.extract",
+            ok=True,
+            summary="extract ok",
+            data={"extraction": {"kind": "article"}},
+        )
+
+    async def fake_verify(_ctx, _args):
+        return ToolRunResponse(
+            tool="web.verify",
+            ok=True,
+            summary="supported",
+            data={"verification": {"verdict": "supported", "confidence": 0.8}},
+        )
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr("jarvis_gpt.tools._web_search", fake_search)
+    monkeypatch.setattr("jarvis_gpt.tools._web_fetch", fake_fetch)
+    monkeypatch.setattr("jarvis_gpt.tools._web_extract", fake_extract)
+    monkeypatch.setattr("jarvis_gpt.tools._web_verify", fake_verify)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    result = asyncio.run(
+        tools.run(
+            "web.research",
+            {
+                "query": "Widget launch date",
+                "mode": "DEEP_RESEARCH",
+                "max_sources": 4,
+                "render_fallback": False,
+            },
+        )
+    )
+
+    assert result.ok is True
+    assert result.data["mode"] == "DEEP_RESEARCH"
+    assert len(result.data["sources"]) == 4
+    assert 1 < maximum_active <= 4
+    storage.close()
+
+
+def test_public_observability_helper_does_not_record_itself(monkeypatch, tmp_path):
+    from jarvis_gpt.tools import internet_observability_snapshot
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    before = len(storage.list_tool_runs(limit=100))
+
+    first = internet_observability_snapshot(storage, limit=20)
+    second = internet_observability_snapshot(storage, limit=20)
+
+    assert first["summary"] == second["summary"]
+    assert len(storage.list_tool_runs(limit=100)) == before
     storage.close()

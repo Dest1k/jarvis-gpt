@@ -1,9 +1,19 @@
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
+import pytest
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
-from jarvis_gpt.storage import JarvisStorage
+from jarvis_gpt.storage import JarvisStorage, _recoverable_fts_error
+
+
+class _FailingFtsConnection:
+    def __init__(self, message: str) -> None:
+        self.message = message
+
+    def execute(self, _statement: str):
+        raise sqlite3.OperationalError(self.message)
 
 
 def test_settings_use_external_home(monkeypatch, tmp_path):
@@ -17,6 +27,15 @@ def test_settings_use_external_home(monkeypatch, tmp_path):
     assert settings.database_path.parent.exists()
     assert settings.model_root == tmp_path / "models"
     assert settings.model_dir.name == "gemma4-31b-it-nvfp4"
+
+
+def test_storage_only_degrades_for_expected_fts_errors(tmp_path):
+    storage = JarvisStorage(tmp_path / "state" / "jarvis.sqlite3")
+
+    assert _recoverable_fts_error(sqlite3.OperationalError("no such module: fts5"))
+    assert storage._ensure_memory_fts(_FailingFtsConnection("no such module: fts5")) is False
+    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+        storage._ensure_memory_fts(_FailingFtsConnection("database is locked"))
 
 
 def test_storage_persists_mission(tmp_path):

@@ -116,7 +116,10 @@ class TelemetryCollector:
             "swap_space_gb": profile.swap_space_gb,
             "recommended_dispatcher": {
                 "port": 8001,
-                "image": os.environ.get("JARVIS_VLLM_IMAGE", "vllm/vllm-openai:nightly"),
+                "image": os.environ.get(
+                    "JARVIS_VLLM_IMAGE",
+                    "vllm/vllm-openai:v0.23.0",
+                ),
                 "vllm_use_v2_model_runner": os.environ.get("VLLM_USE_V2_MODEL_RUNNER", "0"),
                 "vllm_weight_offloading_disable_uva": os.environ.get(
                     "VLLM_WEIGHT_OFFLOADING_DISABLE_UVA",

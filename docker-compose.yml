@@ -1,7 +1,7 @@
 services:
   dispatcher:
     profiles: ["llm"]
-    image: ${JARVIS_VLLM_IMAGE:-vllm/vllm-openai:nightly}
+    image: ${JARVIS_VLLM_IMAGE:-vllm/vllm-openai:v0.23.0}
     container_name: jarvis-gpt-dispatcher
     restart: unless-stopped
     ipc: host
@@ -64,25 +64,82 @@ services:
   backend:
     build:
       context: ./backend
+    restart: unless-stopped
+    init: true
+    shm_size: 512m
+    stop_grace_period: 30s
+    read_only: true
+    pids_limit: 512
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+      - SYS_CHROOT
     environment:
       JARVIS_HOME: /runtime
+      JARVIS_MODEL_ROOT: /runtime/data/models
       JARVIS_PROFILE: ${JARVIS_PROFILE:-gemma4-turbo}
       JARVIS_LLM_BASE_URL: ${JARVIS_LLM_BASE_URL:-http://host.docker.internal:8001/v1}
       JARVIS_LLM_MODEL: ${JARVIS_LLM_MODEL:-dispatcher}
       JARVIS_LLM_ENABLED: ${JARVIS_LLM_ENABLED:-1}
+      JARVIS_LLM_TIMEOUT_SEC: ${JARVIS_LLM_TIMEOUT_SEC:-240}
+      JARVIS_LLM_MAX_TOKENS: ${JARVIS_LLM_MAX_TOKENS:-2048}
+      JARVIS_VERIFY_ANSWERS: ${JARVIS_VERIFY_ANSWERS:-1}
+      JARVIS_EMBEDDINGS_ENABLED: ${JARVIS_EMBEDDINGS_ENABLED:-0}
+      JARVIS_EMBEDDINGS_BASE_URL: ${JARVIS_EMBEDDINGS_BASE_URL:-http://host.docker.internal:8001/v1}
+      JARVIS_EMBEDDINGS_MODEL: ${JARVIS_EMBEDDINGS_MODEL:-}
+      JARVIS_API_HOST: ${JARVIS_API_HOST:-0.0.0.0}
+      JARVIS_API_PORT: ${JARVIS_API_PORT:-8000}
+      JARVIS_API_TOKEN: ${JARVIS_API_TOKEN:-}
+      JARVIS_API_REQUIRE_TOKEN_ON_LOOPBACK: ${JARVIS_API_REQUIRE_TOKEN_ON_LOOPBACK:-0}
+      JARVIS_CORS_ORIGINS: ${JARVIS_CORS_ORIGINS:-}
+      JARVIS_BRAVE_SEARCH_API_KEY: ${JARVIS_BRAVE_SEARCH_API_KEY:-}
+      JARVIS_TAVILY_API_KEY: ${JARVIS_TAVILY_API_KEY:-}
+      JARVIS_SERPER_API_KEY: ${JARVIS_SERPER_API_KEY:-}
+      JARVIS_DEFAULT_CITY: ${JARVIS_DEFAULT_CITY:-}
+      JARVIS_AUTONOMY_ENABLED: ${JARVIS_AUTONOMY_ENABLED:-1}
+      JARVIS_TELEMETRY_INTERVAL_SEC: ${JARVIS_TELEMETRY_INTERVAL_SEC:-120}
+      JARVIS_HEALTH_INTERVAL_SEC: ${JARVIS_HEALTH_INTERVAL_SEC:-300}
+      JARVIS_LEARNING_INTERVAL_SEC: ${JARVIS_LEARNING_INTERVAL_SEC:-600}
+      JARVIS_COGNITION_ENABLED: ${JARVIS_COGNITION_ENABLED:-1}
+      JARVIS_COGNITION_INTERVAL_SEC: ${JARVIS_COGNITION_INTERVAL_SEC:-300}
+      JARVIS_COGNITION_MAX_TOKENS: ${JARVIS_COGNITION_MAX_TOKENS:-512}
+      JARVIS_AUTONOMY_MISSION_INTERVAL_SEC: ${JARVIS_AUTONOMY_MISSION_INTERVAL_SEC:-120}
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=./backend/chromium-seccomp.json
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=512m
+      - /home/jarvis:rw,nosuid,nodev,size=64m
     volumes:
       - type: bind
         source: ${JARVIS_HOST_HOME:-D:/jarvis}
         target: /runtime
     ports:
-      - "8000:8000"
+      - "${JARVIS_API_BIND_ADDRESS:-127.0.0.1}:${JARVIS_API_PORT:-8000}:${JARVIS_API_PORT:-8000}"
 
   frontend:
     build:
       context: ./frontend
+    restart: unless-stopped
+    init: true
+    read_only: true
+    pids_limit: 256
+    cap_drop:
+      - ALL
     environment:
-      NEXT_PUBLIC_JARVIS_API_URL: ${NEXT_PUBLIC_JARVIS_API_URL:-http://localhost:8000}
+      JARVIS_BACKEND_URL: http://backend:8000
+      JARVIS_API_TOKEN: ${JARVIS_API_TOKEN:-}
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=64m
     ports:
-      - "3000:3000"
+      - "${JARVIS_FRONTEND_BIND_ADDRESS:-127.0.0.1}:3000:3000"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy

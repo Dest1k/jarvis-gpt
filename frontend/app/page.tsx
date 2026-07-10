@@ -42,9 +42,7 @@ import {
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, KeyboardEvent, PointerEvent as ReactPointerEvent, ReactNode } from "react";
 
-const DEFAULT_API_URL = "http://localhost:8000";
-const CONFIGURED_API_URL = process.env.NEXT_PUBLIC_JARVIS_API_URL ?? "";
-const CONFIGURED_API_TOKEN = process.env.NEXT_PUBLIC_JARVIS_API_TOKEN ?? "";
+const API_PROXY_URL = "/jarvis-api";
 const CHAT_WINDOWS_KEY = "jarvis.chatWindows.v1";
 const CHAT_SETTINGS_KEY = "jarvis.chatSettings.v1";
 const LEGACY_STORAGE_SUFFIX = ["g", "pt"].join("");
@@ -419,7 +417,7 @@ type ModelDownloadJob = {
   id: string;
   repo_id: string;
   revision: string;
-  status: "queued" | "running" | "done" | "error";
+  status: "queued" | "running" | "cancelling" | "cancelled" | "done" | "error";
   summary: string;
   target: string;
   total_files: number;
@@ -819,13 +817,15 @@ type SpeechRecognitionLike = {
 type SpeechRecognitionConstructorLike = new () => SpeechRecognitionLike;
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
+  const headers = new Headers(init?.headers);
+  if (init?.body != null && !headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json");
+  }
+  headers.set("X-Jarvis-Frontend", "command-center");
   const response = await fetch(`${apiUrl()}${path}`, {
     ...init,
-    headers: {
-      "Content-Type": "application/json",
-      ...apiAuthHeaders(),
-      ...(init?.headers ?? {})
-    }
+    headers,
+    credentials: "same-origin"
   });
   if (!response.ok) {
     throw new Error(`${response.status} ${response.statusText}`);
@@ -840,7 +840,8 @@ async function streamApi(
 ) {
   const response = await fetch(`${apiUrl()}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", ...apiAuthHeaders() },
+    headers: { "Content-Type": "application/json", "X-Jarvis-Frontend": "command-center" },
+    credentials: "same-origin",
     body: JSON.stringify(body)
   });
   if (!response.ok) {
@@ -865,64 +866,15 @@ async function streamApi(
 }
 
 function apiUrl() {
-  const configuredValue = CONFIGURED_API_URL.trim();
-  if (typeof window === "undefined") {
-    return (configuredValue || DEFAULT_API_URL).replace(/\/$/, "");
-  }
-
-  const browserUrl = `${window.location.protocol}//${window.location.hostname}:8000`;
-  if (!configuredValue) {
-    return browserUrl;
-  }
-
-  try {
-    const configured = new URL(configuredValue);
-    const configuredHost = configured.hostname;
-    const pageHost = window.location.hostname;
-
-    if (isLoopbackHost(configuredHost) && !isLoopbackHost(pageHost)) {
-      return browserUrl;
-    }
-    if (isLoopbackHost(pageHost) && isLanHost(configuredHost)) {
-      return browserUrl;
-    }
-
-    return configured.toString().replace(/\/$/, "");
-  } catch {
-    return browserUrl;
-  }
-}
-
-function isLoopbackHost(hostname: string) {
-  const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  return host === "localhost" || host === "::1" || host === "127.0.0.1" || host.startsWith("127.");
-}
-
-function isLanHost(hostname: string) {
-  const host = hostname.toLowerCase();
-  if (host === "localhost" || host.endsWith(".localhost")) return true;
-  const parts = host.split(".").map((part) => Number.parseInt(part, 10));
-  if (parts.length !== 4 || parts.some((part) => Number.isNaN(part) || part < 0 || part > 255)) {
-    return false;
-  }
-  const [first, second] = parts;
-  return first === 10 || (first === 172 && second >= 16 && second <= 31) || (first === 192 && second === 168);
+  return API_PROXY_URL;
 }
 
 function wsUrl() {
-  return apiUrl().replace(/^http/, "ws");
+  return "";
 }
 
-function apiAuthHeaders(): Record<string, string> {
-  const token = CONFIGURED_API_TOKEN.trim();
-  return token ? { "X-Jarvis-Api-Token": token } : {};
-}
-
-function withWsAuth(url: string) {
-  const token = CONFIGURED_API_TOKEN.trim();
-  if (!token) return url;
-  const separator = url.includes("?") ? "&" : "?";
-  return `${url}${separator}token=${encodeURIComponent(token)}`;
+function websocketAuthProtocols() {
+  return undefined;
 }
 
 function liveEventLabel(type: string): string {
@@ -1094,6 +1046,24 @@ function attachmentHref(attachment: ChatAttachment) {
     return attachment.url;
   }
   return `${apiUrl()}/api/files/${encodeURIComponent(attachment.id)}/download`;
+}
+
+async function downloadAttachment(attachment: ChatAttachment) {
+  const response = await fetch(attachmentHref(attachment), {
+    headers: { "X-Jarvis-Frontend": "command-center" },
+    credentials: "same-origin"
+  });
+  if (!response.ok) {
+    throw new Error(`${attachment.name}: ${response.status} ${response.statusText}`);
+  }
+  const blobUrl = window.URL.createObjectURL(await response.blob());
+  const anchor = document.createElement("a");
+  anchor.href = blobUrl;
+  anchor.download = attachment.name;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.URL.revokeObjectURL(blobUrl);
 }
 
 function drainStreamBuffer(
@@ -1854,119 +1824,61 @@ export default function CommandCenter() {
   const refresh = useCallback(async () => {
     try {
       setError(null);
-      const [
-        statusData,
-        conversationData,
-        missionData,
-        toolData,
-        memoryData,
-        memoryVaultData,
-        fileData,
-        auditData,
-        modelData,
-        dispatcherData,
-        telemetryData,
-        hostBridgeData,
-        autonomyData,
-        preferencesData,
-        personaData,
-        autonomyPolicyData,
-        briefingData,
-        browserPolicyData,
-        dockerPolicyData,
-        dockerContainersData,
-        runtimeSecurityData,
-        qualityReportData,
-        autonomyJobData,
-        autonomyJobRunData,
-        routineData,
-        operatorQueueData,
-        approvalData,
-        handoffStatusData,
-        internetObservabilityData
-      ] = await Promise.all([
-        api<RuntimeStatus>("/api/status"),
-        api<ConversationItem[]>("/api/conversations?limit=8"),
-        api<Mission[]>("/api/missions"),
-        api<ToolInfo[]>("/api/tools"),
-        api<MemoryItem[]>("/api/memory?limit=8"),
-        api<MemoryVault>("/api/memory/vault"),
-        api<FileItem[]>("/api/files?limit=8"),
-        api<AuditEntry[]>("/api/audit?limit=8"),
-        api<ModelCatalog>("/api/models"),
-        api<DispatcherStatus>("/api/dispatcher"),
-        api<TelemetrySnapshot>("/api/telemetry"),
-        api<HostBridgeStatus>("/api/host-bridge"),
-        api<AutonomyStatus>("/api/autonomy"),
-        api<RuntimePreferences>("/api/preferences"),
-        api<OperatorPersona>("/api/persona"),
-        api<AutonomyPolicy>("/api/autonomy/policy"),
-        api<DailyBriefing>("/api/briefing"),
-        api<BrowserPolicy>("/api/browser/policy"),
-        api<DockerPolicy>("/api/docker/policy"),
-        api<DockerContainers>("/api/docker/containers"),
-        api<RuntimeSecurity>("/api/runtime/security"),
-        api<QualityReport>("/api/operator/quality"),
-        api<AutonomyJob[]>("/api/autonomy/jobs"),
-        api<AutonomyJobRun[]>("/api/autonomy/job-runs?limit=8"),
-        api<Routine[]>("/api/routines"),
-        api<OperatorQueue>("/api/operator/queue"),
-        api<ApprovalItem[]>("/api/approvals?limit=8"),
-        api<ToolRunResult>("/api/tools/browser.handoff.status/run", {
-          method: "POST",
-          body: JSON.stringify({ arguments: {} })
+      const results = await Promise.allSettled([
+        api<RuntimeStatus>("/api/status").then((data) => {
+          setStatus(data);
+          if (data.health.length) setDiagnostics(data.health);
         }),
-        api<ToolRunResult>("/api/tools/internet.observability/run", {
-          method: "POST",
-          body: JSON.stringify({ arguments: { limit: 120 } })
-        })
+        api<ConversationItem[]>("/api/conversations?limit=8").then(setConversations),
+        api<Mission[]>("/api/missions").then(setMissions),
+        api<ToolInfo[]>("/api/tools").then(setTools),
+        api<MemoryItem[]>("/api/memory?limit=8").then(setMemories),
+        api<MemoryVault>("/api/memory/vault").then(setMemoryVault),
+        api<FileItem[]>("/api/files?limit=8").then(setFiles),
+        api<AuditEntry[]>("/api/audit?limit=8").then(setAudit),
+        api<ModelCatalog>("/api/models").then((data) => {
+          setModelCatalog(data);
+          setModelDownloads(data.downloads ?? []);
+        }),
+        api<DispatcherStatus>("/api/dispatcher").then(setDispatcher),
+        api<TelemetrySnapshot>("/api/telemetry").then(setTelemetry),
+        api<HostBridgeStatus>("/api/host-bridge").then(setHostBridge),
+        api<AutonomyStatus>("/api/autonomy").then(setAutonomy),
+        api<RuntimePreferences>("/api/preferences").then((data) => {
+          setPreferences(data);
+          setPreferenceDraft({
+            operator_name: data.operator_name,
+            communication_style: data.communication_style,
+            quiet_hours: data.quiet_hours
+          });
+        }),
+        api<OperatorPersona>("/api/persona").then((data) => {
+          setPersona(data);
+          setPersonaDraft(personaDraftFrom(data));
+        }),
+        api<AutonomyPolicy>("/api/autonomy/policy").then(setAutonomyPolicy),
+        api<DailyBriefing>("/api/briefing").then(setBriefing),
+        api<BrowserPolicy>("/api/browser/policy").then(setBrowserPolicy),
+        api<DockerPolicy>("/api/docker/policy").then(setDockerPolicy),
+        api<DockerContainers>("/api/docker/containers").then(setDockerContainers),
+        api<RuntimeSecurity>("/api/runtime/security").then(setRuntimeSecurity),
+        api<QualityReport>("/api/operator/quality").then(setQualityReport),
+        api<AutonomyJob[]>("/api/autonomy/jobs").then(setAutonomyJobs),
+        api<AutonomyJobRun[]>("/api/autonomy/job-runs?limit=8").then(setAutonomyJobRuns),
+        api<Routine[]>("/api/routines").then(setRoutines),
+        api<OperatorQueue>("/api/operator/queue").then(setOperatorQueue),
+        api<ApprovalItem[]>("/api/approvals?limit=8").then(setApprovals),
+        api<BrowserHandoff | null>("/api/browser/handoff").then(setBrowserHandoff),
+        api<InternetObservability>("/api/internet/observability?limit=120").then(
+          setInternetObservability
+        )
       ]);
-      setStatus(statusData);
-      setConversations(conversationData);
-      setMissions(missionData);
-      setTools(toolData);
-      setMemories(memoryData);
-      setMemoryVault(memoryVaultData);
-      setFiles(fileData);
-      setAudit(auditData);
-      setModelCatalog(modelData);
-      setModelDownloads(modelData.downloads ?? []);
-      setDispatcher(dispatcherData);
-      setTelemetry(telemetryData);
-      setHostBridge(hostBridgeData);
-      setAutonomy(autonomyData);
-      setPreferences(preferencesData);
-      setPreferenceDraft({
-        operator_name: preferencesData.operator_name,
-        communication_style: preferencesData.communication_style,
-        quiet_hours: preferencesData.quiet_hours
-      });
-      setPersona(personaData);
-      setPersonaDraft(personaDraftFrom(personaData));
-      setAutonomyPolicy(autonomyPolicyData);
-      setBriefing(briefingData);
-      setBrowserPolicy(browserPolicyData);
-      setDockerPolicy(dockerPolicyData);
-      setDockerContainers(dockerContainersData);
-      setRuntimeSecurity(runtimeSecurityData);
-      setQualityReport(qualityReportData);
-      setAutonomyJobs(autonomyJobData);
-      setAutonomyJobRuns(autonomyJobRunData);
-      setRoutines(routineData);
-      setOperatorQueue(operatorQueueData);
-      setApprovals(approvalData);
-      setBrowserHandoff(
-        handoffStatusData.ok
-          ? ((handoffStatusData.data.handoff as BrowserHandoff | null | undefined) ?? null)
-          : null
-      );
-      setInternetObservability(
-        internetObservabilityData.ok
-          ? (internetObservabilityData.data as unknown as InternetObservability)
-          : null
-      );
-      if (statusData.health.length) {
-        setDiagnostics(statusData.health);
+      const failures = results.filter((result) => result.status === "rejected");
+      if (failures.length === results.length) {
+        throw failures[0].reason;
+      }
+      if (failures.length) {
+        setError(`Частичная деградация: недоступно ${failures.length} из ${results.length} снимков.`);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Backend недоступен");
@@ -1977,17 +1889,16 @@ export default function CommandCenter() {
     if (vitalsRequestInFlightRef.current) return;
     vitalsRequestInFlightRef.current = true;
     try {
-      const [statusData, dispatcherData, downloadData] = await Promise.all([
-        api<RuntimeStatus>("/api/status"),
-        api<DispatcherStatus>("/api/dispatcher"),
-        api<ModelDownloadJob[]>("/api/model-hub/downloads")
+      await Promise.allSettled([
+        api<RuntimeStatus>("/api/status").then((data) => {
+          setStatus(data);
+          if (data.health.length) setDiagnostics(data.health);
+        }),
+        api<DispatcherStatus>("/api/dispatcher").then(setDispatcher),
+        api<ModelDownloadJob[]>("/api/model-hub/downloads").then(setModelDownloads),
+        api<Mission[]>("/api/missions").then(setMissions),
+        api<ApprovalItem[]>("/api/approvals?limit=8").then(setApprovals)
       ]);
-      setStatus(statusData);
-      setDispatcher(dispatcherData);
-      setModelDownloads(downloadData);
-      if (statusData.health.length) {
-        setDiagnostics(statusData.health);
-      }
     } catch {
       // The full refresh path owns the visible error state; vitals polling stays quiet.
     } finally {
@@ -2030,6 +1941,10 @@ export default function CommandCenter() {
 
   useEffect(() => {
     if (typeof window === "undefined") return;
+    if (!wsUrl()) {
+      setLiveConnected(false);
+      return;
+    }
     let socket: WebSocket | null = null;
     let closed = false;
     let reconnectTimer: number | undefined;
@@ -2046,7 +1961,7 @@ export default function CommandCenter() {
 
     const connect = () => {
       try {
-        socket = new WebSocket(withWsAuth(`${wsUrl()}/ws/events`));
+        socket = new WebSocket(`${wsUrl()}/ws/events`, websocketAuthProtocols());
       } catch {
         return;
       }
@@ -2412,7 +2327,8 @@ export default function CommandCenter() {
       formData.append("file", file);
       const response = await fetch(`${apiUrl()}/api/files/upload`, {
         method: "POST",
-        headers: apiAuthHeaders(),
+        headers: { "X-Jarvis-Frontend": "command-center" },
+        credentials: "same-origin",
         body: formData
       });
       if (!response.ok) {
@@ -3232,6 +3148,23 @@ export default function CommandCenter() {
     }
   }
 
+  async function cancelModelDownload(jobId: string) {
+    setBusy(true);
+    try {
+      const updated = await api<ModelDownloadJob>(`/api/model-hub/downloads/${jobId}/cancel`, {
+        method: "POST",
+        body: "{}"
+      });
+      setModelDownloads((current) =>
+        current.map((job) => (job.id === updated.id ? updated : job))
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Не удалось отменить загрузку модели");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function activateAndLoadModel(modelId: string) {
     if (dispatcherBusy) return;
     setActiveOperation({
@@ -3573,7 +3506,8 @@ export default function CommandCenter() {
     try {
       const response = await fetch(`${apiUrl()}/api/files/upload`, {
         method: "POST",
-        headers: apiAuthHeaders(),
+        headers: { "X-Jarvis-Frontend": "command-center" },
+        credentials: "same-origin",
         body: formData
       });
       if (!response.ok) {
@@ -4640,11 +4574,19 @@ export default function CommandCenter() {
                     {line.attachments && line.attachments.length > 0 && (
                       <div className="bubbleAttachments">
                         {line.attachments.map((attachment) => (
-                          <a href={attachmentHref(attachment)} key={attachment.id} rel="noreferrer" target="_blank">
+                          <button
+                            key={attachment.id}
+                            onClick={() => {
+                              void downloadAttachment(attachment).catch((err) => {
+                                setError(err instanceof Error ? err.message : "Не удалось скачать файл");
+                              });
+                            }}
+                            type="button"
+                          >
                             <FileText size={13} />
                             <span>{attachment.name}</span>
                             {typeof attachment.size === "number" && <small>{formatBytes(attachment.size)}</small>}
-                          </a>
+                          </button>
                         ))}
                       </div>
                     )}
@@ -4984,6 +4926,18 @@ export default function CommandCenter() {
                           </div>
                           <span>{job.completed_files}/{job.total_files}</span>
                           <small>{job.workers ?? 1} потока · {formatBytes(job.downloaded_bytes)}</small>
+                          {["queued", "running", "cancelling"].includes(job.status) && (
+                            <button
+                              type="button"
+                              className="downloadCancel"
+                              disabled={busy || job.status === "cancelling"}
+                              onClick={() => cancelModelDownload(job.id)}
+                              title="Отменить загрузку"
+                              aria-label={`Отменить загрузку ${job.repo_id}`}
+                            >
+                              <X size={14} />
+                            </button>
+                          )}
                         </article>
                       ))}
                     </div>
@@ -5766,7 +5720,7 @@ export default function CommandCenter() {
 
         <footer className="runtimeLine">
           <span>{status?.settings.home ?? "D:\\jarvis"}</span>
-          <span>{status?.settings.llm.base_url ?? (CONFIGURED_API_URL || DEFAULT_API_URL)}</span>
+          <span>{status?.settings.llm.base_url ?? "same-origin API proxy"}</span>
         </footer>
       </section>
     </main>

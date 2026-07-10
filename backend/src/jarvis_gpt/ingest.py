@@ -52,6 +52,7 @@ EXTENSION_MIME_TYPES = {
     ".yml": "application/x-yaml",
 }
 MAX_TEXT_BYTES = 5 * 1024 * 1024
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 CHUNK_CHARS = 1_800
 CHUNK_OVERLAP = 180
 
@@ -136,14 +137,22 @@ class FileIngestor:
         temp_path = self.files_dir / f".{new_id('upload')}.tmp"
         digest = hashlib.sha256()
         size = 0
-        with temp_path.open("wb") as target:
-            while True:
-                chunk = stream.read(1024 * 1024)
-                if not chunk:
-                    break
-                digest.update(chunk)
-                size += len(chunk)
-                target.write(chunk)
+        try:
+            with temp_path.open("wb") as target:
+                while True:
+                    chunk = stream.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > MAX_UPLOAD_BYTES:
+                        raise OSError(
+                            f"File is larger than the {MAX_UPLOAD_BYTES}-byte upload limit."
+                        )
+                    digest.update(chunk)
+                    target.write(chunk)
+        except BaseException:
+            temp_path.unlink(missing_ok=True)
+            raise
 
         sha256 = digest.hexdigest()
         stored_path = self.files_dir / f"{sha256[:12]}_{safe_name}"

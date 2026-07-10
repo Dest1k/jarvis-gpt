@@ -5,6 +5,7 @@ from jarvis_gpt.dispatcher import DispatcherManager, _runtime_from_command
 
 
 def test_dispatcher_manager_builds_compose_environment(monkeypatch, tmp_path):
+    monkeypatch.delenv("JARVIS_VLLM_IMAGE", raising=False)
     model_root = tmp_path / "models"
     (model_root / "gemma4-31b-it-nvfp4").mkdir(parents=True)
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
@@ -20,6 +21,7 @@ def test_dispatcher_manager_builds_compose_environment(monkeypatch, tmp_path):
     assert env["JARVIS_QWEN_MODEL_PATH"] == "/models/gemma4-31b-it-nvfp4"
     assert env["JARVIS_QWEN_MODEL_NAME"] == "dispatcher"
     assert env["VLLM_USE_V2_MODEL_RUNNER"] == "0"
+    assert env["JARVIS_VLLM_IMAGE"] == "vllm/vllm-openai:v0.23.0"
     assert env["VLLM_WEIGHT_OFFLOADING_DISABLE_UVA"] == "1"
     assert env["JARVIS_QWEN_TOKENIZER_MODE"] == "slow"
     assert env["JARVIS_QWEN_SAFETENSORS_LOAD_STRATEGY"] == "prefetch"
@@ -34,6 +36,20 @@ def test_dispatcher_manager_builds_compose_environment(monkeypatch, tmp_path):
     assert status["runtime"] is None
     assert status["desired_runtime"]["enforce_eager"] is True
     assert status["desired_runtime"]["cpu_offload_gb"] == 8
+
+
+def test_dispatcher_status_redacts_hugging_face_token(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_MODEL_ROOT", str(tmp_path / "models"))
+    monkeypatch.setenv("HF_TOKEN", "hf_super_secret")
+    monkeypatch.setattr("jarvis_gpt.dispatcher.shutil.which", lambda _name: None)
+
+    settings = load_settings("gemma4-mono")
+    ensure_runtime_dirs(settings)
+    manager = DispatcherManager(settings, repo_root=tmp_path)
+
+    assert manager.compose_env()["HF_TOKEN"] == "hf_super_secret"
+    assert manager.status()["env"]["HF_TOKEN"] == "[configured]"
 
 
 def test_dispatcher_turbo_profile_keeps_cuda_graph_path(monkeypatch, tmp_path):

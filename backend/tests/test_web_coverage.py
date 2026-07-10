@@ -89,6 +89,11 @@ def test_parse_feed_entries_rejects_garbage():
         _parse_feed_entries("<html><body>not a feed</body></html>", limit=5)
     with pytest.raises(ValueError):
         _parse_feed_entries("plain text", limit=5)
+    with pytest.raises(ValueError, match="DTD and entity"):
+        _parse_feed_entries(
+            '<!DOCTYPE rss [<!ENTITY x "expanded">]><rss><channel>&x;</channel></rss>',
+            limit=5,
+        )
 
 
 def test_web_feed_tool_returns_entries_and_evidence(monkeypatch, tmp_path):
@@ -108,7 +113,7 @@ def test_web_feed_tool_returns_entries_and_evidence(monkeypatch, tmp_path):
 
     class FakeClient:
         def __init__(self, *args, **kwargs):
-            pass
+            return None
 
         async def __aenter__(self):
             return self
@@ -156,7 +161,7 @@ def test_web_archive_reads_wayback_snapshot(monkeypatch, tmp_path):
 
     class FakeClient:
         def __init__(self, *args, **kwargs):
-            pass
+            return None
 
         async def __aenter__(self):
             return self
@@ -207,7 +212,7 @@ def test_web_archive_reports_missing_snapshot(monkeypatch, tmp_path):
 
     class FakeClient:
         def __init__(self, *args, **kwargs):
-            pass
+            return None
 
         async def __aenter__(self):
             return self
@@ -272,7 +277,7 @@ def test_web_weather_formats_russian_report(monkeypatch, tmp_path):
 
     class FakeClient:
         def __init__(self, *args, **kwargs):
-            pass
+            return None
 
         async def __aenter__(self):
             return self

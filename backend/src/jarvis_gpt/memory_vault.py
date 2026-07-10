@@ -42,7 +42,7 @@ class MemoryVault:
                     path.unlink()
                     removed += 1
                 except OSError:
-                    pass
+                    continue
         return {"root": str(self.root), "written": written, "removed": removed}
 
     def graph(self) -> dict[str, Any]:

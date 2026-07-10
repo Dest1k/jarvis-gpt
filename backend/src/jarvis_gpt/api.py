@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import ipaddress
 import json
 import os
@@ -10,6 +12,7 @@ from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from fastapi import (
     FastAPI,
@@ -115,6 +118,7 @@ from .persona import PersonaManager
 from .storage import JarvisStorage, utc_now
 from .supervisor import RuntimeSupervisor
 from .telemetry import TelemetryCollector
+from .tools import browser_handoff_snapshot, internet_observability_snapshot
 
 
 @asynccontextmanager
@@ -187,20 +191,54 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         detached_tasks = [
-            task for task in getattr(app.state, "autonomy_background_tasks", set()) if not task.done()
+            task
+            for task in getattr(app.state, "autonomy_background_tasks", set())
+            if not task.done()
         ]
         for task in detached_tasks:
             task.cancel()
         if detached_tasks:
             await asyncio.gather(*detached_tasks, return_exceptions=True)
         await supervisor.stop()
+        await asyncio.to_thread(model_hub.close)
         storage.add_event(kind="runtime.stop", title="Jarvis backend stopped")
         storage.close()
 
 
+_WS_TOKEN_PROTOCOL_PREFIX = "jarvis.token."
+
+
+def _normalize_origin(value: str) -> str:
+    raw = value.strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlsplit(raw)
+        port = parsed.port
+    except ValueError:
+        return ""
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        return ""
+    scheme = parsed.scheme.lower()
+    host = parsed.hostname.rstrip(".").lower()
+    rendered_host = f"[{host}]" if ":" in host else host
+    default_port = 80 if scheme == "http" else 443
+    rendered_port = f":{port}" if port is not None and port != default_port else ""
+    return f"{scheme}://{rendered_host}{rendered_port}"
+
+
 def _cors_origins() -> list[str]:
     raw = os.environ.get("JARVIS_CORS_ORIGINS", "")
-    return [item.strip().rstrip("/") for item in raw.split(",") if item.strip()]
+    origins = {_normalize_origin(item) for item in raw.split(",")}
+    return sorted(origin for origin in origins if origin)
 
 
 def _api_token() -> str:
@@ -217,6 +255,14 @@ def _is_loopback_host(host: str | None) -> bool:
         return ipaddress.ip_address(normalized).is_loopback
     except ValueError:
         return False
+
+
+def _origin_allowed(origin: str) -> bool:
+    normalized = _normalize_origin(origin)
+    if not normalized:
+        return False
+    hostname = urlsplit(normalized).hostname
+    return _is_loopback_host(hostname) or normalized in _cors_origins()
 
 
 @lru_cache(maxsize=1)
@@ -252,6 +298,25 @@ def _header_token(headers: Any) -> str:
     if auth.lower().startswith("bearer "):
         return auth.split(" ", 1)[1].strip()
     return str(headers.get("x-jarvis-api-token") or "").strip()
+
+
+def _websocket_protocol_token(headers: Any) -> str:
+    protocols = str(headers.get("sec-websocket-protocol") or "")
+    for raw_protocol in protocols.split(","):
+        protocol = raw_protocol.strip()
+        if not protocol.startswith(_WS_TOKEN_PROTOCOL_PREFIX):
+            continue
+        encoded = protocol[len(_WS_TOKEN_PROTOCOL_PREFIX) :]
+        if not encoded or len(encoded) > 1024:
+            continue
+        padding = "=" * (-len(encoded) % 4)
+        try:
+            token = base64.urlsafe_b64decode(f"{encoded}{padding}").decode("utf-8")
+        except (binascii.Error, UnicodeDecodeError, ValueError):
+            continue
+        if token:
+            return token
+    return ""
 
 
 def _token_allowed(token: str) -> bool:
@@ -307,6 +372,18 @@ async def local_api_guard(request: Request, call_next):
         return await call_next(request)
     host = request.client.host if request.client else ""
     token_ok = _token_allowed(_header_token(request.headers))
+    origin = str(request.headers.get("origin") or "").strip()
+    if origin and not _origin_allowed(origin):
+        return JSONResponse(
+            {"detail": "Request Origin is not allowed for the Jarvis API."},
+            status_code=403,
+        )
+    fetch_site = str(request.headers.get("sec-fetch-site") or "").strip().lower()
+    if fetch_site == "cross-site" and not token_ok:
+        return JSONResponse(
+            {"detail": "Cross-site browser requests require API authentication."},
+            status_code=403,
+        )
     if token_ok or (_is_local_machine_host(host) and not _strict_loopback_token_required()):
         return await call_next(request)
     status_code = 401 if _api_token() else 403
@@ -375,7 +452,7 @@ async def runtime_security(request: Request) -> dict[str, Any]:
 
 @app.post("/api/runtime/backup")
 async def runtime_backup() -> dict[str, Any]:
-    return app.state.storage.backup_database()
+    return await asyncio.to_thread(app.state.storage.backup_database)
 
 
 @app.get("/api/operator/queue", response_model=OperatorQueueResponse)
@@ -581,7 +658,7 @@ def _short_trace_text(value: Any, max_chars: int = 360) -> str:
 
 @app.get("/api/models", response_model=ModelCatalogResponse)
 async def models() -> ModelCatalogResponse:
-    return app.state.model_hub.inventory()
+    return await asyncio.to_thread(app.state.model_hub.inventory)
 
 
 @app.get("/api/model-hub/search", response_model=ModelSearchResponse)
@@ -590,18 +667,24 @@ async def model_hub_search(
     limit: int = Query(default=12, ge=1, le=30),
     context_tokens: int = Query(default=8192, ge=512, le=131072),
 ) -> ModelSearchResponse:
-    return app.state.model_hub.search(query, limit=limit, context_tokens=context_tokens)
+    return await asyncio.to_thread(
+        app.state.model_hub.search,
+        query,
+        limit=limit,
+        context_tokens=context_tokens,
+    )
 
 
 @app.get("/api/model-hub/downloads")
 async def model_downloads() -> list[dict[str, Any]]:
-    return app.state.model_hub.download_jobs()
+    return await asyncio.to_thread(app.state.model_hub.download_jobs)
 
 
 @app.post("/api/model-hub/download")
 async def model_download(request: ModelDownloadRequest) -> dict[str, Any]:
     try:
-        return app.state.model_hub.start_download(
+        return await asyncio.to_thread(
+            app.state.model_hub.start_download,
             request.repo_id,
             revision=request.revision,
             workers=request.workers,
@@ -610,10 +693,20 @@ async def model_download(request: ModelDownloadRequest) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.post("/api/model-hub/downloads/{job_id}/cancel")
+async def model_download_cancel(job_id: str) -> dict[str, Any]:
+    try:
+        result = await asyncio.to_thread(app.state.model_hub.cancel_download, job_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    await app.state.bus.publish({"channel": "models", "action": "download.cancel", **result})
+    return result
+
+
 @app.post("/api/models/activate")
 async def model_activate(request: ModelActivateRequest) -> dict[str, Any]:
     try:
-        result = app.state.model_hub.activate_model(request.model_id)
+        result = await asyncio.to_thread(app.state.model_hub.activate_model, request.model_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     await app.state.bus.publish({"channel": "models", "action": "activate", **result})
@@ -623,7 +716,7 @@ async def model_activate(request: ModelActivateRequest) -> dict[str, Any]:
 @app.delete("/api/models/local/{model_id}")
 async def model_delete(model_id: str) -> dict[str, Any]:
     try:
-        result = app.state.model_hub.delete_model(model_id)
+        result = await asyncio.to_thread(app.state.model_hub.delete_model, model_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     await app.state.bus.publish({"channel": "models", "action": "delete", **result})
@@ -632,7 +725,7 @@ async def model_delete(model_id: str) -> dict[str, Any]:
 
 @app.get("/api/dispatcher", response_model=DispatcherStatusResponse)
 async def dispatcher() -> DispatcherStatusResponse:
-    return app.state.dispatcher.status()
+    return await asyncio.to_thread(app.state.dispatcher.status)
 
 
 @app.post("/api/dispatcher/{action}", response_model=DispatcherActionResponse)
@@ -641,8 +734,8 @@ async def dispatcher_action(action: str) -> DispatcherActionResponse:
     compose_action = action_map.get(action)
     if compose_action is None:
         raise HTTPException(status_code=400, detail="Unsupported dispatcher action")
-    result = app.state.dispatcher.run_compose(compose_action)
-    status_snapshot = app.state.dispatcher.status()
+    result = await asyncio.to_thread(app.state.dispatcher.run_compose, compose_action)
+    status_snapshot = await asyncio.to_thread(app.state.dispatcher.status)
     await app.state.bus.publish(
         {
             "channel": "dispatcher",
@@ -680,7 +773,7 @@ async def learning_journal(limit: int = Query(default=50, ge=1, le=200)) -> list
 
 @app.get("/api/host-bridge", response_model=HostBridgeResponse)
 async def host_bridge() -> HostBridgeResponse:
-    return app.state.host_bridge.snapshot()
+    return await asyncio.to_thread(app.state.host_bridge.snapshot)
 
 
 @app.get("/api/autonomy", response_model=AutonomyStatusResponse)
@@ -738,6 +831,22 @@ async def update_autonomy_policy(
 @app.get("/api/browser/policy", response_model=BrowserPolicyResponse)
 async def browser_policy() -> BrowserPolicyResponse:
     return app.state.operations.browser_policy()
+
+
+@app.get("/api/browser/handoff")
+async def browser_handoff() -> dict[str, Any] | None:
+    return await asyncio.to_thread(browser_handoff_snapshot, app.state.storage)
+
+
+@app.get("/api/internet/observability")
+async def internet_observability(
+    limit: int = Query(default=120, ge=10, le=300),
+) -> dict[str, Any]:
+    return await asyncio.to_thread(
+        internet_observability_snapshot,
+        app.state.storage,
+        limit=limit,
+    )
 
 
 @app.patch("/api/browser/policy", response_model=BrowserPolicyResponse)
@@ -1113,7 +1222,7 @@ async def add_memory(request: MemoryCreateRequest) -> MemoryItem:
 
 @app.get("/api/memory/vault", response_model=MemoryVaultResponse)
 async def memory_vault() -> MemoryVaultResponse:
-    return app.state.storage.memory_graph()
+    return await asyncio.to_thread(app.state.storage.memory_graph)
 
 
 @app.get("/api/memory/hygiene", response_model=MemoryHygieneResponse)
@@ -1123,7 +1232,7 @@ async def memory_hygiene() -> MemoryHygieneResponse:
 
 @app.post("/api/memory/consolidate")
 async def memory_consolidate() -> dict[str, int]:
-    return app.state.storage.consolidate_memories()
+    return await asyncio.to_thread(app.state.storage.consolidate_memories)
 
 
 @app.get("/api/files", response_model=list[FileItem])
@@ -1136,7 +1245,11 @@ async def upload_file(file: UploadFile = File(...)) -> FileIngestResponse:
     if not file.filename:
         raise HTTPException(status_code=400, detail="Filename is required")
     try:
-        result = app.state.ingestor.ingest_upload(file.filename, file.file)
+        result = await asyncio.to_thread(
+            app.state.ingestor.ingest_upload,
+            file.filename,
+            file.file,
+        )
     except OSError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
@@ -1237,11 +1350,14 @@ async def update_approval(
     approval_id: str,
     request: ApprovalUpdateRequest,
 ) -> ApprovalItem:
-    updated = app.state.storage.update_approval(
-        approval_id,
-        status=request.status,
-        result=request.result,
-    )
+    try:
+        updated = app.state.storage.update_approval(
+            approval_id,
+            status=request.status,
+            result=request.result,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     if updated is None:
         raise HTTPException(status_code=404, detail="Approval not found")
     await app.state.bus.publish(
@@ -1347,8 +1463,14 @@ async def benchmark() -> BenchmarkResponse:
 @app.websocket("/ws/events")
 async def ws_events(websocket: WebSocket) -> None:
     host = websocket.client.host if websocket.client else ""
-    token = _header_token(websocket.headers) or str(websocket.query_params.get("token") or "")
-    if not _is_local_machine_host(host) and not _token_allowed(token):
+    origin = str(websocket.headers.get("origin") or "").strip()
+    token = _header_token(websocket.headers) or _websocket_protocol_token(websocket.headers)
+    origin_ok = not origin or _origin_allowed(origin)
+    token_ok = _token_allowed(token)
+    local_without_strict_token = (
+        _is_local_machine_host(host) and not _strict_loopback_token_required()
+    )
+    if not origin_ok or not (token_ok or local_without_strict_token):
         await websocket.close(code=1008)
         return
     bus: EventBus = app.state.bus
@@ -1357,4 +1479,6 @@ async def ws_events(websocket: WebSocket) -> None:
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
+        return
+    finally:
         await bus.disconnect(websocket)

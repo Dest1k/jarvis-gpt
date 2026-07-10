@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import platform
 import shutil
 import subprocess
@@ -55,13 +56,10 @@ def _command_version(name: str, command: list[str]) -> DiagnosticCheck:
     )
 
 
-async def run_diagnostics(
-    *,
+def _local_diagnostic_checks(
     settings: JarvisSettings,
     storage: JarvisStorage,
-    llm: LLMRouter,
-    persist: bool = True,
-) -> DiagnosticsResponse:
+) -> list[DiagnosticCheck]:
     catalog = ModelCatalog(settings).response()
     active_model = catalog["active_model"]
     checks: list[DiagnosticCheck] = [
@@ -89,7 +87,6 @@ async def run_diagnostics(
         _command_version("git", ["git", "--version"]),
         _command_version("docker", ["docker", "--version"]),
     ]
-
     try:
         storage.ping()
         checks.append(
@@ -102,6 +99,27 @@ async def run_diagnostics(
         )
     except Exception as exc:  # noqa: BLE001
         checks.append(DiagnosticCheck(name="storage.sqlite", status="error", message=str(exc)))
+    return checks
+
+
+def _persist_checks(storage: JarvisStorage, checks: list[DiagnosticCheck]) -> None:
+    for check in checks:
+        storage.record_health(
+            component=check.name,
+            status=check.status,
+            message=check.message,
+            details=check.details,
+        )
+
+
+async def run_diagnostics(
+    *,
+    settings: JarvisSettings,
+    storage: JarvisStorage,
+    llm: LLMRouter,
+    persist: bool = True,
+) -> DiagnosticsResponse:
+    checks = await asyncio.to_thread(_local_diagnostic_checks, settings, storage)
 
     llm_health = await llm.health()
     checks.append(
@@ -116,13 +134,7 @@ async def run_diagnostics(
     )
 
     if persist:
-        for check in checks:
-            storage.record_health(
-                component=check.name,
-                status=check.status,
-                message=check.message,
-                details=check.details,
-            )
+        await asyncio.to_thread(_persist_checks, storage, checks)
 
     ok = all(check.status != "error" for check in checks)
     return DiagnosticsResponse(ok=ok, checks=checks)

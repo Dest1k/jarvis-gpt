@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -14,6 +15,16 @@ from .telemetry import TelemetryCollector
 from .tools import ToolRegistry
 
 MissionResumer = Callable[[dict[str, Any], ToolRunResponse], Awaitable[ToolRunResponse | None]]
+
+SUPPORTED_APPROVAL_ACTIONS = (
+    "dispatcher.start",
+    "dispatcher.stop",
+    "diagnostics.run",
+    "learning.tick",
+    "memory.save",
+    "telemetry.snapshot",
+    "tool.run",
+)
 
 
 @dataclass(frozen=True)
@@ -70,25 +81,67 @@ class ApprovalExecutor:
         payload = approval.get("payload") or {}
         if not isinstance(payload, dict):
             payload = {}
-        result = await self._execute_action(approval, action, payload)
-        if not result.finalize:
-            return result
+        # Validate before claiming so malformed/unsupported legacy approvals stay
+        # reviewable instead of becoming permanently terminal without an action.
+        if action not in SUPPORTED_APPROVAL_ACTIONS:
+            return await self._execute_action(approval, action, payload)
 
-        updated = self.storage.update_approval(
+        claimed = self.storage.claim_approval_execution(approval_id)
+        if claimed is None:
+            current = self.storage.get_approval(approval_id)
+            current_status = current["status"] if current is not None else "missing"
+            return ApprovalExecution(
+                ok=False,
+                summary=(
+                    "Approval execution was not claimed; "
+                    f"current status is {current_status}."
+                ),
+                data={"approval": current} if current is not None else {"approval_id": approval_id},
+                approval=current,
+                status_code=409 if current is not None else 404,
+                finalize=False,
+            )
+
+        try:
+            result = await self._execute_action(claimed, action, payload)
+        except asyncio.CancelledError:
+            self.storage.finalize_approval_execution(
+                approval_id,
+                status="failed",
+                result={
+                    "ok": False,
+                    "summary": "Approval execution was cancelled.",
+                    "data": {"error": "CancelledError"},
+                    "executed_at": utc_now(),
+                },
+            )
+            raise
+        except Exception as exc:  # keep the durable approval out of a stuck executing state
+            result = ApprovalExecution(
+                ok=False,
+                summary=f"Approval execution failed: {type(exc).__name__}: {exc}",
+                data={"error": type(exc).__name__, "detail": str(exc)},
+            )
+
+        terminal_status = "executed" if result.ok and result.finalize else "failed"
+        terminal_result = {
+            "ok": result.ok,
+            "summary": result.summary,
+            "data": result.data,
+            "executed_at": utc_now(),
+        }
+        updated = self.storage.finalize_approval_execution(
             approval_id,
-            status="executed",
-            result={
-                "ok": result.ok,
-                "summary": result.summary,
-                "data": result.data,
-                "executed_at": utc_now(),
-            },
+            status=terminal_status,
+            result=terminal_result,
         )
+        if updated is None:
+            updated = self.storage.get_approval(approval_id)
         return ApprovalExecution(
             ok=result.ok,
             summary=result.summary,
             data=result.data,
-            approval=updated or approval,
+            approval=updated or claimed,
             status_code=result.status_code,
             finalize=True,
         )
@@ -210,15 +263,7 @@ class ApprovalExecutor:
             summary=f"Unsupported approval action: {action}",
             data={
                 "requested_action": action,
-                "supported_actions": [
-                    "dispatcher.start",
-                    "dispatcher.stop",
-                    "diagnostics.run",
-                    "learning.tick",
-                    "memory.save",
-                    "telemetry.snapshot",
-                    "tool.run",
-                ],
+                "supported_actions": list(SUPPORTED_APPROVAL_ACTIONS),
             },
             status_code=400,
             finalize=False,

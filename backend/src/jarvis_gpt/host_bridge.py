@@ -19,8 +19,14 @@ class HostBridgeStatus:
     def snapshot(self) -> dict[str, Any]:
         token = bridge_token_path(self.settings)
         deployed_script_path = self.settings.home / "windows_rpc_bridge.py"
-        bundled_script_path = (
+        packaged_script_path = (
+            Path(__file__).resolve().parent / "bundled" / "windows_rpc_bridge.py"
+        )
+        repository_script_path = (
             Path(__file__).resolve().parents[3] / "scripts" / "windows_rpc_bridge.py"
+        )
+        bundled_script_path = (
+            packaged_script_path if packaged_script_path.exists() else repository_script_path
         )
         script_path = bundled_script_path if bundled_script_path.exists() else deployed_script_path
         return {

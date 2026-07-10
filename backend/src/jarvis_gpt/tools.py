@@ -57,6 +57,12 @@ from .operations import OperationsManager, _cadence_interval, docker_container_a
 from .persona import INSIGHT_FIELDS, PersonaManager, load_persona
 from .storage import JarvisStorage, new_id, utc_now
 from .telemetry import TelemetryCollector
+from .web_orchestrator import (
+    WebBudgetExceeded,
+    WebMode,
+    WebOrchestrator,
+    normalize_web_mode,
+)
 
 DangerLevel = Literal["safe", "review", "danger"]
 ToolHandler = Callable[
@@ -316,11 +322,13 @@ class ToolRegistry:
                     data={"error": str(exc)},
                 )
 
+        response = _redact_tool_response_credentials(response)
+        recorded_args = _redact_search_credentials(args)
         self.storage.record_tool_run(
             tool=response.tool,
             ok=response.ok,
             summary=response.summary,
-            arguments=args,
+            arguments=recorded_args,
             data=response.data,
             mission_id=mission_id,
             task_id=task_id,
@@ -535,7 +543,8 @@ class ToolRegistry:
                     "action": "wmi.query (default), window.list, screen.capture, or capabilities",
                     "payload": (
                         "wmi.query: {class_name, properties[], filter?, limit?}; "
-                        "window.list: {limit}; screen.capture: {path?, limit?, ocr?}"
+                        "window.list: {limit}; screen.capture: {limit?, ocr?}; "
+                        "capture path is always generated under Jarvis cache"
                     ),
                     "timeout_sec": "1-120 second timeout",
                 },
@@ -549,6 +558,7 @@ class ToolRegistry:
                 category="browser",
                 input_schema={"url": "HTTP(S) URL to open"},
                 handler=_browser_open,
+                danger_level="review",
             )
         )
         self.add(
@@ -918,6 +928,8 @@ class ToolRegistry:
                 category="web",
                 input_schema={
                     "query": "Search query",
+                    "mode": "FAST_FACT (default), DEEP_RESEARCH, or AGGRESSIVE_SHOPPING",
+                    "deadline_sec": "Optional tighter total deadline for this search run",
                     "limit": "Maximum results",
                     "region": "Search region, default ru-ru",
                     "freshness": "day, week, month, year, or empty",
@@ -1098,6 +1110,8 @@ class ToolRegistry:
                 input_schema={
                     "query": "Search query or research question",
                     "claim": "Optional concrete claim to verify",
+                    "mode": "DEEP_RESEARCH (default), FAST_FACT, or AGGRESSIVE_SHOPPING",
+                    "deadline_sec": "Optional tighter total deadline for the whole research run",
                     "max_sources": "Maximum sources to inspect",
                     "provider": "Optional search provider override",
                     "vertical": "Optional vertical: web, news, images, shopping, places, scholar",
@@ -1117,6 +1131,11 @@ class ToolRegistry:
                 input_schema={
                     "question": "User question to answer from the public web",
                     "query": "Optional explicit search query",
+                    "mode": (
+                        "FAST_FACT, DEEP_RESEARCH, or AGGRESSIVE_SHOPPING; "
+                        "shopping questions infer AGGRESSIVE_SHOPPING"
+                    ),
+                    "deadline_sec": "Optional tighter total deadline for the whole answer run",
                     "max_sources": "Maximum ranked sources",
                     "region": "Search region, default ru-ru",
                     "freshness": "day, week, month, year, empty, or inferred from question",
@@ -1637,14 +1656,13 @@ async def _system_inspect(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResp
     payload = args.get("payload")
     if not isinstance(payload, dict):
         payload = {}
-    if action == "screen.capture" and not payload.get("path"):
+    if action == "screen.capture":
         screen_dir = ctx.settings.cache_dir / "screens"
         payload = {
             **payload,
             "path": str(screen_dir / f"screen-{_timestamp_slug()}.png"),
+            "ocr": bool(payload.get("ocr", True)),
         }
-    if action == "screen.capture":
-        payload = {**payload, "ocr": bool(payload.get("ocr", True))}
     timeout_sec = _int_arg(args.get("timeout_sec"), default=30, minimum=1, maximum=120)
     try:
         native, ok, summary, bridge_data = await _run_native_bridge_command(
@@ -1764,6 +1782,7 @@ async def _browser_read(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
     policy = OperationsManager(settings=ctx.settings, storage=ctx.storage).browser_policy()
     try:
         url = _validate_browser_url(str(args.get("url") or ""), policy=policy)
+        navigation_validator = _browser_navigation_validator(url, policy=policy)
         debug_url = normalize_debug_url(str(args.get("debug_url") or DEFAULT_CHROME_DEBUG_URL))
     except (BrowserCdpError, ValueError) as exc:
         return ToolRunResponse(tool="browser.read", ok=False, summary=str(exc))
@@ -1776,6 +1795,7 @@ async def _browser_read(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
             max_chars=max_chars,
             wait_ms=wait_ms,
             debug_url=debug_url,
+            url_validator=navigation_validator,
         )
     except BrowserCdpError as exc:
         return ToolRunResponse(
@@ -1788,9 +1808,19 @@ async def _browser_read(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
             data={"url": url, "debug_url": debug_url},
         )
 
+    try:
+        final_url = navigation_validator(snapshot.url or url)
+    except ValueError as exc:
+        return ToolRunResponse(
+            tool="browser.read",
+            ok=False,
+            summary=f"Blocked final browser URL: {exc}",
+            data={"requested_url": url, "final_url": snapshot.url or None},
+        )
+
     safety = _web_content_safety(
         source="browser.read",
-        url=snapshot.url or url,
+        url=final_url,
         text=snapshot.text,
     )
     ok = (
@@ -1821,7 +1851,7 @@ async def _browser_read(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
     evidence = _store_web_evidence(
         ctx.storage,
         source="browser.read",
-        url=snapshot.url,
+        url=final_url,
         title=snapshot.title,
         text=snapshot.text,
         content_type="text/plain",
@@ -1834,7 +1864,7 @@ async def _browser_read(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
         ok=ok,
         summary=summary,
         data={
-            "url": snapshot.url,
+            "url": final_url,
             "requested_url": url,
             "title": snapshot.title,
             "ready_state": snapshot.ready_state,
@@ -1859,6 +1889,7 @@ async def _browser_scroll(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResp
     policy = OperationsManager(settings=ctx.settings, storage=ctx.storage).browser_policy()
     try:
         url = _validate_browser_url(str(args.get("url") or ""), policy=policy)
+        navigation_validator = _browser_navigation_validator(url, policy=policy)
         debug_url = normalize_debug_url(str(args.get("debug_url") or DEFAULT_CHROME_DEBUG_URL))
     except (BrowserCdpError, ValueError) as exc:
         return ToolRunResponse(tool="browser.scroll", ok=False, summary=str(exc))
@@ -1884,6 +1915,7 @@ async def _browser_scroll(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResp
             max_chars=max_chars,
             wait_ms=wait_ms,
             debug_url=debug_url,
+            url_validator=navigation_validator,
         )
     except BrowserCdpError as exc:
         return ToolRunResponse(
@@ -1896,9 +1928,19 @@ async def _browser_scroll(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResp
             data={"url": url, "debug_url": debug_url},
         )
 
+    try:
+        final_url = navigation_validator(result.url or url)
+    except ValueError as exc:
+        return ToolRunResponse(
+            tool="browser.scroll",
+            ok=False,
+            summary=f"Blocked final browser URL: {exc}",
+            data={"requested_url": url, "final_url": result.url or None},
+        )
+
     safety = _web_content_safety(
         source="browser.scroll",
-        url=result.url,
+        url=final_url,
         text=result.snapshot.text,
     )
     ok = (
@@ -1928,7 +1970,7 @@ async def _browser_scroll(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResp
     evidence = _store_web_evidence(
         ctx.storage,
         source="browser.scroll",
-        url=result.url,
+        url=final_url,
         title=result.title,
         text=result.snapshot.text,
         content_type="text/plain",
@@ -1941,7 +1983,7 @@ async def _browser_scroll(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResp
         ok=ok,
         summary=summary,
         data={
-            "url": result.url,
+            "url": final_url,
             "requested_url": url,
             "title": result.title,
             "ready_state": result.ready_state,
@@ -1980,9 +2022,7 @@ async def _browser_screenshot(ctx: ToolContext, args: dict[str, Any]) -> ToolRun
 
 
 def _browser_handoff_status(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunResponse:
-    handoff = ctx.storage.get_runtime_value(WEB_HANDOFF_KEY, None)
-    if not isinstance(handoff, dict) or handoff.get("status") == "cleared":
-        handoff = None
+    handoff = browser_handoff_snapshot(ctx.storage)
     return ToolRunResponse(
         tool="browser.handoff.status",
         ok=True,
@@ -2129,6 +2169,7 @@ async def _browser_action(
     policy = OperationsManager(settings=ctx.settings, storage=ctx.storage).browser_policy()
     try:
         url = _validate_browser_url(str(args.get("url") or ""), policy=policy)
+        navigation_validator = _browser_navigation_validator(url, policy=policy)
         debug_url = normalize_debug_url(str(args.get("debug_url") or DEFAULT_CHROME_DEBUG_URL))
         target = _browser_target_arg(args.get("target"))
         selector = _browser_selector_arg(
@@ -2162,6 +2203,7 @@ async def _browser_action(
             wait_ms=wait_ms,
             allow_sensitive=allow_sensitive,
             debug_url=debug_url,
+            url_validator=navigation_validator,
         )
     except BrowserCdpError as exc:
         return ToolRunResponse(
@@ -2174,9 +2216,19 @@ async def _browser_action(
             data={"url": url, "debug_url": debug_url},
         )
 
+    try:
+        final_url = navigation_validator(result.url or url)
+    except ValueError as exc:
+        return ToolRunResponse(
+            tool=f"browser.{action}",
+            ok=False,
+            summary=f"Blocked final browser URL: {exc}",
+            data={"requested_url": url, "final_url": result.url or None},
+        )
+
     safety = _web_content_safety(
         source=f"browser.{action}",
-        url=result.url,
+        url=final_url,
         text=result.snapshot.text,
     )
     screenshot_path = None
@@ -2192,7 +2244,7 @@ async def _browser_action(
     evidence = _store_web_evidence(
         ctx.storage,
         source=f"browser.{action}",
-        url=result.url,
+        url=final_url,
         title=result.title,
         text=result.snapshot.text,
         content_type="text/plain",
@@ -2218,7 +2270,7 @@ async def _browser_action(
         ok=result.ok,
         summary=summary,
         data={
-            "url": result.url,
+            "url": final_url,
             "requested_url": url,
             "action": action,
             "selector": result.selector or selector,
@@ -2624,18 +2676,74 @@ def _documents_apply_replacements(ctx: ToolContext, args: dict[str, Any]) -> Too
     )
 
 
+def _web_orchestration(
+    args: dict[str, Any],
+    *,
+    query: str,
+    default_mode: WebMode,
+    region: str,
+    freshness: str,
+) -> WebOrchestrator:
+    existing = args.get("_web_orchestrator")
+    if isinstance(existing, WebOrchestrator):
+        return existing
+    mode = normalize_web_mode(args.get("mode"), default=default_mode)
+    deadline_sec = None
+    if args.get("deadline_sec") not in {None, ""}:
+        deadline_sec = _float_arg(
+            args.get("deadline_sec"),
+            default=mode_deadline_sec(mode),
+            minimum=0.25,
+            maximum=180.0,
+        )
+    return WebOrchestrator.create(
+        query=query,
+        mode=mode,
+        region=region,
+        freshness=freshness,
+        deadline_sec=deadline_sec,
+    )
+
+
+def mode_deadline_sec(mode: WebMode) -> float:
+    return {
+        WebMode.FAST_FACT: 5.0,
+        WebMode.DEEP_RESEARCH: 60.0,
+        WebMode.AGGRESSIVE_SHOPPING: 90.0,
+    }[mode]
+
+
 async def _web_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     query = " ".join(str(args.get("query") or "").split())
-    limit = _int_arg(args.get("limit"), default=6, minimum=1, maximum=30)
     region = _normalize_search_region(args.get("region"))
     freshness = _normalize_search_freshness(args.get("freshness"))
-    pages = _int_arg(args.get("pages"), default=1, minimum=1, maximum=5)
     provider = str(args.get("provider") or "auto").strip().lower()
     vertical = _normalize_search_vertical(args.get("vertical"))
     if not query:
         return ToolRunResponse(tool="web.search", ok=False, summary="Search query is required.")
     if len(query) > 300:
         query = query[:300].rstrip()
+    try:
+        orchestrator = _web_orchestration(
+            args,
+            query=query,
+            default_mode=WebMode.FAST_FACT,
+            region=region,
+            freshness=freshness,
+        )
+    except ValueError as exc:
+        return ToolRunResponse(tool="web.search", ok=False, summary=str(exc))
+    if orchestrator.mode is WebMode.AGGRESSIVE_SHOPPING and str(
+        args.get("vertical") or "auto"
+    ).strip().lower() in {"", "auto", "web"}:
+        vertical = "shopping"
+    limit = min(
+        _int_arg(args.get("limit"), default=6, minimum=1, maximum=30),
+        orchestrator.limits.max_sources * 2,
+    )
+    pages = _int_arg(args.get("pages"), default=1, minimum=1, maximum=5)
+    if orchestrator.mode is WebMode.FAST_FACT:
+        pages = 1
     search_query = _vertical_search_query(query, vertical)
     providers = _web_search_requests(
         search_query,
@@ -2646,9 +2754,9 @@ async def _web_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
         vertical=vertical,
         limit=limit,
     )
+    providers = providers[: orchestrator.limits.search_requests]
     if not providers:
         return ToolRunResponse(tool="web.search", ok=False, summary="Unsupported search provider.")
-    headers = WEB_HEADERS
     last_failure: dict[str, Any] | None = None
     collected: list[dict[str, Any]] = []
     seen_urls: set[str] = set()
@@ -2660,50 +2768,60 @@ async def _web_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
             trust_env=False,
             transport=_PublicOnlyAsyncHTTPTransport(),
         ) as client:
-            for request in providers:
+            async def execute_request(request: dict[str, Any]) -> dict[str, Any]:
                 source = str(request["source"])
                 url = str(request["url"])
                 if request.get("missing_key"):
-                    last_failure = {
+                    return {
+                        "state": "missing_key",
                         "source": source,
                         "summary": "Search provider API key is not configured.",
                         "env": request.get("env"),
+                        "url": url,
+                        "page": request.get("page"),
                     }
-                    provider_stats.append(
-                        {
-                            "source": source,
-                            "page": request.get("page"),
-                            "url": url,
-                            "parsed": 0,
-                            "added": 0,
-                            "missing_key": True,
-                        }
-                    )
-                    _web_provider_stats_record(
-                        ctx.storage,
-                        source,
-                        ok=False,
-                        vertical=vertical,
-                        error="missing_api_key",
-                    )
-                    continue
                 rate_block = _web_rate_limit_block(ctx.storage, url)
                 if rate_block is not None:
-                    last_failure = {"source": source, **rate_block}
-                    _web_provider_stats_record(
-                        ctx.storage,
-                        source,
-                        ok=False,
-                        vertical=vertical,
-                        error=rate_block["summary"],
+                    return {
+                        "state": "rate_limited",
+                        "source": source,
+                        "url": url,
+                        "page": request.get("page"),
+                        **rate_block,
+                    }
+
+                async def send() -> dict[str, Any]:
+                    request_headers = {
+                        **WEB_HEADERS,
+                        **dict(request.get("headers") or {}),
+                        **_search_provider_auth_headers(source),
+                    }
+                    method = "POST" if request.get("method") == "POST" else "GET"
+                    json_body = (
+                        request.get("json")
+                        if method == "POST" and isinstance(request.get("json"), dict)
+                        else None
                     )
-                    continue
-                try:
-                    request_headers = {**headers, **dict(request.get("headers") or {})}
-                    if request.get("method") == "POST":
-                        json_body = (
-                            request.get("json") if isinstance(request.get("json"), dict) else None
-                        )
+                    if hasattr(client, "stream"):
+                        stream_kwargs: dict[str, Any] = {"headers": request_headers}
+                        if json_body is not None:
+                            stream_kwargs["json"] = json_body
+                        async with client.stream(method, url, **stream_kwargs) as response:
+                            response.raise_for_status()
+                            body = bytearray()
+                            async for chunk in response.aiter_bytes():
+                                await orchestrator.budget.reserve("network_bytes", len(chunk))
+                                body.extend(chunk)
+                            content_type = str(response.headers.get("content-type") or "")
+                            encoding = _charset_from_content_type(content_type) or "utf-8"
+                            return {
+                                "status_code": int(response.status_code),
+                                "content_type": content_type,
+                                "text": _repair_mojibake(
+                                    bytes(body).decode(encoding, errors="replace")
+                                ),
+                            }
+                    if method == "POST":
                         response = await client.post(
                             url,
                             headers=request_headers,
@@ -2712,43 +2830,135 @@ async def _web_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
                     else:
                         response = await client.get(url, headers=request_headers)
                     response.raise_for_status()
-                except httpx.HTTPError as exc:
-                    last_failure = {"source": source, "summary": str(exc), "url": url}
-                    _web_rate_limit_record(ctx.storage, url, ok=False)
-                    _web_provider_stats_record(
-                        ctx.storage,
-                        source,
-                        ok=False,
-                        vertical=vertical,
-                        error=str(exc),
+                    body = bytes(getattr(response, "content", b""))
+                    if not body and getattr(response, "text", ""):
+                        body = str(response.text).encode("utf-8", errors="replace")
+                    await orchestrator.budget.reserve("network_bytes", len(body))
+                    content_type = str(
+                        getattr(response, "headers", {}).get("content-type") or ""
                     )
-                    continue
-                raw_text = _decode_response_text(response)
-                status_code = int(getattr(response, "status_code", 200) or 200)
+                    encoding = _charset_from_content_type(content_type) or "utf-8"
+                    return {
+                        "status_code": int(getattr(response, "status_code", 200) or 200),
+                        "content_type": content_type,
+                        "text": _repair_mojibake(body.decode(encoding, errors="replace")),
+                    }
+
+                try:
+                    response_payload = await orchestrator.run("search_requests", send)
+                except httpx.HTTPError as exc:
+                    return {
+                        "state": "failed",
+                        "source": source,
+                        "summary": str(exc),
+                        "url": url,
+                        "page": request.get("page"),
+                    }
+                raw_text = str(response_payload.get("text") or "")
+                status_code = int(response_payload.get("status_code") or 200)
                 blocked_text = raw_text
                 if not bool(request.get("json_response")):
                     blocked_text = _html_to_text(raw_text)
                 if _web_response_blocked(status_code, blocked_text):
-                    last_failure = {
+                    return {
+                        "state": "blocked",
                         "source": source,
                         "summary": "Search provider returned a blocked page.",
                         "url": url,
+                        "page": request.get("page"),
                     }
-                    _web_rate_limit_record(ctx.storage, url, ok=False, blocked=True)
-                    _web_provider_stats_record(
-                        ctx.storage,
-                        source,
-                        ok=False,
-                        vertical=vertical,
-                        error="blocked",
-                    )
-                    continue
                 parsed = _web_parse_search_results(
                     source,
                     raw_text,
                     limit=limit,
                     vertical=vertical,
                 )
+                return {
+                    "state": "ok",
+                    "source": source,
+                    "url": url,
+                    "page": request.get("page"),
+                    "parsed": parsed,
+                }
+
+            attempts = await orchestrator.bounded_map(
+                providers,
+                execute_request,
+                stop_when=(
+                    lambda outcome: bool(
+                        outcome.ok
+                        and isinstance(outcome.value, dict)
+                        and outcome.value.get("state") == "ok"
+                        and outcome.value.get("parsed")
+                    )
+                    if orchestrator.mode is WebMode.FAST_FACT
+                    else None
+                ),
+            )
+            for outcome in attempts:
+                request = providers[outcome.index]
+                source = str(request.get("source") or "")
+                url = str(request.get("url") or "")
+                if not outcome.ok or not isinstance(outcome.value, dict):
+                    failure_summary = outcome.error or "Search provider failed."
+                    last_failure = {
+                        "source": source,
+                        "summary": failure_summary,
+                        "url": url,
+                    }
+                    provider_stats.append(
+                        {
+                            "source": source,
+                            "page": request.get("page"),
+                            "url": url,
+                            "parsed": 0,
+                            "added": 0,
+                            "budget_exhausted": outcome.budget_exhausted,
+                        }
+                    )
+                    _web_provider_stats_record(
+                        ctx.storage,
+                        source,
+                        ok=False,
+                        vertical=vertical,
+                        error=failure_summary,
+                    )
+                    continue
+                attempt = outcome.value
+                state = str(attempt.get("state") or "failed")
+                if state != "ok":
+                    last_failure = {
+                        "source": source,
+                        "summary": str(attempt.get("summary") or state),
+                        "url": url,
+                    }
+                    provider_stats.append(
+                        {
+                            "source": source,
+                            "page": request.get("page"),
+                            "url": url,
+                            "parsed": 0,
+                            "added": 0,
+                            "missing_key": state == "missing_key",
+                            "blocked": state == "blocked",
+                            "rate_limited": state == "rate_limited",
+                        }
+                    )
+                    _web_rate_limit_record(
+                        ctx.storage,
+                        url,
+                        ok=False,
+                        blocked=state == "blocked",
+                    )
+                    _web_provider_stats_record(
+                        ctx.storage,
+                        source,
+                        ok=False,
+                        vertical=vertical,
+                        error=str(attempt.get("summary") or state),
+                    )
+                    continue
+                parsed = attempt.get("parsed") if isinstance(attempt.get("parsed"), list) else []
                 added = 0
                 for item in parsed:
                     result_url = str(item.get("url") or "")
@@ -2779,23 +2989,25 @@ async def _web_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
                 )
                 _web_rate_limit_record(ctx.storage, url, ok=True)
                 _web_provider_stats_record(ctx.storage, source, ok=True, vertical=vertical)
-                if len(collected) >= limit:
-                    break
             results = collected[:limit]
             if results:
                 evidence_text = "\n".join(
                     f"{item.get('title', '')}\n{item.get('url', '')}\n{item.get('snippet', '')}"
                     for item in results
                 )
+                try:
+                    await orchestrator.budget.account_content(evidence_text)
+                except WebBudgetExceeded as exc:
+                    orchestrator.budget.warn(str(exc))
                 safety = _web_content_safety(
                     source="web.search",
-                    url=url,
+                    url=str(results[0].get("url") or ""),
                     text=evidence_text,
                 )
                 evidence = _store_web_evidence(
                     ctx.storage,
                     source="web.search",
-                    url=url,
+                    url=str(results[0].get("url") or ""),
                     title=query,
                     text=evidence_text,
                     content_type="text/plain",
@@ -2809,6 +3021,7 @@ async def _web_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
                         "vertical": vertical,
                         "providers": provider_stats,
                         "result_count": len(results),
+                        "mode": orchestrator.mode.value,
                     },
                 )
                 return ToolRunResponse(
@@ -2827,6 +3040,8 @@ async def _web_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
                         "vertical": vertical,
                         "pages": pages,
                         "providers": provider_stats,
+                        "mode": orchestrator.mode.value,
+                        "orchestration": orchestrator.metadata(),
                         "safety": safety,
                         "evidence_id": evidence["id"],
                     },
@@ -2836,7 +3051,12 @@ async def _web_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
             tool="web.search",
             ok=False,
             summary=f"Search request failed: {exc}",
-            data={"query": query, "last_failure": last_failure},
+            data={
+                "query": query,
+                "mode": orchestrator.mode.value,
+                "last_failure": last_failure,
+                "orchestration": orchestrator.metadata(),
+            },
         )
     cached_results = _web_search_cached_results_from_evidence(
         ctx.storage,
@@ -2871,6 +3091,8 @@ async def _web_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
                     },
                 ],
                 "last_failure": last_failure,
+                "mode": orchestrator.mode.value,
+                "orchestration": orchestrator.metadata(),
                 "cache": {"hit": True, "kind": "evidence"},
             },
         )
@@ -2878,7 +3100,13 @@ async def _web_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
         tool="web.search",
         ok=False,
         summary="Search request failed for all providers.",
-        data={"query": query, "providers": providers, "last_failure": last_failure},
+        data={
+            "query": query,
+            "providers": provider_stats,
+            "last_failure": last_failure,
+            "mode": orchestrator.mode.value,
+            "orchestration": orchestrator.metadata(),
+        },
     )
 
 
@@ -2980,7 +3208,7 @@ async def _web_crawl(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     include_patterns = _string_list_arg(args.get("include"), limit=8)
     exclude_patterns = _string_list_arg(args.get("exclude"), limit=8)
     try:
-        start_url = _validate_public_http_url(raw_url)
+        start_url = await _validate_public_http_url_async(raw_url)
     except ValueError as exc:
         return ToolRunResponse(tool="web.crawl", ok=False, summary=str(exc))
 
@@ -3086,21 +3314,42 @@ async def _web_research(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
         return ToolRunResponse(tool="web.research", ok=False, summary="Query or claim is required.")
     if not query:
         query = claim
-    max_sources = _int_arg(args.get("max_sources"), default=4, minimum=1, maximum=8)
+    region = _normalize_search_region(args.get("region"))
+    freshness = _normalize_search_freshness(args.get("freshness"))
+    try:
+        orchestrator = _web_orchestration(
+            args,
+            query=query,
+            default_mode=WebMode.DEEP_RESEARCH,
+            region=region,
+            freshness=freshness,
+        )
+    except ValueError as exc:
+        return ToolRunResponse(tool="web.research", ok=False, summary=str(exc))
+    max_sources = min(
+        _int_arg(args.get("max_sources"), default=4, minimum=1, maximum=12),
+        orchestrator.limits.max_sources,
+    )
     render_fallback = _bool_arg(args.get("render_fallback"), default=True)
     archive_fallback = _bool_arg(args.get("archive_fallback"), default=True)
     search_pages = _int_arg(args.get("pages"), default=2, minimum=1, maximum=5)
     vertical = _normalize_search_vertical(args.get("vertical"))
+    if orchestrator.mode is WebMode.AGGRESSIVE_SHOPPING:
+        vertical = "shopping"
+    if orchestrator.mode is WebMode.FAST_FACT:
+        search_pages = 1
     search = await _web_search(
         ctx,
         {
             "query": query,
             "limit": max(6, max_sources * 2),
-            "region": args.get("region") or "ru-ru",
-            "freshness": args.get("freshness") or "",
+            "region": region,
+            "freshness": freshness,
             "pages": search_pages,
             "provider": args.get("provider") or "auto",
             "vertical": vertical,
+            "mode": orchestrator.mode.value,
+            "_web_orchestrator": orchestrator,
         },
     )
     steps: list[dict[str, Any]] = [
@@ -3111,95 +3360,272 @@ async def _web_research(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
             tool="web.research",
             ok=False,
             summary=f"Research search failed: {search.summary}",
-            data={"query": query, "steps": steps, "search": search.data},
+            data={
+                "query": query,
+                "mode": orchestrator.mode.value,
+                "steps": steps,
+                "search": search.data,
+                "orchestration": orchestrator.metadata(),
+            },
         )
 
     sources: list[dict[str, Any]] = []
     evidence_ids: list[str] = []
-    for result in _search_results_for_tools(search)[:max_sources]:
-        fetched = await _web_fetch(ctx, {"url": result["url"], "max_chars": 9000})
-        fetched_text = (
-            str(fetched.data.get("text") or "") if isinstance(fetched.data, dict) else ""
-        )
-        content_type = str(fetched.data.get("content_type") or "").lower()
-        should_render = render_fallback and (
-            not fetched.ok
-            or (len(fetched_text) < 600 and ("html" in content_type or not content_type))
-        )
-        if should_render:
-            rendered = await _web_render(
-                ctx,
+    search_results = _search_results_for_tools(search)[:max_sources]
+    if orchestrator.mode is WebMode.FAST_FACT:
+        sources = [
+            {
+                "rank": result.get("rank"),
+                "title": result.get("title"),
+                "url": result.get("url"),
+                "snippet": result.get("snippet"),
+                "vertical": result.get("vertical"),
+                "published": result.get("published"),
+                "price": result.get("price"),
+                "rating": result.get("rating"),
+                "fetched": False,
+                "tool": "web.search",
+                "evidence_id": None,
+                "excerpt": _short_text(str(result.get("snippet") or ""), 900),
+                "quality": "snippet-only",
+                "extraction": None,
+            }
+            for result in search_results
+        ]
+    else:
+        max_chars = 16_000 if orchestrator.mode is WebMode.AGGRESSIVE_SHOPPING else 9_000
+
+        async def inspect_result(result: dict[str, Any]) -> dict[str, Any]:
+            item_steps: list[dict[str, Any]] = []
+            fetched = await orchestrator.run(
+                "fetches",
+                lambda: _web_fetch(
+                    ctx,
+                    {"url": result["url"], "max_chars": max_chars},
+                ),
+            )
+            fetched_text = (
+                str(fetched.data.get("text") or "") if isinstance(fetched.data, dict) else ""
+            )
+            await orchestrator.budget.reserve(
+                "network_bytes",
+                len(fetched_text.encode("utf-8", errors="replace")),
+            )
+            content_type = str(fetched.data.get("content_type") or "").lower()
+            should_render = render_fallback and (
+                orchestrator.mode is WebMode.AGGRESSIVE_SHOPPING
+                or not fetched.ok
+                or (len(fetched_text) < 600 and ("html" in content_type or not content_type))
+            )
+            if should_render:
+                try:
+                    rendered = await orchestrator.run(
+                        "renders",
+                        lambda: _web_render(
+                            ctx,
+                            {
+                                "url": result["url"],
+                                "max_chars": max_chars,
+                                "wait_ms": (
+                                    4500
+                                    if orchestrator.mode is WebMode.AGGRESSIVE_SHOPPING
+                                    else 2500
+                                ),
+                                "scroll_passes": (
+                                    4
+                                    if orchestrator.mode is WebMode.AGGRESSIVE_SHOPPING
+                                    else 2
+                                ),
+                            },
+                        ),
+                    )
+                except WebBudgetExceeded as exc:
+                    orchestrator.budget.warn(str(exc))
+                else:
+                    item_steps.append(
+                        {"tool": "web.render", "ok": rendered.ok, "summary": rendered.summary}
+                    )
+                    if rendered.ok and str(rendered.data.get("text") or "").strip():
+                        fetched = rendered
+                        fetched_text = str(rendered.data.get("text") or "")
+                        await orchestrator.budget.reserve(
+                            "network_bytes",
+                            len(fetched_text.encode("utf-8", errors="replace")),
+                        )
+            if archive_fallback and (
+                not fetched.ok
+                or bool((fetched.data or {}).get("blocked"))
+                or bool((fetched.data or {}).get("consent_wall"))
+            ):
+                try:
+                    archived = await orchestrator.run(
+                        "fetches",
+                        lambda: _web_archive(
+                            ctx,
+                            {"url": result["url"], "max_chars": max_chars},
+                        ),
+                    )
+                except WebBudgetExceeded as exc:
+                    orchestrator.budget.warn(str(exc))
+                else:
+                    item_steps.append(
+                        {"tool": "web.archive", "ok": archived.ok, "summary": archived.summary}
+                    )
+                    if archived.ok and str(archived.data.get("text") or "").strip():
+                        fetched = archived
+                        fetched_text = str(archived.data.get("text") or "")
+                        await orchestrator.budget.reserve(
+                            "network_bytes",
+                            len(fetched_text.encode("utf-8", errors="replace")),
+                        )
+            item_steps.append(
                 {
+                    "tool": fetched.tool,
+                    "ok": fetched.ok,
+                    "summary": fetched.summary,
                     "url": result["url"],
-                    "max_chars": 9000,
-                    "wait_ms": 2500,
-                    "scroll_passes": 2,
+                }
+            )
+            evidence_id = str(fetched.data.get("evidence_id") or "")
+            extraction: dict[str, Any] | None = None
+            if evidence_id:
+                extracted = await _web_extract(
+                    ctx,
+                    {
+                        "evidence_id": evidence_id,
+                        "kind": "product" if vertical == "shopping" else "auto",
+                    },
+                )
+                item_steps.append(
+                    {"tool": "web.extract", "ok": extracted.ok, "summary": extracted.summary}
+                )
+                if extracted.ok and isinstance(extracted.data.get("extraction"), dict):
+                    extraction = extracted.data["extraction"]
+            try:
+                await orchestrator.budget.account_content(fetched_text)
+            except WebBudgetExceeded as exc:
+                orchestrator.budget.warn(str(exc))
+            final_url = str(fetched.data.get("url") or result.get("url") or "")
+            return {
+                "source": {
+                    "rank": result.get("rank"),
+                    "title": result.get("title"),
+                    "url": final_url,
+                    "requested_url": result.get("url") if final_url != result.get("url") else None,
+                    "snippet": result.get("snippet"),
+                    "vertical": result.get("vertical") or vertical,
+                    "published": result.get("published"),
+                    "price": result.get("price"),
+                    "rating": result.get("rating"),
+                    "fetched": fetched.ok,
+                    "tool": fetched.tool,
+                    "evidence_id": evidence_id or None,
+                    "excerpt": _short_text(
+                        fetched_text or str(result.get("snippet") or ""),
+                        1800 if vertical == "shopping" else 900,
+                    ),
+                    "quality": _web_source_quality(final_url, fetched=fetched.ok),
+                    "extraction": _compact_extraction(extraction),
+                    **(
+                        {"_shopping_analysis_text": fetched_text}
+                        if vertical == "shopping"
+                        else {}
+                    ),
                 },
+                "evidence_id": evidence_id,
+                "steps": item_steps,
+            }
+
+        inspected = await orchestrator.bounded_map(search_results, inspect_result)
+        for outcome in inspected:
+            if outcome.ok and isinstance(outcome.value, dict):
+                payload = outcome.value
+                source = payload.get("source")
+                if isinstance(source, dict):
+                    sources.append(source)
+                evidence_id = str(payload.get("evidence_id") or "")
+                if evidence_id and evidence_id not in evidence_ids:
+                    evidence_ids.append(evidence_id)
+                item_steps = payload.get("steps")
+                if isinstance(item_steps, list):
+                    steps.extend(item for item in item_steps if isinstance(item, dict))
+                continue
+            result = search_results[outcome.index]
+            steps.append(
+                {
+                    "tool": "web.fetch",
+                    "ok": False,
+                    "summary": outcome.error or "Source inspection failed.",
+                    "url": result.get("url"),
+                }
             )
-            steps.append({"tool": "web.render", "ok": rendered.ok, "summary": rendered.summary})
-            if rendered.ok and str(rendered.data.get("text") or "").strip():
-                fetched = rendered
-                fetched_text = str(rendered.data.get("text") or "")
-        if archive_fallback and (
-            not fetched.ok
-            or bool((fetched.data or {}).get("blocked"))
-            or bool((fetched.data or {}).get("consent_wall"))
-        ):
-            archived = await _web_archive(
-                ctx,
-                {"url": result["url"], "max_chars": 9000},
+            # Preserve the search evidence as an explicitly snippet-only source;
+            # a failed renderer must not manufacture a fetched page.
+            sources.append(
+                {
+                    "rank": result.get("rank"),
+                    "title": result.get("title"),
+                    "url": result.get("url"),
+                    "snippet": result.get("snippet"),
+                    "vertical": result.get("vertical") or vertical,
+                    "published": result.get("published"),
+                    "price": result.get("price"),
+                    "rating": result.get("rating"),
+                    "fetched": False,
+                    "tool": "web.search",
+                    "evidence_id": None,
+                    "excerpt": _short_text(str(result.get("snippet") or ""), 900),
+                    "quality": "snippet-only",
+                    "extraction": None,
+                }
             )
-            steps.append({"tool": "web.archive", "ok": archived.ok, "summary": archived.summary})
-            if archived.ok and str(archived.data.get("text") or "").strip():
-                fetched = archived
-                fetched_text = str(archived.data.get("text") or "")
+
+    shopping_summary: dict[str, Any] | None = None
+    if orchestrator.mode is WebMode.AGGRESSIVE_SHOPPING:
+        sources, _filtered, shopping_summary = orchestrator.enrich_shopping_sources(sources)
+        accepted_evidence_ids = {
+            str(source.get("evidence_id") or "") for source in sources
+        }
+        evidence_ids = [
+            evidence_id
+            for evidence_id in evidence_ids
+            if evidence_id in accepted_evidence_ids
+        ]
+
+    if evidence_ids:
+        verification = await _web_verify(
+            ctx,
+            {"claim": claim or query, "evidence_ids": evidence_ids[:8]},
+        )
+        steps.append(
+            {"tool": "web.verify", "ok": verification.ok, "summary": verification.summary}
+        )
+        verification_data = (
+            verification.data.get("verification")
+            if verification.ok and isinstance(verification.data, dict)
+            else None
+        )
+    else:
+        verification_data = _verify_claim_against_sources(
+            claim or query,
+            [
+                {
+                    "url": source.get("url"),
+                    "title": source.get("title"),
+                    "text": " ".join(
+                        str(source.get(key) or "") for key in ("snippet", "excerpt")
+                    ),
+                }
+                for source in sources
+            ],
+        )
         steps.append(
             {
-                "tool": fetched.tool,
-                "ok": fetched.ok,
-                "summary": fetched.summary,
-                "url": result["url"],
+                "tool": "web.verify",
+                "ok": True,
+                "summary": f"Verification verdict: {verification_data['verdict']}.",
             }
         )
-        evidence_id = str(fetched.data.get("evidence_id") or "")
-        if evidence_id:
-            evidence_ids.append(evidence_id)
-        extraction: dict[str, Any] | None = None
-        if evidence_id:
-            extracted = await _web_extract(ctx, {"evidence_id": evidence_id, "kind": "auto"})
-            steps.append(
-                {"tool": "web.extract", "ok": extracted.ok, "summary": extracted.summary}
-            )
-            if extracted.ok and isinstance(extracted.data.get("extraction"), dict):
-                extraction = extracted.data["extraction"]
-        source = {
-            "rank": result.get("rank"),
-            "title": result.get("title"),
-            "url": result.get("url"),
-            "snippet": result.get("snippet"),
-            "vertical": result.get("vertical"),
-            "published": result.get("published"),
-            "price": result.get("price"),
-            "rating": result.get("rating"),
-            "fetched": fetched.ok,
-            "tool": fetched.tool,
-            "evidence_id": evidence_id or None,
-            "excerpt": _short_text(fetched_text or str(result.get("snippet") or ""), 900),
-            "quality": _web_source_quality(str(result.get("url") or ""), fetched=fetched.ok),
-            "extraction": _compact_extraction(extraction),
-        }
-        sources.append(source)
-
-    verification = await _web_verify(
-        ctx,
-        {"claim": claim or query, "evidence_ids": evidence_ids[:8]},
-    )
-    steps.append({"tool": "web.verify", "ok": verification.ok, "summary": verification.summary})
-    verification_data = (
-        verification.data.get("verification")
-        if verification.ok and isinstance(verification.data, dict)
-        else None
-    )
     report = _format_tool_research_report(
         query=query,
         claim=claim,
@@ -3222,11 +3648,14 @@ async def _web_research(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
             "id": record["id"],
             "query": query,
             "claim": claim or None,
+            "mode": orchestrator.mode.value,
             "vertical": vertical,
             "report": report,
             "sources": sources,
             "citations": _research_citations(sources),
             "verification": verification_data,
+            "shopping": shopping_summary,
+            "orchestration": orchestrator.metadata(),
             "steps": steps,
         },
     )
@@ -3241,7 +3670,6 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
         return ToolRunResponse(tool="web.answer", ok=False, summary="Question is required.")
     if len(question) > 600:
         question = question[:600].rstrip()
-    max_sources = _int_arg(args.get("max_sources"), default=6, minimum=2, maximum=10)
     region = _normalize_search_region(args.get("region"))
     freshness = _normalize_search_freshness(args.get("freshness")) or _web_answer_infer_freshness(
         question
@@ -3249,12 +3677,37 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
     vertical = _normalize_search_vertical(
         args.get("vertical") or _web_answer_infer_vertical(question)
     )
+    default_mode = (
+        WebMode.AGGRESSIVE_SHOPPING
+        if vertical == "shopping"
+        or _web_answer_looks_like_shopping(_repair_mojibake(question).lower())
+        else WebMode.DEEP_RESEARCH
+    )
+    try:
+        orchestrator = _web_orchestration(
+            args,
+            query=question,
+            default_mode=default_mode,
+            region=region,
+            freshness=freshness,
+        )
+    except ValueError as exc:
+        return ToolRunResponse(tool="web.answer", ok=False, summary=str(exc))
+    if orchestrator.mode is WebMode.AGGRESSIVE_SHOPPING:
+        vertical = "shopping"
+    max_sources = min(
+        _int_arg(args.get("max_sources"), default=6, minimum=2, maximum=12),
+        orchestrator.limits.max_sources,
+    )
     query_variants = _string_list_arg(
         args.get("query_variants", args.get("queries")),
         limit=4,
     )
     use_cache = _bool_arg(args.get("use_cache"), default=True)
-    synthesis_enabled = _bool_arg(args.get("synthesis"), default=True)
+    synthesis_enabled = (
+        orchestrator.mode is not WebMode.FAST_FACT
+        and _bool_arg(args.get("synthesis"), default=True)
+    )
     queries = _web_answer_queries(
         question,
         explicit_query=explicit_query,
@@ -3272,6 +3725,7 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
         freshness=freshness,
         vertical=vertical,
         max_sources=max_sources,
+        mode=orchestrator.mode.value,
     )
     if use_cache:
         cached = _web_answer_cache_get(ctx.storage, cache_key)
@@ -3286,15 +3740,18 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
                     "Answer engine returned cached answer with "
                     f"{len(cached_sources)} source(s)."
                 ),
-                data=cached,
+                data={**cached, "mode": orchestrator.mode.value},
             )
     sources_by_url: dict[str, dict[str, Any]] = {}
     evidence_ids: list[str] = []
     steps: list[dict[str, Any]] = []
 
-    for index, query in enumerate(queries[:4]):
-        per_query_sources = max(2, min(5, max_sources - len(sources_by_url) + 2))
-        researched = await _web_research(
+    active_queries = queries[:1] if orchestrator.mode is WebMode.FAST_FACT else queries[:4]
+
+    async def research_query(item: tuple[int, str]) -> ToolRunResponse:
+        index, query = item
+        per_query_sources = max(2, min(5, max_sources + 2))
+        return await _web_research(
             ctx,
             {
                 "query": query,
@@ -3304,10 +3761,31 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
                 "freshness": freshness,
                 "vertical": vertical,
                 "pages": 2 if index == 0 else 1,
-                "render_fallback": True,
-                "archive_fallback": True,
+                "render_fallback": orchestrator.mode is not WebMode.FAST_FACT,
+                "archive_fallback": orchestrator.mode is not WebMode.FAST_FACT,
+                "mode": orchestrator.mode.value,
+                "_web_orchestrator": orchestrator,
             },
         )
+
+    research_results = await orchestrator.bounded_map(
+        list(enumerate(active_queries)),
+        research_query,
+        concurrency=(1 if orchestrator.mode is WebMode.FAST_FACT else None),
+    )
+    for outcome in research_results:
+        query = active_queries[outcome.index]
+        if not outcome.ok or not isinstance(outcome.value, ToolRunResponse):
+            steps.append(
+                {
+                    "tool": "web.research",
+                    "ok": False,
+                    "summary": outcome.error or "Research query failed.",
+                    "query": query,
+                }
+            )
+            continue
+        researched = outcome.value
         steps.append(
             {
                 "tool": "web.research",
@@ -3344,14 +3822,6 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
             evidence_id = str(source.get("evidence_id") or "")
             if evidence_id and evidence_id not in evidence_ids:
                 evidence_ids.append(evidence_id)
-        diverse_count = len(
-            _web_answer_diverse_sources(
-                list(sources_by_url.values()),
-                max_sources=max_sources,
-            )
-        )
-        if diverse_count >= max_sources and evidence_ids:
-            break
 
     ranked_candidates = sorted(
         sources_by_url.values(),
@@ -3369,6 +3839,12 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
         ranked_candidates,
         max_sources=max_sources,
     )
+    shopping_summary: dict[str, Any] | None = None
+    if orchestrator.mode is WebMode.AGGRESSIVE_SHOPPING:
+        ranked_sources, _filtered, shopping_summary = orchestrator.enrich_shopping_sources(
+            ranked_sources
+        )
+        ranked_sources = ranked_sources[:max_sources]
     ranked_evidence_ids = [
         str(item.get("evidence_id") or "")
         for item in ranked_sources
@@ -3376,7 +3852,12 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
     ]
     verification = await _web_verify(
         ctx,
-        {"claim": question, "evidence_ids": ranked_evidence_ids[:8]},
+        {
+            "claim": question,
+            "evidence_ids": ranked_evidence_ids[:8],
+            "mode": orchestrator.mode.value,
+            "_web_orchestrator": orchestrator,
+        },
     )
     steps.append({"tool": "web.verify", "ok": verification.ok, "summary": verification.summary})
     verification_data = (
@@ -3385,9 +3866,13 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
         else {}
     )
     verification_dict = verification_data if isinstance(verification_data, dict) else {}
-    if _web_answer_looks_like_shopping(_repair_mojibake(question).lower()) and (
-        _web_answer_price_sensitive_question(question)
-        or _web_answer_weak_shopping_sources(ranked_sources, verification_dict)
+    if (
+        orchestrator.mode is not WebMode.AGGRESSIVE_SHOPPING
+        and _web_answer_looks_like_shopping(_repair_mojibake(question).lower())
+        and (
+            _web_answer_price_sensitive_question(question)
+            or _web_answer_weak_shopping_sources(ranked_sources, verification_dict)
+        )
     ):
         ranked_sources = _web_answer_strong_shopping_sources(
             question,
@@ -3414,14 +3899,25 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
         sources=ranked_sources,
         verification=verification_dict,
     ):
-        synthesis = await _web_answer_synthesis(
-            ctx,
-            question=question,
-            queries=queries,
-            sources=ranked_sources,
-            verification=verification_dict,
-            fallback_answer=fallback_answer,
-        )
+        remaining = orchestrator.budget.remaining_sec()
+        if remaining <= 0:
+            synthesis = {"attempted": False, "used": False, "reason": "deadline_exhausted"}
+        else:
+            try:
+                synthesis = await asyncio.wait_for(
+                    _web_answer_synthesis(
+                        ctx,
+                        question=question,
+                        queries=queries,
+                        sources=ranked_sources,
+                        verification=verification_dict,
+                        fallback_answer=fallback_answer,
+                    ),
+                    timeout=remaining,
+                )
+            except TimeoutError:
+                orchestrator.budget.warn("Web run deadline exhausted during synthesis.")
+                synthesis = {"attempted": True, "used": False, "reason": "deadline_exhausted"}
         if bool(synthesis.get("used")) and str(synthesis.get("answer") or "").strip():
             answer = str(synthesis["answer"]).strip()
     elif synthesis_enabled:
@@ -3451,6 +3947,7 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
         "region": region,
         "freshness": freshness or None,
         "vertical": vertical,
+        "mode": orchestrator.mode.value,
         "preferred_domains": preferred_domains,
         "answer": answer,
         "sources": ranked_sources,
@@ -3460,7 +3957,9 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
         "verification": verification_dict,
         "confidence": confidence,
         "cards": cards,
+        "shopping": shopping_summary,
         "synthesis": synthesis,
+        "orchestration": orchestrator.metadata(),
         "cache": {
             "hit": False,
             "enabled": use_cache,
@@ -3657,7 +4156,7 @@ async def _fetch_public_document(
     source: str,
 ) -> dict[str, Any]:
     try:
-        current_url = _validate_public_http_url(raw_url)
+        current_url = await _validate_public_http_url_async(raw_url)
     except ValueError as exc:
         return {"ok": False, "summary": str(exc), "data": {"url": raw_url}}
     rate_block = _web_rate_limit_block(ctx.storage, current_url)
@@ -3689,7 +4188,7 @@ async def _fetch_public_document(
                             }
                         )
                         try:
-                            current_url = _validate_public_http_url(next_url)
+                            current_url = await _validate_public_http_url_async(next_url)
                         except ValueError as exc:
                             return {
                                 "ok": False,
@@ -3751,7 +4250,7 @@ async def _web_fetch(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     max_chars = _int_arg(args.get("max_chars"), default=6000, minimum=256, maximum=20000)
     use_cache = _bool_arg(args.get("use_cache"), default=True)
     try:
-        current_url = _validate_public_http_url(raw_url)
+        current_url = await _validate_public_http_url_async(raw_url)
     except ValueError as exc:
         return ToolRunResponse(tool="web.fetch", ok=False, summary=str(exc))
     requested_url = current_url
@@ -3800,7 +4299,7 @@ async def _web_fetch(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
                             }
                         )
                         try:
-                            current_url = _validate_public_http_url(next_url)
+                            current_url = await _validate_public_http_url_async(next_url)
                         except ValueError as exc:
                             return ToolRunResponse(
                                 tool="web.fetch",
@@ -3925,7 +4424,7 @@ async def _web_archive(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespons
     timestamp = re.sub(r"[^0-9]", "", str(args.get("timestamp") or ""))[:14]
     max_chars = _int_arg(args.get("max_chars"), default=6000, minimum=256, maximum=20000)
     try:
-        target_url = _validate_public_http_url(raw_url)
+        target_url = await _validate_public_http_url_async(raw_url)
     except ValueError as exc:
         return ToolRunResponse(tool="web.archive", ok=False, summary=str(exc))
 
@@ -4033,7 +4532,7 @@ async def _web_feed(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     raw_url = str(args.get("url") or "").strip()
     limit = _int_arg(args.get("limit"), default=10, minimum=1, maximum=30)
     try:
-        feed_url = _validate_public_http_url(raw_url)
+        feed_url = await _validate_public_http_url_async(raw_url)
     except ValueError as exc:
         return ToolRunResponse(tool="web.feed", ok=False, summary=str(exc))
     rate_block = _web_rate_limit_block(ctx.storage, feed_url)
@@ -4474,6 +4973,8 @@ def _parse_caption_transcript(text: str) -> str:
     raw = text.strip()
     if not raw:
         return ""
+    if re.search(r"<!\s*(?:DOCTYPE|ENTITY)\b", raw, re.IGNORECASE):
+        return ""
     try:
         root = ElementTree.fromstring(raw)
     except ElementTree.ParseError:
@@ -4507,6 +5008,8 @@ def _extract_html_transcript(html: str) -> str:
 def _parse_feed_entries(text: str, *, limit: int) -> tuple[str, list[dict[str, str]]]:
     """Parse RSS 2.0 / RDF / Atom into (feed_title, entries). Raises ValueError."""
 
+    if re.search(r"<!\s*(?:DOCTYPE|ENTITY)\b", text, re.IGNORECASE):
+        raise ValueError("DTD and entity declarations are not allowed in feeds")
     try:
         root = ElementTree.fromstring(text.strip())
     except ElementTree.ParseError as exc:
@@ -4759,13 +5262,13 @@ def _web_watch_jobs(operations: OperationsManager) -> list[dict[str, Any]]:
     return [job for job in operations.list_jobs() if job.get("kind") == "web.watch"]
 
 
-def _web_watch_add(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+async def _web_watch_add(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     raw_url = str(args.get("url") or "").strip()
     label = " ".join(str(args.get("label") or "").split())[:120]
     pattern = str(args.get("pattern") or "").strip()[:400]
     cadence = str(args.get("cadence") or WEB_WATCH_DEFAULT_CADENCE).strip().lower()[:40]
     try:
-        url = _validate_public_http_url(raw_url)
+        url = await _validate_public_http_url_async(raw_url)
     except ValueError as exc:
         return ToolRunResponse(tool="web.watch.add", ok=False, summary=str(exc))
     if pattern:
@@ -4913,7 +5416,7 @@ async def _web_download(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
         maximum=50_000_000,
     )
     try:
-        current_url = _validate_public_http_url(raw_url)
+        current_url = await _validate_public_http_url_async(raw_url)
     except ValueError as exc:
         return ToolRunResponse(tool="web.download", ok=False, summary=str(exc))
     rate_block = _web_rate_limit_block(ctx.storage, current_url)
@@ -4953,7 +5456,7 @@ async def _web_download(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
                             }
                         )
                         try:
-                            current_url = _validate_public_http_url(next_url)
+                            current_url = await _validate_public_http_url_async(next_url)
                         except ValueError as exc:
                             return ToolRunResponse(
                                 tool="web.download",
@@ -5154,7 +5657,7 @@ async def _web_render(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespons
     timeout_sec = _int_arg(args.get("timeout_sec"), default=25, minimum=5, maximum=60)
     scroll_passes = _int_arg(args.get("scroll_passes"), default=0, minimum=0, maximum=12)
     try:
-        url = _validate_public_http_url(raw_url)
+        url = await _validate_public_http_url_async(raw_url)
         parsed = urlparse(url)
         addresses = _public_resolved_addresses(str(parsed.hostname or ""))
     except ValueError as exc:
@@ -5177,25 +5680,15 @@ async def _web_render(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespons
             data={"url": url},
         )
 
-    if scroll_passes:
-        result = await _run_headless_cdp_render(
-            browser,
-            url,
-            addresses=addresses,
-            wait_ms=wait_ms,
-            timeout_sec=timeout_sec,
-            max_chars=max_chars,
-            scroll_passes=scroll_passes,
-        )
-    else:
-        result = await asyncio.to_thread(
-            _run_headless_dump_dom,
-            browser,
-            url,
-            addresses=addresses,
-            wait_ms=wait_ms,
-            timeout_sec=timeout_sec,
-        )
+    result = await _run_headless_cdp_render(
+        browser,
+        url,
+        addresses=addresses,
+        wait_ms=wait_ms,
+        timeout_sec=timeout_sec,
+        max_chars=max_chars,
+        scroll_passes=scroll_passes,
+    )
     if not result["ok"]:
         return ToolRunResponse(
             tool="web.render",
@@ -5203,12 +5696,27 @@ async def _web_render(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespons
             summary=str(result["summary"]),
             data={"url": url, **result},
         )
+    raw_final_url = str(result.get("url") or url)
+    try:
+        final_url = await _validate_public_http_url_async(raw_final_url)
+    except ValueError as exc:
+        _web_rate_limit_record(_ctx.storage, url, ok=False, blocked=True)
+        return ToolRunResponse(
+            tool="web.render",
+            ok=False,
+            summary=f"Blocked final rendered URL: {exc}",
+            data={
+                "requested_url": url,
+                "final_url": raw_final_url,
+                "blocked_final_url": True,
+            },
+        )
     html = str(result.get("html") or "")
     text = str(result.get("text") or "") if result.get("text") is not None else _html_to_text(html)
     truncated = len(text) > max_chars
     if truncated:
         text = text[:max_chars].rstrip()
-    safety = _web_content_safety(source="web.render", url=url, text=text)
+    safety = _web_content_safety(source="web.render", url=final_url, text=text)
     consent_wall = bool(safety["consent_wall_detected"])
     if _web_response_blocked(200, text):
         _web_rate_limit_record(_ctx.storage, url, ok=False, blocked=True)
@@ -5217,7 +5725,8 @@ async def _web_render(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespons
             ok=False,
             summary="Rendered page appears blocked by the remote site.",
             data={
-                "url": url,
+                "url": final_url,
+                "requested_url": url,
                 "browser": str(browser),
                 "text": text,
                 "html_chars": len(html),
@@ -5234,7 +5743,8 @@ async def _web_render(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespons
             ok=False,
             summary="Rendered page appears to be a cookie/consent wall.",
             data={
-                "url": url,
+                "url": final_url,
+                "requested_url": url,
                 "browser": str(browser),
                 "text": text,
                 "html_chars": len(html),
@@ -5251,7 +5761,7 @@ async def _web_render(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespons
     evidence = _store_web_evidence(
         _ctx.storage,
         source="web.render",
-        url=url,
+        url=final_url,
         title="",
         text=text,
         content_type="text/html",
@@ -5263,13 +5773,14 @@ async def _web_render(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespons
             "scroll_passes": scroll_passes,
         },
     )
-    _web_rate_limit_record(_ctx.storage, url, ok=True)
+    _web_rate_limit_record(_ctx.storage, final_url, ok=True)
     return ToolRunResponse(
         tool="web.render",
         ok=True,
         summary=summary,
         data={
-            "url": url,
+            "url": final_url,
+            "requested_url": url,
             "browser": str(browser),
             "text": text,
             "html_chars": len(html),
@@ -5285,7 +5796,7 @@ async def _web_render(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespons
 
 async def _internet_observability(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     limit = _int_arg(args.get("limit"), default=120, minimum=10, maximum=300)
-    snapshot = _internet_observability_snapshot(ctx.storage, limit=limit)
+    snapshot = internet_observability_snapshot(ctx.storage, limit=limit)
     return ToolRunResponse(
         tool="internet.observability",
         ok=True,
@@ -5409,7 +5920,7 @@ async def _internet_smoke(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResp
         },
     )
     checks.append(_smoke_check("web.verify", verified))
-    observability = _internet_observability_snapshot(ctx.storage, limit=120)
+    observability = internet_observability_snapshot(ctx.storage, limit=120)
     required_ok = all(
         item["ok"]
         for item in checks
@@ -6839,6 +7350,62 @@ def _validate_browser_url(raw_url: str, policy: dict[str, Any] | None = None) ->
     return parsed.geturl()
 
 
+def _browser_navigation_validator(
+    initial_url: str,
+    *,
+    policy: dict[str, Any] | None,
+) -> Callable[[str], str]:
+    """Keep public browser sessions from redirecting or loading private-network URLs."""
+    validated_initial = _validate_browser_url(initial_url, policy=policy)
+    initial_host = (urlparse(validated_initial).hostname or "").casefold()
+    allowed_private_hosts = {
+        str(item).casefold() for item in (policy or {}).get("allowed_hosts", [])
+    }
+    if (policy or {}).get("allow_localhost", True):
+        allowed_private_hosts.update({"localhost", "127.0.0.1", "::1"})
+    initial_scope = _browser_host_network_scope(initial_host)
+    if initial_scope == "private" and initial_host not in allowed_private_hosts:
+        raise ValueError(
+            f"Private browser target {initial_host!r} is not explicitly allowed by policy."
+        )
+
+    def validate(candidate: str) -> str:
+        validated = _validate_browser_url(candidate, policy=policy)
+        host = (urlparse(validated).hostname or "").casefold()
+        scope = _browser_host_network_scope(host)
+        if initial_scope == "public" and scope != "public":
+            raise ValueError(
+                f"Public browser content cannot request private host {host!r}."
+            )
+        if scope == "private" and host not in allowed_private_hosts:
+            raise ValueError(
+                f"Private browser host {host!r} is not explicitly allowed by policy."
+            )
+        return validated
+
+    return validate
+
+
+def _browser_host_network_scope(host: str) -> Literal["public", "private"]:
+    addresses = _resolved_ip_addresses(host)
+    if any(
+        not address.is_loopback
+        and (
+            address.is_link_local
+            or address.is_multicast
+            or address.is_reserved
+            or address.is_unspecified
+        )
+        for address in addresses
+    ):
+        raise ValueError(f"Browser host {host!r} resolves to a forbidden network range.")
+    public = [address for address in addresses if address.is_global]
+    private = [address for address in addresses if not address.is_global]
+    if public and private:
+        raise ValueError(f"Browser host {host!r} has mixed public/private DNS answers.")
+    return "public" if public else "private"
+
+
 class _PublicOnlyAsyncNetworkBackend(AsyncNetworkBackend):
     """httpcore network backend that pins DNS to public IPs resolved by Jarvis."""
 
@@ -6853,7 +7420,7 @@ class _PublicOnlyAsyncNetworkBackend(AsyncNetworkBackend):
         local_address: str | None = None,
         socket_options: list[SOCKET_OPTION] | None = None,
     ) -> AsyncNetworkStream:
-        addresses = _public_resolved_addresses(host)
+        addresses = await asyncio.to_thread(_public_resolved_addresses, host)
         last_error: Exception | None = None
         for address in addresses:
             try:
@@ -6915,6 +7482,10 @@ def _validate_public_http_url(raw_url: str) -> str:
         raise ValueError("URL host is required.")
     _public_resolved_addresses(parsed.hostname)
     return parsed.geturl()
+
+
+async def _validate_public_http_url_async(raw_url: str) -> str:
+    return await asyncio.to_thread(_validate_public_http_url, raw_url)
 
 
 def _normalize_search_region(value: Any) -> str:
@@ -7082,19 +7653,16 @@ def _search_api_readiness() -> dict[str, Any]:
         "brave_api": {
             "configured": bool(_env_secret("BRAVE_SEARCH_API_KEY")),
             "env": "BRAVE_SEARCH_API_KEY",
-            "key": _masked_env_secret("BRAVE_SEARCH_API_KEY"),
             "verticals": ["web", "news", "images"],
         },
         "tavily_api": {
             "configured": bool(_env_secret("TAVILY_API_KEY")),
             "env": "TAVILY_API_KEY",
-            "key": _masked_env_secret("TAVILY_API_KEY"),
             "verticals": ["web", "news"],
         },
         "serper_api": {
             "configured": bool(_env_secret("SERPER_API_KEY")),
             "env": "SERPER_API_KEY",
-            "key": _masked_env_secret("SERPER_API_KEY"),
             "verticals": ["web", "news", "images", "shopping", "places", "scholar"],
         },
     }
@@ -7109,11 +7677,61 @@ def _env_secret(name: str) -> str:
     return os.environ.get(f"JARVIS_{name}", os.environ.get(name, "")).strip()
 
 
-def _masked_env_secret(name: str) -> str | None:
-    value = _env_secret(name)
-    if not value:
-        return None
-    return f"set:{len(value)}:{value[-4:].rjust(4, '*')}"
+def _search_provider_auth_headers(source: str) -> dict[str, str]:
+    if source == "brave_api":
+        key = _env_secret("BRAVE_SEARCH_API_KEY")
+        return {"X-Subscription-Token": key} if key else {}
+    if source == "tavily_api":
+        key = _env_secret("TAVILY_API_KEY")
+        return {"Authorization": f"Bearer {key}"} if key else {}
+    if source == "serper_api":
+        key = _env_secret("SERPER_API_KEY")
+        return {"X-API-KEY": key} if key else {}
+    return {}
+
+
+def _redact_tool_response_credentials(response: ToolRunResponse) -> ToolRunResponse:
+    return ToolRunResponse(
+        tool=response.tool,
+        ok=response.ok,
+        summary=str(_redact_search_credentials(response.summary)),
+        data=_redact_search_credentials(response.data),
+    )
+
+
+def _redact_search_credentials(value: Any) -> Any:
+    secrets = tuple(
+        sorted(
+            {
+                secret
+                for name in (
+                    "BRAVE_SEARCH_API_KEY",
+                    "TAVILY_API_KEY",
+                    "SERPER_API_KEY",
+                )
+                if len(secret := _env_secret(name)) >= 4
+            },
+            key=len,
+            reverse=True,
+        )
+    )
+    if not secrets:
+        return value
+    if isinstance(value, str):
+        redacted = value
+        for secret in secrets:
+            redacted = redacted.replace(secret, "[REDACTED]")
+        return redacted
+    if isinstance(value, dict):
+        return {
+            str(_redact_search_credentials(key)): _redact_search_credentials(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_search_credentials(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_search_credentials(item) for item in value)
+    return value
 
 
 def _web_provider_stats_record(
@@ -7138,7 +7756,7 @@ def _web_provider_stats_record(
     current["last_vertical"] = vertical
     current["last_ok"] = bool(ok)
     if error:
-        current["last_error"] = _short_text(error, 240)
+        current["last_error"] = _short_text(str(_redact_search_credentials(error)), 240)
     elif ok:
         current.pop("last_error", None)
     records[source] = current
@@ -7160,7 +7778,6 @@ def _api_search_request(
     limit: int,
 ) -> dict[str, Any]:
     if source == "brave_api":
-        key = _env_secret("BRAVE_SEARCH_API_KEY")
         endpoint = {
             "news": "news/search",
             "images": "images/search",
@@ -7180,22 +7797,18 @@ def _api_search_request(
             "source": source,
             "page": 1,
             "url": f"https://api.search.brave.com/res/v1/{endpoint}?{urlencode(params)}",
-            "headers": {"Accept": "application/json", "X-Subscription-Token": key},
+            "headers": {"Accept": "application/json"},
             "json_response": True,
-            "missing_key": not key,
+            "missing_key": not _env_secret("BRAVE_SEARCH_API_KEY"),
             "env": "BRAVE_SEARCH_API_KEY",
         }
     if source == "tavily_api":
-        key = _env_secret("TAVILY_API_KEY")
         return {
             "source": source,
             "page": 1,
             "url": "https://api.tavily.com/search",
             "method": "POST",
-            "headers": {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {key}",
-            },
+            "headers": {"Content-Type": "application/json"},
             "json": {
                 "query": query,
                 "max_results": min(limit, 10),
@@ -7204,11 +7817,10 @@ def _api_search_request(
                 "include_answer": False,
             },
             "json_response": True,
-            "missing_key": not key,
+            "missing_key": not _env_secret("TAVILY_API_KEY"),
             "env": "TAVILY_API_KEY",
         }
     if source == "serper_api":
-        key = _env_secret("SERPER_API_KEY")
         endpoint = {
             "news": "news",
             "images": "images",
@@ -7234,10 +7846,10 @@ def _api_search_request(
             "page": 1,
             "url": f"https://google.serper.dev/{endpoint}",
             "method": "POST",
-            "headers": {"Content-Type": "application/json", "X-API-KEY": key},
+            "headers": {"Content-Type": "application/json"},
             "json": body,
             "json_response": True,
-            "missing_key": not key,
+            "missing_key": not _env_secret("SERPER_API_KEY"),
             "env": "SERPER_API_KEY",
         }
     return {"source": source, "page": 1, "url": "", "missing_key": True}
@@ -8049,7 +8661,13 @@ def _web_search_cached_results_from_evidence(
             domain_match = bool(
                 preferred_domains and _web_answer_domain_matches(url, preferred_domains)
             )
-            if query_terms and overlap == 0 and not domain_match:
+            if not _cached_search_result_relevant(
+                query_terms,
+                item_terms,
+                overlap=overlap,
+                domain_match=domain_match,
+                vertical=vertical,
+            ):
                 continue
             score = (
                 overlap * 3.0
@@ -8083,6 +8701,30 @@ def _web_search_cached_results_from_evidence(
     for rank, (_score, item) in enumerate(candidates[:limit], start=1):
         results.append({**item, "rank": rank})
     return results
+
+
+def _cached_search_result_relevant(
+    query_terms: set[str],
+    item_terms: set[str],
+    *,
+    overlap: int,
+    domain_match: bool,
+    vertical: str,
+) -> bool:
+    if not query_terms:
+        return domain_match
+    if overlap <= 0:
+        return False
+    if len(query_terms) == 1:
+        return overlap == 1
+    coverage = overlap / len(query_terms)
+    # A site: constraint is a useful prior, but never sufficient by itself.
+    # One generic shared word must not resurrect unrelated stale evidence.
+    if domain_match:
+        return overlap >= 2 or coverage >= 0.5
+    if vertical == "shopping":
+        return overlap >= 2 and coverage >= 0.4
+    return overlap >= 2 and coverage >= 0.35
 
 
 def _web_search_items_from_evidence_record(record: dict[str, Any]) -> list[dict[str, str]]:
@@ -8154,9 +8796,10 @@ def _web_answer_cache_key(
     freshness: str,
     vertical: str,
     max_sources: int,
+    mode: str,
 ) -> str:
     payload = {
-        "version": 4,
+        "version": 5,
         "question": question,
         "explicit_query": explicit_query,
         "queries": queries,
@@ -8164,6 +8807,7 @@ def _web_answer_cache_key(
         "freshness": freshness,
         "vertical": vertical,
         "max_sources": max_sources,
+        "mode": mode,
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
@@ -9041,9 +9685,12 @@ def _web_answer_synthesis_rejection(answer: str, sources: list[dict[str, Any]]) 
     if stripped.startswith(("{", "[")):
         try:
             json.loads(stripped)
-            return "json_not_answer"
         except json.JSONDecodeError:
-            pass
+            is_json_document = False
+        else:
+            is_json_document = True
+        if is_json_document:
+            return "json_not_answer"
     if not _web_answer_mentions_source(answer, sources):
         return "missing_source_url"
     return ""
@@ -9838,43 +10485,85 @@ def _extract_address_hints(text: str) -> list[str]:
 
 def _verify_claim_against_sources(claim: str, sources: list[dict[str, Any]]) -> dict[str, Any]:
     claim_terms = _verify_terms(claim)
-    scored = []
+    scored: list[dict[str, Any]] = []
     for source in sources[:12]:
-        text = " ".join(
-            str(source.get(key) or "")
-            for key in ("title", "url", "text")
-        )
+        text = " ".join(str(source.get(key) or "") for key in ("title", "text"))
         source_terms = _verify_terms(text)
         overlap = sorted(claim_terms & source_terms)
         coverage = len(overlap) / max(1, len(claim_terms))
+        stance, contradiction_reasons = _verification_source_stance(
+            claim,
+            text,
+            claim_terms=claim_terms,
+            coverage=coverage,
+        )
         scored.append(
             {
                 "url": source.get("url"),
                 "domain": _url_domain(str(source.get("url") or "")),
                 "coverage": round(coverage, 3),
+                "stance": stance,
+                "contradiction_reasons": contradiction_reasons,
                 "matched_terms": overlap[:20],
                 "excerpt": _verification_excerpt(str(source.get("text") or ""), claim_terms),
             }
         )
-    useful = [item for item in scored if float(item["coverage"]) >= 0.28]
-    strong = [item for item in scored if float(item["coverage"]) >= 0.55]
-    domains = {str(item.get("domain") or "") for item in useful if item.get("domain")}
-    if len(strong) >= 1 and len(domains) >= 2:
+    supporting = [item for item in scored if item["stance"] == "supporting"]
+    contradicting = [item for item in scored if item["stance"] == "contradicting"]
+    mixed_sources = [item for item in scored if item["stance"] == "mixed"]
+    strong_support = [item for item in supporting if float(item["coverage"]) >= 0.55]
+    support_domains = {
+        str(item.get("domain") or "") for item in supporting if item.get("domain")
+    }
+    contradiction_domains = {
+        str(item.get("domain") or "") for item in contradicting if item.get("domain")
+    }
+    useful_domains = {
+        str(item.get("domain") or "")
+        for item in scored
+        if item.get("domain") and item["stance"] != "irrelevant"
+    }
+    if mixed_sources or (supporting and contradicting):
+        verdict = "mixed"
+        confidence = min(
+            0.68,
+            0.4
+            + 0.06 * len(support_domains | contradiction_domains)
+            + 0.04 * len(mixed_sources),
+        )
+    elif contradicting:
+        verdict = "contradicted"
+        confidence = min(
+            0.8,
+            0.5 + 0.08 * len(contradiction_domains) + 0.04 * len(contradicting),
+        )
+    elif strong_support and len(support_domains) >= 2:
         verdict = "supported"
-        confidence = min(0.92, 0.55 + 0.12 * len(domains) + 0.06 * len(strong))
-    elif useful:
+        confidence = min(
+            0.82,
+            0.52 + 0.08 * len(support_domains) + 0.04 * len(strong_support),
+        )
+    elif supporting:
         verdict = "partially_supported"
-        confidence = min(0.72, 0.32 + 0.1 * len(useful) + 0.05 * len(domains))
+        confidence = min(
+            0.58,
+            0.3 + 0.07 * len(supporting) + 0.04 * len(support_domains),
+        )
     else:
         verdict = "insufficient_evidence"
-        confidence = 0.2 if sources else 0.0
+        confidence = 0.15 if sources else 0.0
     matched = set().union(*(set(item["matched_terms"]) for item in scored)) if scored else set()
     missing_terms = sorted(claim_terms - matched)[:30]
     return {
         "verdict": verdict,
         "confidence": round(confidence, 3),
         "source_count": len(sources),
-        "independent_domains": sorted(domains),
+        "supporting_source_count": len(supporting),
+        "contradicting_source_count": len(contradicting),
+        "mixed_source_count": len(mixed_sources),
+        "independent_domains": sorted(useful_domains),
+        "supporting_domains": sorted(support_domains),
+        "contradicting_domains": sorted(contradiction_domains),
         "missing_terms": missing_terms,
         "coverage": scored,
     }
@@ -9882,11 +10571,176 @@ def _verify_claim_against_sources(claim: str, sources: list[dict[str, Any]]) -> 
 
 def _verify_terms(text: str) -> set[str]:
     terms = {
+        item
+        for item in _verification_tokens(text)
+        if item not in WEB_VERIFY_STOPWORDS
+        and (len(item) >= 3 or _verification_is_number(item))
+    }
+    return {item for item in terms if not item.isdigit() or len(item) >= 4}
+
+
+def _verify_terms_legacy(text: str) -> set[str]:
+    terms = {
         item.lower()
         for item in re.findall(r"[A-Za-zА-Яа-яЁё0-9]{3,}", text)
         if item.lower() not in WEB_VERIFY_STOPWORDS
     }
     return {item for item in terms if not item.isdigit() or len(item) >= 4}
+
+
+def _verification_source_stance(
+    claim: str,
+    source_text: str,
+    *,
+    claim_terms: set[str],
+    coverage: float,
+) -> tuple[str, list[str]]:
+    if coverage < 0.28 or not claim_terms:
+        return "irrelevant", []
+
+    reasons: list[str] = []
+    mixed_reasons: list[str] = []
+    claim_tokens = _verification_tokens(claim)
+    source_tokens = _verification_tokens(source_text)
+    claim_polarity = _verification_term_polarities(claim_tokens, claim_terms)
+    source_polarity = _verification_term_polarities(source_tokens, claim_terms)
+    for term in sorted(claim_terms & set(source_tokens)):
+        expected = claim_polarity.get(term) or {False}
+        observed = source_polarity.get(term) or {False}
+        if expected & observed:
+            if observed - expected:
+                mixed_reasons.append(f"mixed_polarity:{term}")
+            continue
+        reasons.append(f"negation_mismatch:{term}")
+
+    claim_status = _verification_statuses(claim)
+    source_status = _verification_statuses(source_text)
+    for axis, expected in claim_status.items():
+        observed = source_status.get(axis, set())
+        if not observed:
+            continue
+        if expected & observed:
+            if observed - expected:
+                mixed_reasons.append(f"mixed_status:{axis}")
+            continue
+        reasons.append(f"opposing_status:{axis}")
+
+    claim_numbers = _verification_numbers(claim)
+    source_numbers = _verification_numbers(source_text)
+    if claim_numbers and source_numbers and claim_numbers.isdisjoint(source_numbers):
+        reasons.append(
+            "numeric_conflict:"
+            + ",".join(sorted(claim_numbers))
+            + "!="
+            + ",".join(sorted(source_numbers)[:4])
+        )
+
+    normalized_claim = _verification_normalized(claim)
+    normalized_source = _verification_normalized(source_text)
+    if (
+        not re.search(r"\b(?:false|incorrect|untrue)\b", normalized_claim)
+        and re.search(
+            r"\b(?:claim|statement|report)\s+(?:is|was)\s+"
+            r"(?:false|incorrect|untrue)\b",
+            normalized_source,
+        )
+    ):
+        reasons.append("explicit_denial")
+
+    if reasons and mixed_reasons:
+        return "mixed", [*reasons, *mixed_reasons]
+    if reasons:
+        return "contradicting", reasons
+    if mixed_reasons:
+        return "mixed", mixed_reasons
+    return "supporting", []
+
+
+def _verification_tokens(text: str) -> list[str]:
+    normalized = _verification_normalized(text)
+    return re.findall(r"[^\W_]+(?:[.,][0-9]+)?", normalized, flags=re.UNICODE)
+
+
+def _verification_normalized(text: str) -> str:
+    normalized = text.casefold().replace("’", "'")
+    replacements = {
+        "can't": "can not",
+        "cannot": "can not",
+        "won't": "will not",
+        "isn't": "is not",
+        "aren't": "are not",
+        "wasn't": "was not",
+        "weren't": "were not",
+        "doesn't": "does not",
+        "don't": "do not",
+        "didn't": "did not",
+        "hasn't": "has not",
+        "haven't": "have not",
+        "hadn't": "had not",
+    }
+    for old, new in replacements.items():
+        normalized = normalized.replace(old, new)
+    return " ".join(normalized.split())
+
+
+def _verification_term_polarities(
+    tokens: list[str],
+    terms: set[str],
+) -> dict[str, set[bool]]:
+    negations = {"not", "no", "never", "neither", "without", "nor"}
+    polarities: dict[str, set[bool]] = {}
+    for index, token in enumerate(tokens):
+        if token not in terms:
+            continue
+        window = tokens[max(0, index - 4) : index]
+        negated = any(item in negations for item in window)
+        if "not" in window and "only" in window[window.index("not") + 1 :]:
+            negated = False
+        polarities.setdefault(token, set()).add(negated)
+    return polarities
+
+
+def _verification_statuses(text: str) -> dict[str, set[str]]:
+    normalized = _verification_normalized(text)
+    patterns = {
+        "availability": {
+            "positive": (r"\bin stock\b", r"\bavailable\b"),
+            "negative": (r"\bout of stock\b", r"\bnot in stock\b", r"\bunavailable\b"),
+        },
+        "compatibility": {
+            "positive": (r"\bcompatible\b", r"\bsupports?\b"),
+            "negative": (
+                r"\bincompatible\b",
+                r"\bunsupported\b",
+                r"\bdoes not support\b",
+            ),
+        },
+        "state": {
+            "positive": (r"\benabled\b", r"\bactive\b", r"\bpassed\b"),
+            "negative": (r"\bdisabled\b", r"\binactive\b", r"\bfailed\b"),
+        },
+    }
+    statuses: dict[str, set[str]] = {}
+    for axis, sides in patterns.items():
+        matched = {
+            side
+            for side, expressions in sides.items()
+            if any(re.search(expression, normalized) for expression in expressions)
+        }
+        if matched:
+            statuses[axis] = matched
+    return statuses
+
+
+def _verification_numbers(text: str) -> set[str]:
+    return {
+        item.replace(",", ".")
+        for item in re.findall(r"(?<![\w])\d+(?:[.,]\d+)?", text, flags=re.UNICODE)
+    }
+
+
+def _verification_is_number(value: str) -> bool:
+    return bool(re.fullmatch(r"\d+(?:[.,]\d+)?", value))
 
 
 def _verification_excerpt(text: str, claim_terms: set[str]) -> str:
@@ -10139,7 +10993,21 @@ def _pdf_text_is_useful(value: str) -> bool:
     return printable / max(1, len(clean)) > 0.85 and any(ch.isalnum() for ch in clean)
 
 
-def _internet_observability_snapshot(storage: JarvisStorage, *, limit: int) -> dict[str, Any]:
+def browser_handoff_snapshot(storage: JarvisStorage) -> dict[str, Any] | None:
+    """Return the current browser handoff without creating a tool-run record."""
+    handoff = storage.get_runtime_value(WEB_HANDOFF_KEY, None)
+    if not isinstance(handoff, dict) or handoff.get("status") == "cleared":
+        return None
+    return handoff
+
+
+def internet_observability_snapshot(
+    storage: JarvisStorage,
+    *,
+    limit: int = 120,
+) -> dict[str, Any]:
+    """Build an internet telemetry snapshot without polluting tool telemetry."""
+    limit = max(10, min(300, int(limit)))
     runs = storage.list_tool_runs(limit=limit)
     web_runs = [
         item
@@ -10178,7 +11046,7 @@ def _internet_observability_snapshot(storage: JarvisStorage, *, limit: int) -> d
     evidence = storage.get_runtime_value(WEB_EVIDENCE_KEY, [])
     research = storage.get_runtime_value(WEB_RESEARCH_KEY, [])
     answer_cache = storage.get_runtime_value(WEB_ANSWER_CACHE_KEY, [])
-    handoff = storage.get_runtime_value(WEB_HANDOFF_KEY, None)
+    handoff = browser_handoff_snapshot(storage)
     rates = [
         item
         for item in storage.list_runtime_values(prefix=WEB_RATE_KEY_PREFIX)
@@ -10207,7 +11075,7 @@ def _internet_observability_snapshot(storage: JarvisStorage, *, limit: int) -> d
         "verticals": ["web", "news", "images", "shopping", "places", "scholar"],
         "top_domains": sorted(domains.items(), key=lambda item: item[1], reverse=True)[:12],
         "blocked_recent": blocked[:12],
-        "handoff": handoff if isinstance(handoff, dict) else None,
+        "handoff": handoff,
         "cooldowns": cooldowns[:12],
     }
 
@@ -10568,29 +11436,48 @@ async def _run_headless_cdp_render(
                 creationflags=_hidden_process_flags(),
             )
             await _wait_for_headless_debugger(debug_url, timeout_sec=min(timeout_sec, 10))
-            result = await scroll_chrome_page(
-                url=url,
-                direction="bottom",
-                pixels=900,
-                passes=scroll_passes,
-                max_chars=max_chars + 1,
-                wait_ms=wait_ms,
-                debug_url=debug_url,
-            )
+            if scroll_passes:
+                operation = scroll_chrome_page(
+                    url=url,
+                    direction="bottom",
+                    pixels=900,
+                    passes=scroll_passes,
+                    max_chars=max_chars + 1,
+                    wait_ms=wait_ms,
+                    debug_url=debug_url,
+                    url_validator=_validate_public_http_url,
+                )
+            else:
+                operation = read_chrome_page(
+                    url=url,
+                    max_chars=max_chars + 1,
+                    wait_ms=wait_ms,
+                    debug_url=debug_url,
+                    url_validator=_validate_public_http_url,
+                )
+            page_result = await asyncio.wait_for(operation, timeout=timeout_sec)
+            snapshot = page_result.snapshot if scroll_passes else page_result
             return {
-                "ok": result.ok and bool(result.snapshot.text.strip()),
-                "summary": result.summary,
+                "ok": bool(snapshot.text.strip()) and (
+                    bool(page_result.ok) if scroll_passes else True
+                ),
+                "summary": (
+                    page_result.summary
+                    if scroll_passes
+                    else "Headless CDP rendered page."
+                ),
                 "browser": str(browser),
                 "returncode": None,
                 "html": "",
                 "html_chars": 0,
-                "text": result.snapshot.text,
+                "text": snapshot.text,
+                "url": snapshot.url,
                 "stderr": "",
                 "resolver_rules": resolver_rules,
-                "scroll": result.target_info or {},
+                "scroll": page_result.target_info or {} if scroll_passes else {},
                 "debug_url": debug_url,
             }
-        except subprocess.TimeoutExpired:
+        except (TimeoutError, subprocess.TimeoutExpired):
             return {
                 "ok": False,
                 "summary": f"Headless browser timed out after {timeout_sec}s.",
@@ -10650,11 +11537,11 @@ def _headless_host_resolver_rules(
     addresses: list[ipaddress.IPv4Address | ipaddress.IPv6Address],
 ) -> str:
     if not host or not addresses:
-        return "EXCLUDE localhost"
+        return "MAP * 0.0.0.0"
     address = next((item for item in addresses if item.version == 4), addresses[0])
     # Keep SNI/Host as the original hostname while making Chrome use the public
     # IP Jarvis already validated. The wildcard sink reduces background lookups.
-    return f"MAP {host} {address}, MAP * 0.0.0.0, EXCLUDE localhost"
+    return f"MAP {host} {address}, MAP * 0.0.0.0"
 
 
 def _hidden_process_flags() -> int:

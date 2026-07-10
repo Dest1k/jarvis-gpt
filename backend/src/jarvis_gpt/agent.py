@@ -194,6 +194,9 @@ DEFAULT_MAX_TOOL_STEPS = 4
 AGENTIC_TOOL_DENYLIST = frozenset(
     {"memory.save", "learning.tick", "mission.brief", "browser.open", "browser.open_many"}
 )
+SAFE_DIRECT_NATIVE_ACTIONS = frozenset(
+    {"capabilities", "screen.capture", "window.list", "wmi.query"}
+)
 
 # When lexical file search finds nothing, recent chunks are only allowed into
 # the prompt if their fuzzy-vector similarity to the query clears this bar.
@@ -499,6 +502,7 @@ class AgentRuntime:
         self.bus = bus
         self.tools = tools or ToolRegistry(settings, storage, llm)
         self.embeddings = EmbeddingBackend(settings)
+        self._mission_report_lock = asyncio.Lock()
 
     async def chat(
         self,
@@ -1082,33 +1086,58 @@ class AgentRuntime:
                 result=result,
             )
 
-        task = self.storage.next_mission_task(mission_id)
+        task = self.storage.claim_next_mission_task(mission_id)
         if task is None:
+            refreshed = self.storage.get_mission(mission_id) or mission
+            busy = any(item.get("status") == "running" for item in refreshed.get("tasks", []))
+            blocked = any(item.get("status") == "blocked" for item in refreshed.get("tasks", []))
             result = ToolRunResponse(
                 tool="mission.execute_next",
-                ok=True,
-                summary="No pending mission tasks.",
-                data={"mission_id": mission_id},
+                ok=not busy and not blocked,
+                summary=(
+                    "Another mission step is already running."
+                    if busy
+                    else "Mission execution is blocked; resolve the blocked step first."
+                    if blocked
+                    else "No pending mission tasks."
+                ),
+                data={"mission_id": mission_id, "busy": busy, "blocked": blocked},
             )
             return MissionExecutionResponse(
-                mission=Mission.model_validate(mission),
+                mission=Mission.model_validate(refreshed),
                 task=None,
                 result=result,
             )
 
-        running_task = self.storage.update_mission_task(
-            task["id"],
-            mission_id=mission_id,
-            status="running",
-        )
-        if self.settings.llm_enabled:
-            result = await self._execute_mission_step_agentic(mission, task)
-        else:
-            result = await self.tools.run(
-                "mission.brief",
-                {"goal": mission["goal"], "task_title": task["title"]},
+        running_task = task
+        try:
+            if self.settings.llm_enabled:
+                result = await self._execute_mission_step_agentic(mission, task)
+            else:
+                result = await self.tools.run(
+                    "mission.brief",
+                    {"goal": mission["goal"], "task_title": task["title"]},
+                    mission_id=mission_id,
+                    task_id=task["id"],
+                )
+        except asyncio.CancelledError:
+            self.storage.update_mission_task(
+                task["id"],
                 mission_id=mission_id,
-                task_id=task["id"],
+                status="blocked",
+                notes="Execution was cancelled; review the step before retrying.",
+            )
+            raise
+        except Exception as exc:  # keep durable mission state out of a stuck running state
+            result = ToolRunResponse(
+                tool="mission.execute_next",
+                ok=False,
+                summary=f"Mission step failed: {type(exc).__name__}: {exc}"[:2000],
+                data={
+                    "mission_id": mission_id,
+                    "task_id": task["id"],
+                    "error": type(exc).__name__,
+                },
             )
         notes = _task_notes_from_result(result)
         final_status = "done" if result.ok else "blocked"
@@ -1173,16 +1202,24 @@ class AgentRuntime:
         stopped_reason = "empty"
         for _ in range(budget):
             if self.storage.next_mission_task(mission_id) is None:
+                current = self.storage.get_mission(mission_id) or mission
+                if any(item.get("status") == "blocked" for item in current.get("tasks", [])):
+                    stopped_reason = "blocked"
+                elif any(item.get("status") == "running" for item in current.get("tasks", [])):
+                    stopped_reason = "busy"
                 break
             response = await self.execute_next_mission_step(mission_id)
             steps.append(MissionStepOutcome(task=response.task, result=response.result))
+            if response.result.data.get("busy"):
+                stopped_reason = "busy"
+                break
             if not response.result.ok or (response.task and response.task.status == "blocked"):
                 stopped_reason = "blocked"
                 break
 
         refreshed = self.storage.get_mission(mission_id) or mission
-        completed = self.storage.next_mission_task(mission_id) is None
-        if stopped_reason != "blocked":
+        completed = refreshed.get("status") == "done"
+        if stopped_reason not in {"blocked", "busy"}:
             stopped_reason = ("completed" if steps else "empty") if completed else "budget"
         final_report: str | None = None
         if completed:
@@ -1212,6 +1249,10 @@ class AgentRuntime:
         )
 
     async def _maybe_finalize_mission(self, mission_id: str) -> dict[str, Any] | None:
+        async with self._mission_report_lock:
+            return await self._finalize_mission_locked(mission_id)
+
+    async def _finalize_mission_locked(self, mission_id: str) -> dict[str, Any] | None:
         """When a mission reaches ``done``, synthesize the operator deliverable once.
 
         The report is idempotent (stored in runtime KV), saved to mission memory
@@ -1514,85 +1555,49 @@ class AgentRuntime:
             active_console,
         )
         if native_action is not None:
-            result = await self.tools.run(
-                "windows.native",
-                {
-                    "action": native_action.action,
-                    "payload": native_action.payload,
-                    "timeout_sec": 30,
-                },
-                allow_danger=True,
-            )
-            events = [
-                ChatEvent(
-                    type="tool_call",
-                    title=f"windows.native:{native_action.action}",
-                    content=result.summary,
-                    payload={
-                        "tool": result.tool,
-                        "ok": result.ok,
-                        "action": native_action.action,
-                    },
-                )
-            ]
-            answer_action = native_action
-            fallback_note = ""
-            if not result.ok and native_action.fallback is not None:
-                failed_summary = result.summary
-                fallback = native_action.fallback
-                result = await self.tools.run(
+            arguments = {
+                "action": native_action.action,
+                "payload": native_action.payload,
+                "timeout_sec": 30,
+            }
+            if native_action.action not in SAFE_DIRECT_NATIVE_ACTIONS:
+                return self._request_direct_tool_approval(
                     "windows.native",
-                    {
-                        "action": fallback.action,
-                        "payload": fallback.payload,
-                        "timeout_sec": 30,
-                    },
-                    allow_danger=True,
+                    arguments,
+                    context=context,
+                    description=(
+                        "Direct native Windows action requested by the operator: "
+                        f"{native_action.action}."
+                    ),
                 )
-                events.append(
-                    ChatEvent(
-                        type="tool_call",
-                        title=f"windows.native:{fallback.action}",
-                        content=result.summary,
-                        payload={
-                            "tool": result.tool,
-                            "ok": result.ok,
-                            "action": fallback.action,
-                            "fallback_for": native_action.action,
-                        },
-                    )
-                )
-                answer_action = fallback
-                fallback_note = f"\n\nПервичная попытка: {failed_summary}"
-            if context is not None:
-                self._remember_console_target(context.conversation_id, answer_action, result)
-            status = "Готово" if result.ok else "Не смог выполнить native-действие"
+
+            # Keep read-only inspection autonomous through the safe facade.  No
+            # direct route receives a blanket bypass for the danger tool.
+            result = await self.tools.run("system.inspect", arguments)
+            event = ChatEvent(
+                type="tool_call",
+                title=f"system.inspect:{native_action.action}",
+                content=result.summary,
+                payload={
+                    "tool": result.tool,
+                    "ok": result.ok,
+                    "action": native_action.action,
+                },
+            )
+            status = "Готово" if result.ok else "Не смог выполнить безопасную проверку"
             details = _native_result_excerpt(result)
             return DirectAction(
-                answer=(
-                    f"{status}: {answer_action.answer}\n\n"
-                    f"{result.summary}{fallback_note}{details}"
-                ),
-                events=events,
+                answer=f"{status}: {native_action.answer}\n\n{result.summary}{details}",
+                events=[event],
             )
 
         command = _host_command_from_message(message)
         if command is not None:
-            result = await self.tools.run(
+            return self._request_direct_tool_approval(
                 "host.bridge.execute",
                 {"command": command, "timeout_sec": 20},
-                allow_danger=True,
-            )
-            event = ChatEvent(
-                type="tool_call",
-                title="host.bridge.execute",
-                content=result.summary,
-                payload={"tool": result.tool, "ok": result.ok},
-            )
-            verb = "Выполнил локальную команду" if result.ok else "Не смог выполнить команду"
-            return DirectAction(
-                answer=f"{verb}: `{command}`\n\n{result.summary}",
-                events=[event],
+                context=context,
+                description=f"Direct host command requested by the operator: {command}",
             )
 
         # Reasoning-first arbiter: before any fuzzy web-ish branch (shopping,
@@ -1745,20 +1750,64 @@ class AgentRuntime:
 
         url = _browser_url_from_message(message)
         if url is not None:
-            result = await self.tools.run("browser.open", {"url": url}, allow_danger=True)
-            event = ChatEvent(
-                type="tool_call",
-                title="browser.open",
-                content=result.summary,
-                payload={"tool": result.tool, "ok": result.ok, "url": url},
+            pending = self._request_direct_tool_approval(
+                "browser.open",
+                {"url": url},
+                context=context,
+                description=f"Open this URL in the operator browser: {url}",
             )
-            verb = "Открыл" if result.ok else "Не смог открыть"
             return DirectAction(
-                answer=f"{verb} вкладку: {url}\n\n{result.summary}",
-                events=[event],
+                answer=f"Подготовил открытие вкладки: {url}\n\n{pending.answer}",
+                events=pending.events,
             )
 
         return None
+
+    def _request_direct_tool_approval(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        context: AgentContext | None,
+        description: str,
+    ) -> DirectAction:
+        spec = self.tools.get(tool_name)
+        risk = (
+            spec.danger_level
+            if spec is not None and spec.danger_level in {"review", "danger"}
+            else "review"
+        )
+        payload: dict[str, Any] = {"tool": tool_name, "arguments": arguments}
+        if context is not None:
+            payload["conversation_id"] = context.conversation_id
+            if context.mission_id:
+                payload["mission_id"] = context.mission_id
+            if context.task_id:
+                payload["task_id"] = context.task_id
+        approval = self.storage.create_approval(
+            title=f"Подтверждение действия {tool_name}",
+            description=description,
+            requested_action="tool.run",
+            risk=risk,
+            payload=payload,
+        )
+        event = ChatEvent(
+            type="approval",
+            title=f"Approval requested: {tool_name}",
+            content=f"Tool {tool_name} needs operator approval before execution.",
+            payload={
+                "approval_id": approval["id"],
+                "tool": tool_name,
+                "risk": risk,
+            },
+        )
+        return DirectAction(
+            answer=(
+                f"Действие `{tool_name}` подготовлено, но не выполнено. "
+                f"Подтвердите approval `{approval['id']}` для запуска."
+            ),
+            events=[event],
+        )
 
     async def _understand_intent(
         self,
@@ -2390,21 +2439,19 @@ class AgentRuntime:
                 answer="Открывать нечего: в последней выдаче нет подходящих URL.",
                 events=[],
             )
-        result = await self.tools.run(
+        pending = self._request_direct_tool_approval(
             "browser.open",
             {"url": candidate["url"]},
-            allow_danger=True,
-        )
-        event = ChatEvent(
-            type="tool_call",
-            title="browser.open",
-            content=result.summary,
-            payload={"tool": result.tool, "ok": result.ok, "url": candidate["url"]},
+            context=None,
+            description=(
+                "Open the selected shopping candidate in the operator browser: "
+                f"{candidate['url']}"
+            ),
         )
         metric = _candidate_metric(candidate, criterion)
         if metric is not None:
             answer = (
-                f"Открыл вариант по критерию «{_ranking_criterion_label(criterion)}»: "
+                f"Выбрал вариант по критерию «{_ranking_criterion_label(criterion)}»: "
                 f"{_shopping_candidate_label(candidate)}."
             )
         else:
@@ -2415,9 +2462,9 @@ class AgentRuntime:
             )
             answer = (
                 f"{missing_metric}, поэтому не называю это победителем. "
-                f"Открыл самую релевантную найденную ссылку: {candidate['url']}."
+                f"Подготовил самую релевантную найденную ссылку: {candidate['url']}."
             )
-        return DirectAction(answer=f"{answer}\n\n{result.summary}", events=[event])
+        return DirectAction(answer=f"{answer}\n\n{pending.answer}", events=pending.events)
 
     def _plan_task(
         self,
@@ -6660,7 +6707,7 @@ def _native_action_from_message(
     active_console: dict[str, Any] | None = None,
 ) -> NativeAction | None:
     normalized = message.lower()
-    screen_capture = _screen_capture_action(normalized, settings)
+    screen_capture = _screen_capture_action(normalized)
     if screen_capture is not None:
         return screen_capture
 
@@ -6706,17 +6753,17 @@ def _native_action_from_message(
         )
 
     typed_text = _extract_text_to_type(message)
-    if typed_text and not _app_from_message(normalized):
+    app = _app_from_message(normalized)
+    if typed_text and app is None and _has_explicit_typing_target(normalized):
         return NativeAction(
             action="keyboard.send",
             payload={"text": typed_text},
             answer="ввёл текст в активное окно через native input",
         )
 
-    app = _app_from_message(normalized)
     if app is None:
         return None
-    _markers, executable, label = app
+    markers, executable, label = app
     wants_open = _contains_any(
         normalized,
         ("открой", "открыть", "запусти", "запустить", "open", "start", "посчитай"),
@@ -6725,10 +6772,11 @@ def _native_action_from_message(
         normalized,
         ("набери", "введи", "напечат", "посчитай", "посчитать", "type", "write"),
     )
-    if not wants_open and not wants_typing:
+    typing_is_targeted = wants_open or _has_explicit_app_typing_target(normalized, markers)
+    if not wants_open and not (wants_typing and typing_is_targeted):
         return None
 
-    if executable == "calc.exe" and wants_typing:
+    if executable == "calc.exe" and wants_typing and typing_is_targeted:
         keys = _calculator_keys_from_message(message)
         payload = {
             "executable": "explorer.exe",
@@ -6743,7 +6791,7 @@ def _native_action_from_message(
             answer=f"открыл {label} и ввёл выражение",
         )
 
-    if wants_typing and typed_text:
+    if wants_typing and typed_text and typing_is_targeted:
         payload = {
             "executable": executable,
             "text": typed_text,
@@ -6813,10 +6861,7 @@ def _wmi_action_from_message(message: str) -> NativeAction:
 
 def _screen_capture_action(
     normalized: str,
-    settings: JarvisSettings | None,
 ) -> NativeAction | None:
-    if settings is None:
-        return None
     wants_screen = _contains_any(
         normalized,
         (
@@ -6837,18 +6882,11 @@ def _screen_capture_action(
     )
     if not wants_screen:
         return None
-    output_path = _screen_capture_file(settings)
     return NativeAction(
         action="screen.capture",
-        payload={"path": str(output_path), "limit": 30, "ocr": True},
+        payload={"limit": 30, "ocr": True},
         answer="сделал снимок экрана для визуальной проверки",
     )
-
-
-def _screen_capture_file(settings: JarvisSettings) -> Path:
-    screenshot_dir = settings.data_dir / "screenshots"
-    screenshot_dir.mkdir(parents=True, exist_ok=True)
-    return screenshot_dir / f"screen-{uuid.uuid4().hex[:12]}.png"
 
 
 def _system_info_console_action(message: str, history_text: str = "") -> NativeAction | None:
@@ -7547,11 +7585,9 @@ def _native_focus_hint(executable: str) -> dict[str, str]:
 
 
 def _notepad_scratch_file(settings: JarvisSettings) -> Path:
-    scratch_dir = settings.data_dir / "scratch"
-    scratch_dir.mkdir(parents=True, exist_ok=True)
-    path = scratch_dir / f"notepad-{uuid.uuid4().hex[:10]}.txt"
-    path.write_text("", encoding="utf-8")
-    return path
+    # Planning an approval must not mutate the filesystem.  The data directory
+    # already exists, and Notepad can create this file only after approval.
+    return settings.data_dir / f"scratch-notepad-{uuid.uuid4().hex[:10]}.txt"
 
 
 def _extract_text_to_type(message: str) -> str:
@@ -7564,6 +7600,38 @@ def _extract_text_to_type(message: str) -> str:
         return ""
     text = re.sub(r"\s+(?:в|внутри|в окне)\s+.+$", "", match.group(1), flags=re.IGNORECASE)
     return text.strip(" \"'«».,;")[:1000]
+
+
+def _has_explicit_typing_target(normalized: str) -> bool:
+    return _contains_any(
+        normalized,
+        (
+            "активное окно",
+            "активном окне",
+            "текущее окно",
+            "текущем окне",
+            "в это окно",
+            "в этом окне",
+            "сюда в окно",
+            "active window",
+            "current window",
+            "into this window",
+            "in this window",
+        ),
+    )
+
+
+def _has_explicit_app_typing_target(normalized: str, markers: tuple[str, ...]) -> bool:
+    typing_verb = r"(?:набери|введи|напечат\w*|напиши|type|write)"
+    for marker in markers:
+        app = re.escape(marker)
+        if re.search(rf"(?:в|во)\s+(?:окне\s+)?{app}", normalized):
+            return True
+        if re.search(rf"(?:in|into|to)\s+(?:the\s+)?{app}", normalized):
+            return True
+        if re.search(rf"{app}[^.!?]{{0,40}}{typing_verb}", normalized):
+            return True
+    return False
 
 
 def _calculator_keys_from_message(message: str) -> str:

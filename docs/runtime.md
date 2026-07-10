@@ -230,6 +230,37 @@ For the operator and the second model:
   download cache, reports signature/SHA256/executable risk, and lists ZIP
   entries without opening or executing them.
 
+## 2026-07-10 handoff - deployment and LAN hardening
+
+For the operator and the second model:
+
+- `jarvis-launcher.ps1 start` is loopback-only. LAN exposure is now explicit via
+  `jarvis-launcher.ps1 lan` or `-Lan`; the launcher generates a persistent
+  256-bit API token and restarts Next when its server-side auth contract changes.
+  LAN login is `jarvis`; a generated password is ACL-restricted to the current
+  Windows user and stored in `D:\jarvis\.jarvis\api.token` (or the selected
+  `-HomePath`). An explicit `JARVIS_API_TOKEN` remains environment-only.
+- The launcher refuses to reuse or terminate listeners on ports 3000, 8000, or
+  8765 unless their command line belongs to the corresponding Jarvis service.
+- Compose binds UI/API to `127.0.0.1` by default. To expose the authenticated UI
+  to a trusted LAN, set only `JARVIS_FRONTEND_BIND_ADDRESS=0.0.0.0` and configure
+  a strong `JARVIS_API_TOKEN`. The backend remains on loopback; Next reaches it
+  over the private Compose network.
+- Compose intentionally returns HTTP 503 from Command Center when
+  `JARVIS_API_TOKEN` is empty. Set the same non-empty token for backend/frontend
+  through Compose environment before using the UI; the dispatcher-only profile
+  remains independent of this requirement.
+- Backend images include Chromium, start through a path-constrained volume
+  initializer, and immediately drop to UID/GID 10001. Compose enables an init
+  process, a 512 MiB shared-memory segment, read-only root filesystem, minimal
+  init capabilities, `no-new-privileges`, and the Playwright-maintained Docker
+  seccomp baseline with only Chromium user-namespace syscalls added. Frontend
+  runtime uses the unprivileged `node` user.
+- The API token is server-only: Compose passes it to the Next server together
+  with `JARVIS_BACKEND_URL`, and the browser uses the same-origin authenticated
+  proxy. No API URL or credential is compiled into `NEXT_PUBLIC_*` browser
+  JavaScript.
+
 ## 2026-07-10 handoff - internet safety hardening
 
 For the operator and the second model:
@@ -347,9 +378,9 @@ For the operator and the second model:
 
 - Backend API is local-first by default. Loopback clients still work without
   setup; non-loopback clients now need `JARVIS_API_TOKEN` via bearer auth or
-  `X-Jarvis-Api-Token`. The frontend can forward it with
-  `NEXT_PUBLIC_JARVIS_API_TOKEN`. WebSocket `/ws/events` accepts the same token
-  through a header or `?token=...`.
+  `X-Jarvis-Api-Token`. The current frontend keeps this token server-side and
+  forwards authenticated traffic through its same-origin proxy. Browser origins
+  must match loopback or `JARVIS_CORS_ORIGINS`.
 - New operator endpoints:
   `GET /api/runtime/security`, `POST /api/runtime/backup`, and
   `GET /api/autonomy/job-runs`. The backup endpoint uses SQLite's backup API and
@@ -361,8 +392,7 @@ For the operator and the second model:
   into the job run history, so background failures are visible after the fact.
 - Command Center surfaces API guard status, manual DB backup, last backup path,
   job retry state, and the last few job runs in the runtime/resources panels.
-- Config sync: `.env.example` includes `JARVIS_API_TOKEN` and
-  `NEXT_PUBLIC_JARVIS_API_TOKEN`.
+- Config sync: `.env.example` includes the server-only `JARVIS_API_TOKEN`.
 
 ## 2026-07-09 handoff - reasoning-first arbiter now owns local_action
 
@@ -869,7 +899,7 @@ to retry from scratch.
 | `JARVIS_API_TOKEN` | `` | Optional token required for non-loopback backend/API/WS clients |
 | `JARVIS_API_HOST` | `0.0.0.0` | Host FastAPI backend |
 | `JARVIS_API_PORT` | `8000` | Port FastAPI backend |
-| `NEXT_PUBLIC_JARVIS_API_TOKEN` | `` | Optional frontend token forwarded to backend/API/WS |
+| `JARVIS_BACKEND_URL` | `http://127.0.0.1:8000` | Server-only Next proxy target; Compose uses `http://backend:8000` |
 
 ## CLI
 

@@ -57,10 +57,11 @@ _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _A_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 _R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 _REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+_UNSAFE_XML_DECLARATION = re.compile(r"<!\s*(?:DOCTYPE|ENTITY)\b", re.IGNORECASE)
 
 
 class DocumentRuntimeError(ValueError):
-    pass
+    """Raised when a document is unsupported, unsafe, malformed, or oversized."""
 
 
 def document_mime_type(path: Path) -> str:
@@ -336,6 +337,10 @@ def _read_zip_text_member(archive: zipfile.ZipFile, name: str) -> str:
 
 
 def _parse_xml(xml: str, label: str) -> ET.Element:
+    if _UNSAFE_XML_DECLARATION.search(xml):
+        raise DocumentRuntimeError(
+            f"Unsafe {label} XML: DTD and entity declarations are not allowed."
+        )
     try:
         return ET.fromstring(xml)
     except ET.ParseError as exc:

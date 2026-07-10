@@ -1492,7 +1492,7 @@ h3 {
   margin-top: 10px;
 }
 
-.bubbleAttachments a,
+.bubbleAttachments button,
 .composerAttachment {
   display: inline-flex;
   align-items: center;
@@ -1506,6 +1506,11 @@ h3 {
   color: var(--chat-text);
   font-size: 12px;
   text-decoration: none;
+}
+
+.bubbleAttachments button {
+  cursor: pointer;
+  font-family: inherit;
 }
 
 .bubbleAttachments span,
@@ -2481,7 +2486,7 @@ h3 {
 }
 
 .downloadRow {
-  grid-template-columns: 18px minmax(0, 1fr) auto minmax(86px, 0.4fr);
+  grid-template-columns: 18px minmax(0, 1fr) auto minmax(86px, 0.4fr) auto;
 }
 
 .downloadRow.error {
@@ -2490,6 +2495,26 @@ h3 {
 
 .downloadRow.done {
   border-color: rgba(13, 118, 111, 0.38);
+}
+
+.downloadRow.cancelled,
+.downloadRow.cancelling {
+  border-color: rgba(183, 121, 31, 0.45);
+}
+
+.downloadRow .downloadCancel {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--coral);
+}
+
+.downloadRow .downloadCancel:hover:not(:disabled) {
+  border-color: var(--coral);
 }
 
 .localModelRow {
@@ -3614,6 +3639,7 @@ h3 {
   .modelBudget > small,
   .downloadRow > span,
   .downloadRow > small,
+  .downloadRow > .downloadCancel,
   .localModelRow > span,
   .localModelRow > .modelActions,
   .cleanupStrip > span,

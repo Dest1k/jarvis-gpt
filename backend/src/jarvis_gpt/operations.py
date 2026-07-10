@@ -141,9 +141,6 @@ class OperationsManager:
             name = str(container.get("name") or "")
             if docker_container_allowed(policy, name):
                 commands.append(["rm", "-f", name])
-        commands.append(["container", "prune", "-f"])
-        if aggressive:
-            commands.extend([["image", "prune", "-f"], ["builder", "prune", "-f"]])
         for command in commands:
             result = _run_docker(command, timeout=60)
             steps.append(
@@ -169,6 +166,7 @@ class OperationsManager:
             "ok": ok,
             "summary": "Очистка выполнена." if ok else "Очистка завершилась с предупреждениями.",
             "aggressive": aggressive,
+            "global_prune_skipped": True,
             "steps": steps,
         }
 

@@ -6,6 +6,8 @@ from typing import Any
 
 from fastapi import WebSocket
 
+EVENT_SEND_TIMEOUT_SEC = 2.0
+
 
 class EventBus:
     def __init__(self) -> None:
@@ -25,12 +27,22 @@ class EventBus:
         data = json.dumps(event, ensure_ascii=False)
         async with self._lock:
             clients = list(self._clients)
-        dead: list[WebSocket] = []
-        for client in clients:
+
+        async def send(client: WebSocket) -> WebSocket | None:
             try:
-                await client.send_text(data)
+                await asyncio.wait_for(
+                    client.send_text(data),
+                    timeout=EVENT_SEND_TIMEOUT_SEC,
+                )
+                return None
             except Exception:  # noqa: BLE001
-                dead.append(client)
+                return client
+
+        dead = [
+            client
+            for client in await asyncio.gather(*(send(client) for client in clients))
+            if client is not None
+        ]
         if dead:
             async with self._lock:
                 for client in dead:

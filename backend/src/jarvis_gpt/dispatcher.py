@@ -50,7 +50,7 @@ class DispatcherManager:
             "desired_runtime": desired_runtime,
             "compose": self.compose_command("up"),
             "container_status": container,
-            "env": desired_env,
+            "env": _public_env(desired_env),
         }
 
     def compose_env(self) -> dict[str, str]:
@@ -58,7 +58,10 @@ class DispatcherManager:
         env = {
             "JARVIS_HOST_HOME": str(self.settings.home),
             "JARVIS_MODEL_ROOT": str(self.settings.model_root),
-            "JARVIS_VLLM_IMAGE": os.environ.get("JARVIS_VLLM_IMAGE", "vllm/vllm-openai:nightly"),
+            "JARVIS_VLLM_IMAGE": os.environ.get(
+                "JARVIS_VLLM_IMAGE",
+                "vllm/vllm-openai:v0.23.0",
+            ),
             "VLLM_USE_V2_MODEL_RUNNER": os.environ.get("VLLM_USE_V2_MODEL_RUNNER", "0"),
             "VLLM_WEIGHT_OFFLOADING_DISABLE_UVA": os.environ.get(
                 "VLLM_WEIGHT_OFFLOADING_DISABLE_UVA",
@@ -170,6 +173,15 @@ def _port_open(host: str, port: int, *, timeout: float) -> bool:
             return True
     except OSError:
         return False
+
+
+def _public_env(env: dict[str, str]) -> dict[str, str]:
+    """Return dispatcher configuration without exposing credential values."""
+    secret_keys = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"}
+    return {
+        key: "[configured]" if key in secret_keys and value else value
+        for key, value in env.items()
+    }
 
 
 def _runtime_from_container(container: dict[str, Any] | None) -> dict[str, Any] | None:

@@ -9,6 +9,7 @@ status -> chat -> feedback -> mission -> report -> queue -> tools/memory/approva
 
 from __future__ import annotations
 
+import base64
 from pathlib import Path
 from threading import Event
 
@@ -16,11 +17,14 @@ import pytest
 from jarvis_gpt.api import (
     _is_local_machine_host,
     _is_loopback_host,
+    _origin_allowed,
     _persist_interrupted_stream,
     _token_allowed,
     app,
 )
+from jarvis_gpt.model_hub import DOWNLOAD_JOBS_KEY
 from starlette.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 
 @pytest.fixture()
@@ -47,6 +51,57 @@ def test_health_and_status(client):
     assert models.status_code == 200
 
 
+def test_read_only_web_status_endpoints_do_not_create_tool_runs(client):
+    before = len(app.state.storage.list_tool_runs(limit=200))
+
+    handoff = client.get("/api/browser/handoff")
+    observability = client.get("/api/internet/observability?limit=20")
+
+    after = len(app.state.storage.list_tool_runs(limit=200))
+    assert handoff.status_code == 200
+    assert handoff.json() is None
+    assert observability.status_code == 200
+    assert "summary" in observability.json()
+    assert after == before
+
+
+def test_model_download_can_be_cancelled(client):
+    job = {
+        "id": "modeldl_test",
+        "repo_id": "owner/model",
+        "target": str(app.state.settings.model_root / "owner__model"),
+        "status": "queued",
+        "summary": "Queued model download.",
+    }
+    app.state.storage.set_runtime_value(DOWNLOAD_JOBS_KEY, [job])
+
+    response = client.post(f"/api/model-hub/downloads/{job['id']}/cancel")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "cancelled"
+    assert app.state.model_hub.download_jobs()[0]["status"] == "cancelled"
+
+
+def test_api_cannot_reapprove_an_executing_approval(client):
+    approval = app.state.storage.create_approval(
+        title="No replay",
+        description="Execution claim must be one-way.",
+        requested_action="memory.save",
+        payload={"content": "once"},
+    )
+    app.state.storage.update_approval(approval["id"], status="approved")
+    claimed = app.state.storage.claim_approval_execution(approval["id"])
+
+    response = client.patch(
+        f"/api/approvals/{approval['id']}",
+        json={"status": "approved", "result": {}},
+    )
+
+    assert claimed is not None
+    assert response.status_code == 409
+    assert app.state.storage.get_approval(approval["id"])["status"] == "executing"
+
+
 def test_runtime_security_and_backup(client, monkeypatch):
     security = client.get("/api/runtime/security")
     assert security.status_code == 200
@@ -70,6 +125,25 @@ def test_runtime_security_and_backup(client, monkeypatch):
     assert Path(body["path"]).exists()
 
 
+def test_local_api_rejects_cross_site_state_change(client, monkeypatch):
+    called = False
+
+    def forbidden_compose(_action):
+        nonlocal called
+        called = True
+        return {"ok": True}
+
+    monkeypatch.setattr(app.state.dispatcher, "run_compose", forbidden_compose)
+
+    denied = client.post(
+        "/api/dispatcher/stop",
+        headers={"Origin": "https://evil.example", "Sec-Fetch-Site": "cross-site"},
+    )
+
+    assert denied.status_code == 403
+    assert called is False
+
+
 def test_loopback_api_can_require_token(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
@@ -91,6 +165,70 @@ def test_loopback_api_can_require_token(monkeypatch, tmp_path):
     assert denied.status_code == 401
     assert allowed.status_code == 200
     assert security.json()["loopback_requires_token"] is True
+
+
+def _websocket_token_protocol(token: str) -> str:
+    encoded = base64.urlsafe_b64encode(token.encode("utf-8")).decode("ascii").rstrip("=")
+    return f"jarvis.token.{encoded}"
+
+
+def _assert_websocket_denied(
+    client: TestClient,
+    path: str,
+    *,
+    headers: dict[str, str] | None = None,
+    subprotocols: list[str] | None = None,
+) -> None:
+    with (
+        pytest.raises(WebSocketDisconnect) as caught,
+        client.websocket_connect(
+            path,
+            headers=headers,
+            subprotocols=subprotocols,
+        ),
+    ):
+        raise AssertionError("WebSocket unexpectedly accepted invalid authentication")
+    assert caught.value.code == 1008
+
+
+def test_websocket_enforces_strict_token_and_origin(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setenv("JARVIS_AUTONOMY_ENABLED", "0")
+    monkeypatch.setenv("JARVIS_API_REQUIRE_TOKEN_ON_LOOPBACK", "1")
+    monkeypatch.setenv("JARVIS_API_TOKEN", "secret")
+    monkeypatch.setenv("JARVIS_CORS_ORIGINS", "http://192.168.50.4:3000")
+    protocol = _websocket_token_protocol("secret")
+
+    with TestClient(app) as test_client:
+        _assert_websocket_denied(
+            test_client,
+            "/ws/events",
+            headers={"origin": "http://localhost:3000"},
+        )
+        # Long-lived secrets are intentionally not accepted in URLs.
+        _assert_websocket_denied(
+            test_client,
+            "/ws/events?token=secret",
+            headers={"origin": "http://localhost:3000"},
+        )
+        _assert_websocket_denied(
+            test_client,
+            "/ws/events",
+            headers={"origin": "https://example.invalid"},
+            subprotocols=[protocol],
+        )
+
+        with test_client.websocket_connect(
+            "/ws/events",
+            headers={"origin": "http://192.168.50.4:3000"},
+            subprotocols=[protocol],
+        ) as websocket:
+            assert websocket is not None
+
+    assert _origin_allowed("http://localhost:3000") is True
+    assert _origin_allowed("http://192.168.50.4:3000/") is True
+    assert _origin_allowed("https://example.invalid") is False
 
 
 def test_operator_quality_and_autonomy_cancel(client):

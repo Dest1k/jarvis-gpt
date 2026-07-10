@@ -270,7 +270,10 @@ def cmd_approval_request(args: argparse.Namespace) -> None:
 def cmd_approval_update(args: argparse.Namespace) -> None:
     _settings, storage, _llm, _agent = _runtime(args.profile)
     result = _json_argument(args.result)
-    updated = storage.update_approval(args.id, status=args.status, result=result)
+    try:
+        updated = storage.update_approval(args.id, status=args.status, result=result)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     if updated is None:
         raise SystemExit(f"Approval not found: {args.id}")
     _print_json(updated)
@@ -477,7 +480,7 @@ def build_parser() -> argparse.ArgumentParser:
     approval_update_parser.add_argument("id")
     approval_update_parser.add_argument(
         "--status",
-        choices=["approved", "rejected", "executed", "cancelled"],
+        choices=["approved", "rejected", "cancelled"],
         required=True,
     )
     approval_update_parser.add_argument("--result", default="{}")
@@ -558,9 +561,11 @@ def _parse_set_value(value: str) -> Any:
     if not value:
         return ""
     try:
-        return json.loads(value)
+        decoded = json.loads(value)
     except json.JSONDecodeError:
-        pass
+        decoded = None
+    else:
+        return decoded
     if "," in value:
         return [part.strip() for part in value.split(",") if part.strip()]
     return value

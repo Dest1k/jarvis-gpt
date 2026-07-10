@@ -63,8 +63,23 @@ def main() -> int:
             ]
         )
 
-    print(json.dumps({"ok": all(item["ok"] for item in checks), "checks": checks}, indent=2))
-    return 0 if all(item["ok"] for item in checks) else 1
+    required_ok = all(bool(item["ok"]) for item in checks if not item["optional"])
+    optional_gaps = sum(
+        1 for item in checks if item["optional"] and not bool(item["ok"])
+    )
+    report = {
+        "ok": required_ok,
+        "degraded": optional_gaps > 0,
+        "summary": {
+            "passed": sum(1 for item in checks if item["status"] == "passed"),
+            "failed": sum(1 for item in checks if item["status"] == "failed"),
+            "skipped": sum(1 for item in checks if item["status"] == "skipped"),
+            "optional_gaps": optional_gaps,
+        },
+        "checks": checks,
+    }
+    print(json.dumps(report, indent=2))
+    return 0 if required_ok else 1
 
 
 def run(
@@ -84,11 +99,19 @@ def run(
             check=False,
         )
     except FileNotFoundError as exc:
-        return {"name": name, "ok": optional, "optional": optional, "error": str(exc)}
+        return _failed_check(name, optional=optional, error=str(exc), unavailable=True)
+    except subprocess.TimeoutExpired as exc:
+        return _failed_check(
+            name,
+            optional=optional,
+            error=f"timed out after {exc.timeout}s",
+        )
+    ok = result.returncode == 0
     return {
         "name": name,
-        "ok": result.returncode == 0 or optional,
+        "ok": ok,
         "optional": optional,
+        "status": "passed" if ok else "failed",
         "returncode": result.returncode,
         "stdout_tail": tail(result.stdout),
         "stderr_tail": tail(result.stderr),
@@ -102,10 +125,32 @@ def http(name: str, url: str, *, optional: bool = False) -> dict[str, object]:
                 "name": name,
                 "ok": 200 <= response.status < 400,
                 "optional": optional,
-                "status": response.status,
+                "status": "passed" if 200 <= response.status < 400 else "failed",
+                "http_status": response.status,
             }
+    except urllib.error.HTTPError as exc:
+        return {
+            **_failed_check(name, optional=optional, error=str(exc)),
+            "http_status": exc.code,
+        }
     except (urllib.error.URLError, TimeoutError) as exc:
-        return {"name": name, "ok": optional, "optional": optional, "error": str(exc)}
+        return _failed_check(name, optional=optional, error=str(exc), unavailable=True)
+
+
+def _failed_check(
+    name: str,
+    *,
+    optional: bool,
+    error: str,
+    unavailable: bool = False,
+) -> dict[str, object]:
+    return {
+        "name": name,
+        "ok": False,
+        "optional": optional,
+        "status": "skipped" if optional and unavailable else "failed",
+        "error": error,
+    }
 
 
 def tail(text: str, limit: int = 800) -> str:

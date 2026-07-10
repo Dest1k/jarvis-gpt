@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import io
 import zipfile
 
+import pytest
+from jarvis_gpt import ingest as ingest_module
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
 from jarvis_gpt.ingest import FileIngestor
 from jarvis_gpt.storage import JarvisStorage
@@ -162,4 +165,39 @@ def test_file_lookup_prefers_specific_mime_for_duplicate_hash(monkeypatch, tmp_p
     )
 
     assert storage.get_file_by_sha256(sha256)["id"] == preferred["id"]
+    storage.close()
+
+
+def test_file_ingestor_rejects_oversized_stream_and_removes_temp(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(ingest_module, "MAX_UPLOAD_BYTES", 4)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    ingestor = FileIngestor(settings=settings, storage=storage)
+
+    with pytest.raises(OSError, match="upload limit"):
+        ingestor.ingest_upload("large.bin", io.BytesIO(b"12345"))
+
+    assert not list(ingestor.files_dir.glob(".upload_*.tmp"))
+    storage.close()
+
+
+def test_file_ingestor_removes_temp_when_stream_fails(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    ingestor = FileIngestor(settings=settings, storage=storage)
+
+    class BrokenStream:
+        def read(self, _size):
+            raise OSError("read failed")
+
+    with pytest.raises(OSError, match="read failed"):
+        ingestor.ingest_upload("broken.bin", BrokenStream())
+
+    assert not list(ingestor.files_dir.glob(".upload_*.tmp"))
     storage.close()

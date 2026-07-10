@@ -18,9 +18,7 @@ import { useParams } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
 import type { CSSProperties, ReactNode } from "react";
 
-const DEFAULT_API_URL = "http://localhost:8000";
-const CONFIGURED_API_URL = process.env.NEXT_PUBLIC_JARVIS_API_URL ?? "";
-const CONFIGURED_API_TOKEN = process.env.NEXT_PUBLIC_JARVIS_API_TOKEN ?? "";
+const API_PROXY_URL = "/jarvis-api";
 
 type TraceMessage = {
   id: string;
@@ -61,53 +59,7 @@ type TracePayload = {
 };
 
 function apiUrl() {
-  const configuredValue = CONFIGURED_API_URL.trim();
-  if (typeof window === "undefined") {
-    return (configuredValue || DEFAULT_API_URL).replace(/\/$/, "");
-  }
-
-  const browserUrl = `${window.location.protocol}//${window.location.hostname}:8000`;
-  if (!configuredValue) {
-    return browserUrl;
-  }
-
-  try {
-    const configured = new URL(configuredValue);
-    const configuredHost = configured.hostname;
-    const pageHost = window.location.hostname;
-
-    if (isLoopbackHost(configuredHost) && !isLoopbackHost(pageHost)) {
-      return browserUrl;
-    }
-    if (isLoopbackHost(pageHost) && isLanHost(configuredHost)) {
-      return browserUrl;
-    }
-
-    return configured.toString().replace(/\/$/, "");
-  } catch {
-    return browserUrl;
-  }
-}
-
-function isLoopbackHost(hostname: string) {
-  const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  return host === "localhost" || host === "::1" || host === "127.0.0.1" || host.startsWith("127.");
-}
-
-function isLanHost(hostname: string) {
-  const host = hostname.toLowerCase();
-  if (host === "localhost" || host.endsWith(".localhost")) return true;
-  const parts = host.split(".").map((part) => Number.parseInt(part, 10));
-  if (parts.length !== 4 || parts.some((part) => Number.isNaN(part) || part < 0 || part > 255)) {
-    return false;
-  }
-  const [first, second] = parts;
-  return first === 10 || (first === 172 && second >= 16 && second <= 31) || (first === 192 && second === 168);
-}
-
-function apiAuthHeaders(): Record<string, string> {
-  const token = CONFIGURED_API_TOKEN.trim();
-  return token ? { "X-Jarvis-Api-Token": token } : {};
+  return API_PROXY_URL;
 }
 
 function formatDuration(ms?: number | null) {
@@ -175,7 +127,11 @@ export default function TracePage() {
       try {
         const response = await fetch(
           `${apiUrl()}/api/agent/trace/message/${encodeURIComponent(messageId)}`,
-          { cache: "no-store", headers: apiAuthHeaders() }
+          {
+            cache: "no-store",
+            credentials: "same-origin",
+            headers: { "X-Jarvis-Frontend": "command-center" }
+          }
         );
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}`);

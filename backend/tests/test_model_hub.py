@@ -4,12 +4,14 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
 from jarvis_gpt.model_hub import (
     DOWNLOAD_JOBS_KEY,
     DownloadedFile,
     ModelHubManager,
     _download_file,
+    _safe_model_file_path,
 )
 from jarvis_gpt.storage import JarvisStorage
 
@@ -68,6 +70,55 @@ def test_download_file_resumes_part_with_range(monkeypatch, tmp_path):
     assert result.size == 6
 
 
+def test_download_file_discards_oversized_partial(monkeypatch, tmp_path):
+    target_root = tmp_path / "models"
+    target_root.mkdir()
+    partial = target_root / "model.safetensors.part"
+    partial.write_bytes(b"corrupt")
+    captured = {}
+
+    class FakeResponse:
+        status = 200
+
+        def __init__(self) -> None:
+            self.payload = b"abcdef"
+            self.offset = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def getcode(self) -> int:
+            return self.status
+
+        def read(self, size: int = -1) -> bytes:
+            if self.offset:
+                return b""
+            self.offset = len(self.payload)
+            return self.payload
+
+    def fake_urlopen(request, timeout=60):
+        captured["range"] = request.get_header("Range")
+        return FakeResponse()
+
+    monkeypatch.setattr("jarvis_gpt.model_hub.urllib.request.urlopen", fake_urlopen)
+
+    result = _download_file(
+        repo_id="owner/model",
+        revision="main",
+        relative_path="model.safetensors",
+        target_root=target_root,
+        token="",
+        expected_size=6,
+    )
+
+    assert captured["range"] is None
+    assert (target_root / "model.safetensors").read_bytes() == b"abcdef"
+    assert result.skipped is False
+
+
 def test_model_download_worker_uses_parallel_file_workers(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("JARVIS_MODEL_ROOT", str(tmp_path / "models"))
@@ -113,6 +164,7 @@ def test_model_download_worker_uses_parallel_file_workers(monkeypatch, tmp_path)
         token: str,
         expected_size: int,
         part_workers: int = 1,
+        cancel_event: threading.Event | None = None,
     ) -> DownloadedFile:
         nonlocal active, max_active
         with lock:
@@ -217,3 +269,155 @@ def test_download_file_uses_parallel_segments(monkeypatch, tmp_path):
     assert (target_root / "model.safetensors").read_bytes() == payload
     assert not (target_root / "model.safetensors.segments").exists()
     assert result.size == len(payload)
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    ["../escape.json", "nested/../../escape.json", "C:/escape.json"],
+)
+def test_model_file_path_cannot_escape_download_root(tmp_path, relative_path):
+    with pytest.raises(ValueError, match="Unsafe model file path"):
+        _safe_model_file_path(tmp_path / "models", relative_path)
+
+
+def test_model_hub_recovers_interrupted_jobs_on_start(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_MODEL_ROOT", str(tmp_path / "models"))
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    storage.set_runtime_value(
+        DOWNLOAD_JOBS_KEY,
+        [
+            {
+                "id": "stale",
+                "repo_id": "owner/model",
+                "target": str(settings.model_root / "owner__model"),
+                "status": "running",
+            }
+        ],
+    )
+
+    manager = ModelHubManager(settings=settings, storage=storage)
+
+    recovered = manager.download_jobs()[0]
+    assert recovered["status"] == "error"
+    assert "restart to resume" in recovered["summary"]
+    storage.close()
+
+
+def test_model_hub_rejects_duplicate_target_download(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_MODEL_ROOT", str(tmp_path / "models"))
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    manager = ModelHubManager(settings=settings, storage=storage)
+    storage.set_runtime_value(
+        DOWNLOAD_JOBS_KEY,
+        [
+            {
+                "id": "active",
+                "repo_id": "owner/model",
+                "target": str(settings.model_root / "owner__model"),
+                "status": "running",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        manager,
+        "_model_info",
+        lambda _repo_id: {
+            "siblings": [{"rfilename": "config.json", "size": 2}],
+        },
+    )
+
+    with pytest.raises(ValueError, match="already active"):
+        manager.start_download("owner/model")
+
+    storage.close()
+
+
+def test_model_download_worker_honors_preexisting_cancel(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_MODEL_ROOT", str(tmp_path / "models"))
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    manager = ModelHubManager(settings=settings, storage=storage)
+    job = {
+        "id": "cancelled-job",
+        "repo_id": "owner/model",
+        "target": str(settings.model_root / "owner__model"),
+        "status": "queued",
+    }
+    storage.set_runtime_value(DOWNLOAD_JOBS_KEY, [job])
+    cancel_event = threading.Event()
+    cancel_event.set()
+
+    manager._download_worker(
+        job["id"],
+        "owner/model",
+        "main",
+        [{"rfilename": "config.json", "size": 2}],
+        workers=1,
+        cancel_event=cancel_event,
+    )
+
+    updated = manager.download_jobs()[0]
+    assert updated["status"] == "cancelled"
+    assert updated["current_file"] == ""
+    storage.close()
+
+
+def test_shutdown_worker_registry_blocks_overlapping_manager(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_MODEL_ROOT", str(tmp_path / "models"))
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    manager = ModelHubManager(settings=settings, storage=storage)
+    entered = threading.Event()
+    release = threading.Event()
+    info = {"siblings": [{"rfilename": "config.json", "size": 1}]}
+    monkeypatch.setattr(manager, "_model_info", lambda _repo_id: info)
+
+    def blocked_download(
+        *,
+        repo_id: str,
+        revision: str,
+        relative_path: str,
+        target_root: Path,
+        token: str,
+        expected_size: int,
+        part_workers: int = 1,
+        cancel_event: threading.Event | None = None,
+    ) -> DownloadedFile:
+        entered.set()
+        release.wait(timeout=2)
+        target = target_root / relative_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"x")
+        return DownloadedFile(relative_path=relative_path, size=1, resumed_from=0)
+
+    monkeypatch.setattr("jarvis_gpt.model_hub._download_file", blocked_download)
+    job = manager.start_download("owner/model")
+    assert entered.wait(timeout=1)
+    worker = manager._workers[job["id"]]
+
+    manager.close(timeout=0)
+    replacement = ModelHubManager(settings=settings, storage=storage)
+    monkeypatch.setattr(replacement, "_model_info", lambda _repo_id: info)
+
+    with pytest.raises(ValueError, match="still active|already active"):
+        replacement.start_download("owner/model")
+
+    release.set()
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    replacement.close()
+    storage.close()

@@ -372,6 +372,57 @@ def test_autonomy_executor_cancels_running_child_task(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_autonomy_executor_does_not_run_stale_snapshot_after_cancel(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    operations = OperationsManager(settings=settings, storage=storage)
+    llm = LLMRouter(settings)
+    executor = AutonomyExecutor(
+        settings=settings,
+        storage=storage,
+        operations=operations,
+        agent=AgentRuntime(settings=settings, storage=storage, llm=llm),
+        experience=ExperienceManager(settings=settings, storage=storage),
+        llm=llm,
+        telemetry=object(),
+        dispatcher=object(),
+        learning=LearningEngine(storage),
+    )
+    stale = operations.create_job(
+        {
+            "title": "Cancelled before scheduling",
+            "kind": "diagnostics",
+            "cadence": "manual",
+            "budget": {"max_runs": 1, "max_minutes": 5},
+        }
+    )
+    calls: list[str] = []
+
+    async def fake_run_kind(kind, _payload):
+        calls.append(kind)
+        return {"ok": True, "summary": "should not run"}
+
+    executor.run_kind = fake_run_kind
+
+    async def scenario():
+        cancelled = await executor.cancel_job(stale["id"])
+        result = await executor.run_job(stale)
+        return cancelled, result
+
+    cancelled, result = asyncio.run(scenario())
+
+    assert cancelled is not None
+    assert cancelled["status"] == "cancelled"
+    assert result["ok"] is False
+    assert result["job"]["status"] == "cancelled"
+    assert calls == []
+    storage.close()
+
+
 def test_cleanup_removes_only_allowed_containers(monkeypatch, tmp_path):
     manager, storage = _manager(monkeypatch, tmp_path)
     commands = []
@@ -409,5 +460,6 @@ def test_cleanup_removes_only_allowed_containers(monkeypatch, tmp_path):
     assert ["compose", "--profile", "llm", "down", "--remove-orphans"] in commands
     assert ["rm", "-f", "jarvis-gpt-dispatcher"] in commands
     assert ["rm", "-f", "postgres"] not in commands
-    assert ["container", "prune", "-f"] in commands
+    assert ["container", "prune", "-f"] not in commands
+    assert result["global_prune_skipped"] is True
     storage.close()

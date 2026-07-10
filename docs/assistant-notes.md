@@ -721,3 +721,100 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 - Regression coverage: `test_web_search_cache_rejects_irrelevant_shopping_results`
   plus stricter DNS weak-source assertions. `backend/tests/test_tools.py` and
   `backend/tests/test_agent.py` pass.
+
+### 2026-07-10 - Codex (SOL full-repository overhaul)
+
+Claude Sync Note
+
+[Измененные файлы и новые зависимости]
+
+- Web contour: `backend/src/jarvis_gpt/{tools,browser_cdp,web_orchestrator}.py`;
+  focused tests in `test_{tools,browser_cdp,web_orchestrator,web_coverage}.py`.
+- Safety/lifecycle contour: `agent.py`, `api.py`, `approval_executor.py`,
+  `autonomy_executor.py`, `storage.py`, `event_bus.py`, `ingest.py`,
+  `model_hub.py`, `diagnostics.py`, `operations.py`, `document_runtime.py`,
+  `dispatcher.py`, `telemetry.py`, `host_bridge.py`, `models.py`, `cli.py`.
+- Deployment/UI: backend/frontend Dockerfiles and `.dockerignore`, new
+  `backend/docker-entrypoint.sh`, `backend/chromium-seccomp.json`, new Next
+  same-origin route `frontend/app/jarvis-api/[...path]/route.ts`,
+  `frontend/proxy.ts`, Command Center/trace pages, `docker-compose.yml`,
+  `.env.example`, `scripts/{dev,jarvis-launcher,smoke}.ps1|py`, `docs/runtime.md`.
+- Packaging: `pyproject.toml`, `backend/requirements*.txt`, `uv.lock`,
+  `jarvis.py`; wheel force-includes `windows_rpc_bridge.py`.
+- Dependency deltas: Pydantic 2.10.4 -> 2.13.4; pytest 8.3.4 -> 9.0.3;
+  dev-only `httpx2==2.5.0`; FastAPI 0.139.0, Starlette 1.3.1,
+  python-multipart 0.0.32; dispatcher image pinned to
+  `vllm/vllm-openai:v0.23.0`. No Playwright/Selenium dependency: isolated
+  Chromium is driven through bounded CDP.
+
+[Что конкретно исправлено / какие заглушки устранены]
+
+- Implemented strict `FAST_FACT`, `DEEP_RESEARCH`, `AGGRESSIVE_SHOPPING` with
+  shared deadline/semaphore/request/fetch/render/network/content budgets.
+  Deep research fetches in parallel and cross-verifies evidence. Shopping uses
+  isolated dynamic CDP render, structured offers/currencies, negative technical
+  review extraction, cross-domain issue correlation, and paid/affiliate/SEO
+  low-signal rejection.
+- Web boundary blocks private/link-local/metadata targets, unsafe redirects,
+  WS/WSS subrequests, popup/new-target bypasses, DTD/entity XML, oversized
+  bodies, credential persistence, and irrelevant evidence-cache reuse.
+- Dangerous native/browser actions require atomic approval claim
+  (`approved -> executing -> executed|failed`); invalid/replayed transitions
+  fail with conflict. Cancellation/exception paths cannot leave executing work.
+- Mission tasks and autonomy jobs are atomically claimed; stale cancellation,
+  concurrent execution, blocked predecessor skipping, report races, and stuck
+  running states are closed.
+- Model Hub has locked download/job lifecycle, cooperative cancellation,
+  restart recovery, path traversal/oversized-part guards, duplicate protection,
+  bounded history, active-model mutation guards, and process shutdown tracking.
+- Event broadcast is concurrent and drops timed-out clients; ingestion is
+  streamed/capped and cleans partial files; blocking host/subprocess/model work
+  moved off the event loop. Docker-wide prune commands removed.
+- HTTP/WS origin/auth/CSRF boundaries hardened. Root API token removed from
+  browser JavaScript; Next server proxy injects it server-side and fails closed.
+  Browser query-string WS secrets removed. Clean observability endpoints no
+  longer create self-observing tool runs.
+- Deployment is non-root, read-only, seccomp-constrained, cap-minimized, and
+  loopback by default. Explicit LAN mode exposes only Basic-authenticated Next;
+  backend remains loopback/internal. Launcher token is 256-bit with current-user
+  ACL and never reuses/kills foreign listeners.
+- All AST `pass` nodes, TODO/FIXME/NotImplemented stubs, silent broad SQLite FTS
+  failure swallowing, optional-smoke false successes, and repository launcher
+  import side effects eliminated.
+
+[Изменения в API-контрактах, сигнатурах функций и структурах данных]
+
+- `web.search`, `web.research`, `web.answer`: optional `mode` and
+  `deadline_sec`; responses add `mode`, `orchestration`, and shopping results add
+  `shopping`. `browser.open.danger_level` is now `review`.
+- Added pure `internet_observability_snapshot()` and
+  `browser_handoff_snapshot()` plus GET `/api/internet/observability` and
+  `/api/browser/handoff`.
+- Added POST `/api/model-hub/downloads/{download_id}/cancel` and UI cancellation.
+- Approval public updates no longer accept `executed`; illegal state transitions
+  return HTTP 409. Storage adds atomic claim/finalize primitives for approvals
+  and mission tasks.
+- WS authentication uses `Sec-WebSocket-Protocol`; URL token is unsupported.
+  Cross-site HTTP mutations are rejected before loopback bypass.
+- Frontend API base is `/jarvis-api`; `NEXT_PUBLIC_JARVIS_API_TOKEN` and direct
+  browser WebSocket root-token transport are removed. Missing server token -> 503.
+- Smoke JSON uses semantic `status`, separate `http_status`, top-level `degraded`.
+
+[Pending: Текущие точки сборки и что Claude должен делать/проверить дальше]
+
+- Current gates: backend `337 passed`; Ruff/compileall/AST stub scan clean;
+  frontend typecheck/build clean; `pip-audit` and `npm audit --omit=dev` report
+  zero known vulnerabilities; Compose config resolves; Python 3.14.5 isolated
+  wheel install/import-all/CLI/packaged bridge pass; final backend image healthy
+  as UID 10001 with Chromium 150. Live FAST/DEEP/SHOPPING modes pass within budgets.
+- No blocking code issue. Production reliability still benefits from at least
+  one configured Brave/Tavily/Serper API key because anonymous HTML providers
+  can rate-limit or challenge. CAPTCHA path intentionally requires operator
+  handoff rather than bypass.
+- Residual theoretical boundary: an already-running operator Chrome cannot have
+  DNS resolution cryptographically pinned; attached-session CDP validates and
+  intercepts URLs, while autonomous isolated rendering additionally pins host
+  resolver rules. Keep autonomous research on isolated renderer.
+- Claude: review/commit the patch as one coordinated migration; then run target
+  host GPU/vLLM model-load and real LAN-client launcher smoke. Do not reintroduce
+  public backend binding or browser-visible root credentials.

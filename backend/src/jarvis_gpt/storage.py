@@ -106,6 +106,14 @@ def _loads(data: str | None, default: Any) -> Any:
         return default
 
 
+def _approval_record(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        **dict(row),
+        "payload": _loads(row["payload"], {}),
+        "result": _loads(row["result"], {}),
+    }
+
+
 _SENSITIVE_KEY_FRAGMENTS = (
     "authorization",
     "api_key",
@@ -172,6 +180,21 @@ def _query_terms(query: str | None, *, limit: int = 12) -> list[str]:
 
 def _fts_query(query: str) -> str:
     return " OR ".join(f'"{term}"' for term in _query_terms(query, limit=8))
+
+
+def _recoverable_fts_error(exc: sqlite3.OperationalError) -> bool:
+    message = str(exc).casefold()
+    return any(
+        marker in message
+        for marker in (
+            "no such module: fts5",
+            "no such table: memories_fts",
+            "no such table: file_chunks_fts",
+            "fts5: syntax error",
+            "malformed match expression",
+            "unterminated string",
+        )
+    )
 
 
 def _decorate_memory_hit(row: dict[str, Any], query: str | None) -> dict[str, Any]:
@@ -342,8 +365,10 @@ class JarvisStorage:
                 """
             )
             return True
-        except sqlite3.OperationalError:
-            return False
+        except sqlite3.OperationalError as exc:
+            if _recoverable_fts_error(exc):
+                return False
+            raise
 
     def _ensure_file_chunks_fts(self, conn: sqlite3.Connection) -> bool:
         try:
@@ -361,8 +386,10 @@ class JarvisStorage:
                 """
             )
             return True
-        except sqlite3.OperationalError:
-            return False
+        except sqlite3.OperationalError as exc:
+            if _recoverable_fts_error(exc):
+                return False
+            raise
 
     def _sync_memory_vault(self, conn: sqlite3.Connection) -> None:
         rows = conn.execute(
@@ -956,8 +983,9 @@ class JarvisStorage:
                             tuple(params),
                         ).fetchall()
                     add_rows(rows)
-                except sqlite3.OperationalError:
-                    pass
+                except sqlite3.OperationalError as exc:
+                    if not _recoverable_fts_error(exc):
+                        raise
 
         if query and len(decorated) < limit:
             terms = _query_terms(query, limit=8)
@@ -1182,6 +1210,52 @@ class JarvisStorage:
                 (mission_id,),
             ).fetchone()
         return dict(row) if row else None
+
+    def claim_next_mission_task(self, mission_id: str) -> dict[str, Any] | None:
+        """Atomically claim the next task when no sibling task is already running."""
+
+        now = utc_now()
+        with self._lock:
+            conn = self.connect()
+            row = conn.execute(
+                """
+                UPDATE mission_tasks
+                SET status = 'running', updated_at = ?
+                WHERE id = (
+                    SELECT pending.id
+                    FROM mission_tasks AS pending
+                    WHERE pending.mission_id = ?
+                      AND pending.status = 'pending'
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM mission_tasks AS active
+                          WHERE active.mission_id = pending.mission_id
+                            AND active.status IN ('running', 'blocked')
+                      )
+                    ORDER BY pending.position ASC
+                    LIMIT 1
+                )
+                  AND status = 'pending'
+                RETURNING
+                    id, mission_id, title, status, notes, position, created_at, updated_at
+                """,
+                (now, mission_id),
+            ).fetchone()
+            if row is None:
+                conn.commit()
+                return None
+            claimed = dict(row)
+            self._refresh_mission_progress(conn, mission_id, now=now)
+            conn.commit()
+        self.record_audit(
+            actor="system",
+            action="mission.task.claim",
+            target_type="mission_task",
+            target_id=str(claimed["id"]),
+            summary=f"Mission task claimed: {claimed['title']}",
+            after=claimed,
+        )
+        return claimed
 
     def update_mission_task(
         self,
@@ -1725,8 +1799,9 @@ class JarvisStorage:
                             (match, limit),
                         ).fetchall()
                     return [_decorate_file_hit(dict(row), query) for row in rows]
-                except sqlite3.OperationalError:
-                    pass
+                except sqlite3.OperationalError as exc:
+                    if not _recoverable_fts_error(exc):
+                        raise
 
         like = f"%{query}%"
         with self._lock:
@@ -1910,19 +1985,27 @@ class JarvisStorage:
             ).fetchone()
             if existing is None:
                 return None
-            before = {
-                **dict(existing),
-                "payload": _loads(existing["payload"], {}),
-                "result": _loads(existing["result"], {}),
+            before = _approval_record(existing)
+            allowed_transitions = {
+                "pending": {"approved", "rejected", "cancelled"},
+                "approved": {"rejected", "cancelled"},
             }
-            conn.execute(
+            current_status = str(existing["status"])
+            if status not in allowed_transitions.get(current_status, set()):
+                raise ValueError(
+                    f"Approval cannot transition from {current_status!r} to {status!r}."
+                )
+            cursor = conn.execute(
                 """
                 UPDATE approvals
                 SET status = ?, result = ?, updated_at = ?
-                WHERE id = ?
+                WHERE id = ? AND status = ?
                 """,
-                (status, _json(result or {}), now, approval_id),
+                (status, _json(result or {}), now, approval_id, current_status),
             )
+            if cursor.rowcount != 1:
+                conn.rollback()
+                raise ValueError("Approval state changed concurrently; reload before updating.")
             conn.commit()
             row = conn.execute(
                 """
@@ -1934,15 +2017,7 @@ class JarvisStorage:
                 """,
                 (approval_id,),
             ).fetchone()
-        updated = (
-            {
-                **dict(row),
-                "payload": _loads(row["payload"], {}),
-                "result": _loads(row["result"], {}),
-            }
-            if row
-            else None
-        )
+        updated = _approval_record(row) if row else None
         if updated:
             self.record_audit(
                 actor="operator",
@@ -1950,6 +2025,126 @@ class JarvisStorage:
                 target_type="approval",
                 target_id=approval_id,
                 summary=f"Approval {status}: {updated['title']}",
+                before=before,
+                after=updated,
+            )
+        return updated
+
+    def claim_approval_execution(self, approval_id: str) -> dict[str, Any] | None:
+        """Atomically move one approved action into the executing state.
+
+        The conditional UPDATE is the concurrency boundary.  A competing
+        process or request can observe the approval, but only one caller can
+        change ``approved`` to ``executing`` and therefore acquire permission
+        to perform the side effect.
+        """
+
+        now = utc_now()
+        with self._lock:
+            conn = self.connect()
+            before_row = conn.execute(
+                """
+                SELECT
+                    id, created_at, updated_at, status, risk, title, description,
+                    requested_action, payload, result
+                FROM approvals
+                WHERE id = ?
+                """,
+                (approval_id,),
+            ).fetchone()
+            if before_row is None:
+                return None
+            before = _approval_record(before_row)
+            cursor = conn.execute(
+                """
+                UPDATE approvals
+                SET status = 'executing', updated_at = ?
+                WHERE id = ? AND status = 'approved'
+                """,
+                (now, approval_id),
+            )
+            conn.commit()
+            if cursor.rowcount != 1:
+                return None
+            row = conn.execute(
+                """
+                SELECT
+                    id, created_at, updated_at, status, risk, title, description,
+                    requested_action, payload, result
+                FROM approvals
+                WHERE id = ?
+                """,
+                (approval_id,),
+            ).fetchone()
+        claimed = _approval_record(row) if row is not None else None
+        if claimed is not None:
+            self.record_audit(
+                actor="agent",
+                action="approval.execute.claim",
+                target_type="approval",
+                target_id=approval_id,
+                summary=f"Approval execution claimed: {claimed['title']}",
+                before=before,
+                after=claimed,
+            )
+        return claimed
+
+    def finalize_approval_execution(
+        self,
+        approval_id: str,
+        *,
+        status: str,
+        result: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Finalize a claimed approval without overwriting another state change."""
+
+        if status not in {"executed", "failed"}:
+            raise ValueError("Approval execution status must be 'executed' or 'failed'.")
+        now = utc_now()
+        with self._lock:
+            conn = self.connect()
+            before_row = conn.execute(
+                """
+                SELECT
+                    id, created_at, updated_at, status, risk, title, description,
+                    requested_action, payload, result
+                FROM approvals
+                WHERE id = ?
+                """,
+                (approval_id,),
+            ).fetchone()
+            if before_row is None:
+                return None
+            before = _approval_record(before_row)
+            cursor = conn.execute(
+                """
+                UPDATE approvals
+                SET status = ?, result = ?, updated_at = ?
+                WHERE id = ? AND status = 'executing'
+                """,
+                (status, _json(result), now, approval_id),
+            )
+            conn.commit()
+            if cursor.rowcount != 1:
+                return None
+            row = conn.execute(
+                """
+                SELECT
+                    id, created_at, updated_at, status, risk, title, description,
+                    requested_action, payload, result
+                FROM approvals
+                WHERE id = ?
+                """,
+                (approval_id,),
+            ).fetchone()
+        updated = _approval_record(row) if row is not None else None
+        if updated is not None:
+            self.record_audit(
+                actor="agent",
+                action="approval.execute.finalize",
+                target_type="approval",
+                target_id=approval_id,
+                summary=f"Approval execution {status}: {updated['title']}",
                 before=before,
                 after=updated,
             )

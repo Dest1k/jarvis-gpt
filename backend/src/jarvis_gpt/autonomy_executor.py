@@ -78,8 +78,18 @@ class AutonomyExecutor:
                     "summary": "Autonomy job is already running.",
                     "data": {"job_id": job_id},
                 }
-            self._running_job_ids.add(job_id)
-        try:
+            current = next(
+                (item for item in self.operations.list_jobs() if item.get("id") == job_id),
+                None,
+            )
+            if current is None:
+                return {
+                    "job": job,
+                    "ok": False,
+                    "summary": "Autonomy job no longer exists.",
+                    "data": {"job_id": job_id},
+                }
+            job = current
             if job.get("status") != "enabled":
                 return {
                     "job": job,
@@ -87,6 +97,18 @@ class AutonomyExecutor:
                     "summary": f"Autonomy job is {job.get('status')}.",
                     "data": {"job_id": job_id},
                 }
+            if job.get("running_lease_id"):
+                return {
+                    "job": job,
+                    "ok": False,
+                    "summary": "Autonomy job already has a running lease.",
+                    "data": {
+                        "job_id": job_id,
+                        "lease_id": job.get("running_lease_id"),
+                    },
+                }
+            self._running_job_ids.add(job_id)
+        try:
             started_at = utc_now()
             started_perf = time.perf_counter()
             lease_id = new_id("joblease")

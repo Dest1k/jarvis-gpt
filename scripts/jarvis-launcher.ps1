@@ -30,7 +30,14 @@ $LogDir = Join-Path $HomePath "logs\jarvis-gpt"
 $StateDir = Join-Path $HomePath "data\jarvis-gpt\state"
 $StateFile = Join-Path $StateDir "launcher-state.json"
 $BridgeTokenFile = Join-Path $HomePath ".jarvis\bridge.token"
-$script:LanMode = [bool]($Lan -or -not $LocalOnly)
+$ApiTokenFile = Join-Path $HomePath ".jarvis\api.token"
+$script:ConfiguredApiToken = [string]$env:JARVIS_API_TOKEN
+$script:ConfiguredCorsOrigins = [string]$env:JARVIS_CORS_ORIGINS
+$script:ApiTokenSource = ""
+if ($Lan -and $LocalOnly) {
+  throw "-Lan and -LocalOnly cannot be used together."
+}
+$script:LanMode = [bool]$Lan
 
 function Get-LanIPv4 {
   try {
@@ -60,17 +67,20 @@ function Get-LanIPv4 {
   } catch {
   }
 
-  return "127.0.0.1"
+  return $null
 }
 
 function Get-PublicHost {
   if ($script:LanMode) {
-    return Get-LanIPv4
+    $lanIp = Get-LanIPv4
+    if ($lanIp) {
+      return $lanIp
+    }
   }
   return "127.0.0.1"
 }
 
-function Get-BindHost {
+function Get-FrontendBindHost {
   if ($script:LanMode) {
     return "0.0.0.0"
   }
@@ -78,22 +88,118 @@ function Get-BindHost {
 }
 
 function Get-BackendUrl {
-  return "http://$(Get-PublicHost):8000"
+  return "http://127.0.0.1:8000"
 }
 
 function Get-FrontendUrl {
   return "http://$(Get-PublicHost):3000"
 }
 
+function Get-OrCreateApiToken {
+  if (-not [string]::IsNullOrWhiteSpace($script:ConfiguredApiToken)) {
+    $script:ApiTokenSource = "JARVIS_API_TOKEN environment variable"
+    return $script:ConfiguredApiToken.Trim()
+  }
+  if (Test-Path -LiteralPath $ApiTokenFile) {
+    $stored = (Get-Content -LiteralPath $ApiTokenFile -Raw).Trim()
+    if ($stored) {
+      Protect-ApiTokenFile
+      $script:ApiTokenSource = $ApiTokenFile
+      return $stored
+    }
+  }
+
+  $tokenDir = Split-Path -Parent $ApiTokenFile
+  New-Item -ItemType Directory -Force -Path $tokenDir | Out-Null
+  $bytes = New-Object byte[] 32
+  $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+  try {
+    $rng.GetBytes($bytes)
+  } finally {
+    $rng.Dispose()
+  }
+  $token = [Convert]::ToBase64String($bytes).TrimEnd([char[]]"=").Replace("+", "-").Replace("/", "_")
+  Set-Content -LiteralPath $ApiTokenFile -Value $token -Encoding Ascii -NoNewline
+  Protect-ApiTokenFile
+  $script:ApiTokenSource = $ApiTokenFile
+  return $token
+}
+
+function Protect-ApiTokenFile {
+  try {
+    $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $icacls = Join-Path $env:SystemRoot "System32\icacls.exe"
+    foreach ($arguments in @(
+      @($ApiTokenFile, "/reset", "/Q"),
+      @($ApiTokenFile, "/inheritance:r", "/Q"),
+      @($ApiTokenFile, "/grant:r", "*$($identity):(F)", "/Q")
+    )) {
+      & $icacls @arguments | Out-Null
+      if ($LASTEXITCODE -ne 0) {
+        throw "icacls exited with code $LASTEXITCODE"
+      }
+    }
+  } catch {
+    throw "Could not restrict API token file permissions: $($_.Exception.Message)"
+  }
+}
+
+function Get-StringSha256 {
+  param([string]$Value)
+
+  $sha = [System.Security.Cryptography.SHA256]::Create()
+  try {
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Value)
+    $hash = $sha.ComputeHash($bytes)
+    return (($hash | ForEach-Object { $_.ToString("x2") }) -join "")
+  } finally {
+    $sha.Dispose()
+  }
+}
+
+function Get-FrontendEnvironmentSha256 {
+  $values = @(
+    [string]$env:JARVIS_BACKEND_URL
+    [string]$env:JARVIS_API_TOKEN
+  )
+  return Get-StringSha256 -Value ($values -join "`n")
+}
+
+function Get-BackendEnvironmentSha256 {
+  $values = @(
+    [string]$env:JARVIS_HOME
+    [string]$env:JARVIS_MODEL_ROOT
+    [string]$env:JARVIS_PROFILE
+    [string]$env:JARVIS_LLM_BASE_URL
+    [string]$env:JARVIS_LLM_MODEL
+    [string]$env:JARVIS_API_HOST
+    [string]$env:JARVIS_API_PORT
+    [string]$env:JARVIS_API_TOKEN
+    [string]$env:JARVIS_API_REQUIRE_TOKEN_ON_LOOPBACK
+    [string]$env:JARVIS_CORS_ORIGINS
+  )
+  return Get-StringSha256 -Value ($values -join "`n")
+}
+
 function Set-JarvisEnvironment {
   param([string]$SelectedProfile)
+
+  $apiToken = Get-OrCreateApiToken
+  $corsOrigins = @($script:ConfiguredCorsOrigins -split ",") |
+    ForEach-Object { $_.Trim().TrimEnd("/") } |
+    Where-Object { $_ } |
+    Select-Object -Unique
 
   $env:JARVIS_HOME = $HomePath
   $env:JARVIS_MODEL_ROOT = $ModelRoot
   $env:JARVIS_PROFILE = $SelectedProfile
   $env:JARVIS_LLM_BASE_URL = "http://localhost:8001/v1"
   $env:JARVIS_LLM_MODEL = "dispatcher"
-  $env:NEXT_PUBLIC_JARVIS_API_URL = Get-BackendUrl
+  $env:JARVIS_API_HOST = "127.0.0.1"
+  $env:JARVIS_API_PORT = "8000"
+  $env:JARVIS_API_TOKEN = $apiToken
+  $env:JARVIS_CORS_ORIGINS = $corsOrigins -join ","
+  $env:JARVIS_BACKEND_URL = "http://127.0.0.1:8000"
 }
 
 function Ensure-LauncherFolders {
@@ -198,7 +304,7 @@ function Ensure-LanFirewallRules {
     return
   }
 
-  foreach ($port in @(3000, 8000)) {
+  foreach ($port in @(3000)) {
     $name = "Jarvis LAN $port"
     try {
       $existing = Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue
@@ -764,19 +870,6 @@ function Test-JarvisProcess {
     return $true
   }
 
-  $scriptSignatures = @(
-    "jarvis-launcher.ps1",
-    "jarvis.py",
-    "windows_rpc_bridge.py",
-    "jarvis_gpt",
-    "jarvis-gpt-command-center"
-  )
-  foreach ($signature in $scriptSignatures) {
-    if ($text.Contains($signature)) {
-      return $true
-    }
-  }
-
   return $false
 }
 
@@ -820,6 +913,22 @@ function Test-ManagedServiceProcess {
   }
 }
 
+function Test-ManagedPortOwner {
+  param(
+    [int]$Port,
+    [string]$Service
+  )
+
+  $ownerPid = Get-PortOwner -Port $Port
+  if (-not $ownerPid) {
+    return $false
+  }
+  $processInfo = Get-ProcessSnapshot |
+    Where-Object { [int]$_.ProcessId -eq $ownerPid } |
+    Select-Object -First 1
+  return [bool](Test-ManagedServiceProcess -ProcessInfo $processInfo -Service $Service)
+}
+
 function Stop-JarvisProcessesBySignature {
   $snapshot = Get-ProcessSnapshot
   $protected = Get-CurrentProcessFamilyIds
@@ -842,7 +951,9 @@ function Stop-JarvisProcessesBySignature {
 function Stop-PortOwner {
   param(
     [int]$Port,
-    [switch]$SkipDockerEngineOwner
+    [switch]$SkipDockerEngineOwner,
+    [switch]$ManagedOnly,
+    [string]$Service = ""
   )
 
   try {
@@ -858,6 +969,17 @@ function Stop-PortOwner {
     $ownerText = ("{0} {1} {2}" -f $owner.Name, $owner.CommandLine, $owner.ExecutablePath).ToLowerInvariant()
     if ($SkipDockerEngineOwner -and $ownerText -match "(docker desktop|com\.docker\.backend|dockerd|wslhost)") {
       Write-Host ("Skipped Docker engine port owner pid={0} on {1}; dispatcher container is stopped separately." -f $ownerPid, $Port) -ForegroundColor DarkYellow
+      return
+    }
+    if (
+      $ManagedOnly -and
+      -not (Test-ManagedServiceProcess -ProcessInfo $owner -Service $Service)
+    ) {
+      Write-Host (
+        "Skipped foreign listener pid={0} on port {1}; it is not managed by Jarvis." -f
+        $ownerPid,
+        $Port
+      ) -ForegroundColor DarkYellow
       return
     }
     Stop-ProcessTree `
@@ -951,9 +1073,11 @@ function Save-LauncherState {
     profile = $Profile
     home = $HomePath
     lan = [bool]$script:LanMode
-    lan_ip = Get-LanIPv4
+    lan_ip = if ($script:LanMode) { Get-LanIPv4 } else { $null }
     frontend_url = Get-FrontendUrl
     backend_url = Get-BackendUrl
+    backend_environment_sha256 = (Get-BackendEnvironmentSha256)
+    frontend_environment_sha256 = (Get-FrontendEnvironmentSha256)
     started_at = (Get-Date).ToString("o")
     services = $Services
   }
@@ -1055,16 +1179,37 @@ function Ensure-FrontendReady {
 }
 
 function Start-JarvisStack {
+  $lanUnavailable = [bool]($script:LanMode -and -not (Get-LanIPv4))
+  if ($lanUnavailable) {
+    $script:LanMode = $false
+  }
   Ensure-LauncherFolders
   Set-JarvisEnvironment -SelectedProfile $Profile
+  $previousState = Read-LauncherState
+  $backendEnvironmentSha256 = Get-BackendEnvironmentSha256
+  $frontendEnvironmentSha256 = Get-FrontendEnvironmentSha256
+  $backendEnvironmentChanged = [bool](
+    -not $previousState -or
+    [string]$previousState.backend_environment_sha256 -ne $backendEnvironmentSha256
+  )
+  $frontendEnvironmentChanged = [bool](
+    -not $previousState -or
+    [string]$previousState.frontend_environment_sha256 -ne $frontendEnvironmentSha256
+  )
   Ensure-LanFirewallRules
-  $bindHost = Get-BindHost
+  $backendBindHost = "127.0.0.1"
+  $frontendBindHost = Get-FrontendBindHost
   $publicHost = Get-PublicHost
 
   Write-Banner
+  if ($lanUnavailable) {
+    Write-Host "No routable LAN IPv4 address was found; using loopback-only mode." -ForegroundColor DarkYellow
+    Write-Host ""
+  }
   if ($script:LanMode) {
-    Write-Host ("LAN mode: UI http://{0}:3000, API http://{0}:8000" -f $publicHost) -ForegroundColor Cyan
-    Write-Host "Dispatcher and host bridge remain bound to localhost." -ForegroundColor DarkGray
+    Write-Host ("LAN mode: UI http://{0}:3000" -f $publicHost) -ForegroundColor Cyan
+    Write-Host ("Login: user 'jarvis'; password source: {0}" -f $script:ApiTokenSource) -ForegroundColor Cyan
+    Write-Host "Backend, dispatcher, and host bridge remain bound to localhost." -ForegroundColor DarkGray
     Write-Host ""
   }
   Write-Host "Preparing runtime folders..." -ForegroundColor Yellow
@@ -1086,6 +1231,9 @@ function Start-JarvisStack {
 
   if (-not $NoBridge) {
     if (Test-PortOpen -Port 8765) {
+      if (-not (Test-ManagedPortOwner -Port 8765 -Service "bridge")) {
+        throw "TCP 8765 is occupied by a process not managed by Jarvis. Stop it or choose another port."
+      }
       $services.bridge = @{ port = 8765; pid = Get-PortOwner -Port 8765; reused = $true }
       Write-Host "Host bridge already listening on 127.0.0.1:8765" -ForegroundColor DarkYellow
     } else {
@@ -1094,7 +1242,7 @@ function Start-JarvisStack {
         pid = Start-ManagedProcess `
           -Name "host bridge" `
           -FilePath "py.exe" `
-          -Arguments @("-3.11", ".\scripts\windows_rpc_bridge.py", "--host", "127.0.0.1", "--port", "8765", "--token-file", $BridgeTokenFile) `
+          -Arguments @("-3.11", (Join-Path $RepoRoot "scripts\windows_rpc_bridge.py"), "--host", "127.0.0.1", "--port", "8765", "--token-file", $BridgeTokenFile) `
           -WorkingDirectory $RepoRoot `
           -Stdout (Join-Path $LogDir "host-bridge.out.log") `
           -Stderr (Join-Path $LogDir "host-bridge.err.log")
@@ -1104,23 +1252,27 @@ function Start-JarvisStack {
 
   if (-not $NoBackend) {
     if (Test-PortOpen -Port 8000) {
-      if ($script:LanMode -and -not (Test-PortExposedForLan -Port 8000)) {
-        Write-Host "Restarting backend for LAN binding..." -ForegroundColor Yellow
-        Stop-PortOwner -Port 8000
+      if (-not (Test-ManagedPortOwner -Port 8000 -Service "backend")) {
+        throw "TCP 8000 is occupied by a process not managed by Jarvis. Stop it or choose another port."
+      }
+      if ($backendEnvironmentChanged) {
+        $reason = "its launch environment changed"
+        Write-Host ("Restarting backend because {0}..." -f $reason) -ForegroundColor Yellow
+        Stop-PortOwner -Port 8000 -ManagedOnly -Service "backend"
         [void](Wait-PortClosed -Port 8000)
       } else {
-        $services.backend = @{ port = 8000; pid = Get-PortOwner -Port 8000; reused = $true; host = $bindHost }
-        Write-Host ("Backend already listening on {0}:8000" -f $bindHost) -ForegroundColor DarkYellow
+        $services.backend = @{ port = 8000; pid = Get-PortOwner -Port 8000; reused = $true; host = $backendBindHost }
+        Write-Host ("Backend already listening on {0}:8000" -f $backendBindHost) -ForegroundColor DarkYellow
       }
     }
     if (-not (Test-PortOpen -Port 8000)) {
       $services.backend = @{
         port = 8000
-        host = $bindHost
+        host = $backendBindHost
         pid = Start-ManagedProcess `
           -Name "backend" `
           -FilePath "py.exe" `
-          -Arguments @("-3.11", ".\jarvis.py", "--profile", $Profile, "serve", "--host", $bindHost, "--port", "8000") `
+          -Arguments @("-3.11", (Join-Path $RepoRoot "jarvis.py"), "--profile", $Profile, "serve", "--host", $backendBindHost, "--port", "8000") `
           -WorkingDirectory $RepoRoot `
           -Stdout (Join-Path $LogDir "backend.out.log") `
           -Stderr (Join-Path $LogDir "backend.err.log")
@@ -1131,26 +1283,39 @@ function Start-JarvisStack {
   if (-not $NoFrontend) {
     $frontendRebuilt = Ensure-FrontendReady
     if (Test-PortOpen -Port 3000) {
-      if ($frontendRebuilt -or ($script:LanMode -and -not (Test-PortExposedForLan -Port 3000))) {
-        $reason = if ($frontendRebuilt) { "the frontend build changed" } else { "LAN binding is required" }
+      if (-not (Test-ManagedPortOwner -Port 3000 -Service "frontend")) {
+        throw "TCP 3000 is occupied by a process not managed by Jarvis. Stop it or choose another port."
+      }
+      if (
+        $frontendRebuilt -or
+        $frontendEnvironmentChanged -or
+        ($script:LanMode -and -not (Test-PortExposedForLan -Port 3000))
+      ) {
+        $reason = if ($frontendRebuilt) {
+          "the frontend build changed"
+        } elseif ($frontendEnvironmentChanged) {
+          "the frontend launch environment changed"
+        } else {
+          "LAN binding is required"
+        }
         Write-Host ("Restarting Command Center because {0}..." -f $reason) -ForegroundColor Yellow
-        Stop-PortOwner -Port 3000
+        Stop-PortOwner -Port 3000 -ManagedOnly -Service "frontend"
         [void](Wait-PortClosed -Port 3000)
       } else {
-        $services.frontend = @{ port = 3000; pid = Get-PortOwner -Port 3000; reused = $true; host = $bindHost }
-        Write-Host ("Command Center already listening on {0}:3000" -f $bindHost) -ForegroundColor DarkYellow
+        $services.frontend = @{ port = 3000; pid = Get-PortOwner -Port 3000; reused = $true; host = $frontendBindHost }
+        Write-Host ("Command Center already listening on {0}:3000" -f $frontendBindHost) -ForegroundColor DarkYellow
       }
     }
 
     if (-not (Test-PortOpen -Port 3000)) {
       $frontendArgs = if ($DevFrontend) {
-        @("run", "dev", "--", "--hostname", $bindHost)
+        @("run", "dev", "--", "--hostname", $frontendBindHost)
       } else {
-        @("run", "start", "--", "--hostname", $bindHost)
+        @("run", "start", "--", "--hostname", $frontendBindHost)
       }
       $services.frontend = @{
         port = 3000
-        host = $bindHost
+        host = $frontendBindHost
         pid = Start-ManagedProcess `
           -Name "frontend" `
           -FilePath "npm.cmd" `
@@ -1202,9 +1367,9 @@ function Stop-JarvisStack {
 
   Stop-JarvisProcessesBySignature
 
-  Stop-PortOwner -Port 3000
-  Stop-PortOwner -Port 8000
-  Stop-PortOwner -Port 8765
+  Stop-PortOwner -Port 3000 -ManagedOnly -Service "frontend"
+  Stop-PortOwner -Port 8000 -ManagedOnly -Service "backend"
+  Stop-PortOwner -Port 8765 -ManagedOnly -Service "bridge"
 
   Stop-DispatcherRuntime
   Stop-PortOwner -Port 8001 -SkipDockerEngineOwner
@@ -1234,7 +1399,10 @@ function Show-ServiceRow {
 
 function Get-EffectiveLanMode {
   $state = Read-LauncherState
-  return [bool]($script:LanMode -or ($state -and $state.lan))
+  if ($state) {
+    return [bool]$state.lan
+  }
+  return [bool]($script:LanMode -and (Get-LanIPv4))
 }
 
 function Get-EffectivePublicHost {
@@ -1243,7 +1411,10 @@ function Get-EffectivePublicHost {
     return [string]$state.lan_ip
   }
   if (Get-EffectiveLanMode) {
-    return Get-LanIPv4
+    $lanIp = Get-LanIPv4
+    if ($lanIp) {
+      return $lanIp
+    }
   }
   return "127.0.0.1"
 }
@@ -1256,14 +1427,15 @@ function Show-JarvisStatus {
   Write-Host "+----------------+----------+-------------+----------------------------+" -ForegroundColor DarkCyan
   Write-Host "| Service        | State    | Process     | URL                        |" -ForegroundColor Cyan
   Write-Host "+----------------+----------+-------------+----------------------------+" -ForegroundColor DarkCyan
-  Show-ServiceRow -Name "Backend" -Port 8000 -Url ("http://{0}:8000" -f $statusHost)
+  Show-ServiceRow -Name "Backend" -Port 8000 -Url "http://127.0.0.1:8000"
   Show-ServiceRow -Name "Frontend" -Port 3000 -Url ("http://{0}:3000" -f $statusHost)
   Show-ServiceRow -Name "Host bridge" -Port 8765 -Url "http://127.0.0.1:8765"
   Show-ServiceRow -Name "Dispatcher" -Port 8001 -Url "http://127.0.0.1:8001/v1"
   Write-Host "+----------------+----------+-------------+----------------------------+" -ForegroundColor DarkCyan
   if ($lanStatus) {
     Write-Host ("LAN access: open http://{0}:3000 from another device on the same network." -f $statusHost) -ForegroundColor Cyan
-    Write-Host "Only UI/API are exposed to LAN; dispatcher and host bridge remain localhost-only." -ForegroundColor DarkGray
+    Write-Host ("Login: user 'jarvis'; password source: {0}" -f $script:ApiTokenSource) -ForegroundColor Cyan
+    Write-Host "Only the authenticated UI is exposed; backend, dispatcher, and host bridge remain localhost-only." -ForegroundColor DarkGray
     Write-Host ""
   }
   Write-Host ""
@@ -1307,7 +1479,8 @@ function Open-CommandCenter {
 
 function Invoke-Menu {
   $main = @(
-    @{ Label = "Start full stack"; Value = "start"; Hint = "LAN default: dispatcher + bridge + backend + UI" },
+    @{ Label = "Start full stack"; Value = "start"; Hint = "loopback-only: dispatcher + bridge + backend + UI" },
+    @{ Label = "Start with LAN"; Value = "lan"; Hint = "token-auth UI/API on the private network" },
     @{ Label = "Stop stack"; Value = "stop"; Hint = "stop UI/backend/bridge/dispatcher" },
     @{ Label = "Restart stack"; Value = "restart"; Hint = "stop then start" },
     @{ Label = "Status"; Value = "status"; Hint = "show service ports" },

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote, urlparse
@@ -13,6 +14,7 @@ from websockets.exceptions import WebSocketException
 
 DEFAULT_CHROME_DEBUG_URL = "http://127.0.0.1:9222"
 LOCAL_DEBUG_HOSTS = {"127.0.0.1", "localhost", "::1"}
+UrlValidator = Callable[[str], str | None]
 
 HUMAN_VERIFICATION_MARKERS = (
     "verify you are human",
@@ -27,7 +29,7 @@ HUMAN_VERIFICATION_MARKERS = (
 
 
 class BrowserCdpError(RuntimeError):
-    pass
+    """Raised when a Chrome DevTools Protocol operation cannot complete safely."""
 
 
 @dataclass(frozen=True)
@@ -92,31 +94,26 @@ async def read_chrome_page(
     max_chars: int,
     wait_ms: int,
     debug_url: str = DEFAULT_CHROME_DEBUG_URL,
+    url_validator: UrlValidator | None = None,
 ) -> BrowserPageSnapshot:
     base_url = normalize_debug_url(debug_url)
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(8.0), trust_env=False) as client:
             version = await client.get(f"{base_url}/json/version")
             version.raise_for_status()
-            target = await _open_target(client, base_url, url)
+            target = await _open_target(client, base_url, "about:blank")
+            try:
+                return await _read_target_page(
+                    target,
+                    url=url,
+                    max_chars=max_chars,
+                    wait_ms=wait_ms,
+                    url_validator=url_validator,
+                )
+            finally:
+                await _close_target(client, base_url, target.id)
     except (httpx.HTTPError, ValueError) as exc:
         raise BrowserCdpError(f"Chrome DevTools endpoint is unavailable: {exc}") from exc
-
-    try:
-        async with websockets.connect(
-            target.web_socket_debugger_url,
-            max_size=4_000_000,
-            open_timeout=8,
-            close_timeout=2,
-        ) as websocket:
-            cdp = _CdpConnection(websocket)
-            await cdp.send("Page.enable")
-            await cdp.send("Runtime.enable")
-            await cdp.send("Page.navigate", {"url": url})
-            ready_state = await _wait_for_ready_state(cdp, wait_ms)
-            return await _snapshot_page(cdp, max_chars=max_chars, ready_state=ready_state)
-    except (OSError, WebSocketException, TimeoutError) as exc:
-        raise BrowserCdpError(f"Chrome DevTools websocket failed: {exc}") from exc
 
 
 async def scroll_chrome_page(
@@ -128,48 +125,29 @@ async def scroll_chrome_page(
     max_chars: int,
     wait_ms: int,
     debug_url: str = DEFAULT_CHROME_DEBUG_URL,
+    url_validator: UrlValidator | None = None,
 ) -> BrowserActionResult:
     base_url = normalize_debug_url(debug_url)
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(8.0), trust_env=False) as client:
             version = await client.get(f"{base_url}/json/version")
             version.raise_for_status()
-            target = await _open_target(client, base_url, url)
+            target = await _open_target(client, base_url, "about:blank")
+            try:
+                return await _scroll_target_page(
+                    target,
+                    url=url,
+                    direction=direction,
+                    pixels=pixels,
+                    passes=passes,
+                    max_chars=max_chars,
+                    wait_ms=wait_ms,
+                    url_validator=url_validator,
+                )
+            finally:
+                await _close_target(client, base_url, target.id)
     except (httpx.HTTPError, ValueError) as exc:
         raise BrowserCdpError(f"Chrome DevTools endpoint is unavailable: {exc}") from exc
-
-    try:
-        async with websockets.connect(
-            target.web_socket_debugger_url,
-            max_size=8_000_000,
-            open_timeout=8,
-            close_timeout=2,
-        ) as websocket:
-            cdp = _CdpConnection(websocket)
-            await cdp.send("Page.enable")
-            await cdp.send("Runtime.enable")
-            await cdp.send("Page.navigate", {"url": url})
-            ready_state = await _wait_for_ready_state(cdp, wait_ms)
-            scroll_payload = await _run_scroll_expression(
-                cdp,
-                direction=direction,
-                pixels=pixels,
-                passes=passes,
-            )
-            ready_state = await _wait_for_ready_state(cdp, min(wait_ms, 3000))
-            snapshot = await _snapshot_page(cdp, max_chars=max_chars, ready_state=ready_state)
-            return BrowserActionResult(
-                action="scroll",
-                url=snapshot.url,
-                title=snapshot.title,
-                ready_state=snapshot.ready_state,
-                ok=bool(scroll_payload.get("ok", True)),
-                summary=str(scroll_payload.get("summary") or "Scrolled page."),
-                snapshot=snapshot,
-                target_info=scroll_payload,
-            )
-    except (OSError, WebSocketException, TimeoutError) as exc:
-        raise BrowserCdpError(f"Chrome DevTools websocket failed: {exc}") from exc
 
 
 async def run_chrome_action(
@@ -184,16 +162,77 @@ async def run_chrome_action(
     wait_ms: int,
     allow_sensitive: bool = False,
     debug_url: str = DEFAULT_CHROME_DEBUG_URL,
+    url_validator: UrlValidator | None = None,
 ) -> BrowserActionResult:
     base_url = normalize_debug_url(debug_url)
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(8.0), trust_env=False) as client:
             version = await client.get(f"{base_url}/json/version")
             version.raise_for_status()
-            target = await _open_target(client, base_url, url)
+            target_info = await _open_target(client, base_url, "about:blank")
+            try:
+                return await _run_target_action(
+                    target_info,
+                    url=url,
+                    action=action,
+                    selector=selector,
+                    target=target,
+                    text=text,
+                    value=value,
+                    max_chars=max_chars,
+                    wait_ms=wait_ms,
+                    allow_sensitive=allow_sensitive,
+                    url_validator=url_validator,
+                )
+            finally:
+                await _close_target(client, base_url, target_info.id)
     except (httpx.HTTPError, ValueError) as exc:
         raise BrowserCdpError(f"Chrome DevTools endpoint is unavailable: {exc}") from exc
 
+
+async def _read_target_page(
+    target: BrowserTarget,
+    *,
+    url: str,
+    max_chars: int,
+    wait_ms: int,
+    url_validator: UrlValidator | None,
+) -> BrowserPageSnapshot:
+    try:
+        async with websockets.connect(
+            target.web_socket_debugger_url,
+            max_size=4_000_000,
+            open_timeout=8,
+            close_timeout=2,
+        ) as websocket:
+            cdp = _CdpConnection(websocket, url_validator=url_validator)
+            await _prepare_page(cdp)
+            await cdp.send(
+                "Page.navigate",
+                {"url": await _validated_url_async(url, url_validator)},
+            )
+            ready_state = await _wait_for_ready_state(cdp, wait_ms)
+            return await _snapshot_page(
+                cdp,
+                max_chars=max_chars,
+                ready_state=ready_state,
+                url_validator=url_validator,
+            )
+    except (OSError, WebSocketException, TimeoutError) as exc:
+        raise BrowserCdpError(f"Chrome DevTools websocket failed: {exc}") from exc
+
+
+async def _scroll_target_page(
+    target: BrowserTarget,
+    *,
+    url: str,
+    direction: str,
+    pixels: int,
+    passes: int,
+    max_chars: int,
+    wait_ms: int,
+    url_validator: UrlValidator | None,
+) -> BrowserActionResult:
     try:
         async with websockets.connect(
             target.web_socket_debugger_url,
@@ -201,10 +240,67 @@ async def run_chrome_action(
             open_timeout=8,
             close_timeout=2,
         ) as websocket:
-            cdp = _CdpConnection(websocket)
-            await cdp.send("Page.enable")
-            await cdp.send("Runtime.enable")
-            await cdp.send("Page.navigate", {"url": url})
+            cdp = _CdpConnection(websocket, url_validator=url_validator)
+            await _prepare_page(cdp)
+            await cdp.send(
+                "Page.navigate",
+                {"url": await _validated_url_async(url, url_validator)},
+            )
+            ready_state = await _wait_for_ready_state(cdp, wait_ms)
+            scroll_payload = await _run_scroll_expression(
+                cdp,
+                direction=direction,
+                pixels=pixels,
+                passes=passes,
+            )
+            ready_state = await _wait_for_ready_state(cdp, min(wait_ms, 3000))
+            snapshot = await _snapshot_page(
+                cdp,
+                max_chars=max_chars,
+                ready_state=ready_state,
+                url_validator=url_validator,
+            )
+            return BrowserActionResult(
+                action="scroll",
+                url=snapshot.url,
+                title=snapshot.title,
+                ready_state=snapshot.ready_state,
+                ok=bool(scroll_payload.get("ok", True)),
+                summary=str(scroll_payload.get("summary") or "Scrolled page."),
+                snapshot=snapshot,
+                target_info=scroll_payload,
+            )
+    except (OSError, WebSocketException, TimeoutError) as exc:
+        raise BrowserCdpError(f"Chrome DevTools websocket failed: {exc}") from exc
+
+
+async def _run_target_action(
+    target_info: BrowserTarget,
+    *,
+    url: str,
+    action: str,
+    selector: str,
+    target: str,
+    text: str,
+    value: str,
+    max_chars: int,
+    wait_ms: int,
+    allow_sensitive: bool,
+    url_validator: UrlValidator | None,
+) -> BrowserActionResult:
+    try:
+        async with websockets.connect(
+            target_info.web_socket_debugger_url,
+            max_size=8_000_000,
+            open_timeout=8,
+            close_timeout=2,
+        ) as websocket:
+            cdp = _CdpConnection(websocket, url_validator=url_validator)
+            await _prepare_page(cdp)
+            await cdp.send(
+                "Page.navigate",
+                {"url": await _validated_url_async(url, url_validator)},
+            )
             ready_state = await _wait_for_ready_state(cdp, wait_ms)
             action_payload = await _run_action_expression(
                 cdp,
@@ -217,7 +313,12 @@ async def run_chrome_action(
             )
             await asyncio.sleep(0.35)
             ready_state = await _wait_for_ready_state(cdp, min(wait_ms, 3000))
-            snapshot = await _snapshot_page(cdp, max_chars=max_chars, ready_state=ready_state)
+            snapshot = await _snapshot_page(
+                cdp,
+                max_chars=max_chars,
+                ready_state=ready_state,
+                url_validator=url_validator,
+            )
             screenshot = None
             if action == "screenshot":
                 screenshot = await _capture_screenshot(cdp)
@@ -263,20 +364,98 @@ async def _open_target(
     payload = response.json()
     if not isinstance(payload, dict):
         raise BrowserCdpError("Chrome DevTools returned an invalid target payload.")
+    target_id = str(payload.get("id") or "")
     websocket_url = str(payload.get("webSocketDebuggerUrl") or "")
-    if not websocket_url:
+    if not target_id or not websocket_url:
+        if target_id:
+            await _close_target(client, base_url, target_id)
         raise BrowserCdpError("Chrome target has no websocket debugger URL.")
+    try:
+        _validate_websocket_debugger_url(websocket_url)
+    except BrowserCdpError:
+        await _close_target(client, base_url, target_id)
+        raise
     return BrowserTarget(
-        id=str(payload.get("id") or ""),
+        id=target_id,
         url=str(payload.get("url") or url),
         web_socket_debugger_url=websocket_url,
     )
 
 
+async def _close_target(client: httpx.AsyncClient, base_url: str, target_id: str) -> None:
+    if not target_id:
+        return
+    try:
+        response = await client.get(f"{base_url}/json/close/{quote(target_id, safe='')}")
+        if response.status_code not in {200, 404}:
+            response.raise_for_status()
+    except (httpx.HTTPError, OSError, ValueError):
+        # Closing is best-effort and must never mask the action result or original error.
+        return
+
+
+def _validate_websocket_debugger_url(websocket_url: str) -> None:
+    parsed = urlparse(websocket_url)
+    if parsed.scheme not in {"ws", "wss"}:
+        raise BrowserCdpError("Chrome target returned an invalid websocket debugger URL.")
+    if not parsed.hostname or parsed.hostname.lower() not in LOCAL_DEBUG_HOSTS:
+        raise BrowserCdpError("Chrome target websocket must point to localhost.")
+    if parsed.username or parsed.password:
+        raise BrowserCdpError("Chrome target websocket cannot contain credentials.")
+
+
+def _validated_url(url: str, validator: UrlValidator | None) -> str:
+    if validator is None:
+        return url
+    try:
+        validated = validator(url)
+    except BrowserCdpError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise BrowserCdpError(f"Blocked browser URL {url!r}: {exc}") from exc
+    return str(validated or url)
+
+
+async def _validated_url_async(url: str, validator: UrlValidator | None) -> str:
+    if validator is None:
+        return url
+    return await asyncio.to_thread(_validated_url, url, validator)
+
+
+async def _prepare_page(cdp: _CdpConnection) -> None:
+    await cdp.send("Page.enable")
+    await cdp.send("Runtime.enable")
+    if cdp.url_validator is not None:
+        await cdp.send("Network.enable")
+        # WebSocket handshakes cannot be safely DNS-pinned per hop in an existing
+        # operator Chrome session, so content tools fail closed on ws/wss.
+        await cdp.send("Network.setBlockedURLs", {"urls": ["ws://*", "wss://*"]})
+        await cdp.send(
+            "Fetch.enable",
+            {
+                "patterns": [
+                    {"urlPattern": "http://*/*", "requestStage": "Request"},
+                    {"urlPattern": "https://*/*", "requestStage": "Request"},
+                    {"urlPattern": "ws://*", "requestStage": "Request"},
+                    {"urlPattern": "wss://*", "requestStage": "Request"},
+                ]
+            },
+        )
+        # Pause related targets before their first script/network action. Popups
+        # are closed by _handle_attached_target; workers are closed as an
+        # isolation trade-off rather than inheriting an unguarded network stack.
+        await cdp.send(
+            "Target.setAutoAttach",
+            {"autoAttach": True, "waitForDebuggerOnStart": True, "flatten": True},
+        )
+
+
 class _CdpConnection:
-    def __init__(self, websocket: Any) -> None:
+    def __init__(self, websocket: Any, *, url_validator: UrlValidator | None = None) -> None:
         self.websocket = websocket
+        self.url_validator = url_validator
         self._next_id = 0
+        self._blocked_requests: list[dict[str, str]] = []
 
     async def send(
         self,
@@ -295,6 +474,19 @@ class _CdpConnection:
         while True:
             raw = await asyncio.wait_for(self.websocket.recv(), timeout=timeout)
             data = json.loads(raw)
+            event_method = str(data.get("method") or "")
+            if event_method == "Fetch.requestPaused":
+                await self._handle_request_paused(data.get("params"))
+                continue
+            if event_method in {
+                "Network.webSocketCreated",
+                "Network.webSocketWillSendHandshakeRequest",
+            }:
+                self._handle_websocket_event(data.get("params"))
+                continue
+            if event_method == "Target.attachedToTarget":
+                await self._handle_attached_target(data.get("params"))
+                continue
             if data.get("id") != message_id:
                 continue
             if "error" in data:
@@ -305,9 +497,78 @@ class _CdpConnection:
                     detail = error
                 raise BrowserCdpError(f"CDP command {method} failed: {detail}")
             result = data.get("result") or {}
+            self.raise_for_blocked_requests()
             if not isinstance(result, dict):
                 return {}
             return result
+
+    async def _handle_request_paused(self, raw_params: Any) -> None:
+        params = raw_params if isinstance(raw_params, dict) else {}
+        request = params.get("request") if isinstance(params.get("request"), dict) else {}
+        request_id = str(params.get("requestId") or "")
+        url = str(request.get("url") or "")
+        resource_type = str(params.get("resourceType") or "Other")
+        try:
+            await _validated_url_async(url, self.url_validator)
+        except BrowserCdpError as exc:
+            self._blocked_requests.append(
+                {"url": url, "resource_type": resource_type, "reason": str(exc)}
+            )
+            await self._send_untracked(
+                "Fetch.failRequest",
+                {"requestId": request_id, "errorReason": "BlockedByClient"},
+            )
+            return
+        await self._send_untracked("Fetch.continueRequest", {"requestId": request_id})
+
+    def _handle_websocket_event(self, raw_params: Any) -> None:
+        params = raw_params if isinstance(raw_params, dict) else {}
+        request = params.get("request") if isinstance(params.get("request"), dict) else {}
+        url = str(params.get("url") or request.get("url") or "")
+        self._blocked_requests.append(
+            {
+                "url": url,
+                "resource_type": "WebSocket",
+                "reason": "WebSocket transport is disabled for isolated browser content tools.",
+            }
+        )
+
+    async def _handle_attached_target(self, raw_params: Any) -> None:
+        params = raw_params if isinstance(raw_params, dict) else {}
+        target_info = (
+            params.get("targetInfo") if isinstance(params.get("targetInfo"), dict) else {}
+        )
+        target_id = str(target_info.get("targetId") or "")
+        target_type = str(target_info.get("type") or "unknown")
+        url = str(target_info.get("url") or "")
+        if target_id:
+            await self._send_untracked("Target.closeTarget", {"targetId": target_id})
+        if target_type in {"page", "webview"}:
+            self._blocked_requests.append(
+                {
+                    "url": url,
+                    "resource_type": "Popup",
+                    "reason": "New browser targets are disabled for isolated content tools.",
+                }
+            )
+
+    async def _send_untracked(self, method: str, params: dict[str, Any]) -> None:
+        self._next_id += 1
+        await self.websocket.send(
+            json.dumps(
+                {"id": self._next_id, "method": method, "params": params},
+                ensure_ascii=False,
+            )
+        )
+
+    def raise_for_blocked_requests(self) -> None:
+        if not self._blocked_requests:
+            return
+        first = self._blocked_requests[0]
+        raise BrowserCdpError(
+            "Blocked CDP request "
+            f"({first['resource_type']}) to {first['url']!r}: {first['reason']}"
+        )
 
 
 async def _wait_for_ready_state(cdp: _CdpConnection, wait_ms: int) -> str:
@@ -338,6 +599,7 @@ async def _snapshot_page(
     *,
     max_chars: int,
     ready_state: str,
+    url_validator: UrlValidator | None = None,
 ) -> BrowserPageSnapshot:
     expression = _snapshot_expression(max_chars + 1)
     result = await cdp.send(
@@ -354,6 +616,7 @@ async def _snapshot_page(
         text = text[:max_chars]
     title = str(value.get("title") or "")
     final_url = str(value.get("url") or "")
+    await _validated_url_async(final_url, url_validator)
     page_ready_state = str(value.get("readyState") or ready_state)
     return BrowserPageSnapshot(
         title=title,
