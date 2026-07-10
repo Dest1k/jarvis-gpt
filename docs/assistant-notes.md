@@ -737,7 +737,7 @@ Claude Sync Note
 - Deployment/UI: backend/frontend Dockerfiles and `.dockerignore`, new
   `backend/docker-entrypoint.sh`, `backend/chromium-seccomp.json`, new Next
   same-origin route `frontend/app/jarvis-api/[...path]/route.ts`,
-  `frontend/proxy.ts`, Command Center/trace pages, `docker-compose.yml`,
+  Command Center/trace pages, `docker-compose.yml`,
   `.env.example`, `scripts/{dev,jarvis-launcher,smoke}.ps1|py`, `docs/runtime.md`.
 - Packaging: `pyproject.toml`, `backend/requirements*.txt`, `uv.lock`,
   `jarvis.py`; wheel force-includes `windows_rpc_bridge.py`.
@@ -775,9 +775,9 @@ Claude Sync Note
   Browser query-string WS secrets removed. Clean observability endpoints no
   longer create self-observing tool runs.
 - Deployment is non-root, read-only, seccomp-constrained, cap-minimized, and
-  loopback by default. Explicit LAN mode exposes only Basic-authenticated Next;
-  backend remains loopback/internal. Launcher token is 256-bit with current-user
-  ACL and never reuses/kills foreign listeners.
+  loopback-only while browser authentication is disabled. Backend remains
+  loopback/internal. Launcher token is 256-bit with current-user ACL and never
+  reuses/kills foreign listeners.
 - All AST `pass` nodes, TODO/FIXME/NotImplemented stubs, silent broad SQLite FTS
   failure swallowing, optional-smoke false successes, and repository launcher
   import side effects eliminated.
@@ -854,3 +854,36 @@ Claude Sync Note
   smoke with temporary runtime, deployment tests, and full repository gates.
 - On the target host, confirm full start prints the reuse message while a real
   vLLM container is loading/ready; it must not recreate that container.
+
+### 2026-07-10 - Codex (temporary removal of Command Center Basic Auth)
+
+Claude Sync Note
+
+[Измененные файлы и новые зависимости]
+
+- Removed `frontend/proxy.ts`; updated the same-origin API route,
+  `docker-compose.yml`, launcher/dev scripts, deployment tests, and runtime docs.
+- New dependencies: none.
+
+[Что конкретно исправлено / какие заглушки устранены]
+
+- Removed browser-facing HTTP Basic Auth and all login/password output. The UI
+  now opens directly on localhost:3000.
+- LAN action/menu and configurable frontend bind address are disabled while the
+  browser has no authentication. Next is fixed to loopback to prevent an
+  unauthenticated remote client from using the privileged server proxy.
+- Server-to-server API token injection and cross-site mutation rejection remain;
+  missing server token fails only `/jarvis-api/*` with HTTP 503.
+
+[Изменения в API-контрактах, сигнатурах функций и структурах данных]
+
+- Removed Next middleware Basic challenge (`401`/`WWW-Authenticate`).
+- `jarvis.cmd lan` is unavailable and `-Lan` returns an explicit temporary-disable
+  error. `start`, `app`, `restart`, and localhost UI contracts are unchanged.
+
+[Pending: Текущие точки сборки и что Claude должен делать/проверить дальше]
+
+- Restore LAN only together with a new operator-approved authentication policy.
+- Verified: anonymous localhost GET=200 without `WWW-Authenticate`; missing
+  server token API=503; Next typecheck/build; Compose config; PowerShell parser;
+  backend `337 passed`; Ruff clean.

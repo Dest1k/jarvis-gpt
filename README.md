@@ -60,7 +60,7 @@ One-command start/stop/status:
 .\jarvis.cmd llm -WatchLlm
 ```
 
-The launcher auto-rebuilds the production frontend when `frontend/app`, `public`, config or lock files are newer than `.next/BUILD_ID`. `jarvis.cmd app` starts the bridge, backend, and UI without starting or later stopping the LLM dispatcher. Full-stack start first reuses an already running dispatcher/OpenAI-compatible endpoint; only when no LLM is active does it start Docker Desktop and the dispatcher. Use `-NoDockerStart` only for manual Docker diagnostics.
+The launcher auto-rebuilds the production frontend when `frontend/app`, `public`, config or lock files are newer than `.next/BUILD_ID`. `jarvis.cmd app` starts the bridge, backend, and UI without starting or later stopping the LLM dispatcher. Full-stack start first reuses an already running dispatcher/OpenAI-compatible endpoint; only when no LLM is active does it start Docker Desktop and the dispatcher. Command Center currently opens on localhost without browser login; LAN mode is temporarily disabled. Use `-NoDockerStart` only for manual Docker diagnostics.
 
 Profile shortcuts:
 

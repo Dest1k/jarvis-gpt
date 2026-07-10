@@ -1,6 +1,6 @@
 param(
   [Parameter(Position = 0)]
-  [ValidateSet("menu", "start", "app", "lan", "stop", "restart", "status", "llm", "logs", "doctor", "open")]
+  [ValidateSet("menu", "start", "app", "stop", "restart", "status", "llm", "logs", "doctor", "open")]
   [string]$Action = "menu",
 
   [ValidateSet("gemma4-turbo", "gemma4-mono")]
@@ -33,11 +33,10 @@ $BridgeTokenFile = Join-Path $HomePath ".jarvis\bridge.token"
 $ApiTokenFile = Join-Path $HomePath ".jarvis\api.token"
 $script:ConfiguredApiToken = [string]$env:JARVIS_API_TOKEN
 $script:ConfiguredCorsOrigins = [string]$env:JARVIS_CORS_ORIGINS
-$script:ApiTokenSource = ""
-if ($Lan -and $LocalOnly) {
-  throw "-Lan and -LocalOnly cannot be used together."
+if ($Lan) {
+  throw "-Lan is temporarily disabled while Command Center browser authentication is removed."
 }
-$script:LanMode = [bool]$Lan
+$script:LanMode = $false
 
 function Get-LanIPv4 {
   try {
@@ -97,14 +96,12 @@ function Get-FrontendUrl {
 
 function Get-OrCreateApiToken {
   if (-not [string]::IsNullOrWhiteSpace($script:ConfiguredApiToken)) {
-    $script:ApiTokenSource = "JARVIS_API_TOKEN environment variable"
     return $script:ConfiguredApiToken.Trim()
   }
   if (Test-Path -LiteralPath $ApiTokenFile) {
     $stored = (Get-Content -LiteralPath $ApiTokenFile -Raw).Trim()
     if ($stored) {
       Protect-ApiTokenFile
-      $script:ApiTokenSource = $ApiTokenFile
       return $stored
     }
   }
@@ -121,7 +118,6 @@ function Get-OrCreateApiToken {
   $token = [Convert]::ToBase64String($bytes).TrimEnd([char[]]"=").Replace("+", "-").Replace("/", "_")
   Set-Content -LiteralPath $ApiTokenFile -Value $token -Encoding Ascii -NoNewline
   Protect-ApiTokenFile
-  $script:ApiTokenSource = $ApiTokenFile
   return $token
 }
 
@@ -1244,10 +1240,6 @@ function Ensure-FrontendReady {
 }
 
 function Start-JarvisStack {
-  $lanUnavailable = [bool]($script:LanMode -and -not (Get-LanIPv4))
-  if ($lanUnavailable) {
-    $script:LanMode = $false
-  }
   Ensure-LauncherFolders
   Set-JarvisEnvironment -SelectedProfile $Profile
   $previousState = Read-LauncherState
@@ -1264,19 +1256,8 @@ function Start-JarvisStack {
   Ensure-LanFirewallRules
   $backendBindHost = "127.0.0.1"
   $frontendBindHost = Get-FrontendBindHost
-  $publicHost = Get-PublicHost
 
   Write-Banner
-  if ($lanUnavailable) {
-    Write-Host "No routable LAN IPv4 address was found; using loopback-only mode." -ForegroundColor DarkYellow
-    Write-Host ""
-  }
-  if ($script:LanMode) {
-    Write-Host ("LAN mode: UI http://{0}:3000" -f $publicHost) -ForegroundColor Cyan
-    Write-Host ("Login: user 'jarvis'; password source: {0}" -f $script:ApiTokenSource) -ForegroundColor Cyan
-    Write-Host "Backend, dispatcher, and host bridge remain bound to localhost." -ForegroundColor DarkGray
-    Write-Host ""
-  }
   Write-Host "Preparing runtime folders..." -ForegroundColor Yellow
   Invoke-JarvisCommand -FilePath "py.exe" -Arguments @("-3.11", ".\jarvis.py", "--profile", $Profile, "init")
 
@@ -1513,31 +1494,16 @@ function Show-ServiceRow {
 }
 
 function Get-EffectiveLanMode {
-  $state = Read-LauncherState
-  if ($state) {
-    return [bool]$state.lan
-  }
-  return [bool]($script:LanMode -and (Get-LanIPv4))
+  return $false
 }
 
 function Get-EffectivePublicHost {
-  $state = Read-LauncherState
-  if ($state -and $state.lan -and $state.lan_ip) {
-    return [string]$state.lan_ip
-  }
-  if (Get-EffectiveLanMode) {
-    $lanIp = Get-LanIPv4
-    if ($lanIp) {
-      return $lanIp
-    }
-  }
   return "127.0.0.1"
 }
 
 function Show-JarvisStatus {
   Set-JarvisEnvironment -SelectedProfile $Profile
   $statusHost = Get-EffectivePublicHost
-  $lanStatus = Get-EffectiveLanMode
   Write-Banner
   Write-Host "+----------------+----------+-------------+----------------------------+" -ForegroundColor DarkCyan
   Write-Host "| Service        | State    | Process     | URL                        |" -ForegroundColor Cyan
@@ -1547,12 +1513,6 @@ function Show-JarvisStatus {
   Show-ServiceRow -Name "Host bridge" -Port 8765 -Url "http://127.0.0.1:8765"
   Show-ServiceRow -Name "Dispatcher" -Port 8001 -Url "http://127.0.0.1:8001/v1"
   Write-Host "+----------------+----------+-------------+----------------------------+" -ForegroundColor DarkCyan
-  if ($lanStatus) {
-    Write-Host ("LAN access: open http://{0}:3000 from another device on the same network." -f $statusHost) -ForegroundColor Cyan
-    Write-Host ("Login: user 'jarvis'; password source: {0}" -f $script:ApiTokenSource) -ForegroundColor Cyan
-    Write-Host "Only the authenticated UI is exposed; backend, dispatcher, and host bridge remain localhost-only." -ForegroundColor DarkGray
-    Write-Host ""
-  }
   Write-Host ""
   Write-LlmReadinessBlock -Readiness (Get-LlmReadiness)
   Write-Host ""
@@ -1596,7 +1556,6 @@ function Invoke-Menu {
   $main = @(
     @{ Label = "Start full stack"; Value = "start"; Hint = "loopback-only: dispatcher + bridge + backend + UI" },
     @{ Label = "Start app without LLM"; Value = "app"; Hint = "bridge + backend + UI; preserve existing LLM" },
-    @{ Label = "Start with LAN"; Value = "lan"; Hint = "token-auth UI/API on the private network" },
     @{ Label = "Stop stack"; Value = "stop"; Hint = "stop services owned by current launcher state" },
     @{ Label = "Restart stack"; Value = "restart"; Hint = "stop then start" },
     @{ Label = "Status"; Value = "status"; Hint = "show service ports" },
@@ -1611,7 +1570,7 @@ function Invoke-Menu {
     return
   }
 
-  if ($choice.Value -in @("start", "app", "restart", "lan")) {
+  if ($choice.Value -in @("start", "app", "restart")) {
     $profiles = @(
       @{ Label = "gemma4-turbo"; Value = "gemma4-turbo"; Hint = "26B A4B NVFP4, fast warmed runtime" },
       @{ Label = "gemma4-mono"; Value = "gemma4-mono"; Hint = "31B IT NVFP4, stable baseline" }
@@ -1646,7 +1605,6 @@ function Invoke-Menu {
   switch ($choice.Value) {
     "start" { Start-JarvisStack }
     "app" { $script:NoDispatcher = $true; Start-JarvisStack }
-    "lan" { $script:LanMode = $true; Start-JarvisStack }
     "stop" { Stop-JarvisStack }
     "restart" { Stop-JarvisStack; Start-JarvisStack }
     "status" { Show-JarvisStatus }
@@ -1666,7 +1624,6 @@ switch ($Action) {
   "menu" { Invoke-Menu }
   "start" { Start-JarvisStack }
   "app" { $script:NoDispatcher = $true; Start-JarvisStack }
-  "lan" { $script:LanMode = $true; Start-JarvisStack }
   "stop" { Stop-JarvisStack }
   "restart" { Stop-JarvisStack; Start-JarvisStack }
   "status" { Show-JarvisStatus }

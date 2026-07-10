@@ -45,6 +45,12 @@ async function forward(request: NextRequest, context: RouteContext) {
 
   const backend = (process.env.JARVIS_BACKEND_URL ?? "http://127.0.0.1:8000").trim();
   const token = (process.env.JARVIS_API_TOKEN ?? "").trim();
+  if (!token) {
+    return NextResponse.json(
+      { detail: "Server-side JARVIS_API_TOKEN is required for the API proxy." },
+      { status: 503 }
+    );
+  }
   let base: URL;
   try {
     base = new URL(backend);
@@ -68,7 +74,7 @@ async function forward(request: NextRequest, context: RouteContext) {
     const value = request.headers.get(name);
     if (value) headers.set(name, value);
   }
-  if (token) headers.set("X-Jarvis-Api-Token", token);
+  headers.set("X-Jarvis-Api-Token", token);
 
   const init: RequestInit & { duplex?: "half" } = {
     method: request.method,

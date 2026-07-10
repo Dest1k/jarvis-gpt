@@ -30,7 +30,8 @@ def test_compose_defaults_to_loopback_and_propagates_build_contract() -> None:
 
     assert "jarvis-compose-loopback-only" not in compose
     assert '${JARVIS_API_BIND_ADDRESS:-127.0.0.1}' in compose
-    assert '${JARVIS_FRONTEND_BIND_ADDRESS:-127.0.0.1}' in compose
+    assert '"127.0.0.1:3000:3000"' in compose
+    assert "JARVIS_FRONTEND_BIND_ADDRESS" not in compose
     assert "NEXT_PUBLIC_JARVIS_API_URL" not in compose
     assert "NEXT_PUBLIC_JARVIS_API_TOKEN" not in compose
     assert "JARVIS_BACKEND_URL: http://backend:8000" in compose
@@ -52,11 +53,13 @@ def test_chromium_seccomp_profile_keeps_default_deny_and_allows_namespaces() -> 
         assert syscall in profile
 
 
-def test_launcher_requires_explicit_lan_and_preserves_foreign_listeners() -> None:
+def test_launcher_is_local_only_and_preserves_foreign_listeners() -> None:
     launcher = _read("scripts/jarvis-launcher.ps1")
+    dev_script = _read("scripts/dev.ps1")
 
-    assert "$script:LanMode = [bool]$Lan" in launcher
-    assert 'Label = "Start with LAN"' in launcher
+    assert "$script:LanMode = $false" in launcher
+    assert 'Label = "Start with LAN"' not in launcher
+    assert "temporarily disabled" in launcher
     assert 'Label = "Start app without LLM"' in launcher
     assert '"app" { $script:NoDispatcher = $true; Start-JarvisStack }' in launcher
     assert "function Get-LlmStartDecision" in launcher
@@ -73,7 +76,8 @@ def test_launcher_requires_explicit_lan_and_preserves_foreign_listeners() -> Non
     assert "Protect-ApiTokenFile" in launcher
     assert "Get-FrontendEnvironmentSha256" in launcher
     assert '$env:JARVIS_API_HOST = "127.0.0.1"' in launcher
-    assert "password source:" in launcher
+    assert "password source:" not in launcher
+    assert "Command Center Basic auth" not in dev_script
     assert 'Stop-PortOwner -Port 3000 -ManagedOnly -Service "frontend"' in launcher
     assert 'Stop-PortOwner -Port 8000 -ManagedOnly -Service "backend"' in launcher
     assert 'Stop-PortOwner -Port 8765 -ManagedOnly -Service "bridge"' in launcher
@@ -92,3 +96,6 @@ def test_frontend_runtime_uses_unprivileged_node_user() -> None:
     assert "node_modules/" in dockerignore
     assert ".next/" in dockerignore
     assert ".env.*" in dockerignore
+    assert not (REPO_ROOT / "frontend/proxy.ts").exists()
+    route = _read("frontend/app/jarvis-api/[...path]/route.ts")
+    assert "Server-side JARVIS_API_TOKEN is required" in route

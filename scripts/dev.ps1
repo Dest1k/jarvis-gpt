@@ -27,7 +27,6 @@ Start-Process powershell -WindowStyle Hidden -ArgumentList @(
 )
 
 Write-Host "Starting Command Center on http://localhost:3000"
-Write-Host "Command Center Basic auth: user=jarvis password=$apiToken"
 Start-Process powershell -WindowStyle Hidden -ArgumentList @(
   "-NoExit",
   "-Command",

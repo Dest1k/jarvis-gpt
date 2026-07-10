@@ -230,26 +230,23 @@ For the operator and the second model:
   download cache, reports signature/SHA256/executable risk, and lists ZIP
   entries without opening or executing them.
 
-## 2026-07-10 handoff - deployment and LAN hardening
+## 2026-07-10 handoff - local-only deployment without browser login
 
 For the operator and the second model:
 
-- `jarvis-launcher.ps1 start` is loopback-only. LAN exposure is now explicit via
-  `jarvis-launcher.ps1 lan` or `-Lan`; the launcher generates a persistent
-  256-bit API token and restarts Next when its server-side auth contract changes.
-  LAN login is `jarvis`; a generated password is ACL-restricted to the current
-  Windows user and stored in `D:\jarvis\.jarvis\api.token` (or the selected
-  `-HomePath`). An explicit `JARVIS_API_TOKEN` remains environment-only.
+- `jarvis-launcher.ps1 start` and `app` are loopback-only. Browser-facing Basic
+  Auth is temporarily removed, so localhost:3000 opens without a login prompt.
+  `lan`/`-Lan` are disabled until an operator-facing authentication policy is
+  restored. The launcher still generates an ACL-restricted server API token;
+  it is never exposed to browser JavaScript.
 - The launcher refuses to reuse or terminate listeners on ports 3000, 8000, or
   8765 unless their command line belongs to the corresponding Jarvis service.
-- Compose binds UI/API to `127.0.0.1` by default. To expose the authenticated UI
-  to a trusted LAN, set only `JARVIS_FRONTEND_BIND_ADDRESS=0.0.0.0` and configure
-  a strong `JARVIS_API_TOKEN`. The backend remains on loopback; Next reaches it
-  over the private Compose network.
-- Compose intentionally returns HTTP 503 from Command Center when
-  `JARVIS_API_TOKEN` is empty. Set the same non-empty token for backend/frontend
-  through Compose environment before using the UI; the dispatcher-only profile
-  remains independent of this requirement.
+- Compose binds the UI to fixed `127.0.0.1:3000`; there is no environment override
+  for remote exposure while browser authentication is absent. The backend remains
+  on loopback/private Compose networking.
+- The same-origin API proxy returns HTTP 503 when `JARVIS_API_TOKEN` is empty.
+  Set the same non-empty server token for backend/frontend; the dispatcher-only
+  profile remains independent of this requirement.
 - Backend images include Chromium, start through a path-constrained volume
   initializer, and immediately drop to UID/GID 10001. Compose enables an init
   process, a 512 MiB shared-memory segment, read-only root filesystem, minimal
@@ -257,8 +254,8 @@ For the operator and the second model:
   seccomp baseline with only Chromium user-namespace syscalls added. Frontend
   runtime uses the unprivileged `node` user.
 - The API token is server-only: Compose passes it to the Next server together
-  with `JARVIS_BACKEND_URL`, and the browser uses the same-origin authenticated
-  proxy. No API URL or credential is compiled into `NEXT_PUBLIC_*` browser
+  with `JARVIS_BACKEND_URL`, and the browser uses the same-origin server proxy.
+  No API URL or credential is compiled into `NEXT_PUBLIC_*` browser
   JavaScript.
 
 ## 2026-07-10 handoff - internet safety hardening
