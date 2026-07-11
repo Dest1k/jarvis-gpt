@@ -5,20 +5,31 @@ import contextlib
 import ctypes
 import getpass
 import hashlib
+import hmac
+import json
 import os
 import re
 import shutil
 import signal
+import socket
 import stat
 import subprocess
+import sys
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from select import select as select_select
 from types import MappingProxyType
 from typing import Final
 
+from .execution_filesystem import (
+    PathMutationGuard,
+    directory_entries,
+    metadata_identity,
+    verified_binary_handle,
+)
 from .execution_models import (
     ExecutionFeedback,
     FilesystemDiff,
@@ -34,6 +45,8 @@ _MAX_ARGUMENTS: Final = 512
 _MAX_ARGUMENT_LENGTH: Final = 32_768
 _MAX_ENVIRONMENT_ENTRIES: Final = 512
 _STREAM_READ_SIZE: Final = 64 * 1024
+_POSIX_SUPERVISOR_FLAG: Final = "--jarvis-process-supervisor-v1"
+_POSIX_CONTROL_LIMIT: Final = 64 * 1024 * 1024
 _DEFAULT_DENIED_EXECUTABLES: Final = frozenset(
     {
         "bash",
@@ -61,6 +74,12 @@ class ExecutableRule:
     argument_patterns: tuple[str, ...] = ()
     additional_argument_pattern: str | None = None
     environment_patterns: tuple[tuple[str, str], ...] = ()
+    expected_sha256: str = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        resolved = self.executable.resolve(strict=True)
+        object.__setattr__(self, "executable", resolved)
+        object.__setattr__(self, "expected_sha256", _pinned_executable_sha256(resolved))
 
     def validate(
         self,
@@ -73,6 +92,10 @@ class ExecutableRule:
         expected = self.executable.resolve(strict=True)
         if executable != expected:
             raise ValueError("executable does not match this rule")
+        if not hmac.compare_digest(
+            _pinned_executable_sha256(executable), self.expected_sha256
+        ):
+            raise ValueError("executable content changed since capability policy load")
         if len(arguments) < len(self.argument_patterns):
             raise ValueError("argv does not satisfy the executable capability grammar")
         if self.additional_argument_pattern is None and len(arguments) != len(
@@ -341,6 +364,212 @@ class _WindowsJob:
         self.handle = 0
 
 
+class _PosixSupervisor:
+    """Authenticated-by-inheritance control channel for a supervised POSIX tree."""
+
+    def __init__(
+        self,
+        *,
+        process: asyncio.subprocess.Process,
+        control: socket.socket,
+        target_pid: int,
+    ) -> None:
+        self.process = process
+        self.control = control
+        self.target_pid = target_pid
+        self._buffer = bytearray()
+        self._closed = False
+
+    async def resume(self) -> None:
+        if self._closed:
+            raise RuntimeError("POSIX process supervisor control channel is closed")
+        loop = asyncio.get_running_loop()
+        await loop.sock_sendall(self.control, b"G")
+        response = await _recv_supervisor_line(self.control, self._buffer)
+        if response == "STARTED":
+            return
+        if response.startswith("ERROR "):
+            raise OSError(response.removeprefix("ERROR "))
+        raise RuntimeError(f"invalid POSIX process supervisor response: {response!r}")
+
+    def send_signal(self, selected_signal: int) -> bool:
+        if self.process.returncode is not None:
+            return False
+        try:
+            os.kill(self.process.pid, selected_signal)
+            return True
+        except (OSError, ProcessLookupError, ValueError):
+            return False
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        with contextlib.suppress(OSError):
+            self.control.close()
+
+
+async def _spawn_posix_supervised_process(
+    *,
+    argv: tuple[str, ...],
+    cwd: Path,
+    environment: Mapping[str, str],
+    executable_fd: int,
+) -> tuple[asyncio.subprocess.Process, _PosixSupervisor]:
+    if not sys.platform.startswith("linux"):
+        raise OSError(
+            "process.run requires Linux subreaper containment on POSIX platforms"
+        )
+    parent_control, child_control = socket.socketpair()
+    child_control.set_inheritable(True)
+    payload = json.dumps(
+        {
+            "argv": list(argv),
+            "cwd": str(cwd),
+            "environment": dict(environment),
+            "executable_fd": executable_fd,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if len(payload) > _POSIX_CONTROL_LIMIT:
+        parent_control.close()
+        child_control.close()
+        raise ValueError("POSIX process supervisor payload is too large")
+
+    wrapper_environment = _posix_supervisor_environment()
+    spawn_task = asyncio.create_task(
+        asyncio.create_subprocess_exec(
+            sys.executable,
+            "-P",
+            "-m",
+            "jarvis_gpt.execution_process",
+            _POSIX_SUPERVISOR_FLAG,
+            str(child_control.fileno()),
+            str(os.getpid()),
+            cwd=str(Path(__file__).resolve().parent.parent),
+            env=wrapper_environment,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            pass_fds=(child_control.fileno(), executable_fd),
+            start_new_session=True,
+        ),
+        name="execution-posix-supervisor-spawn",
+    )
+    process: asyncio.subprocess.Process | None = None
+    pending_cancellation: asyncio.CancelledError | None = None
+    try:
+        while True:
+            try:
+                process = await asyncio.shield(spawn_task)
+                break
+            except asyncio.CancelledError as exc:
+                pending_cancellation = exc
+                if spawn_task.done():
+                    process = spawn_task.result()
+                    break
+        child_control.close()
+        parent_control.setblocking(False)
+        loop = asyncio.get_running_loop()
+        await loop.sock_sendall(parent_control, len(payload).to_bytes(8, "big") + payload)
+        buffer = bytearray()
+        response = await _recv_supervisor_line(parent_control, buffer)
+        if not response.startswith("READY "):
+            if response.startswith("ERROR "):
+                raise OSError(response.removeprefix("ERROR "))
+            raise RuntimeError(f"invalid POSIX process supervisor response: {response!r}")
+        target_pid = int(response.removeprefix("READY "))
+        if target_pid <= 0 or target_pid == process.pid:
+            raise RuntimeError("POSIX process supervisor returned an invalid target PID")
+        supervisor = _PosixSupervisor(
+            process=process,
+            control=parent_control,
+            target_pid=target_pid,
+        )
+        supervisor._buffer.extend(buffer)
+        if pending_cancellation is not None:
+            await _cleanup_cancelled_posix_spawn(supervisor)
+            raise pending_cancellation
+        return process, supervisor
+    except BaseException:
+        parent_control.close()
+        child_control.close()
+        if process is not None and process.returncode is None:
+            cleanup = asyncio.create_task(
+                _cleanup_raw_posix_supervisor(process),
+                name=f"execution-posix-supervisor-abort-{process.pid}",
+            )
+            await _await_cleanup_task(cleanup)
+        raise
+
+
+async def _recv_supervisor_line(control: socket.socket, buffer: bytearray) -> str:
+    loop = asyncio.get_running_loop()
+    while True:
+        newline = buffer.find(b"\n")
+        if newline >= 0:
+            raw = bytes(buffer[:newline])
+            del buffer[: newline + 1]
+            return raw.decode("utf-8", errors="replace")
+        if len(buffer) > 16 * 1024:
+            raise RuntimeError("POSIX process supervisor response exceeded its limit")
+        chunk = await loop.sock_recv(control, 4096)
+        if not chunk:
+            raise RuntimeError("POSIX process supervisor closed its control channel")
+        buffer.extend(chunk)
+
+
+async def _cleanup_cancelled_posix_spawn(supervisor: _PosixSupervisor) -> None:
+    supervisor.send_signal(signal.SIGTERM)
+    supervisor.close()
+    cleanup = asyncio.create_task(
+        supervisor.process.wait(),
+        name=f"execution-posix-supervisor-cancel-{supervisor.process.pid}",
+    )
+    await _await_cleanup_task(cleanup)
+
+
+async def _cleanup_raw_posix_supervisor(process: asyncio.subprocess.Process) -> None:
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(process.pid, signal.SIGTERM)
+    try:
+        await asyncio.wait_for(process.wait(), timeout=2.0)
+    except TimeoutError:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(process.pid, signal.SIGKILL)
+        await process.wait()
+
+
+async def _await_cleanup_task(task: asyncio.Task[object]) -> None:
+    while True:
+        try:
+            await asyncio.shield(task)
+            return
+        except asyncio.CancelledError:
+            if task.done():
+                task.result()
+                return
+
+
+def _posix_supervisor_environment() -> dict[str, str]:
+    import_paths = [str(Path(__file__).resolve().parent.parent)]
+    for item in sys.path:
+        if not item:
+            item = os.getcwd()
+        candidate = os.path.abspath(item)
+        if candidate not in import_paths:
+            import_paths.append(candidate)
+    # This wrapper is an infrastructure process, not the requested target.
+    # Giving it the backend environment would let a same-UID target read API
+    # keys from /proc/$PPID/environ even when inherit_environment is false.
+    return {
+        "PYTHONPATH": os.pathsep.join(import_paths),
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONSAFEPATH": "1",
+    }
+
+
 class AsyncProcessRunner:
     """Runs a validated argv directly; a command shell is never involved."""
 
@@ -374,17 +603,12 @@ class AsyncProcessRunner:
             filesystem_snapshot,
             request.observe_paths,
             request.max_observed_entries,
+            self.observation_roots,
         )
         stdout = _TailBuffer(request.max_output_bytes)
         stderr = _TailBuffer(request.max_output_bytes)
         environment = dict(os.environ) if request.inherit_environment else {}
         environment.update(request.environment)
-        creationflags = 0
-        start_new_session = os.name != "nt"
-        if os.name == "nt":
-            creationflags = int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)) | int(
-                getattr(subprocess, "CREATE_SUSPENDED", 0x00000004)
-            )
 
         if session is not None:
             if reservation_id is None:
@@ -392,17 +616,32 @@ class AsyncProcessRunner:
             if not session.has_process_start_reservation(reservation_id):
                 session.reserve_process_start(reservation_id)
 
+        executable_fd = _open_pinned_executable(executable)
         try:
-            process = await asyncio.create_subprocess_exec(
-                *argv,
-                cwd=str(cwd),
-                env=environment,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                creationflags=creationflags,
-                start_new_session=start_new_session,
-            )
+            # Re-evaluate the capability while the selected executable object is
+            # pinned against replacement (Windows) or bound by fd (Linux).
+            self.executable_policy.validate(executable, request.arguments, request.environment)
+            if os.name == "nt":
+                creationflags = int(
+                    getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                ) | int(getattr(subprocess, "CREATE_SUSPENDED", 0x00000004))
+                process = await asyncio.create_subprocess_exec(
+                    *argv,
+                    cwd=str(cwd),
+                    env=environment,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    creationflags=creationflags,
+                )
+                posix_supervisor = None
+            else:
+                process, posix_supervisor = await _spawn_posix_supervised_process(
+                    argv=argv,
+                    cwd=cwd,
+                    environment=environment,
+                    executable_fd=executable_fd,
+                )
         except asyncio.CancelledError:
             if session is not None and reservation_id is not None:
                 session.release_process_start(reservation_id)
@@ -414,6 +653,7 @@ class AsyncProcessRunner:
                 filesystem_snapshot,
                 request.observe_paths,
                 request.max_observed_entries,
+                self.observation_roots,
             )
             return ExecutionFeedback(
                 ok=False,
@@ -435,6 +675,8 @@ class AsyncProcessRunner:
                 ),
                 error=f"{type(exc).__name__}: {exc}",
             )
+        finally:
+            os.close(executable_fd)
 
         try:
             job = _WindowsJob.assign(process.pid)
@@ -444,6 +686,7 @@ class AsyncProcessRunner:
             return await _abort_started_process(
                 process=process,
                 job=None,
+                posix_supervisor=posix_supervisor,
                 stdout=stdout,
                 stderr=stderr,
                 request=request,
@@ -453,25 +696,32 @@ class AsyncProcessRunner:
                 permissions=permissions,
                 before=before,
                 before_truncated=before_truncated,
+                observation_roots=self.observation_roots,
                 error=exc,
                 session=None,
+                session_pid=None,
             )
 
+        session_pid = posix_supervisor.target_pid if posix_supervisor is not None else process.pid
         if session is not None:
+            process_registered = False
             try:
                 session.register_process(
-                    pid=process.pid,
-                    parent_pid=os.getpid(),
+                    pid=session_pid,
+                    parent_pid=process.pid if posix_supervisor is not None else os.getpid(),
                     argv=feedback_argv,
                     reservation_id=reservation_id,
-                    process_group_id=process.pid if os.name != "nt" else None,
+                    process_group_id=session_pid if posix_supervisor is not None else None,
                 )
+                process_registered = True
+                session.authorize_process_resume(session_pid)
             except Exception as exc:
                 if reservation_id is not None:
                     session.release_process_start(reservation_id)
                 return await _abort_started_process(
                     process=process,
                     job=job,
+                    posix_supervisor=posix_supervisor,
                     stdout=stdout,
                     stderr=stderr,
                     request=request,
@@ -481,29 +731,39 @@ class AsyncProcessRunner:
                     permissions=permissions,
                     before=before,
                     before_truncated=before_truncated,
+                    observation_roots=self.observation_roots,
                     error=exc,
-                    session=None,
+                    session=session if process_registered else None,
+                    session_pid=session_pid if process_registered else None,
                 )
 
-        if os.name == "nt":
-            try:
+        try:
+            if os.name == "nt":
                 _resume_windows_process(process.pid)
-            except OSError as exc:
-                return await _abort_started_process(
-                    process=process,
-                    job=job,
-                    stdout=stdout,
-                    stderr=stderr,
-                    request=request,
-                    feedback_argv=feedback_argv,
-                    started_at=started_at,
-                    started_clock=started_clock,
-                    permissions=permissions,
-                    before=before,
-                    before_truncated=before_truncated,
-                    error=exc,
-                    session=session,
-                )
+            elif posix_supervisor is not None:
+                await posix_supervisor.resume()
+        except BaseException as exc:
+            feedback = await _abort_started_process(
+                process=process,
+                job=job,
+                posix_supervisor=posix_supervisor,
+                stdout=stdout,
+                stderr=stderr,
+                request=request,
+                feedback_argv=feedback_argv,
+                started_at=started_at,
+                started_clock=started_clock,
+                permissions=permissions,
+                before=before,
+                before_truncated=before_truncated,
+                observation_roots=self.observation_roots,
+                error=exc,
+                session=session,
+                session_pid=session_pid,
+            )
+            if isinstance(exc, asyncio.CancelledError):
+                raise exc
+            return feedback
 
         last_activity = [time.monotonic()]
         stdout_task = asyncio.create_task(
@@ -516,7 +776,11 @@ class AsyncProcessRunner:
         )
         wait_task = asyncio.create_task(process.wait(), name=f"execution-wait-{process.pid}")
         tree: dict[int, ProcessNode] = {
-            process.pid: ProcessNode(process.pid, os.getpid(), str(executable))
+            session_pid: ProcessNode(
+                session_pid,
+                process.pid if posix_supervisor is not None else os.getpid(),
+                str(executable),
+            )
         }
         stop_sampler = asyncio.Event()
         sampler_task = asyncio.create_task(
@@ -526,6 +790,7 @@ class AsyncProcessRunner:
         reason = TerminationReason.EXITED
         interrupt_sent = False
         kill_sent = False
+        pending_error: BaseException | None = None
         try:
             while not wait_task.done():
                 await asyncio.wait({wait_task}, timeout=0.05)
@@ -543,6 +808,7 @@ class AsyncProcessRunner:
                         request.interrupt_grace_seconds,
                         request.kill_grace_seconds,
                         job,
+                        posix_supervisor,
                     )
                     break
                 if (
@@ -556,59 +822,138 @@ class AsyncProcessRunner:
                         request.interrupt_grace_seconds,
                         request.kill_grace_seconds,
                         job,
+                        posix_supervisor,
                     )
                     break
             await asyncio.shield(wait_task)
-        except asyncio.CancelledError:
-            await _stop_process(
+        except BaseException as exc:
+            pending_error = exc
+
+        completion_task = asyncio.create_task(
+            _complete_started_process(
+                process=process,
+                job=job,
+                posix_supervisor=posix_supervisor,
+                session_pid=session_pid,
+                stdout=stdout,
+                stderr=stderr,
+                stdout_task=stdout_task,
+                stderr_task=stderr_task,
+                wait_task=wait_task,
+                sampler_task=sampler_task,
+                stop_sampler=stop_sampler,
+                tree=tree,
+                request=request,
+                feedback_argv=feedback_argv,
+                started_at=started_at,
+                started_clock=started_clock,
+                permissions=permissions,
+                before=before,
+                before_truncated=before_truncated,
+                observation_roots=self.observation_roots,
+                reason=reason,
+                interrupt_sent=interrupt_sent,
+                kill_sent=kill_sent,
+                stop_process=pending_error is not None,
+                session=session,
+            ),
+            name=f"execution-finalize-{process.pid}",
+        )
+        feedback, cleanup_cancellation = await _await_critical_feedback(completion_task)
+        if cleanup_cancellation is not None:
+            raise cleanup_cancellation from pending_error
+        if pending_error is not None:
+            raise pending_error
+        return feedback
+
+    def _validate_observation_paths(self, paths: tuple[Path, ...]) -> None:
+        if paths and not self.observation_roots:
+            raise ValueError("observe_paths require configured observation_roots")
+        for path in paths:
+            resolved = path.resolve(strict=False)
+            if not any(
+                resolved == root or resolved.is_relative_to(root)
+                for root in self.observation_roots
+            ):
+                raise ValueError(f"observed path escapes configured roots: {path}")
+
+
+async def _complete_started_process(
+    *,
+    process: asyncio.subprocess.Process,
+    job: _WindowsJob | None,
+    posix_supervisor: _PosixSupervisor | None,
+    session_pid: int,
+    stdout: _TailBuffer,
+    stderr: _TailBuffer,
+    stdout_task: asyncio.Task[None],
+    stderr_task: asyncio.Task[None],
+    wait_task: asyncio.Task[int],
+    sampler_task: asyncio.Task[None],
+    stop_sampler: asyncio.Event,
+    tree: dict[int, ProcessNode],
+    request: ProcessRequest,
+    feedback_argv: tuple[str, ...],
+    started_at: str,
+    started_clock: float,
+    permissions: PermissionSnapshot,
+    before: Mapping[str, FilesystemEntry],
+    before_truncated: bool,
+    observation_roots: tuple[Path, ...],
+    reason: TerminationReason,
+    interrupt_sent: bool,
+    kill_sent: bool,
+    stop_process: bool,
+    session: ExecutionSession | None,
+) -> ExecutionFeedback:
+    stream_tasks = (stdout_task, stderr_task, sampler_task)
+    terminated = reason is not TerminationReason.EXITED or stop_process
+    try:
+        if stop_process and not wait_task.done():
+            cleanup_interrupt, cleanup_kill = await _stop_process(
                 process,
                 wait_task,
                 request.interrupt_grace_seconds,
                 request.kill_grace_seconds,
                 job,
+                posix_supervisor,
             )
-            _finish_session_process(session, process.pid, process.returncode, terminated=True)
-            raise
-        finally:
-            stop_sampler.set()
-            if os.name != "nt":
-                remaining_group_killed = await _terminate_remaining_process_group(
-                    process.pid,
-                    interrupt_grace=min(request.interrupt_grace_seconds, 1.0),
-                    kill_grace=min(request.kill_grace_seconds, 1.0),
-                )
-                kill_sent = kill_sent or remaining_group_killed
-            stream_tasks = (stdout_task, stderr_task, sampler_task)
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(*stream_tasks, return_exceptions=True),
-                    timeout=2.0,
-                )
-            except TimeoutError:
-                for task in stream_tasks:
-                    task.cancel()
-                await asyncio.gather(*stream_tasks, return_exceptions=True)
-            if process.returncode is None and not wait_task.done():
-                wait_task.cancel()
-            if job is not None:
-                job.close()
+            interrupt_sent = interrupt_sent or cleanup_interrupt
+            kill_sent = kill_sent or cleanup_kill
+
+        if not wait_task.done():
+            await asyncio.shield(wait_task)
+
+        stop_sampler.set()
+        if os.name != "nt" and posix_supervisor is None:
+            remaining_group_killed = await _terminate_remaining_process_group(
+                process.pid,
+                interrupt_grace=min(request.interrupt_grace_seconds, 1.0),
+                kill_grace=min(request.kill_grace_seconds, 1.0),
+            )
+            kill_sent = kill_sent or remaining_group_killed
+
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*stream_tasks, return_exceptions=True),
+                timeout=2.0,
+            )
+        except TimeoutError:
+            for task in stream_tasks:
+                task.cancel()
+            await asyncio.gather(*stream_tasks, return_exceptions=True)
 
         after, after_truncated = await asyncio.to_thread(
             filesystem_snapshot,
             request.observe_paths,
             request.max_observed_entries,
+            observation_roots,
         )
         exit_code = process.returncode
-        _finish_session_process(
-            session,
-            process.pid,
-            exit_code,
-            terminated=reason is not TerminationReason.EXITED,
-        )
         return ExecutionFeedback(
-            ok=reason is TerminationReason.EXITED and exit_code == 0,
+            ok=reason is TerminationReason.EXITED and not stop_process and exit_code == 0,
             argv=feedback_argv,
-            pid=process.pid,
+            pid=session_pid,
             exit_code=exit_code,
             termination_reason=reason,
             started_at=started_at,
@@ -626,23 +971,41 @@ class AsyncProcessRunner:
             interrupt_sent=interrupt_sent,
             kill_sent=kill_sent,
         )
+    finally:
+        stop_sampler.set()
+        if job is not None:
+            job.close()
+        if posix_supervisor is not None:
+            posix_supervisor.close()
+        if process.returncode is not None:
+            _finish_session_process(
+                session,
+                session_pid,
+                process.returncode,
+                terminated=terminated,
+            )
 
-    def _validate_observation_paths(self, paths: tuple[Path, ...]) -> None:
-        if paths and not self.observation_roots:
-            raise ValueError("observe_paths require configured observation_roots")
-        for path in paths:
-            resolved = path.resolve(strict=False)
-            if not any(
-                resolved == root or resolved.is_relative_to(root)
-                for root in self.observation_roots
-            ):
-                raise ValueError(f"observed path escapes configured roots: {path}")
+
+async def _await_critical_feedback(
+    task: asyncio.Task[ExecutionFeedback],
+) -> tuple[ExecutionFeedback, asyncio.CancelledError | None]:
+    """Wait for cleanup despite repeated caller cancellation, then report cancellation."""
+
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            return await asyncio.shield(task), cancellation
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+            if task.done():
+                return task.result(), cancellation
 
 
 async def _abort_started_process(
     *,
     process: asyncio.subprocess.Process,
     job: _WindowsJob | None,
+    posix_supervisor: _PosixSupervisor | None,
     stdout: _TailBuffer,
     stderr: _TailBuffer,
     request: ProcessRequest,
@@ -652,59 +1015,139 @@ async def _abort_started_process(
     permissions: PermissionSnapshot,
     before: Mapping[str, FilesystemEntry],
     before_truncated: bool,
+    observation_roots: tuple[Path, ...],
     error: BaseException,
     session: ExecutionSession | None,
+    session_pid: int | None,
+) -> ExecutionFeedback:
+    abort_task = asyncio.create_task(
+        _abort_started_process_critical(
+            process=process,
+            job=job,
+            posix_supervisor=posix_supervisor,
+            stdout=stdout,
+            stderr=stderr,
+            request=request,
+            feedback_argv=feedback_argv,
+            started_at=started_at,
+            started_clock=started_clock,
+            permissions=permissions,
+            before=before,
+            before_truncated=before_truncated,
+            observation_roots=observation_roots,
+            error=error,
+            session=session,
+            session_pid=session_pid,
+        ),
+        name=f"execution-abort-{process.pid}",
+    )
+    feedback, cancellation = await _await_critical_feedback(abort_task)
+    if cancellation is not None:
+        raise cancellation
+    return feedback
+
+
+async def _abort_started_process_critical(
+    *,
+    process: asyncio.subprocess.Process,
+    job: _WindowsJob | None,
+    posix_supervisor: _PosixSupervisor | None,
+    stdout: _TailBuffer,
+    stderr: _TailBuffer,
+    request: ProcessRequest,
+    feedback_argv: tuple[str, ...],
+    started_at: str,
+    started_clock: float,
+    permissions: PermissionSnapshot,
+    before: Mapping[str, FilesystemEntry],
+    before_truncated: bool,
+    observation_roots: tuple[Path, ...],
+    error: BaseException,
+    session: ExecutionSession | None,
+    session_pid: int | None,
 ) -> ExecutionFeedback:
     try:
-        if job is not None:
-            job.terminate()
-        elif os.name != "nt":
-            os.killpg(process.pid, signal.SIGKILL)
-        elif process.returncode is None:
-            process.kill()
-    except OSError:
-        if process.returncode is None:
-            with contextlib.suppress(ProcessLookupError):
+        try:
+            if job is not None:
+                job.terminate()
+            elif posix_supervisor is not None:
+                posix_supervisor.send_signal(signal.SIGTERM)
+                # The supervisor may still be waiting for its one-byte start
+                # grant. Closing the inherited channel is the authoritative
+                # abort signal and prevents PEP 475 from restarting recv forever.
+                posix_supervisor.close()
+            elif os.name != "nt":
+                os.killpg(process.pid, signal.SIGKILL)
+            elif process.returncode is None:
                 process.kill()
-    captured_stdout, captured_stderr = await process.communicate()
-    if captured_stdout:
-        stdout.append(captured_stdout)
-    if captured_stderr:
-        stderr.append(captured_stderr)
-    _finish_session_process(
-        session,
-        process.pid,
-        process.returncode,
-        terminated=True,
-    )
-    if job is not None:
-        job.close()
-    after, after_truncated = await asyncio.to_thread(
-        filesystem_snapshot,
-        request.observe_paths,
-        request.max_observed_entries,
-    )
-    return ExecutionFeedback(
-        ok=False,
-        argv=feedback_argv,
-        pid=process.pid,
-        exit_code=process.returncode,
-        termination_reason=TerminationReason.START_FAILED,
-        started_at=started_at,
-        finished_at=_utc_now(),
-        duration_ms=_duration_ms(started_clock),
-        stdout=stdout.capture(),
-        stderr=stderr.capture(),
-        pid_tree=(ProcessNode(process.pid, os.getpid(), feedback_argv[0]),),
-        permissions=permissions,
-        filesystem_diff=filesystem_diff(
-            before,
-            after,
-            scan_truncated=before_truncated or after_truncated,
-        ),
-        kill_sent=True,
-        error=f"{type(error).__name__}: {error}",
-    )
+        except OSError:
+            if process.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    process.kill()
+        communicate_task = asyncio.create_task(process.communicate())
+        try:
+            captured_stdout, captured_stderr = await asyncio.wait_for(
+                asyncio.shield(communicate_task), timeout=5.0
+            )
+        except TimeoutError:
+            if posix_supervisor is not None:
+                await asyncio.to_thread(_emergency_kill_posix_supervisor, posix_supervisor)
+            elif job is not None:
+                with contextlib.suppress(OSError):
+                    job.terminate()
+            elif process.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    process.kill()
+            captured_stdout, captured_stderr = await communicate_task
+        if captured_stdout:
+            stdout.append(captured_stdout)
+        if captured_stderr:
+            stderr.append(captured_stderr)
+        after, after_truncated = await asyncio.to_thread(
+            filesystem_snapshot,
+            request.observe_paths,
+            request.max_observed_entries,
+            observation_roots,
+        )
+        return ExecutionFeedback(
+            ok=False,
+            argv=feedback_argv,
+            pid=session_pid or process.pid,
+            exit_code=process.returncode,
+            termination_reason=TerminationReason.START_FAILED,
+            started_at=started_at,
+            finished_at=_utc_now(),
+            duration_ms=_duration_ms(started_clock),
+            stdout=stdout.capture(),
+            stderr=stderr.capture(),
+            pid_tree=(
+                ProcessNode(
+                    session_pid or process.pid,
+                    process.pid if posix_supervisor is not None else os.getpid(),
+                    feedback_argv[0],
+                ),
+            ),
+            permissions=permissions,
+            filesystem_diff=filesystem_diff(
+                before,
+                after,
+                scan_truncated=before_truncated or after_truncated,
+            ),
+            kill_sent=True,
+            error=f"{type(error).__name__}: {error}",
+        )
+    finally:
+        if job is not None:
+            job.close()
+        if posix_supervisor is not None:
+            posix_supervisor.close()
+        if process.returncode is not None:
+            _finish_session_process(
+                session,
+                session_pid or process.pid,
+                process.returncode,
+                terminated=True,
+            )
 
 
 async def _pump_stream(
@@ -743,15 +1186,18 @@ async def _stop_process(
     interrupt_grace: float,
     kill_grace: float,
     job: _WindowsJob | None,
+    posix_supervisor: _PosixSupervisor | None = None,
 ) -> tuple[bool, bool]:
     if wait_task.done():
         return False, False
-    interrupt_sent = _send_interrupt(process)
+    interrupt_sent = _send_interrupt(process, posix_supervisor)
     with contextlib.suppress(TimeoutError):
         await asyncio.wait_for(asyncio.shield(wait_task), timeout=interrupt_grace)
         return interrupt_sent, False
     if job is not None:
         job.terminate()
+    elif posix_supervisor is not None:
+        posix_supervisor.send_signal(signal.SIGTERM)
     elif os.name != "nt":
         with contextlib.suppress(ProcessLookupError):
             os.killpg(process.pid, signal.SIGKILL)
@@ -761,11 +1207,22 @@ async def _stop_process(
     try:
         await asyncio.wait_for(asyncio.shield(wait_task), timeout=kill_grace)
     except TimeoutError as exc:
+        if posix_supervisor is not None:
+            await asyncio.to_thread(_emergency_kill_posix_supervisor, posix_supervisor)
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(wait_task), timeout=1.0)
+            if wait_task.done():
+                return interrupt_sent, True
         raise RuntimeError(f"process {process.pid} did not terminate after kill") from exc
     return interrupt_sent, True
 
 
-def _send_interrupt(process: asyncio.subprocess.Process) -> bool:
+def _send_interrupt(
+    process: asyncio.subprocess.Process,
+    posix_supervisor: _PosixSupervisor | None = None,
+) -> bool:
+    if posix_supervisor is not None:
+        return posix_supervisor.send_signal(signal.SIGINT)
     try:
         if os.name == "nt":
             ctrl_break = getattr(signal, "CTRL_BREAK_EVENT", signal.SIGINT)
@@ -834,6 +1291,332 @@ def _process_group_alive(process_group_id: int) -> bool:
         return False
     except PermissionError:
         return True
+
+
+def _posix_process_supervisor_main(control_fd: int, expected_parent_pid: int) -> int:
+    control = socket.socket(fileno=control_fd)
+    pending_signals: list[int] = []
+
+    def record_signal(selected_signal: int, _frame: object) -> None:
+        pending_signals.append(selected_signal)
+
+    for selected_signal in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(selected_signal, record_signal)
+
+    target_pid: int | None = None
+    try:
+        _enable_posix_supervisor_kernel_guards(expected_parent_pid)
+        payload = _read_posix_supervisor_payload(control)
+        argv = payload.get("argv")
+        cwd = payload.get("cwd")
+        environment = payload.get("environment")
+        executable_fd = payload.get("executable_fd")
+        if (
+            not isinstance(argv, list)
+            or not argv
+            or any(not isinstance(item, str) or "\x00" in item for item in argv)
+            or not isinstance(cwd, str)
+            or not os.path.isabs(cwd)
+            or "\x00" in cwd
+            or not isinstance(environment, dict)
+            or not isinstance(executable_fd, int)
+            or executable_fd < 3
+            or any(
+                not isinstance(key, str)
+                or not isinstance(value, str)
+                or not key
+                or "=" in key
+                or "\x00" in key
+                or "\x00" in value
+                for key, value in environment.items()
+            )
+        ):
+            raise ValueError("invalid supervised process payload")
+
+        start_read, start_write = os.pipe()
+        ready_read, ready_write = os.pipe()
+        exec_status_read, exec_status_write = os.pipe()
+        target_pid = os.fork()
+        if target_pid == 0:
+            _run_posix_supervised_target(
+                control=control,
+                start_read=start_read,
+                start_write=start_write,
+                ready_read=ready_read,
+                ready_write=ready_write,
+                exec_status_read=exec_status_read,
+                exec_status_write=exec_status_write,
+                argv=argv,
+                cwd=cwd,
+                environment=environment,
+                executable_fd=executable_fd,
+            )
+        os.close(executable_fd)
+        os.close(start_read)
+        os.close(ready_write)
+        os.close(exec_status_write)
+        try:
+            if _read_exact_fd(ready_read, 1) != b"R":
+                raise RuntimeError("supervised target failed before session creation")
+        finally:
+            os.close(ready_read)
+        control.sendall(f"READY {target_pid}\n".encode("ascii"))
+        command = _recv_exact_socket(control, 1)
+        if command != b"G" or pending_signals:
+            raise RuntimeError("supervised target start was cancelled")
+        os.write(start_write, b"G")
+        os.close(start_write)
+        exec_error = _read_limited_fd(exec_status_read, 16 * 1024)
+        os.close(exec_status_read)
+        if exec_error:
+            message = " ".join(exec_error.decode("utf-8", errors="replace").split())[:1000]
+            control.sendall(f"ERROR {message}\n".encode())
+            _hard_kill_supervisor_descendants(os.getpid())
+            _reap_supervisor_children()
+            return 127
+        control.sendall(b"STARTED\n")
+        return _monitor_posix_supervised_target(control, target_pid, pending_signals)
+    except BaseException as exc:
+        with contextlib.suppress(OSError):
+            message = " ".join(f"{type(exc).__name__}: {exc}".split())[:1000]
+            control.sendall(f"ERROR {message}\n".encode("utf-8", errors="replace"))
+        if target_pid is not None and target_pid > 0:
+            _hard_kill_supervisor_descendants(os.getpid())
+            _reap_supervisor_children()
+        return 127
+    finally:
+        with contextlib.suppress(OSError):
+            control.close()
+
+
+def _run_posix_supervised_target(
+    *,
+    control: socket.socket,
+    start_read: int,
+    start_write: int,
+    ready_read: int,
+    ready_write: int,
+    exec_status_read: int,
+    exec_status_write: int,
+    argv: list[str],
+    cwd: str,
+    environment: dict[str, str],
+    executable_fd: int,
+) -> None:
+    try:
+        control.close()
+        os.close(start_write)
+        os.close(ready_read)
+        os.close(exec_status_read)
+        for selected_signal in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(selected_signal, signal.SIG_DFL)
+        os.setsid()
+        _set_linux_parent_death_signal(signal.SIGKILL, expected_parent_pid=os.getppid())
+        os.write(ready_write, b"R")
+        os.close(ready_write)
+        if _read_exact_fd(start_read, 1) != b"G":
+            raise RuntimeError("supervised target did not receive its start grant")
+        os.close(start_read)
+        os.chdir(cwd)
+        os.execve(f"/proc/self/fd/{executable_fd}", argv, environment)
+    except BaseException as exc:
+        message = f"{type(exc).__name__}: {exc}".encode("utf-8", errors="replace")[:16_000]
+        with contextlib.suppress(OSError):
+            os.write(exec_status_write, message)
+        os._exit(127)
+
+
+def _monitor_posix_supervised_target(
+    control: socket.socket,
+    target_pid: int,
+    pending_signals: list[int],
+) -> int:
+    control.setblocking(False)
+    target_status: int | None = None
+    while target_status is None:
+        while pending_signals:
+            selected_signal = pending_signals.pop(0)
+            if selected_signal == signal.SIGINT:
+                _signal_supervisor_descendants(os.getpid(), signal.SIGINT)
+                continue
+            _hard_kill_supervisor_descendants(os.getpid())
+            _reap_supervisor_children()
+            return 128 + int(selected_signal)
+
+        try:
+            readable, _, _ = select_select((control,), (), (), 0.02)
+        except (OSError, ValueError):
+            readable = (control,)
+        if readable:
+            try:
+                unexpected = control.recv(1)
+            except BlockingIOError:
+                unexpected = b"x"
+            if not unexpected:
+                _hard_kill_supervisor_descendants(os.getpid())
+                _reap_supervisor_children()
+                return 128 + int(signal.SIGTERM)
+            _hard_kill_supervisor_descendants(os.getpid())
+            _reap_supervisor_children()
+            return 127
+
+        for child_pid, status in _reap_supervisor_children():
+            if child_pid == target_pid:
+                target_status = status
+    _hard_kill_supervisor_descendants(os.getpid())
+    _reap_supervisor_children()
+    return _exit_code_from_wait_status(target_status)
+
+
+def _enable_posix_supervisor_kernel_guards(expected_parent_pid: int) -> None:
+    if expected_parent_pid <= 0 or os.getppid() != expected_parent_pid:
+        raise RuntimeError("process supervisor parent identity changed during startup")
+    if not sys.platform.startswith("linux"):
+        return
+    libc = ctypes.CDLL(None, use_errno=True)
+    prctl = libc.prctl
+    prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+    prctl.restype = ctypes.c_int
+    if prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
+        raise OSError(ctypes.get_errno(), "PR_SET_CHILD_SUBREAPER failed")
+    if prctl(1, int(signal.SIGTERM), 0, 0, 0) != 0:  # PR_SET_PDEATHSIG
+        raise OSError(ctypes.get_errno(), "PR_SET_PDEATHSIG failed")
+    if os.getppid() != expected_parent_pid:
+        raise RuntimeError("process supervisor parent exited during startup")
+
+
+def _set_linux_parent_death_signal(selected_signal: int, *, expected_parent_pid: int) -> None:
+    if not sys.platform.startswith("linux"):
+        return
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(1, int(selected_signal), 0, 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), "target PR_SET_PDEATHSIG failed")
+    if os.getppid() != expected_parent_pid:
+        raise RuntimeError("process supervisor exited during target startup")
+
+
+def _read_posix_supervisor_payload(control: socket.socket) -> dict[str, object]:
+    raw_size = _recv_exact_socket(control, 8)
+    size = int.from_bytes(raw_size, "big")
+    if not 2 <= size <= _POSIX_CONTROL_LIMIT:
+        raise ValueError("invalid process supervisor payload size")
+    decoded = json.loads(_recv_exact_socket(control, size).decode("utf-8"))
+    if not isinstance(decoded, dict):
+        raise ValueError("process supervisor payload must be an object")
+    return decoded
+
+
+def _recv_exact_socket(control: socket.socket, size: int) -> bytes:
+    chunks = bytearray()
+    while len(chunks) < size:
+        chunk = control.recv(size - len(chunks))
+        if not chunk:
+            raise EOFError("process supervisor parent control channel closed")
+        chunks.extend(chunk)
+    return bytes(chunks)
+
+
+def _read_exact_fd(descriptor: int, size: int) -> bytes:
+    chunks = bytearray()
+    while len(chunks) < size:
+        chunk = os.read(descriptor, size - len(chunks))
+        if not chunk:
+            break
+        chunks.extend(chunk)
+    return bytes(chunks)
+
+
+def _read_limited_fd(descriptor: int, limit: int) -> bytes:
+    chunks = bytearray()
+    while len(chunks) < limit:
+        chunk = os.read(descriptor, min(4096, limit - len(chunks)))
+        if not chunk:
+            break
+        chunks.extend(chunk)
+    return bytes(chunks)
+
+
+def _supervisor_descendant_pids(root_pid: int) -> tuple[int, ...]:
+    processes = _procfs_processes() if Path("/proc").is_dir() else _portable_ps_processes()
+    by_parent: dict[int, list[int]] = {}
+    for node in processes:
+        if node.parent_pid is not None:
+            by_parent.setdefault(node.parent_pid, []).append(node.pid)
+    pending = list(by_parent.get(root_pid, ()))
+    descendants: list[int] = []
+    seen: set[int] = set()
+    while pending:
+        pid = pending.pop()
+        if pid in seen or pid == root_pid:
+            continue
+        seen.add(pid)
+        descendants.append(pid)
+        pending.extend(by_parent.get(pid, ()))
+    return tuple(descendants)
+
+
+def _signal_supervisor_descendants(root_pid: int, selected_signal: int) -> None:
+    for pid in reversed(_supervisor_descendant_pids(root_pid)):
+        _signal_pid_safely(pid, selected_signal)
+
+
+def _hard_kill_supervisor_descendants(root_pid: int) -> None:
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        descendants = _supervisor_descendant_pids(root_pid)
+        if not descendants:
+            return
+        for pid in reversed(descendants):
+            _signal_pid_safely(pid, signal.SIGSTOP)
+        for pid in reversed(descendants):
+            _signal_pid_safely(pid, signal.SIGKILL)
+        _reap_supervisor_children()
+        time.sleep(0.01)
+
+
+def _signal_pid_safely(pid: int, selected_signal: int) -> None:
+    if hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"):
+        descriptor: int | None = None
+        try:
+            descriptor = os.pidfd_open(pid)
+            signal.pidfd_send_signal(descriptor, selected_signal)
+            return
+        except (OSError, ProcessLookupError):
+            return
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+    with contextlib.suppress(OSError, ProcessLookupError):
+        os.kill(pid, selected_signal)
+
+
+def _reap_supervisor_children() -> list[tuple[int, int]]:
+    result: list[tuple[int, int]] = []
+    while True:
+        try:
+            pid, status = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return result
+        if pid == 0:
+            return result
+        result.append((pid, status))
+
+
+def _exit_code_from_wait_status(status: int) -> int:
+    if os.WIFEXITED(status):
+        return os.WEXITSTATUS(status)
+    if os.WIFSIGNALED(status):
+        return -os.WTERMSIG(status)
+    return 127
+
+
+def _emergency_kill_posix_supervisor(supervisor: _PosixSupervisor) -> None:
+    supervisor.close()
+    descendants = process_tree_snapshot(supervisor.process.pid)
+    for node in reversed(descendants):
+        if node.pid != supervisor.process.pid:
+            _signal_pid_safely(node.pid, signal.SIGKILL)
+    _signal_pid_safely(supervisor.process.pid, signal.SIGKILL)
 
 
 def process_tree_snapshot(root_pid: int) -> tuple[ProcessNode, ...]:
@@ -987,7 +1770,12 @@ def permission_snapshot(cwd: Path) -> PermissionSnapshot:
 def filesystem_snapshot(
     roots: Sequence[Path],
     max_entries: int,
+    allowed_roots: Sequence[Path] = (),
 ) -> tuple[dict[str, FilesystemEntry], bool]:
+    if not roots:
+        return {}, False
+    if allowed_roots:
+        return _guarded_filesystem_snapshot(roots, max_entries, allowed_roots)
     entries: dict[str, FilesystemEntry] = {}
     truncated = False
     pending = [path.resolve(strict=False) for path in roots]
@@ -1030,6 +1818,77 @@ def filesystem_snapshot(
             except OSError:
                 continue
     return entries, truncated
+
+
+def _guarded_filesystem_snapshot(
+    roots: Sequence[Path],
+    max_entries: int,
+    allowed_roots: Sequence[Path],
+) -> tuple[dict[str, FilesystemEntry], bool]:
+    """Snapshot only handle-anchored, no-follow objects below allowed roots."""
+
+    normalized_roots = tuple(Path(root).resolve(strict=True) for root in allowed_roots)
+    identities = {
+        root: metadata_identity(root.stat(follow_symlinks=False)) for root in normalized_roots
+    }
+    entries: dict[str, FilesystemEntry] = {}
+    truncated = False
+    with PathMutationGuard(normalized_roots, (), identities) as guard:
+        pending = [Path(path) for path in roots]
+        while pending:
+            path = pending.pop()
+            key = str(path)
+            if key in entries:
+                continue
+            if len(entries) >= max_entries:
+                truncated = True
+                break
+            try:
+                bound = guard.bind(path, allow_root=True)
+                metadata = bound.lstat()
+            except (OSError, RuntimeError, ValueError):
+                truncated = True
+                continue
+            kind = (
+                "symlink"
+                if stat.S_ISLNK(metadata.st_mode)
+                else "directory"
+                if stat.S_ISDIR(metadata.st_mode)
+                else "file"
+            )
+            digest = None
+            if kind == "file" and metadata.st_size <= 2 * 1024 * 1024:
+                try:
+                    digest = _sha256_bound_file(bound)
+                except (OSError, RuntimeError, ValueError):
+                    truncated = True
+            entries[key] = FilesystemEntry(
+                path=key,
+                kind=kind,
+                size=metadata.st_size,
+                mtime_ns=metadata.st_mtime_ns,
+                mode=stat.S_IMODE(metadata.st_mode),
+                sha256=digest,
+            )
+            if kind == "directory":
+                try:
+                    remaining = max(1, max_entries - len(entries) + 1)
+                    children = directory_entries(bound, max_entries=remaining)
+                except (OSError, RuntimeError, ValueError):
+                    truncated = True
+                    continue
+                if len(children) >= remaining:
+                    truncated = True
+                pending.extend(path / child.name for child in children[:remaining])
+    return entries, truncated
+
+
+def _sha256_bound_file(path) -> str:
+    digest = hashlib.sha256()
+    with verified_binary_handle(path) as handle:
+        while chunk := handle.read(128 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def filesystem_diff(
@@ -1082,6 +1941,39 @@ def _resolve_executable(executable: str | Path, cwd: Path | None) -> Path:
     if os.name != "nt" and not os.access(resolved, os.X_OK):
         raise ValueError(f"executable is not executable: {resolved}")
     return resolved
+
+
+def _open_pinned_executable(executable: Path) -> int:
+    """Pin the validated image through CreateProcess or Linux fd-based exec."""
+
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(executable, flags)
+    try:
+        opened = os.fstat(descriptor)
+        current = executable.lstat()
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or stat.S_ISLNK(current.st_mode)
+            or metadata_identity(opened) != metadata_identity(current)
+        ):
+            raise RuntimeError("executable identity changed while it was pinned")
+        if os.name != "nt" and not os.access(executable, os.X_OK):
+            raise PermissionError("pinned executable is not executable")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _pinned_executable_sha256(executable: Path) -> str:
+    descriptor = _open_pinned_executable(executable)
+    try:
+        digest = hashlib.sha256()
+        while chunk := os.read(descriptor, 128 * 1024):
+            digest.update(chunk)
+        return digest.hexdigest()
+    finally:
+        os.close(descriptor)
 
 
 def _redact_arguments(request: ProcessRequest) -> tuple[str, ...]:
@@ -1140,3 +2032,21 @@ def _finish_session_process(
         return
     with contextlib.suppress(KeyError, ValueError):
         session.finish_process(pid, exit_code=exit_code, terminated=terminated)
+
+
+if __name__ == "__main__":
+    if (
+        os.name == "nt"
+        or len(sys.argv) != 4
+        or sys.argv[1] != _POSIX_SUPERVISOR_FLAG
+        or not sys.argv[2].isdigit()
+        or not sys.argv[3].isdigit()
+    ):
+        raise SystemExit(2)
+    supervisor_exit = _posix_process_supervisor_main(int(sys.argv[2]), int(sys.argv[3]))
+    if supervisor_exit < 0:
+        target_signal = -supervisor_exit
+        signal.signal(target_signal, signal.SIG_DFL)
+        os.kill(os.getpid(), target_signal)
+        os._exit(128 + target_signal)
+    raise SystemExit(supervisor_exit)

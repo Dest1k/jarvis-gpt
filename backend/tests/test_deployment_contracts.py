@@ -15,6 +15,10 @@ def test_backend_image_installs_sandboxed_chromium_and_drops_root() -> None:
 
     assert "rm -rf /var/lib/apt/lists/*" in dockerfile
     assert "chromium-sandbox" in dockerfile
+    assert "PLAYWRIGHT_BROWSERS_PATH=/ms-playwright" in dockerfile
+    assert "playwright install --with-deps --only-shell chromium" in dockerfile
+    assert "p.chromium.launch(headless=True)" in dockerfile
+    assert "chromium_headless_shell-*" in dockerfile
     assert "Acquire::Retries" in dockerfile
     assert "--no-sandbox" not in dockerfile
     assert 'ENTRYPOINT ["jarvis-docker-entrypoint"]' in dockerfile
@@ -23,6 +27,20 @@ def test_backend_image_installs_sandboxed_chromium_and_drops_root() -> None:
     assert "Refusing unsafe JARVIS_HOME outside /runtime" in entrypoint
     assert "Refusing unsafe JARVIS_MODEL_ROOT outside JARVIS_HOME" in entrypoint
     assert "Refusing unexpected HOME" in entrypoint
+
+
+def test_bundled_web_surfer_dependencies_are_pinned_for_native_and_container_runs() -> None:
+    requirements = _read("backend/requirements.txt")
+    pyproject = _read("pyproject.toml")
+
+    for dependency in (
+        "beautifulsoup4==4.15.0",
+        "lxml==6.1.1",
+        "playwright==1.61.0",
+        "playwright-stealth==2.0.3",
+    ):
+        assert dependency in requirements
+        assert f'"{dependency}"' in pyproject
 
 
 def test_compose_defaults_to_loopback_and_propagates_build_contract() -> None:

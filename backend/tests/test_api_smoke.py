@@ -9,11 +9,13 @@ status -> chat -> feedback -> mission -> report -> queue -> tools/memory/approva
 
 from __future__ import annotations
 
+import asyncio
 import base64
 from pathlib import Path
 from threading import Event
 
 import pytest
+from fastapi import FastAPI
 from jarvis_gpt.api import (
     _is_local_machine_host,
     _is_loopback_host,
@@ -21,8 +23,11 @@ from jarvis_gpt.api import (
     _persist_interrupted_stream,
     _token_allowed,
     app,
+    lifespan,
 )
+from jarvis_gpt.config import load_settings
 from jarvis_gpt.model_hub import DOWNLOAD_JOBS_KEY
+from jarvis_gpt.runtime_lease import PrimaryRuntimeLease, RuntimeLeaseError
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
@@ -34,6 +39,98 @@ def client(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_AUTONOMY_ENABLED", "0")
     with TestClient(app) as test_client:
         yield test_client
+
+
+def test_lifespan_cleanup_survives_repeated_cancellation(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setenv("JARVIS_AUTONOMY_ENABLED", "0")
+    profile = {
+        "schema": "jarvis.host-profile.v1",
+        "fingerprint_sha256": "a" * 64,
+        "host": {},
+    }
+    monkeypatch.setattr(
+        "jarvis_gpt.api.HostProfileManager.refresh", lambda _self: profile
+    )
+
+    async def no_start(_self):
+        return None
+
+    monkeypatch.setattr("jarvis_gpt.api.RuntimeSupervisor.start", no_start)
+
+    async def scenario():
+        isolated_app = FastAPI()
+        context = lifespan(isolated_app)
+        await context.__aenter__()
+        stop_started = asyncio.Event()
+        release_stop = asyncio.Event()
+
+        async def delayed_stop():
+            stop_started.set()
+            await release_stop.wait()
+
+        isolated_app.state.supervisor.stop = delayed_stop
+        closing = asyncio.create_task(context.__aexit__(None, None, None))
+        await stop_started.wait()
+        closing.cancel()
+        closing.cancel()
+        await asyncio.sleep(0)
+        assert not closing.done()
+        closing.cancel()
+        release_stop.set()
+        with pytest.raises(asyncio.CancelledError):
+            await closing
+
+        lease = PrimaryRuntimeLease(
+            isolated_app.state.settings.state_dir / "primary-runtime.lock"
+        )
+        lease.acquire()
+        lease.release()
+
+    asyncio.run(scenario())
+
+
+def test_lifespan_holds_primary_lease_until_cancelled_host_refresh_finishes(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setenv("JARVIS_AUTONOMY_ENABLED", "0")
+    refresh_started = Event()
+    release_refresh = Event()
+
+    def delayed_refresh(_self):
+        refresh_started.set()
+        assert release_refresh.wait(timeout=5)
+        return {
+            "schema": "jarvis.host-profile.v1",
+            "fingerprint_sha256": "b" * 64,
+            "host": {},
+        }
+
+    monkeypatch.setattr("jarvis_gpt.api.HostProfileManager.refresh", delayed_refresh)
+    lease_path = load_settings().state_dir / "primary-runtime.lock"
+
+    async def scenario():
+        isolated_app = FastAPI()
+        context = lifespan(isolated_app)
+        startup = asyncio.create_task(context.__aenter__())
+        assert await asyncio.to_thread(refresh_started.wait, 2)
+        startup.cancel()
+        startup.cancel()
+        await asyncio.sleep(0)
+        lease = PrimaryRuntimeLease(lease_path)
+        with pytest.raises(RuntimeLeaseError):
+            lease.acquire()
+        assert not startup.done()
+        release_refresh.set()
+        with pytest.raises(asyncio.CancelledError):
+            await startup
+        lease.acquire()
+        lease.release()
+
+    asyncio.run(scenario())
 
 
 def test_health_and_status(client):
@@ -49,6 +146,15 @@ def test_health_and_status(client):
 
     models = client.get("/api/models")
     assert models.status_code == 200
+
+    profile = client.get("/api/environment/profile")
+    assert profile.status_code == 200
+    assert len(profile.json()["profile"]["fingerprint_sha256"]) == 64
+    assert (app.state.settings.home / "host_profile.json").exists()
+
+    surfer = client.get("/api/internet/web-surfer")
+    assert surfer.status_code == 200
+    assert surfer.json()["protocol"] == "jarvis.web-surfer-adapter.v1"
 
 
 def test_read_only_web_status_endpoints_do_not_create_tool_runs(client):
@@ -102,6 +208,49 @@ def test_api_cannot_reapprove_an_executing_approval(client):
     assert app.state.storage.get_approval(approval["id"])["status"] == "executing"
 
 
+def test_primary_runtime_recovers_interrupted_approval_without_replay(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setenv("JARVIS_AUTONOMY_ENABLED", "0")
+    with TestClient(app):
+        mission = app.state.storage.create_mission(
+            title="Interrupted approval",
+            goal="Do not replay acquired work",
+            tasks=["Persist memory"],
+        )
+        task = mission["tasks"][0]
+        app.state.storage.update_mission_task(
+            task["id"], mission_id=mission["id"], status="blocked"
+        )
+        approval = app.state.storage.create_approval(
+            title="Acquired before shutdown",
+            description="Simulated abrupt process exit.",
+            requested_action="memory.save",
+            payload={
+                "mission_id": mission["id"],
+                "task_id": task["id"],
+                "content": "interrupted side effect must not replay",
+            },
+        )
+        app.state.storage.update_approval(approval["id"], status="approved")
+        claimed = app.state.storage.claim_approval_execution(approval["id"])
+        assert claimed is not None and claimed["status"] == "executing"
+
+    with TestClient(app):
+        recovered = app.state.storage.get_approval(approval["id"])
+        assert recovered is not None and recovered["status"] == "failed"
+        assert recovered["result"]["data"]["reconcile_only"] is True
+        assert recovered["result"]["reconciliation"]["status"] == "completed"
+        assert (
+            app.state.storage.search_memory(
+                "interrupted side effect must not replay", limit=5
+            )
+            == []
+        )
+
+
 def test_runtime_security_and_backup(client, monkeypatch):
     security = client.get("/api/runtime/security")
     assert security.status_code == 200
@@ -142,6 +291,32 @@ def test_local_api_rejects_cross_site_state_change(client, monkeypatch):
 
     assert denied.status_code == 403
     assert called is False
+
+
+def test_dispatcher_action_api_preserves_independent_verification(client, monkeypatch):
+    status = app.state.dispatcher.status()
+    monkeypatch.setattr(app.state.dispatcher, "status", lambda: status)
+    monkeypatch.setattr(
+        app.state.dispatcher,
+        "run_compose_verified",
+        lambda _action: {
+            "ok": True,
+            "summary": "verified",
+            "returncode": 0,
+            "verification": {
+                "ok": True,
+                "container_known": True,
+                "container_running": True,
+                "port_open": True,
+            },
+        },
+    )
+
+    response = client.post("/api/dispatcher/start")
+
+    assert response.status_code == 200
+    assert response.json()["verification"]["ok"] is True
+    assert response.json()["verification"]["port_open"] is True
 
 
 def test_loopback_api_can_require_token(monkeypatch, tmp_path):
@@ -368,26 +543,107 @@ def test_mission_lifecycle_and_report(client):
     assert created.status_code == 200
     mission_id = created.json()["id"]
     assert created.json()["tasks"]
+    plan = client.get(f"/api/executive/plans/{mission_id}")
+    assert plan.status_code == 200
+    assert plan.json()["protocol"] == "jarvis.executive.v1"
+    assert plan.json()["planner"]["ready_step_ids"] == ["step.001"]
+    bypass = client.patch(
+        f"/api/missions/{mission_id}/tasks/{created.json()['tasks'][0]['id']}",
+        json={"status": "done"},
+    )
+    assert bypass.status_code == 409
 
     # No report before the mission is finished.
     early = client.get(f"/api/missions/{mission_id}/report")
     assert early.status_code == 404
 
-    # Drive the mission to completion (offline deterministic executor).
+    # Offline mode must fail closed instead of fabricating successful evidence.
     run = client.post(f"/api/missions/{mission_id}/run")
     assert run.status_code == 200
     run_body = run.json()
-    assert run_body["completed"] is True
-    assert run_body["final_report"]
-    assert "Итог миссии" in run_body["final_report"]
+    assert run_body["completed"] is False
+    assert run_body["stopped_reason"] == "blocked"
+    assert run_body["final_report"] is None
 
-    # The finished report is now retrievable and stable.
+    # No report or successful goal assertion exists without trusted execution evidence.
     report = client.get(f"/api/missions/{mission_id}/report")
-    assert report.status_code == 200
-    assert report.json()["report"] == run_body["final_report"]
+    assert report.status_code == 404
+
+    final_plan = client.get(f"/api/executive/plans/{mission_id}").json()
+    assert final_plan["planner"]["status"] in {"ready", "running"}
+    assert final_plan["planner"]["goal_assertion_results"] == []
+
+    playbooks = client.get(
+        "/api/memory/playbooks",
+        params={"query": "свободное место диск", "limit": 5},
+    )
+    assert playbooks.status_code == 200
+    # Offline/LLM mission reports are deliverables, not trusted typed-action lessons.
+    assert playbooks.json()["stats"]["entries"] == 0
 
     missing = client.get("/api/missions/mission_nope/report")
     assert missing.status_code == 404
+
+
+def test_rejected_mission_approval_reconciles_executive_branch(client):
+    created = client.post(
+        "/api/missions",
+        json={"goal": "Exercise rejection recovery"},
+    ).json()
+    mission_id = created["id"]
+    claim = app.state.executive.claim_ready_task(mission_id)
+    assert claim is not None
+    app.state.storage.update_mission_task(
+        claim.task["id"],
+        mission_id=mission_id,
+        status="blocked",
+        notes="Waiting for approval.",
+    )
+    step = next(
+        item
+        for item in claim.planner["steps"]
+        if item["spec"]["step_id"] == claim.step_id
+    )
+    approval = client.post(
+        "/api/approvals",
+        json={
+            "title": "Bound approval",
+            "description": "Reject and revise the branch.",
+            "requested_action": "tool.run",
+            "risk": "danger",
+            "payload": {
+                "mission_id": mission_id,
+                "task_id": claim.task["id"],
+                "tool": "diagnostics.run",
+                "arguments": {},
+                "executive_claim": {
+                    "protocol": "jarvis.executive-approval.v1",
+                    "mission_id": mission_id,
+                    "task_id": claim.task["id"],
+                    "step_id": claim.step_id,
+                    "plan_revision": claim.planner["revision"],
+                    "step_attempt": step["attempts"],
+                    "environment_digest": claim.planner["environment"]["digest"],
+                },
+            },
+        },
+    ).json()
+
+    rejected = client.patch(
+        f"/api/approvals/{approval['id']}",
+        json={"status": "rejected", "result": {"operator": "test"}},
+    )
+
+    assert rejected.status_code == 200
+    assert rejected.json()["result"]["reconciliation"]["status"] == "completed"
+    plan = client.get(f"/api/executive/plans/{mission_id}").json()
+    assert plan["planner"]["revision"] == 1
+    old_task = next(
+        item
+        for item in app.state.storage.list_mission_tasks(mission_id)
+        if item["id"] == claim.task["id"]
+    )
+    assert old_task["status"] == "skipped"
 
 
 def test_operator_queue_and_memory_and_tools(client):
@@ -416,6 +672,13 @@ def test_operator_queue_and_memory_and_tools(client):
     assert {"runtime.status", "persona.get", "memory.search"}.issubset(names)
     assert "host.bridge.execute" not in names
     assert "execution.apply" in names
+    assert {
+        "execution.preflight",
+        "environment.profile",
+        "memory.playbooks.lookup",
+        "executive.plan.status",
+        "web.surfer.capabilities",
+    }.issubset(names)
 
     run = client.post("/api/tools/runtime.status/run", json={"arguments": {}})
     assert run.status_code == 200

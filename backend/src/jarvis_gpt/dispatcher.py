@@ -5,6 +5,7 @@ import os
 import shutil
 import socket
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -110,6 +111,73 @@ class DispatcherManager:
             "command": command,
         }
 
+    def run_compose_verified(
+        self,
+        action: str,
+        *,
+        timeout_seconds: float = 15.0,
+    ) -> dict[str, Any]:
+        result = self.run_compose(action)
+        if not result.get("ok"):
+            return {**result, "verification": {"ok": False, "skipped": True}}
+        expected_running = action == "up"
+        verification = self.verify_state(
+            running=expected_running,
+            timeout_seconds=timeout_seconds,
+        )
+        return {
+            **result,
+            "ok": bool(result.get("ok") and verification["ok"]),
+            "summary": (
+                f"Dispatcher compose {action} completed and independent state checks passed."
+                if verification["ok"]
+                else f"Dispatcher compose {action} completed but state verification failed."
+            ),
+            "verification": verification,
+        }
+
+    def verify_state(
+        self,
+        *,
+        running: bool,
+        timeout_seconds: float = 15.0,
+    ) -> dict[str, Any]:
+        deadline = time.monotonic() + max(0.1, min(float(timeout_seconds), 120.0))
+        snapshot: dict[str, Any] = {}
+        while True:
+            snapshot = self.status()
+            container = snapshot.get("container_status")
+            container_status = (
+                str(container.get("status") or "") if isinstance(container, dict) else ""
+            )
+            container_known = bool(
+                isinstance(container, dict)
+                and container.get("ok") is True
+                and isinstance(container.get("exists"), bool)
+            )
+            container_running = bool(
+                container_known
+                and container.get("exists")
+                and container_status.casefold().startswith("up")
+            )
+            port_open = bool(snapshot.get("port_open"))
+            verified = (
+                container_known and container_running and port_open
+                if running
+                else container_known and not container_running and not port_open
+            )
+            if verified or time.monotonic() >= deadline:
+                return {
+                    "ok": verified,
+                    "expected_running": running,
+                    "container_known": container_known,
+                    "container_running": container_running,
+                    "port_open": port_open,
+                    "port": int(snapshot.get("port") or 8001),
+                    "container_status": container,
+                }
+            time.sleep(0.25)
+
     def _container_status(self, docker: str | None) -> dict[str, Any] | None:
         if docker is None:
             return None
@@ -130,10 +198,18 @@ class DispatcherManager:
         )
         if result.returncode != 0:
             return {"ok": False, "error": result.stderr.strip()}
-        line = result.stdout.strip()
-        if not line:
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        exact = next(
+            (
+                line
+                for line in lines
+                if line.split("\t", 1)[0].strip() == DISPATCHER_CONTAINER
+            ),
+            None,
+        )
+        if exact is None:
             return {"ok": True, "exists": False}
-        parts = line.split("\t")
+        parts = exact.split("\t")
         command = self._container_command(docker)
         return {
             "ok": True,

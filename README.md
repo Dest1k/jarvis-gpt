@@ -74,10 +74,17 @@ Profile shortcuts:
 Manual low-level startup remains available:
 
 ```powershell
+py -3.11 -m pip install -r .\backend\requirements.txt
+py -3.11 -m playwright install --only-shell chromium
 py -3.11 .\jarvis.py init
 py -3.11 .\jarvis.py diag
 py -3.11 .\jarvis.py serve --reload
 ```
+
+The Playwright browser install is a one-time prerequisite for the bundled
+`web_surfer` black box. Docker images install the same headless Chromium build
+at image-build time. If browser provisioning is unavailable, the adapter fails
+closed and the existing generic web tools remain usable.
 
 В отдельном окне:
 
@@ -216,7 +223,12 @@ docker compose --profile llm up -d dispatcher
 - Command Center can upload Office/PDF/text attachments for document extraction
   and can run safe public web fetches with clipped results inline.
 - Command Center can create typed `jarvis.execution.v1` approval gates and execute them after approval.
-- Deterministic execution tools provide typed OS actions, rich process feedback, durable rollback checkpoints, idempotency, exact process ownership, and bounded session history. Process/network/registry capabilities are deny-by-default.
+- Deterministic execution tools provide typed OS actions, rich process feedback, durable rollback checkpoints, cross-restart transaction idempotency, exact process ownership, causal postcondition verification, and bounded session history. Failed startup rollback latches mutations closed; process/network/registry capabilities are deny-by-default.
+- Executive missions are persisted as cycle-safe `jarvis.planner.v1` DAGs behind the `jarvis.executive.v1` coordinator. Only dependency-ready tasks can be claimed; every step has assertions, failed branches are revised in place, and completed work survives replanning.
+- API and mutating CLI executive operations share a crash-safe `jarvis.primary-runtime-lease.v1` OS lock, preventing cross-process lost updates during planning, approvals, and recovery.
+- Independent state verification validates changed files, syntax, TCP listeners, registry values, and process identity before success is committed. Safe Gates classify destructive actions, require a dry-run, and use one-shot action-bound permits for high/critical risk.
+- Cold start writes a verified `host_profile.json` and adapts plans to its stable fingerprint. Execution playbooks persist only independently verified typed-action `[symptom -> solution -> verification]` facts in a dedicated SQLite store; LLM reports and retrieved/remote text stay untrusted data.
+- The bundled Claude-owned `web_surfer` service is connected only through `jarvis.web-surfer-adapter.v1` and its public async `fast_fact`, `deep_research`, and `aggressive_shopping` methods. Its Playwright/BeautifulSoup/lxml dependencies are pinned, and Docker provisions a matching headless Chromium build. The service runs in a resident process-tree-contained worker with bounded IPC, public-target validation, hard lifetime deadlines, restart after failure, and deterministic shutdown; missing browser provisioning or contract drift fails closed without changing the existing web stack.
 - Native host bridge uses token-authenticated `action.v1`; arbitrary command execution is removed, `/execute` returns `410 Gone`, and process launch is restricted to a fixed desktop-app/argument grammar.
 - Safe tools include `web.fetch` for public HTTP(S) context with private-network and redirect guards.
 - Web tools mark remote content as untrusted evidence, flag prompt-injection markers, and quarantine downloads without auto-opening files.

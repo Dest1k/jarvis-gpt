@@ -22,6 +22,7 @@ from jarvis_gpt.tools import (
     WEB_SEARCH_PROVIDER_STATS_KEY,
     WEB_USER_AGENT,
     ToolRegistry,
+    ToolSpec,
     _parse_bing_results,
     _PublicOnlyAsyncNetworkBackend,
     _redact_native_payload,
@@ -140,6 +141,57 @@ def test_tool_run_storage_redacts_secrets(monkeypatch, tmp_path):
     assert stored["arguments"]["content_base64"].startswith("[redacted:")
     assert stored["arguments"]["environment"] == {"PRIVATE_VALUE": "[redacted]"}
     assert listed["data"]["headers"]["Authorization"] == "[redacted]"
+    storage.close()
+
+
+def test_tool_registry_redacts_generic_secrets_in_response_and_persistence(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+    tools.add(
+        ToolSpec(
+            name="test.secret_echo",
+            description="Test-only secret echo.",
+            category="test",
+            input_schema={},
+            handler=lambda _ctx, _args: ToolRunResponse(
+                tool="test.secret_echo",
+                ok=True,
+                summary="Authorization: Bearer returned-secret-token",
+                data={
+                    "password": "returned-password",
+                    "stderr": "api_key=returned-api-key",
+                    "headers": {"Proxy-Authorization": "Basic returned-basic-secret"},
+                },
+            ),
+        )
+    )
+
+    result = asyncio.run(
+        tools.run(
+            "test.secret_echo",
+            {
+                "api_token": "argument-token",
+                "nested": {"password": "argument-password"},
+            },
+        )
+    )
+    stored = storage.list_tool_runs(limit=1)[0]
+
+    assert "returned-secret-token" not in result.summary
+    assert result.data["password"] == "[redacted]"
+    assert "returned-api-key" not in result.data["stderr"]
+    assert result.data["headers"]["Proxy-Authorization"] == "[redacted]"
+    assert stored["arguments"]["api_token"] == "[redacted]"
+    assert stored["arguments"]["nested"]["password"] == "[redacted]"
+    assert "returned-secret-token" not in stored["summary"]
+    assert stored["data"] == result.data
     storage.close()
 
 
@@ -548,6 +600,65 @@ def test_windows_native_is_gated_and_uses_winapi_wmi(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_windows_native_process_launch_requires_independent_pid_verification(
+    monkeypatch, tmp_path
+):
+    calls = []
+
+    class FakeBridgeClient:
+        def __init__(self, _settings):
+            return None
+
+        async def action(self, *, action, payload=None, timeout_sec=30):
+            calls.append((action, payload, timeout_sec))
+            if action == "process.start":
+                return {
+                    "ok": True,
+                    "summary": "Started calc.exe.",
+                    "data": {
+                        "ok": True,
+                        "summary": "Started calc.exe.",
+                        "pid": 4242,
+                    },
+                }
+            assert action == "wmi.query"
+            assert payload["filter"] == "ProcessId = 4242"
+            return {
+                "ok": True,
+                "summary": "WMI/CIM query returned 1 item(s).",
+                "data": {
+                    "ok": True,
+                    "summary": "WMI/CIM query returned 1 item(s).",
+                    "result": {
+                        "ok": True,
+                        "data": {"items": [{"ProcessId": 4242, "Name": "calc.exe"}]},
+                    },
+                },
+            }
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr("jarvis_gpt.tools.HostBridgeClient", FakeBridgeClient)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    launched = asyncio.run(
+        tools.run(
+            "windows.native",
+            {"action": "process.start", "payload": {"executable": "calc.exe"}},
+            allow_danger=True,
+        )
+    )
+
+    assert launched.ok is True
+    assert launched.data["verification"]["verified"] is True
+    assert [call[0] for call in calls] == ["process.start", "wmi.query"]
+    storage.close()
+
+
 def test_windows_native_process_start_uses_typed_empty_argv():
     payload = _validate_native_payload("process.start", {"executable": "calc.exe"})
 
@@ -863,6 +974,12 @@ def test_browser_chrome_launch_uses_dedicated_profile(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
     monkeypatch.setattr("jarvis_gpt.tools.HostBridgeClient", FakeBridgeClient)
+
+    async def fake_chrome_status(debug_url):
+        assert debug_url == "http://127.0.0.1:9222"
+        return {"ok": True, "summary": "CDP socket reachable"}
+
+    monkeypatch.setattr("jarvis_gpt.tools.chrome_debugger_status", fake_chrome_status)
     settings = load_settings()
     ensure_runtime_dirs(settings)
     storage = JarvisStorage(settings.database_path)
@@ -877,6 +994,7 @@ def test_browser_chrome_launch_uses_dedicated_profile(monkeypatch, tmp_path):
     assert launched.ok is True
     assert launched.data["debug_url"] == "http://127.0.0.1:9222"
     assert launched.data["profile_dir"].endswith("chrome-profile")
+    assert launched.data["verification"]["ok"] is True
     storage.close()
 
 
@@ -3633,12 +3751,16 @@ def test_dispatcher_tools_are_safe_or_gated(monkeypatch, tmp_path):
             return {"docker_available": True, "port_open": True}
 
         def run_compose(self, action):
+            return self.run_compose_verified(action)
+
+        def run_compose_verified(self, action):
             return {
                 "ok": True,
                 "summary": f"dispatcher {action}",
                 "stdout": "ok",
                 "stderr": "",
                 "command": ["docker", "compose", action],
+                "verification": {"ok": True, "port_open": action == "up"},
             }
 
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))

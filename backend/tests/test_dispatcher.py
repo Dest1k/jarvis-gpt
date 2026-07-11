@@ -105,3 +105,77 @@ def test_dispatcher_parses_actual_container_runtime_command():
     assert runtime["cpu_offload_gb"] == 8
     assert runtime["swap_space_gb"] == 8
     assert runtime_from_string == runtime
+
+
+def test_dispatcher_verification_requires_container_and_socket(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    settings = load_settings("gemma4-turbo")
+    ensure_runtime_dirs(settings)
+    manager = DispatcherManager(settings, repo_root=tmp_path)
+    monkeypatch.setattr(
+        manager,
+        "status",
+        lambda: {
+            "port": 8001,
+            "port_open": True,
+            "container_status": {"ok": True, "exists": True, "status": "Up 4 seconds"},
+        },
+    )
+
+    verification = manager.verify_state(running=True, timeout_seconds=0.1)
+
+    assert verification["ok"] is True
+    assert verification["container_running"] is True
+    assert verification["port_open"] is True
+
+
+def test_dispatcher_compose_success_is_rejected_when_socket_state_disagrees(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    settings = load_settings("gemma4-turbo")
+    ensure_runtime_dirs(settings)
+    manager = DispatcherManager(settings, repo_root=tmp_path)
+    monkeypatch.setattr(
+        manager,
+        "run_compose",
+        lambda _action: {"ok": True, "summary": "compose returned zero"},
+    )
+    monkeypatch.setattr(
+        manager,
+        "status",
+        lambda: {
+            "port": 8001,
+            "port_open": False,
+            "container_status": {"ok": True, "exists": True, "status": "Up 4 seconds"},
+        },
+    )
+    ticks = iter((0.0, 1.0))
+    monkeypatch.setattr("jarvis_gpt.dispatcher.time.monotonic", lambda: next(ticks))
+
+    result = manager.run_compose_verified("up", timeout_seconds=0.1)
+
+    assert result["ok"] is False
+    assert result["verification"]["container_running"] is True
+    assert result["verification"]["port_open"] is False
+
+
+def test_dispatcher_stop_rejects_unknown_docker_state(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    settings = load_settings("gemma4-turbo")
+    ensure_runtime_dirs(settings)
+    manager = DispatcherManager(settings, repo_root=tmp_path)
+    monkeypatch.setattr(
+        manager,
+        "status",
+        lambda: {
+            "port": 8001,
+            "port_open": False,
+            "container_status": {"ok": False, "error": "docker unavailable"},
+        },
+    )
+
+    verification = manager.verify_state(running=False, timeout_seconds=0.1)
+
+    assert verification["ok"] is False
+    assert verification["container_known"] is False

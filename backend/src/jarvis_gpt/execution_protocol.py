@@ -109,6 +109,7 @@ class FsCopySpec(_ActionModel):
     destination: str = Field(min_length=1, max_length=32_768)
     overwrite: StrictBool = False
     create_parents: StrictBool = False
+    expected_sha256: str | None = Field(default=None, pattern=r"^[0-9a-fA-F]{64}$")
 
 
 class FsMoveSpec(FsCopySpec):
@@ -260,6 +261,7 @@ def parse_action(payload: str | bytes | Mapping[str, Any]) -> AtomicAction:
             destination=_absolute_path(spec.destination),
             overwrite=spec.overwrite,
             create_parents=spec.create_parents,
+            expected_sha256=spec.expected_sha256,
             **common,
         )
     if isinstance(spec, FsCopySpec):
@@ -268,6 +270,7 @@ def parse_action(payload: str | bytes | Mapping[str, Any]) -> AtomicAction:
             destination=_absolute_path(spec.destination),
             overwrite=spec.overwrite,
             create_parents=spec.create_parents,
+            expected_sha256=spec.expected_sha256,
             **common,
         )
     if isinstance(spec, FsDeleteSpec):

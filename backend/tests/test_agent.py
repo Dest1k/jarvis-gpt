@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 from datetime import date, timedelta
 from pathlib import Path
 
-from jarvis_gpt.agent import AgentRuntime
+from jarvis_gpt.agent import AgentContext, AgentRuntime
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
 from jarvis_gpt.event_bus import EventBus
+from jarvis_gpt.executive_runtime import ExecutiveCoordinator
 from jarvis_gpt.llm import LLMRouter, LLMStreamChunk
 from jarvis_gpt.models import ToolRunResponse
 from jarvis_gpt.storage import JarvisStorage
@@ -93,12 +95,14 @@ def test_agent_executes_next_mission_step(monkeypatch, tmp_path):
     refreshed = storage.get_mission(mission["id"])
     runs = storage.list_tool_runs()
 
-    assert result.result.ok is True
-    assert result.task is not None
-    assert result.task.status == "done"
+    assert result.result.ok is False
+    assert result.result.data["executor_unavailable"] is True
+    assert result.result.data["state_changed"] is False
+    assert result.task is None
     assert refreshed is not None
-    assert refreshed["progress"] > 0
-    assert runs[0]["tool"] == "mission.brief"
+    assert refreshed["progress"] == 0
+    assert all(task["status"] == "pending" for task in refreshed["tasks"])
+    assert runs == []
     storage.close()
 
 
@@ -110,11 +114,11 @@ def test_run_mission_chains_all_steps_offline(monkeypatch, tmp_path):
     run = asyncio.run(agent.run_mission(mission["id"], max_steps=task_count))
     refreshed = storage.get_mission(mission["id"])
 
-    assert run.completed is True
-    assert run.stopped_reason == "completed"
-    assert run.executed_steps == task_count
-    assert all(task["status"] == "done" for task in refreshed["tasks"])
-    assert refreshed["progress"] == 1.0
+    assert run.completed is False
+    assert run.stopped_reason == "blocked"
+    assert run.executed_steps == 1
+    assert all(task["status"] == "pending" for task in refreshed["tasks"])
+    assert refreshed["progress"] == 0
     storage.close()
 
 
@@ -127,25 +131,32 @@ def test_run_mission_respects_step_budget(monkeypatch, tmp_path):
 
     assert run.executed_steps == 1
     assert run.completed is False
-    assert run.stopped_reason == "budget"
+    assert run.stopped_reason == "blocked"
     storage.close()
 
 
 def test_concurrent_mission_execution_claims_only_one_step(monkeypatch, tmp_path):
     agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    agent.settings = replace(agent.settings, llm_enabled=True)
     mission = agent.create_mission("Build tools runtime")
-    original_run = agent.tools.run
 
     async def scenario():
         entered = asyncio.Event()
         release = asyncio.Event()
 
-        async def slow_run(*args, **kwargs):
+        async def slow_run(*_args, **_kwargs):
             entered.set()
             await release.wait()
-            return await original_run(*args, **kwargs)
+            return (
+                ToolRunResponse(
+                    tool="mission.execute_next",
+                    ok=False,
+                    summary="Synthetic failed step after concurrency observation.",
+                ),
+                None,
+            )
 
-        monkeypatch.setattr(agent.tools, "run", slow_run)
+        monkeypatch.setattr(agent, "_execute_mission_step_agentic", slow_run)
         first_task = asyncio.create_task(agent.execute_next_mission_step(mission["id"]))
         await entered.wait()
         competing = await agent.execute_next_mission_step(mission["id"])
@@ -156,7 +167,7 @@ def test_concurrent_mission_execution_claims_only_one_step(monkeypatch, tmp_path
 
     first, competing, during = asyncio.run(scenario())
 
-    assert first.result.ok is True
+    assert first.result.ok is False
     assert competing.result.ok is False
     assert competing.result.data["busy"] is True
     assert competing.task is None
@@ -167,6 +178,7 @@ def test_concurrent_mission_execution_claims_only_one_step(monkeypatch, tmp_path
 
 def test_cancelled_mission_step_does_not_remain_running(monkeypatch, tmp_path):
     agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    agent.settings = replace(agent.settings, llm_enabled=True)
     mission = agent.create_mission("Build tools runtime")
 
     async def scenario():
@@ -176,7 +188,7 @@ def test_cancelled_mission_step_does_not_remain_running(monkeypatch, tmp_path):
             entered.set()
             await asyncio.Event().wait()
 
-        monkeypatch.setattr(agent.tools, "run", never_finishes)
+        monkeypatch.setattr(agent, "_execute_mission_step_agentic", never_finishes)
         execution = asyncio.create_task(agent.execute_next_mission_step(mission["id"]))
         await entered.wait()
         execution.cancel()
@@ -192,6 +204,109 @@ def test_cancelled_mission_step_does_not_remain_running(monkeypatch, tmp_path):
     assert all(task["status"] != "running" for task in refreshed["tasks"])
     assert refreshed["tasks"][0]["status"] == "blocked"
     assert "cancelled" in refreshed["tasks"][0]["notes"]
+    storage.close()
+
+
+def test_cancelled_executive_step_reconciles_without_replaying_action(monkeypatch, tmp_path):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    agent.settings = replace(agent.settings, llm_enabled=True)
+    profile = {
+        "schema": "jarvis.host-profile.v1",
+        "fingerprint_sha256": "a" * 64,
+        "host": {
+            "os": {"system": "Windows"},
+            "architecture": {"machine": "AMD64"},
+            "accelerators": {},
+            "tools": {},
+        },
+    }
+    agent.executive = ExecutiveCoordinator(storage=storage, host_profile=profile)
+    agent.tools.executive = agent.executive
+    mission = agent.create_mission("Apply one safe mutation exactly once")
+
+    async def scenario():
+        entered = asyncio.Event()
+
+        async def committed_then_waits(*_args, **_kwargs):
+            entered.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(agent, "_execute_mission_step_agentic", committed_then_waits)
+        execution = asyncio.create_task(agent.execute_next_mission_step(mission["id"]))
+        await entered.wait()
+        execution.cancel()
+        try:
+            await execution
+        except asyncio.CancelledError:
+            return
+        raise AssertionError("Mission execution did not propagate cancellation")
+
+    asyncio.run(scenario())
+    refreshed = storage.get_mission(mission["id"])
+    plan = agent.executive.snapshot(mission["id"])["planner"]
+    original = next(item for item in refreshed["tasks"] if item["id"] == mission["tasks"][0]["id"])
+    recovery = next(
+        item
+        for item in plan["steps"]
+        if item["spec"]["action"]["arguments"].get("kind") == "reconciliation"
+    )
+
+    assert original["status"] == "skipped"
+    assert plan["revision"] == 1
+    assert recovery["spec"]["action"]["arguments"]["replay_original_action"] is False
+    storage.close()
+
+
+def test_executive_autonomy_rejects_unverified_side_effect_wrappers(monkeypatch, tmp_path):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    profile = {
+        "schema": "jarvis.host-profile.v1",
+        "fingerprint_sha256": "b" * 64,
+        "host": {"os": {}, "architecture": {}, "accelerators": {}, "tools": {}},
+    }
+    agent.executive = ExecutiveCoordinator(storage=storage, host_profile=profile)
+    agent.tools.executive = agent.executive
+    mission = agent.create_mission("Never bypass the typed mutation substrate")
+    claim = agent.executive.claim_ready_task(mission["id"])
+    context = AgentContext(
+        conversation_id=f"mission:{mission['id']}",
+        memory_hits=[],
+        file_hits=[],
+        mission_id=mission["id"],
+        task_id=claim.task["id"],
+    )
+    wrappers = {
+        "filesystem.write_text": {"path": str(tmp_path / "blocked.txt"), "content": "x"},
+        "execution.transaction": {"actions": []},
+        "documents.apply_replacements": {},
+        "web.watch.add": {"url": "https://example.com"},
+        "web.download": {"url": "https://example.com/file"},
+        "learning.tick": {},
+        "memory.save": {"content": "must not persist"},
+        "persona.insight": {"field": "interests", "value": "must not persist"},
+    }
+
+    async def scenario():
+        results = []
+        for name, arguments in wrappers.items():
+            results.append(
+                await agent._run_agentic_tool(
+                    name,
+                    arguments,
+                    {name},
+                    context,
+                )
+            )
+        return results
+
+    results = asyncio.run(scenario())
+
+    assert all("rejected" in observation for observation, _event, _run in results)
+    assert all(event.type == "thought" for _observation, event, _run in results)
+    assert all(run is None for _observation, _event, run in results)
+    assert not (tmp_path / "blocked.txt").exists()
+    assert storage.search_memory("must not persist", limit=5) == []
+    assert storage.list_approvals(limit=20) == []
     storage.close()
 
 
@@ -213,6 +328,44 @@ def test_blocked_mission_step_prevents_skipping_to_later_tasks(monkeypatch, tmp_
     assert response.result.data["blocked"] is True
     assert response.task is None
     assert refreshed["tasks"][1]["status"] == "pending"
+    storage.close()
+
+
+def test_missing_executive_plan_never_falls_through_to_legacy_fifo(
+    monkeypatch,
+    tmp_path,
+):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    mission = storage.create_mission(
+        title="Interrupted mission creation",
+        goal="Never execute without a durable DAG",
+        tasks=["First action", "Second action"],
+    )
+    assert storage.claim_mission_task(mission["id"], mission["tasks"][0]["id"])
+    agent.executive = ExecutiveCoordinator(
+        storage=storage,
+        host_profile={
+            "schema": "jarvis.host-profile.v1",
+            "fingerprint_sha256": "a" * 64,
+            "host": {
+                "os": {"system": "Windows"},
+                "architecture": {"machine": "AMD64"},
+                "accelerators": {},
+                "tools": {},
+            },
+        },
+    )
+
+    def legacy_fifo_must_not_run(_mission_id):
+        raise AssertionError("legacy FIFO executor was reached")
+
+    monkeypatch.setattr(storage, "claim_next_mission_task", legacy_fifo_must_not_run)
+    response = asyncio.run(agent.execute_next_mission_step(mission["id"]))
+    refreshed = storage.get_mission(mission["id"])
+
+    assert response.result.ok is False
+    assert response.result.data["executive_plan_missing"] is True
+    assert all(item["status"] == "blocked" for item in refreshed["tasks"])
     storage.close()
 
 
@@ -307,9 +460,7 @@ def test_agent_passes_chat_attachments_to_llm_context(monkeypatch, tmp_path):
         }
     ]
 
-    response = asyncio.run(
-        agent.chat("разбери вложение", mode="chat", attachments=attachments)
-    )
+    response = asyncio.run(agent.chat("разбери вложение", mode="chat", attachments=attachments))
 
     stored_messages = storage.recent_messages(response.conversation_id, limit=4)
     user_message = next(item for item in stored_messages if item["role"] == "user")
@@ -357,11 +508,10 @@ def test_agent_can_disable_model_thinking(monkeypatch, tmp_path):
         bus=EventBus(),
     )
 
-    response = asyncio.run(
-        agent.chat("hello", mode="chat", thinking_enabled=False)
-    )
+    response = asyncio.run(agent.chat("hello", mode="chat", thinking_enabled=False))
     user_message = next(
-        item for item in storage.recent_messages(response.conversation_id, limit=4)
+        item
+        for item in storage.recent_messages(response.conversation_id, limit=4)
         if item["role"] == "user"
     )
     rendered_prompt = "\n".join(item["content"] for item in captured["messages"])
@@ -464,9 +614,7 @@ def test_agent_calculator_understands_russian_multiply_sign(monkeypatch, tmp_pat
     storage.close()
 
 
-def test_agent_ignores_raw_console_commands_without_approval_or_execution(
-    monkeypatch, tmp_path
-):
+def test_agent_ignores_raw_console_commands_without_approval_or_execution(monkeypatch, tmp_path):
     agent, storage = _agent_without_llm(monkeypatch, tmp_path)
     conversation_id = storage.create_conversation("active console")
     storage.set_runtime_value(
@@ -577,9 +725,7 @@ def test_agent_captures_screen_when_asked_to_look(monkeypatch, tmp_path):
                         "ProcessName": "chrome",
                         "MainWindowTitle": "Jarvis",
                     },
-                    "windows": [
-                        {"ProcessName": "chrome", "MainWindowTitle": "Jarvis"}
-                    ],
+                    "windows": [{"ProcessName": "chrome", "MainWindowTitle": "Jarvis"}],
                 },
             },
         }
@@ -1405,8 +1551,7 @@ def test_agent_researches_nearby_pharmacy_as_place_lookup(monkeypatch, tmp_path)
                             "title": "Круглосуточная аптека",
                             "url": "https://example.com/pharmacy",
                             "snippet": (
-                                "Аптека, улица Ленина 10, круглосуточно, "
-                                "+7 (343) 123-45-67"
+                                "Аптека, улица Ленина 10, круглосуточно, " "+7 (343) 123-45-67"
                             ),
                         }
                     ]
@@ -1615,8 +1760,7 @@ def test_agent_does_not_web_search_hypothetical_reasoning_scenario(monkeypatch, 
                 {
                     "ok": True,
                     "content": (
-                        "Направляю 100% энергии на астероид и принимаю риск "
-                        "потери части себя."
+                        "Направляю 100% энергии на астероид и принимаю риск " "потери части себя."
                     ),
                     "error": None,
                 },
@@ -1712,13 +1856,12 @@ def test_task_kernel_records_reasoning_route_in_prompt_and_metadata(monkeypatch,
     monkeypatch.setattr(agent.tools, "run", fake_run)
 
     response = asyncio.run(
-        agent.chat(
-            "Roleplay a hypothetical scenario: reason logically and provide the decision."
-        )
+        agent.chat("Roleplay a hypothetical scenario: reason logically and provide the decision.")
     )
 
     user_message = next(
-        item for item in storage.recent_messages(response.conversation_id, limit=4)
+        item
+        for item in storage.recent_messages(response.conversation_id, limit=4)
         if item["role"] == "user"
     )
     rendered_prompt = "\n".join(item["content"] for item in captured["messages"])
@@ -1829,8 +1972,7 @@ def test_agent_does_not_web_search_logic_error_request(monkeypatch, tmp_path):
 
     response = asyncio.run(
         agent.chat(
-            "найди логическую ошибку в этом сценарии: "
-            "если спасать серверы, планета погибает"
+            "найди логическую ошибку в этом сценарии: " "если спасать серверы, планета погибает"
         )
     )
 
@@ -2561,8 +2703,7 @@ def test_intent_router_receives_operator_persona_context(monkeypatch, tmp_path):
                 {
                     "ok": True,
                     "content": (
-                        '{"route":"reasoning","confidence":0.8,'
-                        '"query":"","rationale":"advice"}'
+                        '{"route":"reasoning","confidence":0.8,' '"query":"","rationale":"advice"}'
                     ),
                     "error": None,
                 },

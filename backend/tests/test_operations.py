@@ -259,12 +259,13 @@ def test_mission_autonomy_job_runs_headless_and_persists_mission_id(monkeypatch,
 
     result = asyncio.run(executor.run_job(job))
 
-    assert result["ok"] is True
-    assert result["job"]["status"] == "done"
+    assert result["ok"] is False
+    assert result["job"]["status"] == "paused"
     assert result["job"]["payload"]["mission_id"].startswith("mis_")
-    assert result["data"]["completed"] is True
-    assert storage.get_mission(result["job"]["payload"]["mission_id"])["status"] == "done"
-    assert operations.list_job_runs(job_id=job["id"])[0]["ok"] is True
+    assert result["data"]["completed"] is False
+    assert result["data"]["blocked"] is True
+    assert storage.get_mission(result["job"]["payload"]["mission_id"])["status"] == "planned"
+    assert operations.list_job_runs(job_id=job["id"])[0]["ok"] is False
     storage.close()
 
 

@@ -25,7 +25,11 @@ _ALLOWED_CAPABILITY_KEYS = frozenset(
 )
 
 
-def build_execution_kernel(settings: JarvisSettings) -> ExecutionKernel:
+def build_execution_kernel(
+    settings: JarvisSettings,
+    *,
+    recover_checkpoints: bool = True,
+) -> ExecutionKernel:
     roots = execution_roots(settings)
     capabilities = load_execution_capabilities(settings, roots=roots)
     return ExecutionKernel(
@@ -33,6 +37,7 @@ def build_execution_kernel(settings: JarvisSettings) -> ExecutionKernel:
         state_dir=settings.state_dir,
         denied_paths=execution_denied_paths(settings, capabilities=capabilities),
         capabilities=capabilities,
+        recover_checkpoints=recover_checkpoints,
     )
 
 
@@ -70,6 +75,7 @@ def execution_denied_paths(
     candidates = [
         settings.home / ".jarvis",
         settings.home / "bridge.token",
+        settings.home / "host_profile.json",
         settings.state_dir,
         settings.log_dir,
         Path.cwd() / ".env",
@@ -160,6 +166,11 @@ def execution_capabilities_snapshot(kernel: ExecutionKernel) -> dict[str, Any]:
             }
             for item in kernel.recovered_checkpoints
         ],
+        "mutation_gate": {
+            "available": not kernel.rollback_degraded,
+            "status": "rollback_degraded" if kernel.rollback_degraded else "ready",
+            "unresolved_checkpoint_ids": list(kernel.rollback_degraded_checkpoint_ids),
+        },
         "capabilities_file_env": _CAPABILITIES_FILE_ENV,
         "roots_env": _ROOTS_ENV,
     }

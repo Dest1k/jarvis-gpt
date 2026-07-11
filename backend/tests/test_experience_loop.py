@@ -105,8 +105,10 @@ def test_lessons_prompt_is_injected_into_every_turn(monkeypatch, tmp_path):
     messages = agent._build_llm_messages(context, "как посмотреть загрузку CPU?")
 
     system_text = "\n".join(m["content"] for m in messages if m["role"] == "system")
-    assert "Уроки из опыта Jarvis" in system_text
-    assert "и для Windows, и для Linux" in system_text
+    user_text = "\n".join(m["content"] for m in messages if m["role"] == "user")
+    assert "Untrusted learned-history data" not in system_text
+    assert "Untrusted learned-history data" in user_text
+    assert "и для Windows, и для Linux" in user_text
     storage.close()
 
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import re
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +18,7 @@ class MemoryVault:
         self.ensure()
         path = self._memory_path(memory)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(_render_memory_note(memory), encoding="utf-8")
+        _atomic_write_text(path, _render_memory_note(memory))
         return path
 
     def remove_memory(self, memory_id: str) -> None:
@@ -115,7 +117,11 @@ class MemoryVault:
     def _memory_path(self, memory: dict[str, Any]) -> Path:
         namespace = _safe_slug(str(memory.get("namespace") or "core"))
         memory_id = _safe_slug(str(memory.get("id") or "memory"))
-        return self.root / namespace / f"{memory_id}.md"
+        root = self.root.resolve()
+        candidate = (root / namespace / f"{memory_id}.md").resolve()
+        if not candidate.is_relative_to(root):
+            raise ValueError("memory note path escapes the configured vault")
+        return candidate
 
 
 def _render_memory_note(memory: dict[str, Any]) -> str:
@@ -207,8 +213,9 @@ def _extract_tags(text: str) -> list[str]:
 
 
 def _safe_slug(value: str) -> str:
-    value = re.sub(r"[^\w.-]+", "-", value.strip(), flags=re.UNICODE).strip("-")
-    return value[:120] or "memory"
+    value = re.sub(r"[^\w.-]+", "-", value.strip(), flags=re.UNICODE)
+    value = value.strip(" .-")[:120].rstrip(" .")
+    return value if value not in {"", ".", ".."} else "memory"
 
 
 def _safe_tag(value: str) -> str:
@@ -225,3 +232,19 @@ def _yaml_value(value: Any) -> str:
 
 def _escape_yaml(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise

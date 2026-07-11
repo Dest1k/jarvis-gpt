@@ -285,6 +285,7 @@ class DispatcherActionResponse(BaseModel):
     stdout: str = ""
     stderr: str = ""
     command: list[str] = Field(default_factory=list)
+    verification: dict[str, Any] | None = None
     status: DispatcherStatusResponse
 
 

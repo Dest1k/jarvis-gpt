@@ -14,11 +14,20 @@ import stat
 import tempfile
 import time
 import uuid
+from collections.abc import Iterator
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, TypeAlias
 
+from .execution_filesystem import (
+    BoundPath,
+    PathMutationGuard,
+    directory_entries,
+    metadata_identity,
+    verified_binary_handle,
+)
 from .execution_models import ActionFeedback
 from .execution_process import AsyncProcessRunner, ProcessRequest
 from .execution_session import SessionRegistry
@@ -47,6 +56,9 @@ class PathPolicy:
                 raise ValueError(f"allowed root is not a directory: {resolved}")
             roots.append(resolved)
         self._roots = tuple(dict.fromkeys(roots))
+        self._root_identities = {
+            root: metadata_identity(root.stat(follow_symlinks=False)) for root in self._roots
+        }
         denied: list[Path] = []
         for path in denied_paths:
             if not path.is_absolute():
@@ -55,6 +67,9 @@ class PathPolicy:
             if resolved not in denied:
                 denied.append(resolved)
         self._denied = tuple(denied)
+        self._active_mutation_guard: ContextVar[PathMutationGuard | None] = ContextVar(
+            f"jarvis_path_guard_{id(self)}", default=None
+        )
 
     @property
     def roots(self) -> tuple[Path, ...]:
@@ -87,14 +102,69 @@ class PathPolicy:
         )
         if matching_root is None:
             raise ValueError(f"path escapes allowed roots: {path}")
-        if any(
-            resolved == denied or resolved.is_relative_to(denied)
-            for denied in self._denied
-        ):
+        if any(resolved == denied or resolved.is_relative_to(denied) for denied in self._denied):
             raise PermissionError(f"path is reserved for runtime secrets or state: {path}")
         if resolved == matching_root and not allow_root:
             raise ValueError("the allowed root itself cannot be mutated")
         return resolved
+
+    @contextlib.contextmanager
+    def mutation_scope(self, paths: tuple[Path, ...]) -> Iterator[PathMutationGuard]:
+        """Pin path ancestry for one mutation or an entire transaction."""
+
+        current = self._active_mutation_guard.get()
+        if current is not None:
+            for path in paths:
+                with contextlib.suppress(FileNotFoundError):
+                    bound = current.bind(path, allow_root=True)
+                    if os.name != "nt" and stat.S_ISDIR(bound.lstat().st_mode):
+                        current.bind(path / ".jarvis-directory-pin")
+            yield current
+            return
+        guard = PathMutationGuard(
+            self._roots,
+            self._denied,
+            self._root_identities,
+        )
+        token = self._active_mutation_guard.set(guard)
+        try:
+            # Eagerly pin every currently existing parent. Missing destination
+            # parents are created later through the same root-anchored guard.
+            for path in paths:
+                with contextlib.suppress(FileNotFoundError):
+                    bound = guard.bind(path, allow_root=True)
+                    if os.name != "nt" and stat.S_ISDIR(bound.lstat().st_mode):
+                        guard.bind(path / ".jarvis-directory-pin")
+            yield guard
+        finally:
+            self._active_mutation_guard.reset(token)
+            guard.close()
+
+    def bind_mutation_path(
+        self,
+        path: Path,
+        *,
+        create_parents: bool = False,
+        allow_root: bool = False,
+    ) -> BoundPath:
+        guard = self._active_mutation_guard.get()
+        if guard is None:
+            raise RuntimeError("filesystem mutations require an active path guard")
+        return guard.bind(
+            path,
+            create_parents=create_parents,
+            allow_root=allow_root,
+        )
+
+    def release_mutation_descendants(self, path: Path) -> None:
+        guard = self._active_mutation_guard.get()
+        if guard is None:
+            raise RuntimeError("filesystem mutations require an active path guard")
+        guard.release_descendants(path)
+
+    @property
+    def active_mutation_guard(self) -> PathMutationGuard | None:
+        return self._active_mutation_guard.get()
 
 
 class RegistryHive(StrEnum):
@@ -155,6 +225,7 @@ class CopyFileAction:
     destination: Path
     overwrite: bool = False
     create_parents: bool = False
+    expected_sha256: str | None = None
     action_id: str = field(default_factory=lambda: _new_id("copy"))
 
 
@@ -164,6 +235,7 @@ class MoveFileAction:
     destination: Path
     overwrite: bool = False
     create_parents: bool = False
+    expected_sha256: str | None = None
     action_id: str = field(default_factory=lambda: _new_id("move"))
 
 
@@ -274,6 +346,27 @@ class AtomicActionExecutor:
         self.allow_private_network = allow_private_network
 
     async def execute(self, action: AtomicAction) -> ActionFeedback:
+        mutation_paths = _filesystem_mutation_paths(action)
+        guarded_paths = mutation_paths or _filesystem_read_paths(action)
+        if guarded_paths and self.path_policy.active_mutation_guard is None:
+            try:
+                with self.path_policy.mutation_scope(guarded_paths):
+                    return await self.execute(action)
+            except (
+                OSError,
+                RuntimeError,
+                ValueError,
+                TypeError,
+                KeyError,
+                PermissionError,
+            ) as exc:
+                return ActionFeedback(
+                    ok=False,
+                    action_id=getattr(action, "action_id", "invalid"),
+                    kind=type(action).__name__,
+                    summary="Atomic action failed validation or execution.",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
         try:
             if isinstance(action, CreateDirectoryAction):
                 return await asyncio.to_thread(self._create_directory, action)
@@ -316,68 +409,67 @@ class AtomicActionExecutor:
             )
 
     def _create_directory(self, action: CreateDirectoryAction) -> ActionFeedback:
-        path = self.path_policy.resolve(action.path)
+        path = self.path_policy.bind_mutation_path(
+            action.path,
+            create_parents=action.parents,
+        )
         existed = path.exists()
-        if existed and not path.is_dir():
+        if existed and not stat.S_ISDIR(path.lstat().st_mode):
             raise ValueError("destination exists and is not a directory")
-        path.mkdir(parents=action.parents, exist_ok=True)
-        _fsync_directory(path.parent)
+        if not existed:
+            path.mkdir()
+        _fsync_bound_parent(path)
         return _feedback(
             action,
             ok=True,
             summary="Directory exists.",
             before={"exists": existed},
-            after=_path_state(path),
+            after=_bound_path_state(path),
         )
 
     def _stat_path(self, action: StatPathAction) -> ActionFeedback:
-        path = self.path_policy.resolve(action.path, must_exist=True, allow_root=True)
+        path = self.path_policy.bind_mutation_path(action.path, allow_root=True)
+        if not path.exists():
+            raise FileNotFoundError(path.path)
         return _feedback(
             action,
             ok=True,
             summary="Filesystem metadata read.",
-            after=_path_state(path),
+            after=_bound_path_state(path),
         )
 
     def _list_directory(self, action: ListDirectoryAction) -> ActionFeedback:
-        path = self.path_policy.resolve(action.path, must_exist=True, allow_root=True)
-        if not path.is_dir():
+        path = self.path_policy.bind_mutation_path(action.path, allow_root=True)
+        if not path.exists() or not stat.S_ISDIR(path.lstat().st_mode):
             raise ValueError("list target must be a directory")
         if not 1 <= action.max_entries <= 10_000:
             raise ValueError("max_entries must be between 1 and 10000")
         entries = []
         truncated = False
-        with os.scandir(path) as iterator:
-            for index, entry in enumerate(iterator):
-                if index >= action.max_entries:
-                    truncated = True
-                    break
-                metadata = entry.stat(follow_symlinks=False)
-                entries.append(
-                    {
-                        "name": entry.name,
-                        "kind": (
-                            "symlink"
-                            if entry.is_symlink()
-                            else "directory"
-                            if entry.is_dir(follow_symlinks=False)
-                            else "file"
-                        ),
-                        "size": metadata.st_size,
-                        "mtime_ns": metadata.st_mtime_ns,
-                    }
-                )
+        snapshots = directory_entries(path, max_entries=action.max_entries + 1)
+        for index, entry in enumerate(snapshots):
+            if index >= action.max_entries:
+                truncated = True
+                break
+            entries.append(
+                {
+                    "name": entry.name,
+                    "kind": entry.kind,
+                    "size": entry.size,
+                    "mtime_ns": entry.mtime_ns,
+                }
+            )
         entries.sort(key=lambda item: (item["kind"], item["name"].casefold()))
         return _feedback(
             action,
             ok=True,
             summary=f"Listed {len(entries)} filesystem entries.",
-            after={"path": str(path), "entries": entries, "truncated": truncated},
+            after={"path": str(path.path), "entries": entries, "truncated": truncated},
         )
 
     def _read_file(self, action: ReadFileAction) -> ActionFeedback:
-        path = self.path_policy.resolve(action.path, must_exist=True)
-        if not path.is_file():
+        path = self.path_policy.bind_mutation_path(action.path)
+        if not path.exists() or not stat.S_ISREG(path.lstat().st_mode):
             raise ValueError("read target must be a regular file")
         if (
             isinstance(action.offset, bool)
@@ -387,7 +479,7 @@ class AtomicActionExecutor:
             raise ValueError("offset must be a non-negative integer")
         if not 1 <= action.max_bytes <= 16 * 1024 * 1024:
             raise ValueError("max_bytes must be between 1 and 16777216")
-        with _verified_binary_reader(path) as handle:
+        with verified_binary_handle(path) as handle:
             handle.seek(action.offset)
             content = handle.read(action.max_bytes + 1)
         truncated = len(content) > action.max_bytes
@@ -397,7 +489,7 @@ class AtomicActionExecutor:
             ok=True,
             summary=f"Read {len(content)} byte(s).",
             after={
-                "path": str(path),
+                "path": str(path.path),
                 "offset": action.offset,
                 "content_base64": base64.b64encode(content).decode("ascii"),
                 "bytes": len(content),
@@ -408,21 +500,19 @@ class AtomicActionExecutor:
     def _write_file(self, action: WriteFileAction) -> ActionFeedback:
         if not isinstance(action.content, bytes):
             raise TypeError("content must be bytes")
-        path = self.path_policy.resolve(action.path)
-        before = _path_state(path)
-        if path.exists() and not path.is_file():
+        path = self.path_policy.bind_mutation_path(
+            action.path,
+            create_parents=action.create_parents,
+        )
+        before = _bound_path_state(path)
+        if path.exists() and not stat.S_ISREG(path.lstat().st_mode):
             raise ValueError("destination exists and is not a regular file")
         if action.require_absent and path.exists():
             raise FileExistsError(path)
-        _validate_expected_digest(path, action.expected_sha256)
+        _validate_expected_digest_bound(path, action.expected_sha256)
         if action.mode is not None and not 0 <= action.mode <= 0o777:
             raise ValueError("mode must be between 0 and 0o777")
-        if action.create_parents:
-            parent = self.path_policy.resolve(path.parent, allow_root=True)
-            parent.mkdir(parents=True, exist_ok=True)
-        if not path.parent.is_dir():
-            raise FileNotFoundError(path.parent)
-        descriptor, temporary = _temporary_file(path)
+        descriptor, temporary = _temporary_bound_file(path)
         try:
             with os.fdopen(descriptor, "wb") as handle:
                 handle.write(action.content)
@@ -430,82 +520,106 @@ class AtomicActionExecutor:
                 os.fsync(handle.fileno())
             if action.mode is not None:
                 temporary.chmod(action.mode)
-            os.replace(temporary, path)
-            _fsync_directory(path.parent)
+            _install_temporary_file(
+                temporary,
+                path,
+                overwrite=not action.require_absent,
+                expected_sha256=action.expected_sha256,
+            )
+            _fsync_bound_parent(path)
         finally:
-            temporary.unlink(missing_ok=True)
+            _unlink_bound_if_exists(temporary)
         return _feedback(
             action,
             ok=True,
             summary="File written atomically.",
             before=before,
-            after=_path_state(path),
+            after=_bound_path_state(path),
         )
 
     def _copy_file(self, action: CopyFileAction) -> ActionFeedback:
-        source = self.path_policy.resolve(action.source, must_exist=True)
-        destination = self.path_policy.resolve(action.destination)
-        if not source.is_file() or source.is_symlink():
+        source = self.path_policy.bind_mutation_path(action.source)
+        destination = self.path_policy.bind_mutation_path(
+            action.destination,
+            create_parents=action.create_parents,
+        )
+        if not source.exists() or not stat.S_ISREG(source.lstat().st_mode):
             raise ValueError("source must be a regular file")
-        before = _path_state(destination)
-        _prepare_destination(destination, action.overwrite, action.create_parents, self.path_policy)
-        descriptor, temporary = _temporary_file(destination)
+        _validate_expected_digest_bound(source, action.expected_sha256)
+        before = _bound_path_state(destination)
+        _prepare_bound_destination(destination, action.overwrite)
+        descriptor, temporary = _temporary_bound_file(destination)
         try:
-            with os.fdopen(descriptor, "wb") as target_handle, _verified_binary_reader(
-                source
-            ) as source_handle:
+            with (
+                os.fdopen(descriptor, "wb") as target_handle,
+                verified_binary_handle(source) as source_handle,
+            ):
                 shutil.copyfileobj(source_handle, target_handle, length=128 * 1024)
                 target_handle.flush()
                 os.fsync(target_handle.fileno())
-            shutil.copystat(source, temporary, follow_symlinks=False)
-            os.replace(temporary, destination)
-            _fsync_directory(destination.parent)
+                source_mode = stat.S_IMODE(os.fstat(source_handle.fileno()).st_mode)
+            temporary.chmod(source_mode)
+            _install_temporary_file(
+                temporary,
+                destination,
+                overwrite=action.overwrite,
+            )
+            _fsync_bound_parent(destination)
         finally:
-            temporary.unlink(missing_ok=True)
+            _unlink_bound_if_exists(temporary)
         return _feedback(
             action,
             ok=True,
             summary="File copied atomically.",
             before=before,
-            after=_path_state(destination),
+            after=_bound_path_state(destination),
         )
 
     def _move_file(self, action: MoveFileAction) -> ActionFeedback:
-        source = self.path_policy.resolve(action.source, must_exist=True)
-        destination = self.path_policy.resolve(action.destination)
-        if not source.is_file() or source.is_symlink():
+        source = self.path_policy.bind_mutation_path(action.source)
+        destination = self.path_policy.bind_mutation_path(
+            action.destination,
+            create_parents=action.create_parents,
+        )
+        if not source.exists() or not stat.S_ISREG(source.lstat().st_mode):
             raise ValueError("source must be a regular file")
-        before = {"source": _path_state(source), "destination": _path_state(destination)}
-        _prepare_destination(destination, action.overwrite, action.create_parents, self.path_policy)
-        os.replace(source, destination)
-        for parent in {source.parent, destination.parent}:
-            _fsync_directory(parent)
+        _validate_expected_digest_bound(source, action.expected_sha256)
+        before = {
+            "source": _bound_path_state(source),
+            "destination": _bound_path_state(destination),
+        }
+        _prepare_bound_destination(destination, action.overwrite)
+        _move_bound_file(source, destination, overwrite=action.overwrite)
+        _fsync_bound_parent(source)
+        _fsync_bound_parent(destination)
         return _feedback(
             action,
             ok=True,
             summary="File moved atomically.",
             before=before,
-            after={"source": _path_state(source), "destination": _path_state(destination)},
+            after={
+                "source": _bound_path_state(source),
+                "destination": _bound_path_state(destination),
+            },
         )
 
     def _delete_file(self, action: DeleteFileAction) -> ActionFeedback:
-        path = self.path_policy.resolve(action.path)
-        before = _path_state(path)
+        path = self.path_policy.bind_mutation_path(action.path)
+        before = _bound_path_state(path)
         if not path.exists():
             if action.missing_ok:
                 return _feedback(action, ok=True, summary="File was already absent.", before=before)
             raise FileNotFoundError(path)
-        if not path.is_file() or path.is_symlink():
+        if not stat.S_ISREG(path.lstat().st_mode):
             raise ValueError("only regular files can be deleted")
-        _validate_expected_digest(path, action.expected_sha256)
-        path.unlink()
-        _fsync_directory(path.parent)
+        _delete_bound_file(path, action.expected_sha256)
+        _fsync_bound_parent(path)
         return _feedback(
             action,
             ok=True,
             summary="File deleted.",
             before=before,
-            after=_path_state(path),
+            after=_bound_path_state(path),
         )
 
     async def _run_process(self, action: ProcessAction) -> ActionFeedback:
@@ -702,6 +816,168 @@ def _feedback(
     )
 
 
+def _filesystem_mutation_paths(action: AtomicAction) -> tuple[Path, ...]:
+    if isinstance(action, CreateDirectoryAction | WriteFileAction | DeleteFileAction):
+        return (action.path,)
+    if isinstance(action, CopyFileAction | MoveFileAction):
+        return (action.source, action.destination)
+    return ()
+
+
+def _filesystem_read_paths(action: AtomicAction) -> tuple[Path, ...]:
+    if isinstance(action, StatPathAction | ListDirectoryAction | ReadFileAction):
+        return (action.path,)
+    return ()
+
+
+def _prepare_bound_destination(destination: BoundPath, overwrite: bool) -> None:
+    if not destination.exists():
+        return
+    metadata = destination.lstat()
+    if not overwrite:
+        raise FileExistsError(destination.path)
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ValueError("destination exists and is not a regular file")
+
+
+def _temporary_bound_file(destination: BoundPath) -> tuple[int, BoundPath]:
+    guard_name = f".{destination.name}.{uuid.uuid4().hex}.tmp"
+    temporary = destination.sibling(guard_name)
+    descriptor = temporary.open(
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+        0o600,
+    )
+    return descriptor, temporary
+
+
+def _install_temporary_file(
+    temporary: BoundPath,
+    destination: BoundPath,
+    *,
+    overwrite: bool,
+    expected_sha256: str | None = None,
+) -> None:
+    staged: BoundPath | None = None
+    if expected_sha256 is not None:
+        staged = _stage_bound_file(destination, expected_sha256)
+    try:
+        if overwrite:
+            destination.replace_from(temporary)
+        else:
+            destination.link_from(temporary)
+            temporary.unlink()
+    except BaseException:
+        if staged is not None and not destination.exists():
+            destination.replace_from(staged)
+        raise
+    if staged is not None:
+        staged.unlink()
+
+
+def _move_bound_file(
+    source: BoundPath,
+    destination: BoundPath,
+    *,
+    overwrite: bool,
+) -> None:
+    staged = _stage_bound_file(source, None)
+    try:
+        if overwrite:
+            destination.replace_from(staged)
+        else:
+            destination.link_from(staged)
+            staged.unlink()
+    except BaseException:
+        if not source.exists() and staged.exists():
+            source.replace_from(staged)
+        raise
+
+
+def _delete_bound_file(path: BoundPath, expected_sha256: str | None) -> None:
+    staged = _stage_bound_file(path, expected_sha256)
+    staged.unlink()
+
+
+def _stage_bound_file(path: BoundPath, expected_sha256: str | None) -> BoundPath:
+    """Move and verify one exact file identity before replacing or unlinking it."""
+
+    if expected_sha256 is not None and not re.fullmatch(r"[0-9a-fA-F]{64}", expected_sha256):
+        raise ValueError("expected_sha256 must contain 64 hexadecimal characters")
+    with verified_binary_handle(path) as handle:
+        identity = metadata_identity(os.fstat(handle.fileno()))
+    staged_name = f".{path.name}.{uuid.uuid4().hex}.jarvis-stage"
+    staged = path.sibling(staged_name)
+    staged.replace_from(path)
+    try:
+        if metadata_identity(staged.lstat()) != identity:
+            raise RuntimeError("file identity changed before the mutation")
+        if expected_sha256 is not None and _bound_file_sha256(staged) != expected_sha256.lower():
+            raise RuntimeError("file changed since it was inspected")
+    except BaseException:
+        if not path.exists() and staged.exists():
+            path.replace_from(staged)
+        raise
+    return staged
+
+
+def _unlink_bound_if_exists(path: BoundPath) -> None:
+    with contextlib.suppress(FileNotFoundError):
+        path.unlink()
+
+
+def _fsync_bound_parent(path: BoundPath) -> None:
+    if os.name == "nt":
+        return
+    if path.parent_fd is None:
+        _fsync_directory(path.path.parent)
+    else:
+        os.fsync(path.parent_fd)
+
+
+def _bound_path_state(path: BoundPath) -> dict[str, Any]:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return {"exists": False, "path": str(path.path)}
+    kind = (
+        "symlink"
+        if stat.S_ISLNK(metadata.st_mode)
+        else "directory"
+        if stat.S_ISDIR(metadata.st_mode)
+        else "file"
+    )
+    result: dict[str, Any] = {
+        "exists": True,
+        "path": str(path.path),
+        "kind": kind,
+        "size": metadata.st_size,
+        "mtime_ns": metadata.st_mtime_ns,
+        "mode": stat.S_IMODE(metadata.st_mode),
+    }
+    if kind == "file":
+        result["sha256"] = _bound_file_sha256(path)
+    return result
+
+
+def _validate_expected_digest_bound(path: BoundPath, expected: str | None) -> None:
+    if expected is None:
+        return
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", expected):
+        raise ValueError("expected_sha256 must contain 64 hexadecimal characters")
+    if not path.exists() or not stat.S_ISREG(path.lstat().st_mode):
+        raise FileNotFoundError(path.path)
+    if _bound_file_sha256(path) != expected.lower():
+        raise RuntimeError("file changed since it was inspected")
+
+
+def _bound_file_sha256(path: BoundPath) -> str:
+    digest = hashlib.sha256()
+    with verified_binary_handle(path) as handle:
+        while chunk := handle.read(128 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _prepare_destination(
     destination: Path,
     overwrite: bool,
@@ -779,9 +1055,7 @@ def _verified_binary_reader(path: Path):
     with path.open("rb") as handle:
         descriptor_metadata = os.fstat(handle.fileno())
         path_metadata = path.lstat()
-        if stat.S_ISLNK(path_metadata.st_mode) or not stat.S_ISREG(
-            descriptor_metadata.st_mode
-        ):
+        if stat.S_ISLNK(path_metadata.st_mode) or not stat.S_ISREG(descriptor_metadata.st_mode):
             raise ValueError("file became a symlink or non-regular object")
         if (descriptor_metadata.st_dev, descriptor_metadata.st_ino) != (
             path_metadata.st_dev,
@@ -883,9 +1157,7 @@ def _registry_read(winreg, hive, key: str, name: str) -> dict[str, Any]:
         return {"exists": False}
     if re.search(r"(?i)(?:password|passwd|secret|token|credential|private.?key|api.?key)", name):
         encoded = (
-            value
-            if isinstance(value, bytes)
-            else str(value).encode("utf-8", errors="replace")
+            value if isinstance(value, bytes) else str(value).encode("utf-8", errors="replace")
         )
         value = {
             "redacted": True,

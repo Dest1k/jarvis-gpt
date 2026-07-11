@@ -3,6 +3,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import sqlite3
+from collections.abc import Iterator
+from contextlib import asynccontextmanager, contextmanager, suppress
 from pathlib import Path
 from typing import Any
 
@@ -10,19 +13,23 @@ import uvicorn
 
 from .agent import AgentRuntime
 from .approval_executor import ApprovalExecutor
+from .cognitive_memory import ExecutionPlaybookStore, HostProfileManager
 from .config import PROFILES, ensure_runtime_dirs, load_settings
 from .diagnostics import run_diagnostics
 from .dispatcher import DispatcherManager
 from .event_bus import EventBus
+from .executive_runtime import ExecutiveCoordinator
 from .host_bridge import HostBridgeClient, HostBridgeStatus
 from .ingest import FileIngestor
 from .learning import LearningEngine
 from .llm import LLMRouter
 from .model_catalog import ModelCatalog
 from .persona import PersonaManager
+from .runtime_lease import PrimaryRuntimeLease, RuntimeLeaseError
 from .storage import JarvisStorage
 from .supervisor import RuntimeSupervisor
 from .telemetry import TelemetryCollector
+from .tools import ToolRegistry
 
 
 def _print_json(data: Any) -> None:
@@ -33,17 +40,114 @@ def _runtime(profile: str | None = None) -> tuple[Any, JarvisStorage, LLMRouter,
     settings = load_settings(profile)
     ensure_runtime_dirs(settings)
     storage = JarvisStorage(settings.database_path)
-    storage.initialize()
+    try:
+        storage.open_readonly()
+    except (FileNotFoundError, sqlite3.Error) as exc:
+        raise SystemExit("Jarvis storage is not initialized; run `jarvis init` first.") from exc
     llm = LLMRouter(settings)
     agent = AgentRuntime(settings=settings, storage=storage, llm=llm, bus=EventBus())
     return settings, storage, llm, agent
 
 
+@contextmanager
+def _runtime_context(
+    profile: str | None = None,
+) -> Iterator[tuple[Any, JarvisStorage, LLMRouter, AgentRuntime]]:
+    runtime = _runtime(profile)
+    try:
+        yield runtime
+    finally:
+        runtime[1].close()
+
+
+@contextmanager
+def _primary_runtime(
+    profile: str | None = None,
+) -> Iterator[tuple[Any, JarvisStorage, LLMRouter, AgentRuntime]]:
+    """Serialize CLI executive mutations with the long-running API owner."""
+
+    settings = load_settings(profile)
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    lease = PrimaryRuntimeLease(settings.state_dir / "primary-runtime.lock")
+    playbooks: ExecutionPlaybookStore | None = None
+    agent: AgentRuntime | None = None
+    try:
+        try:
+            lease.acquire()
+        except RuntimeLeaseError as exc:
+            raise SystemExit(
+                "Jarvis API currently owns executive state; use its API or stop it "
+                "before running a mutating CLI command."
+            ) from exc
+        storage.initialize()
+        storage.recover_interrupted_approval_executions()
+        profile_manager = HostProfileManager(settings.home / "host_profile.json")
+        try:
+            host_profile = profile_manager.refresh()
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            host_profile = profile_manager.load_verified(max_age_seconds=86_400)
+            if host_profile is None:
+                raise RuntimeError(
+                    "cold-start host fingerprint could not be collected or recovered"
+                ) from exc
+        storage.set_runtime_value("environment.host_profile", host_profile)
+        playbooks = ExecutionPlaybookStore(
+            settings.state_dir / "execution-playbooks.sqlite3"
+        )
+        executive = ExecutiveCoordinator(
+            storage=storage,
+            host_profile=host_profile,
+            playbooks=playbooks,
+            recover_interrupted=True,
+        )
+        llm = LLMRouter(settings)
+        tools = ToolRegistry(
+            settings,
+            storage,
+            llm,
+            playbooks=playbooks,
+            executive=executive,
+            recover_execution=True,
+        )
+        agent = AgentRuntime(
+            settings=settings,
+            storage=storage,
+            llm=llm,
+            bus=EventBus(),
+            tools=tools,
+            playbooks=playbooks,
+            host_profile=host_profile,
+            executive=executive,
+        )
+        yield settings, storage, llm, agent
+    finally:
+        if agent is not None:
+            with suppress(Exception):
+                agent.tools.web_surfer.close()
+        if playbooks is not None:
+            with suppress(Exception):
+                playbooks.close()
+        with suppress(Exception):
+            lease.release()
+        storage.close()
+
+
+@asynccontextmanager
+async def _async_primary_runtime(profile: str | None = None):
+    with _primary_runtime(profile) as runtime:
+        try:
+            await runtime[3].tools.web_surfer.start()
+            runtime[3].tools.refresh_web_surfer_registration()
+            yield runtime
+        finally:
+            await runtime[3].tools.web_surfer.aclose()
+
+
 def cmd_init(args: argparse.Namespace) -> None:
-    settings, storage, _llm, _agent = _runtime(args.profile)
-    storage.add_event(kind="runtime.init", title="Runtime directories initialized")
-    _print_json(settings.public_dict())
-    storage.close()
+    with _primary_runtime(args.profile) as (settings, storage, _llm, _agent):
+        storage.add_event(kind="runtime.init", title="Runtime directories initialized")
+        _print_json(settings.public_dict())
 
 
 def cmd_profiles(_args: argparse.Namespace) -> None:
@@ -75,9 +179,8 @@ def cmd_status(args: argparse.Namespace) -> None:
 
 
 def cmd_backup(args: argparse.Namespace) -> None:
-    _settings, storage, _llm, _agent = _runtime(args.profile)
-    _print_json(storage.backup_database(args.output_dir))
-    storage.close()
+    with _primary_runtime(args.profile) as (_settings, storage, _llm, _agent):
+        _print_json(storage.backup_database(args.output_dir))
 
 
 def cmd_models(args: argparse.Namespace) -> None:
@@ -92,28 +195,44 @@ def cmd_models(args: argparse.Namespace) -> None:
 
 def cmd_diag(args: argparse.Namespace) -> None:
     async def run() -> None:
-        settings, storage, llm, _agent = _runtime(args.profile)
-        result = await run_diagnostics(settings=settings, storage=storage, llm=llm)
-        _print_json(result.model_dump())
-        storage.close()
+        async with _async_primary_runtime(args.profile) as (
+            settings,
+            storage,
+            llm,
+            _agent,
+        ):
+            result = await run_diagnostics(settings=settings, storage=storage, llm=llm)
+            _print_json(result.model_dump())
 
     asyncio.run(run())
 
 
 def cmd_chat(args: argparse.Namespace) -> None:
     async def run() -> None:
-        _settings, storage, _llm, agent = _runtime(args.profile)
-        response = await agent.chat(args.message, mode=args.mode)
-        _print_json(response.model_dump())
-        storage.close()
+        async with _async_primary_runtime(args.profile) as (
+            _settings,
+            _storage,
+            _llm,
+            agent,
+        ):
+            response = await agent.chat(args.message, mode=args.mode)
+            _print_json(response.model_dump())
 
     asyncio.run(run())
 
 
 def cmd_tools(args: argparse.Namespace) -> None:
-    settings, storage, _llm, agent = _runtime(args.profile)
-    _print_json([tool.model_dump() for tool in agent.tools.list()])
-    storage.close()
+    async def run() -> None:
+        _settings, storage, _llm, agent = _runtime(args.profile)
+        try:
+            await agent.tools.web_surfer.start()
+            agent.tools.refresh_web_surfer_registration()
+            _print_json([tool.model_dump() for tool in agent.tools.list()])
+        finally:
+            await agent.tools.web_surfer.aclose()
+            storage.close()
+
+    asyncio.run(run())
 
 
 def cmd_llm_health(args: argparse.Namespace) -> None:
@@ -149,30 +268,27 @@ def cmd_dispatcher_compose(args: argparse.Namespace) -> None:
 
 
 def cmd_dispatcher_up(args: argparse.Namespace) -> None:
-    settings, storage, _llm, _agent = _runtime(args.profile)
-    _print_json(DispatcherManager(settings).run_compose("up"))
-    storage.close()
+    with _primary_runtime(args.profile) as (settings, _storage, _llm, _agent):
+        _print_json(DispatcherManager(settings).run_compose_verified("up"))
 
 
 def cmd_dispatcher_down(args: argparse.Namespace) -> None:
-    settings, storage, _llm, _agent = _runtime(args.profile)
-    _print_json(DispatcherManager(settings).run_compose("down"))
-    storage.close()
+    with _primary_runtime(args.profile) as (settings, _storage, _llm, _agent):
+        _print_json(DispatcherManager(settings).run_compose_verified("down"))
 
 
 def cmd_telemetry(args: argparse.Namespace) -> None:
-    settings, storage, _llm, _agent = _runtime(args.profile)
-    snapshot = TelemetryCollector(settings).snapshot()
-    if args.persist:
-        storage.record_telemetry(snapshot)
-    _print_json(snapshot)
-    storage.close()
+    runtime = _primary_runtime if args.persist else _runtime_context
+    with runtime(args.profile) as (settings, storage, _llm, _agent):
+        snapshot = TelemetryCollector(settings).snapshot()
+        if args.persist:
+            storage.record_telemetry(snapshot)
+        _print_json(snapshot)
 
 
 def cmd_learning_tick(args: argparse.Namespace) -> None:
-    _settings, storage, llm, _agent = _runtime(args.profile)
-    _print_json(asyncio.run(LearningEngine(storage, llm=llm).tick_async(limit=args.limit)))
-    storage.close()
+    with _primary_runtime(args.profile) as (_settings, storage, llm, _agent):
+        _print_json(asyncio.run(LearningEngine(storage, llm=llm).tick_async(limit=args.limit)))
 
 
 def cmd_host_bridge(args: argparse.Namespace) -> None:
@@ -183,26 +299,31 @@ def cmd_host_bridge(args: argparse.Namespace) -> None:
 
 def cmd_host_bridge_action(args: argparse.Namespace) -> None:
     async def run() -> None:
-        settings, storage, _llm, _agent = _runtime(args.profile)
-        payload = _json_argument(args.payload_json, option="--payload-json")
-        if args.payload_file:
-            path = Path(args.payload_file).expanduser().resolve(strict=True)
-            if not path.is_file() or path.stat().st_size > 1024 * 1024:
-                storage.close()
-                raise SystemExit("--payload-file must be a JSON file no larger than 1 MiB")
-            payload = _json_argument(
-                path.read_text(encoding="utf-8"), option="--payload-file"
+        async with _async_primary_runtime(args.profile) as (
+            settings,
+            _storage,
+            _llm,
+            _agent,
+        ):
+            payload = _json_argument(args.payload_json, option="--payload-json")
+            if args.payload_file:
+                path = Path(args.payload_file).expanduser().resolve(strict=True)
+                if not path.is_file() or path.stat().st_size > 1024 * 1024:
+                    raise SystemExit(
+                        "--payload-file must be a JSON file no larger than 1 MiB"
+                    )
+                payload = _json_argument(
+                    path.read_text(encoding="utf-8"), option="--payload-file"
+                )
+            payload.update(_set_arguments(args.sets))
+            result = await HostBridgeClient(settings).action(
+                action=args.action,
+                payload=payload,
+                timeout_sec=args.timeout,
             )
-        payload.update(_set_arguments(args.sets))
-        result = await HostBridgeClient(settings).action(
-            action=args.action,
-            payload=payload,
-            timeout_sec=args.timeout,
-        )
-        _print_json(result)
-        storage.close()
-        if not result.get("ok"):
-            raise SystemExit(1)
+            _print_json(result)
+            if not result.get("ok"):
+                raise SystemExit(1)
 
     asyncio.run(run())
 
@@ -220,18 +341,16 @@ def cmd_persona(args: argparse.Namespace) -> None:
 
 
 def cmd_persona_set(args: argparse.Namespace) -> None:
-    settings, storage, _llm, _agent = _runtime(args.profile)
-    patch = _set_arguments(args.sets)
-    updated = PersonaManager(settings=settings, storage=storage).update(patch)
-    _print_json(updated)
-    storage.close()
+    with _primary_runtime(args.profile) as (settings, storage, _llm, _agent):
+        patch = _set_arguments(args.sets)
+        updated = PersonaManager(settings=settings, storage=storage).update(patch)
+        _print_json(updated)
 
 
 def cmd_ingest(args: argparse.Namespace) -> None:
-    settings, storage, _llm, _agent = _runtime(args.profile)
-    result = FileIngestor(settings=settings, storage=storage).ingest_path(args.path)
-    _print_json(result)
-    storage.close()
+    with _primary_runtime(args.profile) as (settings, storage, _llm, _agent):
+        result = FileIngestor(settings=settings, storage=storage).ingest_path(args.path)
+        _print_json(result)
 
 
 def cmd_files(args: argparse.Namespace) -> None:
@@ -265,87 +384,117 @@ def cmd_approvals(args: argparse.Namespace) -> None:
 
 
 def cmd_approval_request(args: argparse.Namespace) -> None:
-    _settings, storage, _llm, _agent = _runtime(args.profile)
-    payload = _json_argument(args.payload)
-    approval = storage.create_approval(
-        title=args.title,
-        description=args.description,
-        requested_action=args.action,
-        risk=args.risk,
-        payload=payload,
-    )
-    _print_json(approval)
-    storage.close()
+    with _primary_runtime(args.profile) as (_settings, storage, _llm, _agent):
+        payload = _json_argument(args.payload)
+        approval = storage.create_approval(
+            title=args.title,
+            description=args.description,
+            requested_action=args.action,
+            risk=args.risk,
+            payload=payload,
+        )
+        _print_json(approval)
 
 
 def cmd_approval_update(args: argparse.Namespace) -> None:
-    _settings, storage, _llm, _agent = _runtime(args.profile)
-    result = _json_argument(args.result)
-    try:
-        updated = storage.update_approval(args.id, status=args.status, result=result)
-    except ValueError as exc:
-        raise SystemExit(str(exc)) from exc
-    if updated is None:
-        raise SystemExit(f"Approval not found: {args.id}")
-    _print_json(updated)
-    storage.close()
+    with _primary_runtime(args.profile) as (settings, storage, llm, agent):
+        result = _json_argument(args.result)
+        try:
+            updated = storage.update_approval(args.id, status=args.status, result=result)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        if updated is None:
+            raise SystemExit(f"Approval not found: {args.id}")
+        if args.status in {"rejected", "cancelled"}:
+            executor = ApprovalExecutor(
+                storage=storage,
+                llm=llm,
+                dispatcher=DispatcherManager(settings),
+                tools=agent.tools,
+                mission_resumer=agent.resume_mission_after_approval,
+                mission_aborter=agent.abort_mission_after_approval,
+            )
+            asyncio.run(
+                executor.reconcile_pending_approvals(approval_id=args.id)
+            )
+            updated = storage.get_approval(args.id) or updated
+        _print_json(updated)
 
 
 def cmd_approval_execute(args: argparse.Namespace) -> None:
     async def run() -> None:
-        settings, storage, llm, agent = _runtime(args.profile)
-        executor = ApprovalExecutor(
-            storage=storage,
-            llm=llm,
-            dispatcher=DispatcherManager(settings),
-            tools=agent.tools,
-            mission_resumer=agent.resume_mission_after_approval,
-        )
-        result = await executor.execute(args.id)
-        _print_json(
-            {
-                "ok": result.ok,
-                "summary": result.summary,
-                "data": result.data,
-                "approval": result.approval,
-                "status_code": result.status_code,
-            }
-        )
-        storage.close()
-        if result.status_code >= 400:
-            raise SystemExit(1)
+        async with _async_primary_runtime(args.profile) as (
+            settings,
+            storage,
+            llm,
+            agent,
+        ):
+            executor = ApprovalExecutor(
+                storage=storage,
+                llm=llm,
+                dispatcher=DispatcherManager(settings),
+                tools=agent.tools,
+                mission_resumer=agent.resume_mission_after_approval,
+                mission_aborter=agent.abort_mission_after_approval,
+            )
+            result = await executor.execute(args.id)
+            _print_json(
+                {
+                    "ok": result.ok,
+                    "summary": result.summary,
+                    "data": result.data,
+                    "approval": result.approval,
+                    "status_code": result.status_code,
+                }
+            )
+            if result.status_code >= 400:
+                raise SystemExit(1)
 
     asyncio.run(run())
 
 
 def cmd_tool_run(args: argparse.Namespace) -> None:
     async def run() -> None:
-        _settings, storage, _llm, agent = _runtime(args.profile)
-        arguments = _json_argument(args.arguments)
-        arguments.update(_set_arguments(args.sets))
-        response = await agent.tools.run(args.name, arguments, allow_danger=args.allow_danger)
-        _print_json(response.model_dump())
-        storage.close()
+        async with _async_primary_runtime(args.profile) as (
+            _settings,
+            _storage,
+            _llm,
+            agent,
+        ):
+            arguments = _json_argument(args.arguments)
+            arguments.update(_set_arguments(args.sets))
+            response = await agent.tools.run(
+                args.name, arguments, allow_danger=args.allow_danger
+            )
+            _print_json(response.model_dump())
 
     asyncio.run(run())
 
 
 def cmd_mission_next(args: argparse.Namespace) -> None:
     async def run() -> None:
-        _settings, storage, _llm, agent = _runtime(args.profile)
-        response = await agent.execute_next_mission_step(args.mission_id)
-        _print_json(response.model_dump())
-        storage.close()
+        async with _async_primary_runtime(args.profile) as (
+            _settings,
+            _storage,
+            _llm,
+            agent,
+        ):
+            response = await agent.execute_next_mission_step(args.mission_id)
+            _print_json(response.model_dump())
 
     asyncio.run(run())
 
 
 def cmd_mission_run(args: argparse.Namespace) -> None:
     async def run() -> None:
-        _settings, storage, _llm, agent = _runtime(args.profile)
-        response = await agent.run_mission(args.mission_id, max_steps=args.max_steps)
-        _print_json(response.model_dump())
-        storage.close()
+        async with _async_primary_runtime(args.profile) as (
+            _settings,
+            _storage,
+            _llm,
+            agent,
+        ):
+            response = await agent.run_mission(args.mission_id, max_steps=args.max_steps)
+            _print_json(response.model_dump())
 
     asyncio.run(run())
 

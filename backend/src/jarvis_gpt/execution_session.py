@@ -261,6 +261,10 @@ class ExecutionSession:
                     raise ValueError("process start reservation does not match this action")
                 if self.status not in {SessionStatus.RUNNING, SessionStatus.WAITING}:
                     raise ValueError(f"session cannot register a process while {self.status.value}")
+                if self._cancel_requested:
+                    raise ValueError(
+                        "session cancellation was requested before process registration"
+                    )
             existing = self._processes.get(pid)
             if existing is not None and existing.status is ProcessStatus.RUNNING:
                 raise ValueError(f"process {pid} is already registered")
@@ -282,6 +286,16 @@ class ExecutionSession:
                 self._process_start_reservation = None
             self.updated_at = _utc_now()
         return record
+
+    def authorize_process_resume(self, pid: int) -> None:
+        """Atomically reject a registered-but-suspended process after cancellation."""
+
+        with self._lock:
+            record = self._processes.get(pid)
+            if record is None or record.status is not ProcessStatus.RUNNING:
+                raise ValueError(f"process {pid} is not registered as running")
+            if self._cancel_requested or self.status is not SessionStatus.RUNNING:
+                raise ValueError("session cancellation was requested before process resume")
 
     def reserve_process_start(self, action_id: str) -> None:
         action_id = _bounded_text(action_id, 128, "action_id")

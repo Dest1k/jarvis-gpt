@@ -3,15 +3,18 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import uuid
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from .execution_actions import (
     AtomicAction,
@@ -26,7 +29,19 @@ from .execution_actions import (
     RegistrySetAction,
     WriteFileAction,
 )
+from .execution_filesystem import (
+    BoundPath,
+    metadata_identity,
+    pinned_directory,
+    verified_binary_handle,
+)
 from .execution_models import ActionFeedback
+from .state_verification import StateVerifier, VerificationExpectation
+
+MutationVerifier = Callable[[tuple[ActionFeedback, ...]], Awaitable[bool]]
+CommitRecordFactory = Callable[[str, tuple[ActionFeedback, ...]], Mapping[str, Any]]
+CommitBarrier = Callable[[Mapping[str, Any]], None]
+_AuthoritativeResultT = TypeVar("_AuthoritativeResultT")
 
 
 class CheckpointStatus(StrEnum):
@@ -65,6 +80,7 @@ class EnvironmentCheckpoint:
     registry: tuple[RegistryCheckpoint, ...]
     status: CheckpointStatus = CheckpointStatus.ACTIVE
     rollback_errors: list[str] = field(default_factory=list)
+    commit_record: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +124,9 @@ class CheckpointManager:
         paths: tuple[Path, ...],
         registry_actions: tuple[RegistrySetAction | RegistryDeleteValueAction, ...] = (),
     ) -> EnvironmentCheckpoint:
+        if paths and self.path_policy.active_mutation_guard is None:
+            with self.path_policy.mutation_scope(paths):
+                return self.create(paths, registry_actions)
         checkpoint_id = f"checkpoint_{uuid.uuid4().hex}"
         directory = self.checkpoint_root / checkpoint_id
         directory.mkdir(mode=0o700)
@@ -121,8 +140,9 @@ class CheckpointManager:
                 for target in normalized
             ):
                 raise ValueError("transaction targets overlap the checkpoint store")
-            entries, total_bytes = _measure_paths(
+            entries, total_bytes = _measure_bound_paths(
                 normalized,
+                self.path_policy,
                 max_entries=self.max_entries,
                 max_bytes=self.max_bytes,
             )
@@ -130,7 +150,9 @@ class CheckpointManager:
             if shutil.disk_usage(self.checkpoint_root).free < total_bytes + reserve:
                 raise OSError("insufficient free space for checkpoint and rollback reserve")
             for index, target in enumerate(normalized):
-                path_checkpoints.append(_backup_path(target, directory / str(index)))
+                path_checkpoints.append(
+                    _backup_path(target, directory / str(index), self.path_policy)
+                )
             registry = tuple(_backup_registry(action) for action in registry_actions)
             checkpoint = EnvironmentCheckpoint(
                 checkpoint_id=checkpoint_id,
@@ -145,8 +167,20 @@ class CheckpointManager:
             shutil.rmtree(directory, ignore_errors=True)
             raise
 
-    def commit(self, checkpoint: EnvironmentCheckpoint) -> None:
+    def commit(
+        self,
+        checkpoint: EnvironmentCheckpoint,
+        commit_record: Mapping[str, Any] | None = None,
+        commit_barrier: CommitBarrier | None = None,
+    ) -> None:
         _require_active(checkpoint)
+        if (
+            commit_record is not None
+            and commit_record.get("checkpoint_id") != checkpoint.checkpoint_id
+        ):
+            raise ValueError("commit record does not match its checkpoint")
+        previous_record = checkpoint.commit_record
+        checkpoint.commit_record = dict(commit_record) if commit_record is not None else None
         checkpoint.status = CheckpointStatus.COMMITTED
         try:
             _write_manifest(checkpoint)
@@ -155,11 +189,64 @@ class CheckpointManager:
             # state rollback-eligible so the transactional executor can restore
             # the checkpoint before surfacing the error.
             checkpoint.status = CheckpointStatus.ACTIVE
+            checkpoint.commit_record = previous_record
             raise
+        if commit_barrier is not None and checkpoint.commit_record is not None:
+            # The committed checkpoint manifest is the recovery WAL for the
+            # narrow window before the replay ledger replacement is durable.
+            commit_barrier(checkpoint.commit_record)
         with contextlib.suppress(OSError):
             shutil.rmtree(checkpoint.directory)
 
+    def committed_records(self) -> tuple[dict[str, Any], ...]:
+        """Read committed WAL records before checkpoint recovery removes them."""
+
+        records: list[dict[str, Any]] = []
+        for directory in sorted(self.checkpoint_root.glob("checkpoint_*")):
+            if not directory.is_dir() or directory.is_symlink():
+                continue
+            manifest = directory / "manifest.json"
+            if not manifest.is_file() or manifest.is_symlink():
+                continue
+            checkpoint = _read_manifest(manifest)
+            if (
+                checkpoint.status is CheckpointStatus.COMMITTED
+                and checkpoint.commit_record is not None
+            ):
+                record = dict(checkpoint.commit_record)
+                if record.get("checkpoint_id") != checkpoint.checkpoint_id:
+                    raise ValueError(
+                        "checkpoint commit record does not match its checkpoint"
+                    )
+                records.append(record)
+        return tuple(records)
+
+    def retire_committed(self, checkpoint_id: str) -> None:
+        """Remove one committed WAL directory after its replay ledger is durable."""
+
+        if re.fullmatch(r"checkpoint_[0-9a-f]{32}", checkpoint_id) is None:
+            raise ValueError("invalid committed checkpoint id")
+        directory = self.checkpoint_root / checkpoint_id
+        if not directory.exists():
+            return
+        if directory.is_symlink() or not directory.is_dir():
+            raise RuntimeError("committed checkpoint directory is not trusted")
+        manifest = directory / "manifest.json"
+        checkpoint = _read_manifest(manifest)
+        if (
+            checkpoint.checkpoint_id != checkpoint_id
+            or checkpoint.status is not CheckpointStatus.COMMITTED
+        ):
+            raise RuntimeError("only an exact committed checkpoint can be retired")
+        shutil.rmtree(directory)
+        _fsync_directory(self.checkpoint_root)
+
     def rollback(self, checkpoint: EnvironmentCheckpoint) -> None:
+        checkpoint_targets = tuple(item.target for item in checkpoint.paths)
+        if checkpoint_targets and self.path_policy.active_mutation_guard is None:
+            with self.path_policy.mutation_scope(checkpoint_targets):
+                self.rollback(checkpoint)
+                return
         if checkpoint.status not in {
             CheckpointStatus.ACTIVE,
             CheckpointStatus.ROLLING_BACK,
@@ -172,6 +259,7 @@ class CheckpointManager:
         for item in reversed(checkpoint.registry):
             try:
                 _restore_registry(item)
+                _verify_restored_registry(item)
             except (OSError, ValueError, TypeError) as exc:
                 errors.append(f"registry {item.key}\\{item.name}: {type(exc).__name__}: {exc}")
         try:
@@ -180,8 +268,8 @@ class CheckpointManager:
             errors.append(f"registry key cleanup: {type(exc).__name__}: {exc}")
         for item in reversed(checkpoint.paths):
             try:
-                self.path_policy.resolve(item.target)
-                _restore_path(item)
+                _restore_path(item, self.path_policy)
+                _verify_restored_path(item, self.path_policy)
             except (OSError, TypeError, ValueError, RuntimeError) as exc:
                 errors.append(f"path {item.target}: {type(exc).__name__}: {exc}")
         checkpoint.rollback_errors.extend(errors)
@@ -238,17 +326,70 @@ class TransactionalExecutor:
         self.checkpoints = checkpoints
         if actions.path_policy.roots != checkpoints.path_policy.roots:
             raise ValueError("action executor and checkpoint manager must use the same path policy")
+        self.state_verifier = StateVerifier(
+            path_policy=actions.path_policy,
+            sessions=getattr(actions, "sessions", None),
+            allow_private_network=bool(getattr(actions, "allow_private_network", False)),
+        )
 
     async def execute(
         self,
         actions: tuple[AtomicAction, ...],
         *,
         checkpoint_paths: tuple[Path, ...] = (),
+        verifier: MutationVerifier | None = None,
+        commit_record_factory: CommitRecordFactory | None = None,
+        commit_barrier: CommitBarrier | None = None,
     ) -> TransactionResult:
         if not actions:
             raise ValueError("a transaction must contain at least one action")
         if any(not _is_reversible_mutation(action) for action in actions):
             raise ValueError("transactions accept reversible filesystem/registry mutations only")
+        filesystem_paths = tuple(
+            dict.fromkeys((*checkpoint_paths, *_filesystem_action_paths(actions)))
+        )
+        if filesystem_paths:
+            with self.actions.path_policy.mutation_scope(filesystem_paths):
+                return await self._execute_guarded(
+                    actions,
+                    checkpoint_paths=checkpoint_paths,
+                    verifier=verifier,
+                    commit_record_factory=commit_record_factory,
+                    commit_barrier=commit_barrier,
+                )
+        return await self._execute_guarded(
+            actions,
+            checkpoint_paths=checkpoint_paths,
+            verifier=verifier,
+            commit_record_factory=commit_record_factory,
+            commit_barrier=commit_barrier,
+        )
+
+    async def _execute_guarded(
+        self,
+        actions: tuple[AtomicAction, ...],
+        *,
+        checkpoint_paths: tuple[Path, ...],
+        verifier: MutationVerifier | None,
+        commit_record_factory: CommitRecordFactory | None,
+        commit_barrier: CommitBarrier | None,
+    ) -> TransactionResult:
+        if verifier is None:
+
+            async def verify_by_readback(results: tuple[ActionFeedback, ...]) -> bool:
+                if len(results) != len(actions):
+                    return False
+                for action, result in zip(actions, results, strict=True):
+                    verification = await self.state_verifier.verify(
+                        action,
+                        feedback=result,
+                        expectation=VerificationExpectation(),
+                    )
+                    if not verification.ok:
+                        return False
+                return True
+
+            verifier = verify_by_readback
         affected_paths = _affected_paths(actions)
         registry_actions = tuple(
             action
@@ -262,12 +403,10 @@ class TransactionalExecutor:
                 registry_actions,
             )
         )
-        try:
-            checkpoint = await asyncio.shield(create_task)
-        except asyncio.CancelledError:
-            checkpoint = await create_task
-            await asyncio.shield(asyncio.to_thread(self.checkpoints.rollback, checkpoint))
-            raise
+        checkpoint, create_cancelled = await _await_authoritative_task(create_task)
+        if create_cancelled:
+            await _finish_thread_call_before_cancellation(self.checkpoints.rollback, checkpoint)
+            raise asyncio.CancelledError
         feedback: list[ActionFeedback] = []
         failed_action_id: str | None = None
         try:
@@ -281,7 +420,24 @@ class TransactionalExecutor:
                     )
                     break
             else:
-                await _finish_commit_before_cancellation(self.checkpoints, checkpoint)
+                verified = await verifier(tuple(feedback))
+                if verified:
+                    commit_record = (
+                        commit_record_factory(checkpoint.checkpoint_id, tuple(feedback))
+                        if commit_record_factory is not None
+                        else None
+                    )
+                    await _finish_commit_before_cancellation(
+                        self.checkpoints,
+                        checkpoint,
+                        commit_record,
+                        commit_barrier,
+                    )
+                else:
+                    failed_action_id = "state_verification"
+                    await _finish_thread_call_before_cancellation(
+                        self.checkpoints.rollback, checkpoint
+                    )
         except asyncio.CancelledError:
             await _rollback_if_needed(self.checkpoints, checkpoint)
             raise
@@ -310,6 +466,16 @@ def _affected_paths(actions: tuple[AtomicAction, ...]) -> tuple[Path, ...]:
     return tuple(result)
 
 
+def _filesystem_action_paths(actions: tuple[AtomicAction, ...]) -> tuple[Path, ...]:
+    result: list[Path] = []
+    for action in actions:
+        if isinstance(action, CreateDirectoryAction | WriteFileAction | DeleteFileAction):
+            result.append(action.path)
+        elif isinstance(action, CopyFileAction | MoveFileAction):
+            result.extend((action.source, action.destination))
+    return tuple(result)
+
+
 def _is_reversible_mutation(action: AtomicAction) -> bool:
     return isinstance(
         action,
@@ -328,28 +494,71 @@ async def _finish_action_before_cancellation(
     action: AtomicAction,
 ) -> ActionFeedback:
     task = asyncio.create_task(executor.execute(action))
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
-        await task
-        raise
+    return await _finish_task_before_cancellation(task)
 
 
 async def _finish_thread_call_before_cancellation(function, *args: Any) -> Any:
     task = asyncio.create_task(asyncio.to_thread(function, *args))
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
-        await task
-        raise
+    return await _finish_task_before_cancellation(task)
+
+
+async def _finish_task_before_cancellation(
+    task: asyncio.Task[_AuthoritativeResultT],
+) -> _AuthoritativeResultT:
+    """Wait for an authoritative side effect before re-delivering cancellation.
+
+    ``Task.cancel()`` may be called repeatedly while a mutation or rollback is
+    running.  Each request must be consumed from the current task so a later
+    await cannot propagate cancellation into the shielded operation.  Once the
+    operation has a known outcome, its exception remains authoritative; a
+    successful outcome re-delivers one cancellation to the transaction layer.
+    """
+    result, cancellation_requested = await _await_authoritative_task(task)
+    if cancellation_requested:
+        raise asyncio.CancelledError
+    return result
+
+
+async def _await_authoritative_task(
+    task: asyncio.Task[_AuthoritativeResultT],
+) -> tuple[_AuthoritativeResultT, bool]:
+    """Return the task result plus whether its caller requested cancellation."""
+
+    current = asyncio.current_task()
+    baseline_cancellations = current.cancelling() if current is not None else 0
+    cancellation_requested = False
+    while True:
+        try:
+            await asyncio.shield(task)
+            break
+        except asyncio.CancelledError:
+            pending_cancellations = (
+                max(0, current.cancelling() - baseline_cancellations) if current is not None else 0
+            )
+            if pending_cancellations == 0:
+                # The authoritative operation cancelled itself rather than the
+                # transaction being cancelled by its caller.
+                return task.result()
+            cancellation_requested = True
+            for _ in range(pending_cancellations):
+                current.uncancel()
+            if task.done():
+                break
+
+    result = task.result()
+    return result, cancellation_requested
 
 
 async def _finish_commit_before_cancellation(
     manager: CheckpointManager,
     checkpoint: EnvironmentCheckpoint,
+    commit_record: Mapping[str, Any] | None,
+    commit_barrier: CommitBarrier | None,
 ) -> None:
     """Make the durable commit outcome authoritative over concurrent cancellation."""
-    task = asyncio.create_task(asyncio.to_thread(manager.commit, checkpoint))
+    task = asyncio.create_task(
+        asyncio.to_thread(manager.commit, checkpoint, commit_record, commit_barrier)
+    )
     cancellation_requests = 0
     try:
         while True:
@@ -416,63 +625,310 @@ def _measure_paths(
     return entries, total_bytes
 
 
-def _backup_path(target: Path, backup: Path) -> PathCheckpoint:
-    if not target.exists():
+def _measure_bound_paths(
+    paths: tuple[Path, ...],
+    path_policy: PathPolicy,
+    *,
+    max_entries: int,
+    max_bytes: int,
+) -> tuple[int, int]:
+    entries = 0
+    total_bytes = 0
+
+    def visit(current: BoundPath) -> None:
+        nonlocal entries, total_bytes
+        if not current.exists():
+            return
+        metadata = current.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ValueError(f"checkpoint target contains a symlink: {current.path}")
+        entries += 1
+        if entries > max_entries:
+            raise ValueError("checkpoint exceeds max_entries")
+        if stat.S_ISREG(metadata.st_mode):
+            total_bytes += metadata.st_size
+            if total_bytes > max_bytes:
+                raise ValueError("checkpoint exceeds max_bytes")
+            return
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError(f"unsupported checkpoint target: {current.path}")
+        with pinned_directory(current) as descriptor:
+            scan_target: int | Path = current.path if descriptor is None else descriptor
+            with os.scandir(scan_target) as children:
+                names = tuple(entry.name for entry in children)
+            for name in names:
+                visit(BoundPath(current.path / name, descriptor, name))
+
+    for target in paths:
+        visit(path_policy.bind_mutation_path(target))
+    return entries, total_bytes
+
+
+def _backup_path(target: Path, backup: Path, path_policy: PathPolicy) -> PathCheckpoint:
+    bound = path_policy.bind_mutation_path(target)
+    if not bound.exists():
         return PathCheckpoint(target, False, None, None, None)
-    metadata = target.stat()
+    metadata = bound.lstat()
+    if stat.S_ISLNK(metadata.st_mode):
+        raise ValueError(f"checkpoint target contains a symlink: {target}")
     mode = stat.S_IMODE(metadata.st_mode)
-    if target.is_file():
-        _durable_copy_file(target, backup)
+    if stat.S_ISREG(metadata.st_mode):
+        _durable_copy_bound_file(bound, backup)
         return PathCheckpoint(target, True, "file", backup, mode)
-    if target.is_dir():
-        shutil.copytree(target, backup, symlinks=True, copy_function=_durable_copy_file)
+    if stat.S_ISDIR(metadata.st_mode):
+        _copy_bound_tree(bound, backup)
         return PathCheckpoint(target, True, "directory", backup, mode)
     raise ValueError(f"unsupported checkpoint target: {target}")
 
 
-def _restore_path(checkpoint: PathCheckpoint) -> None:
-    target = checkpoint.target
-    if target.is_symlink():
+def _restore_path(checkpoint: PathCheckpoint, path_policy: PathPolicy) -> None:
+    path_policy.release_mutation_descendants(checkpoint.target)
+    target = path_policy.bind_mutation_path(checkpoint.target)
+    if target.exists() and stat.S_ISLNK(target.lstat().st_mode):
         raise RuntimeError("refusing to replace a symlink created after checkpoint")
     if target.exists():
-        if target.is_dir():
-            shutil.rmtree(target)
-        elif target.is_file():
-            target.unlink()
+        metadata = target.lstat()
+        if stat.S_ISDIR(metadata.st_mode):
+            _remove_bound_tree(target)
+        elif stat.S_ISREG(metadata.st_mode):
+            _remove_bound_file(target)
         else:
             raise RuntimeError("refusing to remove unsupported filesystem object")
     if not checkpoint.existed:
-        _fsync_directory(target.parent)
+        _fsync_bound_parent(target)
         return
     if checkpoint.backup is None or checkpoint.kind is None:
         raise RuntimeError("checkpoint backup is incomplete")
-    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary_name = f".{target.name}.{uuid.uuid4().hex}.rollback"
+    temporary = target.sibling(temporary_name)
     if checkpoint.kind == "file":
-        temporary = target.parent / f".{target.name}.{uuid.uuid4().hex}.rollback"
         try:
-            _durable_copy_file(checkpoint.backup, temporary)
-            os.replace(temporary, target)
+            _durable_copy_file_to_bound(checkpoint.backup, temporary)
+            target.replace_from(temporary)
         finally:
-            temporary.unlink(missing_ok=True)
+            _unlink_bound_if_exists(temporary)
     elif checkpoint.kind == "directory":
-        temporary = target.parent / f".{target.name}.{uuid.uuid4().hex}.rollback"
         try:
-            shutil.copytree(
-                checkpoint.backup,
-                temporary,
-                symlinks=True,
-                copy_function=_durable_copy_file,
-            )
-            _fsync_tree(temporary)
-            os.replace(temporary, target)
+            _restore_tree_to_bound(checkpoint.backup, temporary)
+            target.replace_from(temporary)
         finally:
             if temporary.exists():
-                shutil.rmtree(temporary)
+                _remove_bound_tree(temporary)
     else:
         raise RuntimeError(f"unsupported checkpoint kind: {checkpoint.kind}")
     if checkpoint.mode is not None:
         target.chmod(checkpoint.mode)
-    _fsync_directory(target.parent)
+    _fsync_bound_parent(target)
+
+
+def _verify_restored_path(checkpoint: PathCheckpoint, path_policy: PathPolicy) -> None:
+    target = path_policy.bind_mutation_path(checkpoint.target)
+    if not checkpoint.existed:
+        if target.exists():
+            raise RuntimeError("rollback target should be absent")
+        return
+    if checkpoint.backup is None or checkpoint.kind is None:
+        raise RuntimeError("checkpoint backup is incomplete")
+    if _bound_content_manifest(target) != _path_content_manifest(checkpoint.backup):
+        raise RuntimeError("rollback readback does not match the durable checkpoint")
+    if checkpoint.mode is not None and stat.S_IMODE(target.lstat().st_mode) != checkpoint.mode:
+        raise RuntimeError("rollback target mode does not match the checkpoint")
+
+
+def _durable_copy_bound_file(source: BoundPath, destination: Path) -> str:
+    with verified_binary_handle(source) as source_handle, destination.open("xb") as target_handle:
+        shutil.copyfileobj(source_handle, target_handle, length=128 * 1024)
+        target_handle.flush()
+        os.fsync(target_handle.fileno())
+        mode = stat.S_IMODE(os.fstat(source_handle.fileno()).st_mode)
+    destination.chmod(mode)
+    return str(destination)
+
+
+def _copy_bound_tree(source: BoundPath, destination: Path) -> None:
+    metadata = source.lstat()
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise NotADirectoryError(source.path)
+    destination.mkdir(mode=stat.S_IMODE(metadata.st_mode))
+    with pinned_directory(source) as descriptor:
+        scan_target: int | Path = source.path if descriptor is None else descriptor
+        with os.scandir(scan_target) as entries:
+            for entry in entries:
+                child = BoundPath(
+                    source.path / entry.name,
+                    descriptor,
+                    entry.name,
+                )
+                child_metadata = child.lstat()
+                if stat.S_ISLNK(child_metadata.st_mode):
+                    raise ValueError(f"checkpoint target contains a symlink: {child.path}")
+                backup_child = destination / entry.name
+                if stat.S_ISREG(child_metadata.st_mode):
+                    _durable_copy_bound_file(child, backup_child)
+                elif stat.S_ISDIR(child_metadata.st_mode):
+                    _copy_bound_tree(child, backup_child)
+                else:
+                    raise ValueError(f"unsupported checkpoint target object: {child.path}")
+    destination.chmod(stat.S_IMODE(metadata.st_mode))
+
+
+def _durable_copy_file_to_bound(source: Path, destination: BoundPath) -> None:
+    descriptor = destination.open(os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with source.open("rb") as source_handle, os.fdopen(descriptor, "wb") as target_handle:
+            descriptor = -1
+            source_metadata = os.fstat(source_handle.fileno())
+            path_metadata = source.lstat()
+            if stat.S_ISLNK(path_metadata.st_mode) or not stat.S_ISREG(source_metadata.st_mode):
+                raise RuntimeError("checkpoint backup file is unsafe")
+            if metadata_identity(source_metadata) != metadata_identity(path_metadata):
+                raise RuntimeError("checkpoint backup identity changed while opening")
+            shutil.copyfileobj(source_handle, target_handle, length=128 * 1024)
+            target_handle.flush()
+            os.fsync(target_handle.fileno())
+        destination.chmod(stat.S_IMODE(source_metadata.st_mode))
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _restore_tree_to_bound(source: Path, destination: BoundPath) -> None:
+    source_metadata = source.lstat()
+    if stat.S_ISLNK(source_metadata.st_mode) or not stat.S_ISDIR(source_metadata.st_mode):
+        raise RuntimeError("checkpoint directory backup is unsafe")
+    destination.mkdir(mode=stat.S_IMODE(source_metadata.st_mode))
+    with pinned_directory(destination) as destination_fd, os.scandir(source) as entries:
+        for entry in entries:
+            source_child = source / entry.name
+            child_metadata = source_child.lstat()
+            if stat.S_ISLNK(child_metadata.st_mode):
+                raise RuntimeError("checkpoint directory backup contains a symlink")
+            destination_child = BoundPath(
+                destination.path / entry.name,
+                destination_fd,
+                entry.name,
+            )
+            if stat.S_ISREG(child_metadata.st_mode):
+                _durable_copy_file_to_bound(source_child, destination_child)
+            elif stat.S_ISDIR(child_metadata.st_mode):
+                _restore_tree_to_bound(source_child, destination_child)
+            else:
+                raise RuntimeError("checkpoint directory backup contains an unsafe object")
+    destination.chmod(stat.S_IMODE(source_metadata.st_mode))
+
+
+def _remove_bound_file(target: BoundPath) -> None:
+    with verified_binary_handle(target) as handle:
+        identity = metadata_identity(os.fstat(handle.fileno()))
+    staged_name = f".{target.name}.{uuid.uuid4().hex}.rollback-remove"
+    staged = target.sibling(staged_name)
+    staged.replace_from(target)
+    try:
+        if metadata_identity(staged.lstat()) != identity:
+            raise RuntimeError("rollback file identity changed before removal")
+    except BaseException:
+        if not target.exists() and staged.exists():
+            target.replace_from(staged)
+        raise
+    staged.unlink()
+
+
+def _remove_bound_tree(target: BoundPath) -> None:
+    metadata = target.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise RuntimeError("refusing to recursively remove an unsafe object")
+    with pinned_directory(target) as descriptor:
+        scan_target: int | Path = target.path if descriptor is None else descriptor
+        with os.scandir(scan_target) as entries:
+            children = tuple(entry.name for entry in entries)
+        for name in children:
+            child = BoundPath(target.path / name, descriptor, name)
+            child_metadata = child.lstat()
+            if stat.S_ISLNK(child_metadata.st_mode):
+                child.unlink()
+            elif stat.S_ISDIR(child_metadata.st_mode):
+                _remove_bound_tree(child)
+            elif stat.S_ISREG(child_metadata.st_mode):
+                _remove_bound_file(child)
+            else:
+                raise RuntimeError("refusing to remove unsupported filesystem object")
+    target.rmdir()
+
+
+def _bound_content_manifest(
+    root: BoundPath,
+) -> tuple[tuple[str, str, int, str | None], ...]:
+    entries: list[tuple[str, str, int, str | None]] = []
+
+    def visit(current: BoundPath, relative: str) -> None:
+        metadata = current.lstat()
+        mode = stat.S_IMODE(metadata.st_mode)
+        if stat.S_ISLNK(metadata.st_mode):
+            raise RuntimeError("rollback readback contains a symlink")
+        if stat.S_ISREG(metadata.st_mode):
+            digest = hashlib.sha256()
+            with verified_binary_handle(current) as handle:
+                while chunk := handle.read(128 * 1024):
+                    digest.update(chunk)
+            entries.append((relative, "file", mode, digest.hexdigest()))
+            return
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise RuntimeError("rollback readback contains an unsupported object")
+        entries.append((relative, "directory", mode, None))
+        with pinned_directory(current) as descriptor:
+            scan_target: int | Path = current.path if descriptor is None else descriptor
+            with os.scandir(scan_target) as children:
+                names = sorted(entry.name for entry in children)
+            for name in names:
+                child_relative = name if relative == "." else f"{relative}/{name}"
+                visit(BoundPath(current.path / name, descriptor, name), child_relative)
+
+    visit(root, ".")
+    return tuple(sorted(entries))
+
+
+def _unlink_bound_if_exists(path: BoundPath) -> None:
+    with contextlib.suppress(FileNotFoundError):
+        path.unlink()
+
+
+def _fsync_bound_parent(path: BoundPath) -> None:
+    if os.name == "nt":
+        return
+    if path.parent_fd is None:
+        _fsync_directory(path.path.parent)
+    else:
+        os.fsync(path.parent_fd)
+
+
+def _path_content_manifest(path: Path) -> tuple[tuple[str, str, int, str | None], ...]:
+    if path.is_symlink() or not path.exists():
+        raise RuntimeError("rollback readback target is missing or a symlink")
+    root = path
+    pending = [path]
+    entries: list[tuple[str, str, int, str | None]] = []
+    while pending:
+        current = pending.pop()
+        if current.is_symlink():
+            raise RuntimeError("rollback readback contains a symlink")
+        relative = "." if current == root else current.relative_to(root).as_posix()
+        mode = stat.S_IMODE(current.stat().st_mode)
+        if current.is_file():
+            entries.append((relative, "file", mode, _file_digest(current)))
+        elif current.is_dir():
+            entries.append((relative, "directory", mode, None))
+            pending.extend(sorted(current.iterdir(), reverse=True))
+        else:
+            raise RuntimeError("rollback readback contains an unsupported object")
+    return tuple(sorted(entries))
+
+
+def _file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(128 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _backup_registry(
@@ -495,9 +951,7 @@ def _backup_registry(
             value, value_kind = winreg.QueryValueEx(handle, action.name)
     except FileNotFoundError:
         return RegistryCheckpoint(action.hive, action.key, action.name, True, False)
-    return RegistryCheckpoint(
-        action.hive, action.key, action.name, True, True, value, value_kind
-    )
+    return RegistryCheckpoint(action.hive, action.key, action.name, True, True, value, value_kind)
 
 
 def _restore_registry(checkpoint: RegistryCheckpoint) -> None:
@@ -519,10 +973,33 @@ def _restore_registry(checkpoint: RegistryCheckpoint) -> None:
                 checkpoint.value,
             )
         return
-    with contextlib.suppress(FileNotFoundError), winreg.OpenKey(
-        hive, checkpoint.key, 0, winreg.KEY_SET_VALUE
-    ) as handle:
+    with (
+        contextlib.suppress(FileNotFoundError),
+        winreg.OpenKey(hive, checkpoint.key, 0, winreg.KEY_SET_VALUE) as handle,
+    ):
         winreg.DeleteValue(handle, checkpoint.name)
+
+
+def _verify_restored_registry(checkpoint: RegistryCheckpoint) -> None:
+    if os.name != "nt":
+        return
+    import winreg
+
+    hive = {
+        "HKEY_CURRENT_USER": winreg.HKEY_CURRENT_USER,
+        "HKEY_LOCAL_MACHINE": winreg.HKEY_LOCAL_MACHINE,
+    }[checkpoint.hive.value]
+    try:
+        with winreg.OpenKey(hive, checkpoint.key, 0, winreg.KEY_QUERY_VALUE) as handle:
+            value, value_kind = winreg.QueryValueEx(handle, checkpoint.name)
+    except FileNotFoundError:
+        if checkpoint.existed:
+            raise RuntimeError("rollback registry value is missing") from None
+        return
+    if not checkpoint.existed:
+        raise RuntimeError("rollback registry value should be absent")
+    if value != checkpoint.value or value_kind != checkpoint.value_kind:
+        raise RuntimeError("rollback registry readback does not match the checkpoint")
 
 
 def _cleanup_created_registry_keys(checkpoints: tuple[RegistryCheckpoint, ...]) -> None:
@@ -566,6 +1043,7 @@ def _write_manifest(checkpoint: EnvironmentCheckpoint) -> None:
         "directory": str(checkpoint.directory.resolve(strict=True)),
         "status": checkpoint.status.value,
         "rollback_errors": checkpoint.rollback_errors,
+        "commit_record": checkpoint.commit_record,
         "paths": [
             {
                 "target": str(item.target),
@@ -667,6 +1145,9 @@ def _read_manifest(path: Path) -> EnvironmentCheckpoint:
             )
             for item in payload["registry"]
         )
+        commit_record = payload.get("commit_record")
+        if commit_record is not None and not isinstance(commit_record, dict):
+            raise ValueError("checkpoint commit record is invalid")
         return EnvironmentCheckpoint(
             checkpoint_id=payload["checkpoint_id"],
             directory=directory,
@@ -674,6 +1155,7 @@ def _read_manifest(path: Path) -> EnvironmentCheckpoint:
             registry=registry,
             status=CheckpointStatus(payload["status"]),
             rollback_errors=list(payload.get("rollback_errors") or []),
+            commit_record=dict(commit_record) if commit_record is not None else None,
         )
     except (KeyError, TypeError, json.JSONDecodeError) as exc:
         raise ValueError(f"invalid checkpoint manifest: {path}") from exc
@@ -723,9 +1205,7 @@ def _durable_copy_file(source: str | Path, destination: str | Path) -> str:
     with source_path.open("rb") as source_handle:
         descriptor_metadata = os.fstat(source_handle.fileno())
         path_metadata = source_path.lstat()
-        if stat.S_ISLNK(path_metadata.st_mode) or not stat.S_ISREG(
-            descriptor_metadata.st_mode
-        ):
+        if stat.S_ISLNK(path_metadata.st_mode) or not stat.S_ISREG(descriptor_metadata.st_mode):
             raise ValueError("checkpoint source became a symlink or non-regular file")
         if (descriptor_metadata.st_dev, descriptor_metadata.st_ino) != (
             path_metadata.st_dev,

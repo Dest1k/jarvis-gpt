@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 import sys
 import threading
 from types import SimpleNamespace
@@ -57,6 +58,71 @@ def test_transaction_rolls_back_all_files_after_failure(tmp_path):
     assert list(state.iterdir()) == []
 
 
+def test_transaction_parent_identity_cannot_be_redirected_after_checkpoint(tmp_path):
+    state = tmp_path / "state"
+    state.mkdir()
+    root = tmp_path / "root"
+    parent = root / "parent"
+    parent.mkdir(parents=True)
+    target = parent / "value.txt"
+    target.write_text("before", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_target = outside / "value.txt"
+    outside_target.write_text("outside", encoding="utf-8")
+    relocated = root / "relocated"
+    policy = PathPolicy((root,))
+    manager = CheckpointManager(path_policy=policy, checkpoint_root=state)
+    original_create = manager.create
+    race_was_blocked = False
+    redirected_with_symlink = False
+
+    def create_then_race(*args, **kwargs):
+        nonlocal race_was_blocked, redirected_with_symlink
+        checkpoint = original_create(*args, **kwargs)
+        try:
+            parent.replace(relocated)
+        except OSError:
+            race_was_blocked = True
+        else:
+            try:
+                parent.symlink_to(outside, target_is_directory=True)
+                redirected_with_symlink = True
+            except OSError:
+                parent.mkdir()
+                target.write_text("replacement", encoding="utf-8")
+        return checkpoint
+
+    manager.create = create_then_race
+    executor = TransactionalExecutor(
+        actions=AtomicActionExecutor(path_policy=policy),
+        checkpoints=manager,
+    )
+
+    async def reject(_feedback):
+        return False
+
+    result = asyncio.run(
+        executor.execute(
+            (WriteFileAction(path=target, content=b"changed"),),
+            verifier=reject,
+        )
+    )
+
+    assert outside_target.read_text(encoding="utf-8") == "outside"
+    if race_was_blocked:
+        assert result.status is CheckpointStatus.ROLLED_BACK
+        assert target.read_text(encoding="utf-8") == "before"
+    elif os.name == "nt":
+        assert result.status is CheckpointStatus.ROLLBACK_FAILED
+        assert relocated.joinpath("value.txt").read_text(encoding="utf-8") == "before"
+        if not redirected_with_symlink:
+            assert target.read_text(encoding="utf-8") == "replacement"
+    else:
+        assert result.status is CheckpointStatus.ROLLED_BACK
+        assert relocated.joinpath("value.txt").read_text(encoding="utf-8") == "before"
+
+
 def test_transaction_removes_parent_directories_it_created(tmp_path):
     state = tmp_path / "state"
     state.mkdir()
@@ -105,9 +171,7 @@ def test_checkpoint_wal_recovers_interrupted_mutation(tmp_path):
     checkpoint = manager.create((target,))
     target.write_text("after-crash", encoding="utf-8")
 
-    recovered = CheckpointManager(
-        path_policy=policy, checkpoint_root=state
-    ).recover_active()
+    recovered = CheckpointManager(path_policy=policy, checkpoint_root=state).recover_active()
 
     assert recovered[0].checkpoint_id == checkpoint.checkpoint_id
     assert recovered[0].status is CheckpointStatus.ROLLED_BACK
@@ -123,6 +187,51 @@ def test_checkpoint_rejects_targets_overlapping_its_store(tmp_path):
 
     with pytest.raises(ValueError, match="overlap"):
         manager.create((state,))
+
+
+def test_repeated_cancellation_waits_for_checkpoint_creation_and_cleans_it(tmp_path):
+    state = tmp_path / "state"
+    state.mkdir()
+    target = tmp_path / "value.txt"
+    target.write_text("before", encoding="utf-8")
+    policy = PathPolicy((tmp_path,))
+    manager = CheckpointManager(path_policy=policy, checkpoint_root=state)
+    original_create = manager.create
+    create_started = threading.Event()
+    release_create = threading.Event()
+
+    def delayed_create(*args, **kwargs):
+        create_started.set()
+        assert release_create.wait(timeout=2)
+        return original_create(*args, **kwargs)
+
+    manager.create = delayed_create
+    executor = TransactionalExecutor(
+        actions=AtomicActionExecutor(path_policy=policy),
+        checkpoints=manager,
+    )
+
+    async def scenario():
+        task = asyncio.create_task(
+            executor.execute((WriteFileAction(path=target, content=b"changed"),))
+        )
+        await asyncio.wait_for(asyncio.to_thread(create_started.wait), timeout=2)
+        task.cancel()
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        task.cancel()
+        release_create.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release_create.set()
+
+    assert target.read_text(encoding="utf-8") == "before"
+    assert list(state.iterdir()) == []
 
 
 def test_transaction_cancellation_waits_for_action_then_rolls_back(tmp_path):
@@ -167,6 +276,116 @@ def test_transaction_cancellation_waits_for_action_then_rolls_back(tmp_path):
     assert list(state.iterdir()) == []
 
 
+def test_repeated_cancellation_cannot_interrupt_in_flight_action(tmp_path):
+    state = tmp_path / "state"
+    state.mkdir()
+    target = tmp_path / "value.txt"
+    target.write_text("before", encoding="utf-8")
+    policy = PathPolicy((tmp_path,))
+    started = asyncio.Event()
+    release = asyncio.Event()
+    mutation_finished = asyncio.Event()
+
+    class ControlledActions:
+        path_policy = policy
+
+        async def execute(self, action):
+            started.set()
+            await release.wait()
+            target.write_text("late mutation", encoding="utf-8")
+            mutation_finished.set()
+            return ActionFeedback(
+                ok=True,
+                action_id=action.action_id,
+                kind=type(action).__name__,
+                summary="late",
+            )
+
+    executor = TransactionalExecutor(
+        actions=ControlledActions(),
+        checkpoints=CheckpointManager(path_policy=policy, checkpoint_root=state),
+    )
+
+    async def scenario():
+        task = asyncio.create_task(
+            executor.execute((WriteFileAction(path=target, content=b"ignored"),))
+        )
+        await started.wait()
+        task.cancel()
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert task.done() is False
+        assert mutation_finished.is_set() is False
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert mutation_finished.is_set() is True
+
+    asyncio.run(scenario())
+
+    assert target.read_text(encoding="utf-8") == "before"
+    assert list(state.iterdir()) == []
+
+
+def test_repeated_cancellation_cannot_interrupt_in_flight_rollback(tmp_path):
+    state = tmp_path / "state"
+    state.mkdir()
+    target = tmp_path / "value.txt"
+    target.write_text("before", encoding="utf-8")
+    policy = PathPolicy((tmp_path,))
+    manager = CheckpointManager(path_policy=policy, checkpoint_root=state)
+    executor = TransactionalExecutor(
+        actions=AtomicActionExecutor(path_policy=policy),
+        checkpoints=manager,
+    )
+    rollback_started = threading.Event()
+    release_rollback = threading.Event()
+    rollback_finished = threading.Event()
+    original_rollback = manager.rollback
+
+    def delayed_rollback(checkpoint):
+        rollback_started.set()
+        if not release_rollback.wait(timeout=5):
+            raise TimeoutError("test did not release rollback")
+        original_rollback(checkpoint)
+        rollback_finished.set()
+
+    async def reject_state(_feedback):
+        return False
+
+    manager.rollback = delayed_rollback
+
+    async def scenario():
+        task = asyncio.create_task(
+            executor.execute(
+                (WriteFileAction(path=target, content=b"changed"),),
+                verifier=reject_state,
+            )
+        )
+        await asyncio.wait_for(asyncio.to_thread(rollback_started.wait), timeout=2)
+        task.cancel()
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert task.done() is False
+        assert rollback_finished.is_set() is False
+        release_rollback.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=2)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release_rollback.set()
+
+    assert rollback_finished.is_set() is True
+    assert target.read_text(encoding="utf-8") == "before"
+    assert list(state.iterdir()) == []
+
+
 def test_transaction_cancellation_during_commit_returns_committed_result(tmp_path):
     state = tmp_path / "state"
     state.mkdir()
@@ -181,11 +400,11 @@ def test_transaction_cancellation_during_commit_returns_committed_result(tmp_pat
     release_commit = threading.Event()
     original_commit = manager.commit
 
-    def delayed_commit(checkpoint):
+    def delayed_commit(checkpoint, commit_record=None, commit_barrier=None):
         commit_started.set()
         if not release_commit.wait(timeout=5):
             raise TimeoutError("test did not release commit")
-        original_commit(checkpoint)
+        original_commit(checkpoint, commit_record, commit_barrier)
 
     manager.commit = delayed_commit
 
@@ -310,11 +529,11 @@ def test_cancelled_commit_failure_clears_cancellation_and_rolls_back(tmp_path, m
             raise OSError("combined commit failure")
         original_write_manifest(checkpoint)
 
-    def delayed_commit(checkpoint):
+    def delayed_commit(checkpoint, commit_record=None, commit_barrier=None):
         commit_started.set()
         if not release_commit.wait(timeout=5):
             raise TimeoutError("test did not release commit")
-        original_commit(checkpoint)
+        original_commit(checkpoint, commit_record, commit_barrier)
 
     monkeypatch.setattr(transaction_module, "_write_manifest", fail_committed_manifest)
     manager.commit = delayed_commit

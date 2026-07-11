@@ -7,8 +7,9 @@ import json
 import re
 import signal
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import asdict, dataclass, fields, is_dataclass, replace
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -36,13 +37,24 @@ from .execution_actions import (
 from .execution_models import ActionFeedback
 from .execution_process import AsyncProcessRunner, ExecutablePolicy, ExecutableRule
 from .execution_protocol import ActionClass, classify_action, parse_action
+from .execution_replay import DurableReplayJournal
 from .execution_session import (
     ExecutionSession,
     SessionRegistry,
     SessionStatus,
     StepStatus,
 )
-from .execution_transaction import CheckpointManager, TransactionalExecutor
+from .execution_transaction import (
+    CheckpointManager,
+    CheckpointStatus,
+    MutationVerifier,
+    TransactionalExecutor,
+)
+from .state_verification import StateVerifier, VerificationExpectation
+
+ActionVerifier = Callable[[ActionFeedback], Awaitable[bool]]
+
+_BATCH_COMMIT_PROTOCOL = "jarvis.execution-batch-commit.v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +75,8 @@ class KernelResult:
     transactional: bool
     transaction_status: str | None = None
     checkpoint_id: str | None = None
+    failed_action_id: str | None = None
+    rollback_errors: tuple[str, ...] = ()
     replayed: bool = False
 
     def to_dict(self) -> dict[str, Any]:
@@ -76,6 +90,8 @@ class KernelBatchResult:
     feedback: tuple[ActionFeedback, ...]
     transaction_status: str
     checkpoint_id: str | None
+    failed_action_id: str | None = None
+    rollback_errors: tuple[str, ...] = ()
     replayed: bool = False
 
 
@@ -91,6 +107,9 @@ class ExecutionKernel:
         capabilities: KernelCapabilities | None = None,
         max_cached_results: int = 1024,
         max_cached_result_bytes: int = 64 * 1024 * 1024,
+        max_replay_results: int = 10_000,
+        max_replay_result_bytes: int = 256 * 1024 * 1024,
+        recover_checkpoints: bool = True,
     ) -> None:
         if not state_dir.is_absolute():
             raise ValueError("state_dir must be absolute")
@@ -99,6 +118,7 @@ class ExecutionKernel:
         if not 1024 * 1024 <= max_cached_result_bytes <= 1024 * 1024 * 1024:
             raise ValueError("max_cached_result_bytes must be between 1 MiB and 1 GiB")
         state_dir.mkdir(parents=True, exist_ok=True)
+        state_root = state_dir.resolve(strict=True)
         self.path_policy = PathPolicy(allowed_roots, denied_paths=denied_paths)
         self.capabilities = capabilities or KernelCapabilities()
         runner = AsyncProcessRunner(
@@ -114,12 +134,30 @@ class ExecutionKernel:
         )
         self.checkpoints = CheckpointManager(
             path_policy=self.path_policy,
-            checkpoint_root=state_dir.resolve(strict=True) / "execution-checkpoints",
+            checkpoint_root=state_root / "execution-checkpoints",
         )
-        self.recovered_checkpoints = self.checkpoints.recover_active()
+        self.replay_journal = DurableReplayJournal(
+            state_root / "execution-replay-journal.json",
+            max_entries=max_replay_results,
+            max_bytes=max_replay_result_bytes,
+        )
+        if recover_checkpoints:
+            # A committed checkpoint manifest is a write-ahead record for the
+            # narrow crash window between mutation commit and journal replace.
+            # Import it before checkpoint recovery is allowed to remove it.
+            for record in self.checkpoints.committed_records():
+                self._persist_batch_commit_record(record)
+            self.recovered_checkpoints = self.checkpoints.recover_active()
+        else:
+            self.recovered_checkpoints = ()
         self.transactions = TransactionalExecutor(
             actions=self.actions,
             checkpoints=self.checkpoints,
+        )
+        self.state_verifier = StateVerifier(
+            path_policy=self.path_policy,
+            sessions=self.sessions,
+            allow_private_network=self.capabilities.allow_private_network,
         )
         self.max_cached_results = max_cached_results
         self.max_cached_result_bytes = max_cached_result_bytes
@@ -134,6 +172,79 @@ class ExecutionKernel:
         self._resource_locks: dict[str, asyncio.Lock] = {}
         self._resource_lock_users: dict[str, int] = {}
         self._guard = asyncio.Lock()
+
+    @property
+    def rollback_degraded(self) -> bool:
+        """Whether startup recovery left an unresolved partial rollback."""
+
+        return any(
+            checkpoint.status
+            in {
+                CheckpointStatus.ACTIVE,
+                CheckpointStatus.ROLLING_BACK,
+                CheckpointStatus.ROLLBACK_FAILED,
+            }
+            for checkpoint in self.recovered_checkpoints
+        )
+
+    @property
+    def rollback_degraded_checkpoint_ids(self) -> tuple[str, ...]:
+        """Stable identifiers for checkpoints that keep mutation fail-closed."""
+
+        return tuple(
+            checkpoint.checkpoint_id
+            for checkpoint in self.recovered_checkpoints
+            if checkpoint.status
+            in {
+                CheckpointStatus.ACTIVE,
+                CheckpointStatus.ROLLING_BACK,
+                CheckpointStatus.ROLLBACK_FAILED,
+            }
+        )
+
+    def _rollback_degraded_reason(self) -> str | None:
+        checkpoint_ids = self.rollback_degraded_checkpoint_ids
+        if not checkpoint_ids:
+            return None
+        return (
+            "mutation execution is blocked because startup recovery left "
+            "unresolved rollback checkpoint(s): "
+            + ", ".join(checkpoint_ids)
+        )
+
+    def verification_denial(
+        self,
+        action: AtomicAction,
+        expectation: VerificationExpectation,
+    ) -> str | None:
+        """Apply capability policy to a safe postcondition inspection.
+
+        The rollback-degraded latch blocks mutations, not inspection, but every
+        registry/network target and supplemental expectation remains constrained
+        by the same operator-owned capability policy as execution.
+        """
+
+        denied = self._authorize(action, verification_only=True)
+        if denied is not None:
+            return denied
+        for path in expectation.paths:
+            try:
+                self.path_policy.resolve(path.path, allow_root=True)
+            except (OSError, PermissionError, ValueError) as exc:
+                return f"verification path is outside policy: {exc}"
+        for target in expectation.tcp:
+            denied = self._authorize(
+                TcpProbeAction(
+                    host=target.host,
+                    port=target.port,
+                    timeout_seconds=target.timeout_seconds,
+                    action_id="verification-capability-check",
+                ),
+                verification_only=True,
+            )
+            if denied is not None:
+                return denied
+        return None
 
     def create_session(self, **kwargs: Any) -> ExecutionSession:
         return self.sessions.create(**kwargs)
@@ -210,10 +321,25 @@ class ExecutionKernel:
             "session": snapshot,
         }
 
-    async def execute_payload(self, payload: str | bytes | dict[str, Any]) -> KernelResult:
+    async def execute_payload(
+        self,
+        payload: str | bytes | dict[str, Any],
+        *,
+        mutation_verifier: MutationVerifier | None = None,
+        action_verifier: ActionVerifier | None = None,
+        replay_action_verifier: ActionVerifier | None = None,
+        postcondition_fingerprint: str | None = None,
+    ) -> KernelResult:
         action = parse_action(payload)
         fingerprint = _action_fingerprint(action)
-        return await self.execute(action, fingerprint=fingerprint)
+        return await self.execute(
+            action,
+            fingerprint=fingerprint,
+            mutation_verifier=mutation_verifier,
+            action_verifier=action_verifier,
+            replay_action_verifier=replay_action_verifier,
+            postcondition_fingerprint=postcondition_fingerprint,
+        )
 
     async def execute_transaction_payloads(
         self,
@@ -221,6 +347,7 @@ class ExecutionKernel:
         *,
         idempotency_key: str,
         session_id: str | None = None,
+        mutation_verifier: MutationVerifier | None = None,
     ) -> KernelBatchResult:
         if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.:-]{0,127}", idempotency_key):
             raise ValueError("invalid transaction idempotency_key")
@@ -231,14 +358,31 @@ class ExecutionKernel:
             raise ValueError("transaction action_id values must be unique")
         if any(classify_action(action) is not ActionClass.MUTATION for action in actions):
             raise ValueError("atomic batches accept reversible mutation actions only")
+        recovery_error = self._rollback_degraded_reason()
+        if recovery_error is not None:
+            first = actions[0]
+            return KernelBatchResult(
+                ok=False,
+                idempotency_key=idempotency_key,
+                feedback=(
+                    ActionFeedback(
+                        ok=False,
+                        action_id=first.action_id,
+                        kind=type(first).__name__,
+                        summary="Transaction denied while rollback recovery is degraded.",
+                        error=recovery_error,
+                    ),
+                ),
+                transaction_status="recovery_blocked",
+                checkpoint_id=None,
+            )
+        if mutation_verifier is None:
+            mutation_verifier = self._default_mutation_verifier(actions)
         fingerprint = _batch_fingerprint(actions)
-        async with self._guard:
-            cached = self._batch_results.get(idempotency_key)
-            if cached is not None:
-                if cached[0] != fingerprint:
-                    raise ValueError("idempotency_key was reused with a different transaction")
-                self._batch_results.move_to_end(idempotency_key)
-                return replace(cached[1], replayed=True)
+        cached = await self._cached_batch(idempotency_key, fingerprint)
+        cached_result = replace(cached, replayed=True) if cached is not None else None
+        if cached_result is not None:
+            return await _verified_batch_replay(cached_result, mutation_verifier)
         for action in actions:
             denied = self._authorize(action)
             if denied is not None:
@@ -275,17 +419,25 @@ class ExecutionKernel:
             for lock in locks:
                 await lock.acquire()
                 acquired.append(lock)
-            async with self._guard:
-                cached = self._batch_results.get(idempotency_key)
-                if cached is not None:
-                    if cached[0] != fingerprint:
-                        raise ValueError(
-                            "idempotency_key was reused with a different transaction"
-                        )
-                    return replace(cached[1], replayed=True)
+            cached = await self._cached_batch(idempotency_key, fingerprint)
+            cached_result = replace(cached, replayed=True) if cached is not None else None
+            if cached_result is not None:
+                return await _verified_batch_replay(cached_result, mutation_verifier)
             session = self._prepare_batch_session(session_id)
             try:
-                transaction = await self.transactions.execute(actions)
+                transaction = await self.transactions.execute(
+                    actions,
+                    verifier=mutation_verifier,
+                    commit_record_factory=lambda checkpoint_id, feedback: (
+                        self._batch_commit_record(
+                            idempotency_key=idempotency_key,
+                            fingerprint=fingerprint,
+                            checkpoint_id=checkpoint_id,
+                            feedback=feedback,
+                        )
+                    ),
+                    commit_barrier=self._persist_batch_commit_record,
+                )
             except asyncio.CancelledError:
                 self._record_batch_exception(session, cancelled=True, error=None)
                 raise
@@ -298,6 +450,8 @@ class ExecutionKernel:
                 feedback=transaction.actions,
                 transaction_status=transaction.status.value,
                 checkpoint_id=transaction.checkpoint_id,
+                failed_action_id=transaction.failed_action_id,
+                rollback_errors=transaction.rollback_errors,
             )
             self._record_batch_session(session, result)
             await _await_authoritative(
@@ -343,6 +497,82 @@ class ExecutionKernel:
             ):
                 removed_key, _removed = self._batch_results.popitem(last=False)
                 self._batch_result_bytes -= self._batch_result_sizes.pop(removed_key)
+
+    async def _cached_batch(
+        self,
+        idempotency_key: str,
+        fingerprint: str,
+    ) -> KernelBatchResult | None:
+        async with self._guard:
+            cached = self._batch_results.get(idempotency_key)
+            if cached is not None:
+                if cached[0] != fingerprint:
+                    raise ValueError(
+                        "idempotency_key was reused with a different transaction"
+                    )
+                self._batch_results.move_to_end(idempotency_key)
+                return cached[1]
+        durable = self.replay_journal.lookup(idempotency_key)
+        if durable is None:
+            for raw in self.checkpoints.committed_records():
+                record = _parse_batch_commit_record(raw)
+                if record["key"] != idempotency_key:
+                    continue
+                if record["fingerprint"] != fingerprint:
+                    raise ValueError(
+                        "idempotency_key was reused with a different transaction"
+                    )
+                # A previous live commit may have reached its durable WAL but
+                # failed while replacing the replay ledger. Import that record
+                # before any retry can reach action execution.
+                self._persist_batch_commit_record(raw)
+                result = _batch_result_from_payload(record["result"])
+                await self._remember_batch(idempotency_key, fingerprint, result)
+                if result.checkpoint_id is None:
+                    raise RuntimeError("committed replay record has no checkpoint identity")
+                self.checkpoints.retire_committed(result.checkpoint_id)
+                return result
+            return None
+        if durable.fingerprint != fingerprint:
+            raise ValueError("idempotency_key was reused with a different transaction")
+        result = _batch_result_from_payload(durable.result)
+        if result.idempotency_key != idempotency_key:
+            raise RuntimeError("execution replay journal result key is inconsistent")
+        await self._remember_batch(idempotency_key, fingerprint, result)
+        return result
+
+    @staticmethod
+    def _batch_commit_record(
+        *,
+        idempotency_key: str,
+        fingerprint: str,
+        checkpoint_id: str,
+        feedback: tuple[ActionFeedback, ...],
+    ) -> dict[str, Any]:
+        result = KernelBatchResult(
+            ok=True,
+            idempotency_key=idempotency_key,
+            feedback=feedback,
+            transaction_status=CheckpointStatus.COMMITTED.value,
+            checkpoint_id=checkpoint_id,
+        )
+        return {
+            "protocol": _BATCH_COMMIT_PROTOCOL,
+            "checkpoint_id": checkpoint_id,
+            "key": idempotency_key,
+            "fingerprint": fingerprint,
+            "recorded_at": datetime.now(UTC).isoformat(timespec="milliseconds"),
+            "result": _batch_result_payload(result),
+        }
+
+    def _persist_batch_commit_record(self, raw: Mapping[str, Any]) -> None:
+        record = _parse_batch_commit_record(raw)
+        self.replay_journal.remember(
+            record["key"],
+            record["fingerprint"],
+            record["result"],
+            recorded_at=record["recorded_at"],
+        )
 
     def _prepare_single_session(self, action: AtomicAction) -> ExecutionSession | None:
         if not isinstance(action, ProcessAction) or action.session_id is None:
@@ -455,13 +685,49 @@ class ExecutionKernel:
         action: AtomicAction,
         *,
         fingerprint: str | None = None,
+        mutation_verifier: MutationVerifier | None = None,
+        action_verifier: ActionVerifier | None = None,
+        replay_action_verifier: ActionVerifier | None = None,
+        postcondition_fingerprint: str | None = None,
     ) -> KernelResult:
         fingerprint = fingerprint or _action_fingerprint(action)
+        if postcondition_fingerprint is not None:
+            fingerprint = _postcondition_bound_fingerprint(
+                fingerprint, postcondition_fingerprint
+            )
+        action_class = classify_action(action)
+        recovery_error = (
+            self._rollback_degraded_reason()
+            if action_class is ActionClass.MUTATION
+            else None
+        )
+        if recovery_error is not None:
+            return KernelResult(
+                ok=False,
+                action_class=action_class,
+                feedback=ActionFeedback(
+                    ok=False,
+                    action_id=action.action_id,
+                    kind=type(action).__name__,
+                    summary="Mutation denied while rollback recovery is degraded.",
+                    error=recovery_error,
+                ),
+                transactional=False,
+                transaction_status="recovery_blocked",
+                failed_action_id="startup_recovery",
+            )
+        if mutation_verifier is None and action_class is ActionClass.MUTATION:
+            mutation_verifier = self._default_mutation_verifier((action,))
+        if action_verifier is None and action_class is not ActionClass.MUTATION:
+            action_verifier = self._default_action_verifier(action)
         cached = await self._cached(action.action_id, fingerprint)
         if cached is not None:
-            return replace(cached, replayed=True)
+            return await _verified_single_replay(
+                replace(cached, replayed=True),
+                mutation_verifier,
+                replay_action_verifier or action_verifier,
+            )
         authorization_error = self._authorize(action)
-        action_class = classify_action(action)
         if authorization_error is not None:
             result = KernelResult(
                 ok=False,
@@ -488,9 +754,16 @@ class ExecutionKernel:
                 acquired.append(lock)
             second = await self._cached(action.action_id, fingerprint)
             if second is not None:
-                return replace(second, replayed=True)
+                return await _verified_single_replay(
+                    replace(second, replayed=True),
+                    mutation_verifier,
+                    replay_action_verifier or action_verifier,
+                )
             if action_class is ActionClass.MUTATION:
-                transaction = await self.transactions.execute((action,))
+                transaction = await self.transactions.execute(
+                    (action,),
+                    verifier=mutation_verifier,
+                )
                 feedback = transaction.actions[-1]
                 result = KernelResult(
                     ok=transaction.ok,
@@ -499,6 +772,8 @@ class ExecutionKernel:
                     transactional=True,
                     transaction_status=transaction.status.value,
                     checkpoint_id=transaction.checkpoint_id,
+                    failed_action_id=transaction.failed_action_id,
+                    rollback_errors=transaction.rollback_errors,
                 )
             else:
                 session = self._prepare_single_session(action)
@@ -507,8 +782,22 @@ class ExecutionKernel:
                 except asyncio.CancelledError:
                     self._record_single_cancellation(session, action)
                     raise
+                verified = (
+                    feedback.ok
+                    and (
+                        action_verifier is None
+                        or await action_verifier(feedback)
+                    )
+                )
+                if feedback.ok and not verified:
+                    feedback = replace(
+                        feedback,
+                        ok=False,
+                        summary="Independent state verification failed.",
+                        error="postcondition verification failed",
+                    )
                 result = KernelResult(
-                    ok=feedback.ok,
+                    ok=verified,
                     action_class=action_class,
                     feedback=feedback,
                     transactional=False,
@@ -522,6 +811,36 @@ class ExecutionKernel:
             for lock in reversed(acquired):
                 lock.release()
             await self._retire_locks(keys)
+
+    def _default_mutation_verifier(
+        self,
+        actions: tuple[AtomicAction, ...],
+    ) -> MutationVerifier:
+        async def verify(feedback: tuple[ActionFeedback, ...]) -> bool:
+            if len(feedback) != len(actions):
+                return False
+            for action, item in zip(actions, feedback, strict=True):
+                result = await self.state_verifier.verify(
+                    action,
+                    feedback=item,
+                    expectation=VerificationExpectation(),
+                )
+                if not result.ok:
+                    return False
+            return True
+
+        return verify
+
+    def _default_action_verifier(self, action: AtomicAction) -> ActionVerifier:
+        async def verify(feedback: ActionFeedback) -> bool:
+            result = await self.state_verifier.verify(
+                action,
+                feedback=feedback,
+                expectation=VerificationExpectation(),
+            )
+            return result.ok
+
+        return verify
 
     async def _cached(self, action_id: str, fingerprint: str) -> KernelResult | None:
         async with self._guard:
@@ -569,7 +888,16 @@ class ExecutionKernel:
                 else:
                     self._resource_lock_users[key] = users
 
-    def _authorize(self, action: AtomicAction) -> str | None:
+    def _authorize(
+        self,
+        action: AtomicAction,
+        *,
+        verification_only: bool = False,
+    ) -> str | None:
+        if not verification_only and classify_action(action) is ActionClass.MUTATION:
+            recovery_error = self._rollback_degraded_reason()
+            if recovery_error is not None:
+                return recovery_error
         if isinstance(action, ProcessAction):
             if not self.capabilities.executable_rules:
                 return "process execution is disabled because no executable rules are configured"
@@ -616,6 +944,47 @@ def _registry_allowed(action: Any, prefixes: tuple[tuple[str, str], ...]) -> boo
         )
         for allowed_hive, prefix in prefixes
     )
+
+
+async def _verified_batch_replay(
+    result: KernelBatchResult,
+    verifier: MutationVerifier | None,
+) -> KernelBatchResult:
+    if not result.ok:
+        return result
+    if verifier is not None and not await verifier(result.feedback):
+        return replace(result, ok=False, transaction_status="verification_failed")
+    return result
+
+
+async def _verified_single_replay(
+    result: KernelResult,
+    mutation_verifier: MutationVerifier | None,
+    action_verifier: ActionVerifier | None,
+) -> KernelResult:
+    if not result.ok:
+        return result
+    if result.action_class is ActionClass.MUTATION:
+        if mutation_verifier is None or not await mutation_verifier((result.feedback,)):
+            return replace(
+                result,
+                ok=False,
+                transaction_status="verification_failed",
+                failed_action_id="state_verification",
+            )
+        return result
+    if action_verifier is None or not await action_verifier(result.feedback):
+        return replace(
+            result,
+            ok=False,
+            feedback=replace(
+                result.feedback,
+                ok=False,
+                summary="Independent state verification failed.",
+                error="postcondition verification failed",
+            ),
+        )
+    return result
 
 
 def _resource_keys(
@@ -682,11 +1051,175 @@ def _action_fingerprint(action: AtomicAction) -> str:
     return hashlib.sha256(canonical.encode("utf-8", errors="strict")).hexdigest()
 
 
+def _postcondition_bound_fingerprint(
+    action_fingerprint: str,
+    postcondition_fingerprint: str,
+) -> str:
+    import hashlib
+
+    if not re.fullmatch(r"[0-9a-f]{64}", postcondition_fingerprint):
+        raise ValueError("postcondition_fingerprint must be a lowercase SHA-256 digest")
+    canonical = json.dumps(
+        {
+            "action_sha256": action_fingerprint,
+            "postcondition_sha256": postcondition_fingerprint,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("ascii")).hexdigest()
+
+
 def _batch_fingerprint(actions: tuple[AtomicAction, ...]) -> str:
     import hashlib
 
     canonical = "\x1e".join(_action_fingerprint(action) for action in actions)
     return hashlib.sha256(canonical.encode("ascii")).hexdigest()
+
+
+def _batch_result_payload(result: KernelBatchResult) -> dict[str, Any]:
+    payload = {
+        "ok": result.ok,
+        "idempotency_key": result.idempotency_key,
+        "feedback": [item.to_dict() for item in result.feedback],
+        "transaction_status": result.transaction_status,
+        "checkpoint_id": result.checkpoint_id,
+        "failed_action_id": result.failed_action_id,
+        "rollback_errors": list(result.rollback_errors),
+        "replayed": result.replayed,
+    }
+    # Normalize eagerly so a value that cannot be represented by the durable
+    # protocol fails before the checkpoint is marked committed.
+    return json.loads(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+
+
+def _batch_result_from_payload(raw: Any) -> KernelBatchResult:
+    expected = {
+        "ok",
+        "idempotency_key",
+        "feedback",
+        "transaction_status",
+        "checkpoint_id",
+        "failed_action_id",
+        "rollback_errors",
+        "replayed",
+    }
+    if not isinstance(raw, dict) or set(raw) != expected:
+        raise RuntimeError("execution replay result shape is invalid")
+    key = raw["idempotency_key"]
+    checkpoint_id = raw["checkpoint_id"]
+    feedback_raw = raw["feedback"]
+    if (
+        raw["ok"] is not True
+        or not isinstance(key, str)
+        or re.fullmatch(r"[A-Za-z][A-Za-z0-9_.:-]{0,127}", key) is None
+        or raw["transaction_status"] != CheckpointStatus.COMMITTED.value
+        or not isinstance(checkpoint_id, str)
+        or re.fullmatch(r"checkpoint_[0-9a-f]{32}", checkpoint_id) is None
+        or raw["failed_action_id"] is not None
+        or raw["rollback_errors"] != []
+        or raw["replayed"] is not False
+        or not isinstance(feedback_raw, list)
+        or not 1 <= len(feedback_raw) <= 10_000
+    ):
+        raise RuntimeError("execution replay result metadata is invalid")
+    feedback: list[ActionFeedback] = []
+    feedback_shape = {
+        "ok",
+        "action_id",
+        "kind",
+        "summary",
+        "before",
+        "after",
+        "process",
+        "error",
+    }
+    for item in feedback_raw:
+        if not isinstance(item, dict) or set(item) != feedback_shape:
+            raise RuntimeError("execution replay feedback shape is invalid")
+        if (
+            item["ok"] is not True
+            or not isinstance(item["action_id"], str)
+            or not 1 <= len(item["action_id"]) <= 128
+            or not isinstance(item["kind"], str)
+            or not 1 <= len(item["kind"]) <= 128
+            or not isinstance(item["summary"], str)
+            or not 1 <= len(item["summary"]) <= 4096
+            or not isinstance(item["before"], dict)
+            or not isinstance(item["after"], dict)
+            or item["process"] is not None
+            or item["error"] is not None
+        ):
+            raise RuntimeError("execution replay feedback metadata is invalid")
+        feedback.append(
+            ActionFeedback(
+                ok=True,
+                action_id=item["action_id"],
+                kind=item["kind"],
+                summary=item["summary"],
+                before=item["before"],
+                after=item["after"],
+            )
+        )
+    return KernelBatchResult(
+        ok=True,
+        idempotency_key=key,
+        feedback=tuple(feedback),
+        transaction_status=CheckpointStatus.COMMITTED.value,
+        checkpoint_id=checkpoint_id,
+    )
+
+
+def _parse_batch_commit_record(raw: Mapping[str, Any]) -> dict[str, Any]:
+    record = dict(raw)
+    if set(record) != {
+        "protocol",
+        "checkpoint_id",
+        "key",
+        "fingerprint",
+        "recorded_at",
+        "result",
+    }:
+        raise RuntimeError("execution batch commit record shape is invalid")
+    key = record["key"]
+    checkpoint_id = record["checkpoint_id"]
+    fingerprint = record["fingerprint"]
+    recorded_at = record["recorded_at"]
+    if (
+        record["protocol"] != _BATCH_COMMIT_PROTOCOL
+        or not isinstance(checkpoint_id, str)
+        or re.fullmatch(r"checkpoint_[0-9a-f]{32}", checkpoint_id) is None
+        or not isinstance(key, str)
+        or re.fullmatch(r"[A-Za-z][A-Za-z0-9_.:-]{0,127}", key) is None
+        or not isinstance(fingerprint, str)
+        or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None
+        or not isinstance(recorded_at, str)
+        or not 1 <= len(recorded_at) <= 64
+    ):
+        raise RuntimeError("execution batch commit record metadata is invalid")
+    try:
+        timestamp = datetime.fromisoformat(recorded_at)
+    except ValueError as exc:
+        raise RuntimeError("execution batch commit timestamp is invalid") from exc
+    if timestamp.tzinfo is None:
+        raise RuntimeError("execution batch commit timestamp must include a timezone")
+    result = _batch_result_from_payload(record["result"])
+    if result.idempotency_key != key or result.checkpoint_id != checkpoint_id:
+        raise RuntimeError("execution batch commit record identity is inconsistent")
+    return {
+        "key": key,
+        "fingerprint": fingerprint,
+        "recorded_at": recorded_at,
+        "result": _batch_result_payload(result),
+    }
 
 
 def _result_size(result: KernelResult | KernelBatchResult) -> int:

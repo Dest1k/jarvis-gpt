@@ -8,7 +8,7 @@ import json
 import os
 import secrets
 import socket
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -30,10 +30,12 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from .agent import AgentRuntime
 from .approval_executor import ApprovalExecutor
 from .autonomy_executor import AutonomyExecutor
+from .cognitive_memory import ExecutionPlaybookStore, HostProfileManager
 from .config import ensure_runtime_dirs, load_settings
 from .diagnostics import run_diagnostics
 from .dispatcher import DispatcherManager
 from .event_bus import EventBus
+from .executive_runtime import ExecutiveCoordinator
 from .experience import ExperienceManager
 from .host_bridge import HostBridgeStatus
 from .ingest import FileIngestor
@@ -115,10 +117,12 @@ from .operator_queue import (
     operator_queue_snapshot,
 )
 from .persona import PersonaManager
+from .runtime_lease import PrimaryRuntimeLease
 from .storage import JarvisStorage, utc_now
 from .supervisor import RuntimeSupervisor
 from .telemetry import TelemetryCollector
-from .tools import browser_handoff_snapshot, internet_observability_snapshot
+from .tools import ToolRegistry, browser_handoff_snapshot, internet_observability_snapshot
+from .web_surfer_adapter import WebSurferAdapter
 
 
 @asynccontextmanager
@@ -126,67 +130,204 @@ async def lifespan(app: FastAPI):
     settings = load_settings()
     ensure_runtime_dirs(settings)
     storage = JarvisStorage(settings.database_path)
-    storage.initialize()
-    llm = LLMRouter(settings)
-    bus = EventBus()
-    agent = AgentRuntime(settings=settings, storage=storage, llm=llm, bus=bus)
-    ingestor = FileIngestor(settings=settings, storage=storage)
-    models = ModelCatalog(settings, storage)
-    model_hub = ModelHubManager(settings=settings, storage=storage)
-    dispatcher = DispatcherManager(settings, storage=storage)
-    telemetry = TelemetryCollector(settings)
-    learning = LearningEngine(storage, llm=llm)
-    host_bridge = HostBridgeStatus(settings)
-    experience = ExperienceManager(settings=settings, storage=storage)
-    persona = PersonaManager(settings=settings, storage=storage)
-    operations = OperationsManager(settings=settings, storage=storage)
-    autonomy_executor = AutonomyExecutor(
-        settings=settings,
-        storage=storage,
-        operations=operations,
-        agent=agent,
-        experience=experience,
-        llm=llm,
-        telemetry=telemetry,
-        dispatcher=dispatcher,
-        learning=learning,
-        bus=bus,
-    )
-    supervisor = RuntimeSupervisor(
-        settings=settings,
-        storage=storage,
-        llm=llm,
-        autonomy_executor=autonomy_executor,
-    )
-    approval_executor = ApprovalExecutor(
-        storage=storage,
-        llm=llm,
-        dispatcher=dispatcher,
-        tools=agent.tools,
-        mission_resumer=agent.resume_mission_after_approval,
-    )
+    playbooks: ExecutionPlaybookStore | None = None
+    web_surfer: WebSurferAdapter | None = None
+    model_hub: ModelHubManager | None = None
+    supervisor: RuntimeSupervisor | None = None
+    primary_lease = PrimaryRuntimeLease(settings.state_dir / "primary-runtime.lock")
+    runtime_started = False
+    resources_closed = False
+    resources_closing: asyncio.Task[None] | None = None
 
-    app.state.settings = settings
-    app.state.storage = storage
-    app.state.llm = llm
-    app.state.bus = bus
-    app.state.agent = agent
-    app.state.ingestor = ingestor
-    app.state.models = models
-    app.state.model_hub = model_hub
-    app.state.dispatcher = dispatcher
-    app.state.telemetry = telemetry
-    app.state.learning = learning
-    app.state.host_bridge = host_bridge
-    app.state.experience = experience
-    app.state.persona = persona
-    app.state.operations = operations
-    app.state.autonomy_executor = autonomy_executor
-    app.state.supervisor = supervisor
-    app.state.approval_executor = approval_executor
-    app.state.autonomy_background_tasks = set()
-    storage.add_event(kind="runtime.start", title="Jarvis backend started")
-    await supervisor.start()
+    async def run_lease_owned_thread(call, /, *args, **kwargs):
+        """Do not release the primary lease while its worker thread still mutates state."""
+
+        operation = asyncio.create_task(asyncio.to_thread(call, *args, **kwargs))
+        current = asyncio.current_task()
+        cancellation_requested = False
+        while not operation.done():
+            try:
+                await asyncio.shield(operation)
+            except asyncio.CancelledError:
+                cancellation_requested = True
+                if current is not None:
+                    while current.cancelling():
+                        current.uncancel()
+        if cancellation_requested:
+            with suppress(BaseException):
+                operation.result()
+            raise asyncio.CancelledError
+        return operation.result()
+
+    async def close_resources_impl() -> None:
+        nonlocal resources_closed
+        if supervisor is not None:
+            with suppress(Exception, asyncio.CancelledError):
+                await supervisor.stop()
+        if model_hub is not None:
+            with suppress(Exception, asyncio.CancelledError):
+                await asyncio.to_thread(model_hub.close)
+        if web_surfer is not None:
+            with suppress(Exception, asyncio.CancelledError):
+                await web_surfer.aclose()
+        if playbooks is not None:
+            with suppress(Exception, asyncio.CancelledError):
+                await asyncio.to_thread(playbooks.close)
+        if runtime_started:
+            with suppress(Exception):
+                storage.add_event(kind="runtime.stop", title="Jarvis backend stopped")
+        try:
+            with suppress(Exception):
+                storage.close()
+        finally:
+            with suppress(Exception):
+                primary_lease.release()
+            resources_closed = True
+
+    async def close_resources() -> None:
+        nonlocal resources_closing
+        if resources_closed:
+            return
+        if resources_closing is None:
+            resources_closing = asyncio.create_task(close_resources_impl())
+        cleanup = resources_closing
+        current = asyncio.current_task()
+        cancellation_requested = False
+        while True:
+            try:
+                await asyncio.shield(cleanup)
+                break
+            except asyncio.CancelledError:
+                if cleanup.cancelled():
+                    raise
+                cancellation_requested = True
+                if current is not None:
+                    while current.cancelling():
+                        current.uncancel()
+        cleanup.result()
+        if cancellation_requested:
+            raise asyncio.CancelledError
+
+    try:
+        primary_lease.acquire()
+        storage.initialize()
+        # This is the designated primary runtime.  Fail closed acquired approvals
+        # before any mission recovery can consider their interrupted side effects.
+        # It is inside the resource guard so a database failure still closes storage.
+        storage.recover_interrupted_approval_executions()
+        profile_manager = HostProfileManager(settings.home / "host_profile.json")
+        try:
+            host_profile = await run_lease_owned_thread(profile_manager.refresh)
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            host_profile = await run_lease_owned_thread(
+                profile_manager.load_verified,
+                max_age_seconds=86_400,
+            )
+            if host_profile is None:
+                raise RuntimeError(
+                    "cold-start host fingerprint could not be collected or recovered"
+                ) from exc
+        storage.set_runtime_value("environment.host_profile", host_profile)
+        playbooks = ExecutionPlaybookStore(
+            settings.state_dir / "execution-playbooks.sqlite3"
+        )
+        llm = LLMRouter(settings)
+        bus = EventBus()
+        web_surfer = WebSurferAdapter()
+        await web_surfer.start()
+        executive = ExecutiveCoordinator(
+            storage=storage,
+            host_profile=host_profile,
+            playbooks=playbooks,
+            recover_interrupted=True,
+        )
+        tools = ToolRegistry(
+            settings,
+            storage,
+            llm,
+            playbooks=playbooks,
+            web_surfer=web_surfer,
+            executive=executive,
+            recover_execution=True,
+        )
+        agent = AgentRuntime(
+            settings=settings,
+            storage=storage,
+            llm=llm,
+            bus=bus,
+            tools=tools,
+            playbooks=playbooks,
+            host_profile=host_profile,
+            executive=executive,
+        )
+        ingestor = FileIngestor(settings=settings, storage=storage)
+        models = ModelCatalog(settings, storage)
+        model_hub = ModelHubManager(settings=settings, storage=storage)
+        dispatcher = DispatcherManager(settings, storage=storage)
+        telemetry = TelemetryCollector(settings)
+        learning = LearningEngine(storage, llm=llm)
+        host_bridge = HostBridgeStatus(settings)
+        experience = ExperienceManager(settings=settings, storage=storage)
+        persona = PersonaManager(settings=settings, storage=storage)
+        operations = OperationsManager(settings=settings, storage=storage)
+        autonomy_executor = AutonomyExecutor(
+            settings=settings,
+            storage=storage,
+            operations=operations,
+            agent=agent,
+            experience=experience,
+            llm=llm,
+            telemetry=telemetry,
+            dispatcher=dispatcher,
+            learning=learning,
+            bus=bus,
+        )
+        supervisor = RuntimeSupervisor(
+            settings=settings,
+            storage=storage,
+            llm=llm,
+            autonomy_executor=autonomy_executor,
+        )
+        approval_executor = ApprovalExecutor(
+            storage=storage,
+            llm=llm,
+            dispatcher=dispatcher,
+            tools=agent.tools,
+            mission_resumer=agent.resume_mission_after_approval,
+            mission_aborter=agent.abort_mission_after_approval,
+        )
+        await approval_executor.reconcile_interrupted_executions()
+
+        app.state.settings = settings
+        app.state.storage = storage
+        app.state.llm = llm
+        app.state.bus = bus
+        app.state.agent = agent
+        app.state.host_profile = host_profile
+        app.state.host_profile_manager = profile_manager
+        app.state.playbooks = playbooks
+        app.state.web_surfer = web_surfer
+        app.state.executive = executive
+        app.state.ingestor = ingestor
+        app.state.models = models
+        app.state.model_hub = model_hub
+        app.state.dispatcher = dispatcher
+        app.state.telemetry = telemetry
+        app.state.learning = learning
+        app.state.host_bridge = host_bridge
+        app.state.experience = experience
+        app.state.persona = persona
+        app.state.operations = operations
+        app.state.autonomy_executor = autonomy_executor
+        app.state.supervisor = supervisor
+        app.state.approval_executor = approval_executor
+        app.state.autonomy_background_tasks = set()
+        storage.add_event(kind="runtime.start", title="Jarvis backend started")
+        await supervisor.start()
+        runtime_started = True
+    except BaseException:
+        await close_resources()
+        raise
     try:
         yield
     finally:
@@ -199,10 +340,7 @@ async def lifespan(app: FastAPI):
             task.cancel()
         if detached_tasks:
             await asyncio.gather(*detached_tasks, return_exceptions=True)
-        await supervisor.stop()
-        await asyncio.to_thread(model_hub.close)
-        storage.add_event(kind="runtime.stop", title="Jarvis backend stopped")
-        storage.close()
+        await close_resources()
 
 
 _WS_TOKEN_PROTOCOL_PREFIX = "jarvis.token."
@@ -734,7 +872,12 @@ async def dispatcher_action(action: str) -> DispatcherActionResponse:
     compose_action = action_map.get(action)
     if compose_action is None:
         raise HTTPException(status_code=400, detail="Unsupported dispatcher action")
-    result = await asyncio.to_thread(app.state.dispatcher.run_compose, compose_action)
+    runner = (
+        app.state.dispatcher.run_compose_verified
+        if compose_action in {"up", "down"}
+        else app.state.dispatcher.run_compose
+    )
+    result = await asyncio.to_thread(runner, compose_action)
     status_snapshot = await asyncio.to_thread(app.state.dispatcher.status)
     await app.state.bus.publish(
         {
@@ -1136,6 +1279,42 @@ async def delete_conversation(conversation_id: str) -> dict[str, bool]:
     return {"ok": True}
 
 
+@app.get("/api/environment/profile")
+async def environment_profile() -> dict[str, Any]:
+    return {"profile": app.state.host_profile}
+
+
+@app.get("/api/memory/playbooks")
+async def execution_playbooks(
+    query: str = Query(min_length=1, max_length=32768),
+    limit: int = Query(default=5, ge=1, le=20),
+) -> dict[str, Any]:
+    records = await asyncio.to_thread(
+        app.state.playbooks.lookup,
+        query,
+        limit=limit,
+        mark_used=False,
+    )
+    return {
+        "query": query,
+        "playbooks": [item.to_dict() for item in records],
+        "stats": await asyncio.to_thread(app.state.playbooks.stats),
+    }
+
+
+@app.get("/api/executive/plans/{mission_id}")
+async def executive_plan(mission_id: str) -> dict[str, Any]:
+    plan = app.state.executive.snapshot(mission_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="Executive plan not found")
+    return plan
+
+
+@app.get("/api/internet/web-surfer")
+async def web_surfer_capabilities() -> dict[str, Any]:
+    return app.state.web_surfer.capabilities()
+
+
 @app.get("/api/missions", response_model=list[Mission])
 async def list_missions(limit: int = Query(default=50, ge=1, le=200)) -> list[Mission]:
     return app.state.storage.list_missions(limit=limit)
@@ -1143,7 +1322,10 @@ async def list_missions(limit: int = Query(default=50, ge=1, le=200)) -> list[Mi
 
 @app.post("/api/missions", response_model=Mission)
 async def create_mission(request: MissionCreateRequest) -> Mission:
-    return app.state.agent.create_mission(goal=request.goal, title=request.title)
+    return await app.state.agent.create_mission_planned(
+        goal=request.goal,
+        title=request.title,
+    )
 
 
 @app.get("/api/missions/{mission_id}", response_model=Mission)
@@ -1190,6 +1372,24 @@ async def update_mission_task(
     mission = app.state.storage.get_mission(mission_id)
     if mission is None:
         raise HTTPException(status_code=404, detail="Mission not found")
+    current = next(
+        (item for item in mission.get("tasks", []) if item.get("id") == task_id),
+        None,
+    )
+    if current is None:
+        raise HTTPException(status_code=404, detail="Mission task not found")
+    if (
+        request.status is not None
+        and request.status != current.get("status")
+        and app.state.executive.snapshot(mission_id) is not None
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Task status is owned by the executive DAG; run/resume the mission "
+                "instead of bypassing its state machine."
+            ),
+        )
     updated = app.state.storage.update_mission_task(
         task_id,
         mission_id=mission_id,
@@ -1360,6 +1560,11 @@ async def update_approval(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if updated is None:
         raise HTTPException(status_code=404, detail="Approval not found")
+    if request.status in {"rejected", "cancelled"}:
+        await app.state.approval_executor.reconcile_pending_approvals(
+            approval_id=approval_id,
+        )
+        updated = app.state.storage.get_approval(approval_id) or updated
     await app.state.bus.publish(
         {"channel": "approvals", "approval_id": approval_id, "status": request.status}
     )

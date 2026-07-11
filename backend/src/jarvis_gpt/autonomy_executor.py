@@ -446,7 +446,10 @@ class AutonomyExecutor:
                     "job_status": "paused",
                     "data": {"payload": payload},
                 }
-            mission = self.agent.create_mission(goal, title=_optional_text(payload.get("title")))
+            mission = await self.agent.create_mission_planned(
+                goal,
+                title=_optional_text(payload.get("title")),
+            )
             mission_id = str(mission["id"])
             created = True
 

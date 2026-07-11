@@ -34,6 +34,11 @@ Agent Runtime
   |-- model profile roadmap
   |-- web evidence synthesis
   |-- isolated headless web render
+  |-- deterministic typed OS execution substrate
+  |-- adaptive executive DAG planner/coordinator
+  |-- independent state verification and safe gates
+  |-- host fingerprint and verified execution playbooks
+  |-- isolated black-box web_surfer service adapter
   |-- per-answer observable trace
   |-- answer quality dashboard
   |-- capability/current-work manifest

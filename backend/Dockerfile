@@ -7,6 +7,7 @@ ENV JARVIS_HOME=/runtime
 ENV JARVIS_MODEL_ROOT=/runtime/data/models
 ENV HOME=/home/jarvis
 ENV CHROME_BIN=/usr/bin/chromium
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 WORKDIR /app
 
@@ -34,18 +35,22 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 COPY requirements.txt /app/backend/requirements.txt
 RUN pip install --no-cache-dir -r /app/backend/requirements.txt
+RUN python -m playwright install --with-deps --only-shell chromium \
+    && chmod -R a+rX /ms-playwright \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY src /app/backend/src
 COPY --chmod=755 docker-entrypoint.sh /usr/local/bin/jarvis-docker-entrypoint
 
 RUN test -u /usr/lib/chromium/chrome-sandbox \
-    && gosu jarvis chromium --version | grep -q '^Chromium '
+    && gosu jarvis chromium --version | grep -q '^Chromium ' \
+    && gosu jarvis python -c "from playwright.sync_api import sync_playwright; p=sync_playwright().start(); b=p.chromium.launch(headless=True); b.close(); p.stop()"
 
 ENV PYTHONPATH=/app/backend/src
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD gosu jarvis python -c "import os, shutil, urllib.request; assert shutil.which('chromium'); urllib.request.urlopen(f\"http://127.0.0.1:{os.getenv('JARVIS_API_PORT', '8000')}/health\", timeout=3).read()"
+  CMD gosu jarvis python -c "import os, shutil, urllib.request; from pathlib import Path; assert shutil.which('chromium'); assert list(Path(os.environ['PLAYWRIGHT_BROWSERS_PATH']).glob('chromium_headless_shell-*')); urllib.request.urlopen(f\"http://127.0.0.1:{os.getenv('JARVIS_API_PORT', '8000')}/health\", timeout=3).read()"
 
 ENTRYPOINT ["jarvis-docker-entrypoint"]
 CMD ["sh", "-c", "exec uvicorn jarvis_gpt.main:app --host \"${JARVIS_API_HOST:-0.0.0.0}\" --port \"${JARVIS_API_PORT:-8000}\""]

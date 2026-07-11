@@ -37,6 +37,7 @@ from .browser_cdp import (
     run_chrome_action,
     scroll_chrome_page,
 )
+from .cognitive_memory import ExecutionPlaybookStore
 from .config import JarvisSettings
 from .diagnostics import run_diagnostics
 from .dispatcher import DispatcherManager
@@ -54,8 +55,10 @@ from .execution_protocol import (
     ActionClass,
     action_json_schema,
     classify_payload,
+    parse_action,
 )
 from .execution_session import SessionStatus, StepStatus
+from .executive_runtime import ExecutiveCoordinator
 from .host_bridge import HostBridgeClient, HostBridgeStatus
 from .learning import LearningEngine
 from .llm import LLMRouter
@@ -63,6 +66,17 @@ from .model_catalog import ModelCatalog
 from .models import ToolInfo, ToolRunResponse
 from .operations import OperationsManager, _cadence_interval, docker_container_allowed
 from .persona import INSIGHT_FIELDS, PersonaManager, load_persona
+from .redaction import redact_text, redact_value
+from .state_verification import (
+    GateStatus,
+    PathExpectation,
+    ProcessExpectation,
+    SafeGate,
+    StateVerifier,
+    TcpExpectation,
+    VerificationExpectation,
+    VerificationResult,
+)
 from .storage import JarvisStorage, new_id, utc_now
 from .telemetry import TelemetryCollector
 from .web_orchestrator import (
@@ -71,6 +85,7 @@ from .web_orchestrator import (
     WebOrchestrator,
     normalize_web_mode,
 )
+from .web_surfer_adapter import WebSurferAdapter
 
 DangerLevel = Literal["safe", "review", "danger"]
 ToolHandler = Callable[
@@ -246,6 +261,12 @@ class ToolContext:
     storage: JarvisStorage
     llm: LLMRouter
     execution: ExecutionKernel
+    verifier: StateVerifier
+    safe_gate: SafeGate
+    playbooks: ExecutionPlaybookStore | None = None
+    web_surfer: WebSurferAdapter | None = None
+    executive: ExecutiveCoordinator | None = None
+    approved: bool = False
     mission_id: str | None = None
     task_id: str | None = None
 
@@ -269,12 +290,108 @@ class ToolSpec:
         )
 
 
+def _web_surfer_tool_spec() -> ToolSpec:
+    timeout_schema = {"type": "number", "minimum": 0.1, "maximum": 900}
+    return ToolSpec(
+        name="web.surfer",
+        description=(
+            "Invoke the immutable web_surfer service through one of its public "
+            "fast_fact, deep_research, or aggressive_shopping methods."
+        ),
+        category="internet",
+        input_schema={
+            "type": "object",
+            "oneOf": [
+                {
+                    "properties": {
+                        "mode": {"const": "fast_fact"},
+                        "arguments": {
+                            "type": "object",
+                            "properties": {
+                                "query": {"type": "string", "minLength": 1}
+                            },
+                            "required": ["query"],
+                            "additionalProperties": False,
+                        },
+                        "timeout_sec": timeout_schema,
+                    },
+                    "required": ["mode", "arguments"],
+                    "additionalProperties": False,
+                },
+                {
+                    "properties": {
+                        "mode": {"const": "deep_research"},
+                        "arguments": {
+                            "type": "object",
+                            "properties": {
+                                "query": {"type": "string", "minLength": 1},
+                                "max_depth": {
+                                    "type": "integer",
+                                    "minimum": 1,
+                                    "maximum": 8,
+                                },
+                            },
+                            "required": ["query"],
+                            "additionalProperties": False,
+                        },
+                        "timeout_sec": timeout_schema,
+                    },
+                    "required": ["mode", "arguments"],
+                    "additionalProperties": False,
+                },
+                {
+                    "properties": {
+                        "mode": {"const": "aggressive_shopping"},
+                        "arguments": {
+                            "type": "object",
+                            "properties": {
+                                "product_url": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 4096,
+                                }
+                            },
+                            "required": ["product_url"],
+                            "additionalProperties": False,
+                        },
+                        "timeout_sec": timeout_schema,
+                    },
+                    "required": ["mode", "arguments"],
+                    "additionalProperties": False,
+                },
+            ],
+        },
+        handler=_web_surfer_run,
+    )
+
+
 class ToolRegistry:
-    def __init__(self, settings: JarvisSettings, storage: JarvisStorage, llm: LLMRouter) -> None:
+    def __init__(
+        self,
+        settings: JarvisSettings,
+        storage: JarvisStorage,
+        llm: LLMRouter,
+        *,
+        playbooks: ExecutionPlaybookStore | None = None,
+        web_surfer: WebSurferAdapter | None = None,
+        executive: ExecutiveCoordinator | None = None,
+        recover_execution: bool = False,
+    ) -> None:
         self.settings = settings
         self.storage = storage
         self.llm = llm
-        self.execution = build_execution_kernel(settings)
+        self.execution = build_execution_kernel(
+            settings,
+            recover_checkpoints=recover_execution,
+        )
+        self.verifier = self.execution.state_verifier
+        self.safe_gate = SafeGate(
+            path_policy=self.execution.path_policy,
+            sessions=self.execution.sessions,
+        )
+        self.playbooks = playbooks
+        self.web_surfer = web_surfer or WebSurferAdapter()
+        self.executive = executive
         self._tools: dict[str, ToolSpec] = {}
         self._register_defaults()
 
@@ -286,6 +403,14 @@ class ToolRegistry:
 
     def add(self, spec: ToolSpec) -> None:
         self._tools[spec.name] = spec
+
+    def refresh_web_surfer_registration(self) -> None:
+        """Publish the optional black-box tool only after an isolated probe."""
+
+        if self.web_surfer.available:
+            self.add(_web_surfer_tool_spec())
+        else:
+            self._tools.pop("web.surfer", None)
 
     async def run(
         self,
@@ -325,6 +450,12 @@ class ToolRegistry:
                 storage=self.storage,
                 llm=self.llm,
                 execution=self.execution,
+                verifier=self.verifier,
+                safe_gate=self.safe_gate,
+                playbooks=self.playbooks,
+                web_surfer=self.web_surfer,
+                executive=self.executive,
+                approved=allow_danger,
                 mission_id=mission_id,
                 task_id=task_id,
             )
@@ -340,7 +471,7 @@ class ToolRegistry:
                 )
 
         response = _redact_tool_response_credentials(response)
-        recorded_args = _redact_search_credentials(args)
+        recorded_args = redact_value(_redact_search_credentials(args))
         self.storage.record_tool_run(
             tool=response.tool,
             ok=response.ok,
@@ -390,6 +521,41 @@ class ToolRegistry:
                 category="execution",
                 input_schema=_execution_action_tool_schema(),
                 handler=_execution_inspect,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="execution.verify",
+                description=(
+                    "Independently inspect the current postcondition of an exact typed "
+                    "mutation or atomic batch without executing or replaying it."
+                ),
+                category="execution",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "source_tool": {
+                            "type": "string",
+                            "enum": ["execution.apply", "execution.transaction"],
+                        },
+                        "arguments": {"type": "object"},
+                    },
+                    "required": ["source_tool", "arguments"],
+                    "additionalProperties": False,
+                },
+                handler=_execution_verify,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="execution.preflight",
+                description=(
+                    "Simulate one typed mutation/process/control action without applying it; "
+                    "high-risk actions return an exact expiring one-use safe-gate permit."
+                ),
+                category="execution",
+                input_schema=_execution_preflight_tool_schema(),
+                handler=_execution_preflight,
             )
         )
         self.add(
@@ -450,6 +616,71 @@ class ToolRegistry:
                 danger_level="review",
             )
         )
+        self.add(
+            ToolSpec(
+                name="environment.profile",
+                description=(
+                    "Return the verified cold-start host fingerprint used for adaptive planning."
+                ),
+                category="runtime",
+                input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+                handler=_environment_profile,
+            )
+        )
+        if self.executive is not None:
+            self.add(
+                ToolSpec(
+                    name="executive.plan.status",
+                    description=(
+                        "Return the persisted adaptive DAG, ready nodes, assertions, and revisions "
+                        "for a mission."
+                    ),
+                    category="execution",
+                    input_schema={
+                        "type": "object",
+                        "properties": {
+                            "mission_id": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 128,
+                            }
+                        },
+                        "required": ["mission_id"],
+                        "additionalProperties": False,
+                    },
+                    handler=_executive_plan_status,
+                )
+            )
+        self.add(
+            ToolSpec(
+                name="memory.playbooks.lookup",
+                description=(
+                    "Look up local symptom-solution-verification playbooks before executing a task."
+                ),
+                category="memory",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "minLength": 1, "maxLength": 32768},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+                    },
+                    "required": ["query"],
+                    "additionalProperties": False,
+                },
+                handler=_playbook_lookup,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="web.surfer.capabilities",
+                description="Describe the optional Claude-owned web_surfer black-box contract.",
+                category="internet",
+                input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+                handler=_web_surfer_capabilities,
+            )
+        )
+        if self.web_surfer.available:
+            self.add(_web_surfer_tool_spec())
         self.add(
             ToolSpec(
                 name="diagnostics.run",
@@ -1430,8 +1661,79 @@ def _execution_action_tool_schema() -> dict[str, Any]:
             "payload": action_schema,
             "session_id": {"type": ["string", "null"], "minLength": 1, "maxLength": 128},
             "finalize_session": {"type": "boolean", "default": False},
+            "safe_gate_token": {"type": ["string", "null"], "maxLength": 512},
+            "verification": _execution_verification_schema(),
         },
         "required": ["payload"],
+        "additionalProperties": False,
+    }
+
+
+def _execution_preflight_tool_schema() -> dict[str, Any]:
+    action_schema = action_json_schema()
+    definitions = action_schema.pop("$defs", {})
+    return {
+        "type": "object",
+        "$defs": definitions,
+        "properties": {"payload": action_schema},
+        "required": ["payload"],
+        "additionalProperties": False,
+    }
+
+
+def _execution_verification_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "paths": {
+                "type": "array",
+                "maxItems": 32,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "minLength": 1, "maxLength": 32768},
+                        "exists": {"type": "boolean"},
+                        "kind": {"type": ["string", "null"], "enum": [None, "file", "directory"]},
+                        "sha256": {
+                            "type": ["string", "null"],
+                            "pattern": "^[0-9a-fA-F]{64}$",
+                        },
+                        "syntax_valid": {"type": "boolean"},
+                    },
+                    "required": ["path"],
+                    "additionalProperties": False,
+                },
+            },
+            "tcp": {
+                "type": "array",
+                "maxItems": 16,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "host": {"type": "string", "minLength": 1, "maxLength": 253},
+                        "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+                        "reachable": {"type": "boolean"},
+                        "timeout_seconds": {"type": "number", "minimum": 0.05, "maximum": 60},
+                    },
+                    "required": ["host", "port"],
+                    "additionalProperties": False,
+                },
+            },
+            "processes": {
+                "type": "array",
+                "maxItems": 16,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                        "pid": {"type": "integer", "minimum": 1},
+                        "running": {"type": "boolean"},
+                    },
+                    "required": ["session_id", "pid", "running"],
+                    "additionalProperties": False,
+                },
+            },
+        },
         "additionalProperties": False,
     }
 
@@ -1454,6 +1756,11 @@ def _execution_transaction_tool_schema() -> dict[str, Any]:
                 "pattern": "^[A-Za-z][A-Za-z0-9_.:-]{0,127}$",
             },
             "session_id": {"type": ["string", "null"], "minLength": 1, "maxLength": 128},
+            "safe_gate_tokens": {
+                "type": "object",
+                "additionalProperties": {"type": "string", "maxLength": 512},
+            },
+            "verification": _execution_verification_schema(),
         },
         "required": ["actions", "idempotency_key"],
         "additionalProperties": False,
@@ -1485,6 +1792,370 @@ def _execution_session_tool_schema() -> dict[str, Any]:
     }
 
 
+def _execution_preflight(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    payload = args.get("payload")
+    if not isinstance(payload, dict):
+        return ToolRunResponse(
+            tool="execution.preflight",
+            ok=False,
+            summary="A typed execution payload object is required.",
+        )
+    try:
+        action = parse_action(payload)
+        action_class = classify_payload(payload)
+    except (TypeError, ValueError) as exc:
+        return ToolRunResponse(
+            tool="execution.preflight",
+            ok=False,
+            summary=f"Preflight rejected the execution payload: {exc}",
+        )
+    if action_class is ActionClass.READ_ONLY:
+        return ToolRunResponse(
+            tool="execution.preflight",
+            ok=False,
+            summary="Read-only actions do not require a destructive-action preflight.",
+        )
+    decision = ctx.safe_gate.prepare(action)
+    return ToolRunResponse(
+        tool="execution.preflight",
+        ok=decision.status is not GateStatus.DENIED,
+        summary=decision.summary,
+        data={
+            "protocol": "jarvis.safe-gate.v1",
+            "decision": decision.to_dict(),
+            "next": (
+                "Include decision.permit_token as safe_gate_token in the approval payload."
+                if decision.status is GateStatus.PERMIT_REQUIRED
+                else "The typed action may proceed through its normal approval gate."
+            ),
+        },
+    )
+
+
+_EXECUTION_MISSING = object()
+
+
+def _bounded_object_list(value: Any, *, field: str, limit: int) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > limit:
+        raise ValueError(f"{field} must be an array with at most {limit} items")
+    if not all(isinstance(item, dict) for item in value):
+        raise ValueError(f"{field} items must be objects")
+    return value
+
+
+def _required_string(value: Any, field: str, max_length: int) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value) > max_length:
+        raise ValueError(f"{field} must be a non-empty string up to {max_length} characters")
+    return value
+
+
+def _optional_string(value: Any, *, max_length: int) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value or len(value) > max_length:
+        raise ValueError(f"value must be a string up to {max_length} characters")
+    return value
+
+
+def _optional_enum(value: Any, allowed: set[str], *, field: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or value not in allowed:
+        raise ValueError(f"{field} must be one of: {', '.join(sorted(allowed))}")
+    return value
+
+
+def _strict_bool(
+    value: Any,
+    *,
+    field: str,
+    default: bool | object = _EXECUTION_MISSING,
+) -> bool:
+    if value is None and default is not _EXECUTION_MISSING:
+        return bool(default)
+    if not isinstance(value, bool):
+        raise ValueError(f"{field} must be a boolean")
+    return value
+
+
+def _strict_int(
+    value: Any,
+    *,
+    field: str,
+    minimum: int,
+    maximum: int | None = None,
+    default: int | object = _EXECUTION_MISSING,
+) -> int:
+    if value is None and default is not _EXECUTION_MISSING:
+        value = default
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field} must be an integer")
+    if value < minimum or (maximum is not None and value > maximum):
+        raise ValueError(f"{field} is outside the allowed range")
+    return value
+
+
+def _strict_float(
+    value: Any,
+    *,
+    field: str,
+    minimum: float,
+    maximum: float,
+    default: float,
+) -> float:
+    if value is None:
+        value = default
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError(f"{field} must be a number")
+    number = float(value)
+    if not math.isfinite(number) or not minimum <= number <= maximum:
+        raise ValueError(f"{field} is outside the allowed range")
+    return number
+
+
+def _execution_expectation(value: Any) -> VerificationExpectation:
+    if value is None:
+        return VerificationExpectation()
+    if not isinstance(value, dict):
+        raise ValueError("verification must be an object")
+    unknown = set(value) - {"paths", "tcp", "processes"}
+    if unknown:
+        raise ValueError(f"verification contains unknown fields: {', '.join(sorted(unknown))}")
+    paths: list[PathExpectation] = []
+    for item in _bounded_object_list(value.get("paths"), field="verification.paths", limit=32):
+        paths.append(
+            PathExpectation(
+                path=Path(_required_string(item.get("path"), "verification.paths.path", 32768)),
+                exists=_strict_bool(item.get("exists"), default=True, field="exists"),
+                kind=_optional_enum(item.get("kind"), {"file", "directory"}, field="kind"),
+                sha256=_optional_string(item.get("sha256"), max_length=64),
+                syntax_valid=_strict_bool(
+                    item.get("syntax_valid"), default=False, field="syntax_valid"
+                ),
+            )
+        )
+    tcp: list[TcpExpectation] = []
+    for item in _bounded_object_list(value.get("tcp"), field="verification.tcp", limit=16):
+        tcp.append(
+            TcpExpectation(
+                host=_required_string(item.get("host"), "verification.tcp.host", 253),
+                port=_strict_int(
+                    item.get("port"),
+                    field="verification.tcp.port",
+                    minimum=1,
+                    maximum=65535,
+                ),
+                reachable=_strict_bool(item.get("reachable"), default=True, field="reachable"),
+                timeout_seconds=_strict_float(
+                    item.get("timeout_seconds"),
+                    default=3.0,
+                    field="timeout_seconds",
+                    minimum=0.05,
+                    maximum=60.0,
+                ),
+            )
+        )
+    processes: list[ProcessExpectation] = []
+    for item in _bounded_object_list(
+        value.get("processes"), field="verification.processes", limit=16
+    ):
+        processes.append(
+            ProcessExpectation(
+                session_id=_required_string(
+                    item.get("session_id"), "verification.processes.session_id", 128
+                ),
+                pid=_strict_int(
+                    item.get("pid"), field="verification.processes.pid", minimum=1
+                ),
+                running=_strict_bool(item.get("running"), field="running"),
+            )
+        )
+    return VerificationExpectation(tuple(paths), tuple(tcp), tuple(processes))
+
+
+def _execution_gate(
+    ctx: ToolContext,
+    action: Any,
+    permit_token: Any,
+) -> tuple[bool, dict[str, Any]]:
+    token = str(permit_token or "").strip()
+    decision = ctx.safe_gate.consume(action, token) if token else ctx.safe_gate.prepare(action)
+    if token and ctx.approved and decision.status is GateStatus.DENIED:
+        # Review can legitimately outlive the short, in-memory dry-run permit or
+        # cross a runtime restart.  Approval remains bound to the exact action;
+        # repeat the authoritative simulation against current state instead of
+        # treating an expired transport token as permanent authorization failure.
+        decision = ctx.safe_gate.prepare(action)
+    if (
+        ctx.approved
+        and decision.status is GateStatus.PERMIT_REQUIRED
+        and decision.permit_token
+    ):
+        decision = ctx.safe_gate.consume(action, decision.permit_token)
+    return decision.allowed, decision.to_dict()
+
+
+async def _record_execution_playbook(
+    ctx: ToolContext,
+    *,
+    action: Any,
+    tool: str,
+    ok: bool,
+    verification: VerificationResult | None,
+    error: str | None,
+) -> None:
+    # Only a typed action paired with its own independent inspector result may
+    # become reusable execution memory.  LLM prose, remote content and rich
+    # stderr are deliberately excluded: they are data, not future instructions.
+    if (
+        ctx.playbooks is None
+        or tool not in {"execution.apply", "execution.transaction"}
+        or verification is None
+        or verification.action_id != action.action_id
+        or verification.action_kind != type(action).__name__
+        or not verification.evidence
+    ):
+        return
+    target = ""
+    for name in ("path", "destination", "source", "executable", "key", "host", "pid"):
+        value = getattr(action, name, None)
+        if value is not None and value != "":
+            target = f" target={str(value)[:500]}"
+            break
+    outcome = "success" if ok and verification.ok else "failure"
+    symptom = f"{type(action).__name__}{target}: verified state transition {outcome}."
+    solution = f"Execute typed {type(action).__name__} through {tool}."
+    sources = sorted(
+        {
+            re.sub(r"[^a-zA-Z0-9_.:-]", "_", str(item.source))[:80]
+            for item in verification.evidence
+        }
+    )
+    verification_text = (
+        f"independent_verification status={verification.status.value} "
+        f"assertions={len(verification.evidence)} sources={','.join(sources)}"
+    )
+    try:
+        await asyncio.to_thread(
+            ctx.playbooks.record,
+            symptom=symptom,
+            solution=solution,
+            verification=verification_text,
+            outcome=outcome,
+        )
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return
+
+
+def _environment_profile(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunResponse:
+    profile = ctx.storage.get_runtime_value("environment.host_profile", None)
+    if not isinstance(profile, dict):
+        return ToolRunResponse(
+            tool="environment.profile",
+            ok=False,
+            summary="Cold-start host profile is not available.",
+        )
+    return ToolRunResponse(
+        tool="environment.profile",
+        ok=True,
+        summary="Verified cold-start host profile loaded.",
+        data={"profile": profile},
+    )
+
+
+def _executive_plan_status(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    mission_id = str(args.get("mission_id") or "").strip()
+    if not mission_id:
+        return ToolRunResponse(
+            tool="executive.plan.status", ok=False, summary="mission_id is required."
+        )
+    plan = ctx.executive.snapshot(mission_id) if ctx.executive is not None else None
+    if plan is None:
+        return ToolRunResponse(
+            tool="executive.plan.status",
+            ok=False,
+            summary=f"Executive plan not found for mission {mission_id}.",
+        )
+    planner = plan["planner"]
+    return ToolRunResponse(
+        tool="executive.plan.status",
+        ok=True,
+        summary=(
+            f"Executive plan is {planner['status']} at revision {planner['revision']}; "
+            f"{len(planner['ready_step_ids'])} step(s) ready."
+        ),
+        data=plan,
+    )
+
+
+async def _playbook_lookup(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    query = str(args.get("query") or "").strip()
+    if not query:
+        return ToolRunResponse(
+            tool="memory.playbooks.lookup", ok=False, summary="query is required."
+        )
+    if ctx.playbooks is None:
+        return ToolRunResponse(
+            tool="memory.playbooks.lookup",
+            ok=False,
+            summary="Execution playbook storage is unavailable.",
+        )
+    limit = _strict_int(args.get("limit"), field="limit", default=5, minimum=1, maximum=20)
+    records = await asyncio.to_thread(ctx.playbooks.lookup, query, limit=limit)
+    return ToolRunResponse(
+        tool="memory.playbooks.lookup",
+        ok=True,
+        summary=f"Found {len(records)} relevant execution playbook(s).",
+        data={"playbooks": [item.to_dict() for item in records]},
+    )
+
+
+def _web_surfer_capabilities(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunResponse:
+    capabilities = (
+        ctx.web_surfer.capabilities()
+        if ctx.web_surfer is not None
+        else {"protocol": "jarvis.web-surfer-adapter.v1", "available": False}
+    )
+    return ToolRunResponse(
+        tool="web.surfer.capabilities",
+        ok=True,
+        summary=(
+            "Claude-owned web_surfer black box is available."
+            if capabilities.get("available")
+            else "Claude-owned web_surfer black box is not installed."
+        ),
+        data=capabilities,
+    )
+
+
+async def _web_surfer_run(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    if ctx.web_surfer is None:
+        return ToolRunResponse(
+            tool="web.surfer", ok=False, summary="web_surfer adapter is unavailable."
+        )
+    mode = str(args.get("mode") or "").strip()
+    arguments = args.get("arguments")
+    if not isinstance(arguments, dict):
+        return ToolRunResponse(
+            tool="web.surfer", ok=False, summary="arguments must be an object."
+        )
+    timeout = args.get("timeout_sec")
+    result = await ctx.web_surfer.invoke(mode, arguments, timeout_sec=timeout)
+    error = result.error or {}
+    return ToolRunResponse(
+        tool="web.surfer",
+        ok=result.ok,
+        summary=(
+            f"web_surfer.{mode} completed through the immutable adapter."
+            if result.ok
+            else str(error.get("message") or f"web_surfer.{mode} failed.")
+        ),
+        data=result.to_dict(),
+    )
+
+
 def _execution_capabilities(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunResponse:
     return ToolRunResponse(
         tool="execution.capabilities",
@@ -1496,12 +2167,22 @@ def _execution_capabilities(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunR
             "capabilities": execution_capabilities_snapshot(ctx.execution),
             "interfaces": {
                 "read_only": "execution.inspect",
+                "preflight": "execution.preflight",
                 "approved_action": "execution.apply",
                 "atomic_batch": "execution.transaction",
                 "session_state": "execution.session",
                 "session_cancel": "execution.cancel",
                 "external_subsystems": "ToolRegistry adapters; subsystem internals remain isolated",
             },
+            "verification": {
+                "mandatory": True,
+                "mutation_timing": "before checkpoint commit",
+                "process_postcondition_required": True,
+                "safe_gate": "jarvis.safe-gate.v1",
+            },
+            "web_surfer": (
+                ctx.web_surfer.capabilities() if ctx.web_surfer is not None else None
+            ),
         },
     )
 
@@ -1512,6 +2193,94 @@ async def _execution_inspect(ctx: ToolContext, args: dict[str, Any]) -> ToolRunR
         args,
         expected=ActionClass.READ_ONLY,
         tool="execution.inspect",
+    )
+
+
+async def _execution_verify(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    source_tool = str(args.get("source_tool") or "").strip()
+    source_args = args.get("arguments")
+    if source_tool not in {"execution.apply", "execution.transaction"} or not isinstance(
+        source_args, dict
+    ):
+        return ToolRunResponse(
+            tool="execution.verify",
+            ok=False,
+            summary=(
+                "An exact execution.apply or execution.transaction argument object is required."
+            ),
+        )
+    try:
+        expectation = _execution_expectation(source_args.get("verification"))
+        if source_tool == "execution.apply":
+            payload = source_args.get("payload")
+            if not isinstance(payload, dict):
+                raise ValueError("execution.apply payload is required")
+            action = parse_action(payload)
+            if classify_payload(payload) is ActionClass.READ_ONLY:
+                raise ValueError("reconciliation verification requires a mutation/control action")
+            denied = ctx.execution.verification_denial(action, expectation)
+            if denied is not None:
+                raise ValueError(f"verification capability denied: {denied}")
+            verification = await ctx.verifier.verify(
+                action,
+                feedback=None,
+                expectation=expectation,
+            )
+            verifications = (verification,)
+            serialized: Any = verification.to_dict()
+        else:
+            raw_actions = source_args.get("actions")
+            if not isinstance(raw_actions, list) or not 1 <= len(raw_actions) <= 128:
+                raise ValueError("transaction actions must contain between 1 and 128 items")
+            if not all(isinstance(item, dict) for item in raw_actions):
+                raise ValueError("every transaction action must be an object")
+            actions = tuple(parse_action(item) for item in raw_actions)
+            if any(classify_payload(item) is not ActionClass.MUTATION for item in raw_actions):
+                raise ValueError("transaction verification accepts reversible mutations only")
+            if len({action.action_id for action in actions}) != len(actions):
+                raise ValueError("transaction action_id values must be unique")
+            denied = next(
+                (
+                    reason
+                    for action in actions
+                    if (reason := ctx.execution.verification_denial(action, expectation))
+                    is not None
+                ),
+                None,
+            )
+            if denied is not None:
+                raise ValueError(f"verification capability denied: {denied}")
+            verifications = tuple(
+                [
+                    await ctx.verifier.verify(
+                        action,
+                        feedback=None,
+                        expectation=expectation,
+                    )
+                    for action in actions
+                ]
+            )
+            serialized = [item.to_dict() for item in verifications]
+    except (KeyError, TypeError, ValueError) as exc:
+        return ToolRunResponse(
+            tool="execution.verify",
+            ok=False,
+            summary=f"Reconciliation inspection rejected: {exc}",
+        )
+    passed = all(item.ok for item in verifications)
+    return ToolRunResponse(
+        tool="execution.verify",
+        ok=passed,
+        summary=(
+            "Exact current postcondition is independently satisfied without replay."
+            if passed
+            else "Exact current postcondition is not satisfied; no action was replayed."
+        ),
+        data={
+            "source_tool": source_tool,
+            "verification": serialized,
+            "replayed": False,
+        },
     )
 
 
@@ -1531,8 +2300,17 @@ async def _execution_action(
         return ToolRunResponse(tool=tool, ok=False, summary="A typed payload object is required.")
     try:
         action_class = classify_payload(payload)
+        action = parse_action(payload)
+        expectation = _execution_expectation(args.get("verification"))
     except (TypeError, ValueError) as exc:
         return ToolRunResponse(tool=tool, ok=False, summary=f"Invalid execution payload: {exc}")
+    verification_denial = ctx.execution.verification_denial(action, expectation)
+    if verification_denial is not None:
+        return ToolRunResponse(
+            tool=tool,
+            ok=False,
+            summary=f"Verification capability denied: {verification_denial}",
+        )
     if expected is not None and action_class is not expected:
         return ToolRunResponse(
             tool=tool,
@@ -1549,10 +2327,46 @@ async def _execution_action(
             summary="Read-only actions must use execution.inspect.",
             data={"action_class": action_class.value},
         )
+    if action_class is ActionClass.PROCESS and not (
+        expectation.paths or expectation.tcp or expectation.processes
+    ):
+        return ToolRunResponse(
+            tool=tool,
+            ok=False,
+            summary=(
+                "process.run requires an explicit path, TCP, or owned-process "
+                "postcondition before it can start."
+            ),
+        )
+    gate: dict[str, Any] | None = None
+    if tool != "execution.inspect":
+        if not ctx.approved:
+            return ToolRunResponse(
+                tool=tool,
+                ok=False,
+                summary="Typed mutations require an approved execution context.",
+            )
+        allowed, gate = _execution_gate(ctx, action, args.get("safe_gate_token"))
+        if not allowed:
+            return ToolRunResponse(
+                tool=tool,
+                ok=False,
+                summary=str(gate.get("summary") or "Safe gate denied the action."),
+                data={
+                    "safe_gate": gate,
+                    "preflight_required": gate.get("status") == "permit_required",
+                },
+            )
     session_id = str(args.get("session_id") or "").strip() or None
     action_body = payload.get("action") if isinstance(payload.get("action"), dict) else {}
     embedded_session_id = str(action_body.get("session_id") or "").strip() or None
     process_action = action_class is ActionClass.PROCESS
+    postcondition_fingerprint = (
+        ctx.verifier.expectation_fingerprint(expectation) if process_action else None
+    )
+    kernel_manages_session = bool(
+        process_action and action_body.get("kind") == "process.run"
+    )
     if process_action and session_id != embedded_session_id:
         return ToolRunResponse(
             tool=tool,
@@ -1563,7 +2377,57 @@ async def _execution_action(
             ),
         )
     session = None
-    if session_id is not None and not process_action:
+    session_created_here = False
+    terminal_process_replay = False
+    if process_action:
+        kind = str(action_body.get("kind") or "")
+        if session_id is None:
+            return ToolRunResponse(
+                tool=tool,
+                ok=False,
+                summary=(
+                    f"{kind or 'process action'} requires a non-empty session_id "
+                    "for owned-process tracking."
+                ),
+            )
+        session = ctx.execution.sessions.get(session_id)
+        if kind == "process.run" and session is None:
+            try:
+                session = ctx.execution.create_session(session_id=session_id)
+                session_created_here = True
+            except ValueError:
+                # A concurrent request may have created the same durable owner
+                # between lookup and insertion; accept only that exact session.
+                session = ctx.execution.sessions.get(session_id)
+            except (RuntimeError, TypeError) as exc:
+                return ToolRunResponse(
+                    tool=tool,
+                    ok=False,
+                    summary=f"Execution session could not be created: {exc}",
+                )
+        if session is None:
+            return ToolRunResponse(
+                tool=tool,
+                ok=False,
+                summary=f"Unknown process owner session: {session_id}",
+            )
+        if session.status is SessionStatus.CREATED:
+            session.transition(SessionStatus.RUNNING)
+        elif session.status is not SessionStatus.RUNNING:
+            if kind == "process.run":
+                # The kernel checks the exact action id and canonical payload
+                # fingerprint before returning a cache hit.  Let that proven
+                # idempotent replay reach the cache even after its owner session
+                # became terminal; any new/different action still fails in the
+                # kernel's session preparation path without being executed.
+                terminal_process_replay = True
+            else:
+                return ToolRunResponse(
+                    tool=tool,
+                    ok=False,
+                    summary=f"Execution session is not runnable: {session.status.value}.",
+                )
+    elif session_id is not None:
         session = ctx.execution.sessions.get(session_id)
         if session is None:
             return ToolRunResponse(tool=tool, ok=False, summary=f"Unknown session: {session_id}")
@@ -1575,10 +2439,74 @@ async def _execution_action(
                 ok=False,
                 summary=f"Execution session is not runnable: {session.status.value}.",
             )
+    process_baseline = None
+    if process_action and not terminal_process_replay:
+        try:
+            process_baseline = await ctx.verifier.capture_process_baseline(
+                action, expectation
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            if (
+                session_created_here
+                and session is not None
+                and session.status is SessionStatus.RUNNING
+            ):
+                session.add_step(
+                    action="ProcessAction",
+                    status=StepStatus.FAILED,
+                    summary=f"Process baseline capture failed: {type(exc).__name__}: {exc}",
+                )
+                session.transition(SessionStatus.FAILED)
+            return ToolRunResponse(
+                tool=tool,
+                ok=False,
+                summary=f"Process baseline capture failed: {type(exc).__name__}: {exc}",
+            )
+    verification: VerificationResult | None = None
+
+    async def verify_feedback(feedback: Any) -> bool:
+        nonlocal verification
+        verification = await ctx.verifier.verify(
+            action,
+            feedback=feedback,
+            expectation=expectation,
+            process_baseline=process_baseline,
+        )
+        return verification.ok
+
+    async def verify_replay_feedback(feedback: Any) -> bool:
+        nonlocal verification
+        verification = await ctx.verifier.verify(
+            action,
+            feedback=feedback,
+            expectation=expectation,
+            idempotent_replay=True,
+        )
+        return verification.ok
+
+    async def verify_mutation(feedback: tuple[Any, ...]) -> bool:
+        return await verify_feedback(feedback[-1])
+
     try:
-        result = await ctx.execution.execute_payload(payload)
+        result = await ctx.execution.execute_payload(
+            payload,
+            mutation_verifier=(
+                verify_mutation if action_class is ActionClass.MUTATION else None
+            ),
+            action_verifier=(
+                verify_feedback if action_class is not ActionClass.MUTATION else None
+            ),
+            replay_action_verifier=(
+                verify_replay_feedback if action_class is ActionClass.PROCESS else None
+            ),
+            postcondition_fingerprint=postcondition_fingerprint,
+        )
     except asyncio.CancelledError:
-        if session is not None and session.status is SessionStatus.RUNNING:
+        if (
+            session is not None
+            and not kernel_manages_session
+            and session.status is SessionStatus.RUNNING
+        ):
             session.add_step(
                 action=str(action_body.get("kind") or "execution.action"),
                 status=StepStatus.CANCELLED,
@@ -1587,8 +2515,27 @@ async def _execution_action(
             session.transition(SessionStatus.CANCELLED)
         raise
     except (TypeError, ValueError) as exc:
+        if (
+            session is not None
+            and not kernel_manages_session
+            and session.status is SessionStatus.RUNNING
+        ):
+            session.add_step(
+                action=str(action_body.get("kind") or "execution.action"),
+                status=StepStatus.FAILED,
+                summary=f"Execution rejected: {exc}",
+            )
+            session.transition(SessionStatus.FAILED)
         return ToolRunResponse(tool=tool, ok=False, summary=f"Execution rejected: {exc}")
-    if session is not None and not result.replayed:
+    await _record_execution_playbook(
+        ctx,
+        action=action,
+        tool=tool,
+        ok=result.ok,
+        verification=verification,
+        error=result.feedback.error,
+    )
+    if session is not None and not kernel_manages_session and not result.replayed:
         session.add_step(
             action=result.feedback.kind,
             status=StepStatus.SUCCEEDED if result.ok else StepStatus.FAILED,
@@ -1607,8 +2554,17 @@ async def _execution_action(
     return ToolRunResponse(
         tool=tool,
         ok=result.ok,
-        summary=result.feedback.summary,
-        data={"result": result.to_dict(), "session": snapshot},
+        summary=(
+            verification.summary
+            if verification is not None and not verification.ok
+            else result.feedback.summary
+        ),
+        data={
+            "result": result.to_dict(),
+            "verification": verification.to_dict() if verification is not None else None,
+            "safe_gate": gate,
+            "session": snapshot,
+        },
     )
 
 
@@ -1628,11 +2584,78 @@ async def _execution_transaction(ctx: ToolContext, args: dict[str, Any]) -> Tool
             ok=False,
             summary="Every transaction action must be a JSON object.",
         )
+    if not ctx.approved:
+        return ToolRunResponse(
+            tool="execution.transaction",
+            ok=False,
+            summary="Typed transactions require an approved execution context.",
+        )
+    tokens = args.get("safe_gate_tokens") or {}
+    if not isinstance(tokens, dict) or any(
+        not isinstance(key, str) or not isinstance(value, str)
+        for key, value in tokens.items()
+    ):
+        return ToolRunResponse(
+            tool="execution.transaction",
+            ok=False,
+            summary="safe_gate_tokens must map action ids to permit strings.",
+        )
+    try:
+        actions = tuple(parse_action(item) for item in raw_actions)
+        expectation = _execution_expectation(args.get("verification"))
+    except (TypeError, ValueError) as exc:
+        return ToolRunResponse(
+            tool="execution.transaction",
+            ok=False,
+            summary=f"Transaction payload rejected: {exc}",
+        )
+    verification_denial = next(
+        (
+            reason
+            for action in actions
+            if (reason := ctx.execution.verification_denial(action, expectation)) is not None
+        ),
+        None,
+    )
+    if verification_denial is not None:
+        return ToolRunResponse(
+            tool="execution.transaction",
+            ok=False,
+            summary=f"Verification capability denied: {verification_denial}",
+        )
+    gate_results: list[dict[str, Any]] = []
+    for action in actions:
+        allowed, gate = _execution_gate(ctx, action, tokens.get(action.action_id))
+        gate_results.append(gate)
+        if not allowed:
+            return ToolRunResponse(
+                tool="execution.transaction",
+                ok=False,
+                summary=str(gate.get("summary") or "Safe gate denied the transaction."),
+                data={
+                    "safe_gates": gate_results,
+                    "preflight_required": gate.get("status") == "permit_required",
+                },
+            )
+    verification_results: list[VerificationResult] = []
+
+    async def verify_batch(feedback: tuple[Any, ...]) -> bool:
+        verification_results.clear()
+        for action, action_feedback in zip(actions, feedback, strict=True):
+            verified = await ctx.verifier.verify(
+                action,
+                feedback=action_feedback,
+                expectation=expectation,
+            )
+            verification_results.append(verified)
+        return all(item.ok for item in verification_results)
+
     try:
         result = await ctx.execution.execute_transaction_payloads(
             tuple(raw_actions),
             idempotency_key=idempotency_key,
             session_id=session_id,
+            mutation_verifier=verify_batch,
         )
     except asyncio.CancelledError:
         session = ctx.execution.sessions.get(session_id) if session_id else None
@@ -1651,6 +2674,17 @@ async def _execution_transaction(ctx: ToolContext, args: dict[str, Any]) -> Tool
             ok=False,
             summary=f"Transaction rejected: {exc}",
         )
+    for action, feedback, verification in zip(
+        actions, result.feedback, verification_results, strict=False
+    ):
+        await _record_execution_playbook(
+            ctx,
+            action=action,
+            tool="execution.transaction",
+            ok=result.ok and verification.ok,
+            verification=verification,
+            error=feedback.error,
+        )
     return ToolRunResponse(
         tool="execution.transaction",
         ok=result.ok,
@@ -1666,8 +2700,12 @@ async def _execution_transaction(ctx: ToolContext, args: dict[str, Any]) -> Tool
                 "feedback": [item.to_dict() for item in result.feedback],
                 "transaction_status": result.transaction_status,
                 "checkpoint_id": result.checkpoint_id,
+                "failed_action_id": result.failed_action_id,
+                "rollback_errors": list(result.rollback_errors),
                 "replayed": result.replayed,
             },
+            "verification": [item.to_dict() for item in verification_results],
+            "safe_gates": gate_results,
             "session": ctx.execution.sessions.snapshot(session_id) if session_id else None,
         },
     )
@@ -1924,8 +2962,8 @@ def _docker_containers(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunRespon
     )
 
 
-def _dispatcher_status(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunResponse:
-    status = DispatcherManager(ctx.settings).status()
+async def _dispatcher_status(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunResponse:
+    status = await asyncio.to_thread(DispatcherManager(ctx.settings).status)
     return ToolRunResponse(
         tool="dispatcher.status",
         ok=bool(status.get("docker_available")),
@@ -1936,8 +2974,8 @@ def _dispatcher_status(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunRespon
     )
 
 
-def _dispatcher_logs(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunResponse:
-    result = DispatcherManager(ctx.settings).run_compose("logs")
+async def _dispatcher_logs(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunResponse:
+    result = await asyncio.to_thread(DispatcherManager(ctx.settings).run_compose, "logs")
     return ToolRunResponse(
         tool="dispatcher.logs",
         ok=bool(result.get("ok")),
@@ -1946,8 +2984,11 @@ def _dispatcher_logs(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunResponse
     )
 
 
-def _dispatcher_start(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunResponse:
-    result = DispatcherManager(ctx.settings).run_compose("up")
+async def _dispatcher_start(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunResponse:
+    result = await asyncio.to_thread(
+        DispatcherManager(ctx.settings).run_compose_verified,
+        "up",
+    )
     return ToolRunResponse(
         tool="dispatcher.start",
         ok=bool(result.get("ok")),
@@ -1956,8 +2997,11 @@ def _dispatcher_start(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunRespons
     )
 
 
-def _dispatcher_stop(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunResponse:
-    result = DispatcherManager(ctx.settings).run_compose("down")
+async def _dispatcher_stop(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunResponse:
+    result = await asyncio.to_thread(
+        DispatcherManager(ctx.settings).run_compose_verified,
+        "down",
+    )
     return ToolRunResponse(
         tool="dispatcher.stop",
         ok=bool(result.get("ok")),
@@ -2025,6 +3069,81 @@ async def _run_native_bridge_command(
     return native, ok, summary, bridge_data
 
 
+async def _verify_native_action_state(
+    ctx: ToolContext,
+    action: str,
+    payload: dict[str, Any],
+    native: dict[str, Any],
+    timeout_sec: int,
+) -> tuple[bool, dict[str, Any]]:
+    """Independently inspect durable state after a native process launch."""
+
+    if action not in {"process.start", "app.open_and_type", "chrome.launch"}:
+        return True, {"required": False, "reason": "action has no durable process state"}
+    raw_pid = native.get("pid")
+    if not isinstance(raw_pid, int) or isinstance(raw_pid, bool) or raw_pid <= 0:
+        return False, {
+            "required": True,
+            "verified": False,
+            "reason": "native process launch did not return a valid pid",
+        }
+    try:
+        inspected, inspect_ok, inspect_summary, _bridge = await _run_native_bridge_command(
+            ctx,
+            "wmi.query",
+            {
+                "namespace": "root\\cimv2",
+                "class_name": "Win32_Process",
+                "properties": ["ProcessId", "Name", "ExecutablePath"],
+                "filter": f"ProcessId = {raw_pid}",
+                "limit": 1,
+            },
+            min(timeout_sec, 10),
+        )
+    except ValueError as exc:
+        return False, {
+            "required": True,
+            "verified": False,
+            "pid": raw_pid,
+            "reason": str(exc),
+        }
+    items = _nested_native_items(inspected)
+    expected_names: set[str]
+    if action == "chrome.launch":
+        expected_names = {"chrome.exe"}
+    else:
+        requested = PureWindowsPath(str(payload.get("executable") or "")).name.casefold()
+        expected_names = {"mmc.exe"} if requested.endswith(".msc") else {requested}
+    matching = any(
+        isinstance(item, dict)
+        and str(item.get("ProcessId", item.get("process_id", ""))) == str(raw_pid)
+        and str(item.get("Name", item.get("name", ""))).casefold() in expected_names
+        for item in items
+    )
+    verified = inspect_ok and matching
+    return verified, {
+        "required": True,
+        "verified": verified,
+        "pid": raw_pid,
+        "summary": inspect_summary,
+        "evidence": items[:1],
+        "expected_process_names": sorted(expected_names),
+    }
+
+
+def _nested_native_items(value: Any, *, depth: int = 0) -> list[Any]:
+    if depth > 5 or not isinstance(value, dict):
+        return []
+    items = value.get("items")
+    if isinstance(items, list):
+        return items
+    for key in ("data", "result"):
+        nested = _nested_native_items(value.get(key), depth=depth + 1)
+        if nested:
+            return nested
+    return []
+
+
 async def _windows_native(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     action = str(args.get("action") or "capabilities").strip().lower()
     payload = args.get("payload")
@@ -2037,6 +3156,18 @@ async def _windows_native(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResp
         )
     except ValueError as exc:
         return ToolRunResponse(tool="windows.native", ok=False, summary=str(exc))
+    verification: dict[str, Any] = {"required": False}
+    if ok:
+        verified, verification = await _verify_native_action_state(
+            ctx,
+            action,
+            payload,
+            native,
+            timeout_sec,
+        )
+        if not verified:
+            ok = False
+            summary = "Native action returned success, but independent state verification failed."
     return ToolRunResponse(
         tool="windows.native",
         ok=ok,
@@ -2046,6 +3177,7 @@ async def _windows_native(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResp
             "payload": _redact_native_payload(payload),
             "native": native,
             "bridge": bridge_data,
+            "verification": verification,
         },
     )
 
@@ -2176,15 +3308,44 @@ async def _browser_chrome_launch(ctx: ToolContext, args: dict[str, Any]) -> Tool
         timeout_sec=15,
     )
     data = result.get("data") if isinstance(result.get("data"), dict) else result
+    verification: dict[str, Any] = {
+        "ok": False,
+        "status": "skipped",
+        "summary": "Chrome launch did not reach independent CDP verification.",
+    }
+    if result.get("ok"):
+        deadline = asyncio.get_running_loop().time() + 10.0
+        while True:
+            try:
+                status = await chrome_debugger_status(debug_url)
+            except BrowserCdpError as exc:
+                status = {"ok": False, "summary": str(exc)}
+            if status.get("ok") or asyncio.get_running_loop().time() >= deadline:
+                verification = {
+                    "ok": bool(status.get("ok")),
+                    "status": "passed" if status.get("ok") else "failed",
+                    "summary": str(
+                        status.get("summary") or "Chrome DevTools socket is unavailable."
+                    )[:1000],
+                    "debug_url": debug_url,
+                }
+                break
+            await asyncio.sleep(0.25)
+    verified = bool(result.get("ok") and verification["ok"])
     return ToolRunResponse(
         tool="browser.chrome.launch",
-        ok=bool(result.get("ok")),
-        summary=str(result.get("summary") or "Chrome launch requested."),
+        ok=verified,
+        summary=(
+            str(result.get("summary") or "Chrome launch requested.")
+            if verified
+            else "Chrome launch returned but the DevTools endpoint was not reachable."
+        ),
         data={
             "debug_url": debug_url,
             "profile_dir": str(profile_dir),
             "start_url": start_url,
             "bridge": data,
+            "verification": verification,
         },
     )
 
@@ -6682,7 +7843,7 @@ def _filesystem_read_text(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResp
     )
 
 
-def _filesystem_write_text(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+async def _filesystem_write_text(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     try:
         path = _resolve_allowed_path(ctx.settings, str(args.get("path") or ""))
     except ValueError as exc:
@@ -6718,24 +7879,28 @@ def _filesystem_write_text(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRes
             data={"path": str(path)},
         )
 
-    previous_size = path.stat().st_size if path.exists() else 0
-    path.parent.mkdir(parents=True, exist_ok=True)
+    previous = path.read_bytes() if path.exists() else b""
+    encoded = content.encode("utf-8")
     if mode == "append":
-        with path.open("a", encoding="utf-8", newline="") as handle:
-            handle.write(content)
-    else:
-        path.write_text(content, encoding="utf-8", newline="")
-    return ToolRunResponse(
-        tool="filesystem.write_text",
-        ok=True,
-        summary=f"Wrote {len(content)} character(s) to sandboxed path.",
-        data={
+        encoded = previous + encoded
+    payload = {
+        "protocol": "jarvis.execution.v1",
+        "action": {
+            "kind": "fs.write",
+            "action_id": new_id("legacy-write"),
             "path": str(path),
-            "mode": mode,
-            "chars": len(content),
-            "previous_size": previous_size,
-            "size": path.stat().st_size,
+            "content_base64": base64.b64encode(encoded).decode("ascii"),
+            "create_parents": True,
+            "expected_sha256": (
+                hashlib.sha256(previous).hexdigest() if path.exists() else None
+            ),
         },
+    }
+    return await _execution_action(
+        ctx,
+        {"payload": payload},
+        expected=None,
+        tool="filesystem.write_text",
     )
 
 
@@ -7746,9 +8911,37 @@ def _redact_tool_response_credentials(response: ToolRunResponse) -> ToolRunRespo
     return ToolRunResponse(
         tool=response.tool,
         ok=response.ok,
-        summary=str(_redact_search_credentials(response.summary)),
-        data=_redact_search_credentials(response.data),
+        summary=redact_text(_redact_search_credentials(response.summary)),
+        data=_redact_tool_response_data(_redact_search_credentials(response.data)),
     )
+
+
+def _redact_tool_response_data(value: Any) -> Any:
+    """Redact response secrets without destroying typed evidence or one-use permits."""
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for raw_key, nested in value.items():
+            key = str(raw_key)
+            if key.casefold() == "permit_token":
+                # SafeGate permits are intentionally returned once to the caller. The
+                # storage boundary still redacts them before persistence.
+                result[key] = nested
+                continue
+            if nested is None or isinstance(nested, bool | int | float):
+                result[key] = nested
+                continue
+            if isinstance(nested, dict | list | tuple):
+                clean = _redact_tool_response_data(nested)
+                key_probe = redact_value({key: "sensitive"})[key]
+                result[key] = "[redacted]" if key_probe == "[redacted]" else clean
+                continue
+            result[key] = redact_value({key: nested})[key]
+        return result
+    if isinstance(value, list):
+        return [_redact_tool_response_data(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_tool_response_data(item) for item in value)
+    return redact_value(value)
 
 
 def _redact_search_credentials(value: Any) -> Any:

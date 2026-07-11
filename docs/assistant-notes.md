@@ -1106,3 +1106,151 @@ Claude Sync Note
 - macOS/BSD portable `ps` fallback is unit-covered but not exercised on a native macOS/BSD CI
   runner here. Custom app paths remain an operator-owned ACL/policy concern and must be pinned
   explicitly; verify their `available_apps` capability on the target machine.
+
+---
+
+### 2026-07-11 - Sol (Executive Function, Verification, Memory, and release hardening)
+
+Claude Sync Note
+
+[Итоговая карта репозитория и интерфейсы взаимодействия модулей после фазы оркестрации]
+
+- New core modules: `cognitive_memory.py` (host profile + verified playbooks),
+  `execution_filesystem.py` (handle-anchored filesystem operations),
+  `execution_replay.py` (cross-restart transaction replay ledger),
+  `executive_planner.py` (strict adaptive DAG), `executive_runtime.py` (mission/DAG
+  coordinator and action binding), `state_verification.py` (independent inspectors +
+  SafeGate), `runtime_lease.py` (single-primary OS lease), and `redaction.py`.
+- Existing substrate modules were hardened and integrated: `execution_actions.py`,
+  `execution_protocol.py`, `execution_process.py`, `execution_transaction.py`,
+  `execution_kernel.py`, and `execution_session.py`. Integration points are `agent.py`,
+  `approval_executor.py`, `api.py`, `cli.py`, `dispatcher.py`, `storage.py`, and `tools.py`.
+- Web boundary: Claude's bundled `web_surfer.py` is preserved byte-for-byte and connected
+  through `web_surfer_adapter.py`/`web_surfer_worker.py`. Sol did not modify its internals.
+  The existing generic web stack remains independent and is the fail-closed fallback.
+- Persistent structures: `<JARVIS_HOME>/host_profile.json`
+  (`jarvis.host-profile.v1`, stable capability fingerprint + full snapshot digest),
+  `<state>/execution-playbooks.sqlite3` (`jarvis.execution-playbook.v1`),
+  `<state>/execution-replay-journal.json`
+  (`jarvis.execution-replay-journal.v1`), durable checkpoint manifests/WAL, and
+  executive plan/approval reconciliation records in the primary SQLite database.
+- Executive state uses `jarvis.planner.v1` inside `jarvis.executive.v1`. DAG nodes have
+  immutable IDs, explicit dependencies, precondition fingerprints, evidence policy,
+  assertion criteria, bounded attempts, and revision history. Ready-task claiming is
+  dependency-aware and atomic; replanning replaces only unfinished descendants.
+- One `jarvis.primary-runtime-lease.v1` file lock serializes API and mutating CLI access.
+  Cold-start recovery runs under that lease before new mission work. Interrupted approvals
+  use `jarvis.approval-reconciliation.v1`; ambiguous side effects become verify-only DAG
+  branches and are never replayed speculatively.
+- Filesystem mutation now pins directory ancestry/identities throughout checkpoint,
+  mutation, verification, and rollback. Windows uses non-delete-share directory handles
+  and handle-based rename/chmod; POSIX uses `openat`/`dir_fd` + no-follow semantics.
+- Transaction commits write a committed checkpoint WAL record, atomically persist a
+  bounded checksummed replay snapshot, then retire the checkpoint. Cold start and live
+  retry import committed WAL before any possible re-execution; key/fingerprint/result
+  collisions and corrupted snapshots fail closed.
+- Process execution is argv-only and policy-pinned, drains stdout/stderr concurrently,
+  detects total timeout/stall, sends graceful interrupt then kills the owned tree, and
+  returns bounded output, PID tree, permission state, timing, and filesystem diff.
+  Windows Job Objects and POSIX process groups/supervision preserve exact ownership.
+- Bundled web runtime dependencies are pinned in `pyproject.toml`,
+  `backend/requirements.txt`, and `uv.lock`: `playwright==1.61.0`,
+  `beautifulsoup4==4.15.0`, `lxml==6.1.1`, and `playwright-stealth==2.0.3`.
+  Docker provisions the matching Playwright headless Chromium under `/ms-playwright`.
+
+[Формат работы оркестратора и верификатора, спецификации вызовов для Claude]
+
+- Atomic OS envelope remains strict:
+  `{"protocol":"jarvis.execution.v1","action":{"kind":...,"action_id":...}}`.
+  Supported typed families: FS stat/list/read/mkdir/write/copy/move/delete, process
+  run/owned terminate, DNS/TCP inspection, and registry get/set/delete. Unknown fields,
+  relative paths, shell execution, denied roots, and unconfigured capabilities fail closed.
+  `fs.copy`/`fs.move` accept `expected_sha256`; executive `fs.move` requires this source
+  binding.
+- `execution.inspect`/`execution.apply` arguments:
+  `{"payload":<jarvis.execution.v1>,"session_id"?:string,
+  "finalize_session"?:bool,"safe_gate_token"?:string,
+  "verification"?:{"paths"?:[],"tcp"?:[],"processes"?:[]}}`.
+  Read-only actions use `inspect`; mutations/process/control use approval-gated `apply`.
+  `process.run` requires an explicit postcondition and a matching pre-action baseline.
+- `execution.preflight` is dry-run only: `{"payload":<jarvis.execution.v1>}`. It returns
+  `jarvis.safe-gate.v1`; high/critical actions require the returned one-use, action-bound,
+  expiring `permit_token` as `safe_gate_token` during approved execution.
+- `execution.transaction` arguments:
+  `{"actions":[<jarvis.execution.v1>...],"idempotency_key":string,
+  "session_id"?:string,"safe_gate_tokens"?:{action_id:token},
+  "verification"?:{...}}`. Only reversible FS/registry mutations are accepted. Ordered
+  action identity, collective subject/effect binding, verification, commit, and rollback
+  are strict.
+- `execution.verify` arguments:
+  `{"source_tool":"execution.apply|execution.transaction","arguments":<exact original
+  arguments>}`. It re-parses the original action(s), applies filesystem/network/registry
+  capability policy, performs only independent postcondition inspection, returns
+  `replayed:false`, and cannot execute or substitute a second mutation.
+- `StateVerifier` does not trust exit code/log claims. It independently validates file
+  identity/hash/content/syntax, TCP reachability across resolved addresses, exact
+  session-owned PID birth identity, and registry value/type. Mutation verification occurs
+  before checkpoint commit. Dispatcher start/stop and native launch have secondary
+  socket/container/WMI checks.
+- Executive approval contract `jarvis.executive-approval.v1` binds mission, plan revision,
+  step attempt, environment digest, exact tool/arguments hash, semantic subject/effect,
+  action identity, and postcondition digest. Only runtime-minted inspector evidence is
+  accepted. `execution.inspect` discovery exports only intrinsic plan-bound typed subjects;
+  supplemental verification subjects cannot expand downstream mutation authority.
+- Playbook writes are permitted only from a successful typed execution whose exact action
+  identity is confirmed by independent verifier evidence. Stored/retrieved lesson text,
+  model output, stderr, indexed files, and remote content remain untrusted prompt data.
+- Web black-box contract: `JARVIS_WEB_SURFER_MODULE` defaults to the bundled Claude module.
+  The worker recognizes module functions/singletons or constructs the public
+  `JarvisWebSurfer` class, awaits `start()`, and guarantees bounded `close()`/`aclose()`.
+  Public calls are async `fast_fact(query)`, `deep_research(query,max_depth?)`, and
+  `aggressive_shopping(product_url)`. Optional reviewed constructor kwargs (including a
+  resident proxy pool) come from protected `JARVIS_WEB_SURFER_FACTORY_KWARGS_JSON`. After
+  an isolated lifecycle probe, ToolRegistry conditionally
+  publishes `web.surfer` with
+  `{"mode":"fast_fact|deep_research|aggressive_shopping","arguments":{},
+  "timeout_sec"?:number}`. Adapter/worker protocols are
+  `jarvis.web-surfer-adapter.v1` and `jarvis.web-surfer-worker.v1`; bounded framed IPC,
+  recursive credential redaction, worker identity pinning, hard deadlines, tree cleanup,
+  and restart-on-failure are enforced outside the Claude module. Direct shopping targets
+  reject credentials, local/reserved hosts, and any DNS answer that is not globally
+  routable. A nested service `ok:false` remains a failed adapter/tool result.
+- Read APIs: `GET /api/environment/profile`,
+  `GET /api/memory/playbooks?query=...`, `GET /api/executive/plans/{mission_id}`, and
+  `GET /api/internet/web-surfer`. Safe tools: `environment.profile`,
+  `memory.playbooks.lookup`, `executive.plan.status`, `execution.capabilities`, and
+  `web.surfer.capabilities`.
+
+[Измененные/созданные файлы, новые зависимости и структуры данных]
+
+- Production/test/doc changes are contained in the files listed above plus the associated
+  `test_cognitive_memory.py`, `test_execution_replay.py`, `test_executive_*`,
+  `test_runtime_lease.py`, `test_state_verification.py`, `test_web_surfer_*`, and expanded
+  execution/agent/API/approval regression suites. `README.md`, `docs/runtime.md`, and
+  `docs/architecture.md` describe the effective architecture. Dependency pins are listed
+  above and the lockfile is synchronized.
+- Release verification: Windows Python 3.14 full backend `609 passed, 13 skipped`; Python
+  3.11 focused compatibility `228 passed, 12 skipped`; Ruff and compileall clean; targeted
+  final security suite `15 passed`; frontend typecheck/production build pass; npm production
+  audit reports 0 vulnerabilities; PowerShell parser and Compose config pass; uv lock/pip
+  compatibility pass; sdist/wheel build and isolated Python 3.11 wheel CLI smoke pass.
+  The production backend image builds with its Playwright browser provisioned; an actual
+  Compose-configured container successfully constructed, started, probed, and closed
+  Claude's `JarvisWebSurfer` service while the API process occupied container PID 1.
+
+[Pending: Вектор развития системы и конкретные задачи для следующей сессии Claude]
+
+- Claude retains sole ownership of `web_surfer.py`; keep its public class/method contract and
+  do not bypass adapter/worker containment. Next Claude pass: remove the module's hardcoded
+  Chromium `--no-sandbox` argument where the target runtime supports browser sandboxing,
+  and add in-module redirect/subresource public-network enforcement to complement the
+  adapter's direct-target DNS guard. Preserve structured `ok/error` results.
+- Provision and review the production execution-capabilities JSON before enabling process,
+  private-network, or registry actions. Verify exact executable hashes/argv/environment
+  regexes and target prefixes on the deployment host.
+- Add native Linux and macOS/BSD CI runners for platform-specific process-tree and filesystem
+  containment integration coverage. Windows paths, Job Objects, syntax validation, recovery,
+  and release packaging are verified in this phase.
+- No open P0/P1 core defect remains from this phase. Future schema changes must preserve
+  strict parsing, replay fingerprints, approval bindings, and backward-safe storage
+  migration; extend tests before changing any protocol listed above.

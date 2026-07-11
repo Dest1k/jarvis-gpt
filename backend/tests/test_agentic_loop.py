@@ -9,6 +9,7 @@ from jarvis_gpt.approval_executor import ApprovalExecutor
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
 from jarvis_gpt.dispatcher import DispatcherManager
 from jarvis_gpt.event_bus import EventBus
+from jarvis_gpt.executive_runtime import ExecutiveCoordinator
 from jarvis_gpt.llm import LLMStreamChunk
 from jarvis_gpt.storage import JarvisStorage
 
@@ -429,7 +430,16 @@ def test_approval_execution_resumes_blocked_mission_step(monkeypatch, tmp_path):
 
     llm = MissionDangerThenResumeLLM()
     agent, storage = _agent(monkeypatch, tmp_path, llm)
-    mission = agent.create_mission("Проверить дату на хосте")
+    profile = {
+        "schema": "jarvis.host-profile.v1",
+        "fingerprint_sha256": "a" * 64,
+        "host": {"os": {}, "architecture": {}, "accelerators": {}, "tools": {}},
+    }
+    agent.executive = ExecutiveCoordinator(storage=storage, host_profile=profile)
+    agent.tools.executive = agent.executive
+    goal = f"Write {target}"
+    mission = storage.create_mission(title=goal, goal=goal, tasks=[goal])
+    agent.executive.create_for_mission(mission)
 
     blocked = asyncio.run(agent.execute_next_mission_step(mission["id"]))
     approval = storage.list_approvals(limit=1, status="pending")[0]

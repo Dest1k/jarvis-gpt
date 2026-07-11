@@ -262,6 +262,22 @@ def test_storage_mirrors_memory_to_obsidian_like_vault(tmp_path):
     storage.close()
 
 
+def test_memory_vault_rejects_dot_segment_namespace_escape(tmp_path):
+    storage = JarvisStorage(tmp_path / "state" / "jarvis.sqlite3")
+    storage.initialize()
+
+    memory = storage.add_memory(content="Stay inside vault", namespace="..")
+
+    escaped = storage.memory_vault.root.parent / f"{memory['id']}.md"
+    safe = storage.memory_vault.root / "memory" / f"{memory['id']}.md"
+    assert not escaped.exists()
+    assert safe.exists()
+    storage.rebuild_memory_vault()
+    assert not escaped.exists()
+    assert safe.exists()
+    storage.close()
+
+
 def test_storage_consolidates_existing_duplicate_memories(tmp_path):
     storage = JarvisStorage(tmp_path / "state" / "jarvis.sqlite3")
     storage.initialize()

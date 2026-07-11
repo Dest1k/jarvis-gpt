@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .memory_vault import MemoryVault
+from .redaction import redact_value
 
 _QUERY_STOPWORDS = {
     "a",
@@ -350,11 +351,20 @@ def _memory_sort_key(item: dict[str, Any]) -> tuple[float, float, str]:
     )
 
 
+def _sqlite_table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table,),
+    ).fetchone()
+    return row is not None
+
+
 class JarvisStorage:
     def __init__(self, database_path: Path) -> None:
         self.database_path = database_path
         self._lock = threading.RLock()
         self._conn: sqlite3.Connection | None = None
+        self._read_only = False
         self._memory_fts_available = False
         self._file_fts_available = False
         self.memory_vault = MemoryVault(database_path.parent.parent / "memory-vault")
@@ -372,6 +382,36 @@ class JarvisStorage:
         if self._conn is not None:
             self._conn.close()
             self._conn = None
+
+    def open_readonly(self) -> None:
+        """Open an existing database without migrations, WAL changes, or vault sync."""
+
+        with self._lock:
+            if self._conn is not None:
+                return
+            path = self.database_path.resolve(strict=True)
+            if not path.is_file():
+                raise FileNotFoundError(f"Jarvis database is not a file: {path}")
+            conn = sqlite3.connect(
+                f"{path.as_uri()}?mode=ro",
+                uri=True,
+                check_same_thread=False,
+            )
+            try:
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA query_only=ON")
+                conn.execute("PRAGMA foreign_keys=ON")
+                self._memory_fts_available = _sqlite_table_exists(
+                    conn, "memories_fts"
+                )
+                self._file_fts_available = _sqlite_table_exists(
+                    conn, "file_chunks_fts"
+                )
+            except BaseException:
+                conn.close()
+                raise
+            self._conn = conn
+            self._read_only = True
 
     def initialize(self) -> None:
         with self._lock:
@@ -1244,6 +1284,105 @@ class JarvisStorage:
             ).fetchone()
         return dict(row) if row else None
 
+    def add_mission_task(
+        self,
+        mission_id: str,
+        *,
+        title: str,
+        position: int | None = None,
+    ) -> dict[str, Any]:
+        """Append or insert one planner-owned task into an existing mission."""
+
+        clean_title = str(title).strip()
+        if not clean_title:
+            raise ValueError("mission task title is required")
+        now = utc_now()
+        task_id = new_id("task")
+        with self._lock:
+            conn = self.connect()
+            mission = conn.execute("SELECT id FROM missions WHERE id = ?", (mission_id,)).fetchone()
+            if mission is None:
+                raise KeyError(f"unknown mission: {mission_id}")
+            last_position = int(
+                conn.execute(
+                    "SELECT COALESCE(MAX(position), 0) AS value FROM mission_tasks "
+                    "WHERE mission_id = ?",
+                    (mission_id,),
+                ).fetchone()["value"]
+            )
+            selected = last_position + 1 if position is None else int(position)
+            if selected < 1 or selected > last_position + 1:
+                raise ValueError("mission task position is outside the insert range")
+            if selected <= last_position:
+                conn.execute(
+                    "UPDATE mission_tasks SET position = position + 1, updated_at = ? "
+                    "WHERE mission_id = ? AND position >= ?",
+                    (now, mission_id, selected),
+                )
+            conn.execute(
+                """
+                INSERT INTO mission_tasks(
+                    id, mission_id, title, status, notes, position, created_at, updated_at
+                )
+                VALUES (?, ?, ?, 'pending', NULL, ?, ?, ?)
+                """,
+                (task_id, mission_id, clean_title[:500], selected, now, now),
+            )
+            self._refresh_mission_progress(conn, mission_id, now=now)
+            conn.commit()
+            row = conn.execute(
+                "SELECT id, mission_id, title, status, notes, position, created_at, updated_at "
+                "FROM mission_tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("mission task was not persisted")
+        task = dict(row)
+        self.record_audit(
+            actor="system",
+            action="mission.task.add",
+            target_type="mission_task",
+            target_id=task_id,
+            summary=f"Mission task added: {task['title']}",
+            after=task,
+        )
+        return task
+
+    def claim_mission_task(self, mission_id: str, task_id: str) -> dict[str, Any] | None:
+        """Atomically claim a specific DAG-ready task when no sibling is running."""
+
+        now = utc_now()
+        with self._lock:
+            conn = self.connect()
+            row = conn.execute(
+                """
+                UPDATE mission_tasks
+                SET status = 'running', updated_at = ?
+                WHERE id = ? AND mission_id = ? AND status = 'pending'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM mission_tasks AS active
+                      WHERE active.mission_id = ? AND active.status = 'running'
+                  )
+                RETURNING id, mission_id, title, status, notes, position, created_at, updated_at
+                """,
+                (now, task_id, mission_id, mission_id),
+            ).fetchone()
+            if row is None:
+                conn.commit()
+                return None
+            claimed = dict(row)
+            self._refresh_mission_progress(conn, mission_id, now=now)
+            conn.commit()
+        self.record_audit(
+            actor="system",
+            action="mission.task.claim",
+            target_type="mission_task",
+            target_id=task_id,
+            summary=f"DAG mission task claimed: {claimed['title']}",
+            after=claimed,
+        )
+        return claimed
+
     def claim_next_mission_task(self, mission_id: str) -> dict[str, Any] | None:
         """Atomically claim the next task when no sibling task is already running."""
 
@@ -2028,13 +2167,34 @@ class JarvisStorage:
                 raise ValueError(
                     f"Approval cannot transition from {current_status!r} to {status!r}."
                 )
+            sanitized_result = redact_value(result or {})
+            stored_result = (
+                sanitized_result if isinstance(sanitized_result, dict) else {}
+            )
+            payload = before.get("payload")
+            mission_bound = bool(
+                isinstance(payload, dict)
+                and str(payload.get("mission_id") or "").strip()
+                and str(payload.get("task_id") or "").strip()
+            )
+            if status in {"rejected", "cancelled"} and mission_bound:
+                # The approval transition commits before the async executive
+                # callback.  This outbox marker makes that second half durable
+                # across client disconnects and process/power loss.
+                stored_result["reconciliation"] = {
+                    "protocol": "jarvis.approval-reconciliation.v1",
+                    "status": "pending",
+                    "attempts": 0,
+                    "mode": f"operator_{status}",
+                    "created_at": now,
+                }
             cursor = conn.execute(
                 """
                 UPDATE approvals
                 SET status = ?, result = ?, updated_at = ?
                 WHERE id = ? AND status = ?
                 """,
-                (status, _json(result or {}), now, approval_id, current_status),
+                (status, _json(stored_result), now, approval_id, current_status),
             )
             if cursor.rowcount != 1:
                 conn.rollback()
@@ -2058,6 +2218,101 @@ class JarvisStorage:
                 target_type="approval",
                 target_id=approval_id,
                 summary=f"Approval {status}: {updated['title']}",
+                before=before,
+                after=updated,
+            )
+        return updated
+
+    def invalidate_mission_approval(
+        self,
+        approval_id: str,
+        *,
+        reason: str,
+    ) -> dict[str, Any] | None:
+        """Cancel a stale executive capability with reconciliation already complete.
+
+        Environment/plan recovery performs the branch adaptation itself.  Routing
+        this transition through ``update_approval`` would create an operator
+        cancellation outbox entry and later abort the newly adapted branch a
+        second time.  This dedicated transition records, atomically, that the
+        coordinator has already reconciled the invalidated capability.
+        """
+
+        now = utc_now()
+        with self._lock:
+            conn = self.connect()
+            row = conn.execute(
+                """
+                SELECT
+                    id, created_at, updated_at, status, risk, title, description,
+                    requested_action, payload, result
+                FROM approvals
+                WHERE id = ?
+                """,
+                (approval_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            before = _approval_record(row)
+            payload = before.get("payload")
+            claim = payload.get("executive_claim") if isinstance(payload, dict) else None
+            if not (
+                isinstance(payload, dict)
+                and str(payload.get("mission_id") or "").strip()
+                and str(payload.get("task_id") or "").strip()
+                and isinstance(claim, dict)
+                and claim.get("protocol") == "jarvis.executive-approval.v1"
+            ):
+                raise ValueError("Only a mission-bound executive approval can be invalidated.")
+            current_status = str(before.get("status") or "")
+            if current_status not in {"pending", "approved"}:
+                return None
+            safe_reason = redact_value(str(reason)[:2000])
+            if not isinstance(safe_reason, str):
+                safe_reason = "executive approval was invalidated"
+            result = {
+                "ok": False,
+                "reason": safe_reason,
+                "reconciliation": {
+                    "protocol": "jarvis.approval-reconciliation.v1",
+                    "status": "completed",
+                    "attempts": 1,
+                    "mode": "environment_invalidated",
+                    "created_at": now,
+                    "completed_at": now,
+                    "detail": "executive recovery adapted the invalidated branch",
+                },
+            }
+            cursor = conn.execute(
+                """
+                UPDATE approvals
+                SET status = 'cancelled', result = ?, updated_at = ?
+                WHERE id = ? AND status = ?
+                """,
+                (_json(result), now, approval_id, current_status),
+            )
+            if cursor.rowcount != 1:
+                conn.rollback()
+                return None
+            conn.commit()
+            updated_row = conn.execute(
+                """
+                SELECT
+                    id, created_at, updated_at, status, risk, title, description,
+                    requested_action, payload, result
+                FROM approvals
+                WHERE id = ?
+                """,
+                (approval_id,),
+            ).fetchone()
+        updated = _approval_record(updated_row) if updated_row is not None else None
+        if updated is not None:
+            self.record_audit(
+                actor="system",
+                action="approval.invalidate",
+                target_type="approval",
+                target_id=approval_id,
+                summary=f"Executive approval invalidated: {updated['title']}",
                 before=before,
                 after=updated,
             )
@@ -2133,6 +2388,9 @@ class JarvisStorage:
 
         if status not in {"executed", "failed"}:
             raise ValueError("Approval execution status must be 'executed' or 'failed'.")
+        sanitized_result = redact_value(result)
+        if not isinstance(sanitized_result, dict):
+            raise TypeError("Approval execution result must be a JSON object.")
         now = utc_now()
         with self._lock:
             conn = self.connect()
@@ -2155,7 +2413,7 @@ class JarvisStorage:
                 SET status = ?, result = ?, updated_at = ?
                 WHERE id = ? AND status = 'executing'
                 """,
-                (status, _json(result), now, approval_id),
+                (status, _json(sanitized_result), now, approval_id),
             )
             conn.commit()
             if cursor.rowcount != 1:
@@ -2182,6 +2440,190 @@ class JarvisStorage:
                 after=updated,
             )
         return updated
+
+    def recover_interrupted_approval_executions(self) -> list[dict[str, Any]]:
+        """Fail closed approval executions left in-flight by a process exit.
+
+        An ``executing`` approval is an acquired, one-use capability: replaying it
+        after a restart could duplicate an already completed side effect.  Cold
+        start therefore makes the approval terminal and, for mission-bound
+        actions, persists a separate reconciliation obligation.  The obligation
+        remains discoverable until the executive branch has been reconciled.
+        """
+
+        now = utc_now()
+        recovered: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        with self._lock:
+            conn = self.connect()
+            rows = conn.execute(
+                """
+                SELECT
+                    id, created_at, updated_at, status, risk, title, description,
+                    requested_action, payload, result
+                FROM approvals
+                WHERE status = 'executing'
+                ORDER BY updated_at ASC, rowid ASC
+                """
+            ).fetchall()
+            for raw in rows:
+                before = _approval_record(raw)
+                payload = before.get("payload")
+                mission_bound = bool(
+                    isinstance(payload, dict)
+                    and str(payload.get("mission_id") or "").strip()
+                    and str(payload.get("task_id") or "").strip()
+                )
+                result = {
+                    "ok": False,
+                    "summary": (
+                        "Approval execution was interrupted by a runtime restart; "
+                        "the action will not be replayed automatically."
+                    ),
+                    "data": {
+                        "error": "InterruptedApprovalExecution",
+                        "reconcile_only": True,
+                    },
+                    "recovered_at": now,
+                    "reconciliation": {
+                        "protocol": "jarvis.approval-reconciliation.v1",
+                        "status": "pending" if mission_bound else "not_required",
+                        "attempts": 0,
+                    },
+                }
+                cursor = conn.execute(
+                    """
+                    UPDATE approvals
+                    SET status = 'failed', result = ?, updated_at = ?
+                    WHERE id = ? AND status = 'executing'
+                    """,
+                    (_json(result), now, before["id"]),
+                )
+                if cursor.rowcount != 1:
+                    continue
+                after = {**before, "status": "failed", "updated_at": now, "result": result}
+                recovered.append((before, after))
+            conn.commit()
+
+        for before, after in recovered:
+            self.record_audit(
+                actor="system",
+                action="approval.execute.recover",
+                target_type="approval",
+                target_id=after["id"],
+                summary=f"Interrupted approval execution failed closed: {after['title']}",
+                before=before,
+                after=after,
+            )
+        return [after for _before, after in recovered]
+
+    def pending_approval_reconciliations(
+        self,
+        *,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """Return terminal approvals whose mission branch still needs reconciliation."""
+
+        with self._lock:
+            rows = self.connect().execute(
+                """
+                SELECT
+                    id, created_at, updated_at, status, risk, title, description,
+                    requested_action, payload, result
+                FROM approvals
+                WHERE status IN ('failed', 'rejected', 'cancelled')
+                ORDER BY updated_at ASC, rowid ASC
+                """,
+            ).fetchall()
+        approvals = [_approval_record(row) for row in rows]
+        pending = [
+            approval
+            for approval in approvals
+            if isinstance(approval.get("result"), dict)
+            and isinstance(approval["result"].get("reconciliation"), dict)
+            and approval["result"]["reconciliation"].get("protocol")
+            == "jarvis.approval-reconciliation.v1"
+            and approval["result"]["reconciliation"].get("status") == "pending"
+        ]
+        return pending[: max(1, min(int(limit), 1000))]
+
+    def complete_approval_reconciliation(
+        self,
+        approval_id: str,
+        *,
+        detail: str,
+    ) -> dict[str, Any] | None:
+        """Durably acknowledge one completed reconcile-only mission update."""
+
+        now = utc_now()
+        with self._lock:
+            conn = self.connect()
+            row = conn.execute(
+                """
+                SELECT
+                    id, created_at, updated_at, status, risk, title, description,
+                    requested_action, payload, result
+                FROM approvals
+                WHERE id = ? AND status IN ('failed', 'rejected', 'cancelled')
+                """,
+                (approval_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            raw_result = str(row["result"])
+            before = _approval_record(row)
+            result = before.get("result")
+            reconciliation = result.get("reconciliation") if isinstance(result, dict) else None
+            if (
+                not isinstance(reconciliation, dict)
+                or reconciliation.get("protocol") != "jarvis.approval-reconciliation.v1"
+                or reconciliation.get("status") != "pending"
+            ):
+                return None
+            raw_attempts = reconciliation.get("attempts")
+            attempts = (
+                raw_attempts
+                if isinstance(raw_attempts, int) and raw_attempts >= 0
+                else 0
+            )
+            updated_result = {
+                **result,
+                "reconciliation": {
+                    **reconciliation,
+                    "status": "completed",
+                    "attempts": attempts + 1,
+                    "completed_at": now,
+                    "detail": str(detail)[:1000],
+                },
+            }
+            cursor = conn.execute(
+                """
+                UPDATE approvals
+                SET result = ?, updated_at = ?
+                WHERE id = ?
+                  AND status IN ('failed', 'rejected', 'cancelled')
+                  AND result = ?
+                """,
+                (_json(updated_result), now, approval_id, raw_result),
+            )
+            if cursor.rowcount != 1:
+                conn.rollback()
+                return None
+            conn.commit()
+            after = {
+                **before,
+                "updated_at": now,
+                "result": updated_result,
+            }
+        self.record_audit(
+            actor="system",
+            action="approval.reconcile.complete",
+            target_type="approval",
+            target_id=approval_id,
+            summary=f"Approval mission reconciliation completed: {after['title']}",
+            before=before,
+            after=after,
+        )
+        return after
 
     def _refresh_mission_progress(
         self,

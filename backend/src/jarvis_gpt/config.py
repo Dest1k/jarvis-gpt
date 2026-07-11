@@ -159,6 +159,8 @@ class JarvisSettings:
                 "state": str(self.state_dir),
                 "database": str(self.database_path),
                 "memory_vault": str(self.data_dir / "memory-vault"),
+                "host_profile": str(self.home / "host_profile.json"),
+                "execution_playbooks": str(self.state_dir / "execution-playbooks.sqlite3"),
             },
             "llm": {
                 "enabled": self.llm_enabled,

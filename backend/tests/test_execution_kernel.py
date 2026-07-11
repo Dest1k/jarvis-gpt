@@ -2,14 +2,54 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import re
 import sys
 from pathlib import Path
 
 import pytest
-from jarvis_gpt.execution_actions import ProcessAction
+from jarvis_gpt.execution_actions import ProcessAction, _registry_read
+from jarvis_gpt.execution_config import execution_capabilities_snapshot
 from jarvis_gpt.execution_kernel import ExecutionKernel, KernelCapabilities
 from jarvis_gpt.execution_process import ExecutableRule, ProcessRequest
+from jarvis_gpt.execution_transaction import (
+    CheckpointManager,
+    CheckpointStatus,
+    EnvironmentCheckpoint,
+)
+
+
+async def _verified_diagnostic_process(_feedback):
+    return True
+
+
+def test_registry_feedback_redacts_values_with_secret_names():
+    class FakeKey:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    class FakeWinreg:
+        KEY_QUERY_VALUE = 1
+
+        @staticmethod
+        def OpenKey(_hive, _key, _reserved, _access):
+            return FakeKey()
+
+        @staticmethod
+        def QueryValueEx(_handle, _name):
+            return "registry-secret-value", 1
+
+    snapshot = _registry_read(FakeWinreg(), object(), "Software\\Jarvis", "API_TOKEN")
+
+    assert snapshot["exists"] is True
+    assert snapshot["value"] == {
+        "redacted": True,
+        "sha256": hashlib.sha256(b"registry-secret-value").hexdigest(),
+        "size": len(b"registry-secret-value"),
+    }
 
 
 def test_kernel_transactions_and_idempotent_replay(tmp_path):
@@ -39,6 +79,87 @@ def test_kernel_transactions_and_idempotent_replay(tmp_path):
     payload["action"]["content_base64"] = base64.b64encode(b"two").decode()
     with pytest.raises(ValueError, match="reused"):
         asyncio.run(kernel.execute_payload(payload))
+
+
+def test_secondary_kernel_cannot_recover_primary_checkpoints(tmp_path):
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    root.mkdir()
+    target = root / "value.txt"
+    target.write_text("before", encoding="utf-8")
+    primary = ExecutionKernel(allowed_roots=(root,), state_dir=state)
+    checkpoint = primary.checkpoints.create((target,))
+    target.write_text("live mutation", encoding="utf-8")
+
+    secondary = ExecutionKernel(
+        allowed_roots=(root,),
+        state_dir=state,
+        recover_checkpoints=False,
+    )
+
+    assert secondary.recovered_checkpoints == ()
+    assert target.read_text(encoding="utf-8") == "live mutation"
+    assert checkpoint.checkpoint_id in {
+        item.name for item in primary.checkpoints.checkpoint_root.iterdir()
+    }
+
+    recovered = ExecutionKernel(allowed_roots=(root,), state_dir=state)
+    assert recovered.recovered_checkpoints[0].checkpoint_id == checkpoint.checkpoint_id
+    assert target.read_text(encoding="utf-8") == "before"
+
+
+def test_failed_startup_rollback_blocks_mutations_and_transactions(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    root.mkdir()
+    failed = EnvironmentCheckpoint(
+        checkpoint_id="checkpoint_failed_recovery",
+        directory=state / "execution-checkpoints" / "checkpoint_failed_recovery",
+        paths=(),
+        registry=(),
+        status=CheckpointStatus.ROLLBACK_FAILED,
+        rollback_errors=["filesystem target could not be restored"],
+    )
+    monkeypatch.setattr(CheckpointManager, "recover_active", lambda _self: (failed,))
+    kernel = ExecutionKernel(allowed_roots=(root,), state_dir=state)
+    target = root / "blocked.txt"
+    payload = {
+        "protocol": "jarvis.execution.v1",
+        "action": {
+            "kind": "fs.write",
+            "action_id": "blocked-after-recovery",
+            "path": str(target),
+            "content_base64": base64.b64encode(b"must not be written").decode(),
+        },
+    }
+
+    single = asyncio.run(kernel.execute_payload(payload))
+    batch = asyncio.run(
+        kernel.execute_transaction_payloads(
+            (payload,),
+            idempotency_key="blocked-after-recovery-batch",
+        )
+    )
+    capabilities = execution_capabilities_snapshot(kernel)
+
+    assert single.ok is False
+    assert single.transaction_status == "recovery_blocked"
+    assert single.failed_action_id == "startup_recovery"
+    assert "unresolved rollback" in (single.feedback.error or "")
+    assert batch.ok is False
+    assert batch.transaction_status == "recovery_blocked"
+    assert "unresolved rollback" in (batch.feedback[0].error or "")
+    assert target.exists() is False
+    assert kernel.rollback_degraded is True
+    assert kernel.rollback_degraded_checkpoint_ids == ("checkpoint_failed_recovery",)
+    assert capabilities["mutation_gate"] == {
+        "available": False,
+        "status": "rollback_degraded",
+        "unresolved_checkpoint_ids": ["checkpoint_failed_recovery"],
+    }
 
 
 def test_kernel_disables_processes_without_capability(tmp_path):
@@ -76,7 +197,8 @@ def test_kernel_process_is_nontransactional_and_session_recorded(tmp_path):
                     cwd=root,
                 ),
                 session_id=session.session_id,
-            )
+            ),
+            action_verifier=_verified_diagnostic_process,
         )
     )
 
@@ -137,6 +259,80 @@ def test_kernel_atomic_batch_rejects_non_reversible_actions(tmp_path):
         asyncio.run(
             kernel.execute_transaction_payloads((payload,), idempotency_key="invalid-batch")
         )
+
+
+def test_failed_mutation_verification_rolls_back_before_commit(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    target = root / "verified.txt"
+    target.write_text("before", encoding="utf-8")
+    kernel = ExecutionKernel(allowed_roots=(root,), state_dir=tmp_path / "state")
+    payload = {
+        "protocol": "jarvis.execution.v1",
+        "action": {
+            "kind": "fs.write",
+            "action_id": "verify-before-commit",
+            "path": str(target),
+            "content_base64": base64.b64encode(b"after").decode(),
+        },
+    }
+    observations = []
+
+    async def reject(feedback):
+        observations.append((feedback, target.read_text(encoding="utf-8")))
+        return False
+
+    result = asyncio.run(kernel.execute_payload(payload, mutation_verifier=reject))
+
+    assert result.ok is False
+    assert result.transaction_status == "rolled_back"
+    assert result.failed_action_id == "state_verification"
+    assert result.rollback_errors == ()
+    assert observations[0][1] == "after"
+    assert target.read_text(encoding="utf-8") == "before"
+
+
+def test_batch_verification_runs_before_commit_and_replay_is_rechecked(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    kernel = ExecutionKernel(allowed_roots=(root,), state_dir=tmp_path / "state")
+    payloads = tuple(
+        {
+            "protocol": "jarvis.execution.v1",
+            "action": {
+                "kind": "fs.write",
+                "action_id": f"verified-batch-{index}",
+                "path": str(root / f"{index}.txt"),
+                "content_base64": base64.b64encode(str(index).encode()).decode(),
+            },
+        }
+        for index in range(2)
+    )
+    calls = 0
+
+    async def accept(feedback):
+        nonlocal calls
+        calls += 1
+        return len(feedback) == 2 and all((root / f"{index}.txt").exists() for index in range(2))
+
+    first = asyncio.run(
+        kernel.execute_transaction_payloads(
+            payloads,
+            idempotency_key="verified-batch-key",
+            mutation_verifier=accept,
+        )
+    )
+    replay = asyncio.run(
+        kernel.execute_transaction_payloads(
+            payloads,
+            idempotency_key="verified-batch-key",
+            mutation_verifier=accept,
+        )
+    )
+
+    assert first.ok is True
+    assert replay.ok is True and replay.replayed is True
+    assert calls == 2
 
 
 def test_kernel_batch_exception_finalizes_session(tmp_path):
@@ -271,6 +467,55 @@ def test_kernel_serializes_same_action_id_before_any_second_mutation(tmp_path, m
     assert calls == 1
     assert (root / "first.txt").read_bytes() == b"first"
     assert not (root / "second.txt").exists()
+
+
+def test_concurrent_identical_action_rechecks_second_cache_hit(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    kernel = ExecutionKernel(allowed_roots=(root,), state_dir=tmp_path / "state")
+    payload = {
+        "protocol": "jarvis.execution.v1",
+        "action": {
+            "kind": "fs.write",
+            "action_id": "concurrent-replay",
+            "path": str(root / "value.txt"),
+            "content_base64": base64.b64encode(b"value").decode(),
+        },
+    }
+    original_execute = kernel.transactions.execute
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    verifier_calls = 0
+
+    async def delayed_execute(actions, **kwargs):
+        entered.set()
+        await release.wait()
+        return await original_execute(actions, **kwargs)
+
+    async def verifier(_feedback):
+        nonlocal verifier_calls
+        verifier_calls += 1
+        return (root / "value.txt").read_bytes() == b"value"
+
+    monkeypatch.setattr(kernel.transactions, "execute", delayed_execute)
+
+    async def scenario():
+        first = asyncio.create_task(
+            kernel.execute_payload(payload, mutation_verifier=verifier)
+        )
+        await entered.wait()
+        second = asyncio.create_task(
+            kernel.execute_payload(payload, mutation_verifier=verifier)
+        )
+        await asyncio.sleep(0)
+        release.set()
+        return await asyncio.gather(first, second)
+
+    first, second = asyncio.run(scenario())
+
+    assert first.ok is True
+    assert second.ok is True and second.replayed is True
+    assert verifier_calls == 2
 
 
 def test_committed_mutation_records_idempotency_before_honoring_cancellation(
@@ -434,7 +679,12 @@ def test_kernel_requires_per_executable_environment_grammar(tmp_path):
     )
 
     blocked = asyncio.run(blocked_kernel.execute(ProcessAction(request)))
-    allowed = asyncio.run(allowed_kernel.execute(ProcessAction(request)))
+    allowed = asyncio.run(
+        allowed_kernel.execute(
+            ProcessAction(request),
+            action_verifier=_verified_diagnostic_process,
+        )
+    )
 
     assert blocked.ok is False
     assert "environment key" in (blocked.feedback.error or "")
