@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib.util
 import inspect
 import json
 import os
@@ -14,7 +15,7 @@ from dataclasses import dataclass, replace
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, quote_plus, urlparse
 
 from . import persona as persona_module
 from .cognitive_memory import ExecutionPlaybookStore
@@ -2662,6 +2663,27 @@ class AgentRuntime:
         *,
         conversation_id: str | None = None,
     ) -> DirectAction:
+        # Shop-specific price queries ("самую дешёвую X на DNS/Ozon/WB/...") must
+        # go through a real browser: httpx-based web.answer returns 0 sources on
+        # JS/anti-bot catalogs and bails to a useless link. Route them to
+        # web.shop_search first when the browser layer is actually installed;
+        # only fall back to web.answer if that path is unusable. Gating on the
+        # real Playwright presence keeps the offline/CI path (and all existing
+        # shopping tests) unchanged.
+        normalized = message.lower()
+        if (
+            _looks_like_shopping_query(normalized)
+            and _web_surfer_available()
+            and self.tools.get("web.shop_search") is not None
+        ):
+            shop_key = _shop_key_from_message(normalized)
+            if shop_key:
+                shop_action = await self._run_shop_search(
+                    message, shop_key, conversation_id=conversation_id
+                )
+                if shop_action is not None:
+                    return shop_action
+
         answer_action = await self._run_web_answer_engine(
             message=message,
             query=query,
@@ -2815,6 +2837,67 @@ class AgentRuntime:
                 events.extend(open_action.events)
                 answer = f"{answer}\n\n{open_action.answer}"
         return DirectAction(answer=answer, events=events)
+
+    async def _run_shop_search(
+        self,
+        message: str,
+        shop_key: str,
+        *,
+        conversation_id: str | None = None,
+    ) -> DirectAction | None:
+        """Run web.shop_search for a shop-specific price query.
+
+        Returns a ranked answer on success, an honest install-guidance answer
+        when the browser layer is missing, or None (fall back to web.answer) for
+        anti-bot/empty/other soft failures.
+        """
+
+        product = _clean_shopping_subject(message) or message
+        result = await self.tools.run("web.shop_search", {"query": product, "shop": shop_key})
+        data = result.data if isinstance(result.data, dict) else {}
+        event = ChatEvent(
+            type="tool_call",
+            title="web.shop_search",
+            content=result.summary,
+            payload={"tool": "web.shop_search", "ok": result.ok, "shop": shop_key},
+        )
+        if result.ok and data.get("items"):
+            if conversation_id:
+                candidates = [
+                    {
+                        "title": item.get("title"),
+                        "url": item.get("url"),
+                        "price": item.get("price_text"),
+                        "price_value": item.get("price_value"),
+                    }
+                    for item in data.get("items", [])
+                    if item.get("url")
+                ]
+                if candidates:
+                    self._remember_shopping_research(
+                        conversation_id=conversation_id,
+                        query=product,
+                        candidates=candidates,
+                    )
+            return DirectAction(answer=_format_shop_search_answer(data, product), events=[event])
+        if data.get("needs_install"):
+            link = _shop_search_url_for(shop_key, product)
+            lines = [
+                "Чтобы честно сравнить цены в магазине, мне нужен браузерный слой "
+                "(магазины вроде DNS/Ozon отдают каталог только через JavaScript, "
+                "обычный запрос их не читает). Установи его на машине с Jarvis:",
+                "```",
+                "pip install -r backend/requirements-surfer.txt",
+                "playwright install chromium",
+                "```",
+                "После этого повтори запрос — я открою магазин, выставлю город "
+                "(Донецк, иначе Москву) и отсортирую по цене.",
+            ]
+            if link:
+                lines.append(f"\nПока — прямая ссылка на поиск: {link}")
+            return DirectAction(answer="\n".join(lines), events=[event])
+        # Anti-bot / empty / proxy-needed: let web.answer try (no worse than before).
+        return None
 
     async def _run_web_answer_engine(
         self,
@@ -6464,6 +6547,82 @@ def _shopping_domain_hint(normalized: str) -> str:
     if site_filter.startswith("site:"):
         return site_filter.removeprefix("site:")
     return site_filter
+
+
+# Domain (from _shopping_site_filter) -> web.shop_search shop key.
+_SHOP_DOMAIN_TO_KEY = {
+    "dns-shop.ru": "dns",
+    "ozon.ru": "ozon",
+    "wildberries.ru": "wildberries",
+    "market.yandex.ru": "yandex market",
+    "citilink.ru": "citilink",
+    "mvideo.ru": "mvideo",
+    "eldorado.ru": "eldorado",
+}
+
+# Direct search-URL templates for the honest fallback link (no web_surfer import).
+_SHOP_KEY_TO_SEARCH_URL = {
+    "dns": "https://www.dns-shop.ru/search/?q={q}",
+    "ozon": "https://www.ozon.ru/search/?text={q}",
+    "wildberries": "https://www.wildberries.ru/catalog/0/search.aspx?search={q}",
+    "yandex market": "https://market.yandex.ru/search?text={q}",
+    "citilink": "https://www.citilink.ru/search/?text={q}",
+    "mvideo": "https://www.mvideo.ru/product-list-page?q={q}",
+    "eldorado": "https://www.eldorado.ru/search/catalog.php?q={q}",
+}
+
+
+def _web_surfer_available() -> bool:
+    """True when the browser surfer's deps (real Playwright + bs4) are installed.
+
+    When absent, shop_search routing is skipped so the offline/CI web.answer path
+    (and its tests) stays unchanged. The check requires a real on-disk module
+    origin so a stubbed ``playwright`` in ``sys.modules`` (used by unit tests to
+    import web_surfer without the driver) is not mistaken for a real install.
+    """
+
+    def _real(name: str) -> bool:
+        try:
+            spec = importlib.util.find_spec(name)
+        except (ValueError, ModuleNotFoundError, ImportError):
+            return False
+        origin = getattr(spec, "origin", None) if spec is not None else None
+        return bool(origin) and origin not in {"namespace", "built-in", "frozen"}
+
+    return _real("playwright") and _real("bs4")
+
+
+def _shop_key_from_message(normalized: str) -> str | None:
+    """Map a shopping message that names a shop to a web.shop_search shop key."""
+
+    domain = _shopping_domain_hint(normalized)
+    return _SHOP_DOMAIN_TO_KEY.get(domain)
+
+
+def _shop_search_url_for(shop_key: str, query: str) -> str:
+    template = _SHOP_KEY_TO_SEARCH_URL.get(shop_key)
+    return template.format(q=quote_plus(query)) if template else ""
+
+
+def _format_shop_search_answer(data: dict[str, Any], product: str) -> str:
+    items = [item for item in (data.get("items") or []) if item.get("url")]
+    cheapest = data.get("cheapest") if isinstance(data.get("cheapest"), dict) else None
+    lines: list[str] = []
+    subject = product.strip() or "товар"
+    if cheapest:
+        lines.append(
+            f"Самая дешёвая «{subject}»: {cheapest.get('price_text')} — "
+            f"{cheapest.get('title')}\n{cheapest.get('url')}"
+        )
+        lines.append("")
+    lines.append("Все варианты по возрастанию цены:")
+    for index, item in enumerate(items[:8], start=1):
+        price = item.get("price_text") or "цена не считана"
+        lines.append(f"{index}. {price} — {item.get('title')}\n{item.get('url')}")
+    city = str(data.get("city") or "").strip()
+    if city:
+        lines.append(f"\nЦены показаны для города: {city}.")
+    return "\n".join(lines)
 
 
 def _unique_search_queries(candidates: list[str], current_query: str) -> list[str]:

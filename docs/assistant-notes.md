@@ -9,6 +9,42 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-10 - Claude (route shopping chat to web.shop_search)
+
+Fix for "still the exact same answer": `web.shop_search` existed but the chat
+shopping path never called it — `_run_web_research` went straight to
+`web.answer` (0 sources on DNS => the misleading "сайт не отдал данных" link).
+
+- `_run_web_research` now, BEFORE `web.answer`, routes shop-specific price
+  queries to `web.shop_search`: gated on `_looks_like_shopping_query` AND a
+  recognized shop (`_shop_key_from_message` via `_shopping_domain_hint`:
+  dns/ozon/wildberries/citilink/mvideo/eldorado/yandex market) AND
+  `_web_surfer_available()`.
+- `_run_shop_search`: ok+items => ranked cheapest-first answer
+  (`_format_shop_search_answer`, remembers candidates for followups);
+  needs_install => honest actionable message (pip install
+  requirements-surfer.txt + `playwright install chromium` + direct shop link)
+  instead of the misleading fallback; soft-fail (anti-bot/empty) => None =>
+  existing web.answer path runs unchanged.
+- CRITICAL gating decision: `_web_surfer_available()` checks a REAL on-disk
+  Playwright+bs4 install (find_spec origin must be a real file, not a stubbed
+  sys.modules entry). This keeps every existing shopping test unchanged in CI
+  (Playwright absent => hook never fires => web.answer path as before). The
+  feature activates only where Playwright is installed. Without this gate the
+  hook broke 9 Codex shopping tests in test_agent.py that mock tools.run.
+- test_shop_search.py now pops its Playwright stub from sys.modules after
+  importing web_surfer, so it does not poison other tests' availability check.
+- Tests: `backend/tests/test_shop_routing.py` (5) — shop-key detection, answer
+  formatting, DNS query routes to web.shop_search (not web.answer), needs_install
+  actionable message, soft-fail falls through. test_agent 76/76 restored;
+  shop suites 89/89 together. Remaining full-suite failures (executive_runtime,
+  execution_tools, web_surfer_adapter, host_bridge_script, model_hub) PRE-EXIST
+  on this main without my changes (confirmed by stash) — Codex subsystems on
+  Linux; my changes add 0 failures. ruff clean.
+- Operator action still required for it to actually run: on D:\jarvis do
+  `pip install -r backend/requirements-surfer.txt && playwright install chromium`.
+  Until then the hook is dormant and web.answer path is used (unchanged).
+
 ### 2026-07-10 - Claude (shop_search + web.shop_search wiring)
 
 Root cause of "Jarvis can't find the cheapest 5090 on DNS": for dns-shop.ru the

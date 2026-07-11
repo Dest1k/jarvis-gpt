@@ -38,6 +38,12 @@ _stub_playwright()
 
 from jarvis_gpt import web_surfer as ws  # noqa: E402
 
+# web_surfer has resolved its imports; drop the stub (our stub has no __file__)
+# so it does not pollute other tests' Playwright-availability detection.
+if getattr(sys.modules.get("playwright"), "__file__", None) is None:
+    sys.modules.pop("playwright", None)
+    sys.modules.pop("playwright.async_api", None)
+
 _DNS_GRID = """
 <html><body>
 <div class="products-list">
