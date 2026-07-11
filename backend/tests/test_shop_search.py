@@ -555,6 +555,70 @@ def test_wildberries_api_candidates_survive_browser_enrichment_failure(monkeypat
     assert parse_qs(urlparse(captured["url"]).query)["search"] == ["мощный лазер"]
 
 
+def test_wildberries_retries_api_after_incomplete_browser_result(monkeypatch):
+    surfer = ws.JarvisWebSurfer(
+        ws.SurferConfig(headless=True, shopping_budget_sec=20, headful_shop_fallback=False)
+    )
+    surfer._playwright = object()
+    api_calls = 0
+    browser_item = {
+        "title": "Лазер без мощности",
+        "url": "https://www.wildberries.ru/catalog/1/detail.aspx",
+        "price_value": 1000.0,
+    }
+    api_items = [
+        {
+            "title": "Лазер 100 W",
+            "url": "https://www.wildberries.ru/catalog/2/detail.aspx",
+            "metrics": {"power_w": {"value": 100.0, "text": "100 W", "unit": "W"}},
+        },
+        {
+            "title": "Лазер 50 W",
+            "url": "https://www.wildberries.ru/catalog/3/detail.aspx",
+            "metrics": {"power_w": {"value": 50.0, "text": "50 W", "unit": "W"}},
+        },
+    ]
+
+    async def flaky_api(**_kwargs):
+        nonlocal api_calls
+        api_calls += 1
+        if api_calls == 1:
+            raise ws.WebSurferError("temporary rate limit")
+        return ws._shop_search_result(
+            "лазер",
+            "wildberries",
+            ok=True,
+            items=api_items,
+            best=api_items[0],
+            criterion="power_desc",
+            metric_key="power_w",
+            browser_mode="wildberries_catalog_api",
+        )
+
+    async def incomplete_browser(*_args, **_kwargs):
+        return ws._shop_search_result(
+            "лазер",
+            "wildberries",
+            ok=True,
+            items=[browser_item],
+            criterion="power_desc",
+            metric_key="",
+            browser_mode="headless_chromium",
+        )
+
+    monkeypatch.setattr(surfer, "_wildberries_api_shop_search", flaky_api)
+    monkeypatch.setattr(surfer, "_shop_search_impl", incomplete_browser)
+
+    result = asyncio.run(
+        surfer.shop_search("лазер", shop="wildberries", criterion="power_desc")
+    )
+
+    assert api_calls == 2
+    assert result["comparison"]["complete"] is True
+    assert result["best"]["url"].endswith("/2/detail.aspx")
+    assert result["browser_mode"] == "wildberries_catalog_api"
+
+
 def test_shop_search_result_shape():
     ranked = ws._rank_catalog_items(
         ws._extract_catalog_items(_DNS_GRID, base_url="https://www.dns-shop.ru/search/?q=rtx")

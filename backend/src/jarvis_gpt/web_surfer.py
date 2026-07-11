@@ -968,18 +968,49 @@ class JarvisWebSurfer:
                 criterion_label=criterion_label,
             )
         api_fallback: dict[str, Any] | None = None
-        if _normalize_shop(shop) == "wildberries" and not search_url and not cities:
+        wildberries_api_enabled = (
+            _normalize_shop(shop) == "wildberries" and not search_url and not cities
+        )
+
+        async def fetch_wildberries_api(timeout: float) -> dict[str, Any]:
+            return await asyncio.wait_for(
+                self._wildberries_api_shop_search(
+                    query=query,
+                    search_query=neutral_query,
+                    max_items=max_items,
+                    criterion=criterion,
+                    criterion_label=criterion_label,
+                    constraints=constraints,
+                ),
+                timeout=timeout,
+            )
+
+        async def retry_api_for_incomplete(
+            current: dict[str, Any],
+        ) -> dict[str, Any]:
+            nonlocal api_fallback
+            comparison = current.get("comparison") or {}
+            if (
+                not wildberries_api_enabled
+                or criterion in {"price_asc", "price_desc"}
+                or comparison.get("complete")
+            ):
+                return current
             try:
-                api_result = await asyncio.wait_for(
-                    self._wildberries_api_shop_search(
-                        query=query,
-                        search_query=neutral_query,
-                        max_items=max_items,
-                        criterion=criterion,
-                        criterion_label=criterion_label,
-                        constraints=constraints,
-                    ),
-                    timeout=min(12.0, self.config.shopping_budget_sec * 0.25),
+                refreshed = await fetch_wildberries_api(
+                    min(10.0, self.config.shopping_budget_sec * 0.2)
+                )
+            except (TimeoutError, PlaywrightError, WebSurferError, ValueError):
+                return current
+            refreshed_comparison = refreshed.get("comparison") or {}
+            if refreshed.get("items"):
+                api_fallback = refreshed
+            return refreshed if refreshed_comparison.get("complete") else current
+
+        if wildberries_api_enabled:
+            try:
+                api_result = await fetch_wildberries_api(
+                    min(12.0, self.config.shopping_budget_sec * 0.25)
                 )
                 comparison = api_result.get("comparison") or {}
                 if api_result.get("items"):
@@ -1019,7 +1050,7 @@ class JarvisWebSurfer:
                 timeout=primary_timeout,
             )
             if result.get("ok") and result.get("items"):
-                return result
+                return await retry_api_for_incomplete(result)
             primary_error = str(result.get("error") or "no products parsed")
         except TimeoutError:
             primary_error = "shop_search exceeded budget"
@@ -1051,7 +1082,7 @@ class JarvisWebSurfer:
                         timeout=remaining,
                     )
                     if fallback.get("ok") and fallback.get("items"):
-                        return fallback
+                        return await retry_api_for_incomplete(fallback)
                     fallback_error = str(fallback.get("error") or "no products parsed")
                     primary_error = f"{primary_error}; stable Chrome: {fallback_error}"
                 except TimeoutError:

@@ -37,7 +37,7 @@ answer.
   closed instead of falling back to price/search order.
 - Explicit `search_url` is restricted to public URLs on the selected registered
   shop domain; main-frame cross-domain redirects are aborted.
-- Verification: Ruff and `git diff --check` clean; full backend suite `685
+- Verification: Ruff and `git diff --check` clean; full backend suite `686
   passed, 13 skipped`. Live exact-query smoke used `web.shop_search` (not
   `web.answer`), compared 7/24 typed cards, and returned the 100000 mW listing
   with its direct Wildberries product URL plus the seller-data caveat.
