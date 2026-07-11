@@ -9,6 +9,39 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-11 - Codex (source-aware, criterion-aware catalog search)
+
+Fixed the remaining exact failure `а какой самый мощный лазер есть на
+вайлдберрис?` and generalized the path instead of adding a phrase-specific
+answer.
+
+- Added shared `shop_registry.py` for localized aliases and search endpoints
+  (DNS, Ozon, Wildberries including common Russian misspellings/WB/ВБ, Yandex
+  Market, Citilink, M.Video, Eldorado, Regard, Avito, AliExpress). Shopping
+  routing now distinguishes catalog intent from company/news/support/DNS
+  networking questions and compares every explicitly named marketplace.
+- `web.shop_search` now carries an explicit ranking criterion and hard
+  price/rating constraints. Product wording, delivery city, budget and ranking
+  adjectives are separated before search, so e.g. `лазер до 3000 рублей` is
+  searched as `лазер` and filtered afterwards. Arbitrary `до/от` product specs
+  are not misread as prices.
+- Wildberries uses its current catalog JSON API first, merges neutral and one
+  recall-oriented query, deduplicates real product IDs, and returns direct card
+  URLs. Browser fallback parses only real product cards and enriches bounded
+  detail pages/specs on other registered shops.
+- Non-price comparisons use typed compatible metrics (power, speed, capacity,
+  range, runtime, dimensions, weight, rating confidence, review popularity).
+  Units preserve case (`MW` != `mW`, bytes != bits), stock is a tie-break after
+  the requested metric, and a superlative requires at least two comparable
+  cards. Seller claims are explicitly labelled and unsupported criteria fail
+  closed instead of falling back to price/search order.
+- Explicit `search_url` is restricted to public URLs on the selected registered
+  shop domain; main-frame cross-domain redirects are aborted.
+- Verification: Ruff and `git diff --check` clean; full backend suite `685
+  passed, 13 skipped`. Live exact-query smoke used `web.shop_search` (not
+  `web.answer`), compared 9/24 typed cards, and returned the 100000 mW listing
+  with its direct Wildberries product URL plus the seller-data caveat.
+
 ### 2026-07-11 - Codex (exact DNS 5090 + bounded Russian news fixed live)
 
 The previous chat-routing fix was active, but DNS still returned the same answer:

@@ -1,9 +1,9 @@
 """Isolated, production-grade async web-surfing module for the Jarvis agent.
 
-``JarvisWebSurfer`` is a self-contained black box: it accepts high-level
+``JarvisWebSurfer`` is an isolated browser black box: it accepts high-level
 commands, autonomously gathers data of arbitrary complexity, and returns clean
-structured results (dict / Markdown). It has no dependency on the rest of the
-Jarvis codebase and can be dropped into any async Python 3.11+ project.
+structured results (dict / Markdown). Marketplace names and endpoints come from
+Jarvis' small shared shop registry so routing and browser behavior cannot drift.
 
 Four layers are implemented:
 
@@ -41,6 +41,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import random
 import re
 import sys
@@ -51,6 +52,9 @@ from dataclasses import dataclass, field
 from html import unescape
 from typing import Any
 from urllib.parse import parse_qs, quote_plus, unquote, urlencode, urljoin, urlparse
+
+from .shop_registry import get_shop_source, get_shop_source_by_host
+from .shop_registry import shop_search_url as registry_shop_search_url
 
 try:  # BeautifulSoup is required for sanitization.
     from bs4 import BeautifulSoup
@@ -91,10 +95,15 @@ __all__ = [
 ]
 
 
-def shop_search_url(shop: str | None, query: str) -> str:
+def shop_search_url(
+    shop: str | None,
+    query: str,
+    *,
+    criterion: str = "price_asc",
+) -> str:
     """Public helper: build a shop search URL, or '' if the shop is unknown."""
 
-    return _shop_search_url(shop, query)
+    return _shop_search_url(shop, query, criterion=criterion)
 
 LOGGER = logging.getLogger("jarvis.web_surfer")
 
@@ -907,14 +916,15 @@ class JarvisWebSurfer:
         search_url: str | None = None,
         max_items: int = 24,
         cities: Sequence[str] | None = None,
+        criterion: str = "price_asc",
+        criterion_label: str = "",
+        constraints: dict[str, float] | None = None,
     ) -> dict[str, Any]:
-        """Render a shop's search page and return products ranked cheapest-first.
+        """Render a shop catalog and rank products by a requested criterion.
 
-        This is the "найди самую дешёвую X на <магазин>" capability: a real
-        browser renders the JS/anti-bot catalog that httpx cannot read, product
-        tiles are extracted (title + price + url), and the list is sorted by
-        price ascending. Before reading, it tries to set the delivery city from
-        ``cities`` (default Донецк -> Москва) so regional prices are correct.
+        Price comparisons use catalog prices. Other criteria (power, speed,
+        capacity, range, runtime, size, rating, recency) retain typed units and
+        only name a winner when comparable seller-declared metrics exist.
 
         Returns::
 
@@ -922,19 +932,63 @@ class JarvisWebSurfer:
                 "ok": bool, "query": str, "shop": str, "url": str, "city": str,
                 "count": int,
                 "cheapest": {title,url,price_text,price_value} | None,
+                "best": product | None, "comparison": {...},
                 "items": [{title,url,price_text,price_value,in_stock}],
                 "error": str | None,
             }
         """
 
         query = " ".join(str(query or "").split())
-        url = (search_url or "").strip() or _shop_search_url(shop, query)
+        criterion = _normalize_catalog_criterion(criterion)
+        constraints = _normalize_catalog_constraints(constraints)
+        search_query = _catalog_search_query(query, criterion)
+        url = (search_url or "").strip() or _shop_search_url(
+            shop,
+            search_query,
+            criterion=criterion,
+        )
         if not query:
-            return _shop_search_result(query, shop, ok=False, error="empty query")
+            return _shop_search_result(
+                query,
+                shop,
+                ok=False,
+                error="empty query",
+                criterion=criterion,
+                criterion_label=criterion_label,
+            )
         if not url:
             return _shop_search_result(
-                query, shop, ok=False, error=f"unknown shop: {shop!r} (pass search_url)"
+                query,
+                shop,
+                ok=False,
+                error=f"unknown shop: {shop!r} (pass search_url)",
+                criterion=criterion,
+                criterion_label=criterion_label,
             )
+        api_fallback: dict[str, Any] | None = None
+        if _normalize_shop(shop) == "wildberries" and not search_url and not cities:
+            try:
+                api_result = await asyncio.wait_for(
+                    self._wildberries_api_shop_search(
+                        query=query,
+                        search_query=search_query,
+                        max_items=max_items,
+                        criterion=criterion,
+                        criterion_label=criterion_label,
+                        constraints=constraints,
+                    ),
+                    timeout=min(12.0, self.config.shopping_budget_sec * 0.25),
+                )
+                comparison = api_result.get("comparison") or {}
+                if api_result.get("items"):
+                    api_fallback = api_result
+                if api_result.get("items") and (
+                    criterion in {"price_asc", "price_desc"}
+                    or comparison.get("complete")
+                ):
+                    return api_result
+            except (TimeoutError, PlaywrightError, WebSurferError, ValueError):
+                pass
         want_cities = list(cities) if cities else ["Донецк", "Москва"]
         started = time.monotonic()
         primary_error = ""
@@ -949,7 +1003,17 @@ class JarvisWebSurfer:
             primary_timeout = min(primary_timeout, max(5.0, primary_timeout * 0.4))
         try:
             result = await asyncio.wait_for(
-                self._shop_search_impl(query, shop or "", url, max_items, want_cities),
+                self._shop_search_impl(
+                    query,
+                    shop or "",
+                    url,
+                    max_items,
+                    want_cities,
+                    criterion,
+                    criterion_label,
+                    search_query,
+                    constraints,
+                ),
                 timeout=primary_timeout,
             )
             if result.get("ok") and result.get("items"):
@@ -977,6 +1041,10 @@ class JarvisWebSurfer:
                             url,
                             max_items,
                             want_cities,
+                            criterion,
+                            criterion_label,
+                            search_query,
+                            constraints,
                         ),
                         timeout=remaining,
                     )
@@ -989,7 +1057,127 @@ class JarvisWebSurfer:
                 except (PlaywrightError, OSError, WebSurferError) as exc:
                     primary_error = f"{primary_error}; stable Chrome unavailable: {exc}"
 
-        return _shop_search_result(query, shop, url=url, ok=False, error=primary_error)
+        if api_fallback is not None:
+            return api_fallback
+
+        return _shop_search_result(
+            query,
+            shop,
+            url=url,
+            ok=False,
+            error=primary_error,
+            criterion=criterion,
+            criterion_label=criterion_label,
+            search_query=search_query,
+            constraints=constraints,
+        )
+
+    async def _wildberries_api_shop_search(
+        self,
+        *,
+        query: str,
+        search_query: str,
+        max_items: int,
+        criterion: str,
+        criterion_label: str,
+        constraints: dict[str, float],
+    ) -> dict[str, Any]:
+        """Use Wildberries' own public catalog response before browser rendering."""
+
+        if self._playwright is None:
+            raise WebSurferError("Playwright is not started")
+        sort = (
+            "priceup"
+            if criterion == "price_asc"
+            else "pricedown"
+            if criterion == "price_desc"
+            else "popular"
+        )
+        params = {
+            "appType": "1",
+            "curr": "rub",
+            "dest": "-1257786",
+            "lang": "ru",
+            "locale": "ru",
+            "query": search_query,
+            "resultset": "catalog",
+            "sort": sort,
+            "spp": "30",
+            "suppressSpellcheck": "false",
+        }
+        request = await self._playwright.request.new_context(
+            extra_http_headers={
+                "Accept": "application/json, text/plain, */*",
+                "Referer": "https://www.wildberries.ru/",
+                "User-Agent": self._next_user_agent(),
+            }
+        )
+        found_items: list[dict[str, Any]] = []
+        seen_product_ids: set[str] = set()
+        try:
+            for variant in _catalog_search_variants(query, criterion):
+                params["query"] = variant
+                for version in ("v14", "v9"):
+                    url = (
+                        "https://search.wb.ru/exactmatch/ru/common/"
+                        f"{version}/search?{urlencode(params)}"
+                    )
+                    response = await request.get(url, timeout=8_000)
+                    if response.status != 200:
+                        continue
+                    parsed = await response.json()
+                    if not isinstance(parsed, dict):
+                        continue
+                    variant_items = _wildberries_api_items(parsed)
+                    for item in variant_items:
+                        product_id = str(item.get("product_id") or "")
+                        if product_id in seen_product_ids:
+                            continue
+                        seen_product_ids.add(product_id)
+                        found_items.append(item)
+                    if variant_items:
+                        break
+        finally:
+            with suppress(Exception):
+                await request.dispose()
+        items = _filter_catalog_items_for_query(
+            found_items,
+            query,
+        )
+        items = _filter_catalog_constraints(items, constraints)
+        for item in items:
+            _attach_catalog_metrics(item)
+        metric_key = _select_catalog_metric_key(items, criterion)
+        ranked = _rank_catalog_items(
+            items,
+            criterion=criterion,
+            metric_key=metric_key,
+        )[:max_items]
+        priced = [
+            item
+            for item in ranked
+            if item.get("price_value") is not None and item.get("in_stock") is not False
+        ]
+        cheapest = min(priced, key=lambda item: float(item["price_value"])) if priced else None
+        best = _best_catalog_item(ranked, criterion=criterion, metric_key=metric_key)
+        return _shop_search_result(
+            query,
+            "wildberries",
+            ok=bool(ranked),
+            url=_shop_search_url("wildberries", search_query, criterion=criterion),
+            city="Москва",
+            items=ranked,
+            cheapest=cheapest,
+            best=best,
+            error=None if ranked else "Wildberries API returned no matching products",
+            browser_mode="wildberries_catalog_api",
+            price_sort_confirmed=criterion in {"price_asc", "price_desc"},
+            criterion=criterion,
+            criterion_label=criterion_label,
+            metric_key=metric_key,
+            search_query=search_query,
+            constraints=constraints,
+        )
 
     async def _shop_search_impl(
         self,
@@ -998,6 +1186,10 @@ class JarvisWebSurfer:
         url: str,
         max_items: int,
         cities: list[str],
+        criterion: str,
+        criterion_label: str,
+        search_query: str,
+        constraints: dict[str, float],
     ) -> dict[str, Any]:
         context = await self._new_context()
         try:
@@ -1011,6 +1203,10 @@ class JarvisWebSurfer:
                 cities=cities,
                 wait_for_challenge=False,
                 browser_mode="headless_chromium",
+                criterion=criterion,
+                criterion_label=criterion_label,
+                search_query=search_query,
+                constraints=constraints,
             )
         finally:
             with suppress(Exception):
@@ -1023,6 +1219,10 @@ class JarvisWebSurfer:
         url: str,
         max_items: int,
         cities: list[str],
+        criterion: str,
+        criterion_label: str,
+        search_query: str,
+        constraints: dict[str, float],
     ) -> dict[str, Any]:
         """Retry a blocked catalog in the installed stable Chrome.
 
@@ -1059,6 +1259,10 @@ class JarvisWebSurfer:
                 cities=cities,
                 wait_for_challenge=True,
                 browser_mode="headful_stable_chrome",
+                criterion=criterion,
+                criterion_label=criterion_label,
+                search_query=search_query,
+                constraints=constraints,
             )
         finally:
             if context is not None:
@@ -1078,14 +1282,20 @@ class JarvisWebSurfer:
         cities: list[str],
         wait_for_challenge: bool,
         browser_mode: str,
+        criterion: str,
+        criterion_label: str,
+        search_query: str,
+        constraints: dict[str, float],
     ) -> dict[str, Any]:
+        await _install_shop_navigation_guard(page, shop=shop, initial_url=url)
         response = await self._goto(page, url, wait_until="domcontentloaded")
         if wait_for_challenge:
             # Qrator initially answers 401, runs a browser proof-of-work, then
             # replaces the page with the catalog without a normal navigation.
             with suppress(PlaywrightError, PlaywrightTimeoutError):
                 await page.wait_for_selector(
-                    "a[href*='/product/'], .catalog-product",
+                    "a[href*='/product/'], a[href*='/detail.aspx'], "
+                    ".catalog-product, article.product-card",
                     timeout=10_000,
                 )
         await self._human_mouse_move(page)
@@ -1093,12 +1303,13 @@ class JarvisWebSurfer:
         if not city:
             with suppress(PlaywrightError):
                 city = _city_label_from_cookies(await page.context.cookies())
-        sorted_url = _shop_price_sorted_url(shop, page.url or url)
+        sorted_url = _shop_price_sorted_url(shop, page.url or url, criterion=criterion)
         if sorted_url and sorted_url != (page.url or ""):
             with suppress(PlaywrightError, PlaywrightTimeoutError, NavigationError):
                 response = await self._goto(page, sorted_url, wait_until="domcontentloaded")
                 await page.wait_for_selector(
-                    "a[href*='/product/'], .catalog-product",
+                    "a[href*='/product/'], a[href*='/detail.aspx'], "
+                    ".catalog-product, article.product-card",
                     timeout=10_000,
                 )
         with suppress(PlaywrightError):
@@ -1114,14 +1325,39 @@ class JarvisWebSurfer:
             _extract_catalog_items(html, base_url=page.url or url),
             query,
         )
-        ranked = _rank_catalog_items(items)[:max_items]
+        price_constraints = {
+            key: value
+            for key, value in constraints.items()
+            if key in {"min_price", "max_price"}
+        }
+        items = _filter_catalog_constraints(items, price_constraints)
+        if criterion not in {"price_asc", "price_desc"} or "min_rating" in constraints:
+            if _normalize_shop(shop) == "wildberries":
+                await _enrich_wildberries_catalog_items(page.context, items[:max_items])
+            else:
+                await self._enrich_generic_catalog_items(
+                    page.context,
+                    items[:8],
+                    shop=shop,
+                )
+        items = _filter_catalog_constraints(items, constraints)
+        for item in items:
+            _attach_catalog_metrics(item)
+        metric_key = _select_catalog_metric_key(items, criterion)
+        ranked = _rank_catalog_items(
+            items,
+            criterion=criterion,
+            metric_key=metric_key,
+        )[:max_items]
         priced = [
             item
             for item in ranked
             if item.get("price_value") is not None and item.get("in_stock") is not False
         ]
+        cheapest = min(priced, key=lambda item: float(item["price_value"])) if priced else None
+        best = _best_catalog_item(ranked, criterion=criterion, metric_key=metric_key)
         error = None
-        if not priced:
+        if not ranked:
             status = getattr(response, "status", None)
             title = ""
             with suppress(PlaywrightError):
@@ -1130,9 +1366,7 @@ class JarvisWebSurfer:
             if title:
                 detail = f"{detail} {title}".strip()
             reason = (
-                "matching products are out of stock or have no readable price"
-                if ranked
-                else "no matching products parsed"
+                "no matching products parsed"
             )
             error = f"{detail}: {reason}".lstrip(": ")
         return _shop_search_result(
@@ -1140,13 +1374,76 @@ class JarvisWebSurfer:
             shop,
             url=page.url or url,
             city=city,
-            ok=bool(priced),
+            ok=bool(ranked),
             items=ranked,
-            cheapest=priced[0] if priced else None,
+            cheapest=cheapest,
+            best=best,
             error=error,
             browser_mode=browser_mode,
-            price_sort_confirmed=_shop_price_sort_confirmed(shop, page.url or url),
+            price_sort_confirmed=_shop_price_sort_confirmed(
+                shop,
+                page.url or url,
+                criterion=criterion,
+            ),
+            criterion=criterion,
+            criterion_label=criterion_label,
+            metric_key=metric_key,
+            search_query=search_query,
+            constraints=constraints,
         )
+
+    async def _enrich_generic_catalog_items(
+        self,
+        context: BrowserContext,
+        items: Sequence[dict[str, Any]],
+        *,
+        shop: str,
+    ) -> None:
+        """Read a bounded set of product cards when catalog tiles omit specs."""
+
+        semaphore = asyncio.Semaphore(3)
+
+        async def enrich(item: dict[str, Any]) -> None:
+            product_url = str(item.get("url") or "")
+            if not product_url.startswith(("http://", "https://")):
+                return
+            page: Page | None = None
+            try:
+                async with semaphore:
+                    page = await self._new_page(context)
+                    await _install_shop_navigation_guard(
+                        page,
+                        shop=shop,
+                        initial_url=product_url,
+                    )
+                    await self._goto(page, product_url, wait_until="domcontentloaded")
+                    with suppress(PlaywrightError):
+                        await page.wait_for_load_state("networkidle", timeout=4_000)
+                    specs = await self._extract_specs(page)
+                    html = ""
+                    with suppress(PlaywrightError):
+                        html = await page.content()
+                    jsonld = self._extract_jsonld(html) if html else []
+                    rating = _extract_rating(jsonld)
+                    body = ""
+                    with suppress(PlaywrightError):
+                        body = _collapse(await page.locator("body").inner_text(timeout=3_000))
+                if specs:
+                    item["specs"] = specs
+                if body:
+                    item["description"] = body[:2400]
+                if isinstance(rating.get("value"), int | float):
+                    item["rating_value"] = float(rating["value"])
+                if isinstance(rating.get("count"), int):
+                    item["review_count"] = int(rating["count"])
+            except (NavigationError, PlaywrightError, PlaywrightTimeoutError):
+                return
+            finally:
+                if page is not None:
+                    with suppress(Exception):
+                        await page.close()
+
+        await asyncio.gather(*(enrich(item) for item in items), return_exceptions=True)
 
     async def _try_set_city(self, page: Page, cities: Sequence[str]) -> str:
         """Best-effort delivery-city selection; returns the chosen city or ''."""
@@ -1690,60 +1987,62 @@ def _fast_fact_result(
     }
 
 
-# Search-URL templates for major RU shops/marketplaces. {q} is url-encoded.
-_SHOP_SEARCH_TEMPLATES: dict[str, str] = {
-    "dns": "https://www.dns-shop.ru/search/?q={q}&order=price&stock=all",
-    "citilink": "https://www.citilink.ru/search/?text={q}",
-    "mvideo": "https://www.mvideo.ru/product-list-page?q={q}",
-    "eldorado": "https://www.eldorado.ru/search/catalog.php?q={q}",
-    "ozon": "https://www.ozon.ru/search/?text={q}&sorting=price",
-    "wildberries": "https://www.wildberries.ru/catalog/0/search.aspx?search={q}",
-    "yandex market": "https://market.yandex.ru/search?text={q}",
-    "regard": "https://www.regard.ru/catalog?search={q}",
-}
-
-# Shop name aliases (RU/EN) -> canonical key above.
-_SHOP_ALIASES: dict[str, str] = {
-    "dns": "dns",
-    "днс": "dns",
-    "dns-shop": "dns",
-    "dns-shop.ru": "dns",
-    "ситилинк": "citilink",
-    "citilink": "citilink",
-    "мвидео": "mvideo",
-    "m.видео": "mvideo",
-    "mvideo": "mvideo",
-    "эльдорадо": "eldorado",
-    "eldorado": "eldorado",
-    "озон": "ozon",
-    "ozon": "ozon",
-    "вайлдберриз": "wildberries",
-    "вб": "wildberries",
-    "wildberries": "wildberries",
-    "wb": "wildberries",
-    "яндекс маркет": "yandex market",
-    "яндекс.маркет": "yandex market",
-    "yandex market": "yandex market",
-    "регард": "regard",
-    "regard": "regard",
-}
-
-
 def _normalize_shop(shop: str | None) -> str:
-    key = str(shop or "").strip().lower().replace("ё", "е")
-    return _SHOP_ALIASES.get(key, key)
+    source = get_shop_source(shop)
+    return source.key if source else str(shop or "").strip().casefold().replace("ё", "е")
 
 
-def _shop_search_url(shop: str | None, query: str) -> str:
-    template = _SHOP_SEARCH_TEMPLATES.get(_normalize_shop(shop))
-    if not template:
+async def _install_shop_navigation_guard(
+    page: Page,
+    *,
+    shop: str | None,
+    initial_url: str,
+) -> None:
+    """Abort main-frame redirects outside the selected registered shop."""
+
+    source = get_shop_source(shop) or get_shop_source_by_host(urlparse(initial_url).hostname)
+    if source is None:
+        raise NavigationError("shop URL is not associated with a registered source")
+
+    async def guard(route: Any) -> None:
+        request = route.request
+        hostname = (urlparse(request.url).hostname or "").casefold()
+        same_shop = hostname == source.domain or hostname.endswith(f".{source.domain}")
+        is_main_navigation = False
+        with suppress(PlaywrightError):
+            is_main_navigation = (
+                request.is_navigation_request() and request.frame == page.main_frame
+            )
+        if is_main_navigation and not same_shop:
+            await route.abort("blockedbyclient")
+            return
+        await route.continue_()
+
+    await page.route("**/*", guard)
+
+
+def _shop_search_url(
+    shop: str | None,
+    query: str,
+    *,
+    criterion: str = "price_asc",
+) -> str:
+    url = registry_shop_search_url(shop, query)
+    if not url:
         return ""
-    return template.format(q=quote_plus(query))
+    return _shop_price_sorted_url(shop, url, criterion=criterion)
 
 
-def _shop_price_sorted_url(shop: str | None, url: str) -> str:
+def _shop_price_sorted_url(
+    shop: str | None,
+    url: str,
+    *,
+    criterion: str = "price_asc",
+) -> str:
     """Reapply a shop's price sort after anti-bot and city redirects."""
 
+    if criterion != "price_asc":
+        return url
     normalized_shop = _normalize_shop(shop)
     parsed = urlparse(url)
     if normalized_shop == "dns" or (parsed.hostname or "").endswith("dns-shop.ru"):
@@ -1758,7 +2057,14 @@ def _shop_price_sorted_url(shop: str | None, url: str) -> str:
     return url
 
 
-def _shop_price_sort_confirmed(shop: str | None, url: str) -> bool:
+def _shop_price_sort_confirmed(
+    shop: str | None,
+    url: str,
+    *,
+    criterion: str = "price_asc",
+) -> bool:
+    if criterion != "price_asc":
+        return False
     normalized_shop = _normalize_shop(shop)
     query = parse_qs(urlparse(url).query)
     if normalized_shop == "dns":
@@ -1774,7 +2080,8 @@ _CATALOG_PRICE_RE = re.compile(
     flags=re.IGNORECASE,
 )
 _PRODUCT_HREF_RE = re.compile(
-    r"/(?:product|catalog|goods|p|item|detail|dp|context/detail)/", re.IGNORECASE
+    r"/(?:product(?:s)?|catalog|goods|p|item|detail|dp|card|context/detail)(?:/|--)",
+    re.IGNORECASE,
 )
 
 
@@ -1790,6 +2097,9 @@ def _extract_catalog_items(html: str, *, base_url: str = "") -> list[dict[str, A
     except Exception:  # noqa: BLE001 - lxml optional
         soup = BeautifulSoup(html, "html.parser")
 
+    wildberries_items = _catalog_from_wildberries(soup, base_url)
+    if wildberries_items:
+        return wildberries_items
     items = _catalog_from_jsonld(soup, base_url)
     if len(items) >= 2:
         return items
@@ -1802,6 +2112,13 @@ def _extract_catalog_items(html: str, *, base_url: str = "") -> list[dict[str, A
         title = _collapse(anchor.get_text(" ", strip=True))
         href = str(anchor.get("href") or "")
         if len(title) < 8 or not _PRODUCT_HREF_RE.search(href):
+            continue
+        host = (urlparse(base_url).hostname or "").casefold()
+        if host.endswith("wildberries.ru") and not re.search(
+            r"/catalog/\d+/detail\.aspx(?:$|[?#])",
+            href,
+            flags=re.IGNORECASE,
+        ):
             continue
         if (urlparse(base_url).hostname or "").endswith("dns-shop.ru") and not re.search(
             r"/product/", href, flags=re.IGNORECASE
@@ -1826,6 +2143,93 @@ def _extract_catalog_items(html: str, *, base_url: str = "") -> list[dict[str, A
             }
         )
     return results
+
+
+def _catalog_from_wildberries(soup: Any, base_url: str) -> list[dict[str, Any]]:
+    host = (urlparse(base_url).hostname or "").casefold()
+    if not host.endswith("wildberries.ru"):
+        return []
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for card in soup.select("article.product-card[data-nm-id]"):
+        if not isinstance(card, Tag):
+            continue
+        product_id = str(card.get("data-nm-id") or "").strip()
+        anchor = card.select_one("a[href*='/detail.aspx']")
+        if not product_id.isdigit() or not isinstance(anchor, Tag):
+            continue
+        href = str(anchor.get("href") or "")
+        if not re.search(r"/catalog/\d+/detail\.aspx(?:$|[?#])", href, re.IGNORECASE):
+            continue
+        url = urljoin(base_url, href)
+        if url in seen:
+            continue
+        title = _collapse(str(anchor.get("aria-label") or ""))
+        if not title:
+            title_node = card.select_one(".product-card__brand-wrap")
+            title = _collapse(title_node.get_text(" ", strip=True) if title_node else "")
+        if len(title) < 3:
+            continue
+        price_node = card.select_one("ins")
+        price_text = _collapse(price_node.get_text(" ", strip=True) if price_node else "")
+        if not price_text:
+            price_text = _nearest_price(anchor)
+        if price_text and "₽" not in price_text:
+            price_text = f"{price_text} ₽"
+        lines = [_collapse(value) for value in card.stripped_strings if _collapse(value)]
+        rating_value: float | None = None
+        review_count: int | None = None
+        for index, line in enumerate(lines[:-1]):
+            if not re.fullmatch(r"[1-5](?:[,.]\d)?", line):
+                continue
+            count_match = re.search(r"(\d[\d\s]*)\s+(?:оцен|отзыв)", lines[index + 1])
+            if not count_match:
+                continue
+            rating_value = float(line.replace(",", "."))
+            review_count = int(re.sub(r"\D", "", count_match.group(1)))
+            break
+        image = card.select_one("img")
+        image_url = ""
+        if isinstance(image, Tag):
+            image_url = str(
+                image.get("src")
+                or image.get("data-src-pb")
+                or image.get("data-original")
+                or ""
+            )
+        details_url = _wildberries_details_url(image_url, product_id)
+        seen.add(url)
+        items.append(
+            {
+                "title": title[:300],
+                "url": url,
+                "product_id": product_id,
+                "price_text": price_text,
+                "price_value": _parse_amount(price_text),
+                "in_stock": None,
+                "rating_value": rating_value,
+                "review_count": review_count,
+                "source_text": " ".join(lines)[:1500],
+                "details_url": details_url,
+            }
+        )
+    return items
+
+
+def _wildberries_details_url(image_url: str, product_id: str) -> str:
+    parsed = urlparse(image_url)
+    if not (parsed.hostname or "").endswith(".wbbasket.ru"):
+        return ""
+    marker = f"/{product_id}/images/"
+    if marker not in parsed.path:
+        return ""
+    prefix = parsed.path.split(marker, 1)[0]
+    return parsed._replace(
+        path=f"{prefix}/{product_id}/info/ru/card.json",
+        params="",
+        query="",
+        fragment="",
+    ).geturl()
 
 
 _CATALOG_QUERY_STOPWORDS = {
@@ -1896,6 +2300,21 @@ def _catalog_match_tokens(value: str) -> set[str]:
     return tokens
 
 
+def _catalog_token_matches(token: str, title_tokens: set[str]) -> bool:
+    if token in title_tokens:
+        return True
+    if len(token) < 4 or not re.fullmatch(r"[а-я]+", token):
+        return False
+    stem_length = 4 if len(token) <= 5 else 5
+    stem = token[:stem_length]
+    return any(
+        len(candidate) >= stem_length
+        and re.fullmatch(r"[а-я]+", candidate) is not None
+        and candidate.startswith(stem)
+        for candidate in title_tokens
+    )
+
+
 def _city_label_from_cookies(cookies: Sequence[dict[str, Any]]) -> str:
     aliases = {
         "donetsk": "Донецк",
@@ -1956,9 +2375,12 @@ def _filter_catalog_items_for_query(
             continue
         if model_tokens and not model_tokens.issubset(title_tokens):
             continue
-        if differentiators and not differentiators.issubset(title_tokens):
+        if differentiators and not all(
+            _catalog_token_matches(token, title_tokens) for token in differentiators
+        ):
             continue
-        if lexical and len(lexical & title_tokens) < minimum_lexical:
+        lexical_overlap = sum(_catalog_token_matches(token, title_tokens) for token in lexical)
+        if lexical and lexical_overlap < minimum_lexical:
             continue
         matched.append(item)
     return matched
@@ -2058,16 +2480,624 @@ def _canonical_catalog_product_url(url: str) -> str:
     return value
 
 
-def _rank_catalog_items(items: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
-    def _key(item: dict[str, Any]) -> tuple[int, int, float]:
-        stock = item.get("in_stock")
-        stock_rank = 0 if stock is True else 1 if stock is None else 2
+def _wildberries_api_products(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    products = payload.get("products")
+    if not isinstance(products, list):
+        data = payload.get("data")
+        products = data.get("products") if isinstance(data, dict) else []
+    return [item for item in products if isinstance(item, dict)]
+
+
+def _wildberries_api_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for product in _wildberries_api_products(payload):
+        product_id = str(product.get("id") or "").strip()
+        if not product_id.isdigit():
+            continue
+        name = _collapse(str(product.get("name") or ""))
+        brand = _collapse(str(product.get("brand") or ""))
+        title = _collapse(" / ".join(value for value in (brand, name) if value))
+        if not title:
+            continue
+        prices: list[float] = []
+        quantities: list[int] = []
+        for size in product.get("sizes") or []:
+            if not isinstance(size, dict):
+                continue
+            price = size.get("price")
+            if isinstance(price, dict):
+                # Compare the ordinary card price. ``wallet`` is conditional on
+                # using WB Wallet and would make the result look universally cheaper.
+                for key in ("product", "basic", "wallet"):
+                    raw = price.get(key)
+                    if isinstance(raw, int | float) and raw > 0:
+                        prices.append(float(raw) / 100.0)
+                        break
+            for stock in size.get("stocks") or []:
+                if isinstance(stock, dict):
+                    with suppress(TypeError, ValueError):
+                        quantities.append(int(stock.get("qty") or 0))
+        total_quantity = product.get("totalQuantity")
+        if isinstance(total_quantity, int | float):
+            quantities.append(int(total_quantity))
+        price_value = min(prices) if prices else None
+        rating = product.get("reviewRating") or product.get("nmReviewRating")
+        feedbacks = product.get("feedbacks") or product.get("nmFeedbacks")
+        items.append(
+            {
+                "title": title[:300],
+                "url": f"https://www.wildberries.ru/catalog/{product_id}/detail.aspx",
+                "product_id": product_id,
+                "price_text": (
+                    f"{int(price_value):,} ₽".replace(",", " ")
+                    if price_value is not None
+                    else ""
+                ),
+                "price_value": price_value,
+                "in_stock": any(value > 0 for value in quantities) if quantities else None,
+                "rating_value": float(rating) if isinstance(rating, int | float) else None,
+                "review_count": int(feedbacks) if isinstance(feedbacks, int | float) else None,
+                "source_text": title,
+            }
+        )
+    return items
+
+
+async def _enrich_wildberries_catalog_items(
+    context: BrowserContext,
+    items: Sequence[dict[str, Any]],
+) -> None:
+    semaphore = asyncio.Semaphore(6)
+
+    async def enrich(item: dict[str, Any]) -> None:
+        details_url = str(item.get("details_url") or "")
+        if not details_url or not (urlparse(details_url).hostname or "").endswith(
+            ".wbbasket.ru"
+        ):
+            return
+        try:
+            async with semaphore:
+                response = await context.request.get(details_url, timeout=8_000)
+            if response.status != 200:
+                return
+            payload = await response.json()
+        except (PlaywrightError, ValueError, TypeError):
+            return
+        if not isinstance(payload, dict):
+            return
+        specs: dict[str, str] = {}
+        option_groups: list[Any] = [payload.get("options") or []]
+        for group in payload.get("grouped_options") or []:
+            if isinstance(group, dict):
+                option_groups.append(group.get("options") or [])
+        for options in option_groups:
+            for option in options if isinstance(options, list) else []:
+                if not isinstance(option, dict):
+                    continue
+                name = _collapse(str(option.get("name") or ""))
+                value = _collapse(str(option.get("value") or ""))
+                if name and value and name not in specs:
+                    specs[name[:160]] = value[:300]
+        item["specs"] = specs
+        item["description"] = _collapse(str(payload.get("description") or ""))[:1200]
+        item["category"] = _collapse(str(payload.get("subj_name") or ""))[:160]
+
+    await asyncio.gather(*(enrich(item) for item in items), return_exceptions=True)
+
+
+_CATALOG_CRITERIA = {
+    "price_asc",
+    "price_desc",
+    "power_desc",
+    "speed_desc",
+    "capacity_desc",
+    "range_desc",
+    "runtime_desc",
+    "age_asc",
+    "age_desc",
+    "size_asc",
+    "size_desc",
+    "date_desc",
+    "rating_desc",
+    "popularity_desc",
+    "weight_asc",
+    "weight_desc",
+}
+
+
+def _normalize_catalog_criterion(value: str) -> str:
+    criterion = str(value or "price_asc").strip().casefold()
+    return criterion if criterion in _CATALOG_CRITERIA else "price_asc"
+
+
+def _normalize_catalog_constraints(value: Any) -> dict[str, float]:
+    if not isinstance(value, dict):
+        return {}
+    normalized: dict[str, float] = {}
+    for key in ("max_price", "min_price", "min_rating"):
+        try:
+            number = float(value.get(key))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(number) or number < 0:
+            continue
+        if key == "min_rating" and number > 5:
+            continue
+        normalized[key] = number
+    if (
+        "min_price" in normalized
+        and "max_price" in normalized
+        and normalized["min_price"] > normalized["max_price"]
+    ):
+        normalized.pop("min_price")
+        normalized.pop("max_price")
+    return normalized
+
+
+def _filter_catalog_constraints(
+    items: Sequence[dict[str, Any]],
+    constraints: dict[str, float] | None,
+) -> list[dict[str, Any]]:
+    normalized = _normalize_catalog_constraints(constraints)
+    if not normalized:
+        return list(items)
+    filtered: list[dict[str, Any]] = []
+    for item in items:
+        price = item.get("price_value")
+        rating = item.get("rating_value")
+        if "max_price" in normalized and (
+            not isinstance(price, int | float) or float(price) > normalized["max_price"]
+        ):
+            continue
+        if "min_price" in normalized and (
+            not isinstance(price, int | float) or float(price) < normalized["min_price"]
+        ):
+            continue
+        if "min_rating" in normalized and (
+            not isinstance(rating, int | float) or float(rating) < normalized["min_rating"]
+        ):
+            continue
+        filtered.append(item)
+    return filtered
+
+
+def _catalog_search_query(query: str, criterion: str) -> str:
+    """Keep the primary catalog query neutral; criteria belong in ranking."""
+
+    return _collapse(query)
+
+
+def _catalog_search_variants(query: str, criterion: str) -> list[str]:
+    """Add one recall-oriented variant without replacing the neutral query."""
+
+    hints = {
+        "power_desc": "мощный",
+        "speed_desc": "быстрый",
+        "capacity_desc": "большая емкость",
+        "range_desc": "большая дальность",
+        "runtime_desc": "долгая автономная работа",
+        "rating_desc": "лучший",
+        "date_desc": "новинка",
+        "age_asc": "новинка",
+        "age_desc": "старый выпуск",
+    }
+    base = _collapse(query)
+    hint = hints.get(criterion, "")
+    normalized = query.casefold().replace("ё", "е")
+    if hint and hint.casefold().replace("ё", "е") not in normalized:
+        return [base, _collapse(f"{base} {hint}")]
+    return [base]
+
+
+def _metric_number(value: str) -> float | None:
+    raw = re.sub(r"[\s ]", "", value).replace(",", ".")
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def _metric_record(
+    *,
+    value: float,
+    text: str,
+    unit: str,
+    source: str,
+) -> dict[str, Any]:
+    return {
+        "value": round(float(value), 6),
+        "text": _collapse(text),
+        "unit": unit,
+        "source": source,
+    }
+
+
+def _power_metric(text: str, *, source: str) -> dict[str, Any] | None:
+    candidates: list[dict[str, Any]] = []
+    number = r"\d(?:[\d\s ]*\d)?(?:[.,]\d+)?"
+
+    def factor(raw_unit: str) -> float | None:
+        if raw_unit in {"mW", "mw", "мВт", "мвт"}:
+            return 0.001
+        if raw_unit in {"MW", "МВт"}:
+            return 1_000_000.0
+        if raw_unit in {"kW", "kw", "кВт", "квт"}:
+            return 1000.0
+        if raw_unit in {"W", "w", "Вт", "вт"}:
+            return 1.0
+        return None
+
+    units = r"(?:MW|МВт|mW|мВт|kW|кВт|W|Вт|mw|мвт|kw|квт|w|вт)"
+    for match in re.finditer(
+        rf"(?P<count>{number})\s*[x×]\s*(?P<each>{number})\s*(?P<unit>{units})(?![A-Za-zА-Яа-яЁё])",
+        text,
+    ):
+        count = _metric_number(match.group("count"))
+        each = _metric_number(match.group("each"))
+        unit_factor = factor(match.group("unit"))
+        if count is None or each is None or unit_factor is None:
+            continue
+        candidates.append(
+            _metric_record(
+                value=count * each * unit_factor,
+                text=match.group(0),
+                unit="W",
+                source=source,
+            )
+        )
+    for match in re.finditer(
+        rf"(?P<value>{number})\s*(?P<unit>{units})(?![A-Za-zА-Яа-яЁё])",
+        text,
+    ):
+        value = _metric_number(match.group("value"))
+        unit_factor = factor(match.group("unit"))
+        if value is None or unit_factor is None:
+            continue
+        candidates.append(
+            _metric_record(
+                value=value * unit_factor,
+                text=match.group(0),
+                unit="W",
+                source=source,
+            )
+        )
+    return max(candidates, key=lambda item: float(item["value"])) if candidates else None
+
+
+def _single_metric(
+    text: str,
+    *,
+    pattern: str,
+    factors: dict[str, float],
+    unit: str,
+    source: str,
+    flags: int = re.IGNORECASE,
+    normalize_unit: bool = True,
+) -> dict[str, Any] | None:
+    candidates: list[dict[str, Any]] = []
+    for match in re.finditer(pattern, text, flags=flags):
+        value = _metric_number(match.group("value"))
+        raw_unit = match.group("unit").casefold() if normalize_unit else match.group("unit")
+        if value is None or raw_unit not in factors:
+            continue
+        candidates.append(
+            _metric_record(
+                value=value * factors[raw_unit],
+                text=match.group(0),
+                unit=unit,
+                source=source,
+            )
+        )
+    return max(candidates, key=lambda item: float(item["value"])) if candidates else None
+
+
+def _dimensions_metric(text: str, *, source: str) -> dict[str, Any] | None:
+    number = r"\d+(?:[.,]\d+)?"
+    match = re.search(
+        rf"(?P<a>{number})\s*[x×х]\s*(?P<b>{number})\s*[x×х]\s*"
+        rf"(?P<c>{number})\s*(?P<unit>мм|mm|см|cm|м|m)(?![A-Za-zА-Яа-яЁё])",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    values = [_metric_number(match.group(name)) for name in ("a", "b", "c")]
+    if any(value is None or value <= 0 for value in values):
+        return None
+    factor = {
+        "мм": 0.1,
+        "mm": 0.1,
+        "см": 1.0,
+        "cm": 1.0,
+        "м": 100.0,
+        "m": 100.0,
+    }.get(match.group("unit").casefold())
+    if factor is None:
+        return None
+    a, b, c = (float(value) * factor for value in values if value is not None)
+    return _metric_record(
+        value=a * b * c,
+        text=match.group(0),
+        unit="cm³",
+        source=source,
+    )
+
+
+def _attach_catalog_metrics(item: dict[str, Any]) -> None:
+    metrics = item.get("metrics") if isinstance(item.get("metrics"), dict) else {}
+    segments: list[tuple[str, str]] = [("title", str(item.get("title") or ""))]
+    specs = item.get("specs")
+    if isinstance(specs, dict):
+        segments = [
+            (f"spec:{name}", f"{name}: {value}")
+            for name, value in specs.items()
+        ] + segments
+    for source, text in segments:
+        source_key = source.casefold()
+        power = _power_metric(text, source=source)
+        if power and (source == "title" or any(key in source_key for key in ("мощ", "power"))):
+            current = metrics.get("power_w")
+            if current is None or float(power["value"]) > float(current["value"]):
+                metrics["power_w"] = power
+        speed_kmh = _single_metric(
+            text,
+            pattern=r"(?P<value>\d+(?:[.,]\d+)?)\s*(?P<unit>км/ч|km/h)\b",
+            factors={"км/ч": 1.0, "km/h": 1.0},
+            unit="km/h",
+            source=source,
+        )
+        if speed_kmh:
+            metrics["speed_kmh"] = speed_kmh
+        data_rate = _single_metric(
+            text,
+            pattern=(
+                r"(?P<value>\d+(?:[.,]\d+)?)\s*"
+                r"(?P<unit>GB/s|Gb/s|MB/s|Mb/s|ГБ/с|Гб/с|МБ/с|Мб/с)"
+                r"(?![A-Za-zА-Яа-яЁё])"
+            ),
+            factors={
+                "GB/s": 8000.0,
+                "Gb/s": 1000.0,
+                "MB/s": 8.0,
+                "Mb/s": 1.0,
+                "ГБ/с": 8000.0,
+                "Гб/с": 1000.0,
+                "МБ/с": 8.0,
+                "Мб/с": 1.0,
+            },
+            unit="Mb/s",
+            source=source,
+            flags=0,
+            normalize_unit=False,
+        )
+        if data_rate:
+            metrics["data_rate_mbps"] = data_rate
+        rpm = _single_metric(
+            text,
+            pattern=r"(?P<value>\d[\d\s]*)\s*(?P<unit>об/мин|rpm)\b",
+            factors={"об/мин": 1.0, "rpm": 1.0},
+            unit="rpm",
+            source=source,
+        )
+        if rpm:
+            metrics["rpm"] = rpm
+        capacity = _single_metric(
+            text,
+            pattern=(
+                r"(?P<value>\d+(?:[.,]\d+)?)\s*(?P<unit>тб|tb|гб|gb)"
+                r"(?!\s*/\s*[сs])(?![A-Za-zА-Яа-яЁё])"
+            ),
+            factors={"тб": 1000.0, "tb": 1000.0, "гб": 1.0, "gb": 1.0},
+            unit="GB",
+            source=source,
+        )
+        if capacity:
+            metrics["capacity_gb"] = capacity
+        battery = _single_metric(
+            text,
+            pattern=r"(?P<value>\d[\d\s]*)\s*(?P<unit>мач|mah)\b",
+            factors={"мач": 1.0, "mah": 1.0},
+            unit="mAh",
+            source=source,
+        )
+        if battery:
+            metrics["battery_mah"] = battery
+        if any(key in text.casefold() for key in ("дальн", "радиус", "дистанц", "луч")):
+            distance = _single_metric(
+                text,
+                pattern=r"(?P<value>\d+(?:[.,]\d+)?)\s*(?P<unit>км|km|м|m)\b",
+                factors={"км": 1000.0, "km": 1000.0, "м": 1.0, "m": 1.0},
+                unit="m",
+                source=source,
+            )
+            if distance:
+                metrics["range_m"] = distance
+        if any(key in source_key for key in ("время", "автоном", "работ")):
+            runtime = _single_metric(
+                text,
+                pattern=r"(?P<value>\d+(?:[.,]\d+)?)\s*(?P<unit>ч|час|часов|h)\b",
+                factors={"ч": 1.0, "час": 1.0, "часов": 1.0, "h": 1.0},
+                unit="h",
+                source=source,
+            )
+            if runtime:
+                metrics["runtime_h"] = runtime
+        if any(key in source_key for key in ("вес", "масса", "weight")):
+            mass = _single_metric(
+                text,
+                pattern=r"(?P<value>\d+(?:[.,]\d+)?)\s*(?P<unit>кг|kg|г|g)\b",
+                factors={"кг": 1.0, "kg": 1.0, "г": 0.001, "g": 0.001},
+                unit="kg",
+                source=source,
+            )
+            if mass:
+                metrics["mass_kg"] = mass
+        if any(key in source_key for key in ("размер", "габарит", "dimension")):
+            dimensions = _dimensions_metric(text, source=source)
+            if dimensions:
+                metrics["size_cm3"] = dimensions
+    rating = item.get("rating_value")
+    if isinstance(rating, int | float):
+        reviews = item.get("review_count")
+        review_count = max(0, int(reviews)) if isinstance(reviews, int | float) else 1
+        confidence_weight = 20.0
+        adjusted = (
+            float(rating) * review_count + 4.0 * confidence_weight
+        ) / (review_count + confidence_weight)
+        rating_text = f"{float(rating):g}/5"
+        if isinstance(reviews, int | float):
+            rating_text += f", {int(reviews)} отзывов"
+        metrics["rating_score"] = _metric_record(
+            value=adjusted,
+            text=rating_text,
+            unit="/5",
+            source="catalog",
+        )
+    reviews = item.get("review_count")
+    if isinstance(reviews, int | float):
+        metrics["review_count"] = _metric_record(
+            value=float(reviews),
+            text=f"{int(reviews)} отзывов",
+            unit="reviews",
+            source="catalog",
+        )
+    year_match = re.search(r"\b(20\d{2})\b", str(item.get("title") or ""))
+    if year_match:
+        metrics["year"] = _metric_record(
+            value=float(year_match.group(1)),
+            text=year_match.group(1),
+            unit="year",
+            source="title",
+        )
+    item["metrics"] = metrics
+
+
+_CRITERION_METRIC_KEYS = {
+    "power_desc": ("power_w",),
+    "speed_desc": ("data_rate_mbps", "speed_kmh", "rpm"),
+    "capacity_desc": ("capacity_gb", "battery_mah"),
+    "range_desc": ("range_m",),
+    "runtime_desc": ("runtime_h",),
+    "size_asc": ("size_cm3",),
+    "size_desc": ("size_cm3",),
+    "weight_asc": ("mass_kg",),
+    "weight_desc": ("mass_kg",),
+    "date_desc": ("year",),
+    "age_asc": ("year",),
+    "age_desc": ("year",),
+    "rating_desc": ("rating_score",),
+    "popularity_desc": ("review_count",),
+}
+
+
+def _select_catalog_metric_key(items: Sequence[dict[str, Any]], criterion: str) -> str:
+    if criterion in {"price_asc", "price_desc"}:
+        return "price_value"
+    candidates = _CRITERION_METRIC_KEYS.get(criterion, ())
+    if not candidates:
+        return ""
+    coverage = {
+        key: sum(
+            isinstance(item.get("metrics"), dict)
+            and isinstance(item["metrics"].get(key), dict)
+            for item in items
+        )
+        for key in candidates
+    }
+    return max(candidates, key=lambda key: coverage[key]) if any(coverage.values()) else ""
+
+
+def _catalog_metric(item: dict[str, Any], metric_key: str) -> dict[str, Any] | None:
+    if metric_key == "price_value":
         value = item.get("price_value")
-        if value is None:
-            return (stock_rank, 1, 0.0)
-        return (stock_rank, 0, float(value))
+        if not isinstance(value, int | float):
+            return None
+        return _metric_record(
+            value=float(value),
+            text=str(item.get("price_text") or value),
+            unit="RUB",
+            source="catalog",
+        )
+    metrics = item.get("metrics")
+    metric = metrics.get(metric_key) if isinstance(metrics, dict) else None
+    return metric if isinstance(metric, dict) else None
+
+
+def _rank_catalog_items(
+    items: Sequence[dict[str, Any]],
+    *,
+    criterion: str = "price_asc",
+    metric_key: str = "",
+) -> list[dict[str, Any]]:
+    descending = criterion not in {
+        "price_asc",
+        "size_asc",
+        "weight_asc",
+        "age_desc",
+    }
+
+    def _key(item: dict[str, Any]) -> tuple[int, int, float, int]:
+        stock = item.get("in_stock")
+        out_of_stock = 1 if stock is False else 0
+        availability_tie = 0 if stock is True else 1 if stock is None else 2
+        effective_metric_key = metric_key
+        if not effective_metric_key and criterion in {"price_asc", "price_desc"}:
+            effective_metric_key = "price_value"
+        metric = _catalog_metric(item, effective_metric_key)
+        if metric is None:
+            return (out_of_stock, 1, 0.0, availability_tie)
+        value = float(metric["value"])
+        metric_value = -value if descending else value
+        return (out_of_stock, 0, metric_value, availability_tie)
 
     return sorted(items, key=_key)
+
+
+def _best_catalog_item(
+    items: Sequence[dict[str, Any]],
+    *,
+    criterion: str,
+    metric_key: str,
+) -> dict[str, Any] | None:
+    for item in items:
+        if item.get("in_stock") is False:
+            continue
+        if _catalog_metric(item, metric_key) is not None:
+            return item
+    return None
+
+
+def _public_catalog_item(item: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(item, dict):
+        return None
+    public = dict(item)
+    public.pop("details_url", None)
+    public.pop("source_text", None)
+    if public.get("description"):
+        public["description"] = str(public["description"])[:600]
+    specs = public.get("specs")
+    if isinstance(specs, dict):
+        public["specs"] = dict(list(specs.items())[:20])
+    return public
+
+
+def _catalog_metric_label(metric_key: str) -> str:
+    return {
+        "price_value": "цена",
+        "power_w": "мощность",
+        "data_rate_mbps": "скорость передачи данных",
+        "speed_kmh": "скорость",
+        "rpm": "частота вращения",
+        "capacity_gb": "ёмкость",
+        "battery_mah": "ёмкость аккумулятора",
+        "range_m": "дальность",
+        "runtime_h": "время автономной работы",
+        "mass_kg": "масса",
+        "size_cm3": "габаритный объём",
+        "year": "год",
+        "rating_score": "рейтинг с учётом числа отзывов",
+        "review_count": "популярность по числу отзывов",
+    }.get(metric_key, metric_key)
 
 
 def _shop_search_result(
@@ -2079,20 +3109,56 @@ def _shop_search_result(
     city: str = "",
     items: list[dict[str, Any]] | None = None,
     cheapest: dict[str, Any] | None = None,
+    best: dict[str, Any] | None = None,
     error: str | None = None,
     browser_mode: str = "",
     price_sort_confirmed: bool = False,
+    criterion: str = "price_asc",
+    criterion_label: str = "",
+    metric_key: str = "",
+    search_query: str = "",
+    constraints: dict[str, float] | None = None,
 ) -> dict[str, Any]:
-    rows = items or []
+    rows = [_public_catalog_item(item) for item in (items or [])]
+    public_rows = [item for item in rows if item is not None]
+    public_cheapest = _public_catalog_item(cheapest)
+    public_best = _public_catalog_item(best)
+    compared_count = sum(
+        _catalog_metric(item, metric_key or "price_value") is not None
+        for item in (items or [])
+        if item.get("in_stock") is not False
+    )
+    is_price = criterion in {"price_asc", "price_desc"}
+    comparison_complete = public_best is not None and (is_price or compared_count >= 2)
+    output_best = public_best if comparison_complete else None
+    comparison = {
+        "criterion": criterion,
+        "criterion_label": criterion_label,
+        "metric_key": metric_key,
+        "metric_label": _catalog_metric_label(metric_key),
+        "complete": comparison_complete,
+        "compared_count": compared_count,
+        "discovered_count": len(public_rows),
+        "scope": "seller_declared_catalog_items",
+        "best_metric": (
+            _catalog_metric(best, metric_key)
+            if comparison_complete and isinstance(best, dict) and metric_key
+            else None
+        ),
+    }
     return {
         "ok": ok,
         "query": query,
         "shop": _normalize_shop(shop) or (shop or ""),
         "url": url,
         "city": city,
-        "count": len(rows),
-        "cheapest": cheapest,
-        "items": rows,
+        "search_query": search_query or query,
+        "constraints": _normalize_catalog_constraints(constraints),
+        "count": len(public_rows),
+        "cheapest": public_cheapest,
+        "best": output_best,
+        "comparison": comparison,
+        "items": public_rows,
         "error": error,
         "browser_mode": browser_mode,
         "price_sort_confirmed": price_sort_confirmed,

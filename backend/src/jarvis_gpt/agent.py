@@ -15,7 +15,7 @@ from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, quote_plus, urlparse
+from urllib.parse import quote, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from . import persona as persona_module
@@ -50,6 +50,12 @@ from .models import (
     ToolRunResponse,
 )
 from .operator_queue import operator_context
+from .shop_registry import (
+    SHOP_SOURCES,
+    find_shop_source,
+    find_shop_sources,
+    shop_search_url,
+)
 from .storage import JarvisStorage, utc_now
 from .tools import ToolRegistry
 from .verification import (
@@ -120,11 +126,11 @@ SYSTEM_PROMPT = """Ты Jarvis: локальный агент Windows/WSL/Docker
   web.render, web.extract и web.verify.
   Не пиши "запускаю поиск" и не имитируй результаты. Если поиск или сайт не отдал данные,
   прямо скажи, что именно не подтверждено, и дай проверяемые ссылки.
-- Магазины и товарный поиск («найди самую дешёвую X на <магазин>», «где дешевле X», «цена X на
-  DNS/Ozon/WB»): используй web.shop_search (реальный браузер, читает JS/анти-бот каталоги
-  DNS/Ozon/Wildberries/Citilink/М.Видео, которые web.answer/web.search НЕ берут, и ранжирует по
-  цене — дешёвое сверху; сам выставляет город Донецк, иначе Москву). Назови конкретные цены и
-  магазины по возрастанию и укажи город. НЕ отвечай «погугли сам», если web.shop_search доступен.
+- Магазины и товарный поиск с любым критерием («самая дешёвая», «самый мощный», «самый быстрый»,
+  «с лучшим рейтингом» на DNS/Ozon/WB и т.п.): используй web.shop_search. Он читает каталог/API,
+  извлекает характеристики и сравнивает только совместимые единицы. Для неценового критерия
+  называй победителя лишь при наличии числовой характеристики в карточках продавцов; иначе
+  перечисли найденное и честно укажи пробел, не подменяя критерий ценой или порядком выдачи.
   Если инструмент вернул needs_install/недоступен — честно скажи, что нужен Playwright на
   рантайме, и только тогда дай прямую ссылку на поиск магазина как запасной вариант.
 - Специализированные интернет-маршруты: погода — web.weather (геокодированный прогноз без
@@ -2681,13 +2687,22 @@ class AgentRuntime:
         # Its result is final even on anti-bot failure: a generic cached web
         # answer cannot honestly replace missing catalog prices.
         normalized = message.lower()
+        run_method = getattr(self.tools, "run", None)
+        registry_run = getattr(run_method, "__self__", None) is self.tools
         if (
             _looks_like_shopping_query(normalized)
-            and _web_surfer_available()
+            and (registry_run or _web_surfer_available())
             and self.tools.get("web.shop_search") is not None
         ):
-            shop_key = _shop_key_from_message(normalized)
-            if shop_key:
+            shop_sources = find_shop_sources(normalized)
+            if len(shop_sources) > 1:
+                return await self._run_multi_shop_search(
+                    message,
+                    [source.key for source in shop_sources],
+                    conversation_id=conversation_id,
+                )
+            shop_key = shop_sources[0].key if shop_sources else None
+            if shop_key is not None:
                 shop_action = await self._run_shop_search(
                     message, shop_key, conversation_id=conversation_id
                 )
@@ -2854,7 +2869,7 @@ class AgentRuntime:
         *,
         conversation_id: str | None = None,
     ) -> DirectAction:
-        """Run web.shop_search for a shop-specific price query.
+        """Run criterion-aware web.shop_search for a named marketplace.
 
         Returns a ranked answer on success, an honest install-guidance answer
         when the browser layer is missing, or a precise shop-search failure.
@@ -2863,7 +2878,24 @@ class AgentRuntime:
 
         cleaned_product = _clean_shopping_subject(message) or message
         product = _compact_shopping_subject(cleaned_product)
-        result = await self.tools.run("web.shop_search", {"query": product, "shop": shop_key})
+        criterion = _ranking_criterion_from_message(message) or "price_asc"
+        criterion_label = _ranking_criterion_label(criterion)
+        arguments: dict[str, Any] = {
+            "query": product,
+            "shop": shop_key,
+            "criterion": criterion,
+            "criterion_label": criterion_label,
+        }
+        constraints = _shopping_constraints_from_message(message)
+        cities = _shopping_cities_from_message(message)
+        if constraints:
+            arguments["constraints"] = constraints
+        if cities:
+            arguments["cities"] = cities
+        result = await self.tools.run(
+            "web.shop_search",
+            arguments,
+        )
         data = result.data if isinstance(result.data, dict) else {}
         event = ChatEvent(
             type="tool_call",
@@ -2876,6 +2908,8 @@ class AgentRuntime:
                 "browser_mode": data.get("browser_mode"),
                 "error": data.get("error"),
                 "item_count": len(data.get("items") or []),
+                "criterion": criterion,
+                "comparison": data.get("comparison"),
             },
         )
         if result.ok and data.get("items"):
@@ -2886,6 +2920,8 @@ class AgentRuntime:
                         "url": item.get("url"),
                         "price": item.get("price_text"),
                         "price_value": item.get("price_value"),
+                        "metrics": item.get("metrics"),
+                        "rating_value": item.get("rating_value"),
                     }
                     for item in data.get("items", [])
                     if item.get("url")
@@ -2900,15 +2936,15 @@ class AgentRuntime:
         if data.get("needs_install"):
             link = _shop_search_url_for(shop_key, product)
             lines = [
-                "Чтобы честно сравнить цены в магазине, мне нужен браузерный слой "
+                "Чтобы честно сравнить товары в магазине, мне нужен браузерный слой "
                 "(магазины вроде DNS/Ozon отдают каталог только через JavaScript, "
                 "обычный запрос их не читает). Установи его на машине с Jarvis:",
                 "```",
                 "pip install -r backend/requirements-surfer.txt",
                 "playwright install chromium",
                 "```",
-                "После этого повтори запрос — я открою магазин, выставлю город "
-                "(Донецк, иначе Москву) и отсортирую по цене.",
+                "После этого повтори запрос — я открою каталог, извлеку характеристики "
+                "и сравню товары по запрошенному критерию.",
             ]
             if link:
                 lines.append(f"\nПока — прямая ссылка на поиск: {link}")
@@ -2922,6 +2958,187 @@ class AgentRuntime:
         if link:
             lines.append(f"Прямая ссылка на поиск: {link}")
         return DirectAction(answer="\n".join(lines), events=[event])
+
+    async def _run_multi_shop_search(
+        self,
+        message: str,
+        shop_keys: list[str],
+        *,
+        conversation_id: str | None = None,
+    ) -> DirectAction:
+        """Compare explicitly named shops without collapsing them to the first alias."""
+
+        product = _compact_shopping_subject(_clean_shopping_subject(message) or message)
+        criterion = _ranking_criterion_from_message(message) or "price_asc"
+        criterion_label = _ranking_criterion_label(criterion)
+        constraints = _shopping_constraints_from_message(message)
+        cities = _shopping_cities_from_message(message)
+
+        async def run_one(shop_key: str) -> tuple[str, ToolRunResponse]:
+            arguments: dict[str, Any] = {
+                "query": product,
+                "shop": shop_key,
+                "criterion": criterion,
+                "criterion_label": criterion_label,
+            }
+            if constraints:
+                arguments["constraints"] = constraints
+            if cities:
+                arguments["cities"] = cities
+            return shop_key, await self.tools.run("web.shop_search", arguments)
+
+        responses = await asyncio.gather(
+            *(run_one(shop_key) for shop_key in _dedupe(shop_keys)[:4]),
+            return_exceptions=True,
+        )
+        events: list[ChatEvent] = []
+        successful: list[tuple[str, dict[str, Any]]] = []
+        failures: list[str] = []
+        for response in responses:
+            if isinstance(response, BaseException):
+                failures.append(str(response))
+                continue
+            shop_key, result = response
+            data = result.data if isinstance(result.data, dict) else {}
+            events.append(
+                ChatEvent(
+                    type="tool_call",
+                    title="web.shop_search",
+                    content=result.summary,
+                    payload={
+                        "tool": "web.shop_search",
+                        "ok": result.ok,
+                        "shop": shop_key,
+                        "criterion": criterion,
+                        "item_count": len(data.get("items") or []),
+                    },
+                )
+            )
+            if result.ok and data.get("items"):
+                successful.append((shop_key, data))
+            else:
+                failures.append(f"{shop_key}: {data.get('error') or result.summary}")
+
+        if not successful:
+            links = [
+                f"{key}: {_shop_search_url_for(key, product)}"
+                for key in _dedupe(shop_keys)
+                if _shop_search_url_for(key, product)
+            ]
+            reason = "; ".join(failures) or "каталоги не отдали товары"
+            answer = (
+                f"Не удалось прочитать ни один из выбранных каталогов: {reason}. "
+                "Не подменяю сравнение общим поиском без товарных данных."
+            )
+            if links:
+                answer += "\n\nПрямые ссылки:\n" + "\n".join(f"- {link}" for link in links)
+            return DirectAction(answer=answer, events=events)
+
+        items: list[dict[str, Any]] = []
+        comparisons: list[dict[str, Any]] = []
+        for shop_key, data in successful:
+            comparison = data.get("comparison")
+            if isinstance(comparison, dict):
+                comparisons.append(comparison)
+            for raw_item in data.get("items") or []:
+                if not isinstance(raw_item, dict) or not raw_item.get("url"):
+                    continue
+                item = dict(raw_item)
+                item["shop"] = shop_key
+                items.append(item)
+
+        metric_key = "price_value"
+        if criterion not in {"price_asc", "price_desc"}:
+            keys = {
+                str(comparison.get("metric_key") or "")
+                for comparison in comparisons
+                if comparison.get("metric_key")
+            }
+            metric_key = max(
+                keys,
+                key=lambda key: sum(
+                    isinstance((item.get("metrics") or {}).get(key), dict) for item in items
+                ),
+                default="",
+            )
+
+        def metric_value(item: dict[str, Any]) -> float | None:
+            if metric_key == "price_value":
+                value = item.get("price_value")
+            else:
+                metric = (item.get("metrics") or {}).get(metric_key) or {}
+                value = metric.get("value")
+            return float(value) if isinstance(value, int | float) else None
+
+        descending = criterion not in {
+            "price_asc",
+            "size_asc",
+            "weight_asc",
+            "age_desc",
+        }
+        ranked = sorted(
+            items,
+            key=lambda item: (
+                item.get("in_stock") is False,
+                metric_value(item) is None,
+                -(metric_value(item) or 0.0) if descending else (metric_value(item) or 0.0),
+            ),
+        )
+        comparable = [
+            item
+            for item in ranked
+            if item.get("in_stock") is not False and metric_value(item) is not None
+        ]
+        best = comparable[0] if comparable else None
+        priced = [
+            item
+            for item in items
+            if item.get("in_stock") is not False
+            and isinstance(item.get("price_value"), int | float)
+        ]
+        cheapest = min(priced, key=lambda item: float(item["price_value"])) if priced else None
+        metric_label = next(
+            (
+                str(comparison.get("metric_label") or "")
+                for comparison in comparisons
+                if comparison.get("metric_key") == metric_key
+            ),
+            criterion_label,
+        )
+        best_metric = (
+            {"value": best.get("price_value"), "text": best.get("price_text"), "unit": "RUB"}
+            if best is not None and metric_key == "price_value"
+            else (best.get("metrics") or {}).get(metric_key) if best is not None else None
+        )
+        combined = {
+            "ok": bool(ranked),
+            "shop": "multiple",
+            "items": ranked[:24],
+            "best": best,
+            "cheapest": cheapest,
+            "price_sort_confirmed": False,
+            "comparison": {
+                "criterion": criterion,
+                "criterion_label": criterion_label,
+                "metric_key": metric_key,
+                "metric_label": metric_label,
+                "complete": best is not None
+                and (criterion in {"price_asc", "price_desc"} or len(comparable) >= 2),
+                "compared_count": len(comparable),
+                "discovered_count": len(ranked),
+                "best_metric": best_metric,
+            },
+        }
+        answer = _format_shop_search_answer(combined, product)
+        if failures:
+            answer += "\n\nНе удалось прочитать часть каталогов: " + "; ".join(failures)
+        if conversation_id and ranked:
+            self._remember_shopping_research(
+                conversation_id=conversation_id,
+                query=product,
+                candidates=ranked,
+            )
+        return DirectAction(answer=answer, events=events)
 
     async def _run_web_answer_engine(
         self,
@@ -6461,40 +6678,95 @@ def _looks_like_shopping_query(normalized: str) -> bool:
             "мышь",
         ),
     )
-    store_context = _contains_any(
-        normalized,
-        (
-            "dns",
-            "днс",
-            "ozon",
-            "wildberries",
-            "яндекс маркет",
-            "yandex market",
-            "маркет",
-            "ситилинк",
-            "citilink",
-            "мвидео",
-            "м.видео",
-            "mvideo",
-            "эльдорадо",
-            "eldorado",
-            "онлайнтрейд",
-            "online trade",
-            "avito",
-            "авито",
-            "aliexpress",
-            "алиэкспресс",
-        ),
-    )
+    shop_source = find_shop_source(normalized)
     if _looks_like_travel_query(normalized):
         return False
-    if store_context and not _looks_like_osint_dns_context(normalized):
-        return True
+    if shop_source and not _looks_like_osint_dns_context(normalized):
+        non_catalog_question = _contains_any(
+            normalized,
+            (
+                "владелец",
+                "основател",
+                "гендиректор",
+                "выручк",
+                "курс акц",
+                "котировк",
+                "биржев",
+                "логотип",
+                "история компании",
+                "аккаунт",
+                "поддержк",
+                "возврат",
+                "вернуть товар",
+                "пункт выдачи",
+                "пвз",
+                "не работает",
+                "условия доставки",
+                "официальный сайт",
+                "новост",
+                "вакан",
+                "работа в",
+                "адрес",
+                "склад",
+                "логист",
+                "как доставл",
+                "скорость доставки",
+                "срок доставки",
+                "работает",
+            ),
+        ) or bool(re.search(r"\bкак\s+\w+\s+доставл", normalized))
+        source_count = len(find_shop_sources(normalized))
+        terse_subject = _clean_shopping_subject(normalized)
+        company_comparison = source_count > 1 and not terse_subject
+        catalog_request = bool(
+            purchase_context
+            or product_context
+            or _ranking_criterion_from_message(normalized)
+            or terse_subject
+            or _contains_any(
+                normalized,
+                (
+                    "что есть",
+                    "какой есть",
+                    "какая есть",
+                    "какие есть",
+                    "есть ли",
+                    "прода",
+                    "найди",
+                    "поищи",
+                    "покажи",
+                    "подбери",
+                    "выбери",
+                    "какой",
+                    "какая",
+                    "какие",
+                    "какое",
+                ),
+            )
+        )
+        return catalog_request and not non_catalog_question and not company_comparison
     return product_context and purchase_context
 
 
 def _looks_like_osint_dns_context(normalized: str) -> bool:
-    return _contains_any(normalized, ("whois", "домен", "dns запись", "dns-зап", "dns record"))
+    return _contains_any(
+        normalized,
+        (
+            "whois",
+            "домен",
+            "dns запись",
+            "dns-зап",
+            "dns record",
+            "dns over",
+            "doh",
+            "dns сервер",
+            "dns-сервер",
+            "настроить dns",
+            "dns на роутер",
+            "dns кэш",
+            "dns-кэш",
+        ),
+    )
 
 
 def _looks_like_place_lookup_query(normalized: str) -> bool:
@@ -6681,20 +6953,9 @@ def _fallback_web_research_queries(message: str, current_query: str) -> list[str
 
 
 def _shopping_site_filter(normalized: str) -> str:
-    if _mentions_dns_store(normalized):
-        return "site:dns-shop.ru"
-    if _contains_any(normalized, ("ozon",)):
-        return "site:ozon.ru"
-    if _contains_any(normalized, ("wildberries",)):
-        return "site:wildberries.ru"
-    if _contains_any(normalized, ("яндекс маркет", "yandex market", "маркет")):
-        return "site:market.yandex.ru"
-    if _contains_any(normalized, ("ситилинк", "citilink")):
-        return "site:citilink.ru"
-    if _contains_any(normalized, ("мвидео", "м.видео", "mvideo")):
-        return "site:mvideo.ru"
-    if _contains_any(normalized, ("эльдорадо", "eldorado")):
-        return "site:eldorado.ru"
+    source = find_shop_source(normalized)
+    if source is not None:
+        return f"site:{source.domain}"
     if _contains_any(normalized, ("avito", "авито")):
         return "site:avito.ru"
     return ""
@@ -6705,29 +6966,6 @@ def _shopping_domain_hint(normalized: str) -> str:
     if site_filter.startswith("site:"):
         return site_filter.removeprefix("site:")
     return site_filter
-
-
-# Domain (from _shopping_site_filter) -> web.shop_search shop key.
-_SHOP_DOMAIN_TO_KEY = {
-    "dns-shop.ru": "dns",
-    "ozon.ru": "ozon",
-    "wildberries.ru": "wildberries",
-    "market.yandex.ru": "yandex market",
-    "citilink.ru": "citilink",
-    "mvideo.ru": "mvideo",
-    "eldorado.ru": "eldorado",
-}
-
-# Direct search-URL templates for the honest fallback link (no web_surfer import).
-_SHOP_KEY_TO_SEARCH_URL = {
-    "dns": "https://www.dns-shop.ru/search/?q={q}",
-    "ozon": "https://www.ozon.ru/search/?text={q}",
-    "wildberries": "https://www.wildberries.ru/catalog/0/search.aspx?search={q}",
-    "yandex market": "https://market.yandex.ru/search?text={q}",
-    "citilink": "https://www.citilink.ru/search/?text={q}",
-    "mvideo": "https://www.mvideo.ru/product-list-page?q={q}",
-    "eldorado": "https://www.eldorado.ru/search/catalog.php?q={q}",
-}
 
 
 def _web_surfer_available() -> bool:
@@ -6753,38 +6991,98 @@ def _web_surfer_available() -> bool:
 def _shop_key_from_message(normalized: str) -> str | None:
     """Map a shopping message that names a shop to a web.shop_search shop key."""
 
-    domain = _shopping_domain_hint(normalized)
-    return _SHOP_DOMAIN_TO_KEY.get(domain)
+    source = find_shop_source(normalized)
+    return source.key if source else None
 
 
 def _shop_search_url_for(shop_key: str, query: str) -> str:
-    template = _SHOP_KEY_TO_SEARCH_URL.get(shop_key)
-    return template.format(q=quote_plus(query)) if template else ""
+    return shop_search_url(shop_key, query)
 
 
 def _format_shop_search_answer(data: dict[str, Any], product: str) -> str:
     items = [item for item in (data.get("items") or []) if item.get("url")]
     cheapest = data.get("cheapest") if isinstance(data.get("cheapest"), dict) else None
+    best = data.get("best") if isinstance(data.get("best"), dict) else None
+    comparison = data.get("comparison") if isinstance(data.get("comparison"), dict) else {}
+    criterion = str(comparison.get("criterion") or "price_asc")
+    metric_key = str(comparison.get("metric_key") or "")
     lines: list[str] = []
     subject = product.strip() or "товар"
-    if cheapest:
-        cheapest_label = (
-            "Самая дешёвая"
-            if data.get("price_sort_confirmed")
-            else "Самая дешёвая из найденных"
-        )
+    if criterion in {"price_asc", "price_desc"} and (best or cheapest):
+        price_winner = best or cheapest or {}
+        if criterion == "price_desc":
+            cheapest_label = "Самая дорогая из найденных"
+        else:
+            cheapest_label = (
+                "Самая дешёвая"
+                if data.get("price_sort_confirmed")
+                else "Самая дешёвая из найденных"
+            )
         lines.append(
-            f"{cheapest_label} «{subject}»: {cheapest.get('price_text')} — "
-            f"{cheapest.get('title')}\n{cheapest.get('url')}"
+            f"{cheapest_label} «{subject}»: {price_winner.get('price_text')} — "
+            f"{price_winner.get('title')}\n{price_winner.get('url')}"
         )
         lines.append("")
-    lines.append("Все варианты по возрастанию цены:")
+    elif best and comparison.get("best_metric") and comparison.get("complete"):
+        best_metric = comparison["best_metric"]
+        compared = int(comparison.get("compared_count") or 0)
+        discovered = int(comparison.get("discovered_count") or len(items))
+        metric_label = str(comparison.get("metric_label") or "характеристика")
+        metric_text = str(best_metric.get("text") or "")
+        metric_value = best_metric.get("value")
+        metric_unit = str(best_metric.get("unit") or "").strip()
+        if isinstance(metric_value, int | float) and metric_unit:
+            normalized_metric = f"{float(metric_value):g} {metric_unit}"
+            if normalized_metric.casefold() not in metric_text.casefold():
+                metric_text = f"{metric_text} ({normalized_metric})"
+        value_direction = (
+            "Самое низкое"
+            if criterion in {"size_asc", "weight_asc", "age_desc"}
+            else "Самое высокое"
+        )
+        lines.append(
+            f"{value_direction} заявленное значение «{metric_label}» среди сопоставимых "
+            f"карточек: {metric_text} — {best.get('title')}\n{best.get('url')}"
+        )
+        lines.append(
+            f"Сопоставимая числовая характеристика указана у {compared} из {discovered} "
+            "найденных товаров; это данные продавцов, а не независимый замер."
+        )
+        lines.append("")
+    else:
+        metric_label = str(
+            comparison.get("criterion_label")
+            or comparison.get("metric_label")
+            or _ranking_criterion_label(criterion)
+        )
+        lines.append(
+            f"Нашёл {len(items)} релевантных товаров по запросу «{subject}», но в карточках "
+            f"нет сопоставимой числовой характеристики «{metric_label}». Поэтому победителя "
+            "не называю и не подменяю критерий ценой или порядком выдачи."
+        )
+        lines.append("")
+    if criterion == "price_asc":
+        list_label = "Все варианты по возрастанию цены:"
+    elif criterion == "price_desc":
+        list_label = "Все варианты по убыванию цены:"
+    else:
+        list_label = "Варианты по запрошенному критерию:"
+    lines.append(list_label)
     for index, item in enumerate(items[:8], start=1):
         price = item.get("price_text") or "цена не считана"
-        lines.append(f"{index}. {price} — {item.get('title')}\n{item.get('url')}")
+        metric = (item.get("metrics") or {}).get(metric_key) or {}
+        metric_text = f" · {metric.get('text')}" if metric.get("text") else ""
+        rating = item.get("rating_value")
+        rating_text = f" · рейтинг {rating}" if rating is not None else ""
+        shop = str(item.get("shop") or "").strip()
+        shop_text = f" · {shop}" if shop else ""
+        lines.append(
+            f"{index}. {price}{metric_text}{rating_text}{shop_text} — "
+            f"{item.get('title')}\n{item.get('url')}"
+        )
     city = str(data.get("city") or "").strip()
     if city:
-        lines.append(f"\nЦены показаны для города: {city}.")
+        lines.append(f"\nКаталог и цены показаны для города: {city}.")
     return "\n".join(lines)
 
 
@@ -6802,12 +7100,21 @@ def _unique_search_queries(candidates: list[str], current_query: str) -> list[st
 _SHOPPING_SUBJECT_STOPWORDS = {
     "а",
     "и",
+    "или",
     "во",
     "в",
     "на",
     "по",
     "у",
+    "с",
+    "со",
     "для",
+    "где",
+    "есть",
+    "какая",
+    "какие",
+    "какой",
+    "какое",
     "мне",
     "ну",
     "все",
@@ -6832,6 +7139,8 @@ _SHOPPING_SUBJECT_STOPWORDS = {
     "дешёвый",
     "дешевые",
     "дешёвые",
+    "дешевле",
+    "дороже",
     "недорогую",
     "недорогой",
     "позицию",
@@ -6842,9 +7151,12 @@ _SHOPPING_SUBJECT_STOPWORDS = {
     "предложения",
     "товар",
     "товары",
-    "москва",
-    "москве",
-    "спб",
+    "сравни",
+    "сравнить",
+    "числу",
+    "количеству",
+    "отзывов",
+    "отзывам",
 }
 
 
@@ -6861,34 +7173,190 @@ _SHOPPING_PRICE_RE = re.compile(
     flags=re.IGNORECASE,
 )
 
+_SHOPPING_CURRENCY_RE = r"(?:₽|руб(?:\.|лей|ля)?|rub|р\.)"
+_SHOPPING_MAX_PRICE_PATTERNS = (
+    re.compile(
+        rf"\b(?:до|не\s+дороже|максимум)\s*({_SHOPPING_AMOUNT_RE})\s*"
+        rf"{_SHOPPING_CURRENCY_RE}(?![a-zа-яё])",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\b(?:цена|стоимость|бюджет)\w*[^\d]{{0,24}}"
+        rf"(?:до|не\s+дороже|максимум)?\s*({_SHOPPING_AMOUNT_RE})"
+        rf"(?:\s*{_SHOPPING_CURRENCY_RE})?(?![\d.,a-zа-яё])",
+        flags=re.IGNORECASE,
+    ),
+)
+_SHOPPING_MIN_PRICE_PATTERNS = (
+    re.compile(
+        rf"\b(?:не\s+дешевле|от)\s*({_SHOPPING_AMOUNT_RE})\s*"
+        rf"{_SHOPPING_CURRENCY_RE}(?![a-zа-яё])",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\b(?:цена|стоимость)\w*[^\d]{{0,24}}(?:не\s+дешевле|от)\s*"
+        rf"({_SHOPPING_AMOUNT_RE})(?:\s*{_SHOPPING_CURRENCY_RE})?"
+        rf"(?![\d.,a-zа-яё])",
+        flags=re.IGNORECASE,
+    ),
+)
+
+_SHOPPING_CITY_ALIASES: tuple[tuple[tuple[str, ...], str], ...] = (
+    ((r"санкт[-\s]*петербург(?:е|а)?", r"петербург(?:е|а)?", r"спб"), "Санкт-Петербург"),
+    ((r"москв(?:а|е|ы|у)",), "Москва"),
+    ((r"казан(?:ь|и)",), "Казань"),
+    ((r"екатеринбург(?:е|а)?",), "Екатеринбург"),
+    ((r"новосибирск(?:е|а)?",), "Новосибирск"),
+    ((r"донецк(?:е|а)?",), "Донецк"),
+    ((r"ростов(?:е|а)?[-\s]*на[-\s]*дону",), "Ростов-на-Дону"),
+    ((r"нижн(?:ий|ем)\s+новгород(?:е|а)?",), "Нижний Новгород"),
+    ((r"краснодар(?:е|а)?",), "Краснодар"),
+    ((r"самар(?:а|е|ы)",), "Самара"),
+    ((r"уф(?:а|е|ы)",), "Уфа"),
+    ((r"перм(?:ь|и)",), "Пермь"),
+    ((r"воронеж(?:е|а)?",), "Воронеж"),
+    ((r"волгоград(?:е|а)?",), "Волгоград"),
+)
+
+
+def _shopping_location_pattern(city_pattern: str) -> re.Pattern[str]:
+    return re.compile(
+        rf"\b(?:с\s+доставк\w*(?:\s+до|\s+в)?|доставк\w*\s+(?:до|в)|"
+        rf"доставить\s+(?:до|в)|для|в)\s+(?P<city>{city_pattern})\b",
+        flags=re.IGNORECASE,
+    )
+
+
+_SHOPPING_CRITERION_NOISE: dict[str, tuple[str, ...]] = {
+    "power_desc": (
+        r"\b(?:сам\w+\s+)?(?:мощн|производительн|сильн)\w*\b",
+        r"\b(?:по\s+)?(?:мощност|производительност)\w*\b",
+    ),
+    "speed_desc": (
+        r"\b(?:сам\w+\s+)?(?:быстр|скоростн)\w*\b",
+        r"\b(?:по\s+)?скорост\w*\b",
+    ),
+    "capacity_desc": (
+        r"\b(?:сам\w+\s+)?(?:вместительн|[её]мк(?:ий|ая|ое|ие|ого|ую))\w*\b",
+        r"\b(?:сам\w+\s+)?(?:максимальн|больш|высок)\w*\s+"
+        r"(?:емкост|ёмкост|объем|объём)\w*(?:\s+памят\w*)?\b",
+    ),
+    "range_desc": (
+        r"\b(?:сам\w+\s+)?(?:дальнобойн|дальн)\w*\b",
+        r"\b(?:с\s+)?(?:сам\w+\s+)?(?:больш|максимальн)\w*\s+"
+        r"радиус\w*\s+действ\w*\b",
+        r"\bрадиус\w*\s+действ\w*\b",
+    ),
+    "runtime_desc": (
+        r"\b(?:сам\w+\s+)?автономн\w*\b",
+        r"\b(?:больш\w+\s+)?времен\w*\s+работ\w*\b",
+        r"\bдольше\s+работ\w*\b",
+    ),
+    "price_asc": (
+        r"\b(?:сам\w+\s+)?(?:дешев|дешёв|недорог|бюджетн)\w*\b",
+        r"\bминимальн\w*\s+цен\w*\b",
+    ),
+    "price_desc": (
+        r"\b(?:сам\w+\s+)?(?:дорог|премиальн)\w*\b",
+        r"\bмаксимальн\w*\s+цен\w*\b",
+    ),
+    "rating_desc": (
+        r"\b(?:сам\w+\s+)?лучш\w*\b",
+        r"\b(?:по\s+)?рейтинг\w*\b",
+    ),
+    "popularity_desc": (
+        r"\b(?:сам\w+\s+)?популярн\w*\b",
+        r"\b(?:по\s+)?(?:числ|количеств)\w*\s+отзыв\w*\b",
+    ),
+    "age_asc": (r"\b(?:сам\w+\s+)?(?:молод|юн)\w*\b",),
+    "age_desc": (r"\b(?:сам\w+\s+)?(?:старейш|старш|стар)\w*\b",),
+    "weight_asc": (r"\b(?:сам\w+\s+)?(?:легк|лёгк)\w*\b",),
+    "weight_desc": (r"\b(?:сам\w+\s+)?(?:тяжел|тяжёл)\w*\b",),
+    "size_asc": (r"\b(?:сам\w+\s+)?(?:компактн|маленьк|миниатюрн)\w*\b",),
+    "size_desc": (r"\b(?:сам\w+\s+)?(?:крупн|больш)\w*\b",),
+    "date_desc": (
+        r"\b(?:сам\w+\s+)?(?:новейш|нов|свеж|последн)\w*\b",
+    ),
+}
+
+
+def _strip_shopping_criterion_noise(value: str, original_query: str) -> str:
+    criterion = _ranking_criterion_from_message(original_query)
+    for pattern in _SHOPPING_CRITERION_NOISE.get(criterion or "", ()):
+        value = re.sub(pattern, " ", value, flags=re.IGNORECASE)
+    return value
+
 
 def _clean_shopping_subject(query: str) -> str:
     cleaned = _clean_research_subject(query)
-    store_names = (
-        "dns",
-        "днс",
-        "ozon",
-        "wildberries",
-        "яндекс маркет",
-        "yandex market",
-        "маркет",
-        "ситилинк",
-        "citilink",
-        "мвидео",
-        "м.видео",
-        "mvideo",
-        "эльдорадо",
-        "eldorado",
-        "авито",
-        "avito",
-        "aliexpress",
-        "алиэкспресс",
+    for pattern in (*_SHOPPING_MAX_PRICE_PATTERNS, *_SHOPPING_MIN_PRICE_PATTERNS):
+        cleaned = pattern.sub(" ", cleaned)
+    cleaned = re.sub(
+        r"\b(?:с\s+)?рейтинг\w*\s*(?:не\s+ниже|от|>=?|выше)\s*"
+        r"[1-5](?:[.,]\d)?\b",
+        " ",
+        cleaned,
+        flags=re.IGNORECASE,
     )
-    store_pattern = "|".join(re.escape(name) for name in store_names)
-    cleaned = re.sub(rf"\b(?:на|в|у)\s+(?:{store_pattern})\b", " ", cleaned, flags=re.IGNORECASE)
+    for aliases, _city in _SHOPPING_CITY_ALIASES:
+        for alias in aliases:
+            cleaned = _shopping_location_pattern(alias).sub(" ", cleaned)
+    for source in SHOP_SOURCES:
+        for alias in source.aliases:
+            cleaned = re.sub(
+                rf"(?<![a-zа-яё0-9])(?:{alias})(?![a-zа-яё0-9])",
+                " ",
+                cleaned,
+                flags=re.IGNORECASE,
+            )
+    cleaned = _strip_shopping_criterion_noise(cleaned, query)
+    cleaned = re.sub(
+        r"^\s*(?:а\s+)?(?:какой|какая|какое|какие|что)\s+",
+        " ",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
     cleaned = re.sub(r"\bсам(?:ую|ый|ое|ые)\s+деш[её]в\w*\b", " ", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\bсам(?:ую|ый|ое|ые)\s+недорог\w*\b", " ", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\b(?:купить|цена|стоимость|наличие)\b", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(
+        r"\b(?:с|со|по)?\s*(?:сам\w+\s+)?"
+        r"(?:максимальн|минимальн|высок|низк|больш|мал|лучш)\w*\s+"
+        r"(?:мощност\w*|скорост\w*|рейтинг\w*|(?:емкост|ёмкост)\w*|"
+        r"дальност\w*|радиус\w*(?:\s+действ\w*)?|автономност\w*|"
+        r"времен\w*\s+работ\w*|вес\w*|размер\w*|габарит\w*)\b",
+        " ",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\b(?:по\s+)?(?:числ|количеств)\w*\s+отзыв\w*\b",
+        " ",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\b(?:с\s+|по\s+)?(?:сам(?:ым|ой|ую|ый|ое|ые)\s+)?"
+        r"(?:максимальн|минимальн|высок|низк)\w*\s+"
+        r"(?:мощност|скорост|рейтинг|емкост|ёмкост|дальност|автономност|вес|размер)\w*\b",
+        " ",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\b(?:сам(?:ую|ый|ое|ые)\s+)?(?:мощн|быстр|скоростн|вместительн|"
+        r"дальнобойн|автономн|лучш|популярн|новейш|легк|лёгк|тяжел|тяжёл|"
+        r"компактн|маленьк|крупн)\w*\b",
+        " ",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\b(?:купить|цена|стоимость|наличие|есть|бывает|прода[её]тся|доступен|"
+        r"доступна|доступны)\b",
+        " ",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
     cleaned = re.sub(r"\b(?:все|всё)[-\s]*таки\b", " ", cleaned, flags=re.IGNORECASE)
     tokens = [
         token
@@ -6896,9 +7364,53 @@ def _clean_shopping_subject(query: str) -> str:
         if token.lower() not in _SHOPPING_SUBJECT_STOPWORDS
     ]
     cleaned = _normalize_search_query(" ".join(tokens))
-    if cleaned:
-        return cleaned
-    return _normalize_search_query(query) or query
+    return cleaned
+
+
+def _shopping_constraints_from_message(message: str) -> dict[str, float]:
+    constraints: dict[str, float] = {}
+    for key, patterns in (
+        ("max_price", _SHOPPING_MAX_PRICE_PATTERNS),
+        ("min_price", _SHOPPING_MIN_PRICE_PATTERNS),
+    ):
+        for pattern in patterns:
+            match = pattern.search(message)
+            if not match:
+                continue
+            value = _metric_number_from_text(match.group(1))
+            if value is not None:
+                constraints[key] = value
+            break
+    rating_match = re.search(
+        r"рейтинг\w*\s*(?:не\s+ниже|от|>=?|выше)\s*([1-5](?:[.,]\d)?)",
+        message,
+        flags=re.IGNORECASE,
+    )
+    if rating_match:
+        constraints["min_rating"] = float(rating_match.group(1).replace(",", "."))
+    return constraints
+
+
+def _metric_number_from_text(value: str) -> float | None:
+    normalized = re.sub(r"[\s ]", "", str(value))
+    if re.fullmatch(r"\d{1,3}(?:[.,]\d{3})+", normalized):
+        normalized = re.sub(r"[.,]", "", normalized)
+    elif "," in normalized and "." in normalized:
+        decimal = max(normalized.rfind(","), normalized.rfind("."))
+        normalized = re.sub(r"[.,]", "", normalized[:decimal]) + "." + normalized[decimal + 1 :]
+    else:
+        normalized = normalized.replace(",", ".")
+    try:
+        return float(normalized)
+    except ValueError:
+        return None
+
+
+def _shopping_cities_from_message(message: str) -> list[str]:
+    for aliases, city in _SHOPPING_CITY_ALIASES:
+        if any(_shopping_location_pattern(alias).search(message) for alias in aliases):
+            return [city]
+    return []
 
 
 def _compact_shopping_subject(subject: str) -> str:
@@ -6956,6 +7468,7 @@ def _clean_research_subject(query: str) -> str:
         r"^\s*дай\s+мне\s+(?:пример\s+)?(?:реальн\w+\s+)?",
         r"^\s*(?:найди|поищи|узнай|проверь|покажи|подскажи|подбери)\s+(?:мне\s+)?",
         r"^\s*(?:найти|поискать|проверить|узнать|показать|подобрать)\s+",
+        r"^\s*(?:сравни|сравнить)\s+(?:мне\s+)?",
     )
     for pattern in command_patterns:
         cleaned = re.sub(pattern, " ", cleaned, flags=re.IGNORECASE)
@@ -7490,26 +8003,54 @@ def _shopping_mentions_previous_context(normalized: str) -> bool:
 
 def _ranking_criterion_from_message(message: str) -> str | None:
     normalized = message.lower()
-    if _contains_any(normalized, ("дешев", "дешёв", "бюджет", "недорог", "минимальн")):
-        return "price_asc"
-    if _contains_any(normalized, ("дорог", "премиальн", "максимальн")):
-        return "price_desc"
-    if _contains_any(normalized, ("молод", "юный", "юная")):
-        return "age_asc"
-    if _contains_any(normalized, ("старейш", "старш", "самый стар", "самая стар")):
-        return "age_desc"
     if _contains_any(normalized, ("мощн", "производительн", "сильн")):
         return "power_desc"
     if _contains_any(normalized, ("быстр", "скорост")):
         return "speed_desc"
-    if _contains_any(normalized, ("лёгк", "легк", "компакт", "маленьк", "мини")):
+    if _contains_any(normalized, ("вместительн",)) or re.search(
+        r"\b(?:сам\w+\s+)?(?:[её]мк(?:ий|ая|ое|ие|ого|ую)|"
+        r"(?:максимальн|больш|высок)\w*\s+(?:емкост|ёмкост|объем|объём)\w*)\b",
+        normalized,
+    ):
+        return "capacity_desc"
+    if _contains_any(normalized, ("дальн", "дальнобойн", "радиус действ")) or re.search(
+        r"\bрадиус\w*\s+действ\w*\b",
+        normalized,
+    ):
+        return "range_desc"
+    if _contains_any(normalized, ("автоном", "время работы", "дольше работает")) or re.search(
+        r"\bвремен\w*\s+работ\w*\b",
+        normalized,
+    ):
+        return "runtime_desc"
+    if _contains_any(normalized, ("дешев", "дешёв", "бюджет", "недорог")) or re.search(
+        r"\bминимальн\w*\s+цен\w*\b",
+        normalized,
+    ):
+        return "price_asc"
+    if _contains_any(normalized, ("дорог", "премиальн")) or re.search(
+        r"\bмаксимальн\w*\s+цен\w*\b",
+        normalized,
+    ):
+        return "price_desc"
+    if _contains_any(normalized, ("популяр", "больше отзыв", "много отзыв")):
+        return "popularity_desc"
+    if _contains_any(normalized, ("рейтинг", "лучший", "лучш")):
+        return "rating_desc"
+    if _contains_any(normalized, ("молод", "юный", "юная")):
+        return "age_asc"
+    if _contains_any(normalized, ("старейш", "старш", "самый стар", "самая стар")):
+        return "age_desc"
+    if _contains_any(normalized, ("лёгк", "легк", "малый вес", "меньше вес")):
+        return "weight_asc"
+    if _contains_any(normalized, ("тяжел", "тяжёл", "большой вес", "больше вес")):
+        return "weight_desc"
+    if _contains_any(normalized, ("компакт", "маленьк", "миниатюрн")):
         return "size_asc"
-    if _contains_any(normalized, ("крупн", "больш", "тяжел", "тяжёл")):
+    if _contains_any(normalized, ("крупн", "больш")):
         return "size_desc"
     if _contains_any(normalized, ("новейш", "самый новый", "самая новая", "свеж", "последн")):
         return "date_desc"
-    if _contains_any(normalized, ("популяр", "рейтинг", "лучший", "лучш")):
-        return "rating_desc"
     return None
 
 
@@ -7679,10 +8220,18 @@ def _candidate_sort_key(item: dict[str, Any], criterion: str) -> tuple[int, floa
             return (0, -float(age), rank)
         year = item.get("year_value")
         return (0, float(year), rank) if year is not None else (1, 0.0, rank)
-    if criterion in {"power_desc", "speed_desc", "size_desc", "date_desc", "rating_desc"}:
+    if criterion in {
+        "power_desc",
+        "speed_desc",
+        "size_desc",
+        "weight_desc",
+        "date_desc",
+        "rating_desc",
+        "popularity_desc",
+    }:
         metric = _candidate_metric(item, criterion)
         return (0, -float(metric), rank) if metric is not None else (1, 0.0, rank)
-    if criterion == "size_asc":
+    if criterion in {"size_asc", "weight_asc"}:
         metric = _candidate_metric(item, criterion)
         return (0, float(metric), rank) if metric is not None else (1, 0.0, rank)
     value = item.get("price_value")
@@ -7739,10 +8288,16 @@ def _ranking_criterion_label(criterion: str) -> str:
         "age_desc": "самый старший / максимальный возраст",
         "power_desc": "максимальная мощность/производительность",
         "speed_desc": "максимальная скорость",
-        "size_asc": "минимальный размер/вес",
-        "size_desc": "максимальный размер/вес",
+        "capacity_desc": "максимальная ёмкость",
+        "range_desc": "максимальная дальность",
+        "runtime_desc": "максимальное время автономной работы",
+        "size_asc": "минимальные габариты",
+        "size_desc": "максимальные габариты",
+        "weight_asc": "минимальный вес",
+        "weight_desc": "максимальный вес",
         "date_desc": "самое новое / свежая дата",
-        "rating_desc": "максимальный рейтинг/популярность",
+        "rating_desc": "максимальный рейтинг с учётом числа отзывов",
+        "popularity_desc": "максимальная популярность по числу отзывов",
     }.get(criterion, criterion)
 
 

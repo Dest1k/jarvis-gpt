@@ -534,7 +534,17 @@ def test_dns_catalog_failure_is_not_replaced_by_generic_web_answer(monkeypatch, 
         )
     )
 
-    assert calls == [("web.shop_search", {"query": "rtx 5090", "shop": "dns"})]
+    assert calls == [
+        (
+            "web.shop_search",
+            {
+                "query": "rtx 5090",
+                "shop": "dns",
+                "criterion": "price_asc",
+                "criterion_label": "минимальная цена",
+            },
+        )
+    ]
     assert "HTTP 403" in action.answer
     assert "не подменяю результат общим веб-поиском" in action.answer
     assert "https://www.dns-shop.ru/search/?q=rtx+5090" in action.answer
@@ -2341,6 +2351,7 @@ def test_agent_non_shopping_web_answer_does_not_poison_shopping_followup(
     tmp_path,
 ):
     calls = []
+    shop_calls = []
 
     async def fake_web_answer(_ctx, args):
         calls.append(args)
@@ -2370,9 +2381,36 @@ def test_agent_non_shopping_web_answer_does_not_poison_shopping_followup(
             },
         )
 
+    async def fake_shop_search(_ctx, args):
+        shop_calls.append(args)
+        item = {
+            "title": "DNS RTX 5090",
+            "url": "https://www.dns-shop.ru/product/5090/",
+            "price_text": "409 999 ₽",
+            "price_value": 409999.0,
+            "in_stock": True,
+        }
+        return ToolRunResponse(
+            tool="web.shop_search",
+            ok=True,
+            summary="1 product",
+            data={
+                "ok": True,
+                "items": [item],
+                "best": item,
+                "cheapest": item,
+                "comparison": {
+                    "criterion": "price_asc",
+                    "metric_key": "price_value",
+                    "complete": True,
+                },
+            },
+        )
+
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
     monkeypatch.setattr("jarvis_gpt.tools._web_answer", fake_web_answer)
+    monkeypatch.setattr("jarvis_gpt.tools._web_shop_search", fake_shop_search)
     settings = load_settings()
     ensure_runtime_dirs(settings)
     storage = JarvisStorage(settings.database_path)
@@ -2403,9 +2441,11 @@ def test_agent_non_shopping_web_answer_does_not_poison_shopping_followup(
         )
     )
 
-    assert len(calls) == 2
-    assert "5090" in calls[1]["question"]
-    assert "DNS RTX 5090 search" in second.answer
+    assert len(calls) == 1
+    assert len(shop_calls) == 1
+    assert shop_calls[0]["query"] == "rtx 5090"
+    assert shop_calls[0]["cities"] == ["Москва"]
+    assert "DNS RTX 5090" in second.answer
     assert not any(event.title == "shopping.followup" for event in second.events)
     storage.close()
 

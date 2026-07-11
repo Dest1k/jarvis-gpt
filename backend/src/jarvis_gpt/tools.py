@@ -70,6 +70,7 @@ from .models import ToolInfo, ToolRunResponse
 from .operations import OperationsManager, _cadence_interval, docker_container_allowed
 from .persona import INSIGHT_FIELDS, PersonaManager, load_persona
 from .redaction import redact_text, redact_value
+from .shop_registry import find_shop_source, get_shop_source, get_shop_source_by_host
 from .state_verification import (
     GateStatus,
     PathExpectation,
@@ -1278,23 +1279,31 @@ class ToolRegistry:
             ToolSpec(
                 name="web.shop_search",
                 description=(
-                    "Find products in a shop/marketplace and RANK THEM BY PRICE using a real "
+                    "Find and compare products in a shop/marketplace using its catalog/API and "
                     "headless browser (Playwright + stealth), so JS/anti-bot catalogs like DNS, "
                     "Ozon, Wildberries, Citilink, М.Видео that plain web.search/web.fetch cannot "
-                    "read are actually loaded. Use this for 'найди самую дешёвую X на <магазин>' / "
-                    "'где дешевле X'. Sets the delivery city (Донецк, else Москва) before reading "
-                    "so regional prices are correct. Returns products sorted cheapest-first with "
-                    "the cheapest highlighted. Requires playwright installed on the runtime; if it "
-                    "is not, the tool says so instead of guessing."
+                    "read are actually loaded. Supports price, power, speed, capacity, range, "
+                    "runtime, size, recency and rating criteria. Non-price winners require typed, "
+                    "comparable seller-declared metrics; otherwise it returns the candidates and "
+                    "an explicit evidence gap instead of guessing."
                 ),
                 category="web",
                 input_schema={
                     "query": "What to search, e.g. 'rtx 5090'",
                     "shop": "Shop name: dns/днс, ozon, wildberries, citilink, mvideo, "
-                    "eldorado, yandex market, regard",
-                    "search_url": "Optional explicit shop search URL (overrides shop)",
+                    "eldorado, yandex market, regard, avito, aliexpress",
+                    "search_url": (
+                        "Optional explicit search URL on the selected registered shop domain"
+                    ),
                     "max_items": "Maximum products to return (default 24)",
                     "cities": "Optional ordered city names; default Донецк, Москва",
+                    "criterion": (
+                        "price_asc, price_desc, power_desc, speed_desc, capacity_desc, "
+                        "range_desc, runtime_desc, age_asc, age_desc, size_asc, size_desc, "
+                        "weight_asc, weight_desc, date_desc, rating_desc, popularity_desc"
+                    ),
+                    "criterion_label": "Human-readable requested comparison criterion",
+                    "constraints": "Optional max_price, min_price and min_rating filters",
                 },
                 handler=_web_shop_search,
             )
@@ -4354,6 +4363,25 @@ async def _web_shop_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRes
     search_url = str(args.get("search_url") or "").strip() or None
     max_items = _int_arg(args.get("max_items"), default=24, minimum=1, maximum=60)
     cities = _string_list_arg(args.get("cities"), limit=6) or None
+    criterion = " ".join(str(args.get("criterion") or "price_asc").split()).casefold()
+    criterion_label = " ".join(str(args.get("criterion_label") or "").split())[:160]
+    constraints: dict[str, float] = {}
+    raw_constraints = args.get("constraints")
+    if isinstance(raw_constraints, dict):
+        for key in ("max_price", "min_price", "min_rating"):
+            try:
+                value = float(raw_constraints.get(key))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value) and value >= 0 and (
+                key != "min_rating" or value <= 5
+            ):
+                constraints[key] = value
+    if (
+        constraints.get("min_price", 0) > constraints.get("max_price", math.inf)
+    ):
+        constraints.pop("min_price", None)
+        constraints.pop("max_price", None)
     if not query:
         return ToolRunResponse(
             tool="web.shop_search", ok=False, summary="Search query is required."
@@ -4364,6 +4392,29 @@ async def _web_shop_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRes
             ok=False,
             summary="Specify a shop (dns/ozon/wildberries/...) or an explicit search_url.",
         )
+    if search_url:
+        try:
+            search_url = await _validate_public_http_url_async(search_url)
+        except ValueError as exc:
+            return ToolRunResponse(
+                tool="web.shop_search",
+                ok=False,
+                summary=f"Unsafe shop search URL: {exc}",
+            )
+        hostname = (urlparse(search_url).hostname or "").casefold()
+        url_source = get_shop_source_by_host(hostname)
+        requested_source = get_shop_source(shop)
+        if url_source is None or (
+            requested_source is not None and url_source.key != requested_source.key
+        ):
+            return ToolRunResponse(
+                tool="web.shop_search",
+                ok=False,
+                summary=(
+                    "Shop search URL must use the registered domain for the selected shop."
+                ),
+            )
+        shop = url_source.key
     try:
         from .web_surfer import JarvisWebSurfer, SurferConfig
     except ImportError:
@@ -4387,6 +4438,9 @@ async def _web_shop_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRes
                 search_url=search_url,
                 max_items=max_items,
                 cities=cities,
+                criterion=criterion,
+                criterion_label=criterion_label,
+                constraints=constraints or None,
             )
     except Exception as exc:  # noqa: BLE001 - browser/proxy failures degrade honestly
         return ToolRunResponse(
@@ -4397,7 +4451,9 @@ async def _web_shop_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRes
         )
 
     items = result.get("items") or []
-    cheapest = result.get("cheapest")
+    best = result.get("best")
+    comparison = result.get("comparison") if isinstance(result.get("comparison"), dict) else {}
+    criterion = str(comparison.get("criterion") or criterion)
     if not result.get("ok") or not items:
         reason = result.get("error") or "no products parsed"
         return ToolRunResponse(
@@ -4407,23 +4463,36 @@ async def _web_shop_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRes
             data=result,
         )
     lines = []
-    if cheapest:
+    if criterion in {"price_asc", "price_desc"} and best:
         cheapest_label = (
             "Дешевле всего"
-            if result.get("price_sort_confirmed")
-            else "Дешевле всего из найденного"
+            if criterion == "price_asc" and result.get("price_sort_confirmed")
+            else "Лидер по цене среди найденного"
         )
         lines.append(
-            f"{cheapest_label}: {cheapest.get('price_text')} — {cheapest.get('title')}"
+            f"{cheapest_label}: {best.get('price_text')} — {best.get('title')}"
+        )
+    elif best and comparison.get("complete"):
+        best_metric = comparison.get("best_metric") or {}
+        lines.append(
+            f"Лидер по критерию {comparison.get('metric_label')}: "
+            f"{best_metric.get('text')} — {best.get('title')}"
+        )
+    elif items:
+        lines.append(
+            f"Нет сопоставимой характеристики '{criterion_label or criterion}' "
+            "в найденных карточках."
         )
     for index, item in enumerate(items[:10], start=1):
         price = item.get("price_text") or "цена не считана"
-        lines.append(f"{index}. {price} — {item.get('title')}")
+        metric = (item.get("metrics") or {}).get(comparison.get("metric_key")) or {}
+        metric_suffix = f"; {metric.get('text')}" if metric.get("text") else ""
+        lines.append(f"{index}. {price}{metric_suffix} — {item.get('title')}")
     city = result.get("city")
     summary = f"{len(items)} товар(ов) по '{query}'"
     if city:
         summary += f" (город: {city})"
-    summary += ". " + " | ".join(lines[:3])
+    summary += f"; criterion={criterion}. " + " | ".join(lines[:3])
     return ToolRunResponse(
         tool="web.shop_search",
         ok=True,
@@ -11081,31 +11150,11 @@ def _web_answer_preferred_domains(texts: list[str]) -> list[str]:
         host = _url_domain(match)
         if host:
             _append_unique_domain(domains, host)
+    shop_source = find_shop_source(normalized)
+    if shop_source is not None:
+        _append_unique_domain(domains, shop_source.domain)
     known_sites = (
-        (
-            "dns-shop.ru",
-            (
-                r"\bdns-?shop\b",
-                r"\b\u043d\u0430\s+dns\b",
-                r"\b\u0432\s+dns\b",
-                r"\b\u043d\u0430\s+\u0434\u043d\u0441\b",
-                r"\b\u0432\s+\u0434\u043d\u0441\b",
-                r"\b\u0434\u043d\u0441-?\u0448\u043e\u043f\b",
-                r"\bна\s+dns\b",
-                r"\bв\s+dns\b",
-                r"\bна\s+днс\b",
-                r"\bв\s+днс\b",
-                r"\bднс-?шоп\b",
-            ),
-        ),
-        ("ozon.ru", (r"\bozon\b", r"\bозон\b")),
-        (
-            "wildberries.ru",
-            (r"\bwildberries\b", r"\bна\s+вб\b", r"\bвай?лдберр", r"\bwb\b"),
-        ),
-        ("market.yandex.ru", (r"\bяндекс\s+маркет\b", r"\byandex\s+market\b")),
         ("avito.ru", (r"\bavito\b", r"\bавито\b")),
-        ("citilink.ru", (r"\bcitilink\b", r"\bситилинк\b")),
     )
     for domain, patterns in known_sites:
         if any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in patterns):

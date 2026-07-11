@@ -124,6 +124,196 @@ def test_dns_heuristic_parser_rejects_priced_catalog_recipe_links():
     ]
 
 
+def test_wildberries_parser_uses_real_product_cards_and_rejects_search_links():
+    html = """
+    <a href="/catalog/0/search.aspx?search=laser&nocorrection=1">«лазер»</a>
+    <div>502 ₽</div>
+    <article class="product-card" data-nm-id="721395131">
+      <a href="/catalog/721395131/detail.aspx"
+         aria-label="Мощнейшая лазерная указка 50 000 мВт"></a>
+      <ins>3 026 ₽</ins>
+      <span>4,8</span><span>50 оценок</span>
+      <img src="https://basket-34.wbbasket.ru/vol7213/part721395/721395131/images/c516x688/1.webp">
+    </article>
+    """
+
+    items = ws._extract_catalog_items(
+        html,
+        base_url="https://www.wildberries.ru/catalog/0/search.aspx?search=laser",
+    )
+
+    assert len(items) == 1
+    assert items[0]["product_id"] == "721395131"
+    assert items[0]["price_value"] == 3026.0
+    assert items[0]["rating_value"] == 4.8
+    assert items[0]["review_count"] == 50
+    assert items[0]["url"].endswith("/catalog/721395131/detail.aspx")
+    assert items[0]["details_url"].endswith("/721395131/info/ru/card.json")
+
+
+def test_power_ranking_converts_units_and_ignores_range_numbers():
+    items = [
+        {"title": "Лазерная указка 5 W", "url": "five", "in_stock": True},
+        {"title": "Лазерная указка 1000 mW", "url": "one", "in_stock": True},
+        {"title": "Лазерная указка дальность 300 м", "url": "range", "in_stock": True},
+        {"title": "Лазерная указка 50 000 мВт", "url": "fifty", "in_stock": True},
+    ]
+    for item in items:
+        ws._attach_catalog_metrics(item)
+
+    metric_key = ws._select_catalog_metric_key(items, "power_desc")
+    ranked = ws._rank_catalog_items(
+        items,
+        criterion="power_desc",
+        metric_key=metric_key,
+    )
+
+    assert metric_key == "power_w"
+    assert [item["url"] for item in ranked] == ["fifty", "five", "one", "range"]
+    assert ranked[0]["metrics"]["power_w"]["value"] == 50.0
+    assert "power_w" not in ranked[-1]["metrics"]
+
+
+def test_power_parser_distinguishes_megawatts_and_milliwatts():
+    mega = ws._power_metric("100 MW", source="title")
+    milli = ws._power_metric("100 mW", source="title")
+    russian_mega = ws._power_metric("2 МВт", source="title")
+    russian_milli = ws._power_metric("2 мВт", source="title")
+
+    assert mega["value"] == 100_000_000.0
+    assert milli["value"] == 0.1
+    assert russian_mega["value"] == 2_000_000.0
+    assert russian_milli["value"] == 0.002
+
+
+def test_data_rate_parser_distinguishes_bytes_bits_and_not_storage_capacity():
+    items = [
+        {"title": "Adapter 1 GB/s", "url": "bytes"},
+        {"title": "Adapter 1 Gb/s", "url": "bits"},
+    ]
+    for item in items:
+        ws._attach_catalog_metrics(item)
+
+    assert items[0]["metrics"]["data_rate_mbps"]["value"] == 8000.0
+    assert items[1]["metrics"]["data_rate_mbps"]["value"] == 1000.0
+    assert "capacity_gb" not in items[0]["metrics"]
+    assert "capacity_gb" not in items[1]["metrics"]
+
+
+def test_non_price_result_does_not_claim_winner_without_comparable_metric():
+    item = {"title": "Лазерная указка мощная", "url": "u", "in_stock": True}
+    ws._attach_catalog_metrics(item)
+    result = ws._shop_search_result(
+        "лазер",
+        "wildberries",
+        ok=True,
+        items=[item],
+        best=None,
+        criterion="power_desc",
+        criterion_label="максимальная мощность",
+        metric_key="",
+    )
+
+    assert result["comparison"]["complete"] is False
+    assert result["comparison"]["compared_count"] == 0
+    assert result["best"] is None
+
+
+def test_non_price_result_requires_two_comparable_cards_for_superlative():
+    item = {"title": "Лазер 5 W", "url": "u", "in_stock": True}
+    ws._attach_catalog_metrics(item)
+    result = ws._shop_search_result(
+        "лазер",
+        "wildberries",
+        ok=True,
+        items=[item],
+        best=item,
+        criterion="power_desc",
+        metric_key="power_w",
+    )
+
+    assert result["comparison"]["compared_count"] == 1
+    assert result["comparison"]["complete"] is False
+    assert result["comparison"]["best_metric"] is None
+    assert result["best"] is None
+
+
+def test_catalog_constraints_are_normalized_filtered_and_returned():
+    items = [
+        {"title": "a", "price_value": 1000.0, "rating_value": 4.8},
+        {"title": "b", "price_value": 4000.0, "rating_value": 4.9},
+        {"title": "c", "price_value": None, "rating_value": None},
+    ]
+    constraints = ws._normalize_catalog_constraints(
+        {"max_price": 3000, "min_rating": 4.5, "ignored": 1}
+    )
+
+    assert constraints == {"max_price": 3000.0, "min_rating": 4.5}
+    assert ws._filter_catalog_constraints(items, constraints) == [items[0]]
+    result = ws._shop_search_result(
+        "x",
+        "ozon",
+        ok=True,
+        items=[items[0]],
+        constraints=constraints,
+    )
+    assert result["constraints"] == constraints
+    assert ws._normalize_catalog_constraints({"min_price": 5, "max_price": 1}) == {}
+    assert ws._normalize_catalog_constraints({"min_rating": 5.1}) == {}
+
+
+def test_wildberries_api_parser_preserves_price_stock_and_rating():
+    payload = {
+        "products": [
+            {
+                "id": 721395131,
+                "brand": "Pointer",
+                "name": "Лазерная указка 50 000 мВт",
+                "reviewRating": 4.8,
+                "feedbacks": 50,
+                "totalQuantity": 4,
+                "sizes": [{"price": {"product": 302600}, "stocks": [{"qty": 4}]}],
+            }
+        ]
+    }
+
+    [item] = ws._wildberries_api_items(payload)
+
+    assert item["price_value"] == 3026.0
+    assert item["price_text"] == "3 026 ₽"
+    assert item["in_stock"] is True
+    assert item["rating_value"] == 4.8
+
+
+def test_wildberries_api_prefers_regular_product_price_over_wallet_discount():
+    payload = {
+        "products": [
+            {
+                "id": 1,
+                "name": "Товар",
+                "sizes": [
+                    {
+                        "price": {"wallet": 90000, "product": 100000, "basic": 120000},
+                        "stocks": [{"qty": 1}],
+                    }
+                ],
+            }
+        ]
+    }
+
+    [item] = ws._wildberries_api_items(payload)
+
+    assert item["price_value"] == 1000.0
+
+
+def test_catalog_search_uses_neutral_query_plus_optional_recall_variant():
+    assert ws._catalog_search_query("лазер", "power_desc") == "лазер"
+    assert ws._catalog_search_variants("лазер", "power_desc") == [
+        "лазер",
+        "лазер мощный",
+    ]
+
+
 def test_rank_catalog_items_cheapest_first_and_unpriced_last():
     items = [
         {"title": "b", "url": "u2", "price_value": 500.0, "price_text": "500 ₽"},
@@ -150,6 +340,44 @@ def test_rank_catalog_items_prefers_purchasable_product_over_cheaper_analog():
     assert ranked[0]["title"] == "RTX 5090 B"
     assert ranked[0]["in_stock"] is True
     assert ranked[1]["in_stock"] is False
+
+
+def test_non_price_ranking_prioritizes_metric_before_unknown_stock():
+    items = [
+        {"title": "5 W", "url": "five", "in_stock": True},
+        {"title": "100 W", "url": "hundred", "in_stock": None},
+    ]
+    for item in items:
+        ws._attach_catalog_metrics(item)
+
+    ranked = ws._rank_catalog_items(
+        items,
+        criterion="power_desc",
+        metric_key="power_w",
+    )
+
+    assert [item["url"] for item in ranked] == ["hundred", "five"]
+
+
+def test_rating_ranking_accounts_for_review_volume():
+    items = [
+        {"title": "5 stars", "url": "tiny", "rating_value": 5.0, "review_count": 1},
+        {
+            "title": "4.9 stars",
+            "url": "proven",
+            "rating_value": 4.9,
+            "review_count": 10_000,
+        },
+    ]
+    for item in items:
+        ws._attach_catalog_metrics(item)
+    ranked = ws._rank_catalog_items(
+        items,
+        criterion="rating_desc",
+        metric_key="rating_score",
+    )
+
+    assert ranked[0]["url"] == "proven"
 
 
 def test_catalog_stock_does_not_treat_not_in_stock_as_positive_substring():
@@ -268,6 +496,53 @@ def test_shop_search_retries_blocked_headless_catalog_in_stable_chrome(monkeypat
     assert result["browser_mode"] == "headful_stable_chrome"
 
 
+def test_wildberries_api_candidates_survive_browser_enrichment_failure(monkeypatch):
+    surfer = ws.JarvisWebSurfer(
+        ws.SurferConfig(headless=True, shopping_budget_sec=10, headful_shop_fallback=False)
+    )
+    surfer._playwright = object()
+    item = {
+        "title": "Лазерная указка без заявленной мощности",
+        "url": "https://www.wildberries.ru/catalog/1/detail.aspx",
+        "price_text": "1 000 ₽",
+        "price_value": 1000.0,
+        "in_stock": True,
+    }
+
+    async def api_result(**_kwargs):
+        return ws._shop_search_result(
+            "лазер",
+            "wildberries",
+            ok=True,
+            items=[item],
+            criterion="power_desc",
+            metric_key="",
+            browser_mode="wildberries_catalog_api",
+        )
+
+    async def browser_failure(*_args, **_kwargs):
+        return ws._shop_search_result(
+            "лазер",
+            "wildberries",
+            ok=False,
+            error="anti-bot",
+            criterion="power_desc",
+        )
+
+    monkeypatch.setattr(surfer, "_wildberries_api_shop_search", api_result)
+    monkeypatch.setattr(surfer, "_shop_search_impl", browser_failure)
+
+    result = asyncio.run(
+        surfer.shop_search("лазер", shop="wildberries", criterion="power_desc")
+    )
+
+    assert result["ok"] is True
+    assert result["items"] == [item]
+    assert result["comparison"]["complete"] is False
+    assert result["best"] is None
+    assert result["browser_mode"] == "wildberries_catalog_api"
+
+
 def test_shop_search_result_shape():
     ranked = ws._rank_catalog_items(
         ws._extract_catalog_items(_DNS_GRID, base_url="https://www.dns-shop.ru/search/?q=rtx")
@@ -348,6 +623,37 @@ def test_web_shop_search_requires_query_and_shop(monkeypatch, tmp_path):
     storage.close()
 
 
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"query": "x", "shop": "ozon", "search_url": "https://wildberries.ru/search"},
+        {
+            "query": "x",
+            "shop": "wildberries",
+            "search_url": "https://wildberries.ru.evil.test/search",
+        },
+        {"query": "x", "search_url": "http://127.0.0.1/catalog"},
+        {"query": "x", "search_url": "file:///etc/passwd"},
+    ],
+)
+def test_web_shop_search_rejects_unregistered_or_mismatched_urls(
+    monkeypatch,
+    tmp_path,
+    arguments,
+):
+    async def fake_validate(url):
+        return url
+
+    monkeypatch.setattr("jarvis_gpt.tools._validate_public_http_url_async", fake_validate)
+    tools, storage = _registry(monkeypatch, tmp_path)
+
+    result = asyncio.run(tools.run("web.shop_search", arguments))
+
+    assert result.ok is False
+    assert "registered domain" in result.summary
+    storage.close()
+
+
 def test_web_shop_search_degrades_without_browser(monkeypatch, tmp_path):
     # Force the lazy import to fail so we exercise the honest-degradation path
     # regardless of whether Playwright happens to be installed.
@@ -357,4 +663,60 @@ def test_web_shop_search_degrades_without_browser(monkeypatch, tmp_path):
     assert result.ok is False
     assert (result.data or {}).get("needs_install") is True
     assert "playwright" in result.summary.lower()
+    storage.close()
+
+
+def test_web_shop_search_forwards_non_price_criterion_without_guessing(
+    monkeypatch,
+    tmp_path,
+):
+    captured = {}
+
+    async def fake_start(self):
+        self._started = True
+
+    async def fake_close(self):
+        self._started = False
+
+    async def fake_shop_search(self, query, **kwargs):
+        captured.update({"query": query, **kwargs})
+        item = {
+            "title": "Пылесос без указанной мощности",
+            "url": "https://shop.example/product/1",
+            "price_text": "10 000 ₽",
+            "price_value": 10000.0,
+            "in_stock": True,
+        }
+        return ws._shop_search_result(
+            query,
+            kwargs["shop"],
+            ok=True,
+            items=[item],
+            criterion=kwargs["criterion"],
+            criterion_label=kwargs["criterion_label"],
+            metric_key="",
+        )
+
+    monkeypatch.setattr(ws.JarvisWebSurfer, "start", fake_start)
+    monkeypatch.setattr(ws.JarvisWebSurfer, "close", fake_close)
+    monkeypatch.setattr(ws.JarvisWebSurfer, "shop_search", fake_shop_search)
+    tools, storage = _registry(monkeypatch, tmp_path)
+
+    result = asyncio.run(
+        tools.run(
+            "web.shop_search",
+            {
+                "query": "пылесос",
+                "shop": "wildberries",
+                "criterion": "power_desc",
+                "criterion_label": "максимальная мощность",
+            },
+        )
+    )
+
+    assert result.ok is True
+    assert captured["criterion"] == "power_desc"
+    assert captured["criterion_label"] == "максимальная мощность"
+    assert "Нет сопоставимой характеристики" in result.summary
+    assert result.data["best"] is None
     storage.close()
