@@ -86,7 +86,14 @@ __all__ = [
     "SurferConfig",
     "SurferTimeoutError",
     "WebSurferError",
+    "shop_search_url",
 ]
+
+
+def shop_search_url(shop: str | None, query: str) -> str:
+    """Public helper: build a shop search URL, or '' if the shop is unknown."""
+
+    return _shop_search_url(shop, query)
 
 LOGGER = logging.getLogger("jarvis.web_surfer")
 
@@ -299,6 +306,70 @@ _APP_STATE_JS = r"""
     apollo: grab(() => JSON.stringify(window.__APOLLO_STATE__)),
     preloaded: grab(() => JSON.stringify(window.__PRELOADED_STATE__)),
   };
+}
+"""
+
+# Open a shop's city selector and pick the first available preferred city.
+# Receives the preferred city list as the evaluate() argument.
+_SET_CITY_JS = r"""
+(wanted) => {
+  const norm = (v) => String(v || "").toLowerCase().replace(/ё/g, "е")
+    .replace(/\s+/g, " ").trim();
+  const vis = (el) => {
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    const s = getComputedStyle(el);
+    return s.visibility !== "hidden" && s.display !== "none"
+      && Number(s.opacity || "1") > 0 && r.width > 0 && r.height > 0;
+  };
+  const txt = (el) => [
+    el.innerText || el.textContent || "",
+    el.getAttribute("aria-label") || "",
+    el.getAttribute("title") || "",
+    el.getAttribute("data-city") || "",
+  ].join(" ");
+  const openMarkers = [
+    "ваш город", "выберите город", "выбрать город", "выбор города", "город:",
+    "изменить город", "укажите город", "мой город", "город доставки",
+    "select city", "choose city", "your city",
+  ];
+  const clickables = () => Array.from(document.querySelectorAll(
+    "button, a, [role=button], [role=link], span, div, [data-city]"
+  )).filter(vis);
+  // Already set to a wanted city?
+  for (const el of clickables()) {
+    const t = norm(txt(el));
+    if (!openMarkers.some((m) => t.includes(m))) continue;
+    for (const w of wanted) if (t.includes(norm(w)))
+      return { ok: true, city: norm(w), opened: false };
+  }
+  let opener = null;
+  for (const el of clickables()) {
+    const t = norm(txt(el));
+    if (openMarkers.some((m) => t.includes(m))) { opener = el; break; }
+  }
+  if (!opener) return { ok: false, city: "", reason: "no_selector" };
+  opener.scrollIntoView({ block: "center" });
+  opener.click();
+  return new Promise((resolve) => setTimeout(() => {
+    for (const w of wanted) {
+      const wn = norm(w);
+      const opts = Array.from(document.querySelectorAll(
+        "a, button, li, span, div, [role=option], [data-city]"
+      )).filter(vis);
+      let exact = null; let partial = null;
+      for (const el of opts) {
+        const t = norm(txt(el));
+        if (!t) continue;
+        if (t === wn) { exact = el; break; }
+        if (!partial && t.length <= wn.length + 12 && t.includes(wn)) partial = el;
+      }
+      const pick = exact || partial;
+      if (pick) { pick.scrollIntoView({ block: "center" }); pick.click();
+        return resolve({ ok: true, city: wn, opened: true }); }
+    }
+    resolve({ ok: false, city: "", opened: true, reason: "city_not_offered" });
+  }, 900));
 }
 """
 
@@ -811,6 +882,113 @@ class JarvisWebSurfer:
         finally:
             with suppress(Exception):
                 await context.close()
+
+    async def shop_search(
+        self,
+        query: str,
+        *,
+        shop: str | None = None,
+        search_url: str | None = None,
+        max_items: int = 24,
+        cities: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
+        """Render a shop's search page and return products ranked cheapest-first.
+
+        This is the "найди самую дешёвую X на <магазин>" capability: a real
+        browser renders the JS/anti-bot catalog that httpx cannot read, product
+        tiles are extracted (title + price + url), and the list is sorted by
+        price ascending. Before reading, it tries to set the delivery city from
+        ``cities`` (default Донецк -> Москва) so regional prices are correct.
+
+        Returns::
+
+            {
+                "ok": bool, "query": str, "shop": str, "url": str, "city": str,
+                "count": int,
+                "cheapest": {title,url,price_text,price_value} | None,
+                "items": [{title,url,price_text,price_value,in_stock}],
+                "error": str | None,
+            }
+        """
+
+        query = " ".join(str(query or "").split())
+        url = (search_url or "").strip() or _shop_search_url(shop, query)
+        if not query:
+            return _shop_search_result(query, shop, ok=False, error="empty query")
+        if not url:
+            return _shop_search_result(
+                query, shop, ok=False, error=f"unknown shop: {shop!r} (pass search_url)"
+            )
+        want_cities = list(cities) if cities else ["Донецк", "Москва"]
+        try:
+            return await asyncio.wait_for(
+                self._shop_search_impl(query, shop or "", url, max_items, want_cities),
+                timeout=self.config.shopping_budget_sec,
+            )
+        except TimeoutError:
+            return _shop_search_result(
+                query, shop, url=url, ok=False, error="shop_search exceeded budget"
+            )
+        except AntiBotError as exc:
+            return _shop_search_result(query, shop, url=url, ok=False, error=f"anti-bot: {exc}")
+        except WebSurferError as exc:
+            return _shop_search_result(query, shop, url=url, ok=False, error=str(exc))
+
+    async def _shop_search_impl(
+        self,
+        query: str,
+        shop: str,
+        url: str,
+        max_items: int,
+        cities: list[str],
+    ) -> dict[str, Any]:
+        context = await self._new_context()
+        try:
+            page = await self._new_page(context)
+            await self._goto(page, url, wait_until="domcontentloaded")
+            await self._guard_antibot(page)
+            await self._human_mouse_move(page)
+            city = await self._try_set_city(page, cities)
+            # Let the JS grid and lazy prices settle, then nudge lazy-load.
+            with suppress(PlaywrightError):
+                await page.wait_for_load_state("networkidle", timeout=9_000)
+            for _ in range(3):
+                with suppress(PlaywrightError):
+                    await page.mouse.wheel(0, 2200)
+                await self._human_pause(0.5)
+            html = ""
+            with suppress(PlaywrightError):
+                html = await page.content()
+            items = _extract_catalog_items(html, base_url=url)
+            ranked = _rank_catalog_items(items)[:max_items]
+            priced = [item for item in ranked if item.get("price_value") is not None]
+            return _shop_search_result(
+                query,
+                shop,
+                url=url,
+                city=city,
+                ok=bool(ranked),
+                items=ranked,
+                cheapest=priced[0] if priced else None,
+            )
+        finally:
+            with suppress(Exception):
+                await context.close()
+
+    async def _try_set_city(self, page: Page, cities: Sequence[str]) -> str:
+        """Best-effort delivery-city selection; returns the chosen city or ''."""
+
+        wanted = [str(c).strip() for c in cities if str(c).strip()]
+        if not wanted:
+            return ""
+        with suppress(PlaywrightError):
+            result = await page.evaluate(_SET_CITY_JS, wanted)
+            if isinstance(result, dict) and result.get("ok"):
+                await self._human_pause(1.0)
+                with suppress(PlaywrightError):
+                    await page.wait_for_load_state("networkidle", timeout=6_000)
+                return str(result.get("city") or "")
+        return ""
 
     async def aggressive_shopping(self, product_url: str) -> dict[str, Any]:
         """Render a product card, extract price/specs/availability, and mine real
@@ -1335,6 +1513,193 @@ def _fast_fact_result(
         "snippets": snippets or [],
         "source": "duckduckgo",
         "elapsed_ms": int((time.perf_counter() - started) * 1000),
+        "error": error,
+    }
+
+
+# Search-URL templates for major RU shops/marketplaces. {q} is url-encoded.
+_SHOP_SEARCH_TEMPLATES: dict[str, str] = {
+    "dns": "https://www.dns-shop.ru/search/?q={q}&order=price&stock=all",
+    "citilink": "https://www.citilink.ru/search/?text={q}",
+    "mvideo": "https://www.mvideo.ru/product-list-page?q={q}",
+    "eldorado": "https://www.eldorado.ru/search/catalog.php?q={q}",
+    "ozon": "https://www.ozon.ru/search/?text={q}&sorting=price",
+    "wildberries": "https://www.wildberries.ru/catalog/0/search.aspx?search={q}",
+    "yandex market": "https://market.yandex.ru/search?text={q}",
+    "regard": "https://www.regard.ru/catalog?search={q}",
+}
+
+# Shop name aliases (RU/EN) -> canonical key above.
+_SHOP_ALIASES: dict[str, str] = {
+    "dns": "dns",
+    "днс": "dns",
+    "dns-shop": "dns",
+    "dns-shop.ru": "dns",
+    "ситилинк": "citilink",
+    "citilink": "citilink",
+    "мвидео": "mvideo",
+    "m.видео": "mvideo",
+    "mvideo": "mvideo",
+    "эльдорадо": "eldorado",
+    "eldorado": "eldorado",
+    "озон": "ozon",
+    "ozon": "ozon",
+    "вайлдберриз": "wildberries",
+    "вб": "wildberries",
+    "wildberries": "wildberries",
+    "wb": "wildberries",
+    "яндекс маркет": "yandex market",
+    "яндекс.маркет": "yandex market",
+    "yandex market": "yandex market",
+    "регард": "regard",
+    "regard": "regard",
+}
+
+
+def _normalize_shop(shop: str | None) -> str:
+    key = str(shop or "").strip().lower().replace("ё", "е")
+    return _SHOP_ALIASES.get(key, key)
+
+
+def _shop_search_url(shop: str | None, query: str) -> str:
+    template = _SHOP_SEARCH_TEMPLATES.get(_normalize_shop(shop))
+    if not template:
+        return ""
+    return template.format(q=quote_plus(query))
+
+
+_CATALOG_PRICE_RE = re.compile(
+    r"(?P<num>\d[\d\s ]{2,})\s*(?:₽|руб(?:\.|лей|ля)?|р\.)"
+    r"|(?:₽|руб)\s*(?P<num2>\d[\d\s ]{2,})",
+    flags=re.IGNORECASE,
+)
+_PRODUCT_HREF_RE = re.compile(
+    r"/(?:product|catalog|goods|p|item|detail|dp|context/detail)/", re.IGNORECASE
+)
+
+
+def _extract_catalog_items(html: str, *, base_url: str = "") -> list[dict[str, Any]]:
+    """Extract product tiles (title, url, price) from a rendered catalog page.
+
+    Tries Schema.org ``ItemList``/``Product`` first, then an anchor-first
+    heuristic: any product-looking link whose tile also contains a RUB price.
+    """
+
+    try:
+        soup = BeautifulSoup(html, "lxml")
+    except Exception:  # noqa: BLE001 - lxml optional
+        soup = BeautifulSoup(html, "html.parser")
+
+    items = _catalog_from_jsonld(soup, base_url)
+    if len(items) >= 2:
+        return items
+
+    results: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for anchor in soup.find_all("a", href=True):
+        if not isinstance(anchor, Tag):
+            continue
+        title = _collapse(anchor.get_text(" ", strip=True))
+        href = str(anchor.get("href") or "")
+        if len(title) < 8 or not _PRODUCT_HREF_RE.search(href):
+            continue
+        url = urljoin(base_url, href) if base_url else href
+        key = url.split("?", 1)[0]
+        if key in seen:
+            continue
+        price_text = _nearest_price(anchor)
+        if not price_text:
+            continue
+        seen.add(key)
+        results.append(
+            {
+                "title": title[:200],
+                "url": url,
+                "price_text": price_text,
+                "price_value": _parse_amount(price_text),
+                "in_stock": None,
+            }
+        )
+    return results
+
+
+def _catalog_from_jsonld(soup: Any, base_url: str) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        parsed = _safe_json_loads(script.string or "")
+        blocks = parsed if isinstance(parsed, list) else [parsed]
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            elements = block.get("itemListElement")
+            if not isinstance(elements, list):
+                continue
+            for element in elements:
+                node = element.get("item") if isinstance(element, dict) else None
+                node = node if isinstance(node, dict) else element
+                if not isinstance(node, dict):
+                    continue
+                name = str(node.get("name") or "").strip()
+                url = str(node.get("url") or element.get("url") or "").strip()
+                if not name:
+                    continue
+                price = _jsonld_offer_field([node], "price") or _jsonld_field([node], "price")
+                items.append(
+                    {
+                        "title": name[:200],
+                        "url": urljoin(base_url, url) if (base_url and url) else url,
+                        "price_text": f"{price} ₽" if price else "",
+                        "price_value": _parse_amount(price),
+                        "in_stock": None,
+                    }
+                )
+    return items
+
+
+def _nearest_price(anchor: Tag) -> str:
+    node: Any = anchor
+    for _ in range(6):
+        node = node.parent
+        if node is None or not isinstance(node, Tag):
+            break
+        match = _CATALOG_PRICE_RE.search(node.get_text(" ", strip=True))
+        if match:
+            raw = match.group("num") or match.group("num2") or ""
+            return f"{_collapse(raw)} ₽"
+    return ""
+
+
+def _rank_catalog_items(items: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _key(item: dict[str, Any]) -> tuple[int, float]:
+        value = item.get("price_value")
+        if value is None:
+            return (1, 0.0)
+        return (0, float(value))
+
+    return sorted(items, key=_key)
+
+
+def _shop_search_result(
+    query: str,
+    shop: str | None,
+    *,
+    ok: bool,
+    url: str = "",
+    city: str = "",
+    items: list[dict[str, Any]] | None = None,
+    cheapest: dict[str, Any] | None = None,
+    error: str | None = None,
+) -> dict[str, Any]:
+    rows = items or []
+    return {
+        "ok": ok,
+        "query": query,
+        "shop": _normalize_shop(shop) or (shop or ""),
+        "url": url,
+        "city": city,
+        "count": len(rows),
+        "cheapest": cheapest,
+        "items": rows,
         "error": error,
     }
 

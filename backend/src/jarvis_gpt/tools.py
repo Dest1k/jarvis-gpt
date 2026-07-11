@@ -1257,6 +1257,31 @@ class ToolRegistry:
         )
         self.add(
             ToolSpec(
+                name="web.shop_search",
+                description=(
+                    "Find products in a shop/marketplace and RANK THEM BY PRICE using a real "
+                    "headless browser (Playwright + stealth), so JS/anti-bot catalogs like DNS, "
+                    "Ozon, Wildberries, Citilink, М.Видео that plain web.search/web.fetch cannot "
+                    "read are actually loaded. Use this for 'найди самую дешёвую X на <магазин>' / "
+                    "'где дешевле X'. Sets the delivery city (Донецк, else Москва) before reading "
+                    "so regional prices are correct. Returns products sorted cheapest-first with "
+                    "the cheapest highlighted. Requires playwright installed on the runtime; if it "
+                    "is not, the tool says so instead of guessing."
+                ),
+                category="web",
+                input_schema={
+                    "query": "What to search, e.g. 'rtx 5090'",
+                    "shop": "Shop name: dns/днс, ozon, wildberries, citilink, mvideo, "
+                    "eldorado, yandex market, regard",
+                    "search_url": "Optional explicit shop search URL (overrides shop)",
+                    "max_items": "Maximum products to return (default 24)",
+                    "cities": "Optional ordered city names; default Донецк, Москва",
+                },
+                handler=_web_shop_search,
+            )
+        )
+        self.add(
+            ToolSpec(
                 name="web.crawl",
                 description=(
                     "Bounded same-site crawl for paginated articles, forum threads, docs, and "
@@ -4295,6 +4320,88 @@ def mode_deadline_sec(mode: WebMode) -> float:
         WebMode.DEEP_RESEARCH: 60.0,
         WebMode.AGGRESSIVE_SHOPPING: 90.0,
     }[mode]
+
+
+def _web_surfer_proxies() -> list[str]:
+    raw = os.environ.get("JARVIS_WEB_PROXIES", "")
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+async def _web_shop_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    query = " ".join(str(args.get("query") or "").split())
+    shop = str(args.get("shop") or "").strip() or None
+    search_url = str(args.get("search_url") or "").strip() or None
+    max_items = _int_arg(args.get("max_items"), default=24, minimum=1, maximum=60)
+    cities = _string_list_arg(args.get("cities"), limit=6) or None
+    if not query:
+        return ToolRunResponse(
+            tool="web.shop_search", ok=False, summary="Search query is required."
+        )
+    if not shop and not search_url:
+        return ToolRunResponse(
+            tool="web.shop_search",
+            ok=False,
+            summary="Specify a shop (dns/ozon/wildberries/...) or an explicit search_url.",
+        )
+    try:
+        from .web_surfer import JarvisWebSurfer, SurferConfig
+    except ImportError:
+        return ToolRunResponse(
+            tool="web.shop_search",
+            ok=False,
+            summary=(
+                "Browser surfer is unavailable: install Playwright on the runtime "
+                "(pip install playwright beautifulsoup4 lxml playwright-stealth && "
+                "playwright install chromium)."
+            ),
+            data={"needs_install": True},
+        )
+
+    config = SurferConfig(headless=True, proxies=_web_surfer_proxies())
+    try:
+        async with JarvisWebSurfer(config=config) as surfer:
+            result = await surfer.shop_search(
+                query,
+                shop=shop,
+                search_url=search_url,
+                max_items=max_items,
+                cities=cities,
+            )
+    except Exception as exc:  # noqa: BLE001 - browser/proxy failures degrade honestly
+        return ToolRunResponse(
+            tool="web.shop_search",
+            ok=False,
+            summary=f"Browser shop search failed: {exc}",
+            data={"query": query, "shop": shop},
+        )
+
+    items = result.get("items") or []
+    cheapest = result.get("cheapest")
+    if not result.get("ok") or not items:
+        reason = result.get("error") or "no products parsed"
+        return ToolRunResponse(
+            tool="web.shop_search",
+            ok=False,
+            summary=f"No ranked products for '{query}' ({reason}).",
+            data=result,
+        )
+    lines = []
+    if cheapest:
+        lines.append(f"Дешевле всего: {cheapest.get('price_text')} — {cheapest.get('title')}")
+    for index, item in enumerate(items[:10], start=1):
+        price = item.get("price_text") or "цена не считана"
+        lines.append(f"{index}. {price} — {item.get('title')}")
+    city = result.get("city")
+    summary = f"{len(items)} товар(ов) по '{query}'"
+    if city:
+        summary += f" (город: {city})"
+    summary += ". " + " | ".join(lines[:3])
+    return ToolRunResponse(
+        tool="web.shop_search",
+        ok=True,
+        summary=summary[:900],
+        data={**result, "ranked_lines": lines},
+    )
 
 
 async def _web_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:

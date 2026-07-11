@@ -1,0 +1,13 @@
+# Optional dependencies for the browser-driven web surfer (web_surfer.py,
+# tool web.shop_search). Install these on the runtime to let Jarvis read
+# JS/anti-bot shop catalogs (DNS, Ozon, Wildberries, ...) and rank by price.
+#
+#   pip install -r backend/requirements-surfer.txt
+#   playwright install chromium
+#
+# Without these installed, web.shop_search degrades honestly and the rest of
+# the backend runs unchanged (the import is lazy).
+playwright==1.49.1
+beautifulsoup4==4.12.3
+lxml==5.3.0
+playwright-stealth==1.0.6

@@ -9,6 +9,57 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-10 - Claude (shop_search + web.shop_search wiring)
+
+Root cause of "Jarvis can't find the cheapest 5090 on DNS": for dns-shop.ru the
+`web.answer` pipeline returns 0 sources (JS/anti-bot catalog that httpx
+search/fetch/render cannot read), so it hits the `if not sources` branch =>
+"Сайт не отдал достаточно данных... прямая ссылка". Real browser renders it fine
+(operator screenshot). Fix = drive a real browser for shop queries.
+
+Added to `web_surfer.py`:
+- `async shop_search(query, *, shop=None, search_url=None, max_items=24,
+  cities=None) -> dict`. Renders a shop search page, sets delivery city
+  (Донецк -> Москва) via `_SET_CITY_JS`, extracts product tiles, ranks
+  cheapest-first. Returns
+  `{ok, query, shop, url, city, count, cheapest:{title,url,price_text,
+  price_value}, items:[...], error}`.
+- Pure helpers (unit-tested, no browser): `shop_search_url(shop, query)` +
+  `_SHOP_SEARCH_TEMPLATES`/`_SHOP_ALIASES` (dns/днс, ozon, wildberries/вб,
+  citilink, mvideo, eldorado, yandex market, regard);
+  `_extract_catalog_items(html, base_url)` (Schema.org ItemList first, then
+  anchor-first heuristic: product-href link + nearest RUB price, nav links
+  without a price excluded); `_rank_catalog_items` (unpriced last).
+
+Wired into the tool registry (`tools.py`): safe tool `web.shop_search`
+(`_web_shop_search`) LAZY-imports `web_surfer` inside the handler — backend
+never crashes when Playwright is absent; it returns `data.needs_install=True`
+with the pip/`playwright install chromium` hint. Proxies read from
+`JARVIS_WEB_PROXIES` (comma-separated). SYSTEM_PROMPT now routes
+"найди дешёвую X на <магазин>" to `web.shop_search` and forbids the "погугли
+сам" bail when the tool is available.
+
+Deps: NOT added to `backend/requirements.txt` (kept lightweight / non-breaking
+for CI+Docker). New optional `backend/requirements-surfer.txt`
+(playwright==1.49.1, beautifulsoup4, lxml, playwright-stealth). Operator must
+run `pip install -r backend/requirements-surfer.txt && playwright install
+chromium` on D:\jarvis for the browser path to activate — THIS is the real
+unblock; until then web.shop_search degrades honestly.
+
+Tests: `backend/tests/test_shop_search.py` (8) — URL templates/aliases, DNS-grid
+catalog parse, cheapest-first ranking, JSON-LD ItemList, result shape, tool
+registration (safe), arg validation, honest no-browser degradation. bs4-gated
+via `pytest.importorskip`; Playwright stubbed. Full run: my 8 pass; 4 failures
+(`test_execution_tools`, `test_host_bridge_script` x2, `test_model_hub` C:/) are
+PRE-EXISTING on this main (Windows-path/strict-file tests on Linux), confirmed
+by re-running with my changes stashed — not caused by this work. ruff clean.
+
+Next for Codex: route the chat shopping intent (`_run_web_answer_engine` /
+shopping detection) to try `web.shop_search` before `web.answer` for
+site-specific "на <магазин>" queries; optionally fold shop_search results into
+the evidence ledger + `web.answer` cards. `aggressive_shopping(product_url)` is
+also available to enrich the cheapest hit with specs + real negative reviews.
+
 ### 2026-07-10 - Claude (web_surfer.py — isolated Playwright surfer)
 
 New standalone module `backend/src/jarvis_gpt/web_surfer.py`. Zero imports from
