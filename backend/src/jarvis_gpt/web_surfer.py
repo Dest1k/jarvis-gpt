@@ -941,7 +941,9 @@ class JarvisWebSurfer:
         query = " ".join(str(query or "").split())
         criterion = _normalize_catalog_criterion(criterion)
         constraints = _normalize_catalog_constraints(constraints)
-        search_query = _catalog_search_query(query, criterion)
+        neutral_query = _catalog_search_query(query, criterion)
+        search_variants = _catalog_search_variants(query, criterion)
+        search_query = search_variants[0] if search_variants else neutral_query
         url = (search_url or "").strip() or _shop_search_url(
             shop,
             search_query,
@@ -971,7 +973,7 @@ class JarvisWebSurfer:
                 api_result = await asyncio.wait_for(
                     self._wildberries_api_shop_search(
                         query=query,
-                        search_query=search_query,
+                        search_query=neutral_query,
                         max_items=max_items,
                         criterion=criterion,
                         criterion_label=criterion_label,
@@ -3128,7 +3130,12 @@ def _shop_search_result(
     public_cheapest = _public_catalog_item(cheapest)
     public_best = _public_catalog_item(best)
     compared_count = sum(
-        _catalog_metric(item, metric_key or "price_value") is not None
+        _catalog_metric(
+            item,
+            metric_key
+            or ("price_value" if criterion in {"price_asc", "price_desc"} else ""),
+        )
+        is not None
         for item in (items or [])
         if item.get("in_stock") is not False
     )

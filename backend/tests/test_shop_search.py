@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import types
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
@@ -203,7 +204,13 @@ def test_data_rate_parser_distinguishes_bytes_bits_and_not_storage_capacity():
 
 
 def test_non_price_result_does_not_claim_winner_without_comparable_metric():
-    item = {"title": "Лазерная указка мощная", "url": "u", "in_stock": True}
+    item = {
+        "title": "Лазерная указка мощная",
+        "url": "u",
+        "in_stock": True,
+        "price_value": 1000.0,
+        "price_text": "1 000 ₽",
+    }
     ws._attach_catalog_metrics(item)
     result = ws._shop_search_result(
         "лазер",
@@ -503,6 +510,7 @@ def test_wildberries_api_candidates_survive_browser_enrichment_failure(monkeypat
         ws.SurferConfig(headless=True, shopping_budget_sec=10, headful_shop_fallback=False)
     )
     surfer._playwright = object()
+    captured: dict[str, str] = {}
     item = {
         "title": "Лазерная указка без заявленной мощности",
         "url": "https://www.wildberries.ru/catalog/1/detail.aspx",
@@ -522,7 +530,8 @@ def test_wildberries_api_candidates_survive_browser_enrichment_failure(monkeypat
             browser_mode="wildberries_catalog_api",
         )
 
-    async def browser_failure(*_args, **_kwargs):
+    async def browser_failure(*args, **_kwargs):
+        captured["url"] = args[2]
         return ws._shop_search_result(
             "лазер",
             "wildberries",
@@ -543,6 +552,7 @@ def test_wildberries_api_candidates_survive_browser_enrichment_failure(monkeypat
     assert result["comparison"]["complete"] is False
     assert result["best"] is None
     assert result["browser_mode"] == "wildberries_catalog_api"
+    assert parse_qs(urlparse(captured["url"]).query)["search"] == ["мощный лазер"]
 
 
 def test_shop_search_result_shape():
