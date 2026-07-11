@@ -39,7 +39,7 @@ answer.
   shop domain; main-frame cross-domain redirects are aborted.
 - Verification: Ruff and `git diff --check` clean; full backend suite `685
   passed, 13 skipped`. Live exact-query smoke used `web.shop_search` (not
-  `web.answer`), compared 9/24 typed cards, and returned the 100000 mW listing
+  `web.answer`), compared 7/24 typed cards, and returned the 100000 mW listing
   with its direct Wildberries product URL plus the seller-data caveat.
 
 ### 2026-07-11 - Codex (exact DNS 5090 + bounded Russian news fixed live)

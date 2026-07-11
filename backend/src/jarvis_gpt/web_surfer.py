@@ -2685,7 +2685,9 @@ def _catalog_search_variants(query: str, criterion: str) -> list[str]:
     hint = hints.get(criterion, "")
     normalized = query.casefold().replace("ё", "е")
     if hint and hint.casefold().replace("ё", "е") not in normalized:
-        return [base, _collapse(f"{base} {hint}")]
+        # Marketplaces weigh leading words heavily. Put the requested criterion
+        # first, then merge the neutral catalog query when rate limits allow it.
+        return [_collapse(f"{hint} {base}"), base]
     return [base]
 
 
@@ -2729,7 +2731,8 @@ def _power_metric(text: str, *, source: str) -> dict[str, Any] | None:
 
     units = r"(?:MW|МВт|mW|мВт|kW|кВт|W|Вт|mw|мвт|kw|квт|w|вт)"
     for match in re.finditer(
-        rf"(?P<count>{number})\s*[x×]\s*(?P<each>{number})\s*(?P<unit>{units})(?![A-Za-zА-Яа-яЁё])",
+        rf"(?<![A-Za-zА-Яа-яЁё0-9])(?P<count>{number})\s*[x×]\s*"
+        rf"(?P<each>{number})\s*(?P<unit>{units})(?![A-Za-zА-Яа-яЁё])",
         text,
     ):
         count = _metric_number(match.group("count"))
@@ -2746,7 +2749,8 @@ def _power_metric(text: str, *, source: str) -> dict[str, Any] | None:
             )
         )
     for match in re.finditer(
-        rf"(?P<value>{number})\s*(?P<unit>{units})(?![A-Za-zА-Яа-яЁё])",
+        rf"(?<![A-Za-zА-Яа-яЁё0-9])(?P<value>{number})\s*"
+        rf"(?P<unit>{units})(?![A-Za-zА-Яа-яЁё])",
         text,
     ):
         value = _metric_number(match.group("value"))

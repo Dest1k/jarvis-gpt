@@ -184,6 +184,8 @@ def test_power_parser_distinguishes_megawatts_and_milliwatts():
     assert milli["value"] == 0.1
     assert russian_mega["value"] == 2_000_000.0
     assert russian_milli["value"] == 0.002
+    assert ws._power_metric("LaserJet P1820W", source="title") is None
+    assert ws._power_metric("LaserJet M141w", source="title") is None
 
 
 def test_data_rate_parser_distinguishes_bytes_bits_and_not_storage_capacity():
@@ -309,8 +311,8 @@ def test_wildberries_api_prefers_regular_product_price_over_wallet_discount():
 def test_catalog_search_uses_neutral_query_plus_optional_recall_variant():
     assert ws._catalog_search_query("лазер", "power_desc") == "лазер"
     assert ws._catalog_search_variants("лазер", "power_desc") == [
+        "мощный лазер",
         "лазер",
-        "лазер мощный",
     ]
 
 
