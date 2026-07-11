@@ -12,10 +12,11 @@ import uuid
 from collections.abc import AsyncIterator
 from contextlib import suppress
 from dataclasses import dataclass, replace
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, quote_plus, urlparse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from . import persona as persona_module
 from .cognitive_memory import ExecutionPlaybookStore
@@ -60,6 +61,16 @@ from .verification import (
     parse_verdict,
     valid_mission_report,
 )
+
+
+def _load_moscow_timezone() -> Any:
+    try:
+        return ZoneInfo("Europe/Moscow")
+    except ZoneInfoNotFoundError:  # Windows/minimal Python may not ship the IANA tz database.
+        return timezone(timedelta(hours=3), name="Europe/Moscow")
+
+
+MOSCOW_TIMEZONE = _load_moscow_timezone()
 
 SYSTEM_PROMPT = """Ты Jarvis: локальный агент Windows/WSL/Docker и личный операционный помощник.
 Говори по-русски. Держи тон как у кинематографичного Jarvis: спокойный, точный, слегка ироничный,
@@ -2666,10 +2677,9 @@ class AgentRuntime:
         # Shop-specific price queries ("самую дешёвую X на DNS/Ozon/WB/...") must
         # go through a real browser: httpx-based web.answer returns 0 sources on
         # JS/anti-bot catalogs and bails to a useless link. Route them to
-        # web.shop_search first when the browser layer is actually installed;
-        # only fall back to web.answer if that path is unusable. Gating on the
-        # real Playwright presence keeps the offline/CI path (and all existing
-        # shopping tests) unchanged.
+        # web.shop_search first when the browser layer is actually installed.
+        # Its result is final even on anti-bot failure: a generic cached web
+        # answer cannot honestly replace missing catalog prices.
         normalized = message.lower()
         if (
             _looks_like_shopping_query(normalized)
@@ -2681,8 +2691,7 @@ class AgentRuntime:
                 shop_action = await self._run_shop_search(
                     message, shop_key, conversation_id=conversation_id
                 )
-                if shop_action is not None:
-                    return shop_action
+                return shop_action
 
         answer_action = await self._run_web_answer_engine(
             message=message,
@@ -2844,22 +2853,30 @@ class AgentRuntime:
         shop_key: str,
         *,
         conversation_id: str | None = None,
-    ) -> DirectAction | None:
+    ) -> DirectAction:
         """Run web.shop_search for a shop-specific price query.
 
         Returns a ranked answer on success, an honest install-guidance answer
-        when the browser layer is missing, or None (fall back to web.answer) for
-        anti-bot/empty/other soft failures.
+        when the browser layer is missing, or a precise shop-search failure.
+        A failed catalog read must not be hidden by a generic cached web answer.
         """
 
-        product = _clean_shopping_subject(message) or message
+        cleaned_product = _clean_shopping_subject(message) or message
+        product = _compact_shopping_subject(cleaned_product)
         result = await self.tools.run("web.shop_search", {"query": product, "shop": shop_key})
         data = result.data if isinstance(result.data, dict) else {}
         event = ChatEvent(
             type="tool_call",
             title="web.shop_search",
             content=result.summary,
-            payload={"tool": "web.shop_search", "ok": result.ok, "shop": shop_key},
+            payload={
+                "tool": "web.shop_search",
+                "ok": result.ok,
+                "shop": shop_key,
+                "browser_mode": data.get("browser_mode"),
+                "error": data.get("error"),
+                "item_count": len(data.get("items") or []),
+            },
         )
         if result.ok and data.get("items"):
             if conversation_id:
@@ -2896,8 +2913,15 @@ class AgentRuntime:
             if link:
                 lines.append(f"\nПока — прямая ссылка на поиск: {link}")
             return DirectAction(answer="\n".join(lines), events=[event])
-        # Anti-bot / empty / proxy-needed: let web.answer try (no worse than before).
-        return None
+        link = str(data.get("url") or _shop_search_url_for(shop_key, product)).strip()
+        reason = str(data.get("error") or result.summary or "каталог не отдал товары").strip()
+        lines = [
+            f"Не удалось прочитать каталог магазина: {reason}.",
+            "Поэтому я не подменяю результат общим веб-поиском без цен и товаров.",
+        ]
+        if link:
+            lines.append(f"Прямая ссылка на поиск: {link}")
+        return DirectAction(answer="\n".join(lines), events=[event])
 
     async def _run_web_answer_engine(
         self,
@@ -2909,7 +2933,13 @@ class AgentRuntime:
         run_method = getattr(self.tools, "run", None)
         if getattr(run_method, "__self__", None) is not self.tools:
             return None
-        if self.tools.get("web.surfer") is not None:
+        normalized = message.casefold()
+        news_request = _looks_like_news_query(normalized)
+        news_window = _relative_date_window_for_message(normalized) if news_request else None
+        # A multi-event, date-bounded news request is not a two-second fact lookup.
+        # Keep it in the structured answer engine, which can enforce publication
+        # dates and fall back to publisher RSS feeds.
+        if not news_request and self.tools.get("web.surfer") is not None:
             mode = _web_surfer_mode_for_request(message)
             arguments: dict[str, Any] | None = {"query": query}
             if mode == "aggressive_shopping":
@@ -2946,14 +2976,100 @@ class AgentRuntime:
                         ],
                     )
         if self.tools.get("web.answer") is None:
+            if news_window is not None:
+                return DirectAction(
+                    answer=(
+                        "Не удалось выполнить поиск новостей за точные даты: "
+                        "инструмент датированного поиска недоступен. Недатированные главные "
+                        "страницы не выдаю за выполненный результат."
+                    ),
+                    events=[],
+                )
             return None
+        answer_arguments: dict[str, Any] = {
+            "question": message,
+            "query": query,
+            "max_sources": 6,
+        }
+        if news_request:
+            answer_arguments["vertical"] = "news"
+            if news_window is not None:
+                date_from, date_to = news_window
+                answer_arguments.update(
+                    {
+                        "date_from": date_from.isoformat(),
+                        "date_to": date_to.isoformat(),
+                        # A provider's `day` filter means a rolling 24 hours and
+                        # can lose yesterday morning. Over-fetch, then enforce the
+                        # exact Moscow calendar window inside web.answer.
+                        "freshness": "day" if date_from == date_to else "week",
+                    }
+                )
         try:
-            result = await self.tools.run(
-                "web.answer",
-                {"question": message, "query": query, "max_sources": 6},
-            )
-        except Exception:  # noqa: BLE001 - mocked/minimal registries fall back to legacy search.
+            result = await self.tools.run("web.answer", answer_arguments)
+        except Exception as exc:  # noqa: BLE001 - fail closed for bounded news.
+            if news_window is not None:
+                return DirectAction(
+                    answer=(
+                        "Не удалось выполнить поиск новостей за точные московские даты: "
+                        "сервис датированного поиска не ответил. Недатированные главные "
+                        "страницы не выдаю за выполненный результат."
+                    ),
+                    events=[
+                        ChatEvent(
+                            type="tool_call",
+                            title="web.answer",
+                            content=f"Dated news search failed: {str(exc)[:240]}",
+                            payload={
+                                "tool": "web.answer",
+                                "ok": False,
+                                "query": query,
+                                "vertical": "news",
+                            },
+                        )
+                    ],
+                )
             return None
+        if news_window is not None and (
+            not result.ok
+            or not isinstance(result.data, dict)
+            or not _web_news_answer_complete(result.data, expected_window=news_window)
+        ):
+            data = result.data if isinstance(result.data, dict) else {}
+            news_meta = data.get("news") if isinstance(data.get("news"), dict) else {}
+            missing_dates = [
+                str(item)
+                for item in (news_meta.get("missing_dates") or [])
+                if str(item).strip()
+            ]
+            gap_answer = (
+                "Не удалось полностью собрать новости за запрошенные московские даты."
+            )
+            if missing_dates:
+                gap_answer += f" Нет подтверждённых публикаций за: {', '.join(missing_dates)}."
+            gap_answer += (
+                " Недатированные главные страницы не выдаю за выполненный результат."
+            )
+            partial_answer = str(data.get("answer") or "").strip()
+            if partial_answer and data.get("sources"):
+                gap_answer += f"\n\nЧастичная подтверждённая подборка:\n{partial_answer}"
+            return DirectAction(
+                answer=gap_answer,
+                events=[
+                    ChatEvent(
+                        type="tool_call",
+                        title="web.answer",
+                        content=result.summary,
+                        payload={
+                            "tool": result.tool,
+                            "ok": False,
+                            "query": query,
+                            "vertical": "news",
+                            "news": data.get("news"),
+                        },
+                    )
+                ],
+            )
         if not result.ok or not isinstance(result.data, dict):
             return None
         answer = str(result.data.get("answer") or "").strip()
@@ -5290,7 +5406,7 @@ def _task_notes_from_result(result: ToolRunResponse) -> str:
 
 
 def _runtime_date_context() -> str:
-    today = date.today()
+    today = _moscow_today()
     return "\n".join(
         [
             "Runtime date context:",
@@ -5525,7 +5641,7 @@ def _intent_router_messages(
     heuristic_query: str | None,
     operator_context: str = "",
 ) -> list[dict[str, str]]:
-    today = date.today().isoformat()
+    today = _moscow_today().isoformat()
     history = "\n".join(f"- {item[:500]}" for item in recent_user_messages[:-1])
     if not history:
         history = "- none"
@@ -5737,6 +5853,42 @@ def _web_surfer_mode_for_request(message: str) -> str:
     if len(normalized) > 180 or any(marker in normalized for marker in deep_markers):
         return "deep_research"
     return "fast_fact"
+
+
+def _looks_like_news_query(normalized: str) -> bool:
+    return _contains_any(
+        normalized,
+        (
+            "новост",
+            "сводк",
+            "главные события",
+            "значимые события",
+            "news",
+            "headlines",
+            "breaking",
+        ),
+    )
+
+
+def _web_news_answer_complete(
+    data: dict[str, Any],
+    *,
+    expected_window: tuple[date, date] | None,
+) -> bool:
+    news = data.get("news")
+    if isinstance(news, dict):
+        if not bool(news.get("complete")):
+            return False
+        if expected_window is not None:
+            expected_from, expected_to = expected_window
+            if news.get("date_from") != expected_from.isoformat():
+                return False
+            if news.get("date_to") != expected_to.isoformat():
+                return False
+    elif str(data.get("vertical") or "") != "news":
+        return False
+    sources = data.get("sources")
+    return bool(isinstance(sources, list) and sources)
 
 
 def _explicit_web_product_url(*values: str) -> str | None:
@@ -5986,9 +6138,15 @@ def _web_research_query_from_message(
         if not location:
             return None
         return _weather_search_query(message, normalized, location=location)[:300]
-    resolved_date = _relative_date_for_message(normalized)
-    if resolved_date:
-        query = f"{query} {resolved_date.isoformat()}"
+    resolved_window = _relative_date_window_for_message(normalized)
+    if resolved_window:
+        date_from, date_to = resolved_window
+        date_suffix = (
+            date_from.isoformat()
+            if date_from == date_to
+            else f"{date_from.isoformat()} {date_to.isoformat()}"
+        )
+        query = f"{query} {date_suffix}"
     if _looks_like_shopping_query(normalized):
         query = _shopping_search_query(query, normalized)
     elif _looks_like_travel_query(normalized):
@@ -6610,8 +6768,13 @@ def _format_shop_search_answer(data: dict[str, Any], product: str) -> str:
     lines: list[str] = []
     subject = product.strip() or "товар"
     if cheapest:
+        cheapest_label = (
+            "Самая дешёвая"
+            if data.get("price_sort_confirmed")
+            else "Самая дешёвая из найденных"
+        )
         lines.append(
-            f"Самая дешёвая «{subject}»: {cheapest.get('price_text')} — "
+            f"{cheapest_label} «{subject}»: {cheapest.get('price_text')} — "
             f"{cheapest.get('title')}\n{cheapest.get('url')}"
         )
         lines.append("")
@@ -6808,15 +6971,38 @@ def _mentions_dns_store(normalized: str) -> bool:
     return bool(re.search(r"(?<![a-zа-яё0-9])(?:dns|днс)(?![a-zа-яё0-9])", normalized))
 
 
-def _relative_date_for_message(normalized: str) -> date | None:
-    today = date.today()
-    if "послезавтра" in normalized:
-        return today + timedelta(days=2)
-    if "завтра" in normalized:
-        return today + timedelta(days=1)
+def _moscow_today(now: datetime | None = None) -> date:
+    if now is None:
+        return datetime.now(MOSCOW_TIMEZONE).date()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=MOSCOW_TIMEZONE)
+    return now.astimezone(MOSCOW_TIMEZONE).date()
+
+
+def _relative_date_window_for_message(
+    normalized: str,
+    *,
+    today: date | None = None,
+) -> tuple[date, date] | None:
+    today = today or _moscow_today()
+    dates: list[date] = []
+    if "вчера" in normalized:
+        dates.append(today - timedelta(days=1))
     if "сегодня" in normalized:
-        return today
-    return None
+        dates.append(today)
+    without_day_after = normalized.replace("послезавтра", " ")
+    if "послезавтра" in normalized:
+        dates.append(today + timedelta(days=2))
+    if "завтра" in without_day_after:
+        dates.append(today + timedelta(days=1))
+    if not dates:
+        return None
+    return min(dates), max(dates)
+
+
+def _relative_date_for_message(normalized: str) -> date | None:
+    window = _relative_date_window_for_message(normalized)
+    return window[1] if window is not None else None
 
 
 def _looks_like_travel_query(normalized: str) -> bool:

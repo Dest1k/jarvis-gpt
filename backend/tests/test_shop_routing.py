@@ -133,11 +133,13 @@ def test_shop_search_needs_install_gives_actionable_message(monkeypatch, tmp_pat
     storage.close()
 
 
-def test_shop_search_soft_failure_falls_back_to_web_answer(monkeypatch, tmp_path):
+def test_shop_search_soft_failure_stays_honest_and_does_not_fall_back(monkeypatch, tmp_path):
     agent, storage = _agent(monkeypatch, tmp_path)
+    captured = {}
 
     async def fake_run(name, arguments=None, **kwargs):
         assert name == "web.shop_search"
+        captured.update(arguments or {})
         return ToolRunResponse(
             tool="web.shop_search",
             ok=False,
@@ -147,9 +149,11 @@ def test_shop_search_soft_failure_falls_back_to_web_answer(monkeypatch, tmp_path
 
     monkeypatch.setattr(agent.tools, "run", fake_run)
 
-    # None => the caller falls through to the existing web.answer path.
     action = asyncio.run(
         agent._run_shop_search("найди дешёвую 5090 на днс", "dns", conversation_id=None)
     )
-    assert action is None
+    assert captured == {"query": "rtx 5090", "shop": "dns"}
+    assert "anti-bot" in action.answer
+    assert "не подменяю результат общим веб-поиском" in action.answer
+    assert "dns-shop.ru/search" in action.answer
     storage.close()

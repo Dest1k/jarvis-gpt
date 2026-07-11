@@ -3,9 +3,10 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import replace
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
+import pytest
 from jarvis_gpt.agent import AgentContext, AgentRuntime
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
 from jarvis_gpt.event_bus import EventBus
@@ -13,6 +14,13 @@ from jarvis_gpt.executive_runtime import ExecutiveCoordinator
 from jarvis_gpt.llm import LLMRouter, LLMStreamChunk
 from jarvis_gpt.models import ToolRunResponse
 from jarvis_gpt.storage import JarvisStorage
+
+
+@pytest.fixture(autouse=True)
+def _disable_live_web_surfer_by_default(monkeypatch):
+    """Keep routing tests independent of Playwright installed on the developer host."""
+
+    monkeypatch.setattr("jarvis_gpt.agent._web_surfer_available", lambda: False)
 
 
 def _tool_response(tool: str, ok: bool, summary: str, data: dict):
@@ -420,6 +428,188 @@ def test_agent_includes_runtime_date_context(monkeypatch, tmp_path):
     assert "Runtime date context" in date_context
     assert "current_date:" in date_context
     assert "early 2026" in date_context
+    storage.close()
+
+
+def test_moscow_timezone_falls_back_to_fixed_utc_plus_three(monkeypatch):
+    from zoneinfo import ZoneInfoNotFoundError
+
+    import jarvis_gpt.agent as agent_module
+
+    def missing_zone(_name):
+        raise ZoneInfoNotFoundError("tzdata unavailable")
+
+    monkeypatch.setattr(agent_module, "ZoneInfo", missing_zone)
+
+    fallback = agent_module._load_moscow_timezone()
+
+    assert fallback.utcoffset(None) == timedelta(hours=3)
+    assert datetime(2026, 7, 10, 22, 30, tzinfo=UTC).astimezone(
+        fallback
+    ).date() == date(2026, 7, 11)
+
+
+def test_exact_russian_news_query_bypasses_fast_fact_and_passes_moscow_window(
+    monkeypatch,
+    tmp_path,
+):
+    import jarvis_gpt.agent as agent_module
+
+    captured = {}
+
+    async def fake_web_answer(_ctx, args):
+        captured.update(args)
+        return ToolRunResponse(
+            tool="web.answer",
+            ok=True,
+            summary="Dated news answer.",
+            data={
+                "query": args["query"],
+                "answer": "Конкретная новость — https://ria.ru/20260711/example.html",
+                "vertical": "news",
+                "sources": [
+                    {
+                        "title": "Конкретная новость России",
+                        "url": "https://ria.ru/20260711/example.html",
+                        "published": "2026-07-11T12:00:00+03:00",
+                    }
+                ],
+                "news": {
+                    "complete": True,
+                    "date_from": "2026-07-10",
+                    "date_to": "2026-07-11",
+                },
+            },
+        )
+
+    monkeypatch.setattr(agent_module, "_moscow_today", lambda _now=None: date(2026, 7, 11))
+    monkeypatch.setattr("jarvis_gpt.tools._web_answer", fake_web_answer)
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+
+    response = asyncio.run(
+        agent.chat("Какие в России за вчера и сегодня значимые новости произошли?")
+    )
+
+    assert captured["vertical"] == "news"
+    assert captured["freshness"] == "week"
+    assert captured["date_from"] == "2026-07-10"
+    assert captured["date_to"] == "2026-07-11"
+    assert "2026-07-10" in captured["query"]
+    assert "2026-07-11" in captured["query"]
+    assert "Конкретная новость" in response.answer
+    assert "web.surfer" not in {run["tool"] for run in storage.list_tool_runs(limit=20)}
+    storage.close()
+
+
+def test_dns_catalog_failure_is_not_replaced_by_generic_web_answer(monkeypatch, tmp_path):
+    import jarvis_gpt.agent as agent_module
+
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    calls = []
+
+    async def fake_run(name, arguments=None, **_kwargs):
+        calls.append((name, arguments or {}))
+        assert name == "web.shop_search"
+        return ToolRunResponse(
+            tool=name,
+            ok=False,
+            summary="No ranked products for 'rtx 5090' (HTTP 403).",
+            data={
+                "query": "rtx 5090",
+                "shop": "dns",
+                "url": "https://www.dns-shop.ru/search/?q=rtx+5090",
+                "error": "HTTP 403",
+                "items": [],
+                "browser_mode": "headless",
+            },
+        )
+
+    monkeypatch.setattr(agent_module, "_web_surfer_available", lambda: True)
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+
+    action = asyncio.run(
+        agent._run_web_research(
+            "Найди мне самую дешёвую 5090 на днс",
+            "5090 site:dns-shop.ru",
+        )
+    )
+
+    assert calls == [("web.shop_search", {"query": "rtx 5090", "shop": "dns"})]
+    assert "HTTP 403" in action.answer
+    assert "не подменяю результат общим веб-поиском" in action.answer
+    assert "https://www.dns-shop.ru/search/?q=rtx+5090" in action.answer
+    assert action.events[0].payload["browser_mode"] == "headless"
+    storage.close()
+
+
+def test_bounded_news_exception_does_not_fall_back_to_legacy_search(monkeypatch, tmp_path):
+    from types import MethodType
+
+    import jarvis_gpt.agent as agent_module
+
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+
+    async def exploding_run(_registry, name, arguments=None, **_kwargs):
+        assert name == "web.answer"
+        raise RuntimeError("provider unavailable")
+
+    monkeypatch.setattr(agent_module, "_moscow_today", lambda _now=None: date(2026, 7, 11))
+    monkeypatch.setattr(agent.tools, "run", MethodType(exploding_run, agent.tools))
+
+    action = asyncio.run(
+        agent._run_web_answer_engine(
+            message="Какие в России за вчера и сегодня значимые новости произошли?",
+            query="значимые новости России 2026-07-10 2026-07-11",
+            conversation_id=None,
+        )
+    )
+
+    assert action is not None
+    assert "сервис датированного поиска не ответил" in action.answer
+    assert action.events[0].payload["vertical"] == "news"
+    storage.close()
+
+
+def test_bounded_news_partial_result_names_missing_date(monkeypatch, tmp_path):
+    from types import MethodType
+
+    import jarvis_gpt.agent as agent_module
+
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+
+    async def partial_run(_registry, name, arguments=None, **_kwargs):
+        assert name == "web.answer"
+        return ToolRunResponse(
+            tool=name,
+            ok=False,
+            summary="Only one requested day has dated evidence.",
+            data={
+                "vertical": "news",
+                "answer": "- Новость за 11 июля",
+                "sources": [{"url": "https://news.example/20260711/item"}],
+                "news": {
+                    "complete": False,
+                    "date_from": "2026-07-10",
+                    "date_to": "2026-07-11",
+                    "missing_dates": ["2026-07-10"],
+                },
+            },
+        )
+
+    monkeypatch.setattr(agent_module, "_moscow_today", lambda _now=None: date(2026, 7, 11))
+    monkeypatch.setattr(agent.tools, "run", MethodType(partial_run, agent.tools))
+
+    action = asyncio.run(
+        agent._run_web_answer_engine(
+            message="Какие в России за вчера и сегодня значимые новости произошли?",
+            query="значимые новости России 2026-07-10 2026-07-11",
+            conversation_id=None,
+        )
+    )
+
+    assert action is not None
+    assert "Нет подтверждённых публикаций за: 2026-07-10" in action.answer
+    assert "Частичная подтверждённая подборка" in action.answer
     storage.close()
 
 

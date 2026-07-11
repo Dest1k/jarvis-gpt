@@ -78,6 +78,21 @@ def test_shop_search_url_templates_and_aliases():
     assert ws.shop_search_url("неизвестныймаг", "x") == ""
 
 
+def test_dns_price_sort_is_reapplied_after_redirect():
+    redirected = "https://www.dns-shop.ru/search/?q=rtx+5090&order=popular"
+    sorted_url = ws._shop_price_sorted_url("dns", redirected)
+
+    assert "order=price" in sorted_url
+    assert "stock=all" in sorted_url
+    assert ws._shop_price_sort_confirmed("dns", sorted_url) is True
+    assert ws._shop_price_sort_confirmed("dns", redirected) is False
+
+
+def test_city_label_from_dns_cookie():
+    assert ws._city_label_from_cookies([{"name": "city_path", "value": "moscow"}]) == "Москва"
+    assert ws._city_label_from_cookies([{"name": "other", "value": "x"}]) == ""
+
+
 def test_extract_catalog_items_from_dns_like_grid():
     items = ws._extract_catalog_items(_DNS_GRID, base_url="https://www.dns-shop.ru/search/?q=rtx")
     # Three products; the nav "Помощь" link has no nearby price and is excluded.
@@ -89,6 +104,26 @@ def test_extract_catalog_items_from_dns_like_grid():
     assert values == [409999.0, 413999.0, 499999.0]
 
 
+def test_dns_heuristic_parser_rejects_priced_catalog_recipe_links():
+    html = """
+    <div class="catalog-product">
+      <a href="/catalog/recipe/rtx-5090/">RTX 5090</a><div>409 999 ₽</div>
+    </div>
+    <div class="catalog-product">
+      <a href="/product/real/rtx-5090/">Видеокарта RTX 5090</a><div>413 999 ₽</div>
+    </div>
+    """
+
+    items = ws._extract_catalog_items(
+        html,
+        base_url="https://www.dns-shop.ru/search/?q=rtx+5090",
+    )
+
+    assert [item["url"] for item in items] == [
+        "https://www.dns-shop.ru/product/real/rtx-5090/"
+    ]
+
+
 def test_rank_catalog_items_cheapest_first_and_unpriced_last():
     items = [
         {"title": "b", "url": "u2", "price_value": 500.0, "price_text": "500 ₽"},
@@ -97,6 +132,140 @@ def test_rank_catalog_items_cheapest_first_and_unpriced_last():
     ]
     ranked = ws._rank_catalog_items(items)
     assert [item["url"] for item in ranked] == ["u1", "u2", "u3"]
+
+
+def test_rank_catalog_items_prefers_purchasable_product_over_cheaper_analog():
+    html = """
+    <div class="catalog-product">
+      <a class="catalog-product__name" href="/product/analog/a/rtx-5090/">RTX 5090 A</a>
+      <div class="product-buy__price">409 999 ₽</div><a>Аналоги</a>
+    </div>
+    <div class="catalog-product">
+      <a class="catalog-product__name" href="/product/b/rtx-5090-oc/">RTX 5090 B</a>
+      <div class="product-buy__price">413 999 ₽</div><button>Купить</button>
+    </div>
+    """
+    items = ws._extract_catalog_items(html, base_url="https://www.dns-shop.ru/search/")
+    ranked = ws._rank_catalog_items(items)
+    assert ranked[0]["title"] == "RTX 5090 B"
+    assert ranked[0]["in_stock"] is True
+    assert ranked[1]["in_stock"] is False
+
+
+def test_catalog_stock_does_not_treat_not_in_stock_as_positive_substring():
+    html = """
+    <div class="product-card">
+      <a href="/product/a/item/">RTX 5090 currently not in stock</a>
+      <div>409 999 ₽</div>
+    </div>
+    """
+    [item] = ws._extract_catalog_items(html, base_url="https://shop.example/")
+    assert item["in_stock"] is False
+
+
+def test_catalog_query_filter_drops_cheaper_neighbour_models_and_category_links():
+    items = [
+        {
+            "title": "Видеокарта RTX 5060 Dual",
+            "url": "https://www.dns-shop.ru/product/5060/",
+            "price_value": 33999.0,
+        },
+        {
+            "title": "Видеокарты",
+            "url": "https://www.dns-shop.ru/catalog/video/",
+            "price_value": 409999.0,
+        },
+        {
+            "title": "Видеокарта Palit GeForce RTX 5090 GameRock",
+            "url": "https://www.dns-shop.ru/product/5090/",
+            "price_value": 409999.0,
+        },
+    ]
+    matched = ws._filter_catalog_items_for_query(items, "5090")
+    assert [item["url"] for item in matched] == [
+        "https://www.dns-shop.ru/product/5090/"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("query", "title"),
+    [
+        ("rtx5090", "Видеокарта RTX 5090"),
+        ("2TB SSD", "Накопитель SSD 2 ТБ"),
+        ("iphone16", "Смартфон Apple iPhone 16"),
+    ],
+)
+def test_catalog_query_filter_matches_joined_and_split_model_tokens(query, title):
+    item = {"title": title, "url": "https://shop.example/product/1", "price_value": 1.0}
+    assert ws._filter_catalog_items_for_query([item], query) == [item]
+
+
+def test_catalog_query_filter_keeps_requested_brand_strict():
+    items = [
+        {"title": "MSI GeForce RTX 5090", "url": "msi", "price_value": 1.0},
+        {"title": "Palit GeForce RTX 5090", "url": "palit", "price_value": 2.0},
+    ]
+    matched = ws._filter_catalog_items_for_query(items, "Palit GeForce RTX 5090")
+    assert [item["url"] for item in matched] == ["palit"]
+
+
+@pytest.mark.parametrize("qualifier", ["Ti", "OC", "Pro", "Max"])
+def test_catalog_query_filter_keeps_requested_model_qualifier_strict(qualifier):
+    items = [
+        {"title": "GeForce RTX 5090", "url": "base", "price_value": 1.0},
+        {"title": f"GeForce RTX 5090 {qualifier}", "url": "qualified", "price_value": 2.0},
+    ]
+    matched = ws._filter_catalog_items_for_query(items, f"RTX 5090 {qualifier}")
+    assert [item["url"] for item in matched] == ["qualified"]
+
+
+def test_catalog_query_filter_ignores_inflected_product_category_word():
+    item = {
+        "title": "Видеокарта Palit GeForce RTX 5090",
+        "url": "palit",
+        "price_value": 1.0,
+    }
+    assert ws._filter_catalog_items_for_query([item], "видеокарту rtx 5090") == [item]
+
+
+def test_shop_search_retries_blocked_headless_catalog_in_stable_chrome(monkeypatch):
+    surfer = ws.JarvisWebSurfer(
+        ws.SurferConfig(headless=True, shopping_budget_sec=10, headful_shop_fallback=True)
+    )
+    surfer._playwright = object()
+    calls: list[str] = []
+
+    async def blocked(*_args, **_kwargs):
+        calls.append("headless")
+        return ws._shop_search_result(
+            "5090", "dns", ok=False, error="HTTP 401 HTTP 403: no matching products parsed"
+        )
+
+    async def stable(*_args, **_kwargs):
+        calls.append("stable")
+        item = {
+            "title": "RTX 5090",
+            "url": "https://www.dns-shop.ru/product/5090/",
+            "price_text": "409 999 ₽",
+            "price_value": 409999.0,
+        }
+        return ws._shop_search_result(
+            "5090",
+            "dns",
+            ok=True,
+            items=[item],
+            cheapest=item,
+            browser_mode="headful_stable_chrome",
+        )
+
+    monkeypatch.setattr(ws.sys, "platform", "win32")
+    monkeypatch.setattr(surfer, "_shop_search_impl", blocked)
+    monkeypatch.setattr(surfer, "_shop_search_headful_chrome", stable)
+    result = asyncio.run(surfer.shop_search("5090", shop="dns"))
+    assert calls == ["headless", "stable"]
+    assert result["ok"] is True
+    assert result["cheapest"]["price_value"] == 409999.0
+    assert result["browser_mode"] == "headful_stable_chrome"
 
 
 def test_shop_search_result_shape():
@@ -128,6 +297,26 @@ def test_catalog_from_jsonld_itemlist():
     assert len(items) == 2
     assert ranked[0]["price_value"] == 399000.0
     assert ranked[0]["url"] == "https://shop.ru/p/b"
+
+
+def test_catalog_from_jsonld_ranks_in_stock_offer_before_cheaper_out_of_stock():
+    html = """
+    <script type="application/ld+json">
+    {"@type":"ItemList","itemListElement":[
+      {"item":{"name":"RTX 5090 unavailable","url":"/product/analog/a/item/",
+        "offers":{"price":"409000","availability":"https://schema.org/OutOfStock"}}},
+      {"item":{"name":"RTX 5090 available","url":"/product/b/item/",
+        "offers":{"price":"499000","availability":"https://schema.org/InStock"}}}
+    ]}
+    </script>
+    """
+    ranked = ws._rank_catalog_items(
+        ws._extract_catalog_items(html, base_url="https://www.dns-shop.ru/")
+    )
+    assert ranked[0]["title"] == "RTX 5090 available"
+    assert ranked[0]["in_stock"] is True
+    assert ranked[1]["in_stock"] is False
+    assert "/product/analog/" not in ranked[1]["url"]
 
 
 def _registry(monkeypatch, tmp_path):

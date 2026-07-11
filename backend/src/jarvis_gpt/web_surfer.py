@@ -43,13 +43,14 @@ import json
 import logging
 import random
 import re
+import sys
 import time
 from collections.abc import Iterable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
 from html import unescape
 from typing import Any
-from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
+from urllib.parse import parse_qs, quote_plus, unquote, urlencode, urljoin, urlparse
 
 try:  # BeautifulSoup is required for sanitization.
     from bs4 import BeautifulSoup
@@ -225,6 +226,12 @@ class SurferConfig:
     max_type_delay_ms: float = 170.0
     max_chars_per_page: int = 20_000
     use_stealth: bool = True
+    # Some anti-bot providers deliberately reject Chromium's headless shell even
+    # when the page is otherwise public.  On a Windows workstation we can retry
+    # an empty/blocked catalog in the installed stable Chrome, headful but placed
+    # off-screen.  The retry is never attempted in the Linux container runtime.
+    headful_shop_fallback: bool = True
+    headful_browser_channel: str = "chrome"
 
     def __post_init__(self) -> None:
         if not self.user_agents:
@@ -494,26 +501,34 @@ class JarvisWebSurfer:
         self._ua_index += 1
         return ua
 
-    async def _new_context(self, *, rotate_proxy: bool = True) -> BrowserContext:
-        browser = self._ensure_started()
+    async def _new_context(
+        self,
+        *,
+        rotate_proxy: bool = True,
+        browser: Browser | None = None,
+        use_config_user_agent: bool = True,
+    ) -> BrowserContext:
+        browser = browser or self._ensure_started()
         proxy = self._next_proxy() if rotate_proxy else None
         headers = {
             "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
             **self.config.extra_headers,
         }
+        context_kwargs: dict[str, Any] = {
+            "locale": self.config.locale,
+            "timezone_id": self.config.timezone_id,
+            "viewport": {
+                "width": self.config.viewport_width,
+                "height": self.config.viewport_height,
+            },
+            "proxy": proxy,
+            "extra_http_headers": headers,
+            "ignore_https_errors": True,
+        }
+        if use_config_user_agent:
+            context_kwargs["user_agent"] = self._next_user_agent()
         try:
-            context = await browser.new_context(
-                user_agent=self._next_user_agent(),
-                locale=self.config.locale,
-                timezone_id=self.config.timezone_id,
-                viewport={
-                    "width": self.config.viewport_width,
-                    "height": self.config.viewport_height,
-                },
-                proxy=proxy,  # type: ignore[arg-type]
-                extra_http_headers=headers,
-                ignore_https_errors=True,
-            )
+            context = await browser.new_context(**context_kwargs)
         except (PlaywrightError, ValueError) as exc:
             if proxy is not None:
                 raise ProxyError(f"Proxy context failed: {exc}") from exc
@@ -522,9 +537,10 @@ class JarvisWebSurfer:
         context.set_default_navigation_timeout(self.config.nav_timeout_ms)
         return context
 
-    async def _new_page(self, context: BrowserContext) -> Page:
+    async def _new_page(self, context: BrowserContext, *, use_stealth: bool | None = None) -> Page:
         page = await context.new_page()
-        if self.config.use_stealth:
+        should_use_stealth = self.config.use_stealth if use_stealth is None else use_stealth
+        if should_use_stealth:
             await _apply_stealth(page)
         return page
 
@@ -920,19 +936,60 @@ class JarvisWebSurfer:
                 query, shop, ok=False, error=f"unknown shop: {shop!r} (pass search_url)"
             )
         want_cities = list(cities) if cities else ["Донецк", "Москва"]
+        started = time.monotonic()
+        primary_error = ""
+        can_retry_headful = (
+            self.config.headless
+            and self.config.headful_shop_fallback
+            and sys.platform == "win32"
+            and self._playwright is not None
+        )
+        primary_timeout = self.config.shopping_budget_sec
+        if can_retry_headful:
+            primary_timeout = min(primary_timeout, max(5.0, primary_timeout * 0.4))
         try:
-            return await asyncio.wait_for(
+            result = await asyncio.wait_for(
                 self._shop_search_impl(query, shop or "", url, max_items, want_cities),
-                timeout=self.config.shopping_budget_sec,
+                timeout=primary_timeout,
             )
+            if result.get("ok") and result.get("items"):
+                return result
+            primary_error = str(result.get("error") or "no products parsed")
         except TimeoutError:
-            return _shop_search_result(
-                query, shop, url=url, ok=False, error="shop_search exceeded budget"
-            )
+            primary_error = "shop_search exceeded budget"
         except AntiBotError as exc:
-            return _shop_search_result(query, shop, url=url, ok=False, error=f"anti-bot: {exc}")
+            primary_error = f"anti-bot: {exc}"
         except WebSurferError as exc:
-            return _shop_search_result(query, shop, url=url, ok=False, error=str(exc))
+            primary_error = str(exc)
+
+        # DNS/Qrator currently serves a 401/403 shell to Playwright headless but
+        # lets the installed stable Chrome complete its JS proof-of-work.  Retry
+        # only on an interactive Windows host; production Linux remains strictly
+        # headless and returns the original structured failure.
+        if can_retry_headful:
+            remaining = self.config.shopping_budget_sec - (time.monotonic() - started)
+            if remaining > 3:
+                try:
+                    fallback = await asyncio.wait_for(
+                        self._shop_search_headful_chrome(
+                            query,
+                            shop or "",
+                            url,
+                            max_items,
+                            want_cities,
+                        ),
+                        timeout=remaining,
+                    )
+                    if fallback.get("ok") and fallback.get("items"):
+                        return fallback
+                    fallback_error = str(fallback.get("error") or "no products parsed")
+                    primary_error = f"{primary_error}; stable Chrome: {fallback_error}"
+                except TimeoutError:
+                    primary_error = f"{primary_error}; stable Chrome retry timed out"
+                except (PlaywrightError, OSError, WebSurferError) as exc:
+                    primary_error = f"{primary_error}; stable Chrome unavailable: {exc}"
+
+        return _shop_search_result(query, shop, url=url, ok=False, error=primary_error)
 
     async def _shop_search_impl(
         self,
@@ -945,35 +1002,151 @@ class JarvisWebSurfer:
         context = await self._new_context()
         try:
             page = await self._new_page(context)
-            await self._goto(page, url, wait_until="domcontentloaded")
-            await self._guard_antibot(page)
-            await self._human_mouse_move(page)
-            city = await self._try_set_city(page, cities)
-            # Let the JS grid and lazy prices settle, then nudge lazy-load.
-            with suppress(PlaywrightError):
-                await page.wait_for_load_state("networkidle", timeout=9_000)
-            for _ in range(3):
-                with suppress(PlaywrightError):
-                    await page.mouse.wheel(0, 2200)
-                await self._human_pause(0.5)
-            html = ""
-            with suppress(PlaywrightError):
-                html = await page.content()
-            items = _extract_catalog_items(html, base_url=url)
-            ranked = _rank_catalog_items(items)[:max_items]
-            priced = [item for item in ranked if item.get("price_value") is not None]
-            return _shop_search_result(
-                query,
-                shop,
+            return await self._shop_search_page(
+                page,
+                query=query,
+                shop=shop,
                 url=url,
-                city=city,
-                ok=bool(ranked),
-                items=ranked,
-                cheapest=priced[0] if priced else None,
+                max_items=max_items,
+                cities=cities,
+                wait_for_challenge=False,
+                browser_mode="headless_chromium",
             )
         finally:
             with suppress(Exception):
                 await context.close()
+
+    async def _shop_search_headful_chrome(
+        self,
+        query: str,
+        shop: str,
+        url: str,
+        max_items: int,
+        cities: list[str],
+    ) -> dict[str, Any]:
+        """Retry a blocked catalog in the installed stable Chrome.
+
+        This deliberately skips stealth scripts and UA spoofing: mixing an old
+        spoofed UA with a current Chrome binary is itself a detectable fingerprint.
+        """
+
+        if self._playwright is None:
+            raise BrowserLaunchError("Playwright is not started")
+        channel = str(self.config.headful_browser_channel or "chrome").strip() or "chrome"
+        browser = await self._playwright.chromium.launch(
+            channel=channel,
+            headless=False,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-dev-shm-usage",
+                "--window-position=-32000,-32000",
+                "--window-size=1366,900",
+            ],
+        )
+        context: BrowserContext | None = None
+        try:
+            context = await self._new_context(
+                browser=browser,
+                use_config_user_agent=False,
+            )
+            page = await self._new_page(context, use_stealth=False)
+            return await self._shop_search_page(
+                page,
+                query=query,
+                shop=shop,
+                url=url,
+                max_items=max_items,
+                cities=cities,
+                wait_for_challenge=True,
+                browser_mode="headful_stable_chrome",
+            )
+        finally:
+            if context is not None:
+                with suppress(Exception):
+                    await context.close()
+            with suppress(Exception):
+                await browser.close()
+
+    async def _shop_search_page(
+        self,
+        page: Page,
+        *,
+        query: str,
+        shop: str,
+        url: str,
+        max_items: int,
+        cities: list[str],
+        wait_for_challenge: bool,
+        browser_mode: str,
+    ) -> dict[str, Any]:
+        response = await self._goto(page, url, wait_until="domcontentloaded")
+        if wait_for_challenge:
+            # Qrator initially answers 401, runs a browser proof-of-work, then
+            # replaces the page with the catalog without a normal navigation.
+            with suppress(PlaywrightError, PlaywrightTimeoutError):
+                await page.wait_for_selector(
+                    "a[href*='/product/'], .catalog-product",
+                    timeout=10_000,
+                )
+        await self._human_mouse_move(page)
+        city = await self._try_set_city(page, cities)
+        if not city:
+            with suppress(PlaywrightError):
+                city = _city_label_from_cookies(await page.context.cookies())
+        sorted_url = _shop_price_sorted_url(shop, page.url or url)
+        if sorted_url and sorted_url != (page.url or ""):
+            with suppress(PlaywrightError, PlaywrightTimeoutError, NavigationError):
+                response = await self._goto(page, sorted_url, wait_until="domcontentloaded")
+                await page.wait_for_selector(
+                    "a[href*='/product/'], .catalog-product",
+                    timeout=10_000,
+                )
+        with suppress(PlaywrightError):
+            await page.wait_for_load_state("networkidle", timeout=9_000)
+        for _ in range(3):
+            with suppress(PlaywrightError):
+                await page.mouse.wheel(0, 2200)
+            await self._human_pause(0.5)
+        html = ""
+        with suppress(PlaywrightError):
+            html = await page.content()
+        items = _filter_catalog_items_for_query(
+            _extract_catalog_items(html, base_url=page.url or url),
+            query,
+        )
+        ranked = _rank_catalog_items(items)[:max_items]
+        priced = [
+            item
+            for item in ranked
+            if item.get("price_value") is not None and item.get("in_stock") is not False
+        ]
+        error = None
+        if not priced:
+            status = getattr(response, "status", None)
+            title = ""
+            with suppress(PlaywrightError):
+                title = _collapse(await page.title())
+            detail = f"HTTP {status}" if isinstance(status, int) and status >= 400 else ""
+            if title:
+                detail = f"{detail} {title}".strip()
+            reason = (
+                "matching products are out of stock or have no readable price"
+                if ranked
+                else "no matching products parsed"
+            )
+            error = f"{detail}: {reason}".lstrip(": ")
+        return _shop_search_result(
+            query,
+            shop,
+            url=page.url or url,
+            city=city,
+            ok=bool(priced),
+            items=ranked,
+            cheapest=priced[0] if priced else None,
+            error=error,
+            browser_mode=browser_mode,
+            price_sort_confirmed=_shop_price_sort_confirmed(shop, page.url or url),
+        )
 
     async def _try_set_city(self, page: Page, cities: Sequence[str]) -> str:
         """Best-effort delivery-city selection; returns the chosen city or ''."""
@@ -1568,6 +1741,33 @@ def _shop_search_url(shop: str | None, query: str) -> str:
     return template.format(q=quote_plus(query))
 
 
+def _shop_price_sorted_url(shop: str | None, url: str) -> str:
+    """Reapply a shop's price sort after anti-bot and city redirects."""
+
+    normalized_shop = _normalize_shop(shop)
+    parsed = urlparse(url)
+    if normalized_shop == "dns" or (parsed.hostname or "").endswith("dns-shop.ru"):
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        query["order"] = ["price"]
+        query["stock"] = ["all"]
+        return parsed._replace(query=urlencode(query, doseq=True)).geturl()
+    if normalized_shop == "ozon" or (parsed.hostname or "").endswith("ozon.ru"):
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        query["sorting"] = ["price"]
+        return parsed._replace(query=urlencode(query, doseq=True)).geturl()
+    return url
+
+
+def _shop_price_sort_confirmed(shop: str | None, url: str) -> bool:
+    normalized_shop = _normalize_shop(shop)
+    query = parse_qs(urlparse(url).query)
+    if normalized_shop == "dns":
+        return query.get("order", [""])[0].casefold() == "price"
+    if normalized_shop == "ozon":
+        return query.get("sorting", [""])[0].casefold() == "price"
+    return False
+
+
 _CATALOG_PRICE_RE = re.compile(
     r"(?P<num>\d[\d\s ]{2,})\s*(?:₽|руб(?:\.|лей|ля)?|р\.)"
     r"|(?:₽|руб)\s*(?P<num2>\d[\d\s ]{2,})",
@@ -1603,13 +1803,18 @@ def _extract_catalog_items(html: str, *, base_url: str = "") -> list[dict[str, A
         href = str(anchor.get("href") or "")
         if len(title) < 8 or not _PRODUCT_HREF_RE.search(href):
             continue
-        url = urljoin(base_url, href) if base_url else href
+        if (urlparse(base_url).hostname or "").endswith("dns-shop.ru") and not re.search(
+            r"/product/", href, flags=re.IGNORECASE
+        ):
+            continue
+        url = _canonical_catalog_product_url(urljoin(base_url, href) if base_url else href)
         key = url.split("?", 1)[0]
         if key in seen:
             continue
         price_text = _nearest_price(anchor)
         if not price_text:
             continue
+        in_stock = _catalog_item_stock(anchor, href)
         seen.add(key)
         results.append(
             {
@@ -1617,10 +1822,146 @@ def _extract_catalog_items(html: str, *, base_url: str = "") -> list[dict[str, A
                 "url": url,
                 "price_text": price_text,
                 "price_value": _parse_amount(price_text),
-                "in_stock": None,
+                "in_stock": in_stock,
             }
         )
     return results
+
+
+_CATALOG_QUERY_STOPWORDS = {
+    "buy",
+    "cheap",
+    "cheapest",
+    "find",
+    "in",
+    "price",
+    "shop",
+    "store",
+    "в",
+    "где",
+    "дешево",
+    "дешевую",
+    "дешёвую",
+    "купить",
+    "магазин",
+    "магазине",
+    "на",
+    "найди",
+    "самую",
+    "цена",
+}
+_CATALOG_GENERIC_TOKENS = {
+    "gb",
+    "geforce",
+    "gpu",
+    "hdd",
+    "radeon",
+    "rtx",
+    "series",
+    "ssd",
+    "tb",
+    "гб",
+    "тб",
+}
+_CATALOG_CATEGORY_PREFIXES = (
+    "видеокарт",
+    "клавиатур",
+    "монитор",
+    "мыш",
+    "наушник",
+    "накопител",
+    "ноутбук",
+    "планшет",
+    "процессор",
+    "смартфон",
+    "телевизор",
+    "телефон",
+)
+
+
+def _catalog_match_tokens(value: str) -> set[str]:
+    normalized = str(value or "").casefold().replace("ё", "е")
+    tokens: set[str] = set()
+    for token in re.findall(r"[a-zа-я0-9]+", normalized):
+        if any(char.isalpha() for char in token) and any(char.isdigit() for char in token):
+            tokens.update(re.findall(r"[a-zа-я]+|\d+", token))
+        else:
+            tokens.add(token)
+    aliases = {"tb": "тб", "gb": "гб"}
+    for source, target in aliases.items():
+        if source in tokens:
+            tokens.add(target)
+        if target in tokens:
+            tokens.add(source)
+    return tokens
+
+
+def _city_label_from_cookies(cookies: Sequence[dict[str, Any]]) -> str:
+    aliases = {
+        "donetsk": "Донецк",
+        "moscow": "Москва",
+        "moskva": "Москва",
+        "saint-petersburg": "Санкт-Петербург",
+        "sankt-peterburg": "Санкт-Петербург",
+        "spb": "Санкт-Петербург",
+    }
+    for cookie in cookies:
+        name = str(cookie.get("name") or "").casefold()
+        if name not in {"city", "city_path", "location_city"}:
+            continue
+        value = unquote(str(cookie.get("value") or "")).strip().casefold()
+        if not value:
+            continue
+        return aliases.get(value, value.replace("-", " ").title())
+    return ""
+
+
+def _filter_catalog_items_for_query(
+    items: Sequence[dict[str, Any]],
+    query: str,
+) -> list[dict[str, Any]]:
+    """Drop fuzzy-search neighbours before price ranking.
+
+    Shop search pages commonly mix nearby models (``5060``/``5070`` for a
+    ``5090`` query).  Ranking the raw grid therefore produces a confidently
+    wrong cheapest result.  Numeric/model tokens are strict; descriptive words
+    use a small overlap threshold so ordinary natural-language product queries
+    still work.
+    """
+
+    raw_query_tokens = _catalog_match_tokens(query)
+    stopwords = {token.replace("ё", "е") for token in _CATALOG_QUERY_STOPWORDS}
+    query_tokens = {
+        token
+        for token in raw_query_tokens
+        if token not in stopwords
+        and not any(token.startswith(prefix) for prefix in _CATALOG_CATEGORY_PREFIXES)
+        and (len(token) >= 2 or token.isdigit())
+    }
+    if not query_tokens:
+        return list(items)
+    numeric = {token for token in query_tokens if token.isdigit()}
+    model_tokens = {
+        token
+        for token in query_tokens
+        if any(char.isdigit() for char in token) and any(char.isalpha() for char in token)
+    }
+    lexical = query_tokens - numeric - model_tokens
+    differentiators = lexical - _CATALOG_GENERIC_TOKENS
+    minimum_lexical = 0 if not lexical else max(1, (len(lexical) + 1) // 2)
+    matched: list[dict[str, Any]] = []
+    for item in items:
+        title_tokens = _catalog_match_tokens(str(item.get("title") or ""))
+        if numeric and not numeric.issubset(title_tokens):
+            continue
+        if model_tokens and not model_tokens.issubset(title_tokens):
+            continue
+        if differentiators and not differentiators.issubset(title_tokens):
+            continue
+        if lexical and len(lexical & title_tokens) < minimum_lexical:
+            continue
+        matched.append(item)
+    return matched
 
 
 def _catalog_from_jsonld(soup: Any, base_url: str) -> list[dict[str, Any]]:
@@ -1644,13 +1985,19 @@ def _catalog_from_jsonld(soup: Any, base_url: str) -> list[dict[str, Any]]:
                 if not name:
                     continue
                 price = _jsonld_offer_field([node], "price") or _jsonld_field([node], "price")
+                availability = _jsonld_offer_field([node], "availability").casefold()
+                in_stock = None
+                if availability:
+                    in_stock = "instock" in availability and "outofstock" not in availability
                 items.append(
                     {
                         "title": name[:200],
-                        "url": urljoin(base_url, url) if (base_url and url) else url,
+                        "url": _canonical_catalog_product_url(
+                            urljoin(base_url, url) if (base_url and url) else url
+                        ),
                         "price_text": f"{price} ₽" if price else "",
                         "price_value": _parse_amount(price),
-                        "in_stock": None,
+                        "in_stock": in_stock,
                     }
                 )
     return items
@@ -1669,12 +2016,56 @@ def _nearest_price(anchor: Tag) -> str:
     return ""
 
 
+def _catalog_item_stock(anchor: Tag, href: str) -> bool | None:
+    """Best-effort purchasability from the product card around an anchor."""
+
+    card: Tag | None = None
+    node: Any = anchor
+    for _ in range(8):
+        node = node.parent
+        if node is None or not isinstance(node, Tag):
+            break
+        classes = {str(item) for item in (node.get("class") or [])}
+        if "catalog-product" in classes or "product-card" in classes:
+            card = node
+            break
+    text = _collapse((card or anchor.parent or anchor).get_text(" ", strip=True)).casefold()
+    if "/product/analog/" in href.casefold() or any(
+        marker in text
+        for marker in (
+            "аналоги",
+            "нет в наличии",
+            "нет в продаже",
+            "not in stock",
+            "currently unavailable",
+            "уведомить о поступлении",
+            "out of stock",
+        )
+    ):
+        return False
+    if any(marker in text for marker in ("купить", "в корзину", "add to cart", "in stock")):
+        return True
+    return None
+
+
+def _canonical_catalog_product_url(url: str) -> str:
+    """Turn DNS's availability-dependent ``/product/analog/`` link into the card URL."""
+
+    value = str(url)
+    host = (urlparse(value).hostname or "").casefold()
+    if host == "dns-shop.ru" or host.endswith(".dns-shop.ru"):
+        return re.sub(r"/product/analog/", "/product/", value, count=1, flags=re.IGNORECASE)
+    return value
+
+
 def _rank_catalog_items(items: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
-    def _key(item: dict[str, Any]) -> tuple[int, float]:
+    def _key(item: dict[str, Any]) -> tuple[int, int, float]:
+        stock = item.get("in_stock")
+        stock_rank = 0 if stock is True else 1 if stock is None else 2
         value = item.get("price_value")
         if value is None:
-            return (1, 0.0)
-        return (0, float(value))
+            return (stock_rank, 1, 0.0)
+        return (stock_rank, 0, float(value))
 
     return sorted(items, key=_key)
 
@@ -1689,6 +2080,8 @@ def _shop_search_result(
     items: list[dict[str, Any]] | None = None,
     cheapest: dict[str, Any] | None = None,
     error: str | None = None,
+    browser_mode: str = "",
+    price_sort_confirmed: bool = False,
 ) -> dict[str, Any]:
     rows = items or []
     return {
@@ -1701,6 +2094,8 @@ def _shop_search_result(
         "cheapest": cheapest,
         "items": rows,
         "error": error,
+        "browser_mode": browser_mode,
+        "price_sort_confirmed": price_sort_confirmed,
     }
 
 

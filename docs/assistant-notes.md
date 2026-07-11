@@ -9,6 +9,42 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-11 - Codex (exact DNS 5090 + bounded Russian news fixed live)
+
+The previous chat-routing fix was active, but DNS still returned the same answer:
+the headless Playwright catalog hit Qrator 401/403, then `_run_shop_search`
+silently fell back to cached `web.answer` with 0 sources. The news request used
+generic homepage evidence and allowed a refusal to replace the requested digest.
+
+- Shopping (`web_surfer.py`, `tools.py`, `agent.py`): Windows DNS searches now
+  retry in installed stable Chrome, headful but off-screen, with full browser /
+  context cleanup. After anti-bot and city redirects the code reapplies and
+  verifies `order=price`; unconfirmed sorting is labelled "из найденных" rather
+  than a global minimum. Bare `5090` becomes `rtx 5090`; query relevance is
+  strict for model/brand/qualifiers; DNS heuristic parsing accepts direct
+  `/product/` cards only; unavailable products cannot win. Soft failures no
+  longer fall through to a misleading generic cached answer.
+- News (`tools.py`, `agent.py`): "вчера и сегодня" becomes an exact
+  Europe/Moscow calendar window. Only dated article URLs inside every requested
+  day are accepted; body dates and `dateModified` are not publication dates.
+  Publisher RSS fallback now includes РИА, Интерфакс, РБК, ТАСС, Ведомости and
+  БФМ, filters domestic relevance, balances results across the requested days,
+  and produces a deterministic digest. Cache keys include the date window;
+  partial coverage, missing tool, and exceptions fail closed instead of dropping
+  into legacy homepage search. Windows longer than 31 days are rejected before
+  network work.
+- Tests: full backend suite `650 passed, 13 skipped`; Ruff and `git diff --check`
+  clean. Added regressions for stable-Chrome retry, sort confirmation, DNS
+  category exclusion, qualifier/model matching, exact news coverage, RSS,
+  domestic filtering, publication-date authority, wide-window rejection, and
+  bounded-news failure paths.
+- Live verification after restarting only the backend (`pid 32404`, frontend /
+  bridge / dispatcher reused): the exact DNS request returned 9 direct RTX 5090
+  products for Moscow, price-sort confirmed, cheapest Palit GameRock OC at
+  413,999 RUB; the exact news request returned 6 concrete dated articles, split
+  3 for 2026-07-10 and 3 for 2026-07-11, through `web.answer`. Diagnostic chat
+  conversations were deleted afterward.
+
 ### 2026-07-10 - Claude (route shopping chat to web.shop_search)
 
 Fix for "still the exact same answer": `web.shop_search` existed but the chat

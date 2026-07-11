@@ -1835,6 +1835,351 @@ def test_web_research_uses_archive_after_blocked_live_source(monkeypatch, tmp_pa
     storage.close()
 
 
+def test_russian_news_inference_uses_bounded_moscow_window_and_safe_timezone_fallback(
+    monkeypatch,
+):
+    from datetime import date, timedelta
+    from zoneinfo import ZoneInfoNotFoundError
+
+    import jarvis_gpt.tools as tools_module
+
+    question = "Какие в России за вчера и сегодня значимые новости произошли?"
+
+    assert tools_module._web_answer_infer_vertical(question) == "news"
+    assert tools_module._web_answer_infer_freshness(question) == "week"
+    assert tools_module._web_answer_news_date_window(
+        {}, question, today=date(2026, 7, 11)
+    ) == (date(2026, 7, 10), date(2026, 7, 11))
+
+    def missing_zone(_name):
+        raise ZoneInfoNotFoundError("tzdata unavailable")
+
+    monkeypatch.setattr(tools_module, "ZoneInfo", missing_zone)
+    assert tools_module._load_web_news_timezone().utcoffset(None) == timedelta(hours=3)
+
+
+def test_web_answer_news_uses_dated_rss_articles_when_search_returns_sections(
+    monkeypatch,
+    tmp_path,
+):
+    import jarvis_gpt.tools as tools_module
+
+    research_calls = []
+    feed_calls = []
+
+    async def fake_research(_ctx, args):
+        research_calls.append(args)
+        return ToolRunResponse(
+            tool="web.research",
+            ok=True,
+            summary="Search returned section pages.",
+            data={
+                "sources": [
+                    {
+                        "rank": 1,
+                        "title": "Новости России сегодня",
+                        "url": "https://news.example/",
+                        "snippet": "Новости России за сегодня",
+                        "excerpt": "Главная лента новостей России",
+                        "published": None,
+                        "fetched": True,
+                        "tool": "web.fetch",
+                        "quality": "web-source",
+                    },
+                    {
+                        "rank": 2,
+                        "title": "Старая новость России",
+                        "url": "https://news.example/20260709/old.html",
+                        "snippet": "Событие вне окна",
+                        "excerpt": "Событие вне окна",
+                        "published": "2026-07-09T10:00:00+03:00",
+                        "fetched": True,
+                        "tool": "web.fetch",
+                        "quality": "web-source",
+                    },
+                ]
+            },
+        )
+
+    async def fake_feed(_ctx, args):
+        feed_calls.append(args["url"])
+        if "ria.ru" in args["url"]:
+            entries = [
+                {
+                    "title": "Иран и США договорились продолжить переговоры",
+                    "link": "https://ria.ru/20260711/iran-foreign.html",
+                    "published": "Sat, 11 Jul 2026 13:00:00 +0300",
+                    "summary": "Стороны обсудили двусторонние отношения.",
+                },
+                {
+                    "title": "Правительство России утвердило важное решение",
+                    "link": "https://ria.ru/20260711/reshenie-1.html",
+                    "published": "Sat, 11 Jul 2026 12:00:00 +0300",
+                    "summary": "Решение касается федеральной политики.",
+                }
+            ]
+        elif "interfax.ru" in args["url"]:
+            entries = [
+                {
+                    "title": "В Москве объявили новые меры",
+                    "link": "https://www.interfax.ru/russia/1000001",
+                    "published": "Fri, 10 Jul 2026 18:30:00 +0300",
+                    "summary": "Меры вступили в силу после официального решения.",
+                }
+            ]
+        elif "rbc" in args["url"]:
+            entries = [
+                {
+                    "title": "Старая публикация РБК",
+                    "link": "https://www.rbc.ru/politics/09/07/2026/old",
+                    "published": "Thu, 09 Jul 2026 09:00:00 +0300",
+                    "summary": "Эта запись находится вне запрошенного окна.",
+                }
+            ]
+        else:
+            entries = [
+                {
+                    "title": "Запись без даты",
+                    "link": "https://tass.ru/politika/1000001",
+                    "published": "",
+                    "summary": "Недатированная запись.",
+                }
+            ]
+        return ToolRunResponse(
+            tool="web.feed",
+            ok=True,
+            summary="Feed ok.",
+            data={"url": args["url"], "feed_title": "Publisher", "entries": entries},
+        )
+
+    class SynthesisMustNotRun:
+        async def complete(self, *_args, **_kwargs):
+            raise AssertionError("bounded news must use the validated deterministic digest")
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "1")
+    monkeypatch.setattr(tools_module, "_web_research", fake_research)
+    monkeypatch.setattr(tools_module, "_web_feed", fake_feed)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, SynthesisMustNotRun())
+
+    result = asyncio.run(
+        tools.run(
+            "web.answer",
+            {
+                "question": "Какие в России за вчера и сегодня значимые новости произошли?",
+                "query": "значимые новости России 10-11 июля 2026",
+                "date_from": "2026-07-10",
+                "date_to": "2026-07-11",
+                "vertical": "news",
+                "use_cache": False,
+            },
+        )
+    )
+
+    assert result.ok is True
+    assert result.data["news"]["complete"] is True
+    assert result.data["news"]["date_from"] == "2026-07-10"
+    assert result.data["news"]["date_to"] == "2026-07-11"
+    assert result.data["news"]["covered_dates"] == ["2026-07-10", "2026-07-11"]
+    assert result.data["news"]["missing_dates"] == []
+    assert result.data["synthesis"]["reason"] == "deterministic_news"
+    assert len(feed_calls) == len(tools_module.WEB_NEWS_RSS_FEEDS)
+    assert all(call["vertical"] == "news" for call in research_calls)
+    assert all(call["freshness"] == "week" for call in research_calls)
+    assert not any("wikipedia" in call["query"] for call in research_calls)
+    urls = {source["url"] for source in result.data["sources"]}
+    assert "https://news.example/" not in urls
+    assert "https://news.example/20260709/old.html" not in urls
+    assert "https://ria.ru/20260711/reshenie-1.html" in urls
+    assert "https://ria.ru/20260711/iran-foreign.html" not in urls
+    assert "https://www.interfax.ru/russia/1000001" in urls
+    assert all(
+        "2026-07-10" <= source["published_date"] <= "2026-07-11"
+        for source in result.data["sources"]
+    )
+    assert {source["published_date"] for source in result.data["sources"]} == {
+        "2026-07-10",
+        "2026-07-11",
+    }
+    assert "Правительство России утвердило" in result.data["answer"]
+    assert "невозможно перечислить" not in result.data["answer"].casefold()
+    storage.close()
+
+
+def test_web_answer_news_requires_dated_evidence_for_every_requested_day():
+    import jarvis_gpt.tools as tools_module
+
+    status = tools_module._web_answer_news_coverage(
+        [{"published": "2026-07-11T12:00:00+03:00"}],
+        date_from=tools_module.date(2026, 7, 10),
+        date_to=tools_module.date(2026, 7, 11),
+    )
+
+    assert status["complete"] is False
+    assert status["covered_dates"] == ["2026-07-11"]
+    assert status["missing_dates"] == ["2026-07-10"]
+
+
+def test_web_answer_news_does_not_treat_body_or_modified_dates_as_publication():
+    import jarvis_gpt.tools as tools_module
+
+    source = {
+        "title": "Старая статья с упоминанием новой даты",
+        "url": "https://publisher.example/articles/old-story",
+        "extraction": {
+            "dates": ["2026-07-11"],
+            "article_dates": [],
+            "schema_articles": [
+                {"date_published": "2024-01-01", "date_modified": "2026-07-11"}
+            ],
+        },
+    }
+
+    assert tools_module._web_answer_news_source_date(source) == tools_module.date(
+        2024, 1, 1
+    )
+    assert (
+        tools_module._web_answer_news_source_in_window(
+            source,
+            date_from=tools_module.date(2026, 7, 10),
+            date_to=tools_module.date(2026, 7, 11),
+        )
+        is False
+    )
+    source["extraction"]["schema_articles"] = [
+        {"date_published": None, "date_modified": "2026-07-11"}
+    ]
+    assert tools_module._web_answer_news_source_date(source) is None
+
+
+def test_web_answer_news_rejects_too_wide_window_before_network(monkeypatch, tmp_path):
+    import jarvis_gpt.tools as tools_module
+
+    async def must_not_run(*_args, **_kwargs):
+        raise AssertionError("wide news window must fail before network access")
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr(tools_module, "_web_research", must_not_run)
+    monkeypatch.setattr(tools_module, "_web_feed", must_not_run)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    result = asyncio.run(
+        tools.run(
+            "web.answer",
+            {
+                "question": "Новости России за год",
+                "vertical": "news",
+                "date_from": "2025-07-11",
+                "date_to": "2026-07-11",
+                "use_cache": False,
+            },
+        )
+    )
+
+    assert result.ok is False
+    assert result.data["news"]["missing_dates"] == ["window_exceeds_31_days"]
+    storage.close()
+
+
+def test_web_answer_news_fails_closed_when_only_undated_or_old_sources_exist(
+    monkeypatch,
+    tmp_path,
+):
+    import jarvis_gpt.tools as tools_module
+
+    async def fake_research(_ctx, _args):
+        return ToolRunResponse(
+            tool="web.research",
+            ok=True,
+            summary="Only a homepage.",
+            data={
+                "sources": [
+                    {
+                        "rank": 1,
+                        "title": "Новости России сегодня",
+                        "url": "https://news.example/",
+                        "snippet": "Главная страница",
+                        "excerpt": "Главная страница",
+                        "published": None,
+                        "fetched": True,
+                        "tool": "web.fetch",
+                        "quality": "web-source",
+                    }
+                ]
+            },
+        )
+
+    async def fake_feed(_ctx, args):
+        return ToolRunResponse(
+            tool="web.feed",
+            ok=True,
+            summary="Old feed entries.",
+            data={
+                "url": args["url"],
+                "feed_title": "Publisher",
+                "entries": [
+                    {
+                        "title": "Старая новость",
+                        "link": "https://publisher.example/20260701/old.html",
+                        "published": "Wed, 01 Jul 2026 10:00:00 +0300",
+                        "summary": "Старая запись.",
+                    }
+                ],
+            },
+        )
+
+    class GenericRefusalMustNotRun:
+        calls = 0
+
+        async def complete(self, *_args, **_kwargs):
+            self.calls += 1
+            return SimpleNamespace(
+                ok=True,
+                content="Невозможно перечислить новости. https://news.example/",
+            )
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "1")
+    monkeypatch.setattr(tools_module, "_web_research", fake_research)
+    monkeypatch.setattr(tools_module, "_web_feed", fake_feed)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    llm = GenericRefusalMustNotRun()
+    tools = ToolRegistry(settings, storage, llm)
+
+    result = asyncio.run(
+        tools.run(
+            "web.answer",
+            {
+                "question": "Какие в России за вчера и сегодня значимые новости произошли?",
+                "date_from": "2026-07-10",
+                "date_to": "2026-07-11",
+                "vertical": "news",
+                "use_cache": False,
+            },
+        )
+    )
+
+    assert result.ok is False
+    assert result.data["sources"] == []
+    assert result.data["news"]["complete"] is False
+    assert result.data["synthesis"]["reason"] == "deterministic_news"
+    assert "датированные статьи" in result.data["answer"]
+    assert llm.calls == 0
+    storage.close()
+
+
 def test_web_answer_expands_queries_and_ranks_sources(monkeypatch, tmp_path):
     calls = []
 
