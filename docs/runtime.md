@@ -154,18 +154,44 @@ For the operator and the second model:
 - Uploaded chat files and local paths can now go through the same safe document
   layer. Use `file_id` for chat uploads or `path` for local files under the
   workspace, `JARVIS_HOME`, or the user home directory.
-- New tools: `documents.inspect`, `documents.read`, `documents.compare`,
-  `documents.edit.plan`, and `documents.apply_replacements`.
+- Low-level engine: `document_runtime` (extract/compare/replace).
+- High-level black box: `document_surfer.JarvisDocumentSurfer` (document analogue
+  of `web_surfer`) with inspect/read/analyze/review/compare/search/
+  summarize_corpus/edit_plan/apply_replacements/generate/convert/package/
+  capabilities.
+- Tools: `documents.inspect`, `documents.read`, `documents.review`,
+  `documents.compare`, `documents.edit.plan`, `documents.apply_replacements`,
+  `documents.analyze`, `documents.search`, `documents.corpus.summarize`,
+  `documents.generate`, `documents.convert`, `documents.capabilities`.
 - DOCX extraction reads paragraphs, tables, comments, and style names. XLSX
   extraction reads sheet previews, shared strings, and formulas. PDF extraction
   uses `pypdf` if available and otherwise a basic text fallback. Text/html/json/
-  csv are read directly.
+  csv are read directly. Extended best-effort extract: PPTX/ODT/RTF.
+- Generation formats: md, txt, csv, json, html, docx, xlsx (stdlib OOXML writers).
 - Ingestion now indexes DOCX/XLSX/PDF/text-like uploads into file chunks, so
   attachment context and `files.search` can find Office/PDF content.
-- `documents.apply_replacements` writes an edited copy to
-  `data/document-outputs`, registers it as a file, and never overwrites the
-  original. Use it only for exact replacements; larger formatting/layout work
-  should be planned first and visually verified before delivery.
+- `documents.apply_replacements` / surfer mutations write edited copies to
+  `data/document-outputs`, register files, and never overwrite originals.
+- Use `documents.review` / `documents.analyze` before serious Office/PDF edits.
+
+## 2026-07-12 handoff - document_surfer release
+
+- `document_surfer.JarvisDocumentSurfer` is the production document black box
+  (document analogue of `web_surfer`), backed by `file_types` and
+  `archive_runtime`. The `documents.*` tools are first-class in the
+  ToolRegistry and the agent safe allowlist.
+
+## 2026-07-12 handoff - archives + file type recognition
+
+- `file_types.identify_path/bytes`: magic-byte + compound-extension recognition
+  for archives, documents, images, media, executables, text/code, etc.
+- `archive_runtime`: safe list/extract/read/create for zip, tar, tar.gz, tar.bz2,
+  tar.xz, gz, bz2, xz; optional 7z (`py7zr`) and rar (`rarfile`). Path traversal
+  and uncompressed size bombs are rejected.
+- New tools: `documents.file.identify`, `documents.file.probe`,
+  `documents.archive.list|extract|read_member|create|search`.
+- `documents.inspect` on archives returns member listing instead of forcing
+  document text extraction.
 
 ## 2026-07-10 handoff - internet production surface
 

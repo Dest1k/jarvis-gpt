@@ -207,7 +207,9 @@ MISSION_EXECUTOR_PROMPT = (
     "доступные инструменты, чтобы реально продвинуть шаг: собери данные, проверь систему, "
     "прочитай файлы, посмотри статус. Для интернет-шагов предпочитай web.answer, web.research, "
     "web.extract, web.verify и web.document.read, чтобы получить источники и citations. "
-    "Для Word/Excel/PDF используй documents.inspect/read/compare/edit.plan и создавай "
+    "Для Word/Excel/PDF/PPTX/текста/архивов используй documents.inspect/read/analyze/"
+    "compare/edit.plan/search/corpus.summarize/generate/convert/file.identify/file.probe/"
+    "archive.list/archive.extract/archive.read_member/archive.search/archive.create и "
     "edited copy через documents.apply_replacements, не перезаписывая оригинал. "
     "Не выдумывай результаты — опирайся на observation "
     "инструментов. Опасные действия автономно недоступны и станут approval-гейтом; в этом "
@@ -323,6 +325,19 @@ EXECUTIVE_AUTONOMOUS_TOOL_ALLOWLIST = frozenset(
         "documents.read",
         "documents.compare",
         "documents.edit.plan",
+        "documents.analyze",
+        "documents.search",
+        "documents.corpus.summarize",
+        "documents.generate",
+        "documents.convert",
+        "documents.capabilities",
+        "documents.file.identify",
+        "documents.file.probe",
+        "documents.archive.list",
+        "documents.archive.extract",
+        "documents.archive.read_member",
+        "documents.archive.create",
+        "documents.archive.search",
         "web.search",
         "web.crawl",
         "web.evidence.list",
@@ -490,7 +505,8 @@ def _message_with_attachments(message: str, attachments: list[dict[str, Any]]) -
         "",
         (
             "Attached files already uploaded to Jarvis storage. "
-            "Use indexed file context or documents.* tools when Word/Excel/PDF/text "
+            "Use indexed file context or documents.* tools (document_surfer) "
+            "when Word/Excel/PDF/text "
             "content, comparison, or edits are needed:"
         ),
     ]
@@ -3908,13 +3924,28 @@ class AgentRuntime:
                 tools=(
                     "documents.inspect",
                     "documents.read",
+                    "documents.analyze",
                     "documents.compare",
                     "documents.edit.plan",
                     "documents.apply_replacements",
+                    "documents.search",
+                    "documents.corpus.summarize",
+                    "documents.generate",
+                    "documents.convert",
+                    "documents.capabilities",
+                    "documents.file.identify",
+                    "documents.file.probe",
+                    "documents.archive.list",
+                    "documents.archive.extract",
+                    "documents.archive.read_member",
+                    "documents.archive.create",
+                    "documents.archive.search",
                 ),
                 completion_criteria=(
-                    "inspect/read uploaded documents when relevant",
+                    "inspect/read/analyze uploaded documents when relevant",
+                    "identify unknown file types and list/search archives safely",
                     "compare or prepare an edit plan before changing document copies",
+                    "generate or convert deliverables without overwriting originals",
                     "ask for missing file content only if document extraction is insufficient",
                 ),
                 rationale="The turn includes uploaded file context.",
@@ -4933,7 +4964,8 @@ class AgentRuntime:
                     "mission planning/execution, learning journal/tick, "
                     "web.answer/web.search/web.fetch/web.research/web.verify/web.transcript/"
                     "web.eval/web.document.read, "
-                    "documents.inspect/read/compare/edit.plan/apply_replacements, "
+                    "documents.inspect/read/analyze/compare/edit.plan/apply_replacements/"
+                    "search/corpus.summarize/generate/convert/capabilities (document_surfer), "
                     "telemetry, diagnostics, Docker/dispatcher inspection, host bridge gates."
                 ),
                 (
