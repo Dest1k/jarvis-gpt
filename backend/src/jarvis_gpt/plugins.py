@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
 """
-Plugin System for Ideal Jarvis
-
-Extensible, safe plugin loading for new tools/capabilities.
-Drop-in Python modules or config-defined tools.
+Plugin System - Improved
 """
 
+import importlib
 from dataclasses import dataclass
 from typing import Dict, Any, Callable, List
-
-import importlib
 
 
 @dataclass
@@ -21,14 +17,10 @@ class Plugin:
 
 
 class PluginManager:
-    """Safe plugin registry. Plugins declare capabilities and are loaded with restrictions."""
-
     def __init__(self):
         self.plugins: Dict[str, Plugin] = {}
 
     def load_plugin(self, module_path: str) -> Plugin:
-        """Load a plugin module safely."""
-        # Real impl: importlib with sandbox checks, capability declaration
         mod = importlib.import_module(module_path)
         plugin = Plugin(
             name=getattr(mod, "PLUGIN_NAME", module_path),
@@ -43,11 +35,11 @@ class PluginManager:
         return list(self.plugins.keys())
 
 
-async def get_plugin_tools():
+def get_plugin_tools():
     pm = PluginManager()
     return {
         "plugins.list": pm.list_plugins,
         "plugins.load": pm.load_plugin,
     }
 
-print("[plugins.py] Plugin system initialized - extensibility unlocked.")
+print("[plugins.py] Improved.")
