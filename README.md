@@ -9,14 +9,16 @@
 - Safe tools runtime: диагностика, статус, память, публичный web fetch/search/render/download с SSRF-защитой, evidence ledger/extract/verify, schema.org/OpenGraph/readability extraction, quarantine download inspection, semantic review-gated Chrome CDP read/click/type/select/screenshot plus human handoff status, validated browser open без approval для явных запросов открыть URL, Docker ps/logs для Jarvis-контейнеров, файловое чтение в разрешённых корнях, approval-gated sandbox write, token-auth host bridge и execution brief для миссий.
 - File ingestion: загрузка текстовых, Word/Excel/PDF файлов, хранение в `D:\jarvis\data\jarvis-gpt\files`, document extraction, chunk search и audit trail.
 - Model catalog: активные профили знают реальные Gemma 4 веса в `D:\jarvis\data\models`.
-- HITL approvals: опасные действия оформляются как durable approval gates, а не выполняются молча.
+- HITL approvals: незапрошенные опасные действия оформляются как durable approval gates; точная
+  явная команда текущего сообщения получает одноразовое argument-bound разрешение и выполняется сразу.
 - Telemetry/performance: CPU/RAM/disk/GPU/Docker snapshots, performance profile и host bridge status.
 - Self-learning tick: аудит, tool runs, approvals и append-only learning journal превращаются в долговременные lessons.
 - Operator persona: durable structured profile (роль, домашний город, языки, стек, увлечения, текущий фокус, постоянные правила «всегда/никогда», глоссарий) читается агентом в каждом ответе.
 - Persona auto-learning: модель сама сохраняет устойчивые факты об операторе через safe-инструмент `persona.insight` (один факт за вызов, дедуп, капы, аудит) — без regex-извлечения.
 - Reasoning-first понимание задачи: для fuzzy web-запросов И для запросов о состоянии/действиях на машине оператора агент спрашивает модель (`_understand_intent`), которая понимает интент по смыслу и профилю оператора, а не по ключевым словам; `_looks_like_*`-эвристики остаются детерминированным офлайн-фолбэком. Арбитр может повышать задачу до миссии и уводить локальные запросы в нативные инструменты: решение `local_action` направляет к system.inspect (чтение состояния) и windows.native (мутации под approval) вместо интернет-поиска локального состояния.
 - Web evidence synthesis: `web.answer` is the first-choice Google-like route with optional Search API providers (Brave/Tavily/Serper), vertical search modes, research/fetch/render/archive fallback, verification, grounded LLM synthesis with URL retention, answer TTL cache, source diversity, claim-level citations, transcripts/eval hooks, and structured cards for follow-up/UI use.
-- Агентный tool-loop: на пути ответа модель сама вызывает безопасные инструменты (web.search/fetch, filesystem/docker/runtime read, ...), видит observation и продолжает до готовности; опасные инструменты уходят в HITL-approval, бюджет шагов — из autonomy policy. Протокол JSON-act поверх обычных completions, деградирует без нативного tool-calling.
+- Агентный tool-loop: модель вызывает безопасные инструменты и только те mutating-инструменты,
+  которые семантически совпадают с явной текущей командой; остальные уходят в HITL-approval.
 - Гибридная семантическая память и файлы: retrieval фьюзит лексический BM25/LIKE с семантическим re-ranking (чистый Python fuzzy-вектор по умолчанию, опциональный remote `/embeddings` для настоящей семантики) через RRF — и для долговременной памяти, и для индексированных файловых чанков — поэтому релевантное находится даже при перефразировании и иной словоформе. Деградирует до лексики без потерь. При полном отсутствии лексического пересечения файловый retrieval падает на ограниченный recent-chunk пул с порогом связности, а не молчит.
 - Реальное исполнение миссий: шаг миссии при живом LLM выполняется агентным tool-loop (реальные инструменты, approval для опасного, аудит), а не статичным brief; офлайн — прежний детерминированный brief.
 - Авто-цепочка миссий: `run_mission` / `POST /api/missions/{id}/run` / `mission-run` проходят миссию до завершения, блокировки или бюджета шагов; в Command Center кнопка «Запустить всё» показывает прогресс живьём (прогресс-бар, статусы задач, лог шагов).
@@ -234,10 +236,13 @@ docker compose --profile llm up -d dispatcher
 - Web tools mark remote content as untrusted evidence, flag prompt-injection markers, and quarantine downloads without auto-opening files.
 - Browser tools include local-only Chrome CDP status/launch/read flows for reading pages through a dedicated user browser session without exporting cookies.
 - Safe tools include read-only `docker.ps` and restricted `docker.logs` for Jarvis container diagnostics.
-- Safe tool `system.inspect` даёт агенту read-only инспекцию машины через WMI/CIM (и список окон): модель сама выбирает Win32_* класс по своему знанию для бытовых вопросов о железе/ОС/дисках/оперативке/батарее/службах/автозагрузке/принтерах/сети, без слова «wmi». Мутирующие native-действия остаются на approval-gated `windows.native`.
+- Safe tool `system.inspect` даёт read-only инспекцию машины. Явно названные в текущем сообщении
+  native-действия выполняются через `windows.native` сразу; выведенные моделью действия остаются gated.
 - Dispatcher status/logs are tools, while dispatcher start/stop are approval-gated tool actions.
 - `browser.open` can open validated HTTP(S) URLs through the host bridge without approval for explicit open requests; it is excluded from the autonomous background tool loop.
-- `filesystem.write_text` is sandboxed to the repository or `D:\jarvis` and requires approval.
+- `filesystem.write_text` is sandboxed to the repository or `D:\jarvis`; an exact current-turn
+  path/content request executes immediately, `mode=create` safely creates empty/new files without
+  overwriting, while inferred writes require approval.
 - Memory and file retrieval now return relevance scores, matched terms, and clipped snippets for mission context.
 - Autonomous learning skips duplicate lessons, reads the durable learning journal, and reports the skipped count in tick results.
 - Autonomous supervisor persists telemetry, learning lessons, and health snapshots on separate intervals.

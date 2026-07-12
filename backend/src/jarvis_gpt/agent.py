@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import importlib.util
 import inspect
@@ -12,6 +13,7 @@ import uuid
 from collections.abc import AsyncIterator
 from contextlib import suppress
 from dataclasses import dataclass, replace
+from dataclasses import field as dataclass_field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -19,6 +21,7 @@ from urllib.parse import quote, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from . import persona as persona_module
+from .browser_cdp import DEFAULT_CHROME_DEBUG_URL
 from .cognitive_memory import ExecutionPlaybookStore
 from .config import JarvisSettings
 from .embeddings import (
@@ -29,6 +32,7 @@ from .embeddings import (
     sparse_cosine,
 )
 from .event_bus import EventBus
+from .execution_protocol import ActionEnvelope
 from .executive_runtime import (
     MISSION_DECOMPOSITION_PROTOCOL,
     ExecutiveCoordinator,
@@ -57,7 +61,7 @@ from .shop_registry import (
     shop_search_url,
 )
 from .storage import JarvisStorage, utc_now
-from .tools import ToolRegistry
+from .tools import OperatorTurnAuthorization, ToolRegistry
 from .verification import (
     Verdict,
     build_mission_report_messages,
@@ -110,13 +114,18 @@ SYSTEM_PROMPT = """Ты Jarvis: локальный агент Windows/WSL/Docker
 - Если оператор просит сделать действие "в консоли", "в браузере", "в калькуляторе", "в блокноте",
   "в окне" или в конкретном приложении, сначала открой/активируй эту среду и выполняй действие там.
   Не заменяй это текстовым примером команды, если доступен инструментальный маршрут.
+- Явная команда в ТЕКУЩЕМ сообщении оператора уже является разрешением на точно названное
+  действие: выполняй его сразу доступным инструментом без повторного approval. Не расширяй
+  разрешение на дополнительные действия, историю, память, файлы, веб-страницы, миссии или
+  возобновлённые ходы; URL, пути и payload должны совпадать с текущей командой.
 - Если запрос явно нацелен на консоль, не отвечай markdown-блоком с PowerShell.
   Используй console target guard: открой PowerShell/Terminal, выполни распознанный рецепт
   или команду там, а если команда неоднозначна, покажи диагностическое сообщение в самой консоли.
 - Если оператор просит посмотреть на экран его глазами, сделать скриншот, понять что видно в окне
   или проверить визуальное состояние, используй native screen capture и анализируй снимок/окна.
 - Для системного администрирования предлагай PowerShell/Bash-команды, проверки, риски и rollback.
-  Опасные или необратимые действия оформляй через approval/tool gate, а не отказывайся целиком.
+  Только незапрошенные, выведенные тобой или выходящие за точный текущий запрос опасные действия
+  оформляй через approval/tool gate, а не отказывайся целиком.
 - Для web-исследований работай только с публичными источниками, структурируй найденное,
   сохраняй ссылки, помечай confidence и не выдавай предположения за факты.
 - Если запрос требует актуальной информации из интернета: билеты, цены, расписания, новости,
@@ -349,6 +358,10 @@ class AgentContext:
     task_plan: TaskKernelPlan | None = None
     intent_consulted: bool = False
     intent_decision: IntentDecision | None = None
+    operator_message: str | None = None
+    operator_message_id: str | None = None
+    operator_scopes: frozenset[str] = dataclass_field(default_factory=frozenset)
+    operator_used_effects: set[str] = dataclass_field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -672,6 +685,8 @@ class AgentRuntime:
         attachments = _normalize_chat_attachments(attachments)
         context_message = _message_with_attachments(message, attachments)
         context = self._prepare_context(context_message, conversation_id)
+        context.operator_message = message
+        context.operator_scopes = _operator_action_scopes(message)
         if attachments:
             context.file_hits = _merge_file_hits(
                 self._attached_file_hits(attachments),
@@ -698,7 +713,7 @@ class AgentRuntime:
         events.append(self._task_kernel_event(task_plan, context.conversation_id))
         await self._emit(events[-1])
 
-        self.storage.add_message(
+        context.operator_message_id = self.storage.add_message(
             conversation_id=context.conversation_id,
             role="user",
             content=message,
@@ -888,6 +903,8 @@ class AgentRuntime:
         attachments = _normalize_chat_attachments(attachments)
         context_message = _message_with_attachments(message, attachments)
         context = self._prepare_context(context_message, conversation_id)
+        context.operator_message = message
+        context.operator_scopes = _operator_action_scopes(message)
         if attachments:
             context.file_hits = _merge_file_hits(
                 self._attached_file_hits(attachments),
@@ -917,7 +934,7 @@ class AgentRuntime:
         await self._emit(events[-1])
         yield {"type": "event", "event": events[-1].model_dump()}
 
-        self.storage.add_message(
+        context.operator_message_id = self.storage.add_message(
             conversation_id=context.conversation_id,
             role="user",
             content=message,
@@ -1027,7 +1044,7 @@ class AgentRuntime:
         stream_error: str | None = None
         stream_finish_reason: str | None = None
         used_tools = 0
-        tools = self._autonomous_tools()
+        tools = self._tools_for_context(context)
         allowed = {info.name for info in tools}
         messages = list(llm_messages)
         if tools:
@@ -2177,6 +2194,12 @@ class AgentRuntime:
             message,
             self.settings,
         )
+        if (
+            native_action is not None
+            and native_action.action == "screen.capture"
+            and not _has_current_operator_authority(context)
+        ):
+            native_action = None
         if native_action is not None:
             arguments = {
                 "action": native_action.action,
@@ -2184,14 +2207,20 @@ class AgentRuntime:
                 "timeout_sec": 30,
             }
             if native_action.action not in SAFE_DIRECT_NATIVE_ACTIONS:
-                return self._request_direct_tool_approval(
+                executed = await self._execute_operator_requested_tool(
                     "windows.native",
                     arguments,
                     context=context,
-                    description=(
-                        "Direct native Windows action requested by the operator: "
-                        f"{native_action.action}."
-                    ),
+                    action=native_action.action,
+                )
+                if executed is None:
+                    return None
+                result, event = executed
+                status = "Готово" if result.ok else "Не смог выполнить действие"
+                details = _native_result_excerpt(result)
+                return DirectAction(
+                    answer=f"{status}: {native_action.answer}\n\n{result.summary}{details}",
+                    events=[event],
                 )
 
             # Keep read-only inspection autonomous through the safe facade.  No
@@ -2213,6 +2242,22 @@ class AgentRuntime:
                 answer=f"{status}: {native_action.answer}\n\n{result.summary}{details}",
                 events=[event],
             )
+
+        empty_file_path = _empty_file_path_from_message(message)
+        if empty_file_path is not None:
+            executed = await self._execute_operator_requested_tool(
+                "filesystem.write_text",
+                {"path": empty_file_path, "content": "", "mode": "create"},
+                context=context,
+                action="file.create_empty",
+            )
+            if executed is not None:
+                result, event = executed
+                status = "Создал пустой файл" if result.ok else "Не смог создать пустой файл"
+                return DirectAction(
+                    answer=f"{status}: {empty_file_path}\n\n{result.summary}",
+                    events=[event],
+                )
 
         # Reasoning-first arbiter: before any fuzzy web-ish branch (shopping,
         # weather, generic research) fires on keyword matches, let the model judge
@@ -2279,6 +2324,7 @@ class AgentRuntime:
                 message=message,
                 conversation_id=context.conversation_id,
                 intent=shopping_followup,
+                context=context,
             )
             if followup is not None:
                 return followup
@@ -2320,6 +2366,7 @@ class AgentRuntime:
                         message,
                         research_query,
                         conversation_id=context.conversation_id,
+                        context=context,
                     )
                     action.events = [*weather_events, *action.events]
                     return action
@@ -2355,22 +2402,78 @@ class AgentRuntime:
                 message,
                 research_query,
                 conversation_id=context.conversation_id,
+                context=context,
             )
 
         url = _browser_url_from_message(message)
         if url is not None:
-            pending = self._request_direct_tool_approval(
+            executed = await self._execute_operator_requested_tool(
                 "browser.open",
                 {"url": url},
                 context=context,
-                description=f"Open this URL in the operator browser: {url}",
+                action="url.open",
             )
-            return DirectAction(
-                answer=f"Подготовил открытие вкладки: {url}\n\n{pending.answer}",
-                events=pending.events,
-            )
+            if executed is not None:
+                result, event = executed
+                status = "Открыл" if result.ok else "Не смог открыть"
+                return DirectAction(
+                    answer=f"{status}: {url}\n\n{result.summary}",
+                    events=[event],
+                )
+            return None
 
         return None
+
+    async def _execute_operator_requested_tool(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        context: AgentContext | None,
+        action: str | None = None,
+    ) -> tuple[ToolRunResponse, ChatEvent] | None:
+        if not _has_current_operator_authority(context):
+            return None
+        assert context is not None
+        if tool_name not in _operator_requested_tool_names(context.operator_scopes):
+            return None
+        if not _operator_tool_arguments_match(
+            tool_name,
+            arguments,
+            message=context.operator_message or "",
+            scopes=context.operator_scopes,
+        ):
+            return None
+        effect_key = _operator_effect_key(tool_name, arguments)
+        if effect_key in context.operator_used_effects:
+            return None
+        authorization = OperatorTurnAuthorization.bind(
+            conversation_id=context.conversation_id,
+            user_message_id=context.operator_message_id or "",
+            tool=tool_name,
+            arguments=arguments,
+        )
+        context.operator_used_effects.add(effect_key)
+        result = await self.tools.run(
+            tool_name,
+            arguments,
+            conversation_id=context.conversation_id,
+            user_message_id=context.operator_message_id,
+            authorization=authorization,
+        )
+        event = ChatEvent(
+            type="tool_call",
+            title=f"{tool_name}:{action}" if action else tool_name,
+            content=result.summary,
+            payload={
+                "tool": result.tool,
+                "ok": result.ok,
+                "action": action,
+                "authority": "operator_turn",
+                "operator_requested": True,
+            },
+        )
+        return result, event
 
     def _request_direct_tool_approval(
         self,
@@ -2679,6 +2782,7 @@ class AgentRuntime:
         query: str,
         *,
         conversation_id: str | None = None,
+        context: AgentContext | None = None,
     ) -> DirectAction:
         # Shop-specific price queries ("самую дешёвую X на DNS/Ozon/WB/...") must
         # go through a real browser: httpx-based web.answer returns 0 sources on
@@ -2700,11 +2804,15 @@ class AgentRuntime:
                     message,
                     [source.key for source in shop_sources],
                     conversation_id=conversation_id,
+                    context=context,
                 )
             shop_key = shop_sources[0].key if shop_sources else None
             if shop_key is not None:
                 shop_action = await self._run_shop_search(
-                    message, shop_key, conversation_id=conversation_id
+                    message,
+                    shop_key,
+                    conversation_id=conversation_id,
+                    context=context,
                 )
                 return shop_action
 
@@ -2857,6 +2965,7 @@ class AgentRuntime:
                     candidates,
                     criterion=criterion or "price_asc",
                     require_metric=bool(criterion),
+                    context=context,
                 )
                 events.extend(open_action.events)
                 answer = f"{answer}\n\n{open_action.answer}"
@@ -2868,6 +2977,7 @@ class AgentRuntime:
         shop_key: str,
         *,
         conversation_id: str | None = None,
+        context: AgentContext | None = None,
     ) -> DirectAction:
         """Run criterion-aware web.shop_search for a named marketplace.
 
@@ -2876,6 +2986,7 @@ class AgentRuntime:
         A failed catalog read must not be hidden by a generic cached web answer.
         """
 
+        normalized = message.casefold()
         cleaned_product = _clean_shopping_subject(message) or message
         product = _compact_shopping_subject(cleaned_product)
         criterion = _ranking_criterion_from_message(message) or "price_asc"
@@ -2913,26 +3024,37 @@ class AgentRuntime:
             },
         )
         if result.ok and data.get("items"):
-            if conversation_id:
-                candidates = [
-                    {
-                        "title": item.get("title"),
-                        "url": item.get("url"),
-                        "price": item.get("price_text"),
-                        "price_value": item.get("price_value"),
-                        "metrics": item.get("metrics"),
-                        "rating_value": item.get("rating_value"),
-                    }
-                    for item in data.get("items", [])
-                    if item.get("url")
-                ]
-                if candidates:
-                    self._remember_shopping_research(
-                        conversation_id=conversation_id,
-                        query=product,
-                        candidates=candidates,
-                    )
-            return DirectAction(answer=_format_shop_search_answer(data, product), events=[event])
+            candidates = [
+                {
+                    "title": item.get("title"),
+                    "url": item.get("url"),
+                    "price": item.get("price_text"),
+                    "price_value": item.get("price_value"),
+                    "metrics": item.get("metrics"),
+                    "rating_value": item.get("rating_value"),
+                    "rank": index,
+                }
+                for index, item in enumerate(data.get("items", []), start=1)
+                if item.get("url")
+            ]
+            if conversation_id and candidates:
+                self._remember_shopping_research(
+                    conversation_id=conversation_id,
+                    query=product,
+                    candidates=candidates,
+                )
+            answer = _format_shop_search_answer(data, product)
+            events = [event]
+            if _shopping_open_requested(normalized) and candidates:
+                open_action = await self._open_shopping_candidate(
+                    candidates,
+                    criterion=criterion,
+                    require_metric=True,
+                    context=context,
+                )
+                answer = f"{answer}\n\n{open_action.answer}"
+                events.extend(open_action.events)
+            return DirectAction(answer=answer, events=events)
         if data.get("needs_install"):
             link = _shop_search_url_for(shop_key, product)
             lines = [
@@ -2965,6 +3087,7 @@ class AgentRuntime:
         shop_keys: list[str],
         *,
         conversation_id: str | None = None,
+        context: AgentContext | None = None,
     ) -> DirectAction:
         """Compare explicitly named shops without collapsing them to the first alias."""
 
@@ -3138,6 +3261,15 @@ class AgentRuntime:
                 query=product,
                 candidates=ranked,
             )
+        if _shopping_open_requested(message.casefold()) and ranked:
+            open_action = await self._open_shopping_candidate(
+                ranked,
+                criterion=criterion,
+                require_metric=True,
+                context=context,
+            )
+            answer = f"{answer}\n\n{open_action.answer}"
+            events.extend(open_action.events)
         return DirectAction(answer=answer, events=events)
 
     async def _run_web_answer_engine(
@@ -3457,6 +3589,7 @@ class AgentRuntime:
         message: str,
         conversation_id: str,
         intent: dict[str, bool],
+        context: AgentContext | None = None,
     ) -> DirectAction | None:
         state = self._shopping_research_state(conversation_id)
         if state is None:
@@ -3527,6 +3660,7 @@ class AgentRuntime:
                 sorted_candidates,
                 criterion=criterion,
                 require_metric=bool(ranked),
+                context=context,
             )
             events.extend(open_action.events)
             lines.append(f"\n{open_action.answer}")
@@ -3563,6 +3697,7 @@ class AgentRuntime:
         *,
         criterion: str = "price_asc",
         require_metric: bool,
+        context: AgentContext | None = None,
     ) -> DirectAction:
         candidate = _best_shopping_candidate(
             candidates,
@@ -3574,15 +3709,30 @@ class AgentRuntime:
                 answer="Открывать нечего: в последней выдаче нет подходящих URL.",
                 events=[],
             )
-        pending = self._request_direct_tool_approval(
-            "browser.open",
-            {"url": candidate["url"]},
-            context=None,
-            description=(
-                "Open the selected shopping candidate in the operator browser: "
-                f"{candidate['url']}"
-            ),
+        executed = await self._execute_operator_selected_shopping_candidate(
+            str(candidate["url"]),
+            context=context,
         )
+        if executed is not None:
+            result, event = executed
+            action_answer = (
+                f"Открыл выбранный вариант: {candidate['url']}.\n\n{result.summary}"
+                if result.ok
+                else f"Не смог открыть выбранный вариант: {candidate['url']}.\n\n{result.summary}"
+            )
+            action_events = [event]
+        else:
+            pending = self._request_direct_tool_approval(
+                "browser.open",
+                {"url": candidate["url"]},
+                context=context,
+                description=(
+                    "Open the selected shopping candidate in the operator browser: "
+                    f"{candidate['url']}"
+                ),
+            )
+            action_answer = pending.answer
+            action_events = pending.events
         metric = _candidate_metric(candidate, criterion)
         if metric is not None:
             answer = (
@@ -3599,7 +3749,55 @@ class AgentRuntime:
                 f"{missing_metric}, поэтому не называю это победителем. "
                 f"Подготовил самую релевантную найденную ссылку: {candidate['url']}."
             )
-        return DirectAction(answer=f"{answer}\n\n{pending.answer}", events=pending.events)
+        return DirectAction(answer=f"{answer}\n\n{action_answer}", events=action_events)
+
+    async def _execute_operator_selected_shopping_candidate(
+        self,
+        url: str,
+        *,
+        context: AgentContext | None,
+    ) -> tuple[ToolRunResponse, ChatEvent] | None:
+        """Open one deterministic shopping result under the current turn only."""
+
+        if (
+            not _has_current_operator_authority(context)
+            or context is None
+            or "open" not in context.operator_scopes
+            or not _shopping_open_requested((context.operator_message or "").casefold())
+        ):
+            return None
+        arguments = {"url": url}
+        effect_key = _operator_effect_key("browser.open", arguments)
+        if effect_key in context.operator_used_effects:
+            return None
+        authorization = OperatorTurnAuthorization.bind(
+            conversation_id=context.conversation_id,
+            user_message_id=context.operator_message_id or "",
+            tool="browser.open",
+            arguments=arguments,
+        )
+        context.operator_used_effects.add(effect_key)
+        result = await self.tools.run(
+            "browser.open",
+            arguments,
+            conversation_id=context.conversation_id,
+            user_message_id=context.operator_message_id,
+            authorization=authorization,
+        )
+        event = ChatEvent(
+            type="tool_call",
+            title="browser.open:shopping.selection",
+            content=result.summary,
+            payload={
+                "tool": result.tool,
+                "ok": result.ok,
+                "action": "shopping.selection",
+                "authority": "operator_turn",
+                "operator_requested": True,
+                "derived_selection": "shopping",
+            },
+        )
+        return result, event
 
     def _plan_task(
         self,
@@ -4147,6 +4345,16 @@ class AgentRuntime:
             if info.danger_level == "safe" and info.name not in AGENTIC_TOOL_DENYLIST
         ]
 
+    def _tools_for_context(self, context: AgentContext) -> list[ToolInfo]:
+        tools = {tool.name: tool for tool in self._autonomous_tools()}
+        if not _has_current_operator_authority(context):
+            return list(tools.values())
+        requested = _operator_requested_tool_names(context.operator_scopes)
+        for info in self.tools.list():
+            if info.name in requested:
+                tools[info.name] = info
+        return [tools[name] for name in sorted(tools)]
+
     def _max_tool_steps(self) -> int:
         policy = self.storage.get_runtime_value("experience.autonomy_policy", {})
         steps = DEFAULT_MAX_TOOL_STEPS
@@ -4171,6 +4379,30 @@ class AgentRuntime:
             mission_id = conversation_id.split(":", 1)[1]
         task_id = context.task_id
         spec = self.tools.get(name)
+        operator_binding_required = bool(
+            spec is not None
+            and (spec.danger_level != "safe" or name in AGENTIC_TOOL_DENYLIST)
+        )
+        authorization: OperatorTurnAuthorization | None = None
+        effect_key: str | None = None
+        if (
+            operator_binding_required
+            and name in allowed
+            and _operator_tool_arguments_match(
+                name,
+                args,
+                message=context.operator_message or "",
+                scopes=context.operator_scopes,
+            )
+        ):
+            effect_key = _operator_effect_key(name, args)
+            if effect_key not in context.operator_used_effects:
+                authorization = OperatorTurnAuthorization.bind(
+                    conversation_id=context.conversation_id,
+                    user_message_id=context.operator_message_id or "",
+                    tool=name,
+                    arguments=args,
+                )
         if (
             self.executive is not None
             and mission_id
@@ -4196,7 +4428,7 @@ class AgentRuntime:
                 ),
                 None,
             )
-        if name not in allowed:
+        if name not in allowed or (operator_binding_required and authorization is None):
             if spec is None:
                 observation = (
                     f"observation[{name} · error]: инструмент не существует. "
@@ -4299,17 +4531,31 @@ class AgentRuntime:
                 ),
                 None,
             )
-        result = await self.tools.run(
-            name,
-            args,
-            mission_id=context.mission_id,
-            task_id=context.task_id,
-        )
+        run_kwargs: dict[str, Any] = {
+            "mission_id": context.mission_id,
+            "task_id": context.task_id,
+        }
+        if authorization is not None:
+            context.operator_used_effects.add(effect_key or authorization.fingerprint)
+            run_kwargs.update(
+                {
+                    "conversation_id": context.conversation_id,
+                    "user_message_id": context.operator_message_id,
+                    "authorization": authorization,
+                }
+            )
+        result = await self.tools.run(name, args, **run_kwargs)
         event = ChatEvent(
             type="tool_call",
             title=name,
             content=result.summary,
-            payload={"tool": name, "ok": result.ok, "autonomous": True},
+            payload={
+                "tool": name,
+                "ok": result.ok,
+                "autonomous": authorization is None,
+                "operator_requested": authorization is not None,
+                "authority": "operator_turn" if authorization is not None else "tool_policy",
+            },
         )
         executed = _ExecutedToolResult(
             tool=name,
@@ -4332,7 +4578,7 @@ class AgentRuntime:
         max_tokens: int | None,
         thinking_enabled: bool,
     ) -> _AgenticResult:
-        tools = self._autonomous_tools()
+        tools = self._tools_for_context(context)
         events: list[ChatEvent] = []
         if not tools:
             result = await self._complete_llm(
@@ -5947,9 +6193,10 @@ def _parse_intent_decision(content: str) -> IntentDecision | None:
 
 def _tool_protocol_prompt(tools: list[ToolInfo]) -> str:
     lines = [
-        "У тебя есть инструменты для сбора фактов и локальной проверки. Пользуйся ими "
-        "ТОЛЬКО если без свежих внешних данных или реального осмотра системы честный ответ "
-        "невозможен. Если можешь ответить по знаниям и контексту — отвечай сразу текстом.",
+        "У тебя есть инструменты для сбора фактов, локальной проверки и выполнения явно "
+        "запрошенных действий. Для обычного вопроса используй их только когда нужны реальные "
+        "данные; если оператор прямо попросил открыть, создать, изменить или выполнить что-то "
+        "и соответствующий инструмент доступен, вызови его сейчас вместо инструкции.",
         "Чтобы вызвать инструмент, верни РОВНО одну строку JSON и больше ничего: "
         '{"tool": "<имя>", "arguments": { ... }}',
         "После вызова ты получишь observation с результатом. Повторяй вызовы, пока не "
@@ -8482,7 +8729,11 @@ def _browser_url_from_message(message: str) -> str | None:
         (
             "открой",
             "открыть",
+            "перейди",
+            "зайди",
             "open",
+            "navigate",
+            "go to",
             "запусти",
             "новой вклад",
             "новую вклад",
@@ -8498,6 +8749,16 @@ def _browser_url_from_message(message: str) -> str | None:
     match = re.search(r"https?://[^\s)>\]]+", message)
     if match:
         return match.group(0).rstrip(".,;")
+
+    bare_domain = re.search(
+        r"(?<![@\w.-])((?:www\.)?[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+        r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+"
+        r"(?::\d{2,5})?(?:/[^\s)>\]]*)?)",
+        message,
+        re.IGNORECASE,
+    )
+    if bare_domain is not None:
+        return f"https://{bare_domain.group(1).rstrip('.,;')}"
 
     search_query = _extract_web_search_query(message)
     if search_query:
@@ -8547,6 +8808,762 @@ def _wiki_article_url(title: str) -> str:
     return "https://ru.wikipedia.org/wiki/" + title.replace(" ", "_")
 
 
+_OPERATOR_COMMAND_RE = re.compile(
+    r"^\s*(?:(?:jarvis|джарвис|please|пожалуйста|прошу|теперь|а\s+теперь)\s*[,,:-]?\s*)*"
+    r"(?:открой|перейди|зайди|создай|сделай|запиши|сохрани|добавь|измени|исправь|"
+    r"обнови|замени|отредактируй|удали|сотри|очисти|скопируй|перемести|перенеси|"
+    r"переименуй|запусти|выполни|установи|включи|перезапусти|останови|закрой|"
+    r"выключи|заверши|активируй|сфокусируй|нажми|кликни|введи|набери|напечатай|"
+    r"напиши|заполни|выбери|прокрути|сними|посмотри|покажи|проверь|"
+    r"open|navigate|go\s+to|create|make|write|save|append|add|modify|change|edit|"
+    r"update|set|replace|delete|remove|erase|clear|copy|move|rename|run|execute|"
+    r"launch|start|install|enable|restart|stop|close|disable|terminate|kill|focus|"
+    r"click|press|type|enter|fill|select|choose|scroll|capture|take|show|check)\b",
+    re.IGNORECASE,
+)
+_OPERATOR_POLITE_COMMAND_RE = re.compile(
+    r"^\s*(?:(?:can|could|would)\s+you|мне\s+(?:нужно|надо)|я\s+хочу|можешь)\s+"
+    r"(?:please\s+|пожалуйста\s+)?"
+    r"(?:открыть|создать|записать|сохранить|изменить|удалить|скопировать|"
+    r"переместить|запустить|выполнить|остановить|нажать|ввести|выбрать|"
+    r"open|create|write|save|change|delete|copy|move|run|start|stop|click|type|select)\b",
+    re.IGNORECASE,
+)
+_OPERATOR_META_RE = re.compile(
+    r"^\s*(?:как|каким\s+образом|можно\s+ли|стоит\s+ли|что\s+будет\s+если|"
+    r"how\s+(?:do|can|to)|(?:show|tell)\s+me\s+how|should\s+i|what\s+happens\s+if|"
+    r"объясни|расскажи|переведи|процитируй|explain|translate|quote)\b|"
+    r"\b(?:tomorrow|later|after\s+i\s+confirm|if\s+i\s+confirm|завтра|позже|"
+    r"после\s+подтверждения|если\s+я\s+подтвержу)\b",
+    re.IGNORECASE,
+)
+_OPERATOR_RETRACTION_RE = re.compile(
+    r"\b(?:never\s+mind|cancel\s+that|do\s+not|don't|не\s+надо|отмена|передумал)\b",
+    re.IGNORECASE,
+)
+
+
+def _operator_structural_text(message: str) -> str:
+    text = str(message or "")
+    text = re.sub(
+        r"\x60\x60\x60.*?\x60\x60\x60|\x60[^\x60]*\x60|"
+        r"«[^»]*»|“[^”]*”|\"[^\"]*\"|'[^']*'",
+        " ",
+        text,
+    )
+    return re.sub(r"https?://\S+", " URL ", text, flags=re.IGNORECASE)
+
+
+def _operator_action_scopes(message: str) -> frozenset[str]:
+    structural = " ".join(_operator_structural_text(message).split())
+    shopping_open_command = bool(
+        re.search(
+            r"^\s*(?:найди|поищи|find|search)\b.*\b(?:открой|открыть|open)\b|"
+            r"\b(?:а\s+лучше|лучше|тогда)\s*[-,:]?\s*(?:открой|открыть|open)\b",
+            structural,
+            re.IGNORECASE,
+        )
+    )
+    if (
+        not structural
+        or _OPERATOR_META_RE.search(structural)
+        or _OPERATOR_RETRACTION_RE.search(structural)
+        or not (
+            _OPERATOR_COMMAND_RE.search(structural)
+            or _OPERATOR_POLITE_COMMAND_RE.search(structural)
+            or shopping_open_command
+        )
+    ):
+        return frozenset()
+    scopes: set[str] = {"explicit"}
+    groups = {
+        "open": r"\b(?:открой|открыть|перейди|зайди|open|navigate|go\s+to)\b",
+        "create": r"\b(?:создай|создать|сделай|create|make)\b",
+        "write": r"\b(?:запиши|сохрани|добавь|напиши|write|save|append|add)\b",
+        "modify": (
+            r"\b(?:измени|исправь|обнови|замени|отредактируй|modify|change|edit|"
+            r"update|set|replace)\b"
+        ),
+        "delete": r"\b(?:удали|сотри|очисти|delete|remove|erase|clear)\b",
+        "copy": r"\b(?:скопируй|copy)\b",
+        "move": r"\b(?:перемести|перенеси|переименуй|move|rename)\b",
+        "execute": (
+            r"\b(?:запусти|выполни|установи|включи|перезапусти|run|execute|launch|"
+            r"start|install|enable|restart)\b"
+        ),
+        "stop": r"\b(?:останови|закрой|выключи|заверши|stop|close|disable|terminate|kill)\b",
+        "focus": r"\b(?:активируй|сфокусируй|focus)\b",
+        "click": r"\b(?:нажми|кликни|click|press)\b",
+        "type": r"\b(?:введи|набери|напечатай|напиши|заполни|type|enter|fill|write)\b",
+        "select": r"\b(?:выбери|select|choose)\b",
+        "scroll": r"\b(?:прокрути|scroll)\b",
+        "capture": r"\b(?:сними|посмотри|скриншот|снимок\s+экрана|capture|screenshot|take)\b",
+    }
+    for scope, pattern in groups.items():
+        if re.search(pattern, structural, re.IGNORECASE):
+            scopes.add(scope)
+    context_text = _operator_structural_text(message)
+    if re.search(
+        r"https?://|\b(?:browser|браузер|вкладк|страниц|сайт|wiki|wikipedia|вики|википед)\w*\b",
+        context_text,
+        re.IGNORECASE,
+    ):
+        scopes.add("browser")
+    if _app_from_message(structural.casefold()) is not None or re.search(
+        r"\b(?:window|окн\w*|windows|winapi|wmi|cim|active\s+window|активн\w*\s+окн\w*)\b",
+        context_text,
+        re.IGNORECASE,
+    ):
+        scopes.add("native")
+    if re.search(
+        r"\b(?:file|folder|directory|path|файл\w*|папк\w*|каталог\w*|путь)\b|"
+        r"(?<!\w)[A-Za-z]:[\\/]",
+        context_text,
+        re.IGNORECASE,
+    ):
+        scopes.add("filesystem")
+    if "filesystem" in scopes and "open" in scopes:
+        scopes.add("native")
+    if re.search(
+        r"\b(?:process|command|script|pid|процесс\w*|команд\w*|скрипт\w*|\.exe)\b",
+        context_text,
+        re.IGNORECASE,
+    ):
+        scopes.add("process")
+    if re.search(r"\b(?:registry|реестр|hklm|hkcu|hkcr|hku|hkcc)\b", context_text, re.I):
+        scopes.add("registry")
+    if re.search(r"\b(?:dispatcher|диспетчер\s+модел)\w*\b", context_text, re.I):
+        scopes.add("dispatcher")
+    if "capture" in scopes and "browser" not in scopes:
+        scopes.add("native")
+    return frozenset(scopes)
+
+
+def _has_current_operator_authority(context: AgentContext | None) -> bool:
+    return bool(
+        context is not None
+        and context.operator_message
+        and context.operator_message_id
+        and context.operator_scopes
+        and context.mission_id is None
+        and not str(context.conversation_id).startswith("mission:")
+    )
+
+
+def _operator_requested_tool_names(scopes: frozenset[str]) -> set[str]:
+    names: set[str] = set()
+    if "native" in scopes and scopes & {"open", "execute", "focus", "type", "click", "capture"}:
+        names.add("windows.native")
+    if "open" in scopes:
+        names.update({"browser.open", "browser.open_many", "browser.chrome.launch"})
+    if "browser" in scopes and "click" in scopes:
+        names.add("browser.click")
+    if "browser" in scopes and "type" in scopes:
+        names.add("browser.type")
+    if "browser" in scopes and "select" in scopes:
+        names.add("browser.select")
+    if "browser" in scopes and "scroll" in scopes:
+        names.add("browser.scroll")
+    if "browser" in scopes and "capture" in scopes:
+        names.add("browser.screenshot")
+    if "filesystem" in scopes and scopes & {"create", "write", "modify"}:
+        names.add("filesystem.write_text")
+    if (
+        (
+            "filesystem" in scopes
+            and scopes & {"create", "write", "modify", "delete", "copy", "move"}
+        )
+        or ("process" in scopes and scopes & {"execute", "stop"})
+        or ("registry" in scopes and scopes & {"modify", "delete"})
+    ):
+        names.update({"execution.apply", "execution.transaction"})
+    if "dispatcher" in scopes:
+        names.update({"dispatcher.start", "dispatcher.stop"})
+    return names
+
+
+def _operator_tool_arguments_match(
+    name: str,
+    args: dict[str, Any],
+    *,
+    message: str,
+    scopes: frozenset[str],
+) -> bool:
+    if not isinstance(args, dict) or "explicit" not in scopes:
+        return False
+    if name == "browser.open":
+        if set(args) != {"url"}:
+            return False
+        url = str(args.get("url") or "")
+        return "open" in scopes and (
+            _operator_mentions_url(message, url)
+            or (
+                re.search(r"\b(?:wiki|wikipedia|вики|википед)\w*\b", message, re.I)
+                and "wikipedia.org" in urlparse(url).netloc.casefold()
+            )
+        )
+    if name == "browser.open_many":
+        if set(args) != {"urls"}:
+            return False
+        urls = args.get("urls")
+        return isinstance(urls, list) and bool(urls) and all(
+            _operator_mentions_url(message, str(url)) for url in urls
+        )
+    if name == "windows.native":
+        return _operator_native_arguments_match(message, args, scopes)
+    if name == "filesystem.write_text":
+        if not set(args) <= {"path", "content", "mode"}:
+            return False
+        path = str(args.get("path") or "")
+        content = str(args.get("content") or "")
+        mode = str(args.get("mode") or "overwrite").casefold()
+        append = bool(re.search(r"\b(?:append|add|добавь|допиши)\b", message, re.I))
+        create_empty = bool(
+            not content
+            and mode == "create"
+            and "create" in scopes
+            and re.search(r"\b(?:empty|пуст\w*)\b", message, re.IGNORECASE)
+        )
+        return bool(
+            "filesystem" in scopes
+            and scopes & {"create", "write", "modify"}
+            and _operator_mentions_value(message, path, path_value=True)
+            and (create_empty or (content and _operator_mentions_value(message, content)))
+            and (
+                create_empty
+                or (append and mode == "append")
+                or (not append and mode == "overwrite")
+            )
+        )
+    if name in {
+        "browser.click",
+        "browser.type",
+        "browser.select",
+        "browser.scroll",
+        "browser.screenshot",
+    }:
+        return _operator_browser_arguments_match(name, message, args)
+    if name in {"execution.apply", "execution.transaction"}:
+        return _operator_execution_arguments_match(name, message, args, scopes)
+    if name == "browser.chrome.launch":
+        return _operator_chrome_launch_arguments_match(message, args, scopes)
+    if name == "dispatcher.start":
+        return "dispatcher" in scopes and "execute" in scopes
+    if name == "dispatcher.stop":
+        return "dispatcher" in scopes and "stop" in scopes
+    return False
+
+
+def _operator_browser_arguments_match(
+    name: str,
+    message: str,
+    args: dict[str, Any],
+) -> bool:
+    allowed = {
+        "browser.click": {"url", "target", "selector", "wait_ms", "debug_url"},
+        "browser.type": {
+            "url",
+            "target",
+            "selector",
+            "text",
+            "allow_sensitive",
+            "wait_ms",
+            "debug_url",
+        },
+        "browser.select": {
+            "url",
+            "target",
+            "selector",
+            "value",
+            "wait_ms",
+            "debug_url",
+        },
+        "browser.scroll": {
+            "url",
+            "direction",
+            "pixels",
+            "passes",
+            "wait_ms",
+            "max_chars",
+            "debug_url",
+        },
+        "browser.screenshot": {"url", "wait_ms", "debug_url"},
+    }[name]
+    if not set(args) <= allowed or not _operator_mentions_value(message, args.get("url")):
+        return False
+    fields = {
+        "browser.click": ("target", "selector"),
+        "browser.type": ("target", "selector", "text"),
+        "browser.select": ("target", "selector", "value"),
+        "browser.scroll": ("direction",),
+        "browser.screenshot": (),
+    }[name]
+    if not all(
+        not args.get(field) or _operator_mentions_value(message, args[field]) for field in fields
+    ):
+        return False
+    if bool(args.get("allow_sensitive")) and not re.search(
+        r"\b(?:password|passcode|card|cvv|token|secret|sensitive|парол\w*|карт\w*|"
+        r"токен\w*|секрет\w*|конфиденциальн\w*)\b",
+        message,
+        re.IGNORECASE,
+    ):
+        return False
+    allow_sensitive = args.get("allow_sensitive")
+    if allow_sensitive is not None and not isinstance(allow_sensitive, bool):
+        return False
+    defaults: dict[str, Any] = {
+        "wait_ms": 5000,
+        "debug_url": DEFAULT_CHROME_DEBUG_URL,
+        "pixels": 900,
+        "passes": 3,
+        "max_chars": 9000 if name == "browser.scroll" else 6000,
+    }
+    return all(
+        _operator_control_is_default_or_mentioned(message, args.get(field), default)
+        for field, default in defaults.items()
+        if field in args
+    )
+
+
+def _operator_chrome_launch_arguments_match(
+    message: str,
+    args: dict[str, Any],
+    scopes: frozenset[str],
+) -> bool:
+    if not set(args) <= {"debug_port", "profile_dir", "start_url"}:
+        return False
+    if not (
+        "open" in scopes
+        and re.search(r"\b(?:chrome|хром|browser|браузер)\b", message, re.IGNORECASE)
+    ):
+        return False
+    if "debug_port" in args and not _operator_control_is_default_or_mentioned(
+        message, args.get("debug_port"), 9222
+    ):
+        return False
+    profile_dir = str(args.get("profile_dir") or "")
+    if profile_dir and not _operator_mentions_value(message, profile_dir, path_value=True):
+        return False
+    start_url = str(args.get("start_url") or "")
+    return not start_url or _operator_mentions_value(message, start_url)
+
+
+def _operator_control_is_default_or_mentioned(
+    message: str,
+    value: Any,
+    default: Any,
+) -> bool:
+    if value is None or value == default:
+        return True
+    rendered = str(value)
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        return bool(re.search(rf"(?<!\d){re.escape(rendered)}(?!\d)", message))
+    return _operator_mentions_value(message, value)
+
+
+def _operator_native_arguments_match(
+    message: str,
+    args: dict[str, Any],
+    scopes: frozenset[str],
+) -> bool:
+    if not set(args) <= {"action", "payload", "timeout_sec"}:
+        return False
+    action = str(args.get("action") or "").casefold()
+    payload = args.get("payload")
+    if not isinstance(payload, dict) or args.get("timeout_sec", 30) != 30:
+        return False
+    expected = _native_action_from_message(message)
+    if expected is None or action != expected.action:
+        return False
+    if action == "process.start":
+        return (
+            set(payload) <= {"executable", "arguments", "cwd"}
+            and str(payload.get("executable") or "").casefold()
+            == str(expected.payload.get("executable") or "").casefold()
+            and list(payload.get("arguments") or [])
+            == list(expected.payload.get("arguments") or [])
+            and str(payload.get("cwd") or "") == str(expected.payload.get("cwd") or "")
+        )
+    if action == "app.open_and_type":
+        if not set(payload) <= {
+            "executable",
+            "arguments",
+            "text",
+            "keys",
+            "wait_ms",
+            "process_name",
+            "window_title",
+        }:
+            return False
+        arguments = list(payload.get("arguments") or [])
+        expected_executable = str(expected.payload.get("executable") or "")
+        arguments_match = arguments == list(expected.payload.get("arguments") or [])
+        if expected_executable.casefold() == "notepad.exe" and len(arguments) == 1:
+            arguments_match = bool(
+                re.fullmatch(
+                    r"scratch-notepad-[0-9a-f]{6,32}\.txt",
+                    Path(str(arguments[0])).name,
+                    re.IGNORECASE,
+                )
+            )
+        process_name = str(payload.get("process_name") or "")
+        if process_name.casefold() != str(expected.payload.get("process_name") or "").casefold():
+            return False
+        window_title = str(payload.get("window_title") or "")
+        expected_title = str(expected.payload.get("window_title") or "")
+        if expected_executable.casefold() == "notepad.exe" and arguments:
+            expected_title = Path(str(arguments[0])).name
+        if window_title.casefold() != expected_title.casefold():
+            return False
+        return (
+            str(payload.get("executable") or "").casefold()
+            == expected_executable.casefold()
+            and arguments_match
+            and str(payload.get("text") or "") == str(expected.payload.get("text") or "")
+            and str(payload.get("keys") or "") == str(expected.payload.get("keys") or "")
+            and payload.get("wait_ms", expected.payload.get("wait_ms"))
+            == expected.payload.get("wait_ms")
+        )
+    if action == "keyboard.send":
+        return (
+            "type" in scopes
+            and payload == expected.payload
+        )
+    return action in SAFE_DIRECT_NATIVE_ACTIONS and payload == expected.payload
+
+
+def _operator_execution_arguments_match(
+    name: str,
+    message: str,
+    args: dict[str, Any],
+    scopes: frozenset[str],
+) -> bool:
+    apply_keys = {"payload", "session_id", "finalize_session", "safe_gate_token", "verification"}
+    transaction_keys = {
+        "actions",
+        "idempotency_key",
+        "session_id",
+        "safe_gate_tokens",
+        "verification",
+    }
+    if name == "execution.apply":
+        if not set(args) <= apply_keys or not isinstance(args.get("payload"), dict):
+            return False
+        raw_envelopes = [args["payload"]]
+        finalize_session = args.get("finalize_session")
+        if finalize_session is not None and finalize_session is not False:
+            return False
+        token = args.get("safe_gate_token")
+        if token is not None and (not isinstance(token, str) or not token.strip()):
+            return False
+    elif name == "execution.transaction":
+        if not set(args) <= transaction_keys:
+            return False
+        raw_envelopes = args.get("actions")
+        if not isinstance(raw_envelopes, list) or not raw_envelopes:
+            return False
+        if not isinstance(args.get("idempotency_key"), str):
+            return False
+        tokens = args.get("safe_gate_tokens")
+        if tokens is not None and (
+            not isinstance(tokens, dict)
+            or any(
+                not isinstance(key, str) or not isinstance(value, str)
+                for key, value in tokens.items()
+            )
+        ):
+            return False
+    else:
+        return False
+    session_id = str(args.get("session_id") or "")
+    if session_id and not _operator_mentions_value(message, session_id):
+        return False
+    if not _operator_verification_arguments_match(message, args.get("verification")):
+        return False
+    try:
+        envelopes = [ActionEnvelope.model_validate(item) for item in raw_envelopes]
+    except (TypeError, ValueError):
+        return False
+    for envelope in envelopes:
+        body = envelope.action.model_dump(mode="json")
+        kind = str(body.get("kind") or "")
+        required_scope = (
+            "delete"
+            if kind in {"fs.delete", "registry.delete"}
+            else "copy"
+            if kind == "fs.copy"
+            else "move"
+            if kind == "fs.move"
+            else "stop"
+            if kind == "process.terminate"
+            else "execute"
+            if kind == "process.run"
+            else "modify"
+            if kind == "registry.set"
+            else "create"
+            if kind == "fs.mkdir"
+            else "write"
+        )
+        if required_scope not in scopes:
+            return False
+        values = [
+            body.get(key)
+            for key in (
+                "path",
+                "source",
+                "destination",
+                "executable",
+                "cwd",
+                "hive",
+                "key",
+                "name",
+                "value",
+                "pid",
+                "session_id",
+            )
+            if body.get(key) not in {None, ""}
+        ]
+        values.extend(body.get("arguments") or [])
+        encoded = body.get("content_base64")
+        if encoded is not None:
+            try:
+                values.append(base64.b64decode(str(encoded), validate=True).decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                return False
+        encoded_value = body.get("value_base64")
+        if encoded_value is not None:
+            try:
+                values.append(base64.b64decode(str(encoded_value), validate=True).decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                return False
+        environment = body.get("environment") or {}
+        if not isinstance(environment, dict) or any(
+            not (
+                _operator_mentions_value(message, f"{key}={value}")
+                or (
+                    _operator_mentions_value(message, key)
+                    and _operator_mentions_value(message, value)
+                )
+            )
+            for key, value in environment.items()
+        ):
+            return False
+        values.extend(body.get("observe_paths") or [])
+        if not all(
+            _operator_mentions_value(
+                message,
+                value,
+                path_value=_operator_value_is_path(value),
+            )
+            for value in values
+        ):
+            return False
+        if not _operator_execution_controls_match(message, kind, body, scopes):
+            return False
+    return True
+
+
+def _operator_execution_controls_match(
+    message: str,
+    kind: str,
+    body: dict[str, Any],
+    scopes: frozenset[str],
+) -> bool:
+    if kind in {"fs.copy", "fs.move"} and body.get("overwrite") and not (
+        "modify" in scopes
+        or re.search(r"\b(?:overwrite|replace|перезапиш\w*|замен\w*)\b", message, re.I)
+    ):
+        return False
+    if kind in {"fs.write", "fs.copy", "fs.move"} and body.get("create_parents") and not re.search(
+        r"\b(?:create\s+parents?|parent\s+director\w*|созда\w*\s+родительск\w*|"
+        r"созда\w*\s+папк\w*)\b",
+        message,
+        re.IGNORECASE,
+    ):
+        return False
+    mode = body.get("mode")
+    if mode is not None and not _operator_control_is_default_or_mentioned(message, mode, None):
+        return False
+    if kind == "process.run":
+        if body.get("inherit_environment") and not re.search(
+            r"\b(?:inherit\w*\s+(?:the\s+)?environment|унаслед\w*\s+окружен\w*)\b",
+            message,
+            re.IGNORECASE,
+        ):
+            return False
+        defaults = {
+            "timeout_seconds": 300.0,
+            "stall_timeout_seconds": None,
+            "interrupt_grace_seconds": 3.0,
+            "kill_grace_seconds": 3.0,
+            "max_output_bytes": 2 * 1024 * 1024,
+            "max_observed_entries": 4096,
+        }
+        if not all(
+            _operator_control_is_default_or_mentioned(message, body.get(field), default)
+            for field, default in defaults.items()
+        ):
+            return False
+    if kind == "process.terminate" and str(body.get("signal") or "terminate") != "terminate":
+        return bool(re.search(r"\b(?:kill|force|sigkill|принудительн\w*|убей)\b", message, re.I))
+    if kind == "registry.set" and str(body.get("value_kind") or "").casefold() == "binary":
+        return bool(re.search(r"\b(?:binary|base64|бинарн\w*)\b", message, re.I))
+    return True
+
+
+def _operator_verification_arguments_match(message: str, value: Any) -> bool:
+    if value is None:
+        return True
+    if not isinstance(value, dict) or not set(value) <= {"paths", "tcp", "processes"}:
+        return False
+    identity_fields = {
+        "paths": ("path", "sha256"),
+        "tcp": ("host", "port"),
+        "processes": ("session_id", "pid"),
+    }
+    for group, fields in identity_fields.items():
+        items = value.get(group) or []
+        if not isinstance(items, list):
+            return False
+        for item in items:
+            if not isinstance(item, dict):
+                return False
+            for field in fields:
+                field_value = item.get(field)
+                if field_value is not None and field_value != "" and not _operator_mentions_value(
+                    message,
+                    field_value,
+                    path_value=field == "path",
+                ):
+                    return False
+    return True
+
+
+def _operator_value_is_path(value: Any) -> bool:
+    return bool(re.match(r"^(?:[A-Za-z]:[\\/]|\\\\)", str(value or "")))
+
+
+def _operator_mentions_value(message: str, value: Any, *, path_value: bool = False) -> bool:
+    rendered = " ".join(str(value or "").strip().split())
+    if not rendered:
+        return False
+    source = " ".join(message.split())
+    if path_value:
+        rendered = rendered.replace("/", "\\").casefold()
+        source = source.replace("/", "\\").casefold()
+    return rendered in source
+
+
+def _operator_mentions_url(message: str, url: str) -> bool:
+    if _operator_mentions_value(message, url):
+        return True
+    parsed = urlparse(url)
+    host = parsed.netloc.casefold().removeprefix("www.")
+    if not host:
+        return False
+    normalized_message = message.casefold().replace("www.", "")
+    suffix = parsed.path.rstrip("/")
+    if parsed.query:
+        suffix = f"{suffix}?{parsed.query}"
+    candidate = f"{host}{suffix}"
+    return candidate in normalized_message if suffix else host in normalized_message
+
+
+def _operator_effect_key(name: str, args: dict[str, Any]) -> str:
+    def normalize(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: normalize(item)
+                for key, item in sorted(value.items())
+                if key != "action_id"
+            }
+        if isinstance(value, list):
+            return [normalize(item) for item in value]
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        return value
+
+    effect_arguments: Any = args
+    if name in {"execution.apply", "execution.transaction"}:
+        with suppress(TypeError, ValueError):
+            effect_arguments = _canonical_operator_execution_effect(name, args)
+    payload = json.dumps(
+        {"tool": name, "arguments": normalize(effect_arguments)},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _canonical_operator_execution_effect(name: str, args: dict[str, Any]) -> dict[str, Any]:
+    def envelope(value: Any) -> dict[str, Any]:
+        canonical = ActionEnvelope.model_validate(value).model_dump(mode="json")
+        canonical["action"].pop("action_id", None)
+        return canonical
+
+    common = {
+        "session_id": str(args.get("session_id") or "") or None,
+        "verification": _canonical_operator_verification(args.get("verification")),
+    }
+    if name == "execution.apply":
+        return {
+            "payload": envelope(args.get("payload")),
+            **common,
+            "finalize_session": bool(args.get("finalize_session", False)),
+        }
+    actions = args.get("actions")
+    if not isinstance(actions, list):
+        raise ValueError("execution.transaction actions are required")
+    return {
+        "actions": [envelope(item) for item in actions],
+        **common,
+    }
+
+
+def _canonical_operator_verification(value: Any) -> dict[str, Any]:
+    if value is None:
+        value = {}
+    if not isinstance(value, dict):
+        raise ValueError("verification must be an object")
+    canonical: dict[str, Any] = {"paths": [], "tcp": [], "processes": []}
+    for item in value.get("paths") or []:
+        if not isinstance(item, dict):
+            raise ValueError("verification path must be an object")
+        canonical["paths"].append(
+            {
+                "path": item.get("path"),
+                "exists": item.get("exists", True),
+                "kind": item.get("kind"),
+                "sha256": item.get("sha256"),
+                "syntax_valid": item.get("syntax_valid", False),
+            }
+        )
+    for item in value.get("tcp") or []:
+        if not isinstance(item, dict):
+            raise ValueError("verification TCP item must be an object")
+        canonical["tcp"].append(
+            {
+                "host": item.get("host"),
+                "port": item.get("port"),
+                "reachable": item.get("reachable", True),
+                "timeout_seconds": item.get("timeout_seconds", 3.0),
+            }
+        )
+    for item in value.get("processes") or []:
+        if not isinstance(item, dict):
+            raise ValueError("verification process item must be an object")
+        canonical["processes"].append(
+            {
+                "session_id": item.get("session_id"),
+                "pid": item.get("pid"),
+                "running": item.get("running"),
+            }
+        )
+    return canonical
+
+
 APP_ALIASES: tuple[tuple[tuple[str, ...], str, str], ...] = (
     (("калькулятор", "calculator", "calc.exe", "calc"), "calc.exe", "калькулятор"),
     (("блокнот", "notepad"), "notepad.exe", "блокнот"),
@@ -8592,6 +9609,19 @@ def _native_action_from_message(
 
     typed_text = _extract_text_to_type(message)
     app = _app_from_message(normalized)
+    wants_open = _contains_any(
+        normalized,
+        (
+            "открой",
+            "открыть",
+            "запусти",
+            "запустить",
+            "перейди",
+            "open",
+            "start",
+            "посчитай",
+        ),
+    )
     if typed_text and app is None and _has_explicit_typing_target(normalized):
         return NativeAction(
             action="keyboard.send",
@@ -8600,16 +9630,19 @@ def _native_action_from_message(
         )
 
     if app is None:
+        file_path = _explicit_windows_path_from_message(message)
+        if wants_open and file_path:
+            return NativeAction(
+                action="process.start",
+                payload={"executable": "explorer.exe", "arguments": [file_path]},
+                answer="открыл файл в приложении по умолчанию",
+            )
         return None
     markers, executable, label = app
     if _is_console_executable(executable):
         # Shell text is never converted into a native action. Console work must
         # use the typed execution protocol with an administrator-defined argv grammar.
         return None
-    wants_open = _contains_any(
-        normalized,
-        ("открой", "открыть", "запусти", "запустить", "open", "start", "посчитай"),
-    )
     wants_typing = typed_text or _contains_any(
         normalized,
         ("набери", "введи", "напечат", "посчитай", "посчитать", "type", "write"),
@@ -8617,6 +9650,14 @@ def _native_action_from_message(
     typing_is_targeted = wants_open or _has_explicit_app_typing_target(normalized, markers)
     if not wants_open and not (wants_typing and typing_is_targeted):
         return None
+
+    file_path = _explicit_windows_path_from_message(message)
+    if wants_open and file_path and not wants_typing:
+        return NativeAction(
+            action="process.start",
+            payload={"executable": executable, "arguments": [file_path]},
+            answer=f"открыл файл в {label}",
+        )
 
     if executable == "calc.exe" and wants_typing and typing_is_targeted:
         keys = _calculator_keys_from_message(message)
@@ -8655,6 +9696,31 @@ def _native_action_from_message(
         payload={"executable": executable},
         answer=f"запустил {label}",
     )
+
+
+def _explicit_windows_path_from_message(message: str) -> str | None:
+    quoted = re.search(
+        r"[\"'«“]([A-Za-z]:[\\/][^\"'»”\r\n]+)[\"'»”]",
+        message,
+    )
+    if quoted is not None:
+        return quoted.group(1)
+    match = re.search(
+        r"(?<!\w)([A-Za-z]:[\\/][^\s,;!?]+)",
+        message,
+    )
+    return match.group(1).rstrip(".") if match is not None else None
+
+
+def _empty_file_path_from_message(message: str) -> str | None:
+    if not re.search(
+        r"\b(?:создай|создать|create|make)\b.*\b(?:пуст\w*|empty)\b.*\b(?:файл\w*|file)\b|"
+        r"\b(?:создай|создать|create|make)\b.*\b(?:файл\w*|file)\b.*\b(?:пуст\w*|empty)\b",
+        message,
+        re.IGNORECASE,
+    ):
+        return None
+    return _explicit_windows_path_from_message(message)
 
 
 def _wmi_action_from_message(message: str) -> NativeAction:

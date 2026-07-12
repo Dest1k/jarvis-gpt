@@ -9,6 +9,28 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-12 - Codex (immediate exact operator actions)
+
+- Explicit commands in the current persisted user message now execute immediately without a
+  second approval. The one-use capability is bound to conversation id, message id, tool, and
+  canonical arguments; it cannot flow into history, resumed turns, tasks, or missions.
+- Agentic mutations are exposed only when their full operands match the current command.
+  Typed execution defaults are canonicalized for replay detection, while unrequested flags,
+  wrapper controls, browser targets, native window/process hints, sensitive-input switches,
+  debug endpoints, profiles, ports, and timing overrides fail closed into the existing approval
+  path.
+- Direct actions now cover explicit Wikipedia/full-URL/bare-domain opens, known Windows apps,
+  named files, default-app file opens, active-window typing, and empty-file creation. Shopping
+  search commands and follow-ups deterministically open the selected verified candidate in the
+  same turn instead of creating an approval.
+- `filesystem.write_text` gained `mode=create`, which permits empty content and fails if the path
+  already exists. Existing overwrite/append behavior remains unchanged.
+- Main implementation: `backend/src/jarvis_gpt/agent.py` and `tools.py`; regressions in
+  `test_agent.py`, `test_agentic_loop.py`, and `test_tools.py`; public behavior documented in
+  `README.md`, `docs/architecture.md`, and `docs/runtime.md`.
+- Verification: full backend suite `702 passed, 13 skipped`; full Ruff and compileall clean;
+  `git diff --check` clean before publication.
+
 ### 2026-07-11 - Codex (source-aware, criterion-aware catalog search)
 
 Fixed the remaining exact failure `а какой самый мощный лазер есть на
