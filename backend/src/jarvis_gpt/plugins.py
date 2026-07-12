@@ -23,7 +23,7 @@ class PluginManager:
     def load_plugin(self, path: str):
         mod = importlib.import_module(path)
         p = Plugin(
-            name=getattr(mod, "PLUGIN_NAME", path),
+            name=getattr(mod, "NAME", path),
             version=getattr(mod, "VERSION", "0.1"),
             tools=getattr(mod, "get_tools", lambda: {})(),
             description=getattr(mod, "DESCRIPTION", "")
