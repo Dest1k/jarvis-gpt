@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Voice Module - Larger chunk
+Voice Module - Large chunk
 """
 
 from dataclasses import dataclass
@@ -16,13 +16,13 @@ class VoiceManager:
         self.config = config or VoiceConfig()
 
     def listen(self, duration=5.0):
-        return "[Voice transcription placeholder]"
+        return "[Transcription placeholder]"
 
     def speak(self, text: str):
-        print(f"[JARVIS VOICE] {text[:60]}...")
+        print(f"[JARVIS] {text[:70]}...")
 
     def start_full_duplex(self):
-        print("Full duplex voice activated")
+        print("Full-duplex activated")
 
 
 def get_voice_tools():
@@ -33,4 +33,4 @@ def get_voice_tools():
         "voice.start_full_duplex": v.start_full_duplex,
     }
 
-print("[voice.py] Larger chunk.")
+print("[voice.py] Large chunk.")

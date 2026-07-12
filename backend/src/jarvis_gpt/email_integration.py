@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Email Integration - Larger chunk
+Email Integration - Large chunk
 """
 
 from dataclasses import dataclass
@@ -26,7 +26,7 @@ class EmailIntegration:
         self.config = config or EmailConfig()
 
     def get_unread_summary(self, limit=10) -> List[EmailSummary]:
-        return [EmailSummary(f"e{i}", "test@mail.com", "Subject {i}", "2026-07-12", "Snippet") for i in range(3)]
+        return [EmailSummary(f"e{i}", "test@mail.com", "Subject", "2026-07-12", "Snippet") for i in range(4)]
 
     def send_email(self, to, subject, body, attachments=None):
         return "pending_approval"
@@ -39,4 +39,4 @@ def get_email_tools():
         "email.send": e.send_email,
     }
 
-print("[email_integration.py] Larger chunk.")
+print("[email_integration.py] Large chunk.")
