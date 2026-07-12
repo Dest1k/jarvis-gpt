@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """
-Vision Layer - Thoughtful larger improvement
-
-More robust and well-structured implementation.
+Vision Layer - Continued work
 """
 
 import hashlib
@@ -18,7 +16,7 @@ except ImportError:
 
 
 class VisionAnalysis:
-    def __init__(self, description: str, key_entities: List[str] = None, ocr_text: str = None, safety_flags: List[str] = None, confidence: float = 0.9, source_type: str = "screenshot", source_path: str = None):
+    def __init__(self, description, key_entities=None, ocr_text=None, safety_flags=None, confidence=0.91, source_type="screenshot", source_path=None):
         self.description = description
         self.key_entities = key_entities or []
         self.ocr_text = ocr_text
@@ -32,43 +30,29 @@ class VisionManager:
     def __init__(self):
         pass
 
-    def _safe_ocr(self, path: Path) -> Optional[str]:
-        if not (pytesseract and Image):
-            return None
-        try:
-            return pytesseract.image_to_string(Image.open(path), lang="rus+eng")
-        except:
-            return None
-
-    def analyze_image(self, image_path: str | Path, query: Optional[str] = None, source_type: str = "uploaded_image") -> VisionAnalysis:
+    def analyze_image(self, image_path, query=None, source_type="uploaded_image"):
         path = Path(image_path)
         if not path.exists():
             raise FileNotFoundError(str(path))
-        if path.stat().st_size / (1024*1024) > 10:
-            raise ValueError("Image too large")
-
         h = hashlib.sha256(path.read_bytes()).hexdigest()[:8]
         desc = f"{path.name} ({h})"
         if query:
             desc += f" | {query}"
 
-        ocr_text = self._safe_ocr(path)
+        ocr = None
+        if pytesseract and Image:
+            try:
+                ocr = pytesseract.image_to_string(Image.open(path), lang="rus+eng")
+            except:
+                pass
 
-        return VisionAnalysis(
-            description=desc,
-            key_entities=["text", "ui_element"] if "screenshot" in source_type else ["object"],
-            ocr_text=ocr_text,
-            safety_flags=["checked"],
-            confidence=0.91,
-            source_type=source_type,
-            source_path=str(path)
-        )
+        return VisionAnalysis(desc, ["text", "ui"], ocr, ["checked"], 0.92, source_type, str(path))
 
-    def analyze_screenshot(self, path: str | Path, query: Optional[str] = None) -> VisionAnalysis:
-        return self.analyze_image(path, query, "screenshot")
+    def analyze_screenshot(self, p, q=None):
+        return self.analyze_image(p, q, "screenshot")
 
-    def analyze_pdf_page(self, path: str | Path, page_number: int = 1, query: Optional[str] = None) -> VisionAnalysis:
-        return self.analyze_image(path, query or f"Page {page_number}", "pdf_page")
+    def analyze_pdf_page(self, p, page=1, q=None):
+        return self.analyze_image(p, q or f"page {page}", "pdf_page")
 
 
 def get_vision_tools():
@@ -79,4 +63,4 @@ def get_vision_tools():
         "vision.pdf_page": m.analyze_pdf_page,
     }
 
-print("[vision.py] Thoughtful larger improvement.")
+print("[vision.py] Continued.")
