@@ -456,6 +456,10 @@ type DispatcherStatus = {
   desired_model?: ModelArtifact | null;
   runtime?: DispatcherRuntime | null;
   desired_runtime?: DispatcherRuntime;
+  actual_image?: string;
+  desired_image?: string;
+  runtime_matches_desired?: boolean;
+  runtime_mismatches?: Record<string, { actual?: unknown; desired?: unknown }>;
   container_status?: { exists?: boolean; status?: string } | null;
 };
 
@@ -2364,7 +2368,6 @@ export default function CommandCenter() {
     const previousConversationId = activeChatWindow.conversationId;
     let assistantId: string | null = null;
     let assistantStartedAt = Date.now();
-    let receivedDelta = false;
     setChatBusy(true);
     let attachments: ChatAttachment[] = [];
     const message = typedMessage || "Проанализируй вложенные файлы.";
@@ -2422,7 +2425,6 @@ export default function CommandCenter() {
             }));
           }
           if (item.type === "delta" && item.content) {
-            receivedDelta = true;
             updateChatWindow(chatWindowId, (window) => ({
               ...window,
               lines: window.lines.map((line) =>
@@ -2445,7 +2447,7 @@ export default function CommandCenter() {
                   ? {
                       ...line,
                       id: item.message_id ?? line.id,
-                      content: !receivedDelta && item.answer ? item.answer : line.content,
+                      content: typeof item.answer === "string" ? item.answer : line.content,
                       durationMs,
                       pending: false,
                       startedAt: null,

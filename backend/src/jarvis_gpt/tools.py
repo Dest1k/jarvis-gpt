@@ -964,13 +964,15 @@ class ToolRegistry:
                 name="windows.native",
                 description=(
                     "Perform native Windows actions through WMI/CIM, WinAPI window focus, "
-                    "process launch and GUI text/key input via the local host bridge."
+                    "fixed process views, process launch and GUI text/key input via the local "
+                    "host bridge."
                 ),
                 category="host",
                 input_schema={
                     "action": (
-                        "capabilities, process.start, app.open_and_type, window.focus, "
-                        "screen.capture, window.list, keyboard.send or wmi.query"
+                        "capabilities, process.top, console.show_processes, process.start, "
+                        "app.open_and_type, window.focus, screen.capture, window.list, "
+                        "keyboard.send or wmi.query"
                     ),
                     "payload": "Structured action payload",
                     "timeout_sec": "1-120 second timeout",
@@ -997,9 +999,13 @@ class ToolRegistry:
                 ),
                 category="host",
                 input_schema={
-                    "action": "wmi.query (default), window.list, screen.capture, or capabilities",
+                    "action": (
+                        "wmi.query (default), process.top, window.list, screen.capture, "
+                        "or capabilities"
+                    ),
                     "payload": (
                         "wmi.query: {class_name, properties[], filter?, limit?}; "
+                        "process.top: {limit: 1-50, sort: cpu|memory|name|pid}; "
                         "window.list: {limit}; screen.capture: {limit?, ocr?}; "
                         "capture path is always generated under Jarvis cache"
                     ),
@@ -3462,10 +3468,13 @@ def _host_bridge_status(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunRespo
 
 
 # Read-only native actions that never change desktop/host state, so the agentic
-# loop may drive them without approval. wmi.query is a WMI SELECT, window.list
+# loop may drive them without approval. wmi.query is a WMI SELECT, process.top
+# returns a bounded sorted process snapshot, window.list
 # enumerates visible windows, screen.capture writes a PNG into Jarvis cache, and
 # capabilities reports what the bridge supports.
-SAFE_INSPECT_ACTIONS = frozenset({"capabilities", "screen.capture", "window.list", "wmi.query"})
+SAFE_INSPECT_ACTIONS = frozenset(
+    {"capabilities", "process.top", "screen.capture", "window.list", "wmi.query"}
+)
 
 
 async def _run_native_bridge_command(
@@ -3502,7 +3511,12 @@ async def _verify_native_action_state(
 ) -> tuple[bool, dict[str, Any]]:
     """Independently inspect durable state after a native process launch."""
 
-    if action not in {"process.start", "app.open_and_type", "chrome.launch"}:
+    if action not in {
+        "app.open_and_type",
+        "chrome.launch",
+        "console.show_processes",
+        "process.start",
+    }:
         return True, {"required": False, "reason": "action has no durable process state"}
     raw_pid = native.get("pid")
     if not isinstance(raw_pid, int) or isinstance(raw_pid, bool) or raw_pid <= 0:
@@ -3535,6 +3549,8 @@ async def _verify_native_action_state(
     expected_names: set[str]
     if action == "chrome.launch":
         expected_names = {"chrome.exe"}
+    elif action == "console.show_processes":
+        expected_names = {"powershell.exe"}
     else:
         requested = PureWindowsPath(str(payload.get("executable") or "")).name.casefold()
         expected_names = {"mmc.exe"} if requested.endswith(".msc") else {requested}
@@ -3611,8 +3627,8 @@ async def _system_inspect(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResp
 
     This is the safe, autonomous counterpart of windows.native: the model picks
     the WMI class and properties from its own knowledge and reads system/hardware
-    state without an approval gate, because a WMI SELECT changes nothing. It may
-    also list windows or capture the current screen to Jarvis cache. Actions
+    state without an approval gate, because these snapshots change nothing. It may
+    also list top processes or windows, or capture the current screen to Jarvis cache. Actions
     that touch the desktop stay on the approval-gated windows.native tool.
     """
 
@@ -3625,7 +3641,8 @@ async def _system_inspect(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResp
             summary=(
                 f"system.inspect is read-only; '{action}' is not allowed here "
                 f"(use one of: {allowed}). Desktop-changing actions such as "
-                "process.start, app.open_and_type, keyboard.send or window.focus "
+                "console.show_processes, process.start, app.open_and_type, keyboard.send "
+                "or window.focus "
                 "must go through the approval-gated windows.native tool."
             ),
         )
@@ -9080,6 +9097,8 @@ async def _filesystem_write_text(ctx: ToolContext, args: dict[str, Any]) -> Tool
 
 def _validate_native_payload(action: str, payload: dict[str, Any]) -> dict[str, Any]:
     clean = dict(payload)
+    if action in {"console.show_processes", "process.top"}:
+        clean = _validate_process_view_payload(clean)
     if action in {"process.start", "app.open_and_type"}:
         executable = _native_string(clean.get("executable"), "executable", max_length=260)
         clean["executable"] = executable
@@ -9141,6 +9160,28 @@ def _validate_native_payload(action: str, payload: dict[str, Any]) -> dict[str, 
     if action == "wmi.query":
         clean = _validate_wmi_payload(clean)
     return clean
+
+
+PROCESS_TOP_SORTS = frozenset({"cpu", "memory", "name", "pid"})
+
+
+def _validate_process_view_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    unknown = sorted(set(payload) - {"limit", "sort"})
+    if unknown:
+        raise ValueError(f"Unknown process view field(s): {', '.join(unknown)}.")
+    raw_limit = payload.get("limit", 10)
+    if isinstance(raw_limit, bool) or not isinstance(raw_limit, int):
+        raise ValueError("limit must be an integer.")
+    if not 1 <= raw_limit <= 50:
+        raise ValueError("limit must be between 1 and 50.")
+    raw_sort = payload.get("sort", "cpu")
+    if not isinstance(raw_sort, str):
+        raise ValueError("sort must be a string.")
+    sort = raw_sort.strip().casefold()
+    if sort not in PROCESS_TOP_SORTS:
+        allowed = ", ".join(sorted(PROCESS_TOP_SORTS))
+        raise ValueError(f"sort must be one of: {allowed}.")
+    return {"limit": raw_limit, "sort": sort}
 
 
 def _validate_wmi_payload(payload: dict[str, Any]) -> dict[str, Any]:

@@ -111,6 +111,9 @@ SYSTEM_PROMPT = """Ты Jarvis: локальный агент Windows/WSL/Docker
   службы, автозагрузка, принтеры, сеть) вызывай безопасный инструмент system.inspect и сам
   выбирай нужный WMI-класс Win32_* и свойства по своим знаниям — это надёжнее, чем угадывать
   или искать локальное состояние в вебе. Не жди слова «wmi» в запросе: понимай смысл.
+- Для рейтинга процессов используй только bounded process.top. Если оператор явно просит
+  показать рейтинг в консоли, используй fixed console.show_processes; не составляй и не
+  выполняй произвольную shell-команду из текста запроса.
 - Если оператор просит сделать действие "в консоли", "в браузере", "в калькуляторе", "в блокноте",
   "в окне" или в конкретном приложении, сначала открой/активируй эту среду и выполняй действие там.
   Не заменяй это текстовым примером команды, если доступен инструментальный маршрут.
@@ -187,6 +190,19 @@ FINAL_ANSWER_PROMPT = (
     "данных не хватило, честно скажи, что именно не подтверждено."
 )
 
+TOOL_PROTOCOL_CORRECTION_PROMPT = (
+    "Внутренняя ошибка протокола: предыдущий ответ смешал обычный текст с запросом "
+    "инструмента или вернул повреждённый JSON. Не повторяй объяснение и не извиняйся. "
+    "Если инструмент всё ещё нужен, верни ровно один корректный JSON-объект вида "
+    '{"tool":"<имя>","arguments":{...}} без markdown и другого текста. Если инструмент '
+    "не нужен, дай обычный итоговый ответ по-русски без JSON."
+)
+
+TOOL_PROTOCOL_FAILURE_ANSWER = (
+    "Не удалось безопасно завершить запрос: модель вернула внутренний вызов инструмента "
+    "вместо корректного результата. Повтори запрос — сырой служебный payload не выполнялся."
+)
+
 
 CONTINUE_AFTER_LENGTH_PROMPT = (
     "The previous assistant message ended because of a token limit. Continue the same answer "
@@ -247,7 +263,7 @@ AGENTIC_TOOL_DENYLIST = frozenset(
     {"memory.save", "learning.tick", "mission.brief", "browser.open", "browser.open_many"}
 )
 SAFE_DIRECT_NATIVE_ACTIONS = frozenset(
-    {"capabilities", "screen.capture", "window.list", "wmi.query"}
+    {"capabilities", "process.top", "screen.capture", "window.list", "wmi.query"}
 )
 
 # When lexical file search finds nothing, recent chunks are only allowed into
@@ -597,54 +613,11 @@ class _ThinkBlockFilter:
         return tail
 
 
-class _ToolActionSniffer:
-    """Classify a streamed completion as a tool-call JSON or a normal answer.
-
-    The agentic protocol asks the model to emit ONLY a JSON object when it wants
-    a tool. So we watch the first meaningful character: ``{`` means a tool call
-    (suppress the stream, buffer the JSON), anything else means a normal answer
-    (emit and pass through token by token). This keeps real answers streaming
-    with no extra completion while still supporting tools. When thinking is
-    disabled we also strip ``<think>`` from the visible output.
-    """
-
-    def __init__(self, *, thinking_enabled: bool) -> None:
-        self._raw = ""
-        self._mode: str | None = None
-        self._pending = ""
-        self._think = None if thinking_enabled else _ThinkBlockFilter()
-
-    def push(self, chunk: str) -> tuple[str, str | None]:
-        self._raw += chunk
-        visible = self._think.push(chunk) if self._think else chunk
-        if self._mode == "answer":
-            return visible, "answer"
-        if self._mode == "tool":
-            return "", "tool"
-        self._pending += visible
-        stripped = self._pending.lstrip()
-        if not stripped:
-            return "", None
-        if stripped[0] == "{":
-            self._mode = "tool"
-            self._pending = ""
-            return "", "tool"
-        self._mode = "answer"
-        out = self._pending
-        self._pending = ""
-        return out, "answer"
-
-    def finish(self) -> tuple[str, str]:
-        if self._mode == "tool":
-            return "", "tool"
-        tail = self._think.flush() if self._think else ""
-        pending = self._pending
-        self._pending = ""
-        return f"{pending}{tail}", "answer"
-
-    @property
-    def raw(self) -> str:
-        return self._raw
+@dataclass(frozen=True)
+class _ToolTurn:
+    kind: str
+    text: str
+    action: tuple[str, dict[str, Any]] | None = None
 
 
 @dataclass(frozen=True)
@@ -1152,76 +1125,124 @@ class AgentRuntime:
             messages.append({"role": "system", "content": _tool_protocol_prompt(tools)})
         max_steps = self._max_tool_steps() if tools else 0
 
-        for step in range(max_steps + 1):
-            force_final = bool(tools) and step == max_steps
-            sniff = bool(tools) and not force_final
-            round_messages = messages
-            if force_final:
-                round_messages = [*messages, {"role": "system", "content": FINAL_ANSWER_PROMPT}]
-            sniffer = _ToolActionSniffer(thinking_enabled=thinking_enabled) if sniff else None
-            think_filter = (
-                _ThinkBlockFilter() if (not thinking_enabled and sniffer is None) else None
-            )
-            round_error: str | None = None
-            round_finish: str | None = None
+        if not tools:
+            # With no control-plane tools there is nothing to classify or hide,
+            # so preserve token-by-token streaming for ordinary chat.
+            think_filter = _ThinkBlockFilter() if not thinking_enabled else None
             async for chunk in self._stream_llm(
-                round_messages,
+                messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 thinking_enabled=thinking_enabled,
             ):
                 if chunk.kind == "delta" and chunk.content:
-                    if sniffer is not None:
-                        emit, mode = sniffer.push(chunk.content)
-                        if mode == "answer" and emit:
-                            answer_parts.append(emit)
-                            yield {"type": "delta", "content": emit}
-                    else:
-                        content = (
-                            think_filter.push(chunk.content) if think_filter else chunk.content
-                        )
-                        if not content:
-                            continue
+                    content = think_filter.push(chunk.content) if think_filter else chunk.content
+                    if content:
                         answer_parts.append(content)
                         yield {"type": "delta", "content": content}
                 elif chunk.kind == "error":
-                    round_error = chunk.error
+                    stream_error = chunk.error
                     break
                 elif chunk.kind == "done":
-                    round_finish = getattr(chunk, "finish_reason", None)
+                    stream_finish_reason = getattr(chunk, "finish_reason", None)
                     break
-
-            if sniffer is not None:
-                tail, mode = sniffer.finish()
-                if mode == "tool" and not round_error:
-                    action = _parse_tool_action(sniffer.raw)
-                    if action is not None:
-                        observation, event, _executed = await self._run_agentic_tool(
-                            *action, allowed, context
-                        )
-                        await self._emit(event)
-                        events.append(event)
-                        yield {"type": "event", "event": event.model_dump()}
-                        used_tools += 1
-                        messages.append({"role": "assistant", "content": sniffer.raw})
-                        messages.append({"role": "user", "content": observation})
-                        continue
-                    stray = _clean_assistant_answer(sniffer.raw)
-                    if stray:
-                        answer_parts.append(stray)
-                        yield {"type": "delta", "content": stray}
-                elif tail:
-                    answer_parts.append(tail)
-                    yield {"type": "delta", "content": tail}
-            elif think_filter:
+            if think_filter:
                 tail = think_filter.flush()
                 if tail:
                     answer_parts.append(tail)
                     yield {"type": "delta", "content": tail}
+        else:
+            # Tool-capable rounds must be classified as a whole before anything
+            # becomes visible. This prevents prose-prefixed, fenced or malformed
+            # control payloads from leaking through the streaming endpoint.
+            async def collect_round(
+                round_messages: list[dict[str, str]],
+            ) -> tuple[list[str], str | None, str | None]:
+                parts: list[str] = []
+                error: str | None = None
+                finish_reason: str | None = None
+                async for chunk in self._stream_llm(
+                    round_messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    thinking_enabled=thinking_enabled,
+                ):
+                    if chunk.kind == "delta" and chunk.content:
+                        parts.append(chunk.content)
+                    elif chunk.kind == "error":
+                        error = chunk.error
+                        break
+                    elif chunk.kind == "done":
+                        finish_reason = getattr(chunk, "finish_reason", None)
+                        break
+                return parts, error, finish_reason
 
-            stream_error = round_error
-            stream_finish_reason = round_finish
-            break
+            protocol_correction_used = False
+            force_final = False
+            while used_tools < max_steps:
+                round_parts, round_error, round_finish = await collect_round(messages)
+                raw = "".join(round_parts)
+                if round_error:
+                    stream_error = round_error
+                    break
+                turn = _classify_tool_turn(raw)
+                if turn.kind == "protocol_error":
+                    if not protocol_correction_used:
+                        protocol_correction_used = True
+                        messages.append({"role": "assistant", "content": raw})
+                        messages.append(
+                            {"role": "system", "content": TOOL_PROTOCOL_CORRECTION_PROMPT}
+                        )
+                        continue
+                    answer_parts.append(TOOL_PROTOCOL_FAILURE_ANSWER)
+                    stream_finish_reason = "protocol_error"
+                    yield {"type": "delta", "content": TOOL_PROTOCOL_FAILURE_ANSWER}
+                    break
+                if turn.kind == "answer":
+                    stream_finish_reason = round_finish
+                    visible_parts = round_parts if turn.text == raw else [turn.text]
+                    for content in visible_parts:
+                        if content:
+                            answer_parts.append(content)
+                            yield {"type": "delta", "content": content}
+                    break
+                action = turn.action
+                assert action is not None
+                observation, event, _executed = await self._run_agentic_tool(
+                    *action, allowed, context
+                )
+                await self._emit(event)
+                events.append(event)
+                yield {"type": "event", "event": event.model_dump()}
+                used_tools += 1
+                messages.append({"role": "assistant", "content": raw})
+                messages.append({"role": "user", "content": observation})
+                if event.type == "approval" or used_tools >= max_steps:
+                    force_final = True
+                    break
+
+            if force_final and not answer_parts and stream_error is None:
+                round_parts, round_error, round_finish = await collect_round(
+                    [*messages, {"role": "system", "content": FINAL_ANSWER_PROMPT}]
+                )
+                raw = "".join(round_parts)
+                if round_error:
+                    stream_error = round_error
+                else:
+                    turn = _classify_tool_turn(raw)
+                    answer = (
+                        turn.text if turn.kind == "answer" else TOOL_PROTOCOL_FAILURE_ANSWER
+                    )
+                    stream_finish_reason = (
+                        round_finish if turn.kind == "answer" else "protocol_error"
+                    )
+                    visible_parts = (
+                        round_parts if turn.kind == "answer" and turn.text == raw else [answer]
+                    )
+                    for content in visible_parts:
+                        if content:
+                            answer_parts.append(content)
+                            yield {"type": "delta", "content": content}
 
         continuation_count = 0
         if answer_parts:
@@ -4012,12 +4033,17 @@ class AgentRuntime:
             self.settings,
         )
         if native_action is not None:
+            native_tool = (
+                "system.inspect"
+                if native_action.action in SAFE_DIRECT_NATIVE_ACTIONS
+                else "windows.native"
+            )
             return TaskKernelPlan(
                 route="local_action",
                 mode=task_mode,
                 intent=f"native:{native_action.action}",
                 confidence=0.92,
-                tools=("windows.native",),
+                tools=(native_tool,),
                 completion_criteria=(
                     "execute the requested local/native action",
                     "record the tool result",
@@ -4484,9 +4510,10 @@ class AgentRuntime:
             )
             if not result.ok or not result.content:
                 break
-            addition = _clean_assistant_answer(result.content)
-            if not addition:
+            turn = _classify_tool_turn(result.content)
+            if turn.kind != "answer" or not turn.text:
                 break
+            addition = turn.text
             answer = _join_continuation(answer, addition)
             continuation_count += 1
             finish_reason = _finish_reason_from_llm_result(result) or "stop"
@@ -4610,9 +4637,11 @@ class AgentRuntime:
                 timeout=self._verify_timeout(),
             )
             if result.ok and result.content:
-                repaired_text = _clean_assistant_answer(result.content).strip()
+                turn = _classify_tool_turn(result.content)
+                if turn.kind == "answer":
+                    repaired_text = turn.text.strip()
             if repaired_text.startswith(("{", "[")):
-                # A repair that came back as tool/router JSON is broken output;
+                # A repair that came back as router/data JSON is broken output;
                 # the draft answer must survive it.
                 repaired_text = ""
         except Exception:  # noqa: BLE001 - timeout or error must keep the draft
@@ -4937,8 +4966,9 @@ class AgentRuntime:
         used_tools = max(0, initial_used_tools)
         approval_ids: list[str] = []
         executed_tools: list[_ExecutedToolResult] = []
-        remaining_steps = max(0, self._max_tool_steps() - used_tools)
-        for _step in range(remaining_steps):
+        max_tool_steps = self._max_tool_steps()
+        protocol_correction_used = False
+        while used_tools < max_tool_steps:
             result = await self._complete_llm(
                 messages,
                 temperature=temperature,
@@ -4949,9 +4979,27 @@ class AgentRuntime:
                 if used_tools == initial_used_tools:
                     return _AgenticResult(ok=False, answer="", events=events, error=result.error)
                 break
-            action = _parse_tool_action(result.content)
-            if action is None:
-                answer = _clean_assistant_answer(result.content)
+            turn = _classify_tool_turn(result.content)
+            if turn.kind == "protocol_error":
+                if not protocol_correction_used:
+                    protocol_correction_used = True
+                    messages.append({"role": "assistant", "content": result.content})
+                    messages.append(
+                        {"role": "system", "content": TOOL_PROTOCOL_CORRECTION_PROMPT}
+                    )
+                    continue
+                return _AgenticResult(
+                    ok=True,
+                    answer=TOOL_PROTOCOL_FAILURE_ANSWER,
+                    events=events,
+                    finish_reason="protocol_error",
+                    blocked_by_approval=bool(approval_ids),
+                    approval_ids=tuple(approval_ids),
+                    used_tools=used_tools,
+                    executed_tools=tuple(executed_tools),
+                )
+            if turn.kind == "answer":
+                answer = turn.text
                 finish_reason = _finish_reason_from_llm_result(result)
                 continuation_count = 0
                 if finish_reason == "length":
@@ -4973,6 +5021,8 @@ class AgentRuntime:
                     used_tools=used_tools,
                     executed_tools=tuple(executed_tools),
                 )
+            action = turn.action
+            assert action is not None
             resume = {
                 "kind": "agentic_tool_loop",
                 "messages": _llm_message_snapshot(
@@ -5013,7 +5063,19 @@ class AgentRuntime:
             thinking_enabled=thinking_enabled,
         )
         if result.ok and result.content:
-            answer = _clean_assistant_answer(result.content)
+            turn = _classify_tool_turn(result.content)
+            if turn.kind != "answer":
+                return _AgenticResult(
+                    ok=True,
+                    answer=TOOL_PROTOCOL_FAILURE_ANSWER,
+                    events=events,
+                    finish_reason="protocol_error",
+                    blocked_by_approval=bool(approval_ids),
+                    approval_ids=tuple(approval_ids),
+                    used_tools=used_tools,
+                    executed_tools=tuple(executed_tools),
+                )
+            answer = turn.text
             finish_reason = _finish_reason_from_llm_result(result)
             continuation_count = 0
             if finish_reason == "length":
@@ -6020,12 +6082,20 @@ def _native_result_excerpt(result: ToolRunResponse) -> str:
     native = result.data.get("native")
     if not isinstance(native, dict):
         return ""
-    action = str(native.get("action") or result.data.get("action") or "")
-    native_data = native.get("data")
+    parsed = native.get("result")
+    observation = parsed if isinstance(parsed, dict) else native
+    action = str(
+        observation.get("action") or native.get("action") or result.data.get("action") or ""
+    )
+    native_data = observation.get("data")
     if not isinstance(native_data, dict):
         return ""
     if action == "wmi.query":
         return _format_native_rows(native_data.get("items"), title="Короткая выжимка:")
+    if action == "process.top":
+        return _format_native_rows(
+            native_data.get("items"), title="Топ процессов:", max_rows=50
+        )
     if action == "window.list":
         return _format_native_rows(native_data.get("windows"), title="Видимые окна:")
     if action == "screen.capture":
@@ -6057,12 +6127,12 @@ def _format_screen_capture(data: dict[str, Any]) -> str:
     return "\n\nВизуальная проверка:\n" + "\n".join(lines) + windows
 
 
-def _format_native_rows(value: Any, *, title: str) -> str:
+def _format_native_rows(value: Any, *, title: str, max_rows: int = 5) -> str:
     if value is None:
         return ""
     rows = value if isinstance(value, list) else [value]
     rendered = []
-    for item in rows[:5]:
+    for item in rows[:max_rows]:
         if isinstance(item, dict):
             fields = []
             for key, raw in item.items():
@@ -6571,35 +6641,56 @@ def _schema_hint(schema: dict[str, Any]) -> str:
     return ", ".join(parts)
 
 
-def _parse_tool_action(content: str) -> tuple[str, dict[str, Any]] | None:
-    """Parse a tool-call JSON emitted by the model, or None for a normal answer.
+_TOOL_PAYLOAD_MARKER_RE = re.compile(
+    r"(?is)(?:[\"'](?:tool|name|arguments|args)[\"']|\btool)\s*:"
+)
 
-    To avoid hijacking a prose answer that merely contains an example JSON, the
-    message must start with the JSON object (optionally fenced).
+
+def _classify_tool_turn(content: str) -> _ToolTurn:
+    """Classify a complete model turn without exposing control-plane payloads.
+
+    Tool-enabled rounds are buffered before this function is called. A valid tool
+    turn is one standalone JSON object (an optional full JSON fence is accepted).
+    Any prose/JSON mixture or malformed tool-shaped value is a protocol error,
+    never a user-visible answer.
     """
 
-    text = content.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text).strip()
-    if not text.startswith("{"):
-        return None
-    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
-    if not match:
-        return None
+    text = _clean_assistant_answer(content).strip()
+    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", text, re.IGNORECASE | re.DOTALL)
+    candidate = fenced.group(1).strip() if fenced is not None else text
     try:
-        data = json.loads(match.group(0))
+        data = json.loads(candidate)
     except json.JSONDecodeError:
-        return None
-    if not isinstance(data, dict):
-        return None
-    name = data.get("tool") or data.get("name")
-    if not isinstance(name, str) or not name.strip():
-        return None
-    args = data.get("arguments")
-    if not isinstance(args, dict):
-        args = data.get("args") if isinstance(data.get("args"), dict) else {}
-    return name.strip(), args
+        data = None
+    if isinstance(data, dict):
+        has_tool_name = "tool" in data or "name" in data
+        if has_tool_name:
+            name = data.get("tool") if "tool" in data else data.get("name")
+            if not isinstance(name, str) or not name.strip():
+                return _ToolTurn(kind="protocol_error", text="")
+            if "arguments" in data:
+                args = data.get("arguments")
+            elif "args" in data:
+                args = data.get("args")
+            else:
+                args = {}
+            if not isinstance(args, dict):
+                return _ToolTurn(kind="protocol_error", text="")
+            return _ToolTurn(
+                kind="tool",
+                text="",
+                action=(name.strip(), args),
+            )
+    if _TOOL_PAYLOAD_MARKER_RE.search(candidate):
+        return _ToolTurn(kind="protocol_error", text="")
+    return _ToolTurn(kind="answer", text=text)
+
+
+def _parse_tool_action(content: str) -> tuple[str, dict[str, Any]] | None:
+    """Parse one exact tool turn, or return None for prose/protocol errors."""
+
+    turn = _classify_tool_turn(content)
+    return turn.action if turn.kind == "tool" else None
 
 
 def _tool_observation_excerpt(result: ToolRunResponse, *, max_chars: int = 1400) -> str:
@@ -9578,7 +9669,8 @@ def _operator_action_scopes(message: str) -> frozenset[str]:
     ):
         scopes.add("browser")
     if _app_from_message(structural.casefold()) is not None or re.search(
-        r"\b(?:window|окн\w*|windows|winapi|wmi|cim|active\s+window|активн\w*\s+окн\w*)\b",
+        r"\b(?:window|окн\w*|windows|winapi|wmi|cim|console|terminal|powershell|"
+        r"консол\w*|терминал\w*|active\s+window|активн\w*\s+окн\w*)\b",
         context_text,
         re.IGNORECASE,
     ):
@@ -9898,6 +9990,8 @@ def _operator_native_arguments_match(
             "type" in scopes
             and payload == expected.payload
         )
+    if action == "console.show_processes":
+        return "open" in scopes and payload == expected.payload
     return action in SAFE_DIRECT_NATIVE_ACTIONS and payload == expected.payload
 
 
@@ -10256,6 +10350,52 @@ APP_ALIASES: tuple[tuple[tuple[str, ...], str, str], ...] = (
 )
 
 
+def _process_view_action_from_message(message: str) -> NativeAction | None:
+    normalized = message.casefold()
+    if not re.search(r"\b(?:процесс\w*|process(?:es)?)\b", normalized, re.IGNORECASE):
+        return None
+    console_target = bool(
+        re.search(
+            r"\b(?:консол\w*|терминал\w*|console|terminal|powershell)\b",
+            normalized,
+            re.IGNORECASE,
+        )
+    )
+    ranked = bool(
+        re.search(
+            r"\b(?:топ|top|сам(?:ые|ых)|наибольш\w*|highest|largest)\b|"
+            r"\bпо\s+(?:cpu|памят\w*|pid|имен\w*)\b",
+            normalized,
+            re.IGNORECASE,
+        )
+    )
+    if not ranked:
+        return None
+
+    count = re.search(r"\b(?:топ|top)\s*[-:]?\s*(\d+)\b", normalized, re.IGNORECASE)
+    limit = int(count.group(1)) if count is not None else 10
+    if re.search(r"\b(?:memory|ram|working\s+set|памят\w*|прожорлив\w*)\b", normalized):
+        sort = "memory"
+    elif re.search(r"\b(?:pid|идентификатор\w*)\b", normalized):
+        sort = "pid"
+    elif re.search(r"\b(?:name|alphabet\w*|имен\w*|алфавит\w*)\b", normalized):
+        sort = "name"
+    else:
+        sort = "cpu"
+    payload = {"limit": limit, "sort": sort}
+    if console_target:
+        return NativeAction(
+            action="console.show_processes",
+            payload=payload,
+            answer=f"открыл в консоли топ {limit} процессов по {sort}",
+        )
+    return NativeAction(
+        action="process.top",
+        payload=payload,
+        answer=f"получил топ {limit} процессов по {sort}",
+    )
+
+
 def _native_action_from_message(
     message: str,
     settings: JarvisSettings | None = None,
@@ -10267,6 +10407,10 @@ def _native_action_from_message(
 
     if _contains_any(normalized, ("wmi", "cim", "через wmi", "через cim")):
         return _wmi_action_from_message(message)
+
+    process_view = _process_view_action_from_message(message)
+    if process_view is not None:
+        return process_view
 
     if _contains_any(normalized, ("список окон", "покажи окна", "окна winapi", "list windows")):
         return NativeAction(

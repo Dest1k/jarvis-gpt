@@ -15,6 +15,24 @@ from .storage import JarvisStorage
 
 DISPATCHER_SERVICE = "dispatcher"
 DISPATCHER_CONTAINER = "jarvis-gpt-dispatcher"
+RUNTIME_COMPATIBILITY_FIELDS = (
+    "model_path",
+    "model_id",
+    "served_model_name",
+    "dtype",
+    "enforce_eager",
+    "max_model_len",
+    "gpu_memory_utilization",
+    "kv_cache_dtype",
+    "max_num_seqs",
+    "cpu_offload_gb",
+    "swap_space_gb",
+    "tokenizer_mode",
+    "safetensors_load_strategy",
+    "prefix_caching",
+    "host",
+    "port",
+)
 
 
 class DispatcherManager:
@@ -35,6 +53,14 @@ class DispatcherManager:
         desired_env = self.compose_env()
         desired_runtime = _runtime_from_env(desired_env)
         runtime = _runtime_from_container(container)
+        runtime_mismatches = _runtime_mismatches(runtime, desired_runtime)
+        actual_image = str(container.get("image") or "") if isinstance(container, dict) else ""
+        desired_image = desired_env["JARVIS_VLLM_IMAGE"]
+        if container and container.get("exists") and actual_image != desired_image:
+            runtime_mismatches["image"] = {
+                "actual": actual_image,
+                "desired": desired_image,
+            }
         active_model = _model_for_runtime(catalog, runtime) or catalog["active_model"]
         return {
             "service": DISPATCHER_SERVICE,
@@ -49,6 +75,10 @@ class DispatcherManager:
             "desired_model": catalog["active_model"],
             "runtime": runtime,
             "desired_runtime": desired_runtime,
+            "actual_image": actual_image,
+            "desired_image": desired_image,
+            "runtime_matches_desired": runtime is not None and not runtime_mismatches,
+            "runtime_mismatches": runtime_mismatches,
             "compose": self.compose_command("up"),
             "container_status": container,
             "env": _public_env(desired_env),
@@ -117,9 +147,46 @@ class DispatcherManager:
         *,
         timeout_seconds: float = 15.0,
     ) -> dict[str, Any]:
+        replacement: dict[str, Any] | None = None
+        if action == "up":
+            replacement = self._replace_mismatched_container()
+            if replacement.get("required") and not replacement.get("ok"):
+                return {
+                    "ok": False,
+                    "summary": "Existing dispatcher container could not be replaced safely.",
+                    "returncode": replacement.get("returncode"),
+                    "stdout": replacement.get("stdout", ""),
+                    "stderr": replacement.get("stderr", ""),
+                    "command": replacement.get("command", []),
+                    "replacement": replacement,
+                    "verification": {"ok": False, "skipped": True},
+                }
+            if replacement.get("reused"):
+                verification = self.verify_state(
+                    running=True,
+                    timeout_seconds=timeout_seconds,
+                )
+                return {
+                    "ok": verification["ok"],
+                    "summary": (
+                        "Dispatcher already runs the exact desired runtime."
+                        if verification["ok"]
+                        else "Reusable dispatcher failed independent state verification."
+                    ),
+                    "returncode": 0 if verification["ok"] else None,
+                    "stdout": "",
+                    "stderr": "",
+                    "command": [],
+                    "replacement": replacement,
+                    "verification": verification,
+                }
         result = self.run_compose(action)
         if not result.get("ok"):
-            return {**result, "verification": {"ok": False, "skipped": True}}
+            return {
+                **result,
+                "replacement": replacement,
+                "verification": {"ok": False, "skipped": True},
+            }
         expected_running = action == "up"
         verification = self.verify_state(
             running=expected_running,
@@ -128,12 +195,64 @@ class DispatcherManager:
         return {
             **result,
             "ok": bool(result.get("ok") and verification["ok"]),
+            "replacement": replacement,
             "summary": (
                 f"Dispatcher compose {action} completed and independent state checks passed."
                 if verification["ok"]
                 else f"Dispatcher compose {action} completed but state verification failed."
             ),
             "verification": verification,
+        }
+
+    def _replace_mismatched_container(self) -> dict[str, Any]:
+        snapshot = self.status()
+        container = snapshot.get("container_status")
+        if not isinstance(container, dict) or container.get("exists") is not True:
+            return {
+                "required": False,
+                "ok": True,
+                "removed": False,
+                "reused": False,
+            }
+        container_running = str(container.get("status") or "").casefold().startswith("up")
+        if container_running and snapshot.get("runtime_matches_desired") is True:
+            return {
+                "required": False,
+                "ok": True,
+                "removed": False,
+                "reused": True,
+            }
+
+        docker = shutil.which("docker")
+        if docker is None:
+            return {
+                "required": True,
+                "ok": False,
+                "removed": False,
+                "reused": False,
+                "returncode": None,
+                "stderr": "Docker is not available in PATH.",
+                "mismatches": snapshot.get("runtime_mismatches", {}),
+            }
+        command = [docker, "rm", "-f", DISPATCHER_CONTAINER]
+        result = subprocess.run(
+            command,
+            cwd=self.repo_root,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        return {
+            "required": True,
+            "ok": result.returncode == 0,
+            "removed": result.returncode == 0,
+            "reused": False,
+            "returncode": result.returncode,
+            "stdout": result.stdout.strip(),
+            "stderr": result.stderr.strip(),
+            "command": command,
+            "mismatches": snapshot.get("runtime_mismatches", {}),
         }
 
     def verify_state(
@@ -161,8 +280,9 @@ class DispatcherManager:
                 and container_status.casefold().startswith("up")
             )
             port_open = bool(snapshot.get("port_open"))
+            runtime_matches_desired = snapshot.get("runtime_matches_desired") is True
             verified = (
-                container_known and container_running and port_open
+                container_known and container_running and runtime_matches_desired
                 if running
                 else container_known and not container_running and not port_open
             )
@@ -173,6 +293,8 @@ class DispatcherManager:
                     "container_known": container_known,
                     "container_running": container_running,
                     "port_open": port_open,
+                    "runtime_matches_desired": runtime_matches_desired,
+                    "runtime_mismatches": snapshot.get("runtime_mismatches", {}),
                     "port": int(snapshot.get("port") or 8001),
                     "container_status": container,
                 }
@@ -189,7 +311,7 @@ class DispatcherManager:
                 "--filter",
                 f"name={DISPATCHER_CONTAINER}",
                 "--format",
-                "{{.Names}}\t{{.Status}}\t{{.Ports}}",
+                "{{.Names}}\t{{.Status}}\t{{.Ports}}\t{{.Image}}",
             ],
             capture_output=True,
             text=True,
@@ -217,6 +339,7 @@ class DispatcherManager:
             "name": parts[0] if len(parts) > 0 else DISPATCHER_CONTAINER,
             "status": parts[1] if len(parts) > 1 else "",
             "ports": parts[2] if len(parts) > 2 else "",
+            "image": parts[3] if len(parts) > 3 else "",
             "command": command,
         }
 
@@ -276,6 +399,7 @@ def _runtime_from_env(env: dict[str, str]) -> dict[str, Any]:
         "model_path": env.get("JARVIS_QWEN_MODEL_PATH", ""),
         "model_id": _model_id(env.get("JARVIS_QWEN_MODEL_PATH", "")),
         "served_model_name": env.get("JARVIS_QWEN_MODEL_NAME", ""),
+        "dtype": env.get("JARVIS_QWEN_DTYPE", ""),
         "enforce_eager": bool(env.get("JARVIS_QWEN_ENFORCE_EAGER", "").strip()),
         "max_model_len": _int_or_none(env.get("JARVIS_QWEN_MAX_LEN")),
         "gpu_memory_utilization": _float_or_none(env.get("JARVIS_QWEN_GPU_UTIL")),
@@ -289,6 +413,13 @@ def _runtime_from_env(env: dict[str, str]) -> dict[str, Any]:
             env.get("JARVIS_QWEN_SWAP_SPACE_ARGS"),
             "swap-space",
         ),
+        "tokenizer_mode": env.get("JARVIS_QWEN_TOKENIZER_MODE", ""),
+        "safetensors_load_strategy": env.get(
+            "JARVIS_QWEN_SAFETENSORS_LOAD_STRATEGY", ""
+        ),
+        "prefix_caching": True,
+        "host": "0.0.0.0",
+        "port": 8001,
     }
 
 
@@ -302,6 +433,7 @@ def _runtime_from_command(command: list[str]) -> dict[str, Any]:
         "model_path": model_path,
         "model_id": _model_id(model_path),
         "served_model_name": str(flags.get("served-model-name") or ""),
+        "dtype": str(flags.get("dtype") or ""),
         "enforce_eager": "enforce-eager" in flags,
         "max_model_len": _int_or_none(flags.get("max-model-len")),
         "gpu_memory_utilization": _float_or_none(flags.get("gpu-memory-utilization")),
@@ -309,7 +441,38 @@ def _runtime_from_command(command: list[str]) -> dict[str, Any]:
         "max_num_seqs": _int_or_none(flags.get("max-num-seqs")),
         "cpu_offload_gb": _int_or_none(flags.get("cpu-offload-gb")),
         "swap_space_gb": _int_or_none(flags.get("swap-space")),
+        "tokenizer_mode": str(flags.get("tokenizer-mode") or ""),
+        "safetensors_load_strategy": str(
+            flags.get("safetensors-load-strategy") or ""
+        ),
+        "prefix_caching": "enable-prefix-caching" in flags,
+        "host": str(flags.get("host") or ""),
+        "port": _int_or_none(flags.get("port")),
     }
+
+
+def _runtime_mismatches(
+    actual: dict[str, Any] | None,
+    desired: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    mismatches: dict[str, dict[str, Any]] = {}
+    for field in RUNTIME_COMPATIBILITY_FIELDS:
+        actual_value = actual.get(field) if actual is not None else None
+        desired_value = desired.get(field)
+        if field == "model_path":
+            actual_value = _normalized_model_path(actual_value)
+            desired_value = _normalized_model_path(desired_value)
+        if isinstance(actual_value, float) and isinstance(desired_value, float):
+            matches = abs(actual_value - desired_value) <= 1e-9
+        else:
+            matches = actual_value == desired_value
+        if not matches:
+            mismatches[field] = {"actual": actual_value, "desired": desired_value}
+    return mismatches
+
+
+def _normalized_model_path(value: object) -> str:
+    return str(value or "").replace("\\", "/").rstrip("/")
 
 
 def _parse_flags(command: list[str]) -> dict[str, str | bool]:

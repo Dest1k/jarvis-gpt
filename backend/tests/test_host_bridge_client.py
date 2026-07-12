@@ -40,10 +40,10 @@ def test_host_bridge_client_posts_structured_action(monkeypatch, tmp_path):
     assert result["status_code"] == 200
     assert result["contract"] == "action.v1"
     assert result["data"]["raw_command_execution"] is False
-    assert result["data"]["policy_revision"] == "native-app-v1"
+    assert result["data"]["policy_revision"] == "native-app-v2"
     assert status["action_v1_ready"] is True
     assert status["capabilities_probe"]["raw_command_execution"] is False
-    assert status["capabilities_probe"]["policy_revision"] == "native-app-v1"
+    assert status["capabilities_probe"]["policy_revision"] == "native-app-v2"
     assert status["capabilities_probe"]["app_paths_sha256"] == result["data"][
         "app_paths_sha256"
     ]

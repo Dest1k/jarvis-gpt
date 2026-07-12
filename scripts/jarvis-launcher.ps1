@@ -30,7 +30,7 @@ $LogDir = Join-Path $HomePath "logs\jarvis-gpt"
 $StateDir = Join-Path $HomePath "data\jarvis-gpt\state"
 $StateFile = Join-Path $StateDir "launcher-state.json"
 $BridgeTokenFile = Join-Path $HomePath ".jarvis\bridge.token"
-$BridgePolicyRevision = "native-app-v1"
+$BridgePolicyRevision = "native-app-v2"
 $ApiTokenFile = Join-Path $HomePath ".jarvis\api.token"
 $script:ConfiguredApiToken = [string]$env:JARVIS_API_TOKEN
 $script:ConfiguredCorsOrigins = [string]$env:JARVIS_CORS_ORIGINS
@@ -682,6 +682,30 @@ function Get-LlmReadiness {
   }
 }
 
+function Get-DispatcherDesiredStatus {
+  Push-Location $RepoRoot
+  try {
+    $output = @(
+      & py.exe -3.11 .\jarvis.py --profile $Profile dispatcher-status 2>$null
+    )
+    if ($LASTEXITCODE -ne 0) {
+      throw "dispatcher-status exited with code $LASTEXITCODE"
+    }
+    return (($output -join "`n") | ConvertFrom-Json)
+  } finally {
+    Pop-Location
+  }
+}
+
+function Set-DispatcherComposeModelPath {
+  $status = Get-DispatcherDesiredStatus
+  $modelPath = [string]$status.desired_runtime.model_path
+  if ([string]::IsNullOrWhiteSpace($modelPath)) {
+    throw "Dispatcher desired model path is unavailable."
+  }
+  $env:JARVIS_QWEN_MODEL_PATH = $modelPath
+}
+
 function Write-LlmReadinessBlock {
   param([hashtable]$Readiness)
 
@@ -989,7 +1013,10 @@ function Wait-BridgeReady {
 }
 
 function Get-LlmStartDecision {
-  param([System.Collections.IDictionary]$Readiness)
+  param(
+    [System.Collections.IDictionary]$Readiness,
+    $DispatcherStatus
+  )
 
   if (-not $Readiness) {
     return "start"
@@ -997,12 +1024,14 @@ function Get-LlmStartDecision {
   $container = $Readiness["container"]
   $containerRunning = [bool]($container -and $container["running"])
   $containerState = if ($container) { [string]$container["state"] } else { "" }
-  if (
-    [bool]$Readiness["models_ok"] -or
-    $containerRunning -or
-    $containerState -match "(?i)^(running|restarting)$"
-  ) {
-    return "reuse"
+  if ($containerRunning -or $containerState -match "(?i)^(running|restarting)$") {
+    if ($DispatcherStatus -and [bool]$DispatcherStatus.runtime_matches_desired) {
+      return "reuse"
+    }
+    return "replace"
+  }
+  if ([bool]$Readiness["models_ok"]) {
+    return "conflict"
   }
   if ([bool]$Readiness["port_open"]) {
     return "conflict"
@@ -1114,6 +1143,7 @@ function Stop-DispatcherRuntime {
   }
   try {
     Push-Location $RepoRoot
+    Set-DispatcherComposeModelPath
     & $docker.Source compose --profile llm down --remove-orphans 2>$null | Out-Null
   } catch {
     Write-Host $_ -ForegroundColor DarkYellow
@@ -1381,7 +1411,10 @@ function Start-JarvisStack {
 
   if (-not $NoDispatcher) {
     $llmReadiness = Get-LlmReadiness
-    $llmStartDecision = Get-LlmStartDecision -Readiness $llmReadiness
+    $dispatcherStatus = Get-DispatcherDesiredStatus
+    $llmStartDecision = Get-LlmStartDecision `
+      -Readiness $llmReadiness `
+      -DispatcherStatus $dispatcherStatus
     if ($llmStartDecision -eq "reuse") {
       $runningModel = [string]$llmReadiness.container.runtime.model_id
       $modelText = if ($runningModel) { ", model=$runningModel" } else { "" }
@@ -1407,7 +1440,19 @@ function Start-JarvisStack {
         "OpenAI-compatible /v1/models endpoint was detected. The LLM may still be " +
         "warming; wait for it or free the port before full start."
       )
-    } elseif (Ensure-DockerReady -TimeoutSec $DockerWaitSec) {
+    } elseif (
+      $llmStartDecision -in @("start", "replace") -and
+      (Ensure-DockerReady -TimeoutSec $DockerWaitSec)
+    ) {
+      if ($llmStartDecision -eq "replace") {
+        $actualModel = [string]$dispatcherStatus.runtime.model_id
+        $desiredModel = [string]$dispatcherStatus.desired_runtime.model_id
+        Write-Host (
+          "Replacing mismatched dispatcher (actual={0}, desired={1})..." -f
+          $actualModel,
+          $desiredModel
+        ) -ForegroundColor Yellow
+      }
       Write-Host "Starting dispatcher for $Profile..." -ForegroundColor Yellow
       Invoke-JarvisCommand -FilePath "py.exe" -Arguments @("-3.11", ".\jarvis.py", "--profile", $Profile, "dispatcher-up")
       $startedDispatcher = Get-DispatcherContainerSnapshot
@@ -1694,6 +1739,7 @@ function Show-Logs {
   }
   Write-Banner
   if ($choice.Value -eq "dispatcher") {
+    Set-DispatcherComposeModelPath
     Invoke-JarvisCommand -FilePath "docker" -Arguments @("compose", "--profile", "llm", "logs", "--tail", "160", "dispatcher")
     return
   }

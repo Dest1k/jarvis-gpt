@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -32,6 +33,10 @@ def main() -> int:
             "docker compose config",
             ["docker", "compose", "--profile", "llm", "config"],
             optional=True,
+            env={
+                **os.environ,
+                "JARVIS_QWEN_MODEL_PATH": "/models/__jarvis_compose_config_check__",
+            },
         ),
     ]
     if not args.skip_frontend:
@@ -88,6 +93,7 @@ def run(
     *,
     cwd: Path = ROOT,
     optional: bool = False,
+    env: dict[str, str] | None = None,
 ) -> dict[str, object]:
     try:
         result = subprocess.run(
@@ -97,6 +103,7 @@ def run(
             text=True,
             timeout=180,
             check=False,
+            env=env,
         )
     except FileNotFoundError as exc:
         return _failed_check(name, optional=optional, error=str(exc), unavailable=True)

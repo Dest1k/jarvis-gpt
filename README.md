@@ -176,16 +176,20 @@ py -3.11 .\jarvis.py mission-run <mission_id> --max-steps 8
 
 ```powershell
 $env:JARVIS_HOST_HOME="D:/jarvis"
+$env:JARVIS_QWEN_MODEL_PATH="/models/__inactive_dispatcher__" # config-only; llm profile is off
 docker compose up --build
 ```
 
 LLM dispatcher поднимается отдельным профилем, чтобы тяжёлая модель не стартовала случайно:
 
 ```powershell
-.\scripts\dispatcher.ps1 up
-# или
-docker compose --profile llm up -d dispatcher
+.\scripts\dispatcher.ps1 up -Profile gemma4-turbo
+# или для mono:
+.\scripts\dispatcher.ps1 up -Profile gemma4-mono
 ```
+
+Не запускайте dispatcher прямым `docker compose`: профиль и все параметры vLLM
+должен сформировать dispatcher manager, иначе конфигурация закрывается с ошибкой.
 
 ## Current readiness
 

@@ -304,6 +304,47 @@ def test_system_inspect_runs_read_only_wmi_query(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_system_inspect_runs_bounded_process_top(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+    captured = {}
+
+    async def fake_action(self, *, action, payload=None, timeout_sec=30):
+        captured.update({"action": action, "payload": payload, "timeout_sec": timeout_sec})
+        return {
+            "ok": True,
+            "summary": "Top processes.",
+            "data": {
+                "ok": True,
+                "summary": "Top processes.",
+                "action": action,
+                "data": {"items": [{"ProcessId": 42, "Name": "python"}]},
+            },
+        }
+
+    monkeypatch.setattr("jarvis_gpt.host_bridge.HostBridgeClient.action", fake_action)
+
+    result = asyncio.run(
+        tools.run(
+            "system.inspect",
+            {"action": "process.top", "payload": {"limit": 10, "sort": "memory"}},
+        )
+    )
+
+    assert result.ok is True
+    assert captured == {
+        "action": "process.top",
+        "payload": {"limit": 10, "sort": "memory"},
+        "timeout_sec": 30,
+    }
+    storage.close()
+
+
 def test_system_inspect_refuses_desktop_mutating_action(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
@@ -743,6 +784,24 @@ def test_windows_native_process_start_preserves_nonempty_argv():
     )
 
     assert payload["arguments"] == ["--mode", "inspect"]
+
+
+@pytest.mark.parametrize("action", ("process.top", "console.show_processes"))
+def test_windows_native_process_view_payload_is_strict(action):
+    assert _validate_native_payload(action, {}) == {"limit": 10, "sort": "cpu"}
+    assert _validate_native_payload(action, {"limit": 25, "sort": "MEMORY"}) == {
+        "limit": 25,
+        "sort": "memory",
+    }
+    for invalid in (
+        {"limit": 0, "sort": "cpu"},
+        {"limit": 51, "sort": "cpu"},
+        {"limit": "10", "sort": "cpu"},
+        {"limit": 10, "sort": "cpu; whoami"},
+        {"limit": 10, "sort": "cpu", "command": "whoami"},
+    ):
+        with pytest.raises(ValueError):
+            _validate_native_payload(action, invalid)
 
 
 def test_windows_native_process_response_payload_redacts_split_and_url_secrets():

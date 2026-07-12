@@ -53,7 +53,11 @@ def test_optional_unreachable_http_is_skipped_but_never_successful(monkeypatch):
 
 
 def test_main_exit_ignores_optional_gap_but_reports_degraded(monkeypatch, capsys):
-    def fake_run(name, _command, *, cwd=smoke.ROOT, optional=False):
+    def fake_run(name, _command, *, cwd=smoke.ROOT, optional=False, env=None):
+        if name == "docker compose config":
+            assert env["JARVIS_QWEN_MODEL_PATH"] == (
+                "/models/__jarvis_compose_config_check__"
+            )
         if optional:
             return {
                 "name": name,
@@ -77,7 +81,11 @@ def test_main_exit_ignores_optional_gap_but_reports_degraded(monkeypatch, capsys
 
 
 def test_main_required_failure_sets_nonzero_exit(monkeypatch, capsys):
-    def fake_run(name, _command, *, cwd=smoke.ROOT, optional=False):
+    def fake_run(name, _command, *, cwd=smoke.ROOT, optional=False, env=None):
+        if name == "docker compose config":
+            assert env["JARVIS_QWEN_MODEL_PATH"] == (
+                "/models/__jarvis_compose_config_check__"
+            )
         if name == "backend tests":
             return {
                 "name": name,

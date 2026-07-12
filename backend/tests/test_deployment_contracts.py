@@ -64,6 +64,8 @@ def test_compose_defaults_to_loopback_and_propagates_build_contract() -> None:
     assert "JARVIS_BACKEND_URL: http://backend:8000" in compose
     assert "JARVIS_CORS_ORIGINS:" in compose
     assert "JARVIS_API_REQUIRE_TOKEN_ON_LOOPBACK:" in compose
+    assert "${JARVIS_QWEN_MODEL_PATH:?" in compose
+    assert "JARVIS_QWEN_MODEL_PATH:-/models/" not in compose
     assert "shm_size: 512m" in compose
     assert compose.count("no-new-privileges:true") == 2
     assert "seccomp=./backend/chromium-seccomp.json" in compose
@@ -82,6 +84,7 @@ def test_chromium_seccomp_profile_keeps_default_deny_and_allows_namespaces() -> 
 
 def test_launcher_is_local_only_and_preserves_foreign_listeners() -> None:
     launcher = _read("scripts/jarvis-launcher.ps1")
+    dispatcher_script = _read("scripts/dispatcher.ps1")
     dev_script = _read("scripts/dev.ps1")
 
     assert "$script:LanMode = $false" in launcher
@@ -91,7 +94,13 @@ def test_launcher_is_local_only_and_preserves_foreign_listeners() -> None:
     assert '"app" { $script:NoDispatcher = $true; Start-JarvisStack }' in launcher
     assert "function Get-LlmStartDecision" in launcher
     assert 'return "reuse"' in launcher
+    assert 'return "replace"' in launcher
     assert 'return "conflict"' in launcher
+    assert "runtime_matches_desired" in launcher
+    assert "Replacing mismatched dispatcher" in launcher
+    assert "function Set-DispatcherComposeModelPath" in launcher
+    assert launcher.count("Set-DispatcherComposeModelPath") >= 3
+    assert "$env:JARVIS_QWEN_MODEL_PATH" in dispatcher_script
     assert "LLM is already started" in launcher
     assert "started_by_launcher = $true" in launcher
     assert "function Test-LauncherOwnsDispatcher" in launcher
@@ -117,7 +126,7 @@ def test_launcher_is_local_only_and_preserves_foreign_listeners() -> None:
     assert 'action = "capabilities"' in launcher
     assert "function Wait-BridgeReady" in launcher
     assert "Wait-BridgeReady -TimeoutSec 15" in launcher
-    assert '$BridgePolicyRevision = "native-app-v1"' in launcher
+    assert '$BridgePolicyRevision = "native-app-v2"' in launcher
     assert "data.policy_revision -eq $BridgePolicyRevision" in launcher
     assert "data.app_paths_sha256 -eq $expectedAppPathsSha256" in launcher
     assert "Restarting stale or unauthenticated host bridge" in launcher

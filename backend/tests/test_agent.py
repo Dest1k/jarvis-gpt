@@ -200,6 +200,28 @@ def test_operator_gui_and_browser_authority_rejects_extra_operands():
         "windows.native", targeted_native, message=native_message, scopes=native_scopes
     )
 
+    process_message = "открой топ 10 процессов в консоли"
+    process_scopes = _operator_action_scopes(process_message)
+    exact_process_view = {
+        "action": "console.show_processes",
+        "payload": {"limit": 10, "sort": "cpu"},
+        "timeout_sec": 30,
+    }
+    assert _operator_tool_arguments_match(
+        "windows.native",
+        exact_process_view,
+        message=process_message,
+        scopes=process_scopes,
+    )
+    escalated_process_view = json.loads(json.dumps(exact_process_view))
+    escalated_process_view["payload"]["command"] = "whoami"
+    assert not _operator_tool_arguments_match(
+        "windows.native",
+        escalated_process_view,
+        message=process_message,
+        scopes=process_scopes,
+    )
+
     browser_message = "type hello into search in browser at https://example.com"
     browser_scopes = _operator_action_scopes(browser_message)
     exact_browser = {
@@ -1492,6 +1514,89 @@ def test_agent_calculator_understands_russian_multiply_sign(monkeypatch, tmp_pat
     assert arguments["payload"]["window_title"] == "Calculator|Калькулятор"
     assert calls[0]["payload"]["keys"] == "10{*}10="
     assert "Готово" in response.answer
+    storage.close()
+
+
+def test_agent_opens_only_fixed_top_process_console(monkeypatch, tmp_path):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    calls = []
+
+    async def fake_action(self, *, action, payload=None, timeout_sec=30):
+        payload = dict(payload or {})
+        calls.append({"action": action, "payload": payload, "timeout_sec": timeout_sec})
+        if action == "wmi.query":
+            return {
+                "ok": True,
+                "summary": "verified",
+                "data": {
+                    "ok": True,
+                    "summary": "verified",
+                    "data": {"items": [{"ProcessId": 4242, "Name": "powershell.exe"}]},
+                },
+            }
+        return {
+            "ok": True,
+            "summary": "Opened fixed process console.",
+            "data": {
+                "ok": True,
+                "action": action,
+                "summary": "Opened fixed process console.",
+                "pid": 4242,
+            },
+        }
+
+    monkeypatch.setattr("jarvis_gpt.host_bridge.HostBridgeClient.action", fake_action)
+
+    response = asyncio.run(agent.chat("открой топ 10 процессов в консоли"))
+
+    run = _operator_tool_run(storage, "windows.native")
+    assert run["arguments"] == {
+        "action": "console.show_processes",
+        "payload": {"limit": 10, "sort": "cpu"},
+        "timeout_sec": 30,
+    }
+    assert [call["action"] for call in calls] == ["console.show_processes", "wmi.query"]
+    assert storage.list_approvals(limit=10) == []
+    assert "Готово" in response.answer
+    storage.close()
+
+
+def test_agent_returns_bounded_top_process_snapshot(monkeypatch, tmp_path):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    captured = {}
+
+    async def fake_action(self, *, action, payload=None, timeout_sec=30):
+        captured.update({"action": action, "payload": payload, "timeout_sec": timeout_sec})
+        return {
+            "ok": True,
+            "summary": "Listed 3 process(es), sorted by memory.",
+            "data": {
+                "ok": True,
+                "action": action,
+                "summary": "Listed 3 process(es), sorted by memory.",
+                "data": {
+                    "items": [
+                        {"ProcessId": 1, "Name": "first", "WorkingSetBytes": 300},
+                        {"ProcessId": 2, "Name": "second", "WorkingSetBytes": 200},
+                        {"ProcessId": 3, "Name": "third", "WorkingSetBytes": 100},
+                    ]
+                },
+            },
+        }
+
+    monkeypatch.setattr("jarvis_gpt.host_bridge.HostBridgeClient.action", fake_action)
+
+    response = asyncio.run(agent.chat("покажи топ 3 процессов по памяти"))
+
+    run = _operator_tool_run(storage, "system.inspect")
+    assert run["arguments"] == {
+        "action": "process.top",
+        "payload": {"limit": 3, "sort": "memory"},
+        "timeout_sec": 30,
+    }
+    assert captured["action"] == "process.top"
+    assert "first" in response.answer
+    assert "third" in response.answer
     storage.close()
 
 

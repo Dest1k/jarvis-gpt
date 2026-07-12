@@ -6,7 +6,7 @@ services:
     restart: unless-stopped
     ipc: host
     command: >
-      --model ${JARVIS_QWEN_MODEL_PATH:-/models/gemma4-26b-a4b-nvfp4}
+      --model ${JARVIS_QWEN_MODEL_PATH:?set JARVIS_QWEN_MODEL_PATH via the Jarvis dispatcher manager}
       --served-model-name ${JARVIS_QWEN_MODEL_NAME:-dispatcher}
       --dtype ${JARVIS_QWEN_DTYPE:-auto}
       ${JARVIS_QWEN_QUANT_ARGS:-}

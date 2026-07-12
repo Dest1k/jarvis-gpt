@@ -2,9 +2,16 @@ from __future__ import annotations
 
 import json
 
-from jarvis_gpt.config import ensure_runtime_dirs, load_settings
+import pytest
+from jarvis_gpt.config import PROFILES, ensure_runtime_dirs, load_settings
 from jarvis_gpt.model_catalog import MODEL_OVERRIDE_KEY, ModelCatalog
 from jarvis_gpt.storage import JarvisStorage
+
+
+def test_builtin_profile_model_identities_are_exclusive() -> None:
+    assert PROFILES["gemma4-mono"].model_dir_name == "gemma4-31b-it-nvfp4"
+    assert PROFILES["gemma4-mono-perf"].model_dir_name == "gemma4-31b-it-nvfp4"
+    assert PROFILES["gemma4-turbo"].model_dir_name == "gemma4-26b-a4b-nvfp4"
 
 
 def test_model_catalog_uses_configured_root_and_active_profile(monkeypatch, tmp_path):
@@ -64,4 +71,39 @@ def test_model_catalog_honors_active_model_override(monkeypatch, tmp_path):
 
     assert catalog["active_model"]["id"] == "owner__custom-7b-q4"
     assert catalog["dispatcher"]["env"]["JARVIS_QWEN_MODEL_PATH"] == "/models/owner__custom-7b-q4"
+    storage.close()
+
+
+@pytest.mark.parametrize(
+    ("profile_name", "override", "expected"),
+    [
+        ("gemma4-mono", "gemma4-26b-a4b-nvfp4", "gemma4-31b-it-nvfp4"),
+        ("gemma4-mono-perf", "gemma4-26b-a4b-nvfp4", "gemma4-31b-it-nvfp4"),
+        ("gemma4-turbo", "gemma4-31b-it-nvfp4", "gemma4-26b-a4b-nvfp4"),
+    ],
+)
+def test_model_catalog_ignores_cross_profile_builtin_override(
+    monkeypatch,
+    tmp_path,
+    profile_name,
+    override,
+    expected,
+):
+    model_root = tmp_path / "models"
+    (model_root / "gemma4-26b-a4b-nvfp4").mkdir(parents=True)
+    (model_root / "gemma4-31b-it-nvfp4").mkdir(parents=True)
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_MODEL_ROOT", str(model_root))
+    settings = load_settings(profile_name)
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    storage.set_runtime_value(MODEL_OVERRIDE_KEY, override)
+
+    catalog = ModelCatalog(settings, storage)
+
+    assert catalog.active_model_dir_name() == expected
+    assert catalog.dispatcher_config()["env"]["JARVIS_QWEN_MODEL_PATH"] == (
+        f"/models/{expected}"
+    )
     storage.close()

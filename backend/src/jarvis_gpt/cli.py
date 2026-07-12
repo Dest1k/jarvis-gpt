@@ -246,13 +246,13 @@ def cmd_llm_health(args: argparse.Namespace) -> None:
 
 def cmd_dispatcher_status(args: argparse.Namespace) -> None:
     settings, storage, _llm, _agent = _runtime(args.profile)
-    _print_json(DispatcherManager(settings).status())
+    _print_json(DispatcherManager(settings, storage=storage).status())
     storage.close()
 
 
 def cmd_dispatcher_compose(args: argparse.Namespace) -> None:
     settings, storage, _llm, _agent = _runtime(args.profile)
-    manager = DispatcherManager(settings)
+    manager = DispatcherManager(settings, storage=storage)
     if args.env:
         _print_json(manager.compose_env())
     else:
@@ -268,13 +268,19 @@ def cmd_dispatcher_compose(args: argparse.Namespace) -> None:
 
 
 def cmd_dispatcher_up(args: argparse.Namespace) -> None:
-    with _primary_runtime(args.profile) as (settings, _storage, _llm, _agent):
-        _print_json(DispatcherManager(settings).run_compose_verified("up"))
+    with _primary_runtime(args.profile) as (settings, storage, _llm, _agent):
+        result = DispatcherManager(settings, storage=storage).run_compose_verified("up")
+        _print_json(result)
+        if not result.get("ok"):
+            raise SystemExit(1)
 
 
 def cmd_dispatcher_down(args: argparse.Namespace) -> None:
-    with _primary_runtime(args.profile) as (settings, _storage, _llm, _agent):
-        _print_json(DispatcherManager(settings).run_compose_verified("down"))
+    with _primary_runtime(args.profile) as (settings, storage, _llm, _agent):
+        result = DispatcherManager(settings, storage=storage).run_compose_verified("down")
+        _print_json(result)
+        if not result.get("ok"):
+            raise SystemExit(1)
 
 
 def cmd_telemetry(args: argparse.Namespace) -> None:

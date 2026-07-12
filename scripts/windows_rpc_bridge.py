@@ -24,14 +24,18 @@ MAX_OUTPUT_CHARS = 40_000
 MAX_ARGUMENTS = 128
 MAX_ARGUMENT_CHARS = 2_048
 MAX_ARGUMENTS_TOTAL_CHARS = 8_192
+PROCESS_TOP_MAX_LIMIT = 50
+PROCESS_TOP_SORTS = frozenset({"cpu", "memory", "name", "pid"})
 
 ACTION_NAMES = frozenset(
     {
         "app.open_and_type",
         "capabilities",
         "chrome.launch",
+        "console.show_processes",
         "keyboard.send",
         "process.start",
+        "process.top",
         "screen.capture",
         "url.open",
         "window.focus",
@@ -111,7 +115,7 @@ NATIVE_APP_NAMES = frozenset(
 )
 MMC_CONSOLES = frozenset({"devmgmt.msc", "services.msc"})
 CALCULATOR_APP_URI = r"shell:AppsFolder\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"
-BRIDGE_POLICY_REVISION = "native-app-v1"
+BRIDGE_POLICY_REVISION = "native-app-v2"
 APP_PATHS_ENV = "JARVIS_BRIDGE_APP_PATHS_JSON"
 SENSITIVE_ARGUMENT_RE = re.compile(
     r"(?i)(?:^|[-_.])(api[-_]?key|authorization|bearer|credential(?:s)?|"
@@ -239,6 +243,8 @@ def execute_action(request: dict[str, Any]) -> tuple[dict[str, Any], int]:
     try:
         if action == "capabilities":
             result = _capabilities_result()
+        elif action == "console.show_processes":
+            result = _show_process_console(action, payload)
         elif action == "process.start":
             result = _start_process(action, payload)
         elif action == "url.open":
@@ -307,8 +313,10 @@ def validate_action_request(request: dict[str, Any]) -> tuple[str, dict[str, Any
         "app.open_and_type": _validate_app_open_and_type,
         "capabilities": _validate_empty_payload,
         "chrome.launch": _validate_chrome_launch,
+        "console.show_processes": _validate_process_view,
         "keyboard.send": _validate_keyboard_send,
         "process.start": _validate_process_start,
+        "process.top": _validate_process_view,
         "screen.capture": _validate_screen_capture,
         "url.open": _validate_url_open,
         "window.focus": _validate_window_target,
@@ -335,6 +343,16 @@ def _validate_process_start(payload: dict[str, Any]) -> dict[str, Any]:
         "arguments": arguments,
         "cwd": cwd,
     }
+
+
+def _validate_process_view(payload: dict[str, Any]) -> dict[str, Any]:
+    _reject_extra_keys(payload, {"limit", "sort"}, "process view payload")
+    limit = _strict_int(payload.get("limit", 10), "limit", 1, PROCESS_TOP_MAX_LIMIT)
+    sort = _optional_string(payload.get("sort", "cpu"), "sort", 20).casefold()
+    if sort not in PROCESS_TOP_SORTS:
+        allowed = ", ".join(sorted(PROCESS_TOP_SORTS))
+        raise ActionValidationError(f"sort must be one of: {allowed}.")
+    return {"limit": limit, "sort": sort}
 
 
 def _validate_app_open_and_type(payload: dict[str, Any]) -> dict[str, Any]:
@@ -599,6 +617,11 @@ def _capabilities_result() -> dict[str, Any]:
                 "devmgmt.msc": "fixed_mmc_console",
                 "services.msc": "fixed_mmc_console",
             },
+            "process_views": {
+                "actions": ["console.show_processes", "process.top"],
+                "limit": {"minimum": 1, "maximum": PROCESS_TOP_MAX_LIMIT},
+                "sorts": sorted(PROCESS_TOP_SORTS),
+            },
         },
         "policy_revision": BRIDGE_POLICY_REVISION,
         "app_paths_sha256": _app_paths_configuration_sha256(),
@@ -632,7 +655,7 @@ try {
   $Payload = $Envelope.payload
   $Allowed = @(
     'app.open_and_type', 'keyboard.send', 'screen.capture',
-    'window.focus', 'window.list', 'wmi.query'
+    'process.top', 'window.focus', 'window.list', 'wmi.query'
   )
   if ($Allowed -notcontains $Action) { throw 'Unsupported fixed native action.' }
 
@@ -692,6 +715,35 @@ public static class JarvisBridgeWinApi {
   }
 
   switch ($Action) {
+    'process.top' {
+      $all = Get-Process -ErrorAction SilentlyContinue
+      $sorted = switch ([string]$Payload.sort) {
+        'memory' { $all | Sort-Object WorkingSet64, Id -Descending }
+        'name' { $all | Sort-Object ProcessName, Id }
+        'pid' { $all | Sort-Object Id -Descending }
+        default { $all | Sort-Object CPU, Id -Descending }
+      }
+      $items = @(
+        $sorted |
+          Select-Object -First ([int]$Payload.limit) |
+          ForEach-Object {
+            [pscustomobject]@{
+              ProcessId = [int]$_.Id
+              Name = [string]$_.ProcessName
+              CpuSeconds = $(
+                if ($null -eq $_.CPU) { 0.0 }
+                else { [math]::Round([double]$_.CPU, 2) }
+              )
+              WorkingSetBytes = [int64]$_.WorkingSet64
+            }
+          }
+      )
+      Out $true "Listed $($items.Count) process(es), sorted by $([string]$Payload.sort)." @{
+        items = $items
+        limit = [int]$Payload.limit
+        sort = [string]$Payload.sort
+      }
+    }
     'window.list' {
       $items = Get-Process -ErrorAction SilentlyContinue |
         Where-Object { $_.MainWindowHandle -ne 0 } |
@@ -787,6 +839,81 @@ public static class JarvisBridgeWinApi {
   exit 1
 }
 """.strip()
+
+
+FIXED_PROCESS_CONSOLE_POWERSHELL = r"""
+$ErrorActionPreference = 'Stop'
+$view = $env:JARVIS_PROCESS_VIEW_JSON | ConvertFrom-Json
+$limit = [int]$view.limit
+$sort = [string]$view.sort
+$all = Get-Process -ErrorAction SilentlyContinue
+$sorted = switch ($sort) {
+  'memory' { $all | Sort-Object WorkingSet64, Id -Descending }
+  'name' { $all | Sort-Object ProcessName, Id }
+  'pid' { $all | Sort-Object Id -Descending }
+  default { $all | Sort-Object CPU, Id -Descending }
+}
+$rows = @(
+  $sorted |
+    Select-Object -First $limit |
+    ForEach-Object {
+      [pscustomobject]@{
+        PID = [int]$_.Id
+        Name = [string]$_.ProcessName
+        CPU_s = $(if ($null -eq $_.CPU) { 0.0 } else { [math]::Round([double]$_.CPU, 2) })
+        Memory_MB = [math]::Round([double]$_.WorkingSet64 / 1MB, 1)
+      }
+    }
+)
+$Host.UI.RawUI.WindowTitle = 'Jarvis - Top Processes'
+Write-Host "Jarvis: top $limit processes sorted by $sort" -ForegroundColor Cyan
+$rows | Format-Table -AutoSize
+Write-Host ''
+[void](Read-Host 'Press Enter to close')
+""".strip()
+
+
+def _show_process_console(action: str, payload: dict[str, Any]) -> dict[str, Any]:
+    powershell = _canonical_windows_powershell()
+    encoded = base64.b64encode(FIXED_PROCESS_CONSOLE_POWERSHELL.encode("utf-16-le")).decode(
+        "ascii"
+    )
+    argv = [
+        powershell,
+        "-NoLogo",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "RemoteSigned",
+        "-EncodedCommand",
+        encoded,
+    ]
+    env = os.environ.copy()
+    env["JARVIS_PROCESS_VIEW_JSON"] = json.dumps(payload, separators=(",", ":"))
+    creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(
+        subprocess, "CREATE_NEW_CONSOLE", 0
+    )
+    process = subprocess.Popen(  # noqa: S603 - fixed script and validated enum/int payload only
+        argv,
+        shell=False,
+        close_fds=True,
+        env=env,
+        creationflags=creationflags,
+    )
+    return {
+        "ok": True,
+        "action": action,
+        "summary": f"Opened a fixed top-{payload['limit']} process console.",
+        "state": "started",
+        "pid": process.pid,
+        "limit": payload["limit"],
+        "sort": payload["sort"],
+        "argv": [*argv[:-1], "[FIXED_PROCESS_VIEW_SCRIPT]"],
+        "exit_code": None,
+        "stdout": "",
+        "stderr": "",
+        "output_truncated": False,
+        "timed_out": False,
+    }
 
 
 def _run_fixed_native_action(
@@ -1096,6 +1223,13 @@ def _windows_root() -> Path:
     if path is None:
         raise ActionValidationError("A canonical absolute Windows system root is required.")
     return path
+
+
+def _canonical_windows_powershell() -> str:
+    executable = _windows_root() / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    if not executable.is_file():
+        raise ActionValidationError("Canonical Windows PowerShell was not found.")
+    return str(executable.resolve())
 
 
 def _find_chrome() -> str:

@@ -273,6 +273,10 @@ class DispatcherStatusResponse(BaseModel):
     desired_model: dict[str, Any] | None = None
     runtime: dict[str, Any] | None = None
     desired_runtime: dict[str, Any] = Field(default_factory=dict)
+    actual_image: str = ""
+    desired_image: str = ""
+    runtime_matches_desired: bool = False
+    runtime_mismatches: dict[str, Any] = Field(default_factory=dict)
     compose: list[str]
     container_status: dict[str, Any] | None = None
     env: dict[str, str]

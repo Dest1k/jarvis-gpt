@@ -5,10 +5,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .config import JarvisSettings
+from .config import PROFILES, JarvisSettings
 from .storage import JarvisStorage
 
 MODEL_OVERRIDE_KEY = "models.active_override"
+PROFILE_MODEL_DIR_NAMES = frozenset(
+    profile.model_dir_name for profile in PROFILES.values()
+)
 
 MODEL_METADATA_FILES = (
     "config.json",
@@ -41,7 +44,11 @@ class ModelCatalog:
         override = ""
         if self.storage is not None:
             override = str(self.storage.get_runtime_value(MODEL_OVERRIDE_KEY, "") or "").strip()
-        if override and (self.settings.model_root / override).is_dir():
+        if (
+            override
+            and model_allowed_for_profile(self.settings, override)
+            and (self.settings.model_root / override).is_dir()
+        ):
             return override
         return self.settings.profile.model_dir_name
 
@@ -120,6 +127,15 @@ class ModelCatalog:
                 "JARVIS_ENABLE_UITARS": "0",
             },
         }
+
+
+def model_allowed_for_profile(settings: JarvisSettings, model_dir_name: str) -> bool:
+    """Keep built-in model identities bound to their named runtime profiles."""
+
+    return (
+        model_dir_name not in PROFILE_MODEL_DIR_NAMES
+        or model_dir_name == settings.profile.model_dir_name
+    )
 
 
 def _read_json(path: Path) -> dict[str, Any]:

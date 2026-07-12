@@ -26,6 +26,13 @@ switch ($Action) {
     py -3.11 .\jarvis.py --profile $Profile dispatcher-down
   }
   "logs" {
+    $dispatcherEnv = py -3.11 .\jarvis.py --profile $Profile dispatcher-compose --env |
+      Out-String |
+      ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0 -or -not $dispatcherEnv.JARVIS_QWEN_MODEL_PATH) {
+      throw "Could not resolve the dispatcher model path."
+    }
+    $env:JARVIS_QWEN_MODEL_PATH = [string]$dispatcherEnv.JARVIS_QWEN_MODEL_PATH
     docker compose --profile llm logs --tail 120 dispatcher
   }
 }

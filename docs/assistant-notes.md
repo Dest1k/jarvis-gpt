@@ -1515,3 +1515,42 @@ Claude Sync Note
 - No open P0/P1 core defect remains from this phase. Future schema changes must preserve
   strict parsing, replay fingerprints, approval bindings, and backward-safe storage
   migration; extend tests before changing any protocol listed above.
+
+## 2026-07-12 Codex handoff: profile invariants and reliable process actions
+
+[Implemented]
+
+- Built-in model identity is now profile-bound: `gemma4-turbo` uses only
+  `gemma4-26b-a4b-nvfp4`; both mono profiles use only `gemma4-31b-it-nvfp4`.
+  Custom Model Hub overrides remain supported, while cross-profile built-in overrides are
+  ignored by the catalog and rejected by activation.
+- Dispatcher reuse requires the exact desired image and complete vLLM command contract
+  (model, dtype, eager mode, context, GPU/KV/concurrency/offload settings, tokenizer/load
+  strategy, prefix cache, host and port). A stale or foreign mismatched container is removed
+  before startup. Cold-start verification accepts a running exact container while HTTP is
+  still warming; CLI verification failures now exit nonzero.
+- Compose no longer defaults silently to 26B: `JARVIS_QWEN_MODEL_PATH` is mandatory.
+  Launcher, dispatcher helper and smoke checks resolve or inject it explicitly. Runtime
+  mismatch/image diagnostics survive the API schema and frontend typing.
+- Added typed bridge actions `process.top` (read-only) and `console.show_processes` (fixed
+  console view). Both accept only `limit=1..50` and `sort=cpu|memory|name|pid`; sorting occurs
+  before limiting. The console action launches canonical Windows PowerShell with a fixed
+  encoded script, `shell=False`, and independent PID/name verification. Raw command text is
+  never accepted. Bridge policy is now `native-app-v2`.
+- Russian requests such as `открой топ 10 процессов в консоли` route deterministically to the
+  fixed action and continue to a factual result. Plain top-process requests use the safe
+  `system.inspect/process.top` path.
+- Tool-capable LLM rounds are classified before any stream content becomes visible. Exact
+  standalone tool JSON executes; mixed or malformed tool-shaped output receives one internal
+  correction, then fails with a safe answer if still invalid. Forced-final tool payloads never
+  leak. Command Center treats the final `done.answer` as authoritative.
+
+[Verification]
+
+- Full backend: `789 passed, 13 skipped`; Ruff and compileall clean.
+- Frontend: npm audit 0 vulnerabilities, typecheck and production build pass.
+- PowerShell AST parse and explicit-path Compose config pass. Focused live Windows
+  `process.top` smoke returned correctly sorted rows.
+- The already running stale 26B/nightly container was intentionally not mutated. The next
+  full launcher start with a mono profile will detect and replace it with the 31B/pinned-image
+  runtime.

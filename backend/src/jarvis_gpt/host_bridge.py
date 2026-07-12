@@ -13,13 +13,15 @@ from .config import JarvisSettings
 BRIDGE_HOST = "127.0.0.1"
 BRIDGE_PORT = 8765
 BRIDGE_CONTRACT = "action.v1"
-BRIDGE_POLICY_REVISION = "native-app-v1"
+BRIDGE_POLICY_REVISION = "native-app-v2"
 BRIDGE_ACTIONS = (
     "app.open_and_type",
     "capabilities",
     "chrome.launch",
+    "console.show_processes",
     "keyboard.send",
     "process.start",
+    "process.top",
     "screen.capture",
     "url.open",
     "window.focus",

@@ -95,6 +95,75 @@ def test_agentic_loop_runs_safe_tool_then_answers(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_agentic_loop_corrects_mixed_tool_payload_before_execution(monkeypatch, tmp_path):
+    class MixedThenCorrectToolLLM:
+        def __init__(self) -> None:
+            self.calls: list[list[dict[str, str]]] = []
+
+        async def complete(self, messages, *, temperature=None, max_tokens=None, **kwargs):
+            self.calls.append(messages)
+            if len(self.calls) == 1:
+                return _result(
+                    'Сейчас проверю.\n{"tool":"runtime.status","arguments":{}}'
+                )
+            if len(self.calls) == 2:
+                return _result('{"tool":"runtime.status","arguments":{}}')
+            return _result("Рантайм проверен и работает.")
+
+    llm = MixedThenCorrectToolLLM()
+    agent, storage = _agent(monkeypatch, tmp_path, llm)
+    storage.set_runtime_value("experience.autonomy_policy", {"verify_answers": False})
+    runs = []
+
+    async def fake_run(name, arguments=None, **kwargs):
+        runs.append((name, arguments))
+        return type(
+            "R",
+            (),
+            {"tool": name, "ok": True, "summary": "runtime ok", "data": {"ready": True}},
+        )()
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+
+    response = asyncio.run(agent.chat("собери данные и ответь"))
+
+    assert response.answer == "Рантайм проверен и работает."
+    assert runs == [("runtime.status", {})]
+    correction_system = "\n".join(
+        item["content"] for item in llm.calls[1] if item["role"] == "system"
+    )
+    assert "Внутренняя ошибка протокола" in correction_system
+    assert '"tool"' not in response.answer
+    storage.close()
+
+
+def test_agentic_loop_never_returns_repeated_malformed_tool_payload(monkeypatch, tmp_path):
+    class MalformedToolLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, messages, *, temperature=None, max_tokens=None, **kwargs):
+            self.calls += 1
+            return _result('```json\n{"tool":"runtime.status","arguments":\n```')
+
+    llm = MalformedToolLLM()
+    agent, storage = _agent(monkeypatch, tmp_path, llm)
+    storage.set_runtime_value("experience.autonomy_policy", {"verify_answers": False})
+
+    async def forbidden_run(name, arguments=None, **kwargs):
+        raise AssertionError(f"malformed tool payload reached {name}")
+
+    monkeypatch.setattr(agent.tools, "run", forbidden_run)
+
+    response = asyncio.run(agent.chat("собери данные и ответь"))
+
+    assert llm.calls == 2
+    assert "Не удалось безопасно завершить запрос" in response.answer
+    assert '"tool"' not in response.answer
+    assert "runtime.status" not in response.answer
+    storage.close()
+
+
 def test_agentic_loop_recalls_persisted_document_then_summarizes(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "1")
     monkeypatch.setenv("JARVIS_EMBEDDINGS_ENABLED", "0")
@@ -421,6 +490,122 @@ def test_agentic_stream_suppresses_tool_json_and_streams_answer(monkeypatch, tmp
     storage.close()
 
 
+def test_agentic_stream_corrects_mixed_tool_payload_without_leaking(monkeypatch, tmp_path):
+    class MixedStreamToolThenAnswerLLM:
+        def __init__(self) -> None:
+            self.rounds = 0
+            self.messages: list[list[dict[str, str]]] = []
+
+        async def stream_complete(self, messages, *, temperature=None, max_tokens=None, **kwargs):
+            self.rounds += 1
+            self.messages.append(messages)
+            if self.rounds == 1:
+                for piece in [
+                    "Попробую выполнить проверку.\n",
+                    '{"tool":"runtime.status","arguments":{}}',
+                ]:
+                    yield LLMStreamChunk(kind="delta", content=piece)
+            elif self.rounds == 2:
+                yield LLMStreamChunk(
+                    kind="delta",
+                    content='{"tool":"runtime.status","arguments":{}}',
+                )
+            else:
+                for piece in ["Проверка ", "завершена."]:
+                    yield LLMStreamChunk(kind="delta", content=piece)
+            yield LLMStreamChunk(kind="done", finish_reason="stop")
+
+    llm = MixedStreamToolThenAnswerLLM()
+    agent, storage = _agent(monkeypatch, tmp_path, llm)
+    storage.set_runtime_value("experience.autonomy_policy", {"verify_answers": False})
+    runs = []
+
+    async def fake_run(name, arguments=None, **kwargs):
+        runs.append((name, arguments))
+        return type(
+            "R",
+            (),
+            {"tool": name, "ok": True, "summary": "runtime ok", "data": {"ready": True}},
+        )()
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+
+    async def collect():
+        deltas = []
+        done = None
+        async for item in agent.stream_chat("собери данные и ответь"):
+            if item["type"] == "delta":
+                deltas.append(item["content"])
+            elif item["type"] == "done":
+                done = item
+        return deltas, done
+
+    deltas, done = asyncio.run(collect())
+    visible = "".join(deltas)
+
+    assert visible == "Проверка завершена."
+    assert done["answer"] == visible
+    assert runs == [("runtime.status", {})]
+    assert "Попробую" not in visible
+    assert '"tool"' not in visible
+    assert "Внутренняя ошибка протокола" in "\n".join(
+        item["content"] for item in llm.messages[1] if item["role"] == "system"
+    )
+    storage.close()
+
+
+def test_agentic_stream_forced_final_tool_payload_is_safe_error(monkeypatch, tmp_path):
+    class ToolEvenWhenForcedFinalLLM:
+        def __init__(self) -> None:
+            self.rounds = 0
+
+        async def stream_complete(self, messages, *, temperature=None, max_tokens=None, **kwargs):
+            self.rounds += 1
+            yield LLMStreamChunk(
+                kind="delta",
+                content='{"tool":"runtime.status","arguments":{}}',
+            )
+            yield LLMStreamChunk(kind="done", finish_reason="stop")
+
+    llm = ToolEvenWhenForcedFinalLLM()
+    agent, storage = _agent(monkeypatch, tmp_path, llm)
+    storage.set_runtime_value(
+        "experience.autonomy_policy",
+        {"max_autonomous_steps": 1, "verify_answers": False},
+    )
+    runs = []
+
+    async def fake_run(name, arguments=None, **kwargs):
+        runs.append(name)
+        return type(
+            "R",
+            (),
+            {"tool": name, "ok": True, "summary": "ok", "data": {}},
+        )()
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+
+    async def collect():
+        deltas = []
+        done = None
+        async for item in agent.stream_chat("собери данные и ответь"):
+            if item["type"] == "delta":
+                deltas.append(item["content"])
+            elif item["type"] == "done":
+                done = item
+        return deltas, done
+
+    deltas, done = asyncio.run(collect())
+    visible = "".join(deltas)
+
+    assert runs == ["runtime.status"]
+    assert "Не удалось безопасно завершить запрос" in visible
+    assert '"tool"' not in visible
+    assert done["answer"] == visible
+    assert done["events"][-1]["payload"]["finish_reason"] == "protocol_error"
+    storage.close()
+
+
 def test_mission_step_executes_with_tools_when_llm_enabled(monkeypatch, tmp_path):
     class MissionToolThenReportLLM:
         def __init__(self) -> None:
@@ -568,6 +753,7 @@ def test_agentic_stream_plain_answer_has_no_regression(monkeypatch, tmp_path):
             yield LLMStreamChunk(kind="done", finish_reason="stop")
 
     agent, storage = _agent(monkeypatch, tmp_path, PlainStreamLLM())
+    monkeypatch.setattr(agent, "_tools_for_context", lambda _context: [])
 
     async def collect():
         deltas = []
@@ -577,5 +763,5 @@ def test_agentic_stream_plain_answer_has_no_regression(monkeypatch, tmp_path):
         return deltas
 
     deltas = asyncio.run(collect())
-    assert "".join(deltas) == "Привет, чем помочь?"
+    assert deltas == ["Привет", ", чем помочь?"]
     storage.close()

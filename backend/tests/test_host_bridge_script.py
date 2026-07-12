@@ -102,6 +102,34 @@ def test_action_contract_rejects_unknown_fields_shells_and_string_arguments():
                 "payload": {"executable": "notepad.exe", "arguments": ["--unsafe"]},
             }
         )
+    with pytest.raises(bridge.ActionValidationError, match="Unknown process view"):
+        bridge.validate_action_request(
+            {
+                "action": "process.top",
+                "payload": {"limit": 10, "sort": "cpu", "command": "whoami"},
+            }
+        )
+
+
+@pytest.mark.parametrize("action", ("process.top", "console.show_processes"))
+def test_process_view_contract_is_bounded_and_enum_only(action):
+    bridge = _load_bridge_module()
+
+    validated, payload, timeout = bridge.validate_action_request(
+        {"action": action, "payload": {"limit": 10, "sort": "memory"}}
+    )
+
+    assert validated == action
+    assert payload == {"limit": 10, "sort": "memory"}
+    assert timeout == 30
+    for invalid_payload in (
+        {"limit": 0, "sort": "cpu"},
+        {"limit": 51, "sort": "cpu"},
+        {"limit": "10", "sort": "cpu"},
+        {"limit": 10, "sort": "cpu; Get-Process"},
+    ):
+        with pytest.raises(bridge.ActionValidationError):
+            bridge.validate_action_request({"action": action, "payload": invalid_payload})
 
 
 def test_native_app_policy_rejects_path_aliases_and_accepts_explicit_exact_paths(
@@ -184,6 +212,11 @@ def test_capabilities_publish_versioned_native_app_policy():
     assert len(capabilities["app_paths_sha256"]) == 64
     assert capabilities["process_policy"]["allowed_apps"] == sorted(bridge.NATIVE_APP_NAMES)
     assert "argument_grammars" in capabilities["process_policy"]
+    assert capabilities["process_policy"]["process_views"] == {
+        "actions": ["console.show_processes", "process.top"],
+        "limit": {"minimum": 1, "maximum": 50},
+        "sorts": ["cpu", "memory", "name", "pid"],
+    }
 
 
 @pytest.mark.parametrize(
@@ -256,6 +289,56 @@ def test_process_start_uses_direct_validated_argv_without_shell(monkeypatch):
     ]
     assert captured["kwargs"]["shell"] is False
     assert captured["kwargs"]["stdin"] is subprocess.DEVNULL
+
+
+def test_fixed_process_console_never_executes_request_text(monkeypatch):
+    bridge = _load_bridge_module()
+    captured = {}
+
+    class FakeProcess:
+        pid = 4343
+
+    def fake_popen(argv, **kwargs):
+        captured["argv"] = argv
+        captured["kwargs"] = kwargs
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        bridge,
+        "_canonical_windows_powershell",
+        lambda: r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+    )
+    monkeypatch.setattr(bridge.subprocess, "Popen", fake_popen)
+
+    result, status = bridge.execute_action(
+        {
+            "action": "console.show_processes",
+            "payload": {"limit": 10, "sort": "cpu"},
+        }
+    )
+
+    assert status == 200
+    assert result["ok"] is True
+    assert result["pid"] == 4343
+    assert captured["kwargs"]["shell"] is False
+    assert "-Command" not in captured["argv"]
+    encoded = captured["argv"][captured["argv"].index("-EncodedCommand") + 1]
+    assert base64.b64decode(encoded).decode("utf-16-le") == bridge.FIXED_PROCESS_CONSOLE_POWERSHELL
+    assert json.loads(captured["kwargs"]["env"]["JARVIS_PROCESS_VIEW_JSON"]) == {
+        "limit": 10,
+        "sort": "cpu",
+    }
+    process_block = bridge.FIXED_PROCESS_CONSOLE_POWERSHELL
+    assert process_block.index("Sort-Object") < process_block.index("Select-Object -First")
+
+
+def test_process_top_fixed_script_sorts_before_limiting():
+    bridge = _load_bridge_module()
+    process_block = bridge.FIXED_NATIVE_POWERSHELL.split("'process.top' {", 1)[1].split(
+        "'window.list' {", 1
+    )[0]
+
+    assert process_block.index("Sort-Object") < process_block.index("Select-Object -First")
 
 
 def test_process_argv_redaction_covers_split_inline_and_url_secrets():

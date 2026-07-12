@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import JarvisSettings
-from .model_catalog import MODEL_OVERRIDE_KEY, ModelCatalog
+from .model_catalog import MODEL_OVERRIDE_KEY, ModelCatalog, model_allowed_for_profile
 from .storage import JarvisStorage, new_id, utc_now
 
 HF_API_ROOT = "https://huggingface.co"
@@ -277,6 +277,12 @@ class ModelHubManager:
                 raise ValueError("A model cannot be activated while it is still downloading.")
             if not path.exists() or not path.is_dir():
                 raise ValueError(f"Model is not installed: {model_id}")
+            if not model_allowed_for_profile(self.settings, path.name):
+                raise ValueError(
+                    f"Model {path.name} belongs to another built-in profile. "
+                    f"Select a profile that uses it instead of overriding "
+                    f"{self.settings.profile.name}."
+                )
             self.storage.set_runtime_value(MODEL_OVERRIDE_KEY, path.name)
         self.storage.record_audit(
             actor="operator",

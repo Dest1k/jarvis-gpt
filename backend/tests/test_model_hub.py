@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
+from jarvis_gpt.model_catalog import MODEL_OVERRIDE_KEY
 from jarvis_gpt.model_hub import (
     DOWNLOAD_JOBS_KEY,
     DownloadedFile,
@@ -14,6 +15,54 @@ from jarvis_gpt.model_hub import (
     _safe_model_file_path,
 )
 from jarvis_gpt.storage import JarvisStorage
+
+
+@pytest.mark.parametrize(
+    ("profile_name", "model_id"),
+    [
+        ("gemma4-mono", "gemma4-26b-a4b-nvfp4"),
+        ("gemma4-mono-perf", "gemma4-26b-a4b-nvfp4"),
+        ("gemma4-turbo", "gemma4-31b-it-nvfp4"),
+    ],
+)
+def test_model_hub_rejects_cross_profile_builtin_activation(
+    monkeypatch,
+    tmp_path,
+    profile_name,
+    model_id,
+):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_MODEL_ROOT", str(tmp_path / "models"))
+    settings = load_settings(profile_name)
+    ensure_runtime_dirs(settings)
+    (settings.model_root / model_id).mkdir(parents=True)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    manager = ModelHubManager(settings=settings, storage=storage)
+
+    with pytest.raises(ValueError, match="belongs to another built-in profile"):
+        manager.activate_model(model_id)
+
+    assert storage.get_runtime_value(MODEL_OVERRIDE_KEY, None) is None
+    storage.close()
+
+
+def test_model_hub_keeps_custom_model_override(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_MODEL_ROOT", str(tmp_path / "models"))
+    settings = load_settings("gemma4-mono")
+    ensure_runtime_dirs(settings)
+    custom = settings.model_root / "owner__custom-7b-q4"
+    custom.mkdir(parents=True)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    manager = ModelHubManager(settings=settings, storage=storage)
+
+    result = manager.activate_model(custom.name)
+
+    assert result["model_id"] == custom.name
+    assert storage.get_runtime_value(MODEL_OVERRIDE_KEY, None) == custom.name
+    storage.close()
 
 
 def test_download_file_resumes_part_with_range(monkeypatch, tmp_path):
