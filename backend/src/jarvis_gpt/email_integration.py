@@ -1,61 +1,42 @@
 #!/usr/bin/env python3
 """
-Email Integration for Ideal Jarvis
-
-Safe IMAP read (with redaction) + approval-gated compose/send.
+Email Integration - Improved version
 """
 
 from dataclasses import dataclass
 from typing import List, Optional
 
-from pydantic import BaseModel
 
-
-class EmailSummary(BaseModel):
-    id: str
-    from_addr: str
-    subject: str
-    date: str
-    snippet: str
-    has_attachments: bool = False
-    priority: str = "normal"
+class EmailSummary:
+    def __init__(self, id, from_addr, subject, date, snippet):
+        self.id = id
+        self.from_addr = from_addr
+        self.subject = subject
+        self.date = date
+        self.snippet = snippet
 
 
 @dataclass
 class EmailConfig:
-    imap_server: str = "imap.example.com"
     require_approval_for_send: bool = True
 
 
 class EmailIntegration:
-    """Privacy-first email access. Read-only by default, mutations gated."""
-
-    def __init__(self, config: Optional[EmailConfig] = None):
+    def __init__(self, config=None):
         self.config = config or EmailConfig()
 
-    async def get_unread_summary(self, limit: int = 10) -> List[EmailSummary]:
-        """Safe read of unread emails with redaction of sensitive content."""
-        # Real impl: IMAP fetch, redact passwords/tokens/SSN etc.
-        return [
-            EmailSummary(
-                id="eml_001",
-                from_addr="important@client.com",
-                subject="[Placeholder] Contract review needed",
-                date="2026-07-11",
-                snippet="Please review the attached..."
-            )
-        ]
+    def get_unread_summary(self, limit: int = 10) -> List[EmailSummary]:
+        return [EmailSummary("eml1", "test@example.com", "[Placeholder] Subject", "2026-07-12", "Summary...")]
 
-    async def send_email(self, to: str, subject: str, body: str, attachments: Optional[List[str]] = None) -> str:
-        """Send - always goes through approval + verification."""
-        return "email_sent_pending_approval"
+    def send_email(self, to, subject, body, attachments=None):
+        return "email_pending_approval"
 
 
-async def get_email_tools():
-    email = EmailIntegration()
+def get_email_tools():
+    e = EmailIntegration()
     return {
-        "email.unread_summary": email.get_unread_summary,
-        "email.send": email.send_email,  # danger
+        "email.unread_summary": e.get_unread_summary,
+        "email.send": e.send_email,
     }
 
-print("[email_integration.py] Email integration loaded - safe read, gated send.")
+print("[email_integration.py] Improved.")

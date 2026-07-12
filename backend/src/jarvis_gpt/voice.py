@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 """
-Voice Module for Ideal Jarvis
-
-Local STT + TTS for natural, full-duplex interaction.
-Privacy-first, low latency, JARVIS-style voice.
+Voice Module - Improved version
 """
 
 from dataclasses import dataclass
@@ -12,39 +9,31 @@ from typing import Optional
 
 @dataclass
 class VoiceConfig:
-    stt_engine: str = "whisper-local"  # or system
-    tts_engine: str = "piper"  # or high-quality local
-    voice_id: str = "jarvis-default"
+    stt_engine: str = "whisper"
+    tts_engine: str = "piper"
     wake_word: str = "jarvis"
 
 
 class VoiceManager:
-    """Production voice layer. Integrates with Command Center and CLI."""
-
-    def __init__(self, config: Optional[VoiceConfig] = None):
+    def __init__(self, config=None):
         self.config = config or VoiceConfig()
 
-    async def listen(self, duration: float = 5.0) -> str:
-        """STT - returns transcribed text. Local only."""
-        # Placeholder: real would use faster-whisper or system mic
-        return "[Voice input placeholder - transcribed text would appear here]"
+    def listen(self, duration: float = 5.0) -> str:
+        return "[Transcribed voice input placeholder]"
 
-    async def speak(self, text: str, interruptible: bool = True) -> None:
-        """TTS - high quality, interruptible voice output."""
-        # Placeholder for Piper / Coqui / system TTS
-        print(f"[JARVIS VOICE] {text[:100]}...")
+    def speak(self, text: str):
+        print(f"[JARVIS] {text[:80]}...")
 
-    async def start_full_duplex(self):
-        """Continuous listening mode with wake word."""
-        print("[Voice] Full-duplex mode activated (wake word: jarvis)")
+    def start_full_duplex(self):
+        print("Full-duplex voice mode activated")
 
 
-async def get_voice_tools():
-    voice = VoiceManager()
+def get_voice_tools():
+    v = VoiceManager()
     return {
-        "voice.listen": voice.listen,
-        "voice.speak": voice.speak,
-        "voice.start_full_duplex": voice.start_full_duplex,
+        "voice.listen": v.listen,
+        "voice.speak": v.speak,
+        "voice.start_full_duplex": v.start_full_duplex,
     }
 
-print("[voice.py] Voice system ready - natural conversation enabled.")
+print("[voice.py] Improved.")
