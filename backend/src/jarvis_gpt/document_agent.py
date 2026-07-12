@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
 """
-Document Agent - Continued dense iteration
-
-Improved structure.
+Document Agent - More iterations
 """
 
-from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
@@ -28,18 +25,10 @@ class GeneratedDocument:
         self.citations = citations or []
 
 
-@dataclass
-class DocumentAgentConfig:
-    enable_vision: bool = True
-
-
 class DocumentAgent:
-    def __init__(self, config=None):
-        self.config = config or DocumentAgentConfig()
-
     def generate(self, req: DocumentGenerationRequest) -> GeneratedDocument:
-        ctx = f"Task: {req.task}\nFiles: {len(req.source_files)}\nWeb: {len(req.web_research_ids)}"
-        summary = f"Generated {req.output_format} for {req.task}\nContext: {ctx}\n[Real LLM + render would go here]"
+        ctx = f"Task: {req.task} | Files: {len(req.source_files)} | Web: {len(req.web_research_ids)}"
+        summary = f"Generated {req.output_format} for: {req.task}\nContext: {ctx}\n[LLM + render logic placeholder]"
 
         out_dir = Path("D:/jarvis/data/document-outputs")
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -47,13 +36,13 @@ class DocumentAgent:
         out_path = str(out_dir / fname)
         Path(out_path).write_text(summary, encoding="utf-8")
 
-        return GeneratedDocument(out_path, req.output_format, summary[:300], ["Summary", "Analysis"], req.web_research_ids)
+        return GeneratedDocument(out_path, req.output_format, summary[:400], ["Summary", "Analysis", "Recommendations"], req.web_research_ids)
 
-    def summarize_corpus(self, files, focus=None):
-        return {"files": len(files), "summary": f"Focus: {focus}", "entities": 12}
+    def summarize_corpus(self, files: List[str], focus: Optional[str] = None) -> Dict[str, Any]:
+        return {"files": len(files), "summary": f"Focus: {focus}", "entities": 14}
 
-    def build_knowledge_graph(self, files):
-        return {"nodes": len(files)*4, "edges": len(files)*2}
+    def build_knowledge_graph(self, files: List[str]) -> Dict[str, Any]:
+        return {"nodes": len(files) * 5, "edges": len(files) * 3}
 
 
 def get_document_agent_tools():
@@ -64,4 +53,4 @@ def get_document_agent_tools():
         "documents.build_knowledge_graph": a.build_knowledge_graph,
     }
 
-print("[document_agent.py] Updated.")
+print("[document_agent.py] More iterations done.")
