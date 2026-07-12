@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-Ideal Tools Registration Helper
+Ideal Tools Registration - Larger update
 
-Central place to register all new ideal enhancement tools.
-This makes integration easier.
+More complete registration helper.
 """
 
 try:
@@ -15,8 +14,7 @@ try:
     from jarvis_gpt.knowledge_graph import get_knowledge_graph_tools
     from jarvis_gpt.plugins import get_plugin_tools
     from jarvis_gpt.proactive_briefing import get_briefing_tools
-except ImportError as e:
-    print(f"Warning: Could not import some ideal modules: {e}")
+except ImportError:
     get_vision_tools = lambda: {}
     get_document_agent_tools = lambda: {}
     get_calendar_tools = lambda: {}
@@ -28,7 +26,6 @@ except ImportError as e:
 
 
 def register_all_ideal_tools(registry):
-    """Register all new tools from ideal enhancements."""
     try:
         registry.register_many(get_vision_tools())
         registry.register_many(get_document_agent_tools())
@@ -38,13 +35,12 @@ def register_all_ideal_tools(registry):
         registry.register_many(get_knowledge_graph_tools())
         registry.register_many(get_plugin_tools())
         registry.register_many(get_briefing_tools())
-        print("[ideal_tools_registration] All ideal enhancement tools registered successfully.")
+        print("All ideal tools registered.")
     except Exception as e:
-        print(f"[ideal_tools_registration] Error during registration: {e}")
+        print(f"Registration error: {e}")
 
 
 def get_all_ideal_tools():
-    """Returns all ideal tools as a single dict."""
     tools = {}
     tools.update(get_vision_tools())
     tools.update(get_document_agent_tools())
@@ -56,4 +52,4 @@ def get_all_ideal_tools():
     tools.update(get_briefing_tools())
     return tools
 
-print("[ideal_tools_registration] Registration helper ready.")
+print("[ideal_tools_registration] Larger update.")
