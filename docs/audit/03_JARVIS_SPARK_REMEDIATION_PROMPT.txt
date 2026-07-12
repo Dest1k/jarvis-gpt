@@ -1,0 +1,139 @@
+JARVIS — PHASE C: ИСПРАВЛЕНИЕ РЕЗУЛЬТАТОВ ОБЪЕДИНЁННОГО АУДИТА ЧЕРЕЗ CODEX SPARK
+
+Рабочий Git-репозиторий находится строго в `D:\jarvis-gpt`.
+Тяжёлые runtime-данные, модели, Docker-данные и внешние evidence-файлы находятся в `D:\jarvis`.
+`D:\jarvis` не является репозиторием: не создавай там `.audit`, не редактируй там исходники и не используй его как рабочее дерево.
+
+1. Перейди в `D:\jarvis-gpt` и проверь:
+
+   git -C D:\jarvis-gpt rev-parse --show-toplevel
+
+   Ожидаемый результат — `D:/jarvis-gpt` с допустимым различием регистра и разделителей. Если путь недоступен или это не Git-репозиторий, остановись и сообщи точный blocker; не подменяй его `D:\jarvis`.
+
+2. Прочитай `.audit/LATEST_COMPLETE_RUN.txt`.
+   Если файла нет, не начинай ремонт по частичному статическому аудиту. Сообщи, что PHASE B не разблокировала Spark.
+
+3. Открой указанный run-каталог и полностью прочитай:
+
+   - `PIPELINE_STATE.json`
+   - `EXECUTIVE_SUMMARY.md`
+   - `ASSURANCE_STATEMENT.md`
+   - `spark/READY`
+   - `spark/START_HERE_FOR_SPARK.md`
+   - `spark/SPARK_MASTER_PROMPT.md`
+   - `spark/SPARK_QUEUE.csv`
+   - `spark/SPARK_PROGRESS.md`
+   - `spark/TASK_SCHEMA.md`
+
+4. Проверь, что:
+
+   - `phase_b.status` = `COMPLETE` или `COMPLETE_WITH_BLOCKERS`;
+   - `spark.status` = `READY`;
+   - файл `spark/READY` относится к этому же RUN_ID;
+   - queue не повреждена и consistency-check аудита прошёл.
+
+   Если условие не выполнено, не импровизируй и не чини проект по сырому отчёту. Сохрани точный blocker.
+
+5. Зафиксируй исходный `git status -sb` и текущий HEAD. Не удаляй, не сбрасывай и не присваивай пользовательские изменения. Не используй `git reset --hard`, агрессивный `git clean`, массовый Docker prune или удаление реальных volumes.
+
+6. Начни с первой задачи со статусом `READY`, у которой выполнены все `depends_on` и нет активного file/state conflict. Работай строго по одной задаче.
+
+Для текущей задачи загружай только:
+
+- её `spark/tasks/SPARK-NNNN.md`;
+- связанные `findings/JARVIS-NNNN.md`;
+- перечисленные `context_files`;
+- точные evidence/repro paths;
+- необходимые contracts/scenario rows.
+
+Не загружай весь аудит в контекст без необходимости.
+
+ОБЯЗАТЕЛЬНЫЙ ПОРЯДОК КАЖДОЙ ЗАДАЧИ
+
+1. Зафиксируй baseline и task status.
+2. Восстанови точные preconditions.
+3. Сначала воспроизведи исходный FAIL командами из task.
+4. Если FAIL не воспроизводится:
+   - не делай предположительный patch;
+   - проверь environment/baseline один раз;
+   - сохрани evidence;
+   - поставь `BLOCKED_REPRODUCTION` или предусмотренный task status;
+   - переходи к следующей независимой READY-задаче.
+5. Добавь или обнови regression test, который падает до исправления. Докажи красный результат.
+6. Реализуй минимальный patch только в `allowed_files` и пределах указанного architecture contract.
+7. Не делай несвязанный refactor, переименование, форматирование или dependency upgrade.
+8. Выполни:
+   - узкий regression test;
+   - все `Exact validation commands`;
+   - соседний regression suite;
+   - второй profile, если затронут shared code/config;
+   - Compose/profile/GUI/manual check, если это требуется task.
+9. Для live checks используй `D:\jarvis` только как runtime/data root. Не повреждай реальные user data; corruption/fault tests — только на audit copies/test resources.
+10. Проверь `git diff --check`, полный diff и список changed files на случайные изменения.
+11. Обнови task-файл и `spark/SPARK_PROGRESS.md`:
+    - фактическая root cause;
+    - changed files;
+    - exact commands;
+    - exit codes/results;
+    - regression evidence;
+    - remaining risk;
+    - final status.
+12. Создай один локальный commit с предложенным task message. Не push.
+13. Только после доказанного PASS пометь задачу `DONE` и переходи дальше.
+
+STOP / ESCALATION CONDITIONS
+
+Не импровизируй и не расширяй scope, если:
+
+- contract неоднозначен;
+- task имеет `BLOCKED_BY_SPEC` или `BLOCKED_BY_ENV`;
+- root cause не подтверждается;
+- нужны files вне `allowed_files`;
+- требуется архитектурное решение, не описанное в task;
+- найден конфликт с пользовательскими изменениями;
+- repair требует опасного/destructive action;
+- validation невозможно выполнить;
+- task противоречит более свежему коду.
+
+В таком случае сохрани evidence, точную причину и статус `BLOCKED`, затем продолжи только с независимыми безопасными READY-задачами. Не скрывай blocker зелёным summary.
+
+BATCH VALIDATION
+
+После каждой группы задач выполни соответствующую validation task из queue. Не считай старый audit evidence заменой повторной проверке после patches.
+
+Не запускай параллельно задачи, которые:
+
+- меняют одинаковые files;
+- используют общий persistent state;
+- перезапускают один Docker stack;
+- требуют один GPU/model runtime;
+- изменяют migrations/contracts.
+
+После каждого batch:
+
+- запусти предусмотренный regression scope;
+- проверь оба релевантных profiles;
+- повтори ключевые FAIL-сценарии;
+- проверь новые warnings/errors/resource leaks;
+- обнови progress.
+
+ФИНАЛ КАМПАНИИ
+
+После завершения всех возможных задач:
+
+1. Выполни final validation tasks и полный доступный regression suite.
+2. Повтори P0/P1 scenarios и критичные offline/profile/model/security/data-integrity checks.
+3. Создай `<run>/spark/REMEDIATION_SUMMARY.md`:
+   - DONE/BLOCKED/remaining tasks;
+   - commits по task;
+   - tests/results;
+   - unresolved risks;
+   - regressions found/fixed;
+   - final system validation.
+4. Обнови `PIPELINE_STATE.json`:
+   - `spark.status = COMPLETE`, если все READY-задачи доказанно завершены;
+   - `spark.status = COMPLETE_WITH_BLOCKERS`, если остались документированные blockers;
+   - не ставь COMPLETE при непроверенных patches.
+5. Не push и не открывай PR без отдельной прямой команды пользователя.
+
+Не объявляй проект исправленным только потому, что код компилируется или узкий test зелёный. Успех задачи = исходный FAIL воспроизведён, regression test краснел до patch, patch минимален, все acceptance checks зелёные, соседние сценарии не сломаны, diff чистый и результат задокументирован.
