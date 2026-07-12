@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Proactive Briefing - Improved version
+Proactive Briefing - More refinements
 """
 
 from dataclasses import dataclass
@@ -16,26 +16,13 @@ class Briefing:
 
 
 class ProactiveBriefing:
-    def generate_daily_briefing(self, persona_context: Optional[str] = None) -> Briefing:
-        content = "Daily Briefing\n"
-        content += "- Upcoming events from calendar\n"
-        content += "- Important emails\n"
-        content += "- Web watch triggers\n"
-        content += "- Key lessons from memory\n"
-        content += "[Real synthesis would combine all sources here]"
-
-        return Briefing(
-            title="Daily Briefing",
-            content=content,
-            priority_items=["Review important items", "Focus on key tasks"],
-            sources=["calendar", "email", "web", "memory"]
-        )
+    def generate_daily_briefing(self, persona_context=None):
+        content = "Daily Briefing\n- Calendar events\n- Unread emails\n- Web changes\n- Memory lessons\n[Full synthesis logic would combine sources here]"
+        return Briefing("Daily Briefing", content, ["Key tasks"], ["calendar", "email", "web", "memory"])
 
 
 def get_briefing_tools():
     b = ProactiveBriefing()
-    return {
-        "briefing.daily": b.generate_daily_briefing,
-    }
+    return {"briefing.daily": b.generate_daily_briefing}
 
-print("[proactive_briefing.py] Improved.")
+print("[proactive_briefing.py] More refinements.")
