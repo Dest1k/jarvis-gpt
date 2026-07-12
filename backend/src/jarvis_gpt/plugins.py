@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Plugin System - Large chunk
+Plugin System - Large chunk close to completion
 """
 
 import importlib
@@ -42,4 +42,4 @@ def get_plugin_tools():
         "plugins.load": pm.load_plugin,
     }
 
-print("[plugins.py] Large chunk.")
+print("[plugins.py] Large chunk close to completion.")
