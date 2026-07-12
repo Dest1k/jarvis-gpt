@@ -9,13 +9,51 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-12 - Grok (live DNS shopping metrics on turbo + budget parse)
+
+Branch: `main` @ `bc08d12`. Stack: `gemma4-turbo` / `gemma4-26b-a4b-nvfp4`, dispatcher healthy.
+
+**Operator query (exact):** `найди мне на днс ryzen 9 в районе 50 тысяч рублей любой`
+
+**Result (success after parse fix)**
+
+- Route: shopping → `web.shop_search` (shop=`dns`, criterion=`price_asc`).
+- Catalog query cleaned to **`ryzen 9`** (not `ryzen 9 50`); constraint **`max_price=50000`**.
+- 15 DNS products (Москва). Cheapest: **31 999 ₽** AMD Ryzen 9 5950X OEM  
+  `https://www.dns-shop.ru/product/58fc099217abed20/processor-amd-ryzen-9-5950x-oem/`
+- Also listed 7900X / 9900X / BOX variants in the ~32–37k band.
+
+**End-to-end metrics (this chat turn)**
+
+| Metric | Value |
+|--------|------:|
+| Wall clock | **22.5 s** |
+| `duration_ms` | 22 469 |
+| Prompt tokens Δ | 687 |
+| Generation tokens Δ | 502 |
+| Avg gen tok/s over window | **~22.3** |
+| vLLM peak gen throughput (log) | **~32.8 tok/s** (2 concurrent briefly), then ~22.7 |
+| Prefill peak (log) | **~205 prompt tok/s** |
+| Events | thought → task_kernel → `web.shop_search` ok |
+
+**First attempt before parse fix (failed productively)**
+
+- Subject collapsed to `ryzen 9 50`; DNS returned HTTP 401 / no cards; honest fail + search URL.
+- Wall ~22.5 s; gen Δ ~356; avg gen ~15.7 tok/s (mostly LLM explanation, not catalog).
+
+**Code fix shipped in same commit:** budget phrases `в районе/около/примерно N тысяч [руб]` → `max_price`; money amounts require currency or thousands marker so specs like `до 500 метров` stay non-prices. Tests in `test_shop_routing.py`.
+
 ### 2026-07-12 - Grok (31B decode speed: root cause + working path)
 
-**Measured live**
+**Measured live (synthetic 80-token completion, same host/vLLM 0.23)**
 
-- `gemma4-mono` (24GB CPU offload, 2 seqs): ~0.3–0.8 tok/s total.
-- `gemma4-mono-perf` retuned (12GB offload, eager, 1 seq, 8k): boots, still ~0.6 tok/s.
-- `gemma4-turbo` (26B, no offload, GPU-resident): **~17.3 tok/s** on the same 80-token sample.
+| Profile | Runtime knobs | Gen throughput |
+|---------|---------------|----------------|
+| `gemma4-mono` | 31B, CPU offload 24GB, KV offload 16, eager, 2 seqs, 16k | **~0.3–0.8 tok/s** total |
+| `gemma4-mono-perf` | 31B, CPU offload 12GB, no KV offload, eager, 1 seq, 8k | **~0.6 tok/s** (boots; still PCIe-bound) |
+| `gemma4-turbo` | 26B, no offload, GPU-resident, eager smoke | **~17.3 tok/s** |
+
+Zero-offload 31B is impossible here: checkpoint ~**31.2 GiB** on 32 GiB → no KV room (`Available KV cache memory: -1.93 GiB` at util 0.90). CUDA graphs + UVA offload crash on v0.23; offload profiles must stay eager.
 
 **Why 31B is stuck near 0.5–1 tok/s here**
 
@@ -26,10 +64,10 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 **Profile policy after this**
 
-- Interactive speed → `gemma4-turbo` (default recommendation).
-- 31B quality chat → `gemma4-mono-perf` (12GB offload, eager, 1 seq, 8k) — quality over speed.
+- Interactive speed → `gemma4-turbo` (default recommendation; ~17–33 tok/s gen live).
+- 31B quality chat → `gemma4-mono-perf` (12GB offload, eager, 1 seq, 8k) — quality over speed (~0.6 tok/s).
 - Long-context/OOM-safe 31B → `gemma4-mono` (24GB offload, 16k, 1 seq) — slowest.
-- Live stack left on **turbo** after the speed diagnosis (dispatcher + backend).
+- Live stack left on **turbo** after the speed diagnosis + DNS smoke (dispatcher + backend).
 
 **Not a free lunch:** true high-tok/s 31B on this box needs either a smaller NVFP4 build that fits without offload, native non-WSL GPU runtime, or multi-GPU/TP.
 
