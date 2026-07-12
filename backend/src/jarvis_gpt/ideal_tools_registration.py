@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Ideal Tools Registration - Very large chunk
+Ideal Tools Registration - Final large push
 """
 
 try:
@@ -50,4 +50,4 @@ def get_all_ideal_tools():
     tools.update(get_briefing_tools())
     return tools
 
-print("[ideal_tools_registration] Very large chunk.")
+print("[ideal_tools_registration] Final large push.")
