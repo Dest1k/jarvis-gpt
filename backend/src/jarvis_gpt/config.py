@@ -58,19 +58,20 @@ class RuntimeProfile:
     kv_cache_dtype: str
     max_num_seqs: int
     cpu_offload_gb: int
-    swap_space_gb: int
+    kv_offloading_gb: int
 
 
 PROFILES: dict[str, RuntimeProfile] = {
-    # 31B on RTX 5090 32GB + 128GB RAM: partial weight offload + KV swap.
+    # 31B on RTX 5090 32GB + 128GB RAM: partial weight offload + native KV offload.
     # Prefer this when stability matters (cold start, long context, avoid OOM).
     "gemma4-mono": RuntimeProfile(
         name="gemma4-mono",
         title="Gemma 4 Mono (Offload)",
         description=(
             "Gemma 4 31B IT NVFP4 for RTX 5090 32GB + 128GB RAM with partial CPU "
-            "weight offload and KV swap. Stability-first: eager mode, headroom in "
-            "VRAM, low concurrency — resists OOM/segfault under long context."
+            "weight offload and native KV offload. Stability-first: eager mode, "
+            "headroom in VRAM, low concurrency — resists OOM/segfault under long "
+            "context."
         ),
         model_dir_name="gemma4-31b-it-nvfp4",
         eager_mode=True,
@@ -81,7 +82,7 @@ PROFILES: dict[str, RuntimeProfile] = {
         kv_cache_dtype="fp8",
         max_num_seqs=2,
         cpu_offload_gb=24,
-        swap_space_gb=16,
+        kv_offloading_gb=16,
     ),
     # 31B GPU-first: keep weights on VRAM, shorter context, CUDA graphs.
     # Higher tokens/s when the host is warm and context stays bounded.
@@ -102,7 +103,7 @@ PROFILES: dict[str, RuntimeProfile] = {
         kv_cache_dtype="fp8",
         max_num_seqs=4,
         cpu_offload_gb=0,
-        swap_space_gb=8,
+        kv_offloading_gb=8,
     ),
     "gemma4-turbo": RuntimeProfile(
         name="gemma4-turbo",
@@ -120,7 +121,7 @@ PROFILES: dict[str, RuntimeProfile] = {
         kv_cache_dtype="fp8",
         max_num_seqs=16,
         cpu_offload_gb=0,
-        swap_space_gb=0,
+        kv_offloading_gb=0,
     ),
 }
 
@@ -173,7 +174,7 @@ class JarvisSettings:
                 "kv_cache_dtype": self.profile.kv_cache_dtype,
                 "max_num_seqs": self.profile.max_num_seqs,
                 "cpu_offload_gb": self.profile.cpu_offload_gb,
-                "swap_space_gb": self.profile.swap_space_gb,
+                "kv_offloading_gb": self.profile.kv_offloading_gb,
             },
             "paths": {
                 "data": str(self.data_dir),

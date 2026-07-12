@@ -623,7 +623,8 @@ function Get-DispatcherContainerRuntime {
     kv_cache_dtype = Get-DispatcherFlagValue -Command $Command -Name "kv-cache-dtype"
     max_num_seqs = Get-DispatcherFlagValue -Command $Command -Name "max-num-seqs"
     cpu_offload_gb = Get-DispatcherFlagValue -Command $Command -Name "cpu-offload-gb"
-    swap_space_gb = Get-DispatcherFlagValue -Command $Command -Name "swap-space"
+    kv_offloading_gb = Get-DispatcherFlagValue -Command $Command -Name "kv-offloading-size"
+    kv_offloading_backend = Get-DispatcherFlagValue -Command $Command -Name "kv-offloading-backend"
   }
 }
 
@@ -732,8 +733,8 @@ function Write-LlmReadinessBlock {
     $mode = if ($runtime["enforce_eager"]) { "eager" } else { "cuda-graph" }
     Write-Host ("| Runtime: {0,-28} Mode: {1}  Ctx: {2}" -f $runtime["model_id"], $mode, $runtime["max_model_len"])
     Write-Host ("| vLLM:    gpu-util {0,-6} kv {1,-5} seqs {2}" -f $runtime["gpu_memory_utilization"], $runtime["kv_cache_dtype"], $runtime["max_num_seqs"])
-    if ($runtime["cpu_offload_gb"]) {
-      Write-Host ("| Offload: cpu {0} GB  swap {1} GB" -f $runtime["cpu_offload_gb"], $runtime["swap_space_gb"])
+    if ($runtime["cpu_offload_gb"] -or $runtime["kv_offloading_gb"]) {
+      Write-Host ("| Offload: cpu {0} GB  kv {1} GB ({2})" -f $runtime["cpu_offload_gb"], $runtime["kv_offloading_gb"], $(if ($runtime["kv_offloading_backend"]) { $runtime["kv_offloading_backend"] } else { "native" }))
     }
   }
   Write-Host ("| Docker:  {0,-10} Container: {1}" -f $Readiness.container.state, $Readiness.container.status)

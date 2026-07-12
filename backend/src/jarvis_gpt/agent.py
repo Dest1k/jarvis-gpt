@@ -10,7 +10,7 @@ import os
 import re
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
@@ -210,6 +210,12 @@ CONTINUE_AFTER_LENGTH_PROMPT = (
     "completed text, and finish naturally in Russian."
 )
 
+CONTINUE_INCOMPLETE_TOOL_PROMPT = (
+    "The previous assistant message was truncated mid tool-call JSON. Continue the exact same "
+    "JSON object from the cut-off point. Do not restart, do not add prose or markdown, and "
+    'finish one valid object of the form {"tool":"<name>","arguments":{...}}.'
+)
+
 
 WEB_SYNTHESIS_PROMPT = (
     "web-evidence-synthesis-v1\n"
@@ -376,6 +382,8 @@ EXECUTIVE_AUTONOMOUS_TOOL_ALLOWLIST = frozenset(
         "web.eval",
         "web.document.read",
         "web.fetch",
+        "web.render",
+        "web.shop_search",
         "web.download.inspect",
         "internet.observability",
         "internet.search_api.status",
@@ -866,6 +874,10 @@ class AgentRuntime:
                     temperature=temperature,
                     max_tokens=max_tokens,
                     thinking_enabled=thinking_enabled,
+                    observations=tuple(
+                        _tool_observation_excerpt(item.result, max_chars=400)
+                        for item in agentic.executed_tools
+                    ),
                 )
                 for event in verification_events:
                     events.append(event)
@@ -1118,6 +1130,7 @@ class AgentRuntime:
         stream_error: str | None = None
         stream_finish_reason: str | None = None
         used_tools = 0
+        blocked_by_approval = False
         tools = self._tools_for_context(context)
         allowed = {info.name for info in tools}
         messages = list(llm_messages)
@@ -1140,11 +1153,15 @@ class AgentRuntime:
                     if content:
                         answer_parts.append(content)
                         yield {"type": "delta", "content": content}
+                    if getattr(chunk, "finish_reason", None):
+                        stream_finish_reason = chunk.finish_reason
                 elif chunk.kind == "error":
                     stream_error = chunk.error
                     break
                 elif chunk.kind == "done":
-                    stream_finish_reason = getattr(chunk, "finish_reason", None)
+                    stream_finish_reason = (
+                        getattr(chunk, "finish_reason", None) or stream_finish_reason
+                    )
                     break
             if think_filter:
                 tail = think_filter.flush()
@@ -1169,16 +1186,21 @@ class AgentRuntime:
                 ):
                     if chunk.kind == "delta" and chunk.content:
                         parts.append(chunk.content)
+                        if getattr(chunk, "finish_reason", None):
+                            finish_reason = chunk.finish_reason
                     elif chunk.kind == "error":
                         error = chunk.error
                         break
                     elif chunk.kind == "done":
-                        finish_reason = getattr(chunk, "finish_reason", None)
+                        finish_reason = (
+                            getattr(chunk, "finish_reason", None) or finish_reason
+                        )
                         break
                 return parts, error, finish_reason
 
             protocol_correction_used = False
             force_final = False
+            blocked_by_approval = False
             while used_tools < max_steps:
                 round_parts, round_error, round_finish = await collect_round(messages)
                 raw = "".join(round_parts)
@@ -1186,6 +1208,19 @@ class AgentRuntime:
                     stream_error = round_error
                     break
                 turn = _classify_tool_turn(raw)
+                if (
+                    turn.kind == "protocol_error"
+                    and round_finish == "length"
+                    and _looks_like_broken_tool_payload(raw)
+                ):
+                    raw, _cont, round_finish = await self._auto_continue_incomplete_tool(
+                        messages,
+                        raw,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        thinking_enabled=thinking_enabled,
+                    )
+                    turn = _classify_tool_turn(raw)
                 if turn.kind == "protocol_error":
                     if not protocol_correction_used:
                         protocol_correction_used = True
@@ -1218,6 +1253,7 @@ class AgentRuntime:
                 messages.append({"role": "assistant", "content": raw})
                 messages.append({"role": "user", "content": observation})
                 if event.type == "approval" or used_tools >= max_steps:
+                    blocked_by_approval = event.type == "approval" or blocked_by_approval
                     force_final = True
                     break
 
@@ -1280,6 +1316,7 @@ class AgentRuntime:
             if (
                 not stream_error
                 and stream_finish_reason != "length"
+                and not blocked_by_approval
                 and self._verification_enabled()
                 and self._answer_worth_verifying(answer, used_tools)
             ):
@@ -4519,6 +4556,57 @@ class AgentRuntime:
             finish_reason = _finish_reason_from_llm_result(result) or "stop"
         return answer, continuation_count, finish_reason
 
+    async def _auto_continue_incomplete_tool(
+        self,
+        messages: list[dict[str, str]],
+        partial_payload: str,
+        *,
+        temperature: float | None,
+        max_tokens: int | None,
+        thinking_enabled: bool,
+        max_continuations: int = 2,
+    ) -> tuple[str, int, str | None]:
+        """Recover truncated tool-call JSON before treating it as a protocol error."""
+
+        payload = partial_payload
+        finish_reason: str | None = "length"
+        continuation_count = 0
+        if not hasattr(self.llm, "complete"):
+            return payload, continuation_count, finish_reason
+        for _ in range(max(0, max_continuations)):
+            if finish_reason != "length":
+                break
+            if _classify_tool_turn(payload).kind == "tool":
+                break
+            continuation_max_tokens = max(
+                max_tokens or 0,
+                self.settings.llm_max_tokens,
+                1024,
+            )
+            continuation_messages = [
+                *messages,
+                {"role": "assistant", "content": payload},
+                {"role": "system", "content": CONTINUE_INCOMPLETE_TOOL_PROMPT},
+            ]
+            result = await self._complete_llm(
+                continuation_messages,
+                temperature=temperature,
+                max_tokens=continuation_max_tokens,
+                thinking_enabled=thinking_enabled,
+            )
+            if not result.ok or not result.content:
+                break
+            addition = result.content.strip()
+            if not addition:
+                break
+            # Tool JSON must continue mid-token; never inject a space join.
+            payload = f"{payload}{addition}"
+            continuation_count += 1
+            finish_reason = _finish_reason_from_llm_result(result) or "stop"
+            if _classify_tool_turn(payload).kind == "tool":
+                break
+        return payload, continuation_count, finish_reason
+
     def _verification_enabled(self) -> bool:
         """Result self-check gate: LLM route on, env switch on, policy not opted out."""
 
@@ -4539,6 +4627,7 @@ class AgentRuntime:
         task: str,
         answer: str,
         criteria: tuple[str, ...] = (),
+        observations: Sequence[str] = (),
         kind: str = "chat",
     ) -> Verdict | None:
         """One budgeted critic pass; any failure or timeout means None (draft stands)."""
@@ -4550,6 +4639,7 @@ class AgentRuntime:
                         task=task,
                         answer=answer,
                         criteria=criteria,
+                        observations=observations,
                         kind=kind,
                     ),
                     temperature=0.0,
@@ -4593,6 +4683,7 @@ class AgentRuntime:
         max_tokens: int | None,
         thinking_enabled: bool,
         repair_mode: str = "rewrite",
+        observations: Sequence[str] = (),
     ) -> tuple[str, list[ChatEvent], dict[str, Any] | None]:
         """Self-check the draft against the task; run at most one repair round.
 
@@ -4604,7 +4695,13 @@ class AgentRuntime:
 
         plan = context.task_plan
         criteria = plan.completion_criteria if plan is not None else ()
-        verdict = await self._verify_answer(task=task, answer=answer, criteria=criteria)
+        observation_list = list(observations) or _tool_observation_excerpts(base_messages)
+        verdict = await self._verify_answer(
+            task=task,
+            answer=answer,
+            criteria=criteria,
+            observations=observation_list,
+        )
         if verdict is None:
             return answer, [], None
         if verdict.verdict == "pass":
@@ -4627,9 +4724,25 @@ class AgentRuntime:
             )
         repaired_text = ""
         try:
+            repair_messages = base_messages
+            if observation_list and not any(
+                isinstance(item, dict)
+                and str(item.get("content") or "").startswith("observation[")
+                for item in base_messages
+            ):
+                # Non-stream chat passes pre-tool messages; inject tool facts so
+                # rewrite repair cannot invent work that tools already produced.
+                repair_messages = [
+                    *base_messages,
+                    {
+                        "role": "user",
+                        "content": "Факты из инструментов:\n"
+                        + "\n".join(f"- {item}" for item in observation_list[:6]),
+                    },
+                ]
             result = await asyncio.wait_for(
                 self._complete_llm(
-                    build_repair_messages(base_messages, answer, verdict, mode=repair_mode),
+                    build_repair_messages(repair_messages, answer, verdict, mode=repair_mode),
                     temperature=temperature,
                     max_tokens=max_tokens,
                     thinking_enabled=thinking_enabled,
@@ -4979,11 +5092,26 @@ class AgentRuntime:
                 if used_tools == initial_used_tools:
                     return _AgenticResult(ok=False, answer="", events=events, error=result.error)
                 break
-            turn = _classify_tool_turn(result.content)
+            content = result.content
+            finish_reason = _finish_reason_from_llm_result(result)
+            turn = _classify_tool_turn(content)
+            if (
+                turn.kind == "protocol_error"
+                and finish_reason == "length"
+                and _looks_like_broken_tool_payload(content)
+            ):
+                content, _cont, finish_reason = await self._auto_continue_incomplete_tool(
+                    messages,
+                    content,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    thinking_enabled=thinking_enabled,
+                )
+                turn = _classify_tool_turn(content)
             if turn.kind == "protocol_error":
                 if not protocol_correction_used:
                     protocol_correction_used = True
-                    messages.append({"role": "assistant", "content": result.content})
+                    messages.append({"role": "assistant", "content": content})
                     messages.append(
                         {"role": "system", "content": TOOL_PROTOCOL_CORRECTION_PROMPT}
                     )
@@ -5000,7 +5128,6 @@ class AgentRuntime:
                 )
             if turn.kind == "answer":
                 answer = turn.text
-                finish_reason = _finish_reason_from_llm_result(result)
                 continuation_count = 0
                 if finish_reason == "length":
                     answer, continuation_count, finish_reason = await self._auto_continue_answer(
@@ -5026,7 +5153,7 @@ class AgentRuntime:
             resume = {
                 "kind": "agentic_tool_loop",
                 "messages": _llm_message_snapshot(
-                    [*messages, {"role": "assistant", "content": result.content}]
+                    [*messages, {"role": "assistant", "content": content}]
                 ),
                 "temperature": temperature,
                 "max_tokens": max_tokens,
@@ -5048,7 +5175,7 @@ class AgentRuntime:
                 if isinstance(approval_id, str):
                     approval_ids.append(approval_id)
             used_tools += 1
-            messages.append({"role": "assistant", "content": result.content})
+            messages.append({"role": "assistant", "content": content})
             messages.append({"role": "user", "content": observation})
             if approval_ids:
                 # One durable gate owns the continuation. Creating sibling gates
@@ -6641,9 +6768,21 @@ def _schema_hint(schema: dict[str, Any]) -> str:
     return ", ".join(parts)
 
 
-_TOOL_PAYLOAD_MARKER_RE = re.compile(
-    r"(?is)(?:[\"'](?:tool|name|arguments|args)[\"']|\btool)\s*:"
-)
+_TOOL_JSON_KEY_RE = re.compile(r"""[\"'](?:tool|name|arguments|args)[\"']\s*:""")
+
+
+def _looks_like_broken_tool_payload(content: str) -> bool:
+    """True only for JSON-shaped tool control text, not ordinary prose about tools."""
+
+    text = _clean_assistant_answer(content).strip()
+    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", text, re.IGNORECASE | re.DOTALL)
+    candidate = fenced.group(1).strip() if fenced is not None else text
+    brace_at = candidate.find("{")
+    if brace_at < 0:
+        return False
+    # Require an object body that carries tool control keys. Bare "tool:" prose
+    # without JSON braces must remain a normal answer.
+    return bool(_TOOL_JSON_KEY_RE.search(candidate[brace_at:]))
 
 
 def _classify_tool_turn(content: str) -> _ToolTurn:
@@ -6681,7 +6820,7 @@ def _classify_tool_turn(content: str) -> _ToolTurn:
                 text="",
                 action=(name.strip(), args),
             )
-    if _TOOL_PAYLOAD_MARKER_RE.search(candidate):
+    if _looks_like_broken_tool_payload(candidate):
         return _ToolTurn(kind="protocol_error", text="")
     return _ToolTurn(kind="answer", text=text)
 
@@ -6691,6 +6830,20 @@ def _parse_tool_action(content: str) -> tuple[str, dict[str, Any]] | None:
 
     turn = _classify_tool_turn(content)
     return turn.action if turn.kind == "tool" else None
+
+
+def _tool_observation_excerpts(messages: list[dict[str, str]], *, limit: int = 6) -> list[str]:
+    """Collect recent tool observation strings from an agentic message list."""
+
+    excerpts: list[str] = []
+    for item in messages:
+        if not isinstance(item, dict):
+            continue
+        content = str(item.get("content") or "").strip()
+        if not content.startswith("observation["):
+            continue
+        excerpts.append(content[:400])
+    return excerpts[-limit:]
 
 
 def _tool_observation_excerpt(result: ToolRunResponse, *, max_chars: int = 1400) -> str:

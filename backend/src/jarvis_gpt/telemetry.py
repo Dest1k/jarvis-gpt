@@ -113,7 +113,7 @@ class TelemetryCollector:
             "max_num_seqs": profile.max_num_seqs,
             "eager_mode": profile.eager_mode,
             "cpu_offload_gb": profile.cpu_offload_gb,
-            "swap_space_gb": profile.swap_space_gb,
+            "kv_offloading_gb": profile.kv_offloading_gb,
             "recommended_dispatcher": {
                 "port": 8001,
                 "image": os.environ.get(

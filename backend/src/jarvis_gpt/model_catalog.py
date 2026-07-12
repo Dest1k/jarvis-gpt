@@ -119,9 +119,14 @@ class ModelCatalog:
                     if profile.cpu_offload_gb > 0
                     else ""
                 ),
-                "JARVIS_QWEN_SWAP_SPACE_ARGS": (
-                    f"--swap-space {int(profile.swap_space_gb)}"
-                    if profile.swap_space_gb > 0
+                # vLLM 0.23 removed --swap-space; KV CPU spill uses
+                # --kv-offloading-size / --kv-offloading-backend instead.
+                "JARVIS_QWEN_KV_OFFLOAD_ARGS": (
+                    (
+                        f"--kv-offloading-size {int(profile.kv_offloading_gb)} "
+                        f"--kv-offloading-backend native"
+                    )
+                    if profile.kv_offloading_gb > 0
                     else ""
                 ),
                 "JARVIS_ENABLE_UITARS": "0",

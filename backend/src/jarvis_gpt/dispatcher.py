@@ -26,7 +26,8 @@ RUNTIME_COMPATIBILITY_FIELDS = (
     "kv_cache_dtype",
     "max_num_seqs",
     "cpu_offload_gb",
-    "swap_space_gb",
+    "kv_offloading_gb",
+    "kv_offloading_backend",
     "tokenizer_mode",
     "safetensors_load_strategy",
     "prefix_caching",
@@ -409,9 +410,13 @@ def _runtime_from_env(env: dict[str, str]) -> dict[str, Any]:
             env.get("JARVIS_QWEN_CPU_OFFLOAD_ARGS"),
             "cpu-offload-gb",
         ),
-        "swap_space_gb": _arg_value_from_string(
-            env.get("JARVIS_QWEN_SWAP_SPACE_ARGS"),
-            "swap-space",
+        "kv_offloading_gb": _arg_value_from_string(
+            env.get("JARVIS_QWEN_KV_OFFLOAD_ARGS"),
+            "kv-offloading-size",
+        ),
+        "kv_offloading_backend": _flag_value_from_string(
+            env.get("JARVIS_QWEN_KV_OFFLOAD_ARGS"),
+            "kv-offloading-backend",
         ),
         "tokenizer_mode": env.get("JARVIS_QWEN_TOKENIZER_MODE", ""),
         "safetensors_load_strategy": env.get(
@@ -440,7 +445,10 @@ def _runtime_from_command(command: list[str]) -> dict[str, Any]:
         "kv_cache_dtype": str(flags.get("kv-cache-dtype") or ""),
         "max_num_seqs": _int_or_none(flags.get("max-num-seqs")),
         "cpu_offload_gb": _int_or_none(flags.get("cpu-offload-gb")),
-        "swap_space_gb": _int_or_none(flags.get("swap-space")),
+        "kv_offloading_gb": _int_or_none(flags.get("kv-offloading-size")),
+        "kv_offloading_backend": (
+            str(flags.get("kv-offloading-backend") or "") or None
+        ),
         "tokenizer_mode": str(flags.get("tokenizer-mode") or ""),
         "safetensors_load_strategy": str(
             flags.get("safetensors-load-strategy") or ""
@@ -537,3 +545,14 @@ def _arg_value_from_string(raw: str | None, key: str) -> int | None:
         return None
     flags = _parse_flags([item for item in raw.split() if item])
     return _int_or_none(flags.get(key))
+
+
+def _flag_value_from_string(raw: str | None, key: str) -> str | None:
+    if not raw:
+        return None
+    flags = _parse_flags([item for item in raw.split() if item])
+    value = flags.get(key)
+    if value is True or value is None:
+        return None
+    text = str(value).strip()
+    return text or None

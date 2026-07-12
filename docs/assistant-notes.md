@@ -9,6 +9,44 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-12 - Grok (vLLM 0.23 args + predictability fixes)
+
+Branch: `main` (worktree `D:\jarvis-gpt`). No other agent dirty on this worktree;
+Claude desktop / Codex app processes were idle on other worktrees.
+
+**P0 — mono LLM would not start on vLLM 0.23**
+
+- Live symptom: container restart-loop `unrecognized arguments: --swap-space 16`.
+- Root cause: vLLM 0.23 removed `--swap-space`. KV spill is now
+  `--kv-offloading-size` + `--kv-offloading-backend native`. Weight offload
+  remains `--cpu-offload-gb`.
+- Profiles (unchanged model binding):
+  - `gemma4-turbo` → only `gemma4-26b-a4b-nvfp4` (no offload)
+  - `gemma4-mono` / `gemma4-mono-perf` → only `gemma4-31b-it-nvfp4`
+- Replaced profile field `swap_space_gb` → `kv_offloading_gb`; env
+  `JARVIS_QWEN_KV_OFFLOAD_ARGS`; dispatcher runtime match keys updated.
+- Live verify on mono: weights loaded, `CPUOffloadingSpec` + `kv_offloading_size=16`,
+  `/v1/models` root `gemma4-31b-it-nvfp4`, chat completion returned `Ок`.
+
+**Predictability bugs fixed**
+
+- Executive mission allowlist: added `web.render`, `web.shop_search`.
+- SSE: finish_reason preserved when co-located with final content delta.
+- Truncated tool JSON (`finish_reason=length`) continues before protocol failure.
+- Tool-marker false positives: only JSON-shaped `{..."tool":...}` is protocol_error;
+  prose like `use tool: X` stays an answer.
+- Verify/repair gets tool observations; stream skips verify when approval-gated.
+
+**Files:** `config.py`, `model_catalog.py`, `dispatcher.py`, `docker-compose.yml`,
+`llm.py`, `agent.py`, `telemetry.py`, launcher, frontend types, docs, tests.
+
+**Verification:** Ruff clean; full backend `791 passed, 12 skipped`. Live mono
+dispatcher left running with fixed args (operator home `D:\jarvis`).
+
+**For Codex/Claude:** do not reintroduce `--swap-space`. Do not override built-in
+model dirs across profiles. Next: arbiter must not demote named-shop shopping to
+pure reasoning (P1 remaining); optional docs update for tool protocol.
+
 ### 2026-07-12 - Codex (Windows PowerShell 5 launcher parse fix)
 
 - `b184b2f` added UTF-8 em dashes and middle dots to the profile menu in the BOM-less

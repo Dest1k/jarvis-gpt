@@ -441,7 +441,8 @@ type DispatcherRuntime = {
   kv_cache_dtype?: string;
   max_num_seqs?: number | null;
   cpu_offload_gb?: number | null;
-  swap_space_gb?: number | null;
+  kv_offloading_gb?: number | null;
+  kv_offloading_backend?: string | null;
 };
 
 type DispatcherStatus = {

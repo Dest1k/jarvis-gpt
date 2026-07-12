@@ -33,6 +33,17 @@ def test_stream_chunk_parser_preserves_finish_reason():
     assert chunk.finish_reason == "length"
 
 
+def test_stream_chunk_parser_keeps_finish_reason_on_contentful_delta():
+    chunk = _stream_chunk_from_line(
+        'data: {"choices":[{"delta":{"content":"cut"},"finish_reason":"length"}]}'
+    )
+
+    assert chunk is not None
+    assert chunk.kind == "delta"
+    assert chunk.content == "cut"
+    assert chunk.finish_reason == "length"
+
+
 def test_llm_health_ignores_proxy_environment(monkeypatch, tmp_path):
     captured: dict[str, object] = {}
 

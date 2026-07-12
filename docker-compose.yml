@@ -15,7 +15,7 @@ services:
       --gpu-memory-utilization ${JARVIS_QWEN_GPU_UTIL:-0.82}
       --kv-cache-dtype ${JARVIS_QWEN_KV_DTYPE:-fp8}
       ${JARVIS_QWEN_CPU_OFFLOAD_ARGS:-}
-      ${JARVIS_QWEN_SWAP_SPACE_ARGS:-}
+      ${JARVIS_QWEN_KV_OFFLOAD_ARGS:-}
       --tokenizer-mode ${JARVIS_QWEN_TOKENIZER_MODE:-slow}
       --safetensors-load-strategy ${JARVIS_QWEN_SAFETENSORS_LOAD_STRATEGY:-prefetch}
       --enable-prefix-caching

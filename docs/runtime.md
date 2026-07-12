@@ -1167,7 +1167,7 @@ D:\jarvis\data\models
 ### 31B on RTX 5090 (32GB) + 128GB RAM
 
 - Use `gemma4-mono` when stability matters: partial weight offload (24GB CPU) +
-  KV swap (16GB), eager mode, util 0.85, 16k context, 2 concurrent seqs.
+  native KV offload (16GB), eager mode, util 0.85, 16k context, 2 concurrent seqs.
 - Use `gemma4-mono-perf` for max throughput: no weight offload, CUDA graphs,
   util 0.90, 8k context, 4 seqs, small swap safety net only.
 - Avoid `gpu_memory_utilization` ≥ 0.94 with 16k context on 31B — that profile

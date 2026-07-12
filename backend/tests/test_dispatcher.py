@@ -41,13 +41,16 @@ def test_dispatcher_manager_builds_compose_environment(monkeypatch, tmp_path):
     assert env["JARVIS_QWEN_MAX_NUM_SEQS"] == "2"
     assert env["JARVIS_QWEN_ENFORCE_EAGER"] == "--enforce-eager"
     assert env["JARVIS_QWEN_CPU_OFFLOAD_ARGS"] == "--cpu-offload-gb 24"
-    assert env["JARVIS_QWEN_SWAP_SPACE_ARGS"] == "--swap-space 16"
+    assert env["JARVIS_QWEN_KV_OFFLOAD_ARGS"] == (
+        "--kv-offloading-size 16 --kv-offloading-backend native"
+    )
     assert manager.compose_command("up")[-2:] == ["-d", "dispatcher"]
     assert status["active_model"]["id"] == "gemma4-31b-it-nvfp4"
     assert status["runtime"] is None
     assert status["desired_runtime"]["enforce_eager"] is True
     assert status["desired_runtime"]["cpu_offload_gb"] == 24
-    assert status["desired_runtime"]["swap_space_gb"] == 16
+    assert status["desired_runtime"]["kv_offloading_gb"] == 16
+    assert status["desired_runtime"]["kv_offloading_backend"] == "native"
 
 
 def test_dispatcher_status_redacts_hugging_face_token(monkeypatch, tmp_path):
@@ -97,7 +100,7 @@ def test_dispatcher_turbo_profile_keeps_cuda_graph_path(monkeypatch, tmp_path):
     assert env["JARVIS_QWEN_GPU_UTIL"] == "0.82"
     assert env["JARVIS_QWEN_MAX_LEN"] == "32768"
     assert env["JARVIS_QWEN_CPU_OFFLOAD_ARGS"] == ""
-    assert env["JARVIS_QWEN_SWAP_SPACE_ARGS"] == ""
+    assert env["JARVIS_QWEN_KV_OFFLOAD_ARGS"] == ""
 
 
 def test_dispatcher_mono_perf_profile_is_gpu_first(monkeypatch, tmp_path):
@@ -119,9 +122,13 @@ def test_dispatcher_mono_perf_profile_is_gpu_first(monkeypatch, tmp_path):
     assert env["JARVIS_QWEN_MAX_LEN"] == "8192"
     assert env["JARVIS_QWEN_MAX_NUM_SEQS"] == "4"
     assert env["JARVIS_QWEN_CPU_OFFLOAD_ARGS"] == ""
-    assert env["JARVIS_QWEN_SWAP_SPACE_ARGS"] == "--swap-space 8"
+    assert env["JARVIS_QWEN_KV_OFFLOAD_ARGS"] == (
+        "--kv-offloading-size 8 --kv-offloading-backend native"
+    )
     assert status["desired_runtime"]["enforce_eager"] is False
     assert not status["desired_runtime"].get("cpu_offload_gb")
+    assert status["desired_runtime"]["kv_offloading_gb"] == 8
+    assert status["desired_runtime"]["kv_offloading_backend"] == "native"
 
 
 def test_dispatcher_parses_actual_container_runtime_command():
@@ -143,8 +150,10 @@ def test_dispatcher_parses_actual_container_runtime_command():
         "16",
         "--cpu-offload-gb",
         "8",
-        "--swap-space",
+        "--kv-offloading-size",
         "8",
+        "--kv-offloading-backend",
+        "native",
         "--tokenizer-mode",
         "slow",
         "--safetensors-load-strategy",
@@ -167,7 +176,8 @@ def test_dispatcher_parses_actual_container_runtime_command():
     assert runtime["kv_cache_dtype"] == "fp8"
     assert runtime["max_num_seqs"] == 16
     assert runtime["cpu_offload_gb"] == 8
-    assert runtime["swap_space_gb"] == 8
+    assert runtime["kv_offloading_gb"] == 8
+    assert runtime["kv_offloading_backend"] == "native"
     assert runtime["tokenizer_mode"] == "slow"
     assert runtime["safetensors_load_strategy"] == "prefetch"
     assert runtime["prefix_caching"] is True
@@ -270,8 +280,10 @@ def test_runtime_match_requires_model_and_every_profile_flag(monkeypatch, tmp_pa
             "fp8",
             "--max-num-seqs",
             "4",
-            "--swap-space",
+            "--kv-offloading-size",
             "8",
+            "--kv-offloading-backend",
+            "native",
             "--tokenizer-mode",
             "slow",
             "--safetensors-load-strategy",
@@ -293,7 +305,7 @@ def test_runtime_match_requires_model_and_every_profile_flag(monkeypatch, tmp_pa
         "gpu_memory_utilization",
         "max_num_seqs",
         "cpu_offload_gb",
-        "swap_space_gb",
+        "kv_offloading_gb",
     }
 
 
@@ -339,8 +351,10 @@ def test_dispatcher_reuse_requires_configured_image(
                 "2",
                 "--cpu-offload-gb",
                 "24",
-                "--swap-space",
+                "--kv-offloading-size",
                 "16",
+                "--kv-offloading-backend",
+                "native",
                 "--tokenizer-mode",
                 "slow",
                 "--safetensors-load-strategy",

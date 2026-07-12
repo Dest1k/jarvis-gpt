@@ -170,9 +170,17 @@ def _stream_chunk_from_line(line: str) -> LLMStreamChunk | None:
     choice = choices[0]
     delta = choice.get("delta") or {}
     content = delta.get("content") or choice.get("text") or ""
-    if content:
-        return LLMStreamChunk(kind="delta", content=content, raw=data)
     finish_reason = choice.get("finish_reason")
-    if finish_reason:
-        return LLMStreamChunk(kind="done", finish_reason=str(finish_reason), raw=data)
+    finish = str(finish_reason) if finish_reason else None
+    if content:
+        # Some providers co-locate the final content delta with finish_reason.
+        # Preserve both so length-auto-continue and truncation UX still work.
+        return LLMStreamChunk(
+            kind="delta",
+            content=content,
+            finish_reason=finish,
+            raw=data,
+        )
+    if finish:
+        return LLMStreamChunk(kind="done", finish_reason=finish, raw=data)
     return None
