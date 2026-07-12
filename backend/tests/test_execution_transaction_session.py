@@ -218,10 +218,12 @@ def test_repeated_cancellation_waits_for_checkpoint_creation_and_cleans_it(tmp_p
         await asyncio.wait_for(asyncio.to_thread(create_started.wait), timeout=2)
         task.cancel()
         task.cancel()
-        await asyncio.sleep(0)
-        assert not task.done()
         task.cancel()
-        release_create.set()
+        try:
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(task), timeout=0.05)
+        finally:
+            release_create.set()
         with pytest.raises(asyncio.CancelledError):
             await task
 
@@ -313,12 +315,13 @@ def test_repeated_cancellation_cannot_interrupt_in_flight_action(tmp_path):
         await started.wait()
         task.cancel()
         task.cancel()
-        await asyncio.sleep(0)
         task.cancel()
-        await asyncio.sleep(0)
-        assert task.done() is False
-        assert mutation_finished.is_set() is False
-        release.set()
+        try:
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(task), timeout=0.05)
+            assert mutation_finished.is_set() is False
+        finally:
+            release.set()
         with pytest.raises(asyncio.CancelledError):
             await task
         assert mutation_finished.is_set() is True
@@ -367,12 +370,13 @@ def test_repeated_cancellation_cannot_interrupt_in_flight_rollback(tmp_path):
         await asyncio.wait_for(asyncio.to_thread(rollback_started.wait), timeout=2)
         task.cancel()
         task.cancel()
-        await asyncio.sleep(0)
         task.cancel()
-        await asyncio.sleep(0)
-        assert task.done() is False
-        assert rollback_finished.is_set() is False
-        release_rollback.set()
+        try:
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(task), timeout=0.05)
+            assert rollback_finished.is_set() is False
+        finally:
+            release_rollback.set()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, timeout=2)
 

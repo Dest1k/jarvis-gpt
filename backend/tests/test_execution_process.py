@@ -703,8 +703,11 @@ def test_repeated_cancellation_cannot_interrupt_process_cleanup(monkeypatch, tmp
         await asyncio.wait_for(stop_completed.wait(), timeout=3)
         for _attempt in range(3):
             running.cancel()
-            await asyncio.sleep(0)
-        release_cleanup.set()
+        try:
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(running), timeout=0.05)
+        finally:
+            release_cleanup.set()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(running, timeout=3)
         return session, stopped_returncodes

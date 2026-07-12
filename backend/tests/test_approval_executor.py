@@ -186,10 +186,13 @@ def test_repeated_caller_cancellation_waits_for_action_and_finalization(monkeypa
         task = asyncio.create_task(executor.execute(approval["id"]))
         await entered.wait()
         task.cancel()
-        await asyncio.sleep(0)
         task.cancel()
-        await asyncio.sleep(0)
-        release.set()
+        task.cancel()
+        try:
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(task), timeout=0.05)
+        finally:
+            release.set()
         with pytest.raises(asyncio.CancelledError):
             await task
 

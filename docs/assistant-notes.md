@@ -9,6 +9,21 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-12 - Codex (deterministic repeated-cancellation tests)
+
+- Audited repeated cancellation across transaction checkpoint/action/rollback, process cleanup,
+  API lifespan cleanup, approval finalization, and `WebSurferAdapter.aclose`. Production keeps
+  authoritative mutation/cleanup tasks shielded until completion; no runtime defect or source
+  change was indicated by stress evidence.
+- Replaced flaky `cancel()` + one `sleep(0)` + `task.done()` scheduling assumptions with bounded
+  `wait_for(shield(task))` probes while each explicit test gate remains closed. Gate release is in
+  `finally`, so a failed assertion cannot strand a worker thread, process, or cleanup task.
+- Changed only cancellation regressions in `test_execution_transaction_session.py`,
+  `test_execution_process.py`, `test_api_smoke.py`, `test_approval_executor.py`, and
+  `test_web_surfer_adapter.py`.
+- Verification: cancellation slice passed 25/25 complete stress repetitions with zero failures;
+  full backend suite `758 passed, 13 skipped`; full Ruff, compileall, and `git diff --check` clean.
+
 ### 2026-07-12 - Codex (durable document memory and recall)
 
 - Added `jarvis.document-memory.v1` and safe `documents.recall`: persisted files are resolved

@@ -623,10 +623,12 @@ def test_worker_close_is_idempotent_and_survives_repeated_cancellation():
         await cleanup_started.wait()
         closing.cancel()
         closing.cancel()
-        await asyncio.sleep(0)
-        assert not closing.done()
         closing.cancel()
-        release_cleanup.set()
+        try:
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(closing), timeout=0.05)
+        finally:
+            release_cleanup.set()
         with pytest.raises(asyncio.CancelledError):
             await closing
         await _wait_pid_gone(worker_pid)
