@@ -1150,7 +1150,8 @@ D:\jarvis\data\models
   util 0.90, 8k context, 4 seqs, small swap safety net only.
 - Avoid `gpu_memory_utilization` ≥ 0.94 with 16k context on 31B — that profile
   historically OOMs and can cascade into driver faults.
-- Launcher: `.\jarvis-mono.cmd` / `.\jarvis-mono-offload.cmd` / `.\jarvis-mono-perf.cmd`.
+- Launcher: `.\jarvis.cmd` → Start/Restart → arrow-select profile
+  (Turbo 26B / Mono 31B offload / Mono 31B perf).
 
 Dispatcher запускается отдельно, чтобы не грузить GPU при обычном старте Command Center:
 

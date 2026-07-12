@@ -65,12 +65,12 @@ One-command start/stop/status:
 
 The launcher auto-rebuilds the production frontend when `frontend/app`, `public`, config or lock files are newer than `.next/BUILD_ID`. `jarvis.cmd app` starts the bridge, backend, and UI without starting or later stopping the LLM dispatcher. Full-stack start first reuses an already running dispatcher/OpenAI-compatible endpoint; only when no LLM is active does it start Docker Desktop and the dispatcher. Command Center currently opens on localhost without browser login; LAN mode is temporarily disabled. Use `-NoDockerStart` only for manual Docker diagnostics.
 
-Profile shortcuts:
+Профиль LLM выбирается стрелками в меню `.\jarvis.cmd` (Start / Restart):
+Turbo 26B, Mono 31B offload, Mono 31B perf. CLI-флаг `-Profile` остаётся для скриптов.
 
 ```powershell
-.\jarvis-turbo.cmd
-.\jarvis-mono.cmd
-.\jarvis-start.cmd -Profile gemma4-turbo
+.\jarvis.cmd
+.\jarvis.cmd start -Profile gemma4-mono-perf
 .\jarvis-stop.cmd
 ```
 
@@ -209,7 +209,7 @@ docker compose --profile llm up -d dispatcher
   `documents.review` reports OCR need, Word redline readiness, and Excel
   formula/style audit. Edited copies are written under `data/document-outputs`
   without overwriting originals.
-- Unified launcher `.\jarvis.cmd` provides keyboard-menu start/stop/restart/status/logs/doctor/open flows plus `gemma4-turbo`, `gemma4-mono`, and `gemma4-mono-perf` shortcuts (`jarvis-mono.cmd`, `jarvis-mono-offload.cmd`, `jarvis-mono-perf.cmd`, `jarvis-turbo.cmd`).
+- Unified launcher `.\jarvis.cmd`: keyboard menu (arrows) to start/stop/restart and pick LLM profile — Turbo 26B, Mono 31B offload, Mono 31B perf.
 - Experience API persists operator preferences, autonomy policy, daily briefing, self-heal reports and benchmark history in SQLite.
 - Operator persona (`/api/persona`) is a first-class understanding layer: the agent injects it into every LLM turn, uses `location` as the generic place fallback (weather/local/geo) instead of a weather-only cache, and surfaces `current_focus` in the daily briefing. Editable from Command Center → «Профиль оператора» and via `jarvis persona` / `persona-set`.
 - Command Center exposes briefing, autonomy policy modes, self-heal suggestions, benchmark telemetry and operator communication preferences.

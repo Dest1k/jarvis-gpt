@@ -1733,11 +1733,23 @@ function Invoke-Menu {
 
   if ($choice.Value -in @("start", "app", "restart")) {
     $profiles = @(
-      @{ Label = "gemma4-turbo"; Value = "gemma4-turbo"; Hint = "26B A4B NVFP4, fast warmed runtime (no offload)" },
-      @{ Label = "gemma4-mono"; Value = "gemma4-mono"; Hint = "31B IT NVFP4, partial offload+swap, stability on 5090 32GB" },
-      @{ Label = "gemma4-mono-perf"; Value = "gemma4-mono-perf"; Hint = "31B IT NVFP4, GPU-first max throughput, 8k ctx" }
+      @{
+        Label = "Turbo 26B — fast"
+        Value = "gemma4-turbo"
+        Hint  = "gemma4-26b-a4b-nvfp4 · no offload · max throughput warmed path"
+      },
+      @{
+        Label = "Mono 31B — stable offload"
+        Value = "gemma4-mono"
+        Hint  = "gemma4-31b-it-nvfp4 · CPU offload 24GB + KV swap · 16k ctx · RTX 5090 safe"
+      },
+      @{
+        Label = "Mono 31B — max perf"
+        Value = "gemma4-mono-perf"
+        Hint  = "gemma4-31b-it-nvfp4 · GPU-first · CUDA graphs · 8k ctx · highest tokens/s"
+      }
     )
-    $profileChoice = Select-Menu -Title "Select LLM profile" -Items $profiles
+    $profileChoice = Select-Menu -Title "Select LLM profile (arrows + Enter)" -Items $profiles
     if (-not $profileChoice) {
       return
     }
