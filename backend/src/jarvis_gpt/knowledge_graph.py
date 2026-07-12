@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Knowledge Graph - More refinements
+Knowledge Graph - Large chunk
 """
 
 from dataclasses import dataclass, field
@@ -34,12 +34,12 @@ class KnowledgeGraph:
     def add_relation(self, relation):
         self.relations.append(relation)
 
-    def query(self, query):
-        return [{"name": e.name, "type": e.type} for e in self.entities.values() if query.lower() in e.name.lower()]
+    def query(self, query: str):
+        return [{"name": e.name} for e in self.entities.values() if query.lower() in e.name.lower()]
 
     def build_from_documents(self, chunks):
-        for i in range(min(5, len(chunks))):
-            self.add_entity(Entity(f"e{i}", f"Entity {i}", "concept"))
+        for i in range(min(6, len(chunks))):
+            self.add_entity(Entity(f"ent{i}", f"Entity {i}", "concept"))
 
 
 def get_knowledge_graph_tools():
@@ -49,4 +49,4 @@ def get_knowledge_graph_tools():
         "memory.build_graph_from_docs": kg.build_from_documents,
     }
 
-print("[knowledge_graph.py] More refinements.")
+print("[knowledge_graph.py] Large chunk.")
