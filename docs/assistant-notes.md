@@ -9,6 +9,20 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-12 - Codex (Windows PowerShell 5 launcher parse fix)
+
+- `b184b2f` added UTF-8 em dashes and middle dots to the profile menu in the BOM-less
+  `jarvis-launcher.ps1`. `jarvis.cmd` invokes Windows PowerShell 5.1, whose ANSI fallback decoded
+  the em-dash bytes into mojibake ending in a parser-significant smart quote, breaking the entire
+  script before the menu opened.
+- Replaced all six non-ASCII menu punctuation lines with ASCII `-` and `|`. The launcher is now
+  fully ASCII-safe while remaining UTF-8-compatible; no other parser hazard was found.
+- Added a deployment-contract regression requiring the BOM-less launcher to stay ASCII, so the
+  Windows PowerShell 5.1 failure is caught on every platform.
+- Verification: exact Windows PowerShell 5.1 `Parser.ParseFile` clean; ASCII scan clean; real
+  `.\jarvis.cmd status` exited successfully; full backend suite `759 passed, 13 skipped`; full
+  Ruff, compileall, and `git diff --check` clean.
+
 ### 2026-07-12 - Codex (deterministic repeated-cancellation tests)
 
 - Audited repeated cancellation across transaction checkpoint/action/rollback, process cleanup,

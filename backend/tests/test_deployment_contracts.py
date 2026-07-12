@@ -9,6 +9,15 @@ def _read(relative_path: str) -> str:
     return (REPO_ROOT / relative_path).read_text(encoding="utf-8")
 
 
+def test_launcher_is_ascii_safe_for_windows_powershell_5() -> None:
+    launcher = (REPO_ROOT / "scripts/jarvis-launcher.ps1").read_bytes()
+
+    assert launcher.isascii(), (
+        "BOM-less Windows PowerShell 5 scripts must stay ASCII; UTF-8 punctuation can be "
+        "decoded as parser-significant smart quotes."
+    )
+
+
 def test_backend_image_installs_sandboxed_chromium_and_drops_root() -> None:
     dockerfile = _read("backend/Dockerfile")
     entrypoint = _read("backend/docker-entrypoint.sh")
