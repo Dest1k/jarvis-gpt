@@ -62,16 +62,16 @@ class RuntimeProfile:
 
 
 PROFILES: dict[str, RuntimeProfile] = {
-    # 31B on RTX 5090 32GB + 128GB RAM: partial weight offload + native KV offload.
-    # Prefer this when stability matters (cold start, long context, avoid OOM).
+    # 31B stability path: partial weight offload + native KV offload.
+    # Decode is intentionally slow (PCIe weight streaming). Prefer mono-perf for chat.
     "gemma4-mono": RuntimeProfile(
         name="gemma4-mono",
         title="Gemma 4 Mono (Offload)",
         description=(
-            "Gemma 4 31B IT NVFP4 for RTX 5090 32GB + 128GB RAM with partial CPU "
-            "weight offload and native KV offload. Stability-first: eager mode, "
-            "headroom in VRAM, low concurrency — resists OOM/segfault under long "
-            "context."
+            "Gemma 4 31B IT NVFP4 stability profile for RTX 5090 32GB + 128GB RAM. "
+            "Partial CPU weight offload + native KV offload, eager mode, single-seq. "
+            "Use for cold start / long context / OOM resistance — not for interactive "
+            "tok/s (prefer gemma4-mono-perf or gemma4-turbo)."
         ),
         model_dir_name="gemma4-31b-it-nvfp4",
         eager_mode=True,
@@ -80,30 +80,39 @@ PROFILES: dict[str, RuntimeProfile] = {
         max_model_len=16384,
         gpu_memory_utilization=0.85,
         kv_cache_dtype="fp8",
-        max_num_seqs=2,
+        # One request at a time so background cognition cannot half the already-slow
+        # PCIe-offload decode path.
+        max_num_seqs=1,
         cpu_offload_gb=24,
         kv_offloading_gb=16,
     ),
-    # 31B GPU-first: keep weights on VRAM, shorter context, CUDA graphs.
-    # Higher tokens/s when the host is warm and context stays bounded.
+    # 31B interactive: minimal CPU offload so most weights stay GPU-resident.
+    # Zero-offload is impossible (~31.2 GiB checkpoint on 32 GiB). torch.compile /
+    # CUDA graphs currently break with UVA weight offload on this image, so eager
+    # stays on whenever offload is used.
     "gemma4-mono-perf": RuntimeProfile(
         name="gemma4-mono-perf",
         title="Gemma 4 Mono Perf",
         description=(
-            "Gemma 4 31B IT NVFP4 max-throughput profile for RTX 5090 32GB + 128GB "
-            "RAM. Weights stay on GPU (no CPU offload), CUDA graphs enabled, shorter "
-            "context and modest util headroom to avoid allocator OOM."
+            "Gemma 4 31B IT NVFP4 interactive profile for RTX 5090 32GB + 128GB RAM. "
+            "Minimal CPU weight offload (~12GB) leaves most weights GPU-resident; "
+            "eager mode (required with offload), 8k context, single-seq ownership. "
+            "Much faster than full-offload mono; turbo is still the absolute fastest."
         ),
         model_dir_name="gemma4-31b-it-nvfp4",
-        eager_mode=False,
+        eager_mode=True,
         max_steps=16,
         temperature=0.15,
         max_model_len=8192,
-        gpu_memory_utilization=0.90,
+        # Keep util below free VRAM at process start (host often leaves ~1–2 GiB busy).
+        gpu_memory_utilization=0.92,
         kv_cache_dtype="fp8",
-        max_num_seqs=4,
-        cpu_offload_gb=0,
-        kv_offloading_gb=8,
+        # One operator request owns decode; autonomy waits instead of splitting tok/s.
+        max_num_seqs=1,
+        # Checkpoint ~31.2 GiB: offload enough for KV/activations while keeping
+        # most layers GPU-resident (far less PCIe thrash than mono's 24GB).
+        cpu_offload_gb=12,
+        kv_offloading_gb=0,
     ),
     "gemma4-turbo": RuntimeProfile(
         name="gemma4-turbo",

@@ -8316,10 +8316,32 @@ _SHOPPING_SUBJECT_STOPWORDS = {
     "количеству",
     "отзывов",
     "отзывам",
+    "любой",
+    "любая",
+    "любое",
+    "любые",
+    "районе",
+    "район",
+    "около",
+    "примерно",
+    "порядка",
+    "тысяч",
+    "тысячи",
+    "тыс",
+    "рублей",
+    "рубля",
+    "руб",
 }
 
 
-_SHOPPING_AMOUNT_RE = r"(?:\d{1,3}(?:[\s.,]\d{3})+(?:[,.]\d{1,2})?|\d+(?:[,.]\d{1,2})?)"
+_SHOPPING_AMOUNT_CORE_RE = (
+    r"(?:\d{1,3}(?:[\s.,]\d{3})+(?:[,.]\d{1,2})?|\d+(?:[,.]\d{1,2})?)"
+)
+_SHOPPING_THOUSANDS_RE = r"(?:тыс(?:\.|яч[ауи]?)?|k|т\.?р\.?)"
+# Capture bare numbers and "50 тысяч" / "50к" as one budget token.
+_SHOPPING_AMOUNT_RE = (
+    rf"(?:{_SHOPPING_AMOUNT_CORE_RE}(?:\s*{_SHOPPING_THOUSANDS_RE})?)"
+)
 
 
 _SHOPPING_PRICE_RE = re.compile(
@@ -8333,29 +8355,34 @@ _SHOPPING_PRICE_RE = re.compile(
 )
 
 _SHOPPING_CURRENCY_RE = r"(?:₽|руб(?:\.|лей|ля)?|rub|р\.)"
+# Money amounts must include currency and/or a thousands marker so product specs
+# like "до 500 метров" / "от 7000 МБ/с" are not misread as prices.
+_SHOPPING_MONEY_AMOUNT_RE = (
+    rf"(?:{_SHOPPING_AMOUNT_CORE_RE}"
+    rf"(?:\s*{_SHOPPING_THOUSANDS_RE}(?:\s*{_SHOPPING_CURRENCY_RE})?"
+    rf"|\s*{_SHOPPING_CURRENCY_RE}))"
+)
 _SHOPPING_MAX_PRICE_PATTERNS = (
     re.compile(
-        rf"\b(?:до|не\s+дороже|максимум)\s*({_SHOPPING_AMOUNT_RE})\s*"
-        rf"{_SHOPPING_CURRENCY_RE}(?![a-zа-яё])",
+        rf"\b(?:до|не\s+дороже|максимум|в\s+районе|около|примерно|порядка)\s*"
+        rf"({_SHOPPING_MONEY_AMOUNT_RE})(?![a-zа-яё0-9])",
         flags=re.IGNORECASE,
     ),
     re.compile(
         rf"\b(?:цена|стоимость|бюджет)\w*[^\d]{{0,24}}"
-        rf"(?:до|не\s+дороже|максимум)?\s*({_SHOPPING_AMOUNT_RE})"
-        rf"(?:\s*{_SHOPPING_CURRENCY_RE})?(?![\d.,a-zа-яё])",
+        rf"(?:до|не\s+дороже|максимум|в\s+районе|около|примерно|порядка)?\s*"
+        rf"({_SHOPPING_MONEY_AMOUNT_RE})(?![a-zа-яё0-9])",
         flags=re.IGNORECASE,
     ),
 )
 _SHOPPING_MIN_PRICE_PATTERNS = (
     re.compile(
-        rf"\b(?:не\s+дешевле|от)\s*({_SHOPPING_AMOUNT_RE})\s*"
-        rf"{_SHOPPING_CURRENCY_RE}(?![a-zа-яё])",
+        rf"\b(?:не\s+дешевле|от)\s*({_SHOPPING_MONEY_AMOUNT_RE})(?![a-zа-яё0-9])",
         flags=re.IGNORECASE,
     ),
     re.compile(
         rf"\b(?:цена|стоимость)\w*[^\d]{{0,24}}(?:не\s+дешевле|от)\s*"
-        rf"({_SHOPPING_AMOUNT_RE})(?:\s*{_SHOPPING_CURRENCY_RE})?"
-        rf"(?![\d.,a-zа-яё])",
+        rf"({_SHOPPING_MONEY_AMOUNT_RE})(?![a-zа-яё0-9])",
         flags=re.IGNORECASE,
     ),
 )
@@ -8551,7 +8578,19 @@ def _shopping_constraints_from_message(message: str) -> dict[str, float]:
 
 
 def _metric_number_from_text(value: str) -> float | None:
-    normalized = re.sub(r"[\s ]", "", str(value))
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    thousands = bool(
+        re.search(r"(?i)(?:тыс(?:\.|яч[ауи]?)?|(?<![a-zа-яё])[kк](?![a-zа-яё])|т\.?р\.?)", raw)
+    )
+    # Strip multiplier/currency words before parsing the numeric core.
+    numeric = re.sub(
+        r"(?i)(?:тыс(?:\.|яч[ауи]?)?|(?<![a-zа-яё])[kк](?![a-zа-яё])|т\.?р\.?|₽|руб(?:\.|лей|ля)?|rub|р\.)",
+        "",
+        raw,
+    )
+    normalized = re.sub(r"[\s ]", "", numeric)
     if re.fullmatch(r"\d{1,3}(?:[.,]\d{3})+", normalized):
         normalized = re.sub(r"[.,]", "", normalized)
     elif "," in normalized and "." in normalized:
@@ -8560,9 +8599,12 @@ def _metric_number_from_text(value: str) -> float | None:
     else:
         normalized = normalized.replace(",", ".")
     try:
-        return float(normalized)
+        amount = float(normalized)
     except ValueError:
         return None
+    if thousands:
+        amount *= 1000.0
+    return amount
 
 
 def _shopping_cities_from_message(message: str) -> list[str]:

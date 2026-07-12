@@ -1783,17 +1783,17 @@ function Invoke-Menu {
       @{
         Label = "Turbo 26B - fast"
         Value = "gemma4-turbo"
-        Hint  = "gemma4-26b-a4b-nvfp4 | no offload | max throughput warmed path"
+        Hint  = "gemma4-26b-a4b-nvfp4 | no offload | fastest interactive"
+      },
+      @{
+        Label = "Mono 31B - interactive"
+        Value = "gemma4-mono-perf"
+        Hint  = "gemma4-31b-it-nvfp4 | min offload 12GB | eager | 8k | recommended 31B chat"
       },
       @{
         Label = "Mono 31B - stable offload"
         Value = "gemma4-mono"
-        Hint  = "gemma4-31b-it-nvfp4 | CPU offload 24GB + KV swap | 16k ctx | RTX 5090 safe"
-      },
-      @{
-        Label = "Mono 31B - max perf"
-        Value = "gemma4-mono-perf"
-        Hint  = "gemma4-31b-it-nvfp4 | GPU-first | CUDA graphs | 8k ctx | highest tokens/s"
+        Hint  = "gemma4-31b-it-nvfp4 | CPU offload | 16k | slow decode | long-context/OOM-safe"
       }
     )
     $profileChoice = Select-Menu -Title "Select LLM profile (arrows + Enter)" -Items $profiles

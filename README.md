@@ -166,7 +166,8 @@ py -3.11 .\jarvis.py mission-run <mission_id> --max-steps 8
 .\scripts\doctor.ps1
 ```
 
-`gemma4-mono` — 31B IT NVFP4 со partial CPU offload + native KV offload (стабильность, cold start).
+`gemma4-mono-perf` — 31B IT NVFP4 min-offload interactive (8k; checkpoint ~31.2GiB).  
+`gemma4-mono` — 31B IT NVFP4 со partial CPU offload + native KV offload (стабильность/long-context; decode медленный).
 `gemma4-mono-perf` — тот же 31B, но GPU-first (без offload, CUDA graphs, context 8k) для максимальной скорости.
 `gemma4-turbo` — 26B A4B NVFP4, быстрый warmed path без offload.
 

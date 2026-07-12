@@ -7,6 +7,7 @@ import asyncio
 from jarvis_gpt.agent import (
     AgentRuntime,
     _clean_shopping_subject,
+    _compact_shopping_subject,
     _format_shop_search_answer,
     _looks_like_shopping_query,
     _ranking_criterion_from_message,
@@ -119,6 +120,23 @@ def test_price_constraints_do_not_capture_product_specs():
     assert _shopping_constraints_from_message(
         "лазер до 3 000 рублей на Wildberries"
     ) == {"max_price": 3000.0}
+    assert _shopping_constraints_from_message(
+        "найди мне на днс ryzen 9 в районе 50 тысяч рублей любой"
+    ) == {"max_price": 50000.0}
+    assert (
+        _clean_shopping_subject(
+            "найди мне на днс ryzen 9 в районе 50 тысяч рублей любой"
+        )
+        == "ryzen 9"
+    )
+    assert (
+        _compact_shopping_subject(
+            _clean_shopping_subject(
+                "найди мне на днс ryzen 9 в районе 50 тысяч рублей любой"
+            )
+        )
+        == "ryzen 9"
+    )
     assert _shopping_constraints_from_message(
         "лазер дальностью до 500 метров на Wildberries"
     ) == {}

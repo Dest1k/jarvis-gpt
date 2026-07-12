@@ -171,19 +171,19 @@ External host runtime
 
 Целевое железо для 31B: **RTX 5090 32GB VRAM + 128GB system RAM**.
 
-`gemma4-mono` (partial offload / stability):
+`gemma4-mono` (partial offload / stability, slow decode):
 
 - модель `gemma4-31b-it-nvfp4`;
 - `--cpu-offload-gb 24`, `--kv-offloading-size 16 --kv-offloading-backend native`, eager mode;
-- `gpu_memory_utilization=0.85`, `max_model_len=16384`, `max_num_seqs=2`;
-- cold-start, длинный context, минимум OOM/segfault.
+- `gpu_memory_utilization=0.85`, `max_model_len=16384`, `max_num_seqs=1`;
+- cold-start / long-context / OOM-resistance; не для интерактивного tok/s.
 
-`gemma4-mono-perf` (GPU-first / max throughput):
+`gemma4-mono-perf` (interactive 31B):
 
-- та же 31B NVFP4, веса на GPU (offload 0);
-- CUDA graphs (`eager=false`), `max_model_len=8192`, util `0.90`;
-- `max_num_seqs=4`, emergency `--kv-offloading-size 8 --kv-offloading-backend native` only;
-- максимум tokens/s при ограниченном context.
+- та же 31B NVFP4; checkpoint ~31.2 GiB → zero-offload на 32GB невозможен;
+- минимальный `--cpu-offload-gb 12` (остальное GPU-resident), KV offload 0;
+- eager required with weight offload (torch.compile+UVA breaks on v0.23), 8k, util 0.92, 1 seq;
+- рекомендуемый 31B chat path (гораздо быстрее full-offload mono); turbo быстрее всего.
 
 `gemma4-turbo`:
 

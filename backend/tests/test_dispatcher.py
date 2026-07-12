@@ -38,7 +38,7 @@ def test_dispatcher_manager_builds_compose_environment(monkeypatch, tmp_path):
     assert env["JARVIS_QWEN_SAFETENSORS_LOAD_STRATEGY"] == "prefetch"
     assert env["JARVIS_QWEN_MAX_LEN"] == "16384"
     assert env["JARVIS_QWEN_GPU_UTIL"] == "0.85"
-    assert env["JARVIS_QWEN_MAX_NUM_SEQS"] == "2"
+    assert env["JARVIS_QWEN_MAX_NUM_SEQS"] == "1"
     assert env["JARVIS_QWEN_ENFORCE_EAGER"] == "--enforce-eager"
     assert env["JARVIS_QWEN_CPU_OFFLOAD_ARGS"] == "--cpu-offload-gb 24"
     assert env["JARVIS_QWEN_KV_OFFLOAD_ARGS"] == (
@@ -117,18 +117,16 @@ def test_dispatcher_mono_perf_profile_is_gpu_first(monkeypatch, tmp_path):
     status = manager.status()
 
     assert env["JARVIS_QWEN_MODEL_PATH"] == "/models/gemma4-31b-it-nvfp4"
-    assert env["JARVIS_QWEN_ENFORCE_EAGER"] == ""
-    assert env["JARVIS_QWEN_GPU_UTIL"] == "0.90"
+    assert env["JARVIS_QWEN_ENFORCE_EAGER"] == "--enforce-eager"
+    assert env["JARVIS_QWEN_GPU_UTIL"] == "0.92"
     assert env["JARVIS_QWEN_MAX_LEN"] == "8192"
-    assert env["JARVIS_QWEN_MAX_NUM_SEQS"] == "4"
-    assert env["JARVIS_QWEN_CPU_OFFLOAD_ARGS"] == ""
-    assert env["JARVIS_QWEN_KV_OFFLOAD_ARGS"] == (
-        "--kv-offloading-size 8 --kv-offloading-backend native"
-    )
-    assert status["desired_runtime"]["enforce_eager"] is False
-    assert not status["desired_runtime"].get("cpu_offload_gb")
-    assert status["desired_runtime"]["kv_offloading_gb"] == 8
-    assert status["desired_runtime"]["kv_offloading_backend"] == "native"
+    assert env["JARVIS_QWEN_MAX_NUM_SEQS"] == "1"
+    assert env["JARVIS_QWEN_CPU_OFFLOAD_ARGS"] == "--cpu-offload-gb 12"
+    assert env["JARVIS_QWEN_KV_OFFLOAD_ARGS"] == ""
+    assert status["desired_runtime"]["enforce_eager"] is True
+    assert status["desired_runtime"]["cpu_offload_gb"] == 12
+    assert not status["desired_runtime"].get("kv_offloading_gb")
+    assert not status["desired_runtime"].get("kv_offloading_backend")
 
 
 def test_dispatcher_parses_actual_container_runtime_command():
@@ -272,18 +270,17 @@ def test_runtime_match_requires_model_and_every_profile_flag(monkeypatch, tmp_pa
             "dispatcher",
             "--dtype",
             "auto",
+            "--enforce-eager",
             "--max-model-len",
             "8192",
             "--gpu-memory-utilization",
-            "0.90",
+            "0.92",
             "--kv-cache-dtype",
             "fp8",
             "--max-num-seqs",
-            "4",
-            "--kv-offloading-size",
-            "8",
-            "--kv-offloading-backend",
-            "native",
+            "1",
+            "--cpu-offload-gb",
+            "12",
             "--tokenizer-mode",
             "slow",
             "--safetensors-load-strategy",
@@ -300,12 +297,11 @@ def test_runtime_match_requires_model_and_every_profile_flag(monkeypatch, tmp_pa
 
     assert "model_id" not in mismatches
     assert set(mismatches) == {
-        "enforce_eager",
         "max_model_len",
         "gpu_memory_utilization",
-        "max_num_seqs",
         "cpu_offload_gb",
         "kv_offloading_gb",
+        "kv_offloading_backend",
     }
 
 
@@ -348,7 +344,7 @@ def test_dispatcher_reuse_requires_configured_image(
                 "--kv-cache-dtype",
                 "fp8",
                 "--max-num-seqs",
-                "2",
+                "1",
                 "--cpu-offload-gb",
                 "24",
                 "--kv-offloading-size",

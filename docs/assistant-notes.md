@@ -9,6 +9,30 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-12 - Grok (31B decode speed: root cause + working path)
+
+**Measured live**
+
+- `gemma4-mono` (24GB CPU offload, 2 seqs): ~0.3–0.8 tok/s total.
+- `gemma4-mono-perf` retuned (12GB offload, eager, 1 seq, 8k): boots, still ~0.6 tok/s.
+- `gemma4-turbo` (26B, no offload, GPU-resident): **~17.3 tok/s** on the same 80-token sample.
+
+**Why 31B is stuck near 0.5–1 tok/s here**
+
+1. Checkpoint is ~31.2 GiB on a 32 GiB card → some CPU weight offload is mandatory.
+2. Docker Desktop reports WSL → vLLM sets `pin_memory=False` → UVA/CPU offload decode is pathologically slow.
+3. `torch.compile`/CUDA graphs + UVA offload currently crash on v0.23; offload profiles must stay eager.
+4. Concurrent seqs split the already tiny decode budget.
+
+**Profile policy after this**
+
+- Interactive speed → `gemma4-turbo` (default recommendation).
+- 31B quality chat → `gemma4-mono-perf` (12GB offload, eager, 1 seq, 8k) — quality over speed.
+- Long-context/OOM-safe 31B → `gemma4-mono` (24GB offload, 16k, 1 seq) — slowest.
+- Live stack left on **turbo** after the speed diagnosis (dispatcher + backend).
+
+**Not a free lunch:** true high-tok/s 31B on this box needs either a smaller NVFP4 build that fits without offload, native non-WSL GPU runtime, or multi-GPU/TP.
+
 ### 2026-07-12 - Grok (vLLM 0.23 args + predictability fixes)
 
 Branch: `main` (worktree `D:\jarvis-gpt`). No other agent dirty on this worktree;
