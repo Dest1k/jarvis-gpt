@@ -176,10 +176,10 @@ For the operator and the second model:
 
 ## 2026-07-12 handoff - document_surfer release
 
-- Branch `feature/ideal-jarvis-all-enhancements` ships production `document_surfer`.
-- Experimental ideal modules (vision/calendar/email/voice/plugins/briefing) stay
-  out of core ToolRegistry auto-path; document tools are first-class.
-- See `docs/ideal-jarvis-roadmap.md` and `INTEGRATION_GUIDE.md`.
+- `document_surfer.JarvisDocumentSurfer` is the production document black box
+  (document analogue of `web_surfer`), backed by `file_types` and
+  `archive_runtime`. The `documents.*` tools are first-class in the
+  ToolRegistry and the agent safe allowlist.
 
 ## 2026-07-12 handoff - archives + file type recognition
 
@@ -1166,3 +1166,17 @@ Dispatcher запускается отдельно, чтобы не грузит
 - `audit_log`
 
 Если SQLite собран с FTS5, память индексируется в `memories_fts`, а файловые чанки — в `file_chunks_fts`. Если FTS5 нет, поиск автоматически деградирует до `LIKE`.
+
+## 2026-07-12 — current-turn operator authorization
+
+- Явная команда текущего persisted user message открывает только релевантные mutating tools.
+- Перед выполнением runtime сверяет tool и operands с исходным сообщением и выдаёт одноразовый
+  capability, связанный с conversation id, message id и canonical argument hash.
+- Capability нельзя повторить, подменить аргументы или перенести в mission/task/resume/history.
+- Прямые `browser.open` и `windows.native` используют тот же путь; совпавшая команда выполняется
+  сразу, а не превращается в approval. Незапрошенные действия сохраняют прежний HITL gate.
+- Нормализуются полные URL и домены без схемы; локальный файл можно открыть указанным либо
+  системным приложением. `filesystem.write_text mode=create` атомарно создаёт в разрешённом корне
+  новый, в том числе пустой, файл и не перезаписывает существующий.
+- Команда открыть найденный товар разрешает только один детерминированно выбранный URL из
+  сохранённой текущим диалогом shopping-выдачи; произвольная подмена URL остаётся заблокированной.

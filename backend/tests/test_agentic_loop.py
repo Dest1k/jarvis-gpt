@@ -244,6 +244,47 @@ def test_agentic_loop_gates_dangerous_tool_with_approval(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_explicit_current_turn_write_executes_without_approval(monkeypatch, tmp_path):
+    target = tmp_path / "operator-created.txt"
+    content = b"approved current turn"
+    tool_call = _execution_write_call(
+        target,
+        action_id="operator-write",
+        content=content,
+    )
+
+    class ExplicitWriteLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, messages, *, temperature=None, max_tokens=None, **kwargs):
+            if any("Ты intent-router" in item["content"] for item in messages):
+                return _result(
+                    '{"route":"local_action","confidence":0.99,'
+                    '"rationale":"explicit file write"}'
+                )
+            self.calls += 1
+            if self.calls == 1:
+                return _result(tool_call)
+            return _result("Готово: файл записан.")
+
+    llm = ExplicitWriteLLM()
+    agent, storage = _agent(monkeypatch, tmp_path, llm)
+    storage.set_runtime_value("experience.autonomy_policy", {"verify_answers": False})
+
+    response = asyncio.run(
+        agent.chat(f"Создай файл {target} и запиши approved current turn")
+    )
+
+    assert target.read_bytes() == content
+    assert storage.list_approvals(limit=10, status="pending") == []
+    run = next(run for run in storage.list_tool_runs() if run["tool"] == "execution.apply")
+    assert run["ok"] is True
+    event = next(event for event in response.events if event.payload.get("operator_requested"))
+    assert event.payload["authority"] == "operator_turn"
+    storage.close()
+
+
 def test_agentic_loop_stops_at_step_budget(monkeypatch, tmp_path):
     # Model keeps asking for a tool; loop must force a final answer at the budget.
     class AlwaysToolLLM:

@@ -7,7 +7,14 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from jarvis_gpt.agent import AgentContext, AgentRuntime
+from jarvis_gpt.agent import (
+    AgentContext,
+    AgentRuntime,
+    _native_action_from_message,
+    _operator_action_scopes,
+    _operator_effect_key,
+    _operator_tool_arguments_match,
+)
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
 from jarvis_gpt.event_bus import EventBus
 from jarvis_gpt.executive_runtime import ExecutiveCoordinator
@@ -51,6 +58,176 @@ def _pending_native_request(storage: JarvisStorage):
     assert approval["risk"] == "danger"
     assert approval["payload"]["tool"] == "windows.native"
     return approval, approval["payload"]["arguments"]
+
+
+def _verified_host_action(calls: list[dict]):
+    launched = {"executable": ""}
+
+    async def fake_action(self, *, action, payload=None, timeout_sec=30):
+        payload = dict(payload or {})
+        calls.append({"action": action, "payload": payload, "timeout_sec": timeout_sec})
+        if action == "wmi.query":
+            name = Path(launched["executable"]).name.casefold()
+            return {
+                "ok": True,
+                "summary": "verified",
+                "data": {
+                    "ok": True,
+                    "summary": "verified",
+                    "data": {"items": [{"ProcessId": 4242, "Name": name}]},
+                },
+            }
+        launched["executable"] = str(payload.get("executable") or "")
+        return {
+            "ok": True,
+            "summary": f"Native action {action} completed.",
+            "data": {
+                "ok": True,
+                "summary": f"Native action {action} completed.",
+                "pid": 4242,
+            },
+        }
+
+    return fake_action
+
+
+def _operator_tool_run(storage: JarvisStorage, tool: str):
+    assert storage.list_approvals(limit=10, status="pending") == []
+    runs = [run for run in storage.list_tool_runs() if run["tool"] == tool]
+    assert len(runs) == 1
+    return runs[0]
+
+
+def test_operator_execution_effect_key_canonicalizes_explicit_defaults(tmp_path):
+    target = tmp_path / "canonical.txt"
+    minimal = {
+        "payload": {
+            "protocol": "jarvis.execution.v1",
+            "action": {
+                "kind": "fs.write",
+                "action_id": "first-id",
+                "path": str(target),
+                "content_base64": "aGVsbG8=",
+            },
+        }
+    }
+    explicit_defaults = {
+        "payload": {
+            "protocol": "jarvis.execution.v1",
+            "action": {
+                "kind": "fs.write",
+                "action_id": "second-id",
+                "path": str(target),
+                "content_base64": "aGVsbG8=",
+                "create_parents": False,
+                "require_absent": False,
+                "expected_sha256": None,
+                "mode": None,
+            },
+        },
+        "session_id": None,
+        "finalize_session": False,
+        "safe_gate_token": None,
+        "verification": {},
+    }
+
+    assert _operator_effect_key("execution.apply", minimal) == _operator_effect_key(
+        "execution.apply", explicit_defaults
+    )
+
+
+def test_operator_execution_rejects_unrequested_effect_flags(tmp_path):
+    target = tmp_path / "exact.txt"
+    message = f"Create file {target} and write hello"
+    scopes = _operator_action_scopes(message)
+    payload = {
+        "protocol": "jarvis.execution.v1",
+        "action": {
+            "kind": "fs.write",
+            "path": str(target),
+            "content_base64": "aGVsbG8=",
+        },
+    }
+
+    assert _operator_tool_arguments_match(
+        "execution.apply", {"payload": payload}, message=message, scopes=scopes
+    )
+    escalated = json.loads(json.dumps(payload))
+    escalated["action"]["mode"] = 0o777
+    assert not _operator_tool_arguments_match(
+        "execution.apply", {"payload": escalated}, message=message, scopes=scopes
+    )
+    assert not _operator_tool_arguments_match(
+        "execution.apply",
+        {"payload": payload, "finalize_session": True},
+        message=message,
+        scopes=scopes,
+    )
+
+
+def test_operator_gui_and_browser_authority_rejects_extra_operands():
+    open_message = "Open example.com"
+    open_scopes = _operator_action_scopes(open_message)
+    assert _operator_tool_arguments_match(
+        "browser.open",
+        {"url": "https://example.com"},
+        message=open_message,
+        scopes=open_scopes,
+    )
+    assert not _operator_tool_arguments_match(
+        "browser.open",
+        {"url": "https://example.com/unrequested"},
+        message=open_message,
+        scopes=open_scopes,
+    )
+
+    native_message = "type hello into active window"
+    native_scopes = _operator_action_scopes(native_message)
+    expected = _native_action_from_message(native_message)
+    assert expected is not None
+    exact_native = {"action": expected.action, "payload": expected.payload, "timeout_sec": 30}
+    assert _operator_tool_arguments_match(
+        "windows.native", exact_native, message=native_message, scopes=native_scopes
+    )
+    targeted_native = json.loads(json.dumps(exact_native))
+    targeted_native["payload"]["process_name"] = "KeePass.exe"
+    assert not _operator_tool_arguments_match(
+        "windows.native", targeted_native, message=native_message, scopes=native_scopes
+    )
+
+    browser_message = "type hello into search in browser at https://example.com"
+    browser_scopes = _operator_action_scopes(browser_message)
+    exact_browser = {
+        "url": "https://example.com",
+        "target": "search",
+        "text": "hello",
+    }
+    assert _operator_tool_arguments_match(
+        "browser.type", exact_browser, message=browser_message, scopes=browser_scopes
+    )
+    for extra in (
+        {"allow_sensitive": True},
+        {"debug_url": "http://127.0.0.1:9555"},
+        {"wait_ms": 30000},
+    ):
+        assert not _operator_tool_arguments_match(
+            "browser.type",
+            {**exact_browser, **extra},
+            message=browser_message,
+            scopes=browser_scopes,
+        )
+
+    chrome_message = "Open Chrome"
+    chrome_scopes = _operator_action_scopes(chrome_message)
+    assert _operator_tool_arguments_match(
+        "browser.chrome.launch", {}, message=chrome_message, scopes=chrome_scopes
+    )
+    assert not _operator_tool_arguments_match(
+        "browser.chrome.launch",
+        {"start_url": "https://example.com", "debug_port": 9555},
+        message=chrome_message,
+        scopes=chrome_scopes,
+    )
 
 
 def test_agent_creates_mission_from_large_goal(monkeypatch, tmp_path):
@@ -724,7 +901,7 @@ def test_agent_can_disable_model_thinking(monkeypatch, tmp_path):
     storage.close()
 
 
-def test_agent_requests_approval_before_opening_wiki(monkeypatch, tmp_path):
+def test_agent_executes_explicit_wiki_open_without_approval(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
     settings = load_settings()
@@ -744,16 +921,109 @@ def test_agent_requests_approval_before_opening_wiki(monkeypatch, tmp_path):
 
     assert "ru.wikipedia.org" in response.answer
     assert "Адольф_Гитлер" in response.answer
-    assert not runs
-    assert len(approvals) == 1
-    assert approvals[0]["payload"]["tool"] == "browser.open"
-    assert "ru.wikipedia.org" in approvals[0]["payload"]["arguments"]["url"]
+    assert len(runs) == 1
+    assert runs[0]["tool"] == "browser.open"
+    assert "ru.wikipedia.org" in runs[0]["arguments"]["url"]
+    assert approvals == []
+    event = next(event for event in response.events if event.payload.get("operator_requested"))
+    assert event.payload["authority"] == "operator_turn"
+    storage.close()
+
+
+def test_agent_opens_bare_domain_without_approval(monkeypatch, tmp_path):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+
+    response = asyncio.run(agent.chat("перейди на example.com"))
+
+    run = _operator_tool_run(storage, "browser.open")
+    assert run["arguments"] == {"url": "https://example.com"}
+    assert "https://example.com" in response.answer
+    storage.close()
+
+
+def test_stream_chat_opens_explicit_url_without_approval(monkeypatch, tmp_path):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+
+    async def collect_stream():
+        return [item async for item in agent.stream_chat("open https://example.com")]
+
+    items = asyncio.run(collect_stream())
+
+    run = _operator_tool_run(storage, "browser.open")
+    assert run["arguments"] == {"url": "https://example.com"}
+    assert any(
+        item.get("type") == "event"
+        and item["event"].get("payload", {}).get("authority") == "operator_turn"
+        for item in items
+    )
+    storage.close()
+
+
+def test_agent_opens_file_with_default_windows_application(monkeypatch, tmp_path):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    target = tmp_path / "report.txt"
+    target.write_text("report", encoding="utf-8")
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        "jarvis_gpt.host_bridge.HostBridgeClient.action",
+        _verified_host_action(calls),
+    )
+
+    response = asyncio.run(agent.chat(f'открой файл "{target}"'))
+
+    run = _operator_tool_run(storage, "windows.native")
+    assert run["arguments"]["payload"] == {
+        "executable": "explorer.exe",
+        "arguments": [str(target)],
+    }
+    assert calls[0]["action"] == "process.start"
+    assert "приложении по умолчанию" in response.answer
+    storage.close()
+
+
+def test_agent_creates_empty_file_without_approval(monkeypatch, tmp_path):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    target = tmp_path / "empty.txt"
+
+    response = asyncio.run(agent.chat(f'создай пустой файл "{target}"'))
+
+    assert target.exists()
+    assert target.read_bytes() == b""
+    run = _operator_tool_run(storage, "filesystem.write_text")
+    assert run["arguments"] == {"path": str(target), "content": "", "mode": "create"}
+    assert "Создал пустой файл" in response.answer
+    storage.close()
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "How do I open Notepad?",
+        "Show me how to take a screenshot",
+        "Объясни, как открыть калькулятор",
+        "Фраза 'open Notepad' — это пример команды",
+        "Open Notepad tomorrow",
+    ],
+)
+def test_meta_or_deferred_phrases_do_not_authorize_actions(monkeypatch, tmp_path, message):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+
+    response = asyncio.run(agent.chat(message))
+
+    assert storage.list_tool_runs() == []
+    assert storage.list_approvals(limit=10) == []
+    assert all(not event.payload.get("operator_requested") for event in response.events)
     storage.close()
 
 
 def test_agent_opens_calculator_with_host_bridge(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    calls = []
+    monkeypatch.setattr(
+        "jarvis_gpt.host_bridge.HostBridgeClient.action",
+        _verified_host_action(calls),
+    )
     settings = load_settings()
     ensure_runtime_dirs(settings)
     storage = JarvisStorage(settings.database_path)
@@ -766,10 +1036,9 @@ def test_agent_opens_calculator_with_host_bridge(monkeypatch, tmp_path):
     )
 
     response = asyncio.run(agent.chat("открой калькулятор и набери в нём что-нибудь"))
-    runs = storage.list_tool_runs()
 
-    approval, arguments = _pending_native_request(storage)
-    assert runs == []
+    run = _operator_tool_run(storage, "windows.native")
+    arguments = run["arguments"]
     assert arguments["action"] == "app.open_and_type"
     assert arguments["payload"]["executable"] == "explorer.exe"
     assert any(
@@ -777,15 +1046,20 @@ def test_agent_opens_calculator_with_host_bridge(monkeypatch, tmp_path):
         for item in arguments["payload"]["arguments"]
     )
     assert arguments["payload"]["keys"] == "123{+}456="
-    assert response.events[-1].type == "approval"
-    assert response.events[-1].payload["approval_id"] == approval["id"]
-    assert approval["id"] in response.answer
+    assert calls[0]["action"] == "app.open_and_type"
+    assert response.events[-1].payload["authority"] == "operator_turn"
+    assert "Готово" in response.answer
     storage.close()
 
 
 def test_agent_calculator_understands_russian_multiply_sign(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    calls = []
+    monkeypatch.setattr(
+        "jarvis_gpt.host_bridge.HostBridgeClient.action",
+        _verified_host_action(calls),
+    )
     settings = load_settings()
     ensure_runtime_dirs(settings)
     storage = JarvisStorage(settings.database_path)
@@ -798,10 +1072,8 @@ def test_agent_calculator_understands_russian_multiply_sign(monkeypatch, tmp_pat
     )
 
     response = asyncio.run(agent.chat("открой калькулятор и посчитай там 10х10"))
-    runs = storage.list_tool_runs()
 
-    _approval, arguments = _pending_native_request(storage)
-    assert runs == []
+    arguments = _operator_tool_run(storage, "windows.native")["arguments"]
     assert arguments["action"] == "app.open_and_type"
     assert arguments["payload"]["executable"] == "explorer.exe"
     assert any(
@@ -810,7 +1082,8 @@ def test_agent_calculator_understands_russian_multiply_sign(monkeypatch, tmp_pat
     )
     assert arguments["payload"]["keys"] == "10{*}10="
     assert arguments["payload"]["window_title"] == "Calculator|Калькулятор"
-    assert "Подтвердите approval" in response.answer
+    assert calls[0]["payload"]["keys"] == "10{*}10="
+    assert "Готово" in response.answer
     storage.close()
 
 
@@ -865,22 +1138,32 @@ def test_agent_does_not_treat_creative_writing_as_gui_input(monkeypatch, tmp_pat
     storage.close()
 
 
-def test_agent_gates_explicit_active_window_input(monkeypatch, tmp_path):
+def test_agent_executes_explicit_active_window_input(monkeypatch, tmp_path):
     agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    calls = []
+    monkeypatch.setattr(
+        "jarvis_gpt.host_bridge.HostBridgeClient.action",
+        _verified_host_action(calls),
+    )
 
     response = asyncio.run(agent.chat("введи Jarvis online в активное окно"))
 
-    _approval, arguments = _pending_native_request(storage)
+    arguments = _operator_tool_run(storage, "windows.native")["arguments"]
     assert arguments["action"] == "keyboard.send"
     assert arguments["payload"]["text"] == "Jarvis online"
-    assert storage.list_tool_runs() == []
-    assert response.events[-1].type == "approval"
+    assert calls[0]["action"] == "keyboard.send"
+    assert response.events[-1].payload["authority"] == "operator_turn"
     storage.close()
 
 
 def test_agent_opens_named_programs_through_native_layer(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    calls = []
+    monkeypatch.setattr(
+        "jarvis_gpt.host_bridge.HostBridgeClient.action",
+        _verified_host_action(calls),
+    )
     settings = load_settings()
     ensure_runtime_dirs(settings)
     storage = JarvisStorage(settings.database_path)
@@ -893,13 +1176,32 @@ def test_agent_opens_named_programs_through_native_layer(monkeypatch, tmp_path):
     )
 
     response = asyncio.run(agent.chat("открой Microsoft Edge"))
-    runs = storage.list_tool_runs()
 
-    _approval, arguments = _pending_native_request(storage)
-    assert runs == []
+    arguments = _operator_tool_run(storage, "windows.native")["arguments"]
     assert arguments["action"] == "process.start"
     assert arguments["payload"]["executable"] == "msedge.exe"
-    assert "Подтвердите approval" in response.answer
+    assert calls[0]["action"] == "process.start"
+    assert "Готово" in response.answer
+    storage.close()
+
+
+def test_agent_opens_explicit_file_in_named_app(monkeypatch, tmp_path):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    calls = []
+    monkeypatch.setattr(
+        "jarvis_gpt.host_bridge.HostBridgeClient.action",
+        _verified_host_action(calls),
+    )
+    target = tmp_path / "sample.txt"
+
+    response = asyncio.run(agent.chat(f"Open {target} in Notepad"))
+
+    arguments = _operator_tool_run(storage, "windows.native")["arguments"]
+    assert arguments["action"] == "process.start"
+    assert arguments["payload"]["executable"] == "notepad.exe"
+    assert arguments["payload"]["arguments"] == [str(target)]
+    assert calls[0]["payload"]["arguments"] == [str(target)]
+    assert "Готово" in response.answer
     storage.close()
 
 
@@ -959,6 +1261,11 @@ def test_agent_captures_screen_when_asked_to_look(monkeypatch, tmp_path):
 def test_agent_types_into_general_windows_app(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    calls = []
+    monkeypatch.setattr(
+        "jarvis_gpt.host_bridge.HostBridgeClient.action",
+        _verified_host_action(calls),
+    )
     settings = load_settings()
     ensure_runtime_dirs(settings)
     storage = JarvisStorage(settings.database_path)
@@ -971,19 +1278,17 @@ def test_agent_types_into_general_windows_app(monkeypatch, tmp_path):
     )
 
     response = asyncio.run(agent.chat("открой блокнот и напиши Jarvis online"))
-    runs = storage.list_tool_runs()
 
-    _approval, arguments = _pending_native_request(storage)
+    arguments = _operator_tool_run(storage, "windows.native")["arguments"]
     payload = arguments["payload"]
-    assert runs == []
     assert arguments["action"] == "app.open_and_type"
     assert payload["executable"] == "notepad.exe"
     assert payload["text"] == "Jarvis online"
     assert len(payload["arguments"]) == 1
     assert "scratch-notepad-" in payload["arguments"][0]
     assert payload["arguments"][0].endswith(".txt")
-    assert not list(settings.data_dir.glob("scratch-notepad-*.txt"))
-    assert "Подтвердите approval" in response.answer
+    assert calls[0]["action"] == "app.open_and_type"
+    assert "Готово" in response.answer
     storage.close()
 
 
@@ -1654,12 +1959,77 @@ def test_agent_sorts_previous_shopping_results_and_opens_cheapest(monkeypatch, t
     open_calls = [call for call in calls if call[0] == "browser.open"]
     approvals = storage.list_approvals(limit=5, status="pending")
     assert len(search_calls) == 1
-    assert not open_calls
-    assert len(approvals) == 1
-    assert approvals[0]["payload"]["tool"] == "browser.open"
-    assert approvals[0]["payload"]["arguments"]["url"] == "https://shop.example/cheap"
+    assert len(open_calls) == 1
+    assert open_calls[0][1]["url"] == "https://shop.example/cheap"
+    assert approvals == []
     assert "399 000" in response.answer
     assert "https://shop.example/cheap" in response.answer
+    event = next(event for event in response.events if event.payload.get("derived_selection"))
+    assert event.payload["authority"] == "operator_turn"
+    assert event.payload["operator_requested"] is True
+    storage.close()
+
+
+def test_agent_searches_and_opens_selected_shopping_result_in_same_turn(monkeypatch, tmp_path):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    calls = []
+
+    async def fake_run(name, arguments=None, **kwargs):
+        calls.append((name, arguments or {}, kwargs))
+        if name == "web.search":
+            return _tool_response(
+                name,
+                True,
+                "Web search returned 2 result(s).",
+                {
+                    "results": [
+                        {
+                            "title": "RTX 5090 Expensive",
+                            "url": "https://shop.example/expensive",
+                            "snippet": "RTX 5090 499 000 ₽ в наличии",
+                        },
+                        {
+                            "title": "RTX 5090 Cheap",
+                            "url": "https://shop.example/cheap",
+                            "snippet": "RTX 5090 399 000 ₽ в наличии",
+                        },
+                    ]
+                },
+            )
+        if name == "web.fetch":
+            return _tool_response(
+                name,
+                True,
+                "Fetched URL with HTTP 200.",
+                {
+                    "url": arguments["url"],
+                    "text": "товар "
+                    + ("399 000 ₽" if "cheap" in arguments["url"] else "499 000 ₽"),
+                },
+            )
+        if name == "browser.open":
+            return _tool_response(
+                name,
+                True,
+                "Browser open requested.",
+                {"url": arguments["url"]},
+            )
+        raise AssertionError(f"unexpected tool {name}")
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+
+    response = asyncio.run(agent.chat("найди и открой самую дешёвую RTX 5090"))
+
+    open_calls = [call for call in calls if call[0] == "browser.open"]
+    assert len(open_calls) == 1
+    assert open_calls[0][1]["url"] == "https://shop.example/cheap"
+    assert open_calls[0][2]["conversation_id"] == response.conversation_id
+    assert open_calls[0][2]["user_message_id"]
+    assert open_calls[0][2]["authorization"].tool == "browser.open"
+    assert storage.list_approvals(limit=5, status="pending") == []
+    assert "https://shop.example/cheap" in response.answer
+    event = next(event for event in response.events if event.payload.get("derived_selection"))
+    assert event.payload["authority"] == "operator_turn"
     storage.close()
 
 

@@ -456,10 +456,11 @@ def _list_tar(path: Path, kind: str, cfg: ArchiveConfig) -> list[dict[str, Any]]
             )
         for info in infos:
             name = info.name.replace("\\", "/")
-            if info.issym() or info.islnk():
-                if not cfg.allow_symlinks:
-                    members.append({"name": name, "is_dir": False, "size": 0, "symlink": True, "skipped": True})
-                    continue
+            if (info.issym() or info.islnk()) and not cfg.allow_symlinks:
+                members.append(
+                    {"name": name, "is_dir": False, "size": 0, "symlink": True, "skipped": True}
+                )
+                continue
             if info.isdir():
                 members.append({"name": name.rstrip("/"), "is_dir": True, "size": 0})
                 continue
@@ -543,7 +544,9 @@ def _list_rar(path: Path, cfg: ArchiveConfig) -> list[dict[str, Any]]:
             try:
                 safe = _safe_member_name(name)
             except ArchiveSafetyError:
-                members.append({"name": name, "is_dir": False, "size": info.file_size, "unsafe": True})
+                members.append(
+                    {"name": name, "is_dir": False, "size": info.file_size, "unsafe": True}
+                )
                 continue
             members.append({"name": safe, "is_dir": False, "size": int(info.file_size or 0)})
     return members
@@ -691,7 +694,11 @@ def _extract_7z(
     targets = list(wanted) if wanted else None
     with py7zr.SevenZipFile(path, mode="r") as archive:
         # py7zr extracts with its own path checks; still re-validate listed names.
-        all_names = [str(i.filename).replace("\\", "/") for i in archive.list() if not i.is_directory]
+        all_names = [
+            str(i.filename).replace("\\", "/")
+            for i in archive.list()
+            if not i.is_directory
+        ]
         for name in all_names:
             _safe_member_name(name)
         archive.extract(path=dest_root, targets=targets)
@@ -828,9 +835,8 @@ def _read_member_bytes(
             import rarfile  # type: ignore[import-not-found]
         except ImportError as exc:
             raise ArchiveUnsupportedError("RAR requires rarfile") from exc
-        with rarfile.RarFile(path) as archive:
-            with archive.open(member) as handle:
-                return handle.read(limit)
+        with rarfile.RarFile(path) as archive, archive.open(member) as handle:
+            return handle.read(limit)
     raise ArchiveUnsupportedError(f"Reading members not supported for '{kind}'")
 
 

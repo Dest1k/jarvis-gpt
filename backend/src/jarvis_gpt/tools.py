@@ -14,9 +14,10 @@ import shutil
 import socket
 import subprocess
 import tempfile
+import threading
 import zipfile
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html import unescape
@@ -394,6 +395,83 @@ def _web_surfer_tool_spec() -> ToolSpec:
     )
 
 
+class OperatorTurnAuthorizationError(ValueError):
+    """An exact current-turn capability was invalid, mismatched, or replayed."""
+
+
+@dataclass(frozen=True)
+class OperatorTurnAuthorization:
+    """One-use capability for one exact tool call from one persisted user turn."""
+
+    conversation_id: str
+    user_message_id: str
+    tool: str
+    arguments_sha256: str
+    fingerprint: str
+    _consumed: bool = field(default=False, init=False, repr=False, compare=False)
+    _lock: Any = field(default_factory=threading.Lock, init=False, repr=False, compare=False)
+
+    @classmethod
+    def bind(
+        cls,
+        *,
+        conversation_id: str,
+        user_message_id: str,
+        tool: str,
+        arguments: dict[str, Any],
+    ) -> OperatorTurnAuthorization:
+        conversation = str(conversation_id or "").strip()
+        message_id = str(user_message_id or "").strip()
+        tool_name = str(tool or "").strip()
+        if not conversation or not message_id or not tool_name:
+            raise ValueError("Operator authorization requires conversation, message and tool.")
+        digest = _operator_arguments_sha256(arguments)
+        fingerprint = hashlib.sha256(
+            f"{conversation}\0{message_id}\0{tool_name}\0{digest}".encode()
+        ).hexdigest()
+        return cls(conversation, message_id, tool_name, digest, fingerprint)
+
+    def consume(
+        self,
+        *,
+        conversation_id: str | None,
+        user_message_id: str | None,
+        tool: str,
+        arguments: dict[str, Any],
+        mission_id: str | None,
+        task_id: str | None,
+    ) -> None:
+        if mission_id is not None or task_id is not None:
+            raise OperatorTurnAuthorizationError(
+                "Current-turn authorization is unavailable to missions and tasks."
+            )
+        expected = OperatorTurnAuthorization.bind(
+            conversation_id=str(conversation_id or ""),
+            user_message_id=str(user_message_id or ""),
+            tool=tool,
+            arguments=arguments,
+        )
+        with self._lock:
+            if self._consumed:
+                raise OperatorTurnAuthorizationError("Operator authorization was already used.")
+            if expected.fingerprint != self.fingerprint:
+                raise OperatorTurnAuthorizationError(
+                    "Operator authorization does not match this exact tool call."
+                )
+            object.__setattr__(self, "_consumed", True)
+
+
+def _operator_arguments_sha256(arguments: dict[str, Any]) -> str:
+    canonical = json.dumps(
+        arguments,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 class ToolRegistry:
     def __init__(
         self,
@@ -449,9 +527,29 @@ class ToolRegistry:
         mission_id: str | None = None,
         task_id: str | None = None,
         allow_danger: bool = False,
+        conversation_id: str | None = None,
+        user_message_id: str | None = None,
+        authorization: OperatorTurnAuthorization | None = None,
     ) -> ToolRunResponse:
         spec = self.get(name)
         args = arguments or {}
+        operator_authorized = False
+        authorization_error: str | None = None
+        if authorization is not None:
+            try:
+                authorization.consume(
+                    conversation_id=conversation_id,
+                    user_message_id=user_message_id,
+                    tool=name,
+                    arguments=args,
+                    mission_id=mission_id,
+                    task_id=task_id,
+                )
+            except (OperatorTurnAuthorizationError, TypeError, ValueError) as exc:
+                authorization_error = str(exc)
+            else:
+                operator_authorized = True
+        approved = allow_danger or operator_authorized
         if spec is None:
             response = ToolRunResponse(
                 tool=name,
@@ -459,7 +557,14 @@ class ToolRegistry:
                 summary=f"Tool {name!r} is not registered.",
                 data={"available": [tool.name for tool in self.list()]},
             )
-        elif spec.danger_level != "safe" and not allow_danger:
+        elif authorization_error is not None:
+            response = ToolRunResponse(
+                tool=name,
+                ok=False,
+                summary=f"Operator authorization rejected: {authorization_error}",
+                data={"authorization_rejected": True},
+            )
+        elif spec.danger_level != "safe" and not approved:
             response = ToolRunResponse(
                 tool=name,
                 ok=False,
@@ -484,7 +589,7 @@ class ToolRegistry:
                 playbooks=self.playbooks,
                 web_surfer=self.web_surfer,
                 executive=self.executive,
-                approved=allow_danger,
+                approved=approved,
                 mission_id=mission_id,
                 task_id=task_id,
             )
@@ -514,7 +619,15 @@ class ToolRegistry:
             kind="tool.run",
             title=response.summary,
             level="info" if response.ok else "warn",
-            payload={"tool": response.tool, "mission_id": mission_id, "task_id": task_id},
+            payload={
+                "tool": response.tool,
+                "mission_id": mission_id,
+                "task_id": task_id,
+                "authority": "operator_turn" if operator_authorized else "tool_policy",
+                "authorization_fingerprint": (
+                    authorization.fingerprint if operator_authorized and authorization else None
+                ),
+            },
         )
         return response
 
@@ -1929,7 +2042,7 @@ class ToolRegistry:
                 input_schema={
                     "path": "Path to write",
                     "content": "UTF-8 text content",
-                    "mode": "overwrite or append",
+                    "mode": "overwrite, append, or create (fail if the path exists)",
                 },
                 handler=_filesystem_write_text,
                 danger_level="review",
@@ -4851,7 +4964,9 @@ def _documents_archive_create(ctx: ToolContext, args: dict[str, Any]) -> ToolRun
 def _documents_archive_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     query = " ".join(str(args.get("query") or "").split())
     if not query:
-        return ToolRunResponse(tool="documents.archive.search", ok=False, summary="query is required.")
+        return ToolRunResponse(
+            tool="documents.archive.search", ok=False, summary="query is required."
+        )
     max_members = _int_arg(args.get("max_members"), default=40, minimum=1, maximum=200)
     try:
         path = _document_path_only(ctx, args)
@@ -8825,14 +8940,14 @@ async def _filesystem_write_text(ctx: ToolContext, args: dict[str, Any]) -> Tool
         path = _resolve_allowed_path(ctx.settings, str(args.get("path") or ""))
     except ValueError as exc:
         return ToolRunResponse(tool="filesystem.write_text", ok=False, summary=str(exc))
-    content = str(args.get("content") or "")
-    if not content:
+    if "content" not in args:
         return ToolRunResponse(
             tool="filesystem.write_text",
             ok=False,
             summary="Content is required.",
             data={"path": str(path)},
         )
+    content = str(args.get("content") or "")
     if len(content) > 200_000:
         return ToolRunResponse(
             tool="filesystem.write_text",
@@ -8841,11 +8956,11 @@ async def _filesystem_write_text(ctx: ToolContext, args: dict[str, Any]) -> Tool
             data={"path": str(path), "chars": len(content), "max_chars": 200_000},
         )
     mode = str(args.get("mode") or "overwrite").strip().lower()
-    if mode not in {"overwrite", "append"}:
+    if mode not in {"overwrite", "append", "create"}:
         return ToolRunResponse(
             tool="filesystem.write_text",
             ok=False,
-            summary="Mode must be 'overwrite' or 'append'.",
+            summary="Mode must be 'overwrite', 'append', or 'create'.",
             data={"path": str(path), "mode": mode},
         )
     if path.exists() and path.is_dir():
@@ -8868,8 +8983,11 @@ async def _filesystem_write_text(ctx: ToolContext, args: dict[str, Any]) -> Tool
             "path": str(path),
             "content_base64": base64.b64encode(encoded).decode("ascii"),
             "create_parents": True,
+            "require_absent": mode == "create",
             "expected_sha256": (
-                hashlib.sha256(previous).hexdigest() if path.exists() else None
+                hashlib.sha256(previous).hexdigest()
+                if path.exists() and mode != "create"
+                else None
             ),
         },
     }
@@ -9128,7 +9246,12 @@ def _document_target(
             document = extract_document(path, max_chars=max_chars)
         else:
             document = _document_surfer_for(ctx)._load(path, max_chars=max_chars)
-    except (DocumentRuntimeError, DocumentSurferError, DocumentUnsupportedError, DocumentSafetyError) as exc:
+    except (
+        DocumentRuntimeError,
+        DocumentSurferError,
+        DocumentUnsupportedError,
+        DocumentSafetyError,
+    ) as exc:
         raise ValueError(str(exc)) from exc
     return {"path": path, "file": file_record, "document": document}
 

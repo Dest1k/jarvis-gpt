@@ -32,7 +32,7 @@ import shutil
 import zipfile
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
@@ -41,10 +41,18 @@ from .archive_runtime import (
     ArchiveConfig,
     ArchiveError,
     archive_capabilities,
-    create_archive as archive_create,
-    extract_archive as archive_extract,
     is_archive_path,
+)
+from .archive_runtime import (
+    create_archive as archive_create,
+)
+from .archive_runtime import (
+    extract_archive as archive_extract,
+)
+from .archive_runtime import (
     list_archive as archive_list,
+)
+from .archive_runtime import (
     read_archive_member as archive_read_member,
 )
 from .document_runtime import (
@@ -243,7 +251,9 @@ def document_surfer_capabilities(*, path: Path | None = None) -> dict[str, Any]:
         },
         "visual_diff": {"available": bool(libre)},
         "mutation": {
-            "exact_replacements": ["docx", "xlsx", "xlsm", "txt", "md", "html", "csv", "tsv", "json", "xml", "log"],
+            "exact_replacements": [
+                "docx", "xlsx", "xlsm", "txt", "md", "html", "csv", "tsv", "json", "xml", "log",
+            ],
             "generate": kinds["generate"],
             "archives_create": archive_capabilities().get("create") or [],
             "never_overwrites_original": True,
@@ -336,7 +346,8 @@ class JarvisDocumentSurfer:
             "sha256": digest,
             "type": info.to_dict(),
             "is_archive": info.is_archive and not (
-                info.is_document and info.kind in {"docx", "xlsx", "xlsm", "pptx", "odt", "ods", "odp", "epub"}
+                info.is_document
+                and info.kind in {"docx", "xlsx", "xlsm", "pptx", "odt", "ods", "odp", "epub"}
             ),
             "is_document": bool(info.is_document or info.is_text),
             "markdown": (
@@ -688,7 +699,9 @@ class JarvisDocumentSurfer:
                     else "text_diff_only"
                 ),
                 "can_apply_exact_replacements": str(document.get("kind") or "")
-                in {"docx", "txt", "md", "html", "csv", "tsv", "json", "xml", "log", "xlsx", "xlsm"},
+                in {
+                    "docx", "txt", "md", "html", "csv", "tsv", "json", "xml", "log", "xlsx", "xlsm",
+                },
                 "track_changes_native": False,
             },
             "excel": {
@@ -915,7 +928,10 @@ class JarvisDocumentSurfer:
             "markdown": (
                 f"# Edit plan: {document.get('name')}\n\n"
                 f"Instruction: {instruction_clean}\n\n"
-                + "\n".join(f"{index}. {step}" for index, step in enumerate(plan["recommended_steps"], 1))
+                + "\n".join(
+                    f"{index}. {step}"
+                    for index, step in enumerate(plan["recommended_steps"], 1)
+                )
             ),
         }
 
@@ -1005,7 +1021,7 @@ class JarvisDocumentSurfer:
             stem_suffix="",
         )
         meta = dict(metadata or {})
-        meta.setdefault("generated_at", datetime.now(timezone.utc).isoformat())
+        meta.setdefault("generated_at", datetime.now(UTC).isoformat())
         meta.setdefault("generator", "jarvis.document_surfer")
         meta.setdefault("title", title_clean)
 
@@ -1150,7 +1166,8 @@ class JarvisDocumentSurfer:
             for member in members:
                 name = member.name
                 if name in used_names:
-                    name = f"{member.stem}-{hashlib.sha1(str(member).encode()).hexdigest()[:8]}{member.suffix}"
+                    digest = hashlib.sha1(str(member).encode()).hexdigest()[:8]
+                    name = f"{member.stem}-{digest}{member.suffix}"
                 used_names.add(name)
                 archive.write(member, arcname=name)
         return {
@@ -1194,7 +1211,9 @@ class JarvisDocumentSurfer:
             "warnings": list(document.get("warnings") or []),
             "ocr": {
                 "needed": ocr_needed,
-                "available": bool(host.get("tesseract") and (host.get("pdftoppm") or kind != "pdf")),
+                "available": bool(
+                    host.get("tesseract") and (host.get("pdftoppm") or kind != "pdf")
+                ),
                 "tesseract": bool(host.get("tesseract")),
                 "pdftoppm": bool(host.get("pdftoppm")),
             },
@@ -1213,7 +1232,9 @@ class JarvisDocumentSurfer:
             },
             "slides": {
                 "supported": kind in {"pptx", "odt"},
-                "slide_count": int(structure.get("slide_count") or structure.get("paragraph_count") or 0),
+                "slide_count": int(
+                    structure.get("slide_count") or structure.get("paragraph_count") or 0
+                ),
             },
             "diff": {
                 "text_diff_supported": True,
@@ -1288,7 +1309,9 @@ class JarvisDocumentSurfer:
             except DocumentSurferError:
                 raise
             except Exception as exc:  # noqa: BLE001
-                raise DocumentSurferError(f"Extended extract failed for {resolved.name}: {exc}") from exc
+                raise DocumentSurferError(
+                    f"Extended extract failed for {resolved.name}: {exc}"
+                ) from exc
 
         raise DocumentUnsupportedError(
             f"Unsupported document type: {suffix or resolved.name}"
@@ -1359,7 +1382,7 @@ class JarvisDocumentSurfer:
         if not candidate.exists():
             candidate.mkdir(parents=True, exist_ok=True)
             return candidate
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        stamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
         dest = base / f"{label}-{stamp}"
         dest.mkdir(parents=True, exist_ok=True)
         return dest
@@ -1391,16 +1414,19 @@ class JarvisDocumentSurfer:
             if not Path(safe_name).suffix:
                 safe_name = f"{safe_name}{default_suffix}"
         else:
-            safe_name = f"{_safe_filename(source.stem)}{stem_suffix}{default_suffix or source.suffix or '.txt'}"
+            fallback_suffix = default_suffix or source.suffix or ".txt"
+            safe_name = f"{_safe_filename(source.stem)}{stem_suffix}{fallback_suffix}"
         candidate = base_dir / safe_name[:180]
         if not candidate.exists():
             return candidate
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        stamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
         return base_dir / f"{candidate.stem}.{stamp}{candidate.suffix}"
 
     def _entity_signals(self, text: str) -> dict[str, list[str]]:
         if not text:
-            return {"emails": [], "urls": [], "dates": [], "money": [], "phones": [], "entities": []}
+            return {
+                "emails": [], "urls": [], "dates": [], "money": [], "phones": [], "entities": [],
+            }
         emails = _unique(_EMAIL_RE.findall(text), limit=20)
         urls = _unique(_URL_RE.findall(text), limit=20)
         dates = _unique(_DATE_RE.findall(text), limit=20)
@@ -1475,7 +1501,9 @@ class JarvisDocumentSurfer:
         word = capabilities.get("word") if isinstance(capabilities.get("word"), dict) else {}
         if ocr.get("needed"):
             if ocr.get("available"):
-                recommendations.append("Run OCR before answering detailed questions about this PDF.")
+                recommendations.append(
+                    "Run OCR before answering detailed questions about this PDF."
+                )
             else:
                 recommendations.append(
                     "PDF looks scanned or text-poor; install tesseract + pdftoppm for OCR fallback."
@@ -1491,7 +1519,9 @@ class JarvisDocumentSurfer:
         if word.get("comments_detected"):
             recommendations.append("Review embedded Word comments before final edits.")
         if kind in {"pptx"}:
-            recommendations.append("Slide decks are text-extracted; regenerate DOCX/MD for heavy edits.")
+            recommendations.append(
+                "Slide decks are text-extracted; regenerate DOCX/MD for heavy edits."
+            )
         if comparison:
             stats = comparison.get("stats") if isinstance(comparison.get("stats"), dict) else {}
             if int(stats.get("diff_lines") or 0) > 0:
@@ -1512,8 +1542,10 @@ class JarvisDocumentSurfer:
         comparison: dict[str, Any] | None,
     ) -> dict[str, Any]:
         steps = [
-            "Inspect target structure and preserve existing layout unless the instruction requires it.",
-            "Use extracted text as evidence; do not invent content that is not in the document/reference.",
+            "Inspect target structure and preserve existing layout unless the instruction "
+            "requires it.",
+            "Use extracted text as evidence; do not invent content that is not in the "
+            "document/reference.",
         ]
         if reference is not None:
             steps.append(
@@ -1521,12 +1553,21 @@ class JarvisDocumentSurfer:
             )
         kind = str(target.get("kind") or "")
         if kind == "docx":
-            steps.append("For exact text edits, use documents.apply_replacements to create a DOCX copy.")
-            steps.append("For major rewrite, generate a new DOCX via documents.generate and keep the original.")
+            steps.append(
+                "For exact text edits, use documents.apply_replacements to create a DOCX copy."
+            )
+            steps.append(
+                "For major rewrite, generate a new DOCX via documents.generate "
+                "and keep the original."
+            )
         elif kind in {"xlsx", "xlsm"}:
-            steps.append("Preserve formulas and workbook structure; exact shared-string edits can be copied.")
+            steps.append(
+                "Preserve formulas and workbook structure; exact shared-string edits can be copied."
+            )
         elif kind == "pdf":
-            steps.append("Treat PDF as source/review material; create a new DOCX/PDF/MD artifact for edits.")
+            steps.append(
+                "Treat PDF as source/review material; create a new DOCX/PDF/MD artifact for edits."
+            )
         elif kind == "pptx":
             steps.append("Extract slide text, then generate MD/DOCX deliverable for edits.")
         else:
@@ -1668,7 +1709,8 @@ def _write_minimal_docx(path: Path, title: str, body: str, metadata: dict[str, A
     content_types = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         f'<Types xmlns="{_CONTENT_TYPES_NS}">'
-        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="rels" '
+        'ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
         '<Default Extension="xml" ContentType="application/xml"/>'
         '<Override PartName="/word/document.xml" '
         'ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
@@ -1683,7 +1725,8 @@ def _write_minimal_docx(path: Path, title: str, body: str, metadata: dict[str, A
         'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
         'Target="word/document.xml"/>'
         '<Relationship Id="rId2" '
-        'Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" '
+        'Type="http://schemas.openxmlformats.org/package/2006/'
+        'relationships/metadata/core-properties" '
         'Target="docProps/core.xml"/>'
         "</Relationships>"
     )
@@ -1765,7 +1808,8 @@ def _write_minimal_xlsx(path: Path, title: str, body: str) -> None:
     content_types = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         f'<Types xmlns="{_CONTENT_TYPES_NS}">'
-        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="rels" '
+        'ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
         '<Default Extension="xml" ContentType="application/xml"/>'
         '<Override PartName="/xl/workbook.xml" '
         'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
@@ -1796,7 +1840,9 @@ def _xlsx_col_name(index: int) -> str:
 # --------------------------------------------------------------------------- #
 # Small helpers
 # --------------------------------------------------------------------------- #
-def _public_document(document: dict[str, Any] | None, *, include_text: bool) -> dict[str, Any] | None:
+def _public_document(
+    document: dict[str, Any] | None, *, include_text: bool
+) -> dict[str, Any] | None:
     if document is None:
         return None
     payload = {
@@ -1976,5 +2022,6 @@ def _search_markdown(query: str, hits: Sequence[dict[str, Any]], scanned: int) -
         "",
     ]
     for hit in hits[:20]:
-        lines.append(f"- `{hit.get('name')}` @ {hit.get('offset')}: {_short(str(hit.get('snippet') or ''), 160)}")
+        snippet = _short(str(hit.get("snippet") or ""), 160)
+        lines.append(f"- `{hit.get('name')}` @ {hit.get('offset')}: {snippet}")
     return "\n".join(lines) + "\n"

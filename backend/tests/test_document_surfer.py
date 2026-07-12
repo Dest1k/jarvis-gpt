@@ -3,7 +3,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-
 from jarvis_gpt.document_agent import DocumentAgent, DocumentGenerationRequest
 from jarvis_gpt.document_runtime import extract_document
 from jarvis_gpt.document_surfer import (

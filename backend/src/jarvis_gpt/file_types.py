@@ -482,7 +482,10 @@ def _match_magic(data: bytes) -> _MagicHit | None:
         return None
     # PDF
     if data.startswith(b"%PDF"):
-        return _MagicHit("pdf", "document", "application/pdf", ".pdf", 0.99, is_document=True, description="PDF document")
+        return _MagicHit(
+            "pdf", "document", "application/pdf", ".pdf", 0.99,
+            is_document=True, description="PDF document",
+        )
     # ZIP family
     if data[:4] in {b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"}:
         return _MagicHit(
@@ -646,9 +649,10 @@ def _match_magic(data: bytes) -> _MagicHit | None:
     if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"AVI ":
         return _MagicHit("avi", "video", "video/x-msvideo", ".avi", 0.97, description="AVI video")
     # MP3 ID3 or frame sync
-    if data.startswith(b"ID3") or (len(data) >= 2 and data[0] == 0xFF and (data[1] & 0xE0) == 0xE0):
-        if data.startswith(b"ID3"):
-            return _MagicHit("mp3", "audio", "audio/mpeg", ".mp3", 0.9, description="MP3 audio")
+    if data.startswith(b"ID3") or (
+        len(data) >= 2 and data[0] == 0xFF and (data[1] & 0xE0) == 0xE0
+    ):
+        return _MagicHit("mp3", "audio", "audio/mpeg", ".mp3", 0.9, description="MP3 audio")
     # FLAC
     if data.startswith(b"fLaC"):
         return _MagicHit("flac", "audio", "audio/flac", ".flac", 0.99, description="FLAC audio")
@@ -657,7 +661,10 @@ def _match_magic(data: bytes) -> _MagicHit | None:
         return _MagicHit("ogg", "audio", "audio/ogg", ".ogg", 0.95, description="Ogg container")
     # Matroska / WebM
     if data.startswith(b"\x1a\x45\xdf\xa3"):
-        return _MagicHit("mkv", "video", "video/x-matroska", ".mkv", 0.9, description="Matroska/WebM container")
+        return _MagicHit(
+            "mkv", "video", "video/x-matroska", ".mkv", 0.9,
+            description="Matroska/WebM container",
+        )
     # ISO9660
     if len(data) >= 0x8006 and data[0x8001:0x8006] == b"CD001":
         return _MagicHit(
@@ -672,7 +679,9 @@ def _match_magic(data: bytes) -> _MagicHit | None:
         )
     # ELF
     if data.startswith(b"\x7fELF"):
-        return _MagicHit("elf", "executable", "application/x-executable", "", 0.99, description="ELF binary")
+        return _MagicHit(
+            "elf", "executable", "application/x-executable", "", 0.99, description="ELF binary"
+        )
     # PE / MZ
     if data.startswith(b"MZ"):
         return _MagicHit(
@@ -684,8 +693,13 @@ def _match_magic(data: bytes) -> _MagicHit | None:
             description="DOS/PE executable",
         )
     # Mach-O
-    if data[:4] in {b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf", b"\xce\xfa\xed\xfe", b"\xcf\xfa\xed\xfe"}:
-        return _MagicHit("macho", "executable", "application/x-mach-binary", "", 0.97, description="Mach-O binary")
+    if data[:4] in {
+        b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf", b"\xce\xfa\xed\xfe", b"\xcf\xfa\xed\xfe"
+    }:
+        return _MagicHit(
+            "macho", "executable", "application/x-mach-binary", "", 0.97,
+            description="Mach-O binary",
+        )
     # SQLite
     if data.startswith(b"SQLite format 3\x00"):
         return _MagicHit(
@@ -722,9 +736,16 @@ def _match_magic(data: bytes) -> _MagicHit | None:
         )
     # WASM
     if data.startswith(b"\x00asm"):
-        return _MagicHit("wasm", "executable", "application/wasm", ".wasm", 0.99, description="WebAssembly module")
+        return _MagicHit(
+            "wasm", "executable", "application/wasm", ".wasm", 0.99,
+            description="WebAssembly module",
+        )
     # UTF-8/UTF-16 BOM text
-    if data.startswith(b"\xef\xbb\xbf") or data.startswith(b"\xff\xfe") or data.startswith(b"\xfe\xff"):
+    if (
+        data.startswith(b"\xef\xbb\xbf")
+        or data.startswith(b"\xff\xfe")
+        or data.startswith(b"\xfe\xff")
+    ):
         return _MagicHit(
             "txt",
             "text",
@@ -743,10 +764,19 @@ def _refine_zip_container(data: bytes, *, name: str) -> FileTypeInfo | None:
 
     lower = name.lower()
     mapping = (
-        (".docx", "docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", True),
-        (".xlsx", "xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", True),
+        (
+            ".docx", "docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document", True,
+        ),
+        (
+            ".xlsx", "xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", True,
+        ),
         (".xlsm", "xlsm", "application/vnd.ms-excel.sheet.macroEnabled.12", True),
-        (".pptx", "pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation", True),
+        (
+            ".pptx", "pptx",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation", True,
+        ),
         (".odt", "odt", "application/vnd.oasis.opendocument.text", True),
         (".ods", "ods", "application/vnd.oasis.opendocument.spreadsheet", True),
         (".odp", "odp", "application/vnd.oasis.opendocument.presentation", True),
@@ -851,10 +881,9 @@ def _extension_of(name: str) -> str:
         if lower.endswith(suffix):
             return suffix
     suffixes = "".join(Path(name).suffixes).lower()
-    if len(Path(name).suffixes) >= 2 and suffixes:
-        # prefer full multi-suffix for tar.* style
-        if suffixes.count(".") >= 2:
-            return suffixes if len(suffixes) <= 16 else Path(name).suffix.lower()
+    # prefer full multi-suffix for tar.* style
+    if len(Path(name).suffixes) >= 2 and suffixes and suffixes.count(".") >= 2:
+        return suffixes if len(suffixes) <= 16 else Path(name).suffix.lower()
     return Path(name).suffix.lower()
 
 
@@ -887,7 +916,9 @@ def _sniff_text_kind(data: bytes) -> tuple[str, str]:
     stripped = text.lstrip()
     if stripped.startswith("{") or stripped.startswith("["):
         return "json", "application/json"
-    if re.search(r"^#{1,6}\s+\S", text, re.M) or ("```" in text and re.search(r"^#\s+\w", text, re.M)):
+    if re.search(r"^#{1,6}\s+\S", text, re.M) or (
+        "```" in text and re.search(r"^#\s+\w", text, re.M)
+    ):
         return "md", "text/markdown"
     if text.count(",") >= 3 and "\n" in text:
         return "csv", "text/csv"

@@ -74,7 +74,9 @@ External host runtime
 - JS-heavy web pages go through backend-owned `web.render`: isolated headless Chrome/Edge, temporary profile, public-only DNS pinning, no operator browser tabs. The normal route tries `web.fetch` first and falls back to render when fetched text is too thin or unavailable.
 - Web SSRF protection is enforced both before request setup and at connect time: `web.search`/`web.fetch` use a public-only httpx transport that resolves, validates, and pins public IPs before opening TCP, closing the old DNS-rebinding window without giving the model local network reach.
 - Per-answer trace: сохранённый assistant message можно открыть как `/trace/{messageId}`. Backend отдаёт предыдущий user input, assistant output, события runtime и nodes/edges граф; UI показывает анимированный путь сигнала без раскрытия hidden chain-of-thought.
-- Агентный tool-loop: на пути ответа модель — не одиночный forward-pass, а цикл, где она сама выбирает безопасные инструменты, читает observation и продолжает до финального ответа. Опасные инструменты автономно не выполняются, а становятся approval-гейтами. Это снимает «чат-бот»-стену (у модели появляются руки), не завися от размера модели.
+- Агентный tool-loop: модель выбирает safe-инструменты и mutating-инструменты, точно разрешённые
+  текущей явной командой. Разрешение связано с conversation/message/tool/canonical arguments,
+  одноразовое и недоступно истории, миссиям и resume; всё остальное становится approval-гейтом.
 - Гибридный retrieval: память достаётся не только лексически (BM25/LIKE), но и семантически (fuzzy-вектор или remote-эмбеддинги), фьюз через RRF над ограниченным пулом кандидатов. Модель получает релевантный контекст даже при перефразировании — это отдельная подсистема, которую нельзя «дообучить» размером чат-модели.
 - Реальное исполнение миссий: `execute_next_mission_step` при живом LLM прогоняет шаг через агентный tool-loop (реальные вызовы инструментов, approval для опасного, аудит), а не отдаёт статичный brief. Миссии перестали быть «планами, которые ничего не делают». Офлайн остаётся детерминированный brief.
 - Авто-цепочка миссий: `run_mission` последовательно исполняет шаги до завершения/блокировки/бюджета, не обходя approval-гейты. Command Center гоняет цепочку клиентски (по `execute-next`), давая живой прогресс без WS; серверный `/run` — для headless.
@@ -85,7 +87,8 @@ External host runtime
 - Audit log фиксирует изменения памяти, миссий, task lifecycle, tool runs и ingestion.
 - Профили `gemma4-mono` и `gemma4-turbo` указывают на реальные каталоги весов в `D:\jarvis\data\models`; backend не хранит веса в репозитории.
 - Dispatcher вынесен в отдельный Compose profile `llm`, чтобы Command Center можно было запускать без случайной загрузки тяжёлых весов в VRAM.
-- Любое действие с риском выше safe должно сначала стать approval gate; выполнение после approve проходит через отдельный whitelisted gated executor.
+- Действие выше safe исполняется либо по одноразовому exact current-turn capability, либо после
+  approval через отдельный whitelisted gated executor; выведенная моделью мутация не наследует допуск.
 - Self-learning идёт через append-only learning journal и `learning.tick`: диалоги, tool runs, web/browser observations и deletion markers превращаются в lessons без привязки к видимой истории чатов.
 - When the local LLM is enabled, learning tick also runs a bounded JSON-only distillation pass over recent signals, adding at most two grounded lessons on top of deterministic lessons. The quality dashboard exposes recent negative feedback, verifier revise signals, and repeated gaps for operator/assistant review.
 - Background cognition is an observational supervisor loop, not another UI

@@ -21,6 +21,7 @@ from jarvis_gpt.tools import (
     WEB_RESEARCH_KEY,
     WEB_SEARCH_PROVIDER_STATS_KEY,
     WEB_USER_AGENT,
+    OperatorTurnAuthorization,
     ToolRegistry,
     ToolSpec,
     _parse_bing_results,
@@ -29,6 +30,73 @@ from jarvis_gpt.tools import (
     _store_web_evidence,
     _validate_native_payload,
 )
+
+
+def test_operator_turn_authorization_is_exact_and_single_use(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+    executed: list[dict] = []
+
+    def handler(_context, arguments):
+        executed.append(dict(arguments))
+        return ToolRunResponse(tool="test.review", ok=True, summary="done")
+
+    tools.add(
+        ToolSpec(
+            name="test.review",
+            description="test",
+            category="test",
+            input_schema={},
+            handler=handler,
+            danger_level="review",
+        )
+    )
+    arguments = {"value": "exact"}
+    authorization = OperatorTurnAuthorization.bind(
+        conversation_id="conv-test",
+        user_message_id="msg-test",
+        tool="test.review",
+        arguments=arguments,
+    )
+
+    mismatch = asyncio.run(
+        tools.run(
+            "test.review",
+            {"value": "substituted"},
+            conversation_id="conv-test",
+            user_message_id="msg-test",
+            authorization=authorization,
+        )
+    )
+    first = asyncio.run(
+        tools.run(
+            "test.review",
+            arguments,
+            conversation_id="conv-test",
+            user_message_id="msg-test",
+            authorization=authorization,
+        )
+    )
+    replay = asyncio.run(
+        tools.run(
+            "test.review",
+            arguments,
+            conversation_id="conv-test",
+            user_message_id="msg-test",
+            authorization=authorization,
+        )
+    )
+
+    assert mismatch.ok is False
+    assert first.ok is True
+    assert replay.ok is False
+    assert executed == [arguments]
+    storage.close()
 
 
 def _write_minimal_docx(path: Path, text: str) -> None:

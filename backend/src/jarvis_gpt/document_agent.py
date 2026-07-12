@@ -80,7 +80,9 @@ class DocumentAgent:
             if request.source_files:
                 try:
                     corpus = self.surfer.summarize_corpus(request.source_files)
-                    body_parts.append(corpus.get("combined_outline") or corpus.get("markdown") or "")
+                    body_parts.append(
+                        corpus.get("combined_outline") or corpus.get("markdown") or ""
+                    )
                     body_parts.append(
                         "Source files:\n"
                         + "\n".join(f"- {path}" for path in request.source_files[:40])
@@ -165,7 +167,7 @@ class DocumentAgent:
         edges: list[dict[str, Any]] = []
         labels = [node["id"] for node in nodes]
         # Pair consecutive frequent entities as soft edges (extractive, not ML).
-        for left, right in zip(labels, labels[1:]):
+        for left, right in zip(labels, labels[1:], strict=False):
             edges.append({"source": left, "target": right, "weight": 1})
         return {
             "nodes": len(nodes),
