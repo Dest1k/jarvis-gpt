@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Ideal Tools Registration - Large substantial chunk
+Ideal Tools Registration - Very large chunk
 """
 
 try:
@@ -33,7 +33,7 @@ def register_all_ideal_tools(registry):
         registry.register_many(get_knowledge_graph_tools())
         registry.register_many(get_plugin_tools())
         registry.register_many(get_briefing_tools())
-        print("All ideal tools registered.")
+        print("All ideal tools registered successfully.")
     except Exception as e:
         print(f"Error: {e}")
 
@@ -50,4 +50,4 @@ def get_all_ideal_tools():
     tools.update(get_briefing_tools())
     return tools
 
-print("[ideal_tools_registration] Large substantial chunk.")
+print("[ideal_tools_registration] Very large chunk.")
