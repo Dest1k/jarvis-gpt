@@ -168,14 +168,23 @@ External host runtime
 
 ## Runtime profiles
 
-`gemma4-mono`:
+Целевое железо для 31B: **RTX 5090 32GB VRAM + 128GB system RAM**.
 
-- надёжный cold-start;
-- eager mode;
-- профиль разработки и диагностики.
+`gemma4-mono` (partial offload / stability):
+
+- модель `gemma4-31b-it-nvfp4`;
+- `--cpu-offload-gb 24`, `--swap-space 16`, eager mode;
+- `gpu_memory_utilization=0.85`, `max_model_len=16384`, `max_num_seqs=2`;
+- cold-start, длинный context, минимум OOM/segfault.
+
+`gemma4-mono-perf` (GPU-first / max throughput):
+
+- та же 31B NVFP4, веса на GPU (offload 0);
+- CUDA graphs (`eager=false`), `max_model_len=8192`, util `0.90`;
+- `max_num_seqs=4`, emergency `--swap-space 8` only;
+- максимум tokens/s при ограниченном context.
 
 `gemma4-turbo`:
 
-- быстрый warmed runtime;
-- больше шагов агента;
-- включается после проверки окружения.
+- `gemma4-26b-a4b-nvfp4`, без offload;
+- быстрый warmed runtime и больший concurrency.

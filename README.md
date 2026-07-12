@@ -34,7 +34,7 @@
 - Autonomous supervisor: безопасный фоновой цикл собирает telemetry и запускает learning tick.
 - Исполнение следующего шага mission plan с прогрессом задач и журналом tool runs.
 - SQLite WAL-хранилище в `D:\jarvis\data\jarvis-gpt\state\jarvis.sqlite3`.
-- Два runtime-профиля: `gemma4-mono` и `gemma4-turbo`.
+- Runtime-профили под RTX 5090 32GB + 128GB RAM: `gemma4-turbo` (26B fast), `gemma4-mono` (31B partial offload), `gemma4-mono-perf` (31B GPU-first).
 - Next.js Command Center: чат, статус runtime, миссии и диагностика.
 - Command Center показывает файлы, поиск по чанкам, ручную память, tools и audit stream.
 - Command Center показывает локальные модели, approvals, активный профиль и dispatcher-конфигурацию.
@@ -166,7 +166,9 @@ py -3.11 .\jarvis.py mission-run <mission_id> --max-steps 8
 .\scripts\doctor.ps1
 ```
 
-`gemma4-mono` — стабильный baseline на `gemma4-31b-it-nvfp4` для холодного старта и диагностики.
+`gemma4-mono` — 31B IT NVFP4 со partial CPU offload + KV swap (стабильность, cold start).
+`gemma4-mono-perf` — тот же 31B, но GPU-first (без offload, CUDA graphs, context 8k) для максимальной скорости.
+`gemma4-turbo` — 26B A4B NVFP4, быстрый warmed path без offload.
 
 `gemma4-turbo` — быстрый профиль на `gemma4-26b-a4b-nvfp4` для прогретого runtime.
 
@@ -207,7 +209,7 @@ docker compose --profile llm up -d dispatcher
   `documents.review` reports OCR need, Word redline readiness, and Excel
   formula/style audit. Edited copies are written under `data/document-outputs`
   without overwriting originals.
-- Unified launcher `.\jarvis.cmd` provides keyboard-menu start/stop/restart/status/logs/doctor/open flows plus `gemma4-turbo` and `gemma4-mono` startup shortcuts.
+- Unified launcher `.\jarvis.cmd` provides keyboard-menu start/stop/restart/status/logs/doctor/open flows plus `gemma4-turbo`, `gemma4-mono`, and `gemma4-mono-perf` shortcuts (`jarvis-mono.cmd`, `jarvis-mono-offload.cmd`, `jarvis-mono-perf.cmd`, `jarvis-turbo.cmd`).
 - Experience API persists operator preferences, autonomy policy, daily briefing, self-heal reports and benchmark history in SQLite.
 - Operator persona (`/api/persona`) is a first-class understanding layer: the agent injects it into every LLM turn, uses `location` as the generic place fallback (weather/local/geo) instead of a weather-only cache, and surfaces `current_focus` in the daily briefing. Editable from Command Center → «Профиль оператора» and via `jarvis persona` / `persona-set`.
 - Command Center exposes briefing, autonomy policy modes, self-heal suggestions, benchmark telemetry and operator communication preferences.

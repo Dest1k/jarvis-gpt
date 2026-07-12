@@ -3,7 +3,7 @@ param(
   [ValidateSet("menu", "start", "app", "stop", "restart", "status", "llm", "logs", "doctor", "open")]
   [string]$Action = "menu",
 
-  [ValidateSet("gemma4-turbo", "gemma4-mono")]
+  [ValidateSet("gemma4-turbo", "gemma4-mono", "gemma4-mono-perf")]
   [string]$Profile = "gemma4-turbo",
 
   [string]$HomePath = "D:\jarvis",
@@ -1733,8 +1733,9 @@ function Invoke-Menu {
 
   if ($choice.Value -in @("start", "app", "restart")) {
     $profiles = @(
-      @{ Label = "gemma4-turbo"; Value = "gemma4-turbo"; Hint = "26B A4B NVFP4, fast warmed runtime" },
-      @{ Label = "gemma4-mono"; Value = "gemma4-mono"; Hint = "31B IT NVFP4, stable baseline" }
+      @{ Label = "gemma4-turbo"; Value = "gemma4-turbo"; Hint = "26B A4B NVFP4, fast warmed runtime (no offload)" },
+      @{ Label = "gemma4-mono"; Value = "gemma4-mono"; Hint = "31B IT NVFP4, partial offload+swap, stability on 5090 32GB" },
+      @{ Label = "gemma4-mono-perf"; Value = "gemma4-mono-perf"; Hint = "31B IT NVFP4, GPU-first max throughput, 8k ctx" }
     )
     $profileChoice = Select-Menu -Title "Select LLM profile" -Items $profiles
     if (-not $profileChoice) {
