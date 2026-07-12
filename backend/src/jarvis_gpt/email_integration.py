@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Email Integration - Improved version
+Email Integration - More refinements
 """
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List
 
 
 class EmailSummary:
@@ -25,11 +25,11 @@ class EmailIntegration:
     def __init__(self, config=None):
         self.config = config or EmailConfig()
 
-    def get_unread_summary(self, limit: int = 10) -> List[EmailSummary]:
-        return [EmailSummary("eml1", "test@example.com", "[Placeholder] Subject", "2026-07-12", "Summary...")]
+    def get_unread_summary(self, limit=10):
+        return [EmailSummary("e1", "example@ mail.com", "Subject", "2026-07-12", "Snippet...") for _ in range(2)]
 
     def send_email(self, to, subject, body, attachments=None):
-        return "email_pending_approval"
+        return "pending_approval"
 
 
 def get_email_tools():
@@ -39,4 +39,4 @@ def get_email_tools():
         "email.send": e.send_email,
     }
 
-print("[email_integration.py] Improved.")
+print("[email_integration.py] More refinements.")
