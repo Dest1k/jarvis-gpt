@@ -26,16 +26,17 @@ def test_dispatcher_manager_builds_compose_environment(monkeypatch, tmp_path):
     assert env["JARVIS_QWEN_TOKENIZER_MODE"] == "slow"
     assert env["JARVIS_QWEN_SAFETENSORS_LOAD_STRATEGY"] == "prefetch"
     assert env["JARVIS_QWEN_MAX_LEN"] == "16384"
-    assert env["JARVIS_QWEN_GPU_UTIL"] == "0.94"
-    assert env["JARVIS_QWEN_MAX_NUM_SEQS"] == "4"
+    assert env["JARVIS_QWEN_GPU_UTIL"] == "0.85"
+    assert env["JARVIS_QWEN_MAX_NUM_SEQS"] == "2"
     assert env["JARVIS_QWEN_ENFORCE_EAGER"] == "--enforce-eager"
-    assert env["JARVIS_QWEN_CPU_OFFLOAD_ARGS"] == "--cpu-offload-gb 8"
-    assert env["JARVIS_QWEN_SWAP_SPACE_ARGS"] == "--swap-space 8"
+    assert env["JARVIS_QWEN_CPU_OFFLOAD_ARGS"] == "--cpu-offload-gb 24"
+    assert env["JARVIS_QWEN_SWAP_SPACE_ARGS"] == "--swap-space 16"
     assert manager.compose_command("up")[-2:] == ["-d", "dispatcher"]
     assert status["active_model"]["id"] == "gemma4-31b-it-nvfp4"
     assert status["runtime"] is None
     assert status["desired_runtime"]["enforce_eager"] is True
-    assert status["desired_runtime"]["cpu_offload_gb"] == 8
+    assert status["desired_runtime"]["cpu_offload_gb"] == 24
+    assert status["desired_runtime"]["swap_space_gb"] == 16
 
 
 def test_dispatcher_status_redacts_hugging_face_token(monkeypatch, tmp_path):
@@ -70,6 +71,30 @@ def test_dispatcher_turbo_profile_keeps_cuda_graph_path(monkeypatch, tmp_path):
     assert env["JARVIS_QWEN_MAX_LEN"] == "32768"
     assert env["JARVIS_QWEN_CPU_OFFLOAD_ARGS"] == ""
     assert env["JARVIS_QWEN_SWAP_SPACE_ARGS"] == ""
+
+
+def test_dispatcher_mono_perf_profile_is_gpu_first(monkeypatch, tmp_path):
+    model_root = tmp_path / "models"
+    (model_root / "gemma4-31b-it-nvfp4").mkdir(parents=True)
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_MODEL_ROOT", str(model_root))
+    monkeypatch.setattr("jarvis_gpt.dispatcher.shutil.which", lambda _name: None)
+
+    settings = load_settings("gemma4-mono-perf")
+    ensure_runtime_dirs(settings)
+    manager = DispatcherManager(settings, repo_root=tmp_path)
+    env = manager.compose_env()
+    status = manager.status()
+
+    assert env["JARVIS_QWEN_MODEL_PATH"] == "/models/gemma4-31b-it-nvfp4"
+    assert env["JARVIS_QWEN_ENFORCE_EAGER"] == ""
+    assert env["JARVIS_QWEN_GPU_UTIL"] == "0.90"
+    assert env["JARVIS_QWEN_MAX_LEN"] == "8192"
+    assert env["JARVIS_QWEN_MAX_NUM_SEQS"] == "4"
+    assert env["JARVIS_QWEN_CPU_OFFLOAD_ARGS"] == ""
+    assert env["JARVIS_QWEN_SWAP_SPACE_ARGS"] == "--swap-space 8"
+    assert status["desired_runtime"]["enforce_eager"] is False
+    assert not status["desired_runtime"].get("cpu_offload_gb")
 
 
 def test_dispatcher_parses_actual_container_runtime_command():

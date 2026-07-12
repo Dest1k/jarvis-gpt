@@ -100,20 +100,20 @@ class ModelCatalog:
                 "JARVIS_QWEN_MODEL_NAME": self.settings.llm_model,
                 "JARVIS_QWEN_MODEL_PATH": f"/models/{model_name}",
                 "JARVIS_QWEN_DTYPE": "auto",
-                "JARVIS_QWEN_GPU_UTIL": str(profile.gpu_memory_utilization),
-                "JARVIS_QWEN_MAX_LEN": str(profile.max_model_len),
+                "JARVIS_QWEN_GPU_UTIL": f"{float(profile.gpu_memory_utilization):.2f}",
+                "JARVIS_QWEN_MAX_LEN": str(int(profile.max_model_len)),
                 "JARVIS_QWEN_KV_DTYPE": profile.kv_cache_dtype,
                 "JARVIS_QWEN_TOKENIZER_MODE": "slow",
                 "JARVIS_QWEN_SAFETENSORS_LOAD_STRATEGY": "prefetch",
-                "JARVIS_QWEN_MAX_NUM_SEQS": str(profile.max_num_seqs),
+                "JARVIS_QWEN_MAX_NUM_SEQS": str(int(profile.max_num_seqs)),
                 "JARVIS_QWEN_ENFORCE_EAGER": "--enforce-eager" if profile.eager_mode else "",
                 "JARVIS_QWEN_CPU_OFFLOAD_ARGS": (
-                    f"--cpu-offload-gb {profile.cpu_offload_gb}"
+                    f"--cpu-offload-gb {int(profile.cpu_offload_gb)}"
                     if profile.cpu_offload_gb > 0
                     else ""
                 ),
                 "JARVIS_QWEN_SWAP_SPACE_ARGS": (
-                    f"--swap-space {profile.swap_space_gb}"
+                    f"--swap-space {int(profile.swap_space_gb)}"
                     if profile.swap_space_gb > 0
                     else ""
                 ),

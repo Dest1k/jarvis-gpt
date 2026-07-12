@@ -32,6 +32,37 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 - Verification: full backend suite `757 passed, 13 skipped`; full Ruff, compileall, and
   `git diff --check` clean. No known blockers.
 
+### 2026-07-12 - Grok (document_surfer + archives + 31B RTX 5090 profiles)
+
+Branch: `feature/ideal-jarvis-all-enhancements`  
+Worktree: `D:/jarvis-gpt-ideal` only (does **not** touch `D:/jarvis-gpt` / Codex WIP on `main`).  
+Tip commits: `966ca10` (launcher menu), `84fce53` (31B profiles), earlier document stack `7138acb` / `3930e37` (merged with main at `13698bc`).
+
+**Documents / files (production)**
+
+- New black-box `document_surfer.py` (document analogue of `web_surfer`): inspect/read/analyze/review/compare/search/corpus/generate/convert/package + archive ops.
+- `file_types.py`: magic-byte + compound-extension identification (archives, Office, images, media, exec, text/code, …).
+- `archive_runtime.py`: safe list/extract/read/create for zip/tar/tar.gz|bz2|xz/gz/bz2/xz; optional 7z/rar; path-traversal and size-bomb guards.
+- Tools wired in `tools.py` + agent allowlist: `documents.*` including `file.identify`, `file.probe`, `archive.list|extract|read_member|create|search`.
+- Ideal-branch stubs cleaned (no import-time print); experimental modules stay out of core registry.
+- Tests: `test_document_surfer.py`, `test_file_types_and_archives.py` (plus existing document_runtime).
+
+**31B NVFP4 on RTX 5090 32GB + 128GB RAM**
+
+- Problem: old `gemma4-mono` (`util=0.94`, 16k ctx, only 8GB offload) left almost no VRAM headroom → OOM / driver faults.
+- `gemma4-mono` (stability / partial offload): offload 24GB, swap 16GB, util 0.85, max_len 16384, max_num_seqs 2, eager.
+- `gemma4-mono-perf` (GPU-first throughput): offload 0, swap 8, util 0.90, max_len 8192, max_num_seqs 4, CUDA graphs.
+- `gemma4-turbo` unchanged (26B, no offload).
+- Dispatcher env formatting: `gpu_memory_utilization` always `%.2f`.
+- Launcher: **all profile choice only via `.\jarvis.cmd` menu** (arrows). Removed `jarvis-mono-perf.cmd` / `jarvis-mono-offload.cmd`. Menu labels: Turbo 26B / Mono 31B stable offload / Mono 31B max perf. `-Profile` CLI remains for scripts.
+- Docs: `config.py`, `model_catalog.py`, `scripts/jarvis-launcher.ps1`, `.env.example`, README, architecture, runtime.
+- Tests: dispatcher + config profile suite green after retune (23 passed in that slice).
+
+**Coordination / safety**
+
+- Early session mistake: shared-worktree stash/checkout interfered with another agent — fixed by dedicated worktree + never checkout/stash on `D:/jarvis-gpt` while Codex is there.
+- Next assistants: append here after each commit (newest on top). Prefer `D:/jarvis-gpt-ideal` for this branch; leave Codex worktree alone.
+
 ### 2026-07-12 - Codex (immediate exact operator actions)
 
 - Explicit commands in the current persisted user message now execute immediately without a

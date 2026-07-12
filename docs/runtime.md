@@ -1161,7 +1161,19 @@ D:\jarvis\data\jarvis-gpt\files
 D:\jarvis\data\models
 ```
 
-`gemma4-mono` указывает на `gemma4-31b-it-nvfp4`, `gemma4-turbo` — на `gemma4-26b-a4b-nvfp4`. Команда `models --env` печатает переменные для OpenAI-compatible vLLM dispatcher.
+`gemma4-mono` / `gemma4-mono-perf` указывают на `gemma4-31b-it-nvfp4`, `gemma4-turbo` — на `gemma4-26b-a4b-nvfp4`.
+Команда `models --env` печатает переменные для OpenAI-compatible vLLM dispatcher.
+
+### 31B on RTX 5090 (32GB) + 128GB RAM
+
+- Use `gemma4-mono` when stability matters: partial weight offload (24GB CPU) +
+  KV swap (16GB), eager mode, util 0.85, 16k context, 2 concurrent seqs.
+- Use `gemma4-mono-perf` for max throughput: no weight offload, CUDA graphs,
+  util 0.90, 8k context, 4 seqs, small swap safety net only.
+- Avoid `gpu_memory_utilization` ≥ 0.94 with 16k context on 31B — that profile
+  historically OOMs and can cascade into driver faults.
+- Launcher: `.\jarvis.cmd` → Start/Restart → arrow-select profile
+  (Turbo 26B / Mono 31B offload / Mono 31B perf).
 
 Dispatcher запускается отдельно, чтобы не грузить GPU при обычном старте Command Center:
 
