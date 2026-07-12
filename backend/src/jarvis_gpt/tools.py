@@ -52,6 +52,15 @@ from .document_runtime import (
     extract_document,
     is_supported_document,
 )
+from .document_surfer import (
+    DocumentGenerationError,
+    DocumentSafetyError,
+    DocumentSurferConfig,
+    DocumentSurferError,
+    DocumentUnsupportedError,
+    JarvisDocumentSurfer,
+    is_document_path_supported,
+)
 from .execution_config import build_execution_kernel, execution_capabilities_snapshot
 from .execution_kernel import ExecutionKernel
 from .execution_protocol import (
@@ -1249,6 +1258,112 @@ class ToolRegistry:
                     "output_name": "Optional output filename",
                 },
                 handler=_documents_apply_replacements,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="documents.analyze",
+                description=(
+                    "Deep document analysis via document_surfer: structure, entity signals, "
+                    "tables/formulas, OCR readiness, and edit recommendations."
+                ),
+                category="documents",
+                input_schema={
+                    "file_id": "Uploaded/indexed file id",
+                    "path": "Local path under the workspace, JARVIS_HOME, or user home",
+                    "instruction": "Optional analysis focus",
+                    "max_chars": "Maximum extracted text characters",
+                },
+                handler=_documents_analyze,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="documents.search",
+                description=(
+                    "Search one or many local/uploaded documents for a keyword or regex "
+                    "and return bounded snippets."
+                ),
+                category="documents",
+                input_schema={
+                    "query": "Search text or regex",
+                    "paths": "List of local paths",
+                    "file_ids": "List of uploaded/indexed file ids",
+                    "regex": "Treat query as regex (bool)",
+                    "case_sensitive": "Case-sensitive match (bool)",
+                    "max_hits": "Maximum hits",
+                    "max_chars": "Maximum characters extracted per file",
+                },
+                handler=_documents_search,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="documents.corpus.summarize",
+                description=(
+                    "Extractive multi-document corpus brief: themes, entities, per-file outline."
+                ),
+                category="documents",
+                input_schema={
+                    "paths": "List of local paths",
+                    "file_ids": "List of uploaded/indexed file ids",
+                    "focus": "Optional focus phrase",
+                    "max_chars": "Maximum characters extracted per file",
+                },
+                handler=_documents_corpus_summarize,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="documents.generate",
+                description=(
+                    "Generate a new document artifact (md/txt/csv/json/html/docx/xlsx) under "
+                    "document-outputs. Never overwrites source files."
+                ),
+                category="documents",
+                input_schema={
+                    "title": "Document title",
+                    "body": "Main body text or list of sections",
+                    "output_format": "md|txt|csv|json|html|docx|xlsx",
+                    "output_name": "Optional output filename",
+                    "sections": "Optional list of {heading,body}",
+                    "source_paths": "Optional source paths to include in context outline",
+                    "source_file_ids": "Optional source file ids for context outline",
+                },
+                handler=_documents_generate,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="documents.convert",
+                description=(
+                    "Convert a document by extracting text and regenerating in another "
+                    "supported format (md/txt/csv/json/html/docx/xlsx)."
+                ),
+                category="documents",
+                input_schema={
+                    "file_id": "Source uploaded/indexed file id",
+                    "path": "Source local path",
+                    "output_format": "Target format",
+                    "output_name": "Optional output filename",
+                    "max_chars": "Maximum extracted characters from source",
+                },
+                handler=_documents_convert,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="documents.capabilities",
+                description=(
+                    "Report document_surfer format coverage and host tool availability "
+                    "(OCR, LibreOffice, pypdf), optionally for one path."
+                ),
+                category="documents",
+                input_schema={
+                    "file_id": "Optional uploaded/indexed file id",
+                    "path": "Optional local path",
+                },
+                handler=_documents_capabilities,
             )
         )
         self.add(
@@ -4313,6 +4428,208 @@ def _documents_apply_replacements(ctx: ToolContext, args: dict[str, Any]) -> Too
             },
         },
     )
+
+
+def _documents_analyze(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    max_chars = _int_arg(args.get("max_chars"), default=60000, minimum=1000, maximum=200000)
+    instruction = " ".join(str(args.get("instruction") or "").split())
+    try:
+        target = _document_target(ctx, args, max_chars=max_chars)
+        surfer = _document_surfer_for(ctx)
+        result = surfer.analyze(target["path"], max_chars=max_chars, instruction=instruction)
+    except (ValueError, DocumentSurferError) as exc:
+        return ToolRunResponse(tool="documents.analyze", ok=False, summary=str(exc))
+    return ToolRunResponse(
+        tool="documents.analyze",
+        ok=True,
+        summary=f"Analyzed {result.get('document', {}).get('kind')} document via document_surfer.",
+        data={
+            "target": _document_target_payload(target),
+            **{key: value for key, value in result.items() if key != "ok"},
+        },
+    )
+
+
+def _documents_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    query = " ".join(str(args.get("query") or "").split())
+    if not query:
+        return ToolRunResponse(tool="documents.search", ok=False, summary="query is required.")
+    max_chars = _int_arg(args.get("max_chars"), default=40000, minimum=500, maximum=150000)
+    max_hits = _int_arg(args.get("max_hits"), default=40, minimum=1, maximum=200)
+    try:
+        paths = _document_paths_from_args(ctx, args)
+        if not paths:
+            raise ValueError("paths or file_ids is required.")
+        surfer = _document_surfer_for(ctx)
+        result = surfer.search(
+            query,
+            paths,
+            regex=_bool_arg(args.get("regex"), default=False),
+            case_sensitive=_bool_arg(args.get("case_sensitive"), default=False),
+            max_chars=max_chars,
+            max_hits=max_hits,
+        )
+    except (ValueError, DocumentSurferError) as exc:
+        return ToolRunResponse(tool="documents.search", ok=False, summary=str(exc))
+    return ToolRunResponse(
+        tool="documents.search",
+        ok=True,
+        summary=(
+            f"Found {result.get('hit_count', 0)} hit(s) across "
+            f"{result.get('scanned_files', 0)} document(s)."
+        ),
+        data=result,
+    )
+
+
+def _documents_corpus_summarize(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    max_chars = _int_arg(args.get("max_chars"), default=30000, minimum=500, maximum=150000)
+    focus = " ".join(str(args.get("focus") or "").split()) or None
+    try:
+        paths = _document_paths_from_args(ctx, args)
+        if not paths:
+            raise ValueError("paths or file_ids is required.")
+        surfer = _document_surfer_for(ctx)
+        result = surfer.summarize_corpus(paths, focus=focus, max_chars=max_chars)
+    except (ValueError, DocumentSurferError) as exc:
+        return ToolRunResponse(tool="documents.corpus.summarize", ok=False, summary=str(exc))
+    summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
+    return ToolRunResponse(
+        tool="documents.corpus.summarize",
+        ok=True,
+        summary=f"Summarized corpus of {summary.get('files', 0)} document(s).",
+        data=result,
+    )
+
+
+def _documents_generate(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    title = " ".join(str(args.get("title") or args.get("task") or "Document").split())
+    body = args.get("body")
+    if body is None:
+        body = str(args.get("text") or args.get("content") or "")
+    output_format = str(args.get("output_format") or args.get("format") or "md").strip().lower()
+    sections = args.get("sections") if isinstance(args.get("sections"), list) else None
+    try:
+        source_paths: list[Path] = []
+        if args.get("source_paths") or args.get("source_file_ids"):
+            source_paths = _document_paths_from_args(
+                ctx,
+                {
+                    "paths": args.get("source_paths"),
+                    "file_ids": args.get("source_file_ids"),
+                },
+            )
+        surfer = _document_surfer_for(ctx)
+        if source_paths and (not body or (isinstance(body, str) and not body.strip())):
+            corpus = surfer.summarize_corpus(source_paths)
+            body = corpus.get("combined_outline") or corpus.get("markdown") or title
+        result = surfer.generate(
+            title=title,
+            body=body if body is not None else title,
+            output_format=output_format,
+            output_name=args.get("output_name"),
+            sections=sections,
+            metadata={"source_paths": [str(path) for path in source_paths]},
+        )
+        output_path = Path(str((result.get("output") or {}).get("path") or ""))
+        file_record = _record_generated_document(ctx, output_path) if output_path.exists() else None
+    except (ValueError, DocumentSurferError, DocumentGenerationError, OSError) as exc:
+        return ToolRunResponse(tool="documents.generate", ok=False, summary=str(exc))
+    return ToolRunResponse(
+        tool="documents.generate",
+        ok=True,
+        summary=f"Generated {output_format} document: {output_path.name}.",
+        data={
+            **result,
+            "file": file_record,
+        },
+    )
+
+
+def _documents_convert(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    max_chars = _int_arg(args.get("max_chars"), default=80000, minimum=500, maximum=200000)
+    output_format = str(args.get("output_format") or args.get("format") or "md").strip().lower()
+    try:
+        target = _document_target(ctx, args, max_chars=max_chars)
+        surfer = _document_surfer_for(ctx)
+        result = surfer.convert(
+            target["path"],
+            output_format=output_format,
+            output_name=args.get("output_name"),
+            max_chars=max_chars,
+        )
+        output_path = Path(str((result.get("output") or {}).get("path") or ""))
+        file_record = _record_generated_document(ctx, output_path) if output_path.exists() else None
+    except (ValueError, DocumentSurferError, DocumentGenerationError, OSError) as exc:
+        return ToolRunResponse(tool="documents.convert", ok=False, summary=str(exc))
+    return ToolRunResponse(
+        tool="documents.convert",
+        ok=True,
+        summary=f"Converted {target['path'].name} to {output_format}: {output_path.name}.",
+        data={
+            "source": _document_target_payload(target),
+            **result,
+            "file": file_record,
+        },
+    )
+
+
+def _documents_capabilities(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    try:
+        path: Path | None = None
+        if args.get("file_id") or args.get("path"):
+            target = _document_target(ctx, args, max_chars=2000)
+            path = target["path"]
+        surfer = _document_surfer_for(ctx)
+        payload = surfer.capabilities(path)
+    except (ValueError, DocumentSurferError) as exc:
+        return ToolRunResponse(tool="documents.capabilities", ok=False, summary=str(exc))
+    return ToolRunResponse(
+        tool="documents.capabilities",
+        ok=True,
+        summary="Document surfer capabilities ready.",
+        data=payload,
+    )
+
+
+def _document_surfer_for(ctx: ToolContext) -> JarvisDocumentSurfer:
+    output_dir = ctx.settings.data_dir / DOCUMENT_OUTPUT_DIRNAME
+    return JarvisDocumentSurfer(DocumentSurferConfig(output_dir=output_dir))
+
+
+def _document_paths_from_args(ctx: ToolContext, args: dict[str, Any]) -> list[Path]:
+    paths: list[Path] = []
+    raw_paths = args.get("paths")
+    if isinstance(raw_paths, str) and raw_paths.strip():
+        raw_paths = [raw_paths]
+    if isinstance(raw_paths, list):
+        for item in raw_paths[:40]:
+            text = str(item or "").strip()
+            if text:
+                paths.append(_resolve_document_path(ctx.settings, text))
+    file_ids = args.get("file_ids")
+    if isinstance(file_ids, str) and file_ids.strip():
+        file_ids = [file_ids]
+    if isinstance(file_ids, list):
+        for file_id in file_ids[:40]:
+            record = ctx.storage.get_file(str(file_id or "").strip())
+            if record is None:
+                raise ValueError(f"File not found: {file_id}")
+            paths.append(Path(str(record["stored_path"])).resolve(strict=False))
+    # single-path aliases for convenience
+    if not paths and (args.get("file_id") or args.get("path")):
+        target = _document_target(ctx, args, max_chars=2000)
+        paths.append(target["path"])
+    # de-dupe while preserving order
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for path in paths:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+    return unique
 
 
 def _web_orchestration(
@@ -8501,11 +8818,14 @@ def _document_target(
         raise ValueError("file_id or path is required.")
     if not path.exists() or not path.is_file():
         raise ValueError(f"Document does not exist: {path}")
-    if not is_supported_document(path):
+    if not is_document_path_supported(path) and not is_supported_document(path):
         raise ValueError(f"Unsupported document type: {path.suffix or path.name}")
     try:
-        document = extract_document(path, max_chars=max_chars)
-    except DocumentRuntimeError as exc:
+        if is_supported_document(path):
+            document = extract_document(path, max_chars=max_chars)
+        else:
+            document = _document_surfer_for(ctx)._load(path, max_chars=max_chars)
+    except (DocumentRuntimeError, DocumentSurferError, DocumentUnsupportedError, DocumentSafetyError) as exc:
         raise ValueError(str(exc)) from exc
     return {"path": path, "file": file_record, "document": document}
 

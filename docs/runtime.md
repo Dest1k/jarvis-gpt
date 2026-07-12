@@ -154,18 +154,32 @@ For the operator and the second model:
 - Uploaded chat files and local paths can now go through the same safe document
   layer. Use `file_id` for chat uploads or `path` for local files under the
   workspace, `JARVIS_HOME`, or the user home directory.
-- New tools: `documents.inspect`, `documents.read`, `documents.compare`,
-  `documents.edit.plan`, and `documents.apply_replacements`.
+- Low-level engine: `document_runtime` (extract/compare/replace).
+- High-level black box: `document_surfer.JarvisDocumentSurfer` (document analogue
+  of `web_surfer`) with inspect/read/analyze/review/compare/search/
+  summarize_corpus/edit_plan/apply_replacements/generate/convert/package/
+  capabilities.
+- Tools: `documents.inspect`, `documents.read`, `documents.review`,
+  `documents.compare`, `documents.edit.plan`, `documents.apply_replacements`,
+  `documents.analyze`, `documents.search`, `documents.corpus.summarize`,
+  `documents.generate`, `documents.convert`, `documents.capabilities`.
 - DOCX extraction reads paragraphs, tables, comments, and style names. XLSX
   extraction reads sheet previews, shared strings, and formulas. PDF extraction
   uses `pypdf` if available and otherwise a basic text fallback. Text/html/json/
-  csv are read directly.
+  csv are read directly. Extended best-effort extract: PPTX/ODT/RTF.
+- Generation formats: md, txt, csv, json, html, docx, xlsx (stdlib OOXML writers).
 - Ingestion now indexes DOCX/XLSX/PDF/text-like uploads into file chunks, so
   attachment context and `files.search` can find Office/PDF content.
-- `documents.apply_replacements` writes an edited copy to
-  `data/document-outputs`, registers it as a file, and never overwrites the
-  original. Use it only for exact replacements; larger formatting/layout work
-  should be planned first and visually verified before delivery.
+- `documents.apply_replacements` / surfer mutations write edited copies to
+  `data/document-outputs`, register files, and never overwrite originals.
+- Use `documents.review` / `documents.analyze` before serious Office/PDF edits.
+
+## 2026-07-12 handoff - document_surfer release
+
+- Branch `feature/ideal-jarvis-all-enhancements` ships production `document_surfer`.
+- Experimental ideal modules (vision/calendar/email/voice/plugins/briefing) stay
+  out of core ToolRegistry auto-path; document tools are first-class.
+- See `docs/ideal-jarvis-roadmap.md` and `INTEGRATION_GUIDE.md`.
 
 ## 2026-07-10 handoff - internet production surface
 

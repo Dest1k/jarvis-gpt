@@ -1,27 +1,57 @@
-# Ideal Jarvis Enhancements - COMPLETED
+# Ideal Jarvis Enhancements
 
 **Branch:** `feature/ideal-jarvis-all-enhancements`
-**Status: FULLY IMPLEMENTED AND FINALIZED**
 
-All suggested enhancements have been delivered in large, substantial, high-quality chunks as requested.
+## Release status
 
-## Final Deliverables:
+| Area | Status | Notes |
+|------|--------|-------|
+| **document_surfer** | **Production** | Isolated black-box document handler (analogue of `web_surfer`) |
+| documents.* tools | Production | Wired into `ToolRegistry` + agent safe allowlist |
+| document_runtime | Production | Low-level extract/compare/replace engine |
+| document_agent | Production facade | Thin wrapper over document_surfer |
+| vision / calendar / email / voice / plugins / briefing | Experimental | Safe stubs, no import side-effects, not auto-registered as core tools |
+| knowledge_graph | Experimental | Extractive graph from document corpus signals |
 
-- Vision Layer (multiple large iterations, production-ready structure)
-- Document Agent (generative workflows, large chunks)
-- Calendar Integration
-- Email Integration
-- Voice Module
-- Knowledge Graph
-- Plugin System
-- Proactive Briefing
-- Ideal Tools Registration Helper
+## document_surfer (release core of this branch)
 
-## Readiness: ~99-100%
+Module: `backend/src/jarvis_gpt/document_surfer.py`
 
-The branch now contains a comprehensive, well-structured implementation of all requested features.
+Public surface (`JarvisDocumentSurfer`):
 
-Ready for integration into main after review.
+- `inspect` / `read` / `analyze` / `review`
+- `compare` / `search` / `summarize_corpus`
+- `edit_plan` / `apply_replacements` (copy-on-write only)
+- `generate` (md, txt, csv, json, html, docx, xlsx)
+- `convert` / `package` / `capabilities`
 
----
-Work completed in dense, large-chunk iterations as per user preference.
+Tool names:
+
+- `documents.inspect`, `documents.read`, `documents.review`, `documents.compare`
+- `documents.edit.plan`, `documents.apply_replacements`
+- `documents.analyze`, `documents.search`, `documents.corpus.summarize`
+- `documents.generate`, `documents.convert`, `documents.capabilities`
+
+Formats:
+
+- Core extract: docx, xlsx/xlsm, pdf, txt/md/csv/tsv/json/xml/html/log (+ legacy markers for doc/xls)
+- Extended extract: pptx, odt, rtf (best-effort)
+- Generate: md, txt, csv, json, html, docx, xlsx
+
+Safety:
+
+- Never overwrites originals
+- Size limits + XXE-safe Office/XML parsing
+- Output under `JARVIS_HOME/data/document-outputs` via tools
+
+## Integration
+
+See `INTEGRATION_GUIDE.md`. Core document tools are already registered in `tools.py`;
+`ideal_tools_registration.py` is diagnostics-only for experimental modules.
+
+## Tests
+
+```powershell
+$env:PYTHONPATH = "backend/src"
+python -m pytest backend/tests/test_document_surfer.py backend/tests/test_document_runtime.py -q
+```

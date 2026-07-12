@@ -1,45 +1,55 @@
-# Integration Guide for Ideal Jarvis Enhancements
+# Integration Guide — Ideal Jarvis / Document Surfer
 
-This file provides exact steps to wire all new modules into the core Jarvis runtime.
+## Production (ready)
 
-## 1. Register new tools (in tools.py or ToolRegistry)
+### 1. Document surfer is already wired
+
+`backend/src/jarvis_gpt/tools.py` registers the full `documents.*` surface.
+`backend/src/jarvis_gpt/agent.py` includes the new tools in the safe agent allowlist
+and mission executor prompt.
+
+No extra registration call is required for document capabilities.
+
+### 2. Optional low-level API
 
 ```python
-# At the end of tool registration section
-try:
-    from jarvis_gpt.vision import get_vision_tools
-    from jarvis_gpt.document_agent import get_document_agent_tools
-    from jarvis_gpt.calendar_integration import get_calendar_tools
-    from jarvis_gpt.email_integration import get_email_tools
-    from jarvis_gpt.voice import get_voice_tools
-    from jarvis_gpt.knowledge_graph import get_knowledge_graph_tools
-    from jarvis_gpt.plugins import get_plugin_tools
-    from jarvis_gpt.proactive_briefing import get_briefing_tools
+from pathlib import Path
+from jarvis_gpt.document_surfer import DocumentSurferConfig, JarvisDocumentSurfer
 
-    registry.register_many(get_vision_tools())
-    registry.register_many(get_document_agent_tools())
-    registry.register_many(get_calendar_tools())
-    registry.register_many(get_email_tools())
-    registry.register_many(get_voice_tools())
-    registry.register_many(get_knowledge_graph_tools())
-    registry.register_many(get_plugin_tools())
-    registry.register_many(get_briefing_tools())
-except Exception as e:
-    logger.warning(f"Some ideal enhancements tools failed to register: {e}")
+with JarvisDocumentSurfer(DocumentSurferConfig(output_dir=Path("out"))) as surfer:
+    report = surfer.analyze("contract.docx")
+    pack = surfer.generate(title="Summary", body=report["text_preview"], output_format="docx")
 ```
 
-## 2. Update SYSTEM_PROMPT / agent prompts
-Add sections for new capabilities (vision analysis, document generation, proactive briefings, etc.).
+### 3. Document agent facade
 
-## 3. Arbiter / reasoning routes
-Extend `_understand_intent` and route logic to handle new intents ("analyze screenshot", "generate report from research", "daily briefing", etc.).
+```python
+from jarvis_gpt.document_agent import DocumentAgent, DocumentGenerationRequest
 
-## 4. Executive Planner
-Add new task types for document generation, proactive jobs, voice interactions.
+agent = DocumentAgent(output_dir="D:/jarvis/data/document-outputs")
+doc = agent.generate(DocumentGenerationRequest(task="Weekly report", body="...", output_format="md"))
+```
 
-## 5. Command Center (frontend)
-Add UI elements for new tools (vision results, briefing panel, voice input toggle).
+## Experimental modules
 
-All modules are designed to be drop-in with minimal friction while maintaining full safety and architecture compliance.
+`vision`, `calendar_integration`, `email_integration`, `voice`, `plugins`,
+`proactive_briefing`, `knowledge_graph` are **not** production Command Center tools.
 
-**Full feature set is implemented and ready.**
+`ideal_tools_registration.register_all_ideal_tools(registry)` is a best-effort helper
+for diagnostics only. Prefer native `ToolRegistry` specs for anything release-critical.
+
+## System prompt / routing
+
+Agent prompts already mention document_surfer tools. When adding new UI routes:
+
+1. Prefer existing `documents.*` tools over ad-hoc file reads.
+2. Never instruct the model to overwrite source documents.
+3. Use `documents.generate` / `documents.convert` for deliverables.
+
+## Verification
+
+```powershell
+$env:PYTHONPATH = "backend/src"
+python -m pytest backend/tests/test_document_surfer.py -q
+python -c "from jarvis_gpt.tools import ToolRegistry; r=ToolRegistry(); print([t for t in r.names() if t.startswith('documents.')])"
+```

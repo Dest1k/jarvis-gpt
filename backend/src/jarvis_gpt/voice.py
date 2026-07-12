@@ -1,36 +1,38 @@
-#!/usr/bin/env python3
-"""
-Voice Module - Large chunk toward final
-"""
+"""Experimental voice helpers (host Whisper detection only)."""
 
-from dataclasses import dataclass
+from __future__ import annotations
 
-
-@dataclass
-class VoiceConfig:
-    wake_word: str = "jarvis"
+import shutil
+from typing import Any
 
 
 class VoiceManager:
-    def __init__(self, config=None):
-        self.config = config or VoiceConfig()
+    def status(self) -> dict[str, Any]:
+        whisper = shutil.which("whisper")
+        return {
+            "whisper_available": bool(whisper),
+            "whisper_path": whisper,
+            "note": "Transcription requires host Whisper; not auto-enabled in core runtime.",
+        }
 
-    def listen(self, duration=5.0):
-        return "[Transcription placeholder]"
+    def transcribe(self, path: str) -> dict[str, Any]:
+        status = self.status()
+        if not status["whisper_available"]:
+            return {
+                "ok": False,
+                "path": path,
+                "error": "whisper binary not found in PATH",
+            }
+        return {
+            "ok": False,
+            "path": path,
+            "error": "Voice transcription adapter is experimental and not wired for auto-run.",
+        }
 
-    def speak(self, text: str):
-        print(f"[JARVIS] {text[:80]}...")
 
-    def start_full_duplex(self):
-        print("Full-duplex voice mode activated")
-
-
-def get_voice_tools():
-    v = VoiceManager()
+def get_voice_tools() -> dict[str, Any]:
+    voice = VoiceManager()
     return {
-        "voice.listen": v.listen,
-        "voice.speak": v.speak,
-        "voice.start_full_duplex": v.start_full_duplex,
+        "voice.status": voice.status,
+        "voice.transcribe": voice.transcribe,
     }
-
-print("[voice.py] Large chunk toward final.")

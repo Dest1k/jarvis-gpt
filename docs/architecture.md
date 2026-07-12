@@ -39,6 +39,7 @@ Agent Runtime
   |-- independent state verification and safe gates
   |-- host fingerprint and verified execution playbooks
   |-- isolated black-box web_surfer service adapter
+  |-- isolated black-box document_surfer (multi-format documents)
   |-- per-answer observable trace
   |-- answer quality dashboard
   |-- capability/current-work manifest

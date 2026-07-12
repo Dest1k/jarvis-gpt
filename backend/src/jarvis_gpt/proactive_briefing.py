@@ -1,28 +1,28 @@
-#!/usr/bin/env python3
-"""
-Proactive Briefing - Final large push
-"""
+"""Experimental proactive briefing builder using local document/memory signals."""
 
-from dataclasses import dataclass
-from typing import List, Optional
+from __future__ import annotations
 
-
-@dataclass
-class Briefing:
-    title: str
-    content: str
-    priority_items: List[str]
-    sources: List[str]
+from datetime import datetime, timezone
+from typing import Any
 
 
 class ProactiveBriefing:
-    def generate_daily_briefing(self, persona_context=None):
-        content = "Daily Briefing\n- Calendar events\n- Unread emails\n- Web watch triggers\n- Memory lessons\n[Full synthesis ready]"
-        return Briefing("Daily Briefing", content, ["Key priorities"], ["calendar", "email", "web", "memory"])
+    def build(self, *, focus: str | None = None, notes: list[str] | None = None) -> dict[str, Any]:
+        items = list(notes or [])
+        if focus:
+            items.insert(0, f"Focus: {focus}")
+        if not items:
+            items = ["No briefing inputs provided; attach memory/docs to enrich."]
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "focus": focus,
+            "items": items[:20],
+            "status": "draft",
+        }
 
 
-def get_briefing_tools():
-    b = ProactiveBriefing()
-    return {"briefing.daily": b.generate_daily_briefing}
-
-print("[proactive_briefing.py] Final large push.")
+def get_briefing_tools() -> dict[str, Any]:
+    briefing = ProactiveBriefing()
+    return {
+        "briefing.build": briefing.build,
+    }

@@ -1,79 +1,112 @@
-#!/usr/bin/env python3
-"""
-Vision Layer - FINAL
+"""Optional vision helpers (OCR when host tools are available).
 
-Finalized production-grade implementation.
+Experimental ideal-branch module. Production document OCR readiness is reported
+by ``document_surfer`` / ``documents.analyze`` without requiring this module.
 """
+
+from __future__ import annotations
 
 import hashlib
+import logging
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, List
+from typing import Any
 
-try:
-    from PIL import Image
-    import pytesseract
-except ImportError:
-    Image = None
-    pytesseract = None
+LOGGER = logging.getLogger("jarvis.vision")
+
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
 
 
+@dataclass
 class VisionAnalysis:
-    def __init__(self, description: str, key_entities: List[str] = None, ocr_text: str = None, safety_flags: List[str] = None, confidence: float = 0.96, source_type: str = "screenshot", source_path: str = None):
-        self.description = description
-        self.key_entities = key_entities or []
-        self.ocr_text = ocr_text
-        self.safety_flags = safety_flags or []
-        self.confidence = confidence
-        self.source_type = source_type
-        self.source_path = source_path
+    description: str
+    key_entities: list[str] = field(default_factory=list)
+    ocr_text: str | None = None
+    safety_flags: list[str] = field(default_factory=list)
+    confidence: float = 0.0
+    source_type: str = "uploaded_image"
+    source_path: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "description": self.description,
+            "key_entities": list(self.key_entities),
+            "ocr_text": self.ocr_text,
+            "safety_flags": list(self.safety_flags),
+            "confidence": self.confidence,
+            "source_type": self.source_type,
+            "source_path": self.source_path,
+        }
 
 
 class VisionManager:
-    def __init__(self):
-        pass
-
-    def analyze_image(self, image_path: str | Path, query: Optional[str] = None, source_type: str = "uploaded_image") -> VisionAnalysis:
+    def analyze_image(
+        self,
+        image_path: str | Path,
+        query: str | None = None,
+        source_type: str = "uploaded_image",
+    ) -> VisionAnalysis:
         path = Path(image_path)
-        if not path.exists():
+        if not path.exists() or not path.is_file():
             raise FileNotFoundError(str(path))
-        if path.stat().st_size / (1024*1024) > 10:
-            raise ValueError("Too large")
+        size = path.stat().st_size
+        if size > MAX_IMAGE_BYTES:
+            raise ValueError(f"Image too large ({size} > {MAX_IMAGE_BYTES} bytes)")
 
-        h = hashlib.sha256(path.read_bytes()).hexdigest()[:8]
-        desc = f"{path.name} ({h})"
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()[:12]
+        description = f"{path.name} ({digest})"
         if query:
-            desc += f" | {query}"
+            description += f" | {query}"
 
-        ocr_text = None
-        if pytesseract and Image:
-            try:
-                ocr_text = pytesseract.image_to_string(Image.open(path), lang="rus+eng")
-            except:
-                pass
+        ocr_text: str | None = None
+        confidence = 0.35
+        safety_flags = ["path_checked", "size_checked"]
+        try:
+            from PIL import Image  # type: ignore[import-not-found]
+            import pytesseract  # type: ignore[import-not-found]
+
+            ocr_text = pytesseract.image_to_string(Image.open(path), lang="rus+eng")
+            confidence = 0.8 if (ocr_text or "").strip() else 0.45
+            safety_flags.append("ocr_attempted")
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.debug("OCR unavailable for %s: %s", path, exc)
+            safety_flags.append("ocr_unavailable")
 
         return VisionAnalysis(
-            description=desc,
+            description=description,
             key_entities=["text", "ui"] if "screenshot" in source_type else [],
             ocr_text=ocr_text,
-            safety_flags=["checked"],
-            confidence=0.96,
+            safety_flags=safety_flags,
+            confidence=confidence,
             source_type=source_type,
-            source_path=str(path)
+            source_path=str(path),
         )
 
-    def analyze_screenshot(self, path: str | Path, query: Optional[str] = None) -> VisionAnalysis:
+    def analyze_screenshot(
+        self,
+        path: str | Path,
+        query: str | None = None,
+    ) -> VisionAnalysis:
         return self.analyze_image(path, query, "screenshot")
 
-    def analyze_pdf_page(self, path: str | Path, page_number: int = 1, query: Optional[str] = None) -> VisionAnalysis:
-        return self.analyze_image(path, query or f"Page {page_number}", "pdf_page")
+    def analyze_pdf_page(
+        self,
+        path: str | Path,
+        page_number: int = 1,
+        query: str | None = None,
+    ) -> VisionAnalysis:
+        # Page rasterization requires pdftoppm; fall back to metadata-only analysis.
+        return self.analyze_image(
+            path,
+            query or f"Page {page_number}",
+            "pdf_page",
+        )
 
 
-def get_vision_tools():
-    m = VisionManager()
+def get_vision_tools() -> dict[str, Any]:
+    manager = VisionManager()
     return {
-        "vision.analyze": m.analyze_image,
-        "vision.screenshot": m.analyze_screenshot,
-        "vision.pdf_page": m.analyze_pdf_page,
+        "vision.analyze": manager.analyze_image,
+        "vision.screenshot": manager.analyze_screenshot,
+        "vision.pdf_page": manager.analyze_pdf_page,
     }
-
-print("[vision.py] FINAL.")
