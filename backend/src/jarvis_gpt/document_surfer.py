@@ -1313,6 +1313,10 @@ class JarvisDocumentSurfer:
                     f"Extended extract failed for {resolved.name}: {exc}"
                 ) from exc
 
+        identity = identify_path(resolved)
+        if identity.is_text or identity.family in {"code", "text"}:
+            return _extract_generic_text(resolved, identity=identity.to_dict(), max_chars=limit)
+
         raise DocumentUnsupportedError(
             f"Unsupported document type: {suffix or resolved.name}"
         )
@@ -1593,6 +1597,44 @@ class JarvisDocumentSurfer:
 # --------------------------------------------------------------------------- #
 # Extended extractors
 # --------------------------------------------------------------------------- #
+def _extract_generic_text(
+    path: Path,
+    *,
+    identity: dict[str, Any],
+    max_chars: int,
+) -> dict[str, Any]:
+    size = path.stat().st_size
+    byte_limit = min(size, max(4_096, max_chars * 4))
+    with path.open("rb") as handle:
+        data = handle.read(byte_limit + 1)
+    byte_truncated = len(data) > byte_limit
+    data = data[:byte_limit]
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        text = data.decode("utf-16", errors="replace")
+    else:
+        text = data.decode("utf-8-sig", errors="replace")
+    char_truncated = len(text) > max_chars
+    text = text[:max_chars].rstrip()
+    kind = str(identity.get("kind") or path.suffix.lower().lstrip(".") or "text")
+    return {
+        "kind": kind,
+        "path": str(path),
+        "name": path.name,
+        "mime_type": str(identity.get("mime_type") or "text/plain"),
+        "size": size,
+        "text": text,
+        "truncated": byte_truncated or char_truncated,
+        "warnings": (
+            ["Text was truncated to the requested max_chars."]
+            if byte_truncated or char_truncated
+            else []
+        ),
+        "structure": {
+            "line_count": len(text.splitlines()),
+        },
+    }
+
+
 def _extract_pptx(path: Path) -> dict[str, Any]:
     if not zipfile.is_zipfile(path):
         raise DocumentSurferError("PPTX is not a valid ZIP package.")

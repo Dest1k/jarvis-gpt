@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import zipfile
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -10,14 +11,18 @@ import pytest
 from jarvis_gpt.agent import (
     AgentContext,
     AgentRuntime,
+    _looks_like_document_memory_query,
     _native_action_from_message,
     _operator_action_scopes,
     _operator_effect_key,
     _operator_tool_arguments_match,
+    _schema_hint,
+    _tool_observation_excerpt,
 )
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
 from jarvis_gpt.event_bus import EventBus
 from jarvis_gpt.executive_runtime import ExecutiveCoordinator
+from jarvis_gpt.ingest import FileIngestor
 from jarvis_gpt.llm import LLMRouter, LLMStreamChunk
 from jarvis_gpt.models import ToolRunResponse
 from jarvis_gpt.storage import JarvisStorage
@@ -850,6 +855,409 @@ def test_agent_passes_chat_attachments_to_llm_context(monkeypatch, tmp_path):
     assert "brief.txt" in rendered_prompt
     assert "alpha attached content from upload" in rendered_prompt
     storage.close()
+
+
+def test_agent_routes_persisted_document_recall_and_exposes_file_id(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    source = tmp_path / "alpha-contract.txt"
+    source.write_text("Alpha contract deadline is September.", encoding="utf-8")
+    ingested = FileIngestor(settings, storage).ingest_path(source)
+    captured = {}
+
+    class CapturingLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None):
+            captured["messages"] = messages
+            return type("Result", (), {"ok": True, "content": "done", "error": None})()
+
+    agent = AgentRuntime(settings=settings, storage=storage, llm=CapturingLLM(), bus=EventBus())
+    response = asyncio.run(agent.chat("Дай резюме сохраненного договора Alpha"))
+    rendered_prompt = "\n".join(item["content"] for item in captured["messages"])
+    user_message = next(
+        item
+        for item in storage.recent_messages(response.conversation_id, limit=4)
+        if item["role"] == "user"
+    )
+
+    assert user_message["metadata"]["task_kernel"]["intent"] == "document_memory"
+    assert ingested["file"]["id"] in rendered_prompt
+    assert "Alpha contract deadline" in rendered_prompt
+    assert "documents.recall" in rendered_prompt
+    storage.close()
+
+
+def test_document_memory_route_is_not_intercepted_by_weather(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    source = tmp_path / "погода-report.txt"
+    source.write_text("Погода в отчете использована как тестовая метка.", encoding="utf-8")
+    FileIngestor(settings, storage).ingest_path(source)
+    captured = {}
+
+    class CapturingLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None):
+            captured["messages"] = messages
+            return type("Result", (), {"ok": True, "content": "Резюме готово.", "error": None})()
+
+    agent = AgentRuntime(settings=settings, storage=storage, llm=CapturingLLM(), bus=EventBus())
+    response = asyncio.run(agent.chat("Дай резюме сохраненного отчета: погода"))
+    rendered = "\n".join(item["content"] for item in captured["messages"])
+
+    assert response.answer == "Резюме готово."
+    assert "Погода в отчете" in rendered
+    assert any(event.payload.get("prefetch") is True for event in response.events)
+    storage.close()
+
+
+def test_agent_carries_recent_attachment_into_summary_followup(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    path = tmp_path / "brief.txt"
+    path.write_text("Phoenix release is ready for validation.", encoding="utf-8")
+    record = storage.create_file_record(
+        name=path.name,
+        stored_path=path,
+        sha256="b" * 64,
+        size=path.stat().st_size,
+        mime_type="text/plain",
+        status="stored",
+        chunk_count=0,
+    )
+    conversation_id = storage.create_conversation("Attachment follow-up")
+    storage.add_message(
+        conversation_id=conversation_id,
+        role="user",
+        content="Посмотри вложение",
+        metadata={"attachments": [{"id": record["id"], "name": record["name"]}]},
+    )
+    captured = {}
+
+    class CapturingLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None):
+            captured["messages"] = messages
+            return type("Result", (), {"ok": True, "content": "done", "error": None})()
+
+    agent = AgentRuntime(settings=settings, storage=storage, llm=CapturingLLM(), bus=EventBus())
+    response = asyncio.run(agent.chat("Сделай краткое резюме", conversation_id=conversation_id))
+    rendered_prompt = "\n".join(item["content"] for item in captured["messages"])
+    user_message = next(
+        item
+        for item in storage.recent_messages(response.conversation_id, limit=3)
+        if item["role"] == "user" and item["content"] == "Сделай краткое резюме"
+    )
+
+    assert user_message["metadata"]["task_kernel"]["intent"] == "document_memory"
+    assert record["id"] in rendered_prompt
+    assert "Phoenix release" in rendered_prompt
+    assert any(
+        event.payload.get("tool") == "documents.recall"
+        and event.payload.get("prefetch") is True
+        for event in response.events
+    )
+    storage.close()
+
+
+def test_agent_binds_singular_followup_to_latest_attachment_turn(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    records = []
+    for name, content in (
+        ("alpha.txt", "Alpha attachment must not be recalled."),
+        ("beta.txt", "Beta attachment is the active document."),
+    ):
+        path = tmp_path / name
+        path.write_text(content, encoding="utf-8")
+        records.append(FileIngestor(settings, storage).ingest_path(path)["file"])
+    conversation_id = storage.create_conversation("Latest attachment binding")
+    for record in records:
+        storage.add_message(
+            conversation_id=conversation_id,
+            role="user",
+            content=f"Uploaded {record['name']}",
+            metadata={"attachments": [{"id": record["id"], "name": record["name"]}]},
+        )
+        storage.add_message(
+            conversation_id=conversation_id,
+            role="assistant",
+            content="Принял.",
+        )
+    captured = {}
+
+    class CapturingLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None):
+            captured["messages"] = messages
+            return type("Result", (), {"ok": True, "content": "done", "error": None})()
+
+    agent = AgentRuntime(settings=settings, storage=storage, llm=CapturingLLM(), bus=EventBus())
+    response = asyncio.run(agent.chat("Summarize it", conversation_id=conversation_id))
+    rendered_prompt = "\n".join(item["content"] for item in captured["messages"])
+    recall_event = next(
+        event
+        for event in response.events
+        if event.payload.get("tool") == "documents.recall"
+        and event.payload.get("prefetch") is True
+    )
+
+    assert recall_event.payload["file_ids"] == [records[1]["id"]]
+    assert "Beta attachment is the active document" in rendered_prompt
+    assert "Alpha attachment must not be recalled" not in rendered_prompt
+    storage.close()
+
+
+def test_agent_reuses_successful_recall_for_deictic_followup(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    source = tmp_path / "phoenix-plan.txt"
+    source.write_text("Phoenix launch requires a backup check.", encoding="utf-8")
+    record = FileIngestor(settings, storage).ingest_path(source)["file"]
+    prompts = []
+
+    class CapturingLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None):
+            prompts.append("\n".join(item["content"] for item in messages))
+            return type("Result", (), {"ok": True, "content": "done", "error": None})()
+
+    agent = AgentRuntime(settings=settings, storage=storage, llm=CapturingLLM(), bus=EventBus())
+    first = asyncio.run(agent.chat("Summarize saved Phoenix document"))
+    stored_first = storage.get_message(first.message_id)
+    second = asyncio.run(
+        agent.chat("Summarize it more briefly", conversation_id=first.conversation_id)
+    )
+    recall_event = next(
+        event
+        for event in second.events
+        if event.payload.get("tool") == "documents.recall"
+        and event.payload.get("prefetch") is True
+    )
+
+    assert stored_first["metadata"]["document_recall"]["file_ids"] == [record["id"]]
+    assert recall_event.payload["file_ids"] == [record["id"]]
+    assert "Phoenix launch requires a backup check" in prompts[1]
+    storage.close()
+
+
+def test_agent_stream_persists_successful_document_recall(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "1")
+    monkeypatch.setenv("JARVIS_EMBEDDINGS_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    source = tmp_path / "stream-report.txt"
+    source.write_text("Stream report says the rollout is ready.", encoding="utf-8")
+    record = FileIngestor(settings, storage).ingest_path(source)["file"]
+    captured = {}
+
+    class CapturingStreamLLM:
+        async def stream_complete(self, messages, *, temperature=None, max_tokens=None, **kwargs):
+            captured["messages"] = messages
+            yield LLMStreamChunk(kind="delta", content="Rollout готов.")
+
+    agent = AgentRuntime(
+        settings=settings,
+        storage=storage,
+        llm=CapturingStreamLLM(),
+        bus=EventBus(),
+    )
+    storage.set_runtime_value("experience.autonomy_policy", {"verify_answers": False})
+    items = asyncio.run(
+        _collect(agent.stream_chat("Summarize saved stream report", mode="chat"))
+    )
+    done = next(item for item in items if item["type"] == "done")
+    stored = storage.get_message(done["message_id"])
+    rendered = "\n".join(item["content"] for item in captured["messages"])
+
+    assert "Stream report says the rollout is ready" in rendered
+    assert stored["metadata"]["document_recall"]["file_ids"] == [record["id"]]
+    assert any(
+        item["type"] == "event"
+        and item["event"].get("payload", {}).get("prefetch") is True
+        for item in items
+    )
+    storage.close()
+
+
+def test_agent_routes_saved_archive_to_archive_tools(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "1")
+    monkeypatch.setenv("JARVIS_EMBEDDINGS_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    archive_path = tmp_path / "saved-bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("notes.txt", "Phoenix archive evidence is ready.")
+    record = FileIngestor(settings, storage).ingest_path(archive_path)["file"]
+    conversation_id = storage.create_conversation("Archive follow-up")
+    storage.add_message(
+        conversation_id=conversation_id,
+        role="user",
+        content="Сохрани архив",
+        metadata={"attachments": [{"id": record["id"], "name": record["name"]}]},
+    )
+    storage.add_message(conversation_id=conversation_id, role="assistant", content="Принял.")
+
+    class ArchiveLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, messages, *, temperature=None, max_tokens=None, **kwargs):
+            self.calls += 1
+            rendered = "\n".join(item["content"] for item in messages)
+            if self.calls == 1:
+                assert record["id"] in rendered
+                return type(
+                    "Result",
+                    (),
+                    {
+                        "ok": True,
+                        "content": json.dumps(
+                            {
+                                "tool": "documents.archive.search",
+                                "arguments": {"file_id": record["id"], "query": "Phoenix"},
+                            }
+                        ),
+                        "error": None,
+                    },
+                )()
+            assert "Phoenix archive evidence" in rendered
+            return type(
+                "Result",
+                (),
+                {"ok": True, "content": "Phoenix найден в notes.txt.", "error": None},
+            )()
+
+    llm = ArchiveLLM()
+    agent = AgentRuntime(settings=settings, storage=storage, llm=llm, bus=EventBus())
+    storage.set_runtime_value("experience.autonomy_policy", {"verify_answers": False})
+    response = asyncio.run(
+        agent.chat("Найди Phoenix в сохраненном архиве", conversation_id=conversation_id)
+    )
+    user_message = next(
+        item
+        for item in storage.recent_messages(conversation_id, limit=4)
+        if item["role"] == "user" and "Phoenix" in item["content"]
+    )
+
+    assert user_message["metadata"]["task_kernel"]["intent"] == "archive_memory"
+    assert llm.calls == 2
+    assert response.answer == "Phoenix найден в notes.txt."
+    assert any(
+        event.payload.get("tool") == "documents.archive.search" for event in response.events
+    )
+    assert not any(
+        event.payload.get("tool") == "documents.recall" for event in response.events
+    )
+    storage.close()
+
+
+def test_document_tool_prompt_hints_and_observations_keep_content() -> None:
+    assert _schema_hint({"query": "Text query", "limit": "Maximum results"}) == ("query?, limit?")
+    observation = _tool_observation_excerpt(
+        ToolRunResponse(
+            tool="documents.recall",
+            ok=True,
+            summary="recalled",
+            data={"passages": [{"content": ("x" * 2_000) + "TAIL"}]},
+        )
+    )
+
+    assert "TAIL" in observation
+    assert "untrusted document/file evidence" in observation
+
+    large_observation = _tool_observation_excerpt(
+        ToolRunResponse(
+            tool="documents.recall",
+            ok=True,
+            summary="recalled",
+            data={
+                "sources": [{"file_id": "file_1", "name": "large.xlsx"}],
+                "passages": [{"content": ("p" * 4_000) + "PASSAGE_TAIL"}],
+                "analyses": [{"tables": ["x" * 40_000]}],
+            },
+        )
+    )
+    payload = large_observation.split("\ndata: ", 1)[1]
+
+    assert "PASSAGE_TAIL" in large_observation
+    assert json.loads(payload)["truncated"] is True
+
+
+def test_document_memory_routing_distinguishes_persisted_file_from_web_report() -> None:
+    assert _looks_like_document_memory_query(
+        "Summarize the last document",
+        has_file_context=False,
+        has_persisted_files=True,
+    )
+
+
+def test_document_memory_ambiguity_returns_before_llm(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "1")
+    monkeypatch.setenv("JARVIS_EMBEDDINGS_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    ids = []
+    for index, suffix in enumerate(("A", "B")):
+        path = tmp_path / f"contract-{suffix}.txt"
+        path.write_text(f"Стандартные условия договора {suffix}.", encoding="utf-8")
+        record = storage.create_file_record(
+            name=path.name,
+            stored_path=path,
+            sha256=str(index + 1) * 64,
+            size=path.stat().st_size,
+            mime_type="text/plain",
+            status="indexed",
+            chunk_count=1,
+        )
+        storage.add_file_chunks(record["id"], [f"Стандартные условия договора {suffix}."])
+        ids.append(record["id"])
+
+    class MustNotRunLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None, **kwargs):
+            raise AssertionError("LLM must not run for ambiguous document selection")
+
+    agent = AgentRuntime(settings=settings, storage=storage, llm=MustNotRunLLM(), bus=EventBus())
+    response = asyncio.run(agent.chat("Дай резюме сохраненного договора"))
+
+    assert "несколько подходящих документов" in response.answer
+    assert all(file_id in response.answer for file_id in ids)
+    assert "Стандартные условия договора" not in response.answer
+    storage.close()
+    assert not _looks_like_document_memory_query(
+        "Summarize the recent Microsoft report",
+        has_file_context=False,
+        has_persisted_files=True,
+    )
+    assert not _looks_like_document_memory_query(
+        "Найди и проанализируй отчёт Минфина в интернете",
+        has_file_context=True,
+        has_persisted_files=True,
+    )
 
 
 def test_agent_can_disable_model_thinking(monkeypatch, tmp_path):

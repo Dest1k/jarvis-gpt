@@ -40,6 +40,7 @@ Agent Runtime
   |-- host fingerprint and verified execution playbooks
   |-- isolated black-box web_surfer service adapter
   |-- isolated black-box document_surfer (multi-format documents)
+  |-- durable document-memory resolver (filename/chunks -> file_id -> analysis)
   |-- per-answer observable trace
   |-- answer quality dashboard
   |-- capability/current-work manifest

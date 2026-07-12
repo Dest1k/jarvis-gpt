@@ -162,14 +162,16 @@ For the operator and the second model:
 - Tools: `documents.inspect`, `documents.read`, `documents.review`,
   `documents.compare`, `documents.edit.plan`, `documents.apply_replacements`,
   `documents.analyze`, `documents.search`, `documents.corpus.summarize`,
-  `documents.generate`, `documents.convert`, `documents.capabilities`.
+  `documents.generate`, `documents.convert`, `documents.capabilities`, and
+  `documents.recall` for durable file-memory retrieval plus analysis evidence.
 - DOCX extraction reads paragraphs, tables, comments, and style names. XLSX
   extraction reads sheet previews, shared strings, and formulas. PDF extraction
   uses `pypdf` if available and otherwise a basic text fallback. Text/html/json/
   csv are read directly. Extended best-effort extract: PPTX/ODT/RTF.
 - Generation formats: md, txt, csv, json, html, docx, xlsx (stdlib OOXML writers).
-- Ingestion now indexes DOCX/XLSX/PDF/text-like uploads into file chunks, so
-  attachment context and `files.search` can find Office/PDF content.
+- Ingestion indexes DOCX/XLSX/PDF/PPTX/ODT/RTF/text-like uploads into durable
+  file chunks, so later conversations can find document content without a new
+  attachment.
 - `documents.apply_replacements` / surfer mutations write edited copies to
   `data/document-outputs`, register files, and never overwrite originals.
 - Use `documents.review` / `documents.analyze` before serious Office/PDF edits.
@@ -192,6 +194,26 @@ For the operator and the second model:
   `documents.archive.list|extract|read_member|create|search`.
 - `documents.inspect` on archives returns member listing instead of forcing
   document text extraction.
+
+## 2026-07-12 handoff - durable document recall
+
+- `documents.recall {query, file_ids?, focus?, max_files?, max_chars?}` joins
+  persistent `files`/`file_chunks` memory with `document_surfer`: filename and
+  content matches resolve to stable `file_id` values, the stored sources are
+  read and analyzed, and bounded passages/corpus evidence feed the final LLM
+  summary. Specific misses fail closed instead of selecting an unrelated recent
+  file.
+- Historical document requests get a dedicated task-kernel route. Indexed-file
+  prompt context includes `file_id`; same-conversation follow-ups bind to the
+  latest attachment turn or validated recalled source ids stored in message
+  metadata. Temporal requests choose the newest matching document but never
+  broaden a failed named match to an unrelated recent file.
+- Persisted ZIP/RAR/7z/TAR requests use a separate archive-memory route and the
+  `documents.archive.*` tools instead of being rejected by document recall.
+- Document observations use larger, content-first bounds and are explicitly
+  marked as untrusted data, so long text reaches synthesis without becoming
+  instructions. Tool argument hints now render for the repository's shorthand
+  schemas.
 
 ## 2026-07-10 handoff - internet production surface
 
