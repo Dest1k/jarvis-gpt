@@ -1,35 +1,22 @@
 """Isolated, production-grade document-surfing module for the Jarvis agent.
 
 ``JarvisDocumentSurfer`` is an isolated document black box: it accepts high-level
-commands over documents of many types, extracts structure and text, compares /
-searches / summarizes / edits / generates artifacts, and returns clean structured
-results (dict / Markdown). Low-level parsing stays in ``document_runtime``; this
-module is the operator-facing capability surface, analogous to ``web_surfer``.
+commands over documents, archives, and generic files, extracts structure and text,
+compares / searches / summarizes / edits / generates artifacts, and returns clean
+structured results (dict / Markdown). Low-level parsing stays in
+``document_runtime`` / ``archive_runtime`` / ``file_types``; this module is the
+operator-facing capability surface, analogous to ``web_surfer``.
 
-Four layers are implemented:
+Layers:
 
-1. Safety & detection
-   - Size, zip-bomb, and path-policy checks via ``document_runtime``.
-   - XXE-safe XML parsing for Office packages.
-   - Capability probing (OCR tools, LibreOffice, Whisper) without hard deps.
+1. Safety & detection — size limits, XXE-safe XML, archive zip-bomb guards,
+   magic-byte + extension type recognition.
+2. Documents — DOCX/XLSX/PDF/text/HTML + extended PPTX/ODT/RTF.
+3. Archives — list/extract/read/create for zip/tar/gz/bz2/xz (+ optional 7z/rar).
+4. Corpus ops & generation — search/summarize/compare/generate/convert/package.
 
-2. Extraction & structure
-   - DOCX / XLSX / XLSM / PDF / text / HTML / CSV / JSON / XML.
-   - Extended kinds: PPTX, ODT, RTF (best-effort, stdlib-only).
-   - Tables, formulas, comments, headings, page counts.
-
-3. Analysis & corpus ops
-   - Single-doc deep analysis and multi-doc search / compare / summarize.
-   - Extractive corpus briefs (no LLM required).
-   - Keyword and regex search with bounded hit lists.
-
-4. Mutation & generation
-   - Copy-on-write exact replacements (never overwrite originals).
-   - Generate Markdown / text / CSV / JSON / HTML / DOCX / XLSX artifacts.
-   - Lightweight format conversion through extract → regenerate.
-
-Dependencies: stdlib + existing ``document_runtime``. Optional:
-    pypdf (richer PDF), tesseract/pdftoppm (OCR readiness), LibreOffice (visual).
+Dependencies: stdlib + ``document_runtime``. Optional: pypdf, py7zr, rarfile,
+tesseract/pdftoppm, LibreOffice.
 """
 
 from __future__ import annotations
@@ -50,6 +37,16 @@ from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
 
+from .archive_runtime import (
+    ArchiveConfig,
+    ArchiveError,
+    archive_capabilities,
+    create_archive as archive_create,
+    extract_archive as archive_extract,
+    is_archive_path,
+    list_archive as archive_list,
+    read_archive_member as archive_read_member,
+)
 from .document_runtime import (
     DOCUMENT_EXTENSIONS,
     DOCUMENT_MIME_TYPES,
@@ -60,6 +57,12 @@ from .document_runtime import (
     document_mime_type,
     extract_document,
     is_supported_document,
+)
+from .file_types import (
+    archive_kinds,
+    document_kinds,
+    identify_path,
+    is_document_kind,
 )
 
 LOGGER = logging.getLogger("jarvis.document_surfer")
@@ -73,6 +76,8 @@ __all__ = [
     "JarvisDocumentSurfer",
     "document_surfer_capabilities",
     "supported_document_kinds",
+    "is_archive_path",
+    "identify_path",
 ]
 
 # --------------------------------------------------------------------------- #
@@ -150,6 +155,9 @@ class DocumentSurferConfig:
     output_dir: Path | None = None
     allow_extended_formats: bool = True
     include_entity_signals: bool = True
+    max_archive_members: int = 5_000
+    max_archive_member_bytes: int = 50_000_000
+    max_archive_total_bytes: int = 200_000_000
 
     def __post_init__(self) -> None:
         self.max_document_bytes = max(1_000, int(self.max_document_bytes))
@@ -159,8 +167,18 @@ class DocumentSurferConfig:
         self.max_diffs = max(10, min(2_000, int(self.max_diffs)))
         self.max_replacements = max(1, min(200, int(self.max_replacements)))
         self.max_generated_chars = max(1_000, min(5_000_000, int(self.max_generated_chars)))
+        self.max_archive_members = max(1, min(50_000, int(self.max_archive_members)))
+        self.max_archive_member_bytes = max(1_000, int(self.max_archive_member_bytes))
+        self.max_archive_total_bytes = max(1_000, int(self.max_archive_total_bytes))
         if self.output_dir is not None:
             self.output_dir = Path(self.output_dir)
+
+    def archive_config(self) -> ArchiveConfig:
+        return ArchiveConfig(
+            max_members=self.max_archive_members,
+            max_member_bytes=self.max_archive_member_bytes,
+            max_total_uncompressed_bytes=self.max_archive_total_bytes,
+        )
 
 
 def supported_document_kinds() -> dict[str, list[str]]:
@@ -174,6 +192,23 @@ def supported_document_kinds() -> dict[str, list[str]]:
         "extract_extended": extended,
         "generate": generatable,
         "mime_core": sorted(DOCUMENT_MIME_TYPES),
+        "archives": archive_kinds(),
+        "documents": document_kinds(),
+        "file_families": [
+            "archive",
+            "document",
+            "text",
+            "code",
+            "image",
+            "audio",
+            "video",
+            "font",
+            "executable",
+            "disk",
+            "database",
+            "certificate",
+            "binary",
+        ],
     }
 
 
@@ -194,6 +229,7 @@ def document_surfer_capabilities(*, path: Path | None = None) -> dict[str, Any]:
     kinds = supported_document_kinds()
     payload: dict[str, Any] = {
         "formats": kinds,
+        "archives": archive_capabilities(),
         "host_tools": {
             "tesseract": bool(tesseract),
             "pdftoppm": bool(pdftoppm),
@@ -209,12 +245,16 @@ def document_surfer_capabilities(*, path: Path | None = None) -> dict[str, Any]:
         "mutation": {
             "exact_replacements": ["docx", "xlsx", "xlsm", "txt", "md", "html", "csv", "tsv", "json", "xml", "log"],
             "generate": kinds["generate"],
+            "archives_create": archive_capabilities().get("create") or [],
             "never_overwrites_original": True,
         },
+        "file_identify": True,
     }
     if path is not None:
-        payload["path_supported"] = is_document_path_supported(path)
-        payload["path_kind"] = _kind_for_path(path)
+        identified = identify_path(path)
+        payload["path_supported"] = is_document_path_supported(path) or identified.is_archive
+        payload["path_kind"] = identified.kind
+        payload["path_type"] = identified.to_dict()
     return payload
 
 
@@ -222,12 +262,21 @@ def is_document_path_supported(path: str | Path, mime_type: str = "") -> bool:
     path_obj = Path(path)
     if is_supported_document(path_obj, mime_type):
         return True
-    return path_obj.suffix.lower() in _EXTENDED_EXTENSIONS
+    if path_obj.suffix.lower() in _EXTENDED_EXTENSIONS:
+        return True
+    try:
+        info = identify_path(path_obj)
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(info.is_document or info.is_text or is_document_kind(info.kind))
 
 
 def _kind_for_path(path: Path) -> str:
-    suffix = path.suffix.lower().lstrip(".")
-    return suffix or "unknown"
+    try:
+        return identify_path(path).kind
+    except Exception:  # noqa: BLE001
+        suffix = path.suffix.lower().lstrip(".")
+        return suffix or "unknown"
 
 
 # --------------------------------------------------------------------------- #
@@ -262,17 +311,290 @@ class JarvisDocumentSurfer:
     def __exit__(self, *_exc: object) -> None:
         self.close()
 
+    # -- type recognition & generic files ------------------------------------ #
+    def identify(self, path: str | Path) -> dict[str, Any]:
+        """Magic-byte + extension type recognition for any file."""
+
+        resolved = Path(path).resolve(strict=False)
+        if not resolved.exists() or not resolved.is_file():
+            raise DocumentSafetyError(f"File does not exist: {resolved}")
+        info = identify_path(resolved)
+        digest = ""
+        size = resolved.stat().st_size
+        if size <= min(self.config.max_document_bytes, 32_000_000):
+            digest = hashlib.sha256(resolved.read_bytes()).hexdigest()
+        else:
+            # Hash first 1 MiB + size marker for oversized files.
+            with resolved.open("rb") as handle:
+                digest = hashlib.sha256(handle.read(1_048_576)).hexdigest() + ":partial"
+        return {
+            "ok": True,
+            "mode": "identify",
+            "path": str(resolved),
+            "name": resolved.name,
+            "size": size,
+            "sha256": digest,
+            "type": info.to_dict(),
+            "is_archive": info.is_archive and not (
+                info.is_document and info.kind in {"docx", "xlsx", "xlsm", "pptx", "odt", "ods", "odp", "epub"}
+            ),
+            "is_document": bool(info.is_document or info.is_text),
+            "markdown": (
+                f"# Identify: {resolved.name}\n\n"
+                f"- kind: `{info.kind}`\n"
+                f"- family: `{info.family}`\n"
+                f"- mime: `{info.mime_type}`\n"
+                f"- confidence: {info.confidence}\n"
+                f"- source: {info.source}\n"
+                f"- size: {size} bytes\n"
+            ),
+        }
+
+    def probe(self, path: str | Path, *, max_chars: int | None = None) -> dict[str, Any]:
+        """Unified entry: identify + document inspect and/or archive list."""
+
+        identity = self.identify(path)
+        type_info = identity.get("type") if isinstance(identity.get("type"), dict) else {}
+        result: dict[str, Any] = {
+            "ok": True,
+            "mode": "probe",
+            "identify": identity,
+            "document": None,
+            "archive": None,
+        }
+        path_obj = Path(path)
+        if identity.get("is_document") or is_document_path_supported(path_obj):
+            try:
+                result["document"] = self.inspect(path_obj, max_chars=max_chars)
+            except DocumentSurferError as exc:
+                result["document_error"] = str(exc)
+        if identity.get("is_archive") or is_archive_path(path_obj):
+            try:
+                result["archive"] = self.list_archive(path_obj)
+            except DocumentSurferError as exc:
+                result["archive_error"] = str(exc)
+        kind = type_info.get("kind") or "unknown"
+        result["markdown"] = (
+            f"# Probe: {path_obj.name}\n\n"
+            f"- kind: `{kind}`\n"
+            f"- document: {'yes' if result.get('document') else 'no'}\n"
+            f"- archive: {'yes' if result.get('archive') else 'no'}\n"
+        )
+        return result
+
+    # -- archives ------------------------------------------------------------- #
+    def list_archive(self, path: str | Path, *, prefix: str = "") -> dict[str, Any]:
+        try:
+            return archive_list(path, config=self.config.archive_config(), prefix=prefix)
+        except (ArchiveError, OSError) as exc:
+            raise DocumentSurferError(str(exc)) from exc
+
+    def extract_archive(
+        self,
+        path: str | Path,
+        *,
+        members: Sequence[str] | None = None,
+        output_dir: str | Path | None = None,
+        output_name: str | None = None,
+    ) -> dict[str, Any]:
+        dest = self._archive_output_dir(path, output_dir=output_dir, output_name=output_name)
+        try:
+            return archive_extract(
+                path,
+                output_dir=dest,
+                members=members,
+                config=self.config.archive_config(),
+            )
+        except (ArchiveError, OSError) as exc:
+            raise DocumentSurferError(str(exc)) from exc
+
+    def read_archive_member(
+        self,
+        path: str | Path,
+        member: str,
+        *,
+        max_bytes: int | None = None,
+        as_document: bool = False,
+        max_chars: int | None = None,
+    ) -> dict[str, Any]:
+        try:
+            payload = archive_read_member(
+                path,
+                member,
+                max_bytes=max_bytes,
+                config=self.config.archive_config(),
+            )
+        except (ArchiveError, OSError) as exc:
+            raise DocumentSurferError(str(exc)) from exc
+        if as_document:
+            # Materialize member under output dir, then run document load.
+            extracted = self.extract_archive(path, members=[member])
+            files = extracted.get("extracted") or []
+            if not files:
+                raise DocumentSurferError(f"Failed to materialize archive member: {member}")
+            member_path = Path(str(files[0]["path"]))
+            try:
+                document = self._load(member_path, max_chars=max_chars)
+                payload["document"] = _public_document(document, include_text=True)
+            except DocumentSurferError as exc:
+                payload["document_error"] = str(exc)
+        return payload
+
+    def create_archive(
+        self,
+        paths: Sequence[str | Path],
+        *,
+        archive_format: str = "zip",
+        output_path: str | Path | None = None,
+        output_name: str | None = None,
+    ) -> dict[str, Any]:
+        fmt = str(archive_format or "zip").strip().lower().lstrip(".")
+        if fmt in {"tgz"}:
+            fmt = "tar.gz"
+        if fmt in {"tbz", "tbz2"}:
+            fmt = "tar.bz2"
+        if fmt in {"txz"}:
+            fmt = "tar.xz"
+        suffix_map = {
+            "zip": ".zip",
+            "tar": ".tar",
+            "tar.gz": ".tar.gz",
+            "tar.bz2": ".tar.bz2",
+            "tar.xz": ".tar.xz",
+            "gz": ".gz",
+        }
+        if fmt not in suffix_map:
+            raise DocumentGenerationError(
+                f"Unsupported archive create format '{fmt}'. "
+                f"Supported: {', '.join(sorted(suffix_map))}"
+            )
+        default_suffix = suffix_map[fmt]
+        destination = self._resolve_output_path(
+            Path(f"archive{default_suffix}"),
+            output_path=output_path,
+            output_name=output_name or f"archive{default_suffix}",
+            default_suffix=default_suffix,
+            stem_suffix="",
+        )
+        try:
+            return archive_create(
+                paths,
+                output_path=destination,
+                archive_format=fmt,
+                config=self.config.archive_config(),
+            )
+        except (ArchiveError, OSError) as exc:
+            raise DocumentSurferError(str(exc)) from exc
+
+    def search_archive(
+        self,
+        path: str | Path,
+        query: str,
+        *,
+        regex: bool = False,
+        case_sensitive: bool = False,
+        max_members: int = 40,
+        max_bytes_per_member: int = 1_000_000,
+    ) -> dict[str, Any]:
+        """Search text-like members inside an archive."""
+
+        listing = self.list_archive(path)
+        needle = str(query or "").strip()
+        if not needle:
+            raise DocumentSurferError("search query must not be empty")
+        flags = 0 if case_sensitive else re.IGNORECASE
+        try:
+            pattern = re.compile(needle if regex else re.escape(needle), flags)
+        except re.error as exc:
+            raise DocumentSurferError(f"Invalid search pattern: {exc}") from exc
+        hits: list[dict[str, Any]] = []
+        scanned = 0
+        for item in listing.get("members") or []:
+            if item.get("is_dir") or item.get("unsafe") or item.get("skipped"):
+                continue
+            name = str(item.get("name") or "")
+            if not name:
+                continue
+            try:
+                member = self.read_archive_member(
+                    path,
+                    name,
+                    max_bytes=max_bytes_per_member,
+                )
+            except DocumentSurferError:
+                continue
+            scanned += 1
+            text = str(member.get("text_preview") or "")
+            if not text:
+                # try decode raw if type looks textual
+                type_info = member.get("type") if isinstance(member.get("type"), dict) else {}
+                if not (type_info.get("is_text") or type_info.get("is_document")):
+                    if scanned >= max_members:
+                        break
+                    continue
+            for match in pattern.finditer(text):
+                start = max(0, match.start() - 60)
+                end = min(len(text), match.end() + 60)
+                hits.append(
+                    {
+                        "member": name,
+                        "match": match.group(0),
+                        "offset": match.start(),
+                        "snippet": text[start:end].replace("\n", " "),
+                    }
+                )
+                if len(hits) >= self.config.max_search_hits:
+                    break
+            if len(hits) >= self.config.max_search_hits or scanned >= max_members:
+                break
+        return {
+            "ok": True,
+            "mode": "search_archive",
+            "archive": str(Path(path)),
+            "query": needle,
+            "scanned_members": scanned,
+            "hit_count": len(hits),
+            "hits": hits,
+            "markdown": (
+                f"# Archive search: {needle}\n\n"
+                f"- archive: `{Path(path).name}`\n"
+                f"- scanned members: {scanned}\n"
+                f"- hits: {len(hits)}\n"
+            ),
+        }
+
     # -- single document ------------------------------------------------------ #
     def inspect(self, path: str | Path, *, max_chars: int | None = None) -> dict[str, Any]:
         """Lightweight metadata + structure + capability snapshot."""
 
+        # Archives get listing-oriented inspect without forcing document extract.
+        if is_archive_path(path):
+            listing = self.list_archive(path)
+            identity = self.identify(path)
+            return {
+                "ok": True,
+                "mode": "inspect",
+                "document": None,
+                "archive": listing,
+                "type": identity.get("type"),
+                "text_preview": "",
+                "summary": (
+                    f"Archive {listing.get('kind')}: "
+                    f"{listing.get('member_count', 0)} member(s) listed."
+                ),
+                "capabilities": {"kind": "archive", "archive": True},
+                "markdown": listing.get("markdown") or identity.get("markdown") or "",
+            }
+
         document = self._load(path, max_chars=max_chars)
         text = str(document.get("text") or "")
         caps = self.capabilities_for(document, path=Path(document["path"]))
+        identity = identify_path(Path(document["path"]))
         return {
             "ok": True,
             "mode": "inspect",
             "document": _public_document(document, include_text=False),
+            "type": identity.to_dict(),
             "text_preview": _short(text, 1600),
             "summary": _summary_line(document),
             "capabilities": caps,
@@ -1018,6 +1340,29 @@ class JarvisDocumentSurfer:
             }
         )
         return payload
+
+    def _archive_output_dir(
+        self,
+        source: str | Path,
+        *,
+        output_dir: str | Path | None,
+        output_name: str | None,
+    ) -> Path:
+        if output_dir is not None:
+            dest = Path(output_dir).resolve(strict=False)
+            dest.mkdir(parents=True, exist_ok=True)
+            return dest
+        base = self.config.output_dir or (Path.cwd() / "document-outputs")
+        base.mkdir(parents=True, exist_ok=True)
+        label = _safe_filename(output_name or f"{Path(source).stem}-extracted")
+        candidate = base / label
+        if not candidate.exists():
+            candidate.mkdir(parents=True, exist_ok=True)
+            return candidate
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        dest = base / f"{label}-{stamp}"
+        dest.mkdir(parents=True, exist_ok=True)
+        return dest
 
     def _resolve_output_path(
         self,

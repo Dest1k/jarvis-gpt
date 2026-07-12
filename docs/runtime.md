@@ -181,6 +181,18 @@ For the operator and the second model:
   out of core ToolRegistry auto-path; document tools are first-class.
 - See `docs/ideal-jarvis-roadmap.md` and `INTEGRATION_GUIDE.md`.
 
+## 2026-07-12 handoff - archives + file type recognition
+
+- `file_types.identify_path/bytes`: magic-byte + compound-extension recognition
+  for archives, documents, images, media, executables, text/code, etc.
+- `archive_runtime`: safe list/extract/read/create for zip, tar, tar.gz, tar.bz2,
+  tar.xz, gz, bz2, xz; optional 7z (`py7zr`) and rar (`rarfile`). Path traversal
+  and uncompressed size bombs are rejected.
+- New tools: `documents.file.identify`, `documents.file.probe`,
+  `documents.archive.list|extract|read_member|create|search`.
+- `documents.inspect` on archives returns member listing instead of forcing
+  document text extraction.
+
 ## 2026-07-10 handoff - internet production surface
 
 For the operator and the second model:

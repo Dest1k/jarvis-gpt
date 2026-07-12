@@ -1356,7 +1356,7 @@ class ToolRegistry:
                 name="documents.capabilities",
                 description=(
                     "Report document_surfer format coverage and host tool availability "
-                    "(OCR, LibreOffice, pypdf), optionally for one path."
+                    "(OCR, LibreOffice, pypdf, archive engines), optionally for one path."
                 ),
                 category="documents",
                 input_schema={
@@ -1364,6 +1364,122 @@ class ToolRegistry:
                     "path": "Optional local path",
                 },
                 handler=_documents_capabilities,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="documents.file.identify",
+                description=(
+                    "Identify any file type via magic bytes + extension "
+                    "(documents, archives, images, media, executables, …)."
+                ),
+                category="documents",
+                input_schema={
+                    "file_id": "Uploaded/indexed file id",
+                    "path": "Local path under allowed roots",
+                },
+                handler=_documents_file_identify,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="documents.file.probe",
+                description=(
+                    "Unified probe: identify type, document inspect when applicable, "
+                    "and archive listing when applicable."
+                ),
+                category="documents",
+                input_schema={
+                    "file_id": "Uploaded/indexed file id",
+                    "path": "Local path under allowed roots",
+                    "max_chars": "Maximum characters if document text is extracted",
+                },
+                handler=_documents_file_probe,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="documents.archive.list",
+                description=(
+                    "List members of a zip/tar/tar.gz/tar.bz2/tar.xz/gz/bz2/xz archive "
+                    "(7z/rar when optional engines are installed)."
+                ),
+                category="documents",
+                input_schema={
+                    "file_id": "Uploaded/indexed archive file id",
+                    "path": "Local archive path",
+                    "prefix": "Optional member name prefix filter",
+                },
+                handler=_documents_archive_list,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="documents.archive.extract",
+                description=(
+                    "Safely extract archive members into document-outputs "
+                    "(path traversal and size bomb protected)."
+                ),
+                category="documents",
+                input_schema={
+                    "file_id": "Uploaded/indexed archive file id",
+                    "path": "Local archive path",
+                    "members": "Optional list of member names; default extracts all safe members",
+                    "output_name": "Optional output directory name under document-outputs",
+                },
+                handler=_documents_archive_extract,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="documents.archive.read_member",
+                description=(
+                    "Read one archive member with type identification and optional "
+                    "document extraction."
+                ),
+                category="documents",
+                input_schema={
+                    "file_id": "Uploaded/indexed archive file id",
+                    "path": "Local archive path",
+                    "member": "Member path inside the archive",
+                    "max_bytes": "Maximum bytes to read",
+                    "as_document": "If true, also parse member as a document when possible",
+                    "max_chars": "Max document chars when as_document=true",
+                },
+                handler=_documents_archive_read_member,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="documents.archive.create",
+                description=(
+                    "Create a new archive (zip/tar/tar.gz/tar.bz2/tar.xz/gz) from local files. "
+                    "Never overwrites an existing archive path."
+                ),
+                category="documents",
+                input_schema={
+                    "paths": "List of local source paths",
+                    "file_ids": "Optional uploaded/indexed file ids to include",
+                    "archive_format": "zip|tar|tar.gz|tar.bz2|tar.xz|gz",
+                    "output_name": "Optional output archive filename",
+                },
+                handler=_documents_archive_create,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="documents.archive.search",
+                description="Search text-like members inside an archive for a keyword or regex.",
+                category="documents",
+                input_schema={
+                    "file_id": "Uploaded/indexed archive file id",
+                    "path": "Local archive path",
+                    "query": "Search text or regex",
+                    "regex": "Treat query as regex",
+                    "case_sensitive": "Case-sensitive match",
+                    "max_members": "Maximum members to scan",
+                },
+                handler=_documents_archive_search,
             )
         )
         self.add(
@@ -4578,8 +4694,7 @@ def _documents_capabilities(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRe
     try:
         path: Path | None = None
         if args.get("file_id") or args.get("path"):
-            target = _document_target(ctx, args, max_chars=2000)
-            path = target["path"]
+            path = _document_path_only(ctx, args)
         surfer = _document_surfer_for(ctx)
         payload = surfer.capabilities(path)
     except (ValueError, DocumentSurferError) as exc:
@@ -4590,6 +4705,194 @@ def _documents_capabilities(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRe
         summary="Document surfer capabilities ready.",
         data=payload,
     )
+
+
+def _documents_file_identify(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    try:
+        path = _document_path_only(ctx, args)
+        surfer = _document_surfer_for(ctx)
+        result = surfer.identify(path)
+    except (ValueError, DocumentSurferError) as exc:
+        return ToolRunResponse(tool="documents.file.identify", ok=False, summary=str(exc))
+    type_info = result.get("type") if isinstance(result.get("type"), dict) else {}
+    return ToolRunResponse(
+        tool="documents.file.identify",
+        ok=True,
+        summary=(
+            f"Identified {path.name} as {type_info.get('kind')} "
+            f"({type_info.get('family')}, conf={type_info.get('confidence')})."
+        ),
+        data=result,
+    )
+
+
+def _documents_file_probe(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    max_chars = _int_arg(args.get("max_chars"), default=20000, minimum=500, maximum=150000)
+    try:
+        path = _document_path_only(ctx, args)
+        surfer = _document_surfer_for(ctx)
+        result = surfer.probe(path, max_chars=max_chars)
+    except (ValueError, DocumentSurferError) as exc:
+        return ToolRunResponse(tool="documents.file.probe", ok=False, summary=str(exc))
+    return ToolRunResponse(
+        tool="documents.file.probe",
+        ok=True,
+        summary=f"Probed {path.name}.",
+        data=result,
+    )
+
+
+def _documents_archive_list(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    try:
+        path = _document_path_only(ctx, args)
+        surfer = _document_surfer_for(ctx)
+        result = surfer.list_archive(path, prefix=str(args.get("prefix") or ""))
+    except (ValueError, DocumentSurferError) as exc:
+        return ToolRunResponse(tool="documents.archive.list", ok=False, summary=str(exc))
+    return ToolRunResponse(
+        tool="documents.archive.list",
+        ok=True,
+        summary=(
+            f"Listed {result.get('member_count', 0)} member(s) in "
+            f"{result.get('kind')} archive {path.name}."
+        ),
+        data=result,
+    )
+
+
+def _documents_archive_extract(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    try:
+        path = _document_path_only(ctx, args)
+        members = args.get("members")
+        if isinstance(members, str) and members.strip():
+            members = [members]
+        if members is not None and not isinstance(members, list):
+            raise ValueError("members must be a list of names")
+        surfer = _document_surfer_for(ctx)
+        result = surfer.extract_archive(
+            path,
+            members=members,
+            output_name=args.get("output_name"),
+        )
+        # index extracted files when possible
+        indexed = []
+        for item in result.get("extracted") or []:
+            out = Path(str(item.get("path") or ""))
+            if out.exists() and out.is_file():
+                try:
+                    indexed.append(_record_generated_document(ctx, out))
+                except Exception:  # noqa: BLE001
+                    continue
+        result["indexed_files"] = indexed
+    except (ValueError, DocumentSurferError, OSError) as exc:
+        return ToolRunResponse(tool="documents.archive.extract", ok=False, summary=str(exc))
+    return ToolRunResponse(
+        tool="documents.archive.extract",
+        ok=True,
+        summary=f"Extracted {result.get('extracted_count', 0)} member(s) from {path.name}.",
+        data=result,
+    )
+
+
+def _documents_archive_read_member(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    member = str(args.get("member") or "").strip()
+    if not member:
+        return ToolRunResponse(
+            tool="documents.archive.read_member",
+            ok=False,
+            summary="member is required.",
+        )
+    max_bytes = _int_arg(args.get("max_bytes"), default=2_000_000, minimum=64, maximum=50_000_000)
+    max_chars = _int_arg(args.get("max_chars"), default=30000, minimum=500, maximum=150000)
+    try:
+        path = _document_path_only(ctx, args)
+        surfer = _document_surfer_for(ctx)
+        result = surfer.read_archive_member(
+            path,
+            member,
+            max_bytes=max_bytes,
+            as_document=_bool_arg(args.get("as_document"), default=False),
+            max_chars=max_chars,
+        )
+    except (ValueError, DocumentSurferError) as exc:
+        return ToolRunResponse(tool="documents.archive.read_member", ok=False, summary=str(exc))
+    return ToolRunResponse(
+        tool="documents.archive.read_member",
+        ok=True,
+        summary=f"Read archive member {member} ({result.get('size', 0)} bytes).",
+        data=result,
+    )
+
+
+def _documents_archive_create(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    archive_format = str(args.get("archive_format") or args.get("format") or "zip").strip().lower()
+    try:
+        paths = _document_paths_from_args(ctx, args)
+        if not paths:
+            raise ValueError("paths or file_ids is required.")
+        surfer = _document_surfer_for(ctx)
+        result = surfer.create_archive(
+            paths,
+            archive_format=archive_format,
+            output_name=args.get("output_name"),
+        )
+        output = Path(str(result.get("path") or ""))
+        file_record = _record_generated_document(ctx, output) if output.exists() else None
+    except (ValueError, DocumentSurferError, OSError) as exc:
+        return ToolRunResponse(tool="documents.archive.create", ok=False, summary=str(exc))
+    return ToolRunResponse(
+        tool="documents.archive.create",
+        ok=True,
+        summary=f"Created {archive_format} archive with {result.get('member_count', 0)} member(s).",
+        data={**result, "file": file_record},
+    )
+
+
+def _documents_archive_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    query = " ".join(str(args.get("query") or "").split())
+    if not query:
+        return ToolRunResponse(tool="documents.archive.search", ok=False, summary="query is required.")
+    max_members = _int_arg(args.get("max_members"), default=40, minimum=1, maximum=200)
+    try:
+        path = _document_path_only(ctx, args)
+        surfer = _document_surfer_for(ctx)
+        result = surfer.search_archive(
+            path,
+            query,
+            regex=_bool_arg(args.get("regex"), default=False),
+            case_sensitive=_bool_arg(args.get("case_sensitive"), default=False),
+            max_members=max_members,
+        )
+    except (ValueError, DocumentSurferError) as exc:
+        return ToolRunResponse(tool="documents.archive.search", ok=False, summary=str(exc))
+    return ToolRunResponse(
+        tool="documents.archive.search",
+        ok=True,
+        summary=(
+            f"Found {result.get('hit_count', 0)} hit(s) in "
+            f"{result.get('scanned_members', 0)} archive member(s)."
+        ),
+        data=result,
+    )
+
+
+def _document_path_only(ctx: ToolContext, args: dict[str, Any]) -> Path:
+    """Resolve file_id/path without requiring a document extract."""
+
+    file_id = str(args.get("file_id") or "").strip()
+    raw_path = str(args.get("path") or "").strip()
+    if file_id:
+        file_record = ctx.storage.get_file(file_id)
+        if file_record is None:
+            raise ValueError(f"File not found: {file_id}")
+        path = Path(str(file_record["stored_path"])).resolve(strict=False)
+    elif raw_path:
+        path = _resolve_document_path(ctx.settings, raw_path)
+    else:
+        raise ValueError("file_id or path is required.")
+    if not path.exists() or not path.is_file():
+        raise ValueError(f"File does not exist: {path}")
+    return path
 
 
 def _document_surfer_for(ctx: ToolContext) -> JarvisDocumentSurfer:
