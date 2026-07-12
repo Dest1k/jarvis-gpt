@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Calendar Integration - Improved version
+Calendar Integration - Larger chunk
 """
 
 from dataclasses import dataclass
@@ -26,14 +26,13 @@ class CalendarIntegration:
     def __init__(self, config=None):
         self.config = config or CalendarConfig()
 
-    def get_upcoming(self, days: int = 7, limit: int = 20) -> List[CalendarEvent]:
-        # Placeholder with more structure
-        return [CalendarEvent("evt1", "[Placeholder] Meeting", datetime.now())]
+    def get_upcoming(self, days: int = 7) -> List[CalendarEvent]:
+        return [CalendarEvent("e1", "[Placeholder] Event", datetime.now())]
 
     def add_event(self, event: CalendarEvent) -> str:
-        return f"event_{event.id}_pending_approval"
+        return f"{event.id}_pending_approval"
 
-    def check_conflicts(self, proposed_time, duration=60):
+    def check_conflicts(self, time, duration=60):
         return []
 
 
@@ -45,4 +44,4 @@ def get_calendar_tools():
         "calendar.check_conflicts": c.check_conflicts,
     }
 
-print("[calendar_integration.py] Improved.")
+print("[calendar_integration.py] Larger chunk.")

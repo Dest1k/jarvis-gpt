@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
 """
-Voice Module - Improved version
+Voice Module - Larger chunk
 """
 
 from dataclasses import dataclass
-from typing import Optional
 
 
 @dataclass
 class VoiceConfig:
-    stt_engine: str = "whisper"
-    tts_engine: str = "piper"
     wake_word: str = "jarvis"
 
 
@@ -18,14 +15,14 @@ class VoiceManager:
     def __init__(self, config=None):
         self.config = config or VoiceConfig()
 
-    def listen(self, duration: float = 5.0) -> str:
-        return "[Transcribed voice input placeholder]"
+    def listen(self, duration=5.0):
+        return "[Voice transcription placeholder]"
 
     def speak(self, text: str):
-        print(f"[JARVIS] {text[:80]}...")
+        print(f"[JARVIS VOICE] {text[:60]}...")
 
     def start_full_duplex(self):
-        print("Full-duplex voice mode activated")
+        print("Full duplex voice activated")
 
 
 def get_voice_tools():
@@ -36,4 +33,4 @@ def get_voice_tools():
         "voice.start_full_duplex": v.start_full_duplex,
     }
 
-print("[voice.py] Improved.")
+print("[voice.py] Larger chunk.")
