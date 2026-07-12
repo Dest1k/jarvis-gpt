@@ -18,6 +18,19 @@ class FakeLLM:
             "configured_model": "dispatcher",
         }
 
+    async def benchmark_inference(self, **kwargs) -> dict[str, Any]:
+        assert kwargs == {"runs": 3, "max_tokens": 64, "timeout_sec": 30.0}
+        return {
+            "ok": True,
+            "requested_runs": 3,
+            "successful_runs": 3,
+            "runs": [],
+            "aggregate": {
+                "ttft_ms_p50": 125.0,
+                "decode_tokens_per_sec_p50": 42.5,
+            },
+        }
+
 
 class FakeTelemetry:
     def snapshot(self) -> dict[str, Any]:
@@ -64,6 +77,7 @@ def test_preferences_and_policy_are_persistent(monkeypatch, tmp_path):
         {
             "operator_name": "Operator",
             "communication_style": "detailed",
+            "preferred_profile": "gemma4-mono-perf",
             "working_roots": ["D:/jarvis", "C:/work"],
         }
     )
@@ -72,6 +86,7 @@ def test_preferences_and_policy_are_persistent(monkeypatch, tmp_path):
 
     assert preferences["operator_name"] == "Operator"
     assert reloaded.preferences()["communication_style"] == "detailed"
+    assert reloaded.preferences()["preferred_profile"] == "gemma4-mono-perf"
     assert policy["mode"] == "safe"
     assert policy["max_autonomous_steps"] == 1
     assert reloaded.autonomy_policy()["resource_guard"]["max_gpu_memory_ratio"] == 0.84
@@ -138,6 +153,8 @@ def test_benchmark_records_history(monkeypatch, tmp_path):
     )
 
     assert report["llm"]["ok"] is True
+    assert report["inference"]["aggregate"]["ttft_ms_p50"] == 125.0
+    assert report["history"][0]["decode_tokens_per_sec_p50"] == 42.5
     assert report["dispatcher"]["port_open"] is True
     assert report["history"][0]["profile"] == "gemma4-turbo"
     latest = storage.get_runtime_value("performance.benchmark.latest", {})

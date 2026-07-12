@@ -66,6 +66,7 @@ def test_compose_defaults_to_loopback_and_propagates_build_contract() -> None:
     assert "JARVIS_API_REQUIRE_TOKEN_ON_LOOPBACK:" in compose
     assert "${JARVIS_QWEN_MODEL_PATH:?" in compose
     assert "JARVIS_QWEN_MODEL_PATH:-/models/" not in compose
+    assert "${JARVIS_QWEN_EXTRA_ARGS:-}" in compose
     assert "shm_size: 512m" in compose
     assert compose.count("no-new-privileges:true") == 2
     assert "seccomp=./backend/chromium-seccomp.json" in compose
@@ -93,6 +94,8 @@ def test_launcher_is_local_only_and_preserves_foreign_listeners() -> None:
     assert 'Label = "Start app without LLM"' in launcher
     assert '"app" { $script:NoDispatcher = $true; Start-JarvisStack }' in launcher
     assert "function Get-LlmStartDecision" in launcher
+    assert 'language_model_only = [bool]($Command -contains "--language-model-only")' in launcher
+    assert 'Name "max-num-batched-tokens"' in launcher
     assert 'return "reuse"' in launcher
     assert 'return "replace"' in launcher
     assert 'return "conflict"' in launcher

@@ -171,21 +171,30 @@ External host runtime
 
 Целевое железо для 31B: **RTX 5090 32GB VRAM + 128GB system RAM**.
 
-`gemma4-mono` (partial offload / stability, slow decode):
+`gemma4-mono` (experimental Docker/WSL long-context; below 1 tok/s measured):
 
 - модель `gemma4-31b-it-nvfp4`;
 - `--cpu-offload-gb 24`, `--kv-offloading-size 16 --kv-offloading-backend native`, eager mode;
 - `gpu_memory_utilization=0.85`, `max_model_len=16384`, `max_num_seqs=1`;
 - cold-start / long-context / OOM-resistance; не для интерактивного tok/s.
 
-`gemma4-mono-perf` (interactive 31B):
+`gemma4-mono-perf` (vLLM 31B text-only quality; ~2.45 tok/s measured):
 
-- та же 31B NVFP4; checkpoint ~31.2 GiB → zero-offload на 32GB невозможен;
-- минимальный `--cpu-offload-gb 12` (остальное GPU-resident), KV offload 0;
-- eager required with weight offload (torch.compile+UVA breaks on v0.23), 8k, util 0.92, 1 seq;
-- рекомендуемый 31B chat path (гораздо быстрее full-offload mono); turbo быстрее всего.
+- та же `gemma4-31b-it-nvfp4`, model load 27.58 GiB;
+- `--cpu-offload-gb 2.5` (vLLM reports 2.51 GiB), KV offload 0;
+- eager, FP8 KV, 4k, util 0.93, 1 seq;
+- text-only flags: `--language-model-only --skip-mm-profiling
+  --mm-processor-cache-gb 0 --max-num-batched-tokens 512`;
+- KV cache 1.1 GiB / 6040 tokens, estimated maximum concurrency 1.47x;
+- certified 3x32 streaming: p50 TTFT 899.3ms, decode 2.446 tok/s
+  (2.446 / 2.420 / 2.555), about 4.1x the previous ~0.6 tok/s profile;
+- не является интерактивным профилем; для Command Center используется turbo.
 
 `gemma4-turbo`:
 
 - `gemma4-26b-a4b-nvfp4`, без offload;
-- быстрый warmed runtime и больший concurrency.
+- рекомендуемый интерактивный runtime и больший concurrency.
+
+Медленные mono-результаты относятся к текущему Docker Desktop/WSL пути vLLM.
+Оба `gemma4-mono*` по контракту используют только `gemma4-31b-it-nvfp4`;
+другие runtime и форматы в продуктовый профиль не входят.

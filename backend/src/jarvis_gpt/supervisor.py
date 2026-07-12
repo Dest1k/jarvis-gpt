@@ -8,7 +8,7 @@ from typing import Any
 from .config import JarvisSettings
 from .diagnostics import run_diagnostics
 from .learning import LearningEngine
-from .llm import LLMRouter
+from .llm import LLMRouter, background_llm_priority
 from .storage import JarvisStorage, utc_now
 from .telemetry import TelemetryCollector
 
@@ -97,6 +97,8 @@ class RuntimeSupervisor:
         )
 
     def status(self) -> dict[str, Any]:
+        admission_status = getattr(self.llm, "admission_status", None)
+        admission = admission_status() if callable(admission_status) else {}
         return {
             "enabled": self.settings.autonomy_enabled,
             "started_at": self._started_at,
@@ -115,6 +117,7 @@ class RuntimeSupervisor:
             "last_cognition_error": self._last_cognition_error,
             "last_background_job_at": self._last_background_job_at,
             "last_error": self._last_error,
+            "llm_admission": admission,
             "capabilities": [
                 "telemetry.persist",
                 "health.persist",
@@ -141,13 +144,11 @@ class RuntimeSupervisor:
             await self._record_telemetry()
 
     async def _learning_loop(self) -> None:
-        await self._run_learning()
         while True:
             await asyncio.sleep(max(60, self.settings.learning_interval_sec))
             await self._run_learning()
 
     async def _cognition_loop(self) -> None:
-        await self._run_cognition()
         while True:
             await asyncio.sleep(max(60, self.settings.cognition_interval_sec))
             await self._run_cognition()
@@ -159,7 +160,6 @@ class RuntimeSupervisor:
             await self._record_health()
 
     async def _background_job_loop(self) -> None:
-        await self._run_background_jobs()
         while True:
             await asyncio.sleep(max(30, self.settings.autonomy_mission_interval_sec))
             await self._run_background_jobs()
@@ -227,15 +227,16 @@ class RuntimeSupervisor:
             return
         try:
             messages = _cognition_messages(self.storage)
-            result = await asyncio.wait_for(
-                self.llm.complete(
-                    messages,
-                    temperature=0.2,
-                    max_tokens=max(128, min(2048, self.settings.cognition_max_tokens)),
-                    thinking_enabled=False,
-                ),
-                timeout=min(90.0, max(20.0, self.settings.llm_timeout_sec)),
-            )
+            with background_llm_priority(self.llm):
+                result = await asyncio.wait_for(
+                    self.llm.complete(
+                        messages,
+                        temperature=0.2,
+                        max_tokens=max(128, min(2048, self.settings.cognition_max_tokens)),
+                        thinking_enabled=False,
+                    ),
+                    timeout=min(90.0, max(20.0, self.settings.llm_timeout_sec)),
+                )
             if not result.ok:
                 self._last_cognition_error = str(result.error or "cognition failed")
                 self.storage.add_event(
@@ -264,6 +265,10 @@ class RuntimeSupervisor:
                     "suggested_jobs": pulse.get("suggested_jobs", []),
                 },
             )
+        except TimeoutError:
+            # Expected when foreground traffic occupies the model for the full
+            # maintenance window. The next scheduled pulse will retry.
+            return
         except Exception as exc:  # noqa: BLE001
             self._last_cognition_error = str(exc) or exc.__class__.__name__
             self.storage.add_event(
@@ -277,7 +282,8 @@ class RuntimeSupervisor:
         if self.autonomy_executor is None:
             return
         try:
-            results = await self.autonomy_executor.run_due_jobs(limit=1)
+            with background_llm_priority(self.llm):
+                results = await self.autonomy_executor.run_due_jobs(limit=1)
             self._last_background_job_at = utc_now()
             if results:
                 self.storage.add_event(

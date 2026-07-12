@@ -14,6 +14,21 @@ def test_builtin_profile_model_identities_are_exclusive() -> None:
     assert PROFILES["gemma4-turbo"].model_dir_name == "gemma4-26b-a4b-nvfp4"
 
 
+def test_mono_perf_dispatcher_args_are_exact_and_keep_fractional_offload(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    settings = load_settings("gemma4-mono-perf")
+
+    env = ModelCatalog(settings).dispatcher_config()["env"]
+
+    assert env["JARVIS_QWEN_CPU_OFFLOAD_ARGS"] == "--cpu-offload-gb 2.5"
+    assert env["JARVIS_QWEN_EXTRA_ARGS"] == (
+        "--language-model-only --skip-mm-profiling --mm-processor-cache-gb 0 "
+        "--max-num-batched-tokens 512"
+    )
+
+
 def test_model_catalog_uses_configured_root_and_active_profile(monkeypatch, tmp_path):
     model_root = tmp_path / "models"
     active = model_root / "gemma4-31b-it-nvfp4"

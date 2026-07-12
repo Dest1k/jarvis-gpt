@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import jarvis_gpt.telemetry as telemetry_module
@@ -103,7 +104,18 @@ def test_learning_tick_can_distill_with_llm(monkeypatch, tmp_path):
     )
 
     class FakeLLM:
+        background = False
+
+        @contextmanager
+        def background_priority(self):
+            self.background = True
+            try:
+                yield
+            finally:
+                self.background = False
+
         async def complete(self, *args, **kwargs):
+            assert self.background is True
             return SimpleNamespace(
                 ok=True,
                 content=(
@@ -136,6 +148,7 @@ def test_telemetry_performance_plan_and_host_bridge_status(monkeypatch, tmp_path
 
     assert plan["profile"] == "gemma4-turbo"
     assert plan["recommended_dispatcher"]["model_path"].endswith("gemma4-26b-a4b-nvfp4")
+    assert plan["vllm_extra_args"]["language_model_only"] is False
     assert bridge["port"] == 8765
     assert bridge["script_available"] is True
     assert bridge["bundled_script_path"].replace("\\", "/").endswith(
@@ -224,7 +237,18 @@ def test_supervisor_background_cognition_persists_pulse(monkeypatch, tmp_path):
     storage.add_event(kind="test.signal", title="Operator asked for a living background brain")
 
     class FakeLLM:
+        background = False
+
+        @contextmanager
+        def background_priority(self):
+            self.background = True
+            try:
+                yield
+            finally:
+                self.background = False
+
         async def complete(self, _messages, **_kwargs):
+            assert self.background is True
             return SimpleNamespace(
                 ok=True,
                 content=(

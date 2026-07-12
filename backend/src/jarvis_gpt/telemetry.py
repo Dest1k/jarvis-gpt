@@ -114,6 +114,12 @@ class TelemetryCollector:
             "eager_mode": profile.eager_mode,
             "cpu_offload_gb": profile.cpu_offload_gb,
             "kv_offloading_gb": profile.kv_offloading_gb,
+            "vllm_extra_args": {
+                "language_model_only": profile.vllm_extra_args.language_model_only,
+                "skip_mm_profiling": profile.vllm_extra_args.skip_mm_profiling,
+                "mm_processor_cache_gb": profile.vllm_extra_args.mm_processor_cache_gb,
+                "max_num_batched_tokens": profile.vllm_extra_args.max_num_batched_tokens,
+            },
             "recommended_dispatcher": {
                 "port": 8001,
                 "image": os.environ.get(

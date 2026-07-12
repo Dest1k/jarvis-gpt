@@ -118,13 +118,21 @@ def test_dispatcher_mono_perf_profile_is_gpu_first(monkeypatch, tmp_path):
 
     assert env["JARVIS_QWEN_MODEL_PATH"] == "/models/gemma4-31b-it-nvfp4"
     assert env["JARVIS_QWEN_ENFORCE_EAGER"] == "--enforce-eager"
-    assert env["JARVIS_QWEN_GPU_UTIL"] == "0.92"
-    assert env["JARVIS_QWEN_MAX_LEN"] == "8192"
+    assert env["JARVIS_QWEN_GPU_UTIL"] == "0.93"
+    assert env["JARVIS_QWEN_MAX_LEN"] == "4096"
     assert env["JARVIS_QWEN_MAX_NUM_SEQS"] == "1"
-    assert env["JARVIS_QWEN_CPU_OFFLOAD_ARGS"] == "--cpu-offload-gb 12"
+    assert env["JARVIS_QWEN_CPU_OFFLOAD_ARGS"] == "--cpu-offload-gb 2.5"
     assert env["JARVIS_QWEN_KV_OFFLOAD_ARGS"] == ""
+    assert env["JARVIS_QWEN_EXTRA_ARGS"] == (
+        "--language-model-only --skip-mm-profiling --mm-processor-cache-gb 0 "
+        "--max-num-batched-tokens 512"
+    )
     assert status["desired_runtime"]["enforce_eager"] is True
-    assert status["desired_runtime"]["cpu_offload_gb"] == 12
+    assert status["desired_runtime"]["cpu_offload_gb"] == 2.5
+    assert status["desired_runtime"]["language_model_only"] is True
+    assert status["desired_runtime"]["skip_mm_profiling"] is True
+    assert status["desired_runtime"]["mm_processor_cache_gb"] == 0
+    assert status["desired_runtime"]["max_num_batched_tokens"] == 512
     assert not status["desired_runtime"].get("kv_offloading_gb")
     assert not status["desired_runtime"].get("kv_offloading_backend")
 
@@ -147,7 +155,7 @@ def test_dispatcher_parses_actual_container_runtime_command():
         "--max-num-seqs",
         "16",
         "--cpu-offload-gb",
-        "8",
+        "2.5",
         "--kv-offloading-size",
         "8",
         "--kv-offloading-backend",
@@ -157,6 +165,12 @@ def test_dispatcher_parses_actual_container_runtime_command():
         "--safetensors-load-strategy",
         "prefetch",
         "--enable-prefix-caching",
+        "--language-model-only",
+        "--skip-mm-profiling",
+        "--mm-processor-cache-gb",
+        "0",
+        "--max-num-batched-tokens",
+        "512",
         "--host",
         "0.0.0.0",
         "--port",
@@ -173,12 +187,16 @@ def test_dispatcher_parses_actual_container_runtime_command():
     assert runtime["gpu_memory_utilization"] == 0.86
     assert runtime["kv_cache_dtype"] == "fp8"
     assert runtime["max_num_seqs"] == 16
-    assert runtime["cpu_offload_gb"] == 8
+    assert runtime["cpu_offload_gb"] == 2.5
     assert runtime["kv_offloading_gb"] == 8
     assert runtime["kv_offloading_backend"] == "native"
     assert runtime["tokenizer_mode"] == "slow"
     assert runtime["safetensors_load_strategy"] == "prefetch"
     assert runtime["prefix_caching"] is True
+    assert runtime["language_model_only"] is True
+    assert runtime["skip_mm_profiling"] is True
+    assert runtime["mm_processor_cache_gb"] == 0
+    assert runtime["max_num_batched_tokens"] == 512
     assert runtime["host"] == "0.0.0.0"
     assert runtime["port"] == 8001
     assert runtime_from_string == runtime
@@ -302,6 +320,21 @@ def test_runtime_match_requires_model_and_every_profile_flag(monkeypatch, tmp_pa
         "cpu_offload_gb",
         "kv_offloading_gb",
         "kv_offloading_backend",
+    }
+
+
+def test_runtime_match_rejects_stale_mono_perf_without_text_only_flag(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    settings = load_settings("gemma4-mono-perf")
+    manager = DispatcherManager(settings, repo_root=tmp_path)
+    desired = _runtime_from_env(manager.compose_env())
+    stale = dict(desired)
+    stale["skip_mm_profiling"] = False
+
+    assert _runtime_mismatches(stale, desired) == {
+        "skip_mm_profiling": {"actual": False, "desired": True}
     }
 
 

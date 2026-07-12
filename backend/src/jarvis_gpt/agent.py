@@ -14,7 +14,7 @@ from collections.abc import AsyncIterator, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlparse
@@ -58,6 +58,7 @@ from .shop_registry import (
     SHOP_SOURCES,
     find_shop_source,
     find_shop_sources,
+    get_shop_source_by_host,
     shop_search_url,
 )
 from .storage import JarvisStorage, utc_now
@@ -735,6 +736,11 @@ class AgentRuntime:
             events.append(event)
             await self._emit(event)
 
+        shop_start = self._named_shop_start_event(message, task_plan)
+        if shop_start is not None:
+            events.append(shop_start)
+            await self._emit(shop_start)
+
         direct_action = await self._try_direct_action(message, context)
         if direct_action is not None:
             for event in direct_action.events:
@@ -997,6 +1003,12 @@ class AgentRuntime:
             events.append(event)
             await self._emit(event)
             yield {"type": "event", "event": event.model_dump()}
+
+        shop_start = self._named_shop_start_event(message, task_plan)
+        if shop_start is not None:
+            events.append(shop_start)
+            await self._emit(shop_start)
+            yield {"type": "event", "event": shop_start.model_dump()}
 
         direct_action = await self._try_direct_action(message, context)
         if direct_action is not None:
@@ -2344,6 +2356,43 @@ class AgentRuntime:
             data=data,
         )
 
+    def _named_shop_start_event(
+        self,
+        message: str,
+        task_plan: TaskKernelPlan | None,
+    ) -> ChatEvent | None:
+        shop_keys = self._direct_shop_catalog_keys(message, task_plan)
+        if not shop_keys:
+            return None
+        product = _compact_shopping_subject(_clean_shopping_subject(message) or message)
+        criterion = _ranking_criterion_from_message(message) or "price_asc"
+        constraints = _shopping_constraints_from_message(message)
+        return ChatEvent(
+            type="tool_call",
+            title="web.shop_search",
+            content="Читаю актуальный каталог и проверяю цены магазина.",
+            payload={
+                "tool": "web.shop_search",
+                "state": "started",
+                "shops": shop_keys,
+                "query": product,
+                "criterion": criterion,
+                "constraints": constraints,
+            },
+        )
+
+    def _direct_shop_catalog_keys(
+        self,
+        message: str,
+        task_plan: TaskKernelPlan | None,
+    ) -> list[str]:
+        shop_keys = _deterministic_named_shop_keys(message, task_plan)
+        if not shop_keys or self.tools.get("web.shop_search") is None:
+            return []
+        run_method = getattr(self.tools, "run", None)
+        registry_run = getattr(run_method, "__self__", None) is self.tools
+        return shop_keys if registry_run or _web_surfer_available() else []
+
     async def _try_direct_action(
         self,
         message: str,
@@ -2428,6 +2477,27 @@ class AgentRuntime:
                     answer=f"{status}: {empty_file_path}\n\n{result.summary}",
                     events=[event],
                 )
+
+        # A registered shop + an unambiguous catalog request already forms a
+        # typed, read-only action.  Sending it through the 200-token intent
+        # arbiter adds seconds on turbo and several minutes on offloaded mono,
+        # without changing the route.  Keep the LLM arbiter for fuzzy web
+        # requests; execute only this high-confidence binding deterministically.
+        shop_keys = self._direct_shop_catalog_keys(message, task_plan)
+        if shop_keys:
+            if len(shop_keys) > 1:
+                return await self._run_multi_shop_search(
+                    message,
+                    shop_keys,
+                    conversation_id=context.conversation_id if context is not None else None,
+                    context=context,
+                )
+            return await self._run_shop_search(
+                message,
+                shop_keys[0],
+                conversation_id=context.conversation_id if context is not None else None,
+                context=context,
+            )
 
         # Reasoning-first arbiter: before any fuzzy web-ish branch (shopping,
         # weather, generic research) fires on keyword matches, let the model judge
@@ -3186,6 +3256,7 @@ class AgentRuntime:
             content=result.summary,
             payload={
                 "tool": "web.shop_search",
+                "state": "completed",
                 "ok": result.ok,
                 "shop": shop_key,
                 "browser_mode": data.get("browser_mode"),
@@ -3193,6 +3264,8 @@ class AgentRuntime:
                 "item_count": len(data.get("items") or []),
                 "criterion": criterion,
                 "comparison": data.get("comparison"),
+                "cache": data.get("cache"),
+                "provenance": data.get("provenance"),
             },
         )
         if result.ok and data.get("items"):
@@ -3214,14 +3287,23 @@ class AgentRuntime:
                     conversation_id=conversation_id,
                     query=product,
                     candidates=candidates,
+                    shops=[shop_key],
+                    criterion=criterion,
+                    constraints=constraints,
+                    confirmed_at=_catalog_verified_at(data),
+                    provenance={shop_key: _catalog_provenance(data)},
                 )
-            answer = _format_shop_search_answer(data, product)
+            answer = _format_shop_search_answer(
+                {**data, "constraints": data.get("constraints") or constraints},
+                product,
+            )
             events = [event]
             if _shopping_open_requested(normalized) and candidates:
                 open_action = await self._open_shopping_candidate(
                     candidates,
                     criterion=criterion,
                     require_metric=True,
+                    target_price=_float_or_none(constraints.get("target_price")),
                     context=context,
                 )
                 answer = f"{answer}\n\n{open_action.answer}"
@@ -3243,6 +3325,17 @@ class AgentRuntime:
             if link:
                 lines.append(f"\nПока — прямая ссылка на поиск: {link}")
             return DirectAction(answer="\n".join(lines), events=[event])
+        cached = self._cached_shop_failure_answer(
+            conversation_id=conversation_id,
+            shop_key=shop_key,
+            product=product,
+            criterion=criterion,
+            constraints=constraints,
+            failure=str(data.get("error") or result.summary or "каталог не отдал товары"),
+        )
+        if cached is not None:
+            cached_answer, cached_event = cached
+            return DirectAction(answer=cached_answer, events=[event, cached_event])
         link = str(data.get("url") or _shop_search_url_for(shop_key, product)).strip()
         reason = str(data.get("error") or result.summary or "каталог не отдал товары").strip()
         lines = [
@@ -3302,10 +3395,13 @@ class AgentRuntime:
                     content=result.summary,
                     payload={
                         "tool": "web.shop_search",
+                        "state": "completed",
                         "ok": result.ok,
                         "shop": shop_key,
                         "criterion": criterion,
                         "item_count": len(data.get("items") or []),
+                        "cache": data.get("cache"),
+                        "provenance": data.get("provenance"),
                     },
                 )
             )
@@ -3331,6 +3427,9 @@ class AgentRuntime:
 
         items: list[dict[str, Any]] = []
         comparisons: list[dict[str, Any]] = []
+        shop_provenance = {
+            shop_key: _catalog_provenance(data) for shop_key, data in successful
+        }
         for shop_key, data in successful:
             comparison = data.get("comparison")
             if isinstance(comparison, dict):
@@ -3340,10 +3439,11 @@ class AgentRuntime:
                     continue
                 item = dict(raw_item)
                 item["shop"] = shop_key
-                items.append(item)
+                if _shopping_item_matches_hard_constraints(item, constraints):
+                    items.append(item)
 
         metric_key = "price_value"
-        if criterion not in {"price_asc", "price_desc"}:
+        if criterion not in {"price_asc", "price_desc", "price_nearest"}:
             keys = {
                 str(comparison.get("metric_key") or "")
                 for comparison in comparisons
@@ -3365,18 +3465,27 @@ class AgentRuntime:
                 value = metric.get("value")
             return float(value) if isinstance(value, int | float) else None
 
+        target_price = _float_or_none(constraints.get("target_price"))
         descending = criterion not in {
             "price_asc",
+            "price_nearest",
             "size_asc",
             "weight_asc",
             "age_desc",
         }
+
+        def rank_value(item: dict[str, Any]) -> float:
+            value = metric_value(item) or 0.0
+            if criterion == "price_nearest" and target_price is not None:
+                return abs(value - target_price)
+            return -value if descending else value
+
         ranked = sorted(
             items,
             key=lambda item: (
                 item.get("in_stock") is False,
                 metric_value(item) is None,
-                -(metric_value(item) or 0.0) if descending else (metric_value(item) or 0.0),
+                rank_value(item),
             ),
         )
         comparable = [
@@ -3411,6 +3520,8 @@ class AgentRuntime:
             "items": ranked[:24],
             "best": best,
             "cheapest": cheapest,
+            "constraints": constraints,
+            "shop_provenance": shop_provenance,
             "price_sort_confirmed": False,
             "comparison": {
                 "criterion": criterion,
@@ -3418,7 +3529,10 @@ class AgentRuntime:
                 "metric_key": metric_key,
                 "metric_label": metric_label,
                 "complete": best is not None
-                and (criterion in {"price_asc", "price_desc"} or len(comparable) >= 2),
+                and (
+                    criterion in {"price_asc", "price_desc", "price_nearest"}
+                    or len(comparable) >= 2
+                ),
                 "compared_count": len(comparable),
                 "discovered_count": len(ranked),
                 "best_metric": best_metric,
@@ -3432,12 +3546,20 @@ class AgentRuntime:
                 conversation_id=conversation_id,
                 query=product,
                 candidates=ranked,
+                shops=_dedupe(shop_keys),
+                criterion=criterion,
+                constraints=constraints,
+                confirmed_at=_oldest_catalog_verified_at(
+                    [item.get("verified_at") for item in shop_provenance.values()]
+                ),
+                provenance=shop_provenance,
             )
         if _shopping_open_requested(message.casefold()) and ranked:
             open_action = await self._open_shopping_candidate(
                 ranked,
                 criterion=criterion,
                 require_metric=True,
+                target_price=target_price,
                 context=context,
             )
             answer = f"{answer}\n\n{open_action.answer}"
@@ -3796,8 +3918,17 @@ class AgentRuntime:
             )
 
         criterion = str(intent.get("criterion") or "price_asc")
-        sorted_candidates = _sort_shopping_candidates(candidates, criterion=criterion)
-        lines = [f"Взял последний поиск: `{state.get('query', 'выдача')}`."]
+        target_price = _float_or_none((state.get("constraints") or {}).get("target_price"))
+        sorted_candidates = _sort_shopping_candidates(
+            candidates,
+            criterion=criterion,
+            target_price=target_price,
+        )
+        confirmed_at = str(state.get("updated_at") or "время не записано")
+        lines = [
+            f"Взял последний поиск: `{state.get('query', 'выдача')}`. "
+            f"Последнее подтверждение: {confirmed_at}; цены и наличие могли измениться."
+        ]
         ranked = [
             item for item in sorted_candidates if _candidate_metric(item, criterion) is not None
         ]
@@ -3811,6 +3942,8 @@ class AgentRuntime:
                     "candidates": len(candidates),
                     "ranked": len(ranked),
                     "intent": intent,
+                    "confirmed_at": confirmed_at,
+                    "provenance": state.get("provenance"),
                 },
             )
         ]
@@ -3832,6 +3965,7 @@ class AgentRuntime:
                 sorted_candidates,
                 criterion=criterion,
                 require_metric=bool(ranked),
+                target_price=target_price,
                 context=context,
             )
             events.extend(open_action.events)
@@ -3845,15 +3979,124 @@ class AgentRuntime:
         conversation_id: str,
         query: str,
         candidates: list[dict[str, Any]],
+        shops: list[str] | None = None,
+        criterion: str | None = None,
+        constraints: dict[str, float] | None = None,
+        confirmed_at: str | None = None,
+        provenance: dict[str, Any] | None = None,
     ) -> None:
         self.storage.set_runtime_value(
             _shopping_research_key(conversation_id),
             {
                 "query": query,
                 "candidates": candidates,
-                "updated_at": date.today().isoformat(),
+                "shops": list(shops or []),
+                "criterion": criterion,
+                "constraints": dict(constraints or {}),
+                "provenance": dict(provenance or {}),
+                "updated_at": confirmed_at or utc_now(),
             },
         )
+
+    def _cached_shop_failure_answer(
+        self,
+        *,
+        conversation_id: str | None,
+        shop_key: str,
+        product: str,
+        criterion: str,
+        constraints: dict[str, float],
+        failure: str,
+    ) -> tuple[str, ChatEvent] | None:
+        """Return only a recent, provenance-labelled catalog result after live failure."""
+
+        if not conversation_id:
+            return None
+        state = self._shopping_research_state(conversation_id)
+        if state is None:
+            return None
+        state_shops = [str(item) for item in (state.get("shops") or [])]
+        if shop_key not in state_shops:
+            return None
+        state_provenance = state.get("provenance")
+        shop_provenance = (
+            state_provenance.get(shop_key)
+            if isinstance(state_provenance, dict)
+            else None
+        )
+        if not isinstance(shop_provenance, dict):
+            return None
+        catalog_provenance = shop_provenance.get("provenance")
+        if not isinstance(catalog_provenance, dict) or catalog_provenance.get(
+            "source"
+        ) not in {"live_catalog", "verified_catalog_cache"}:
+            return None
+        confirmed_at = str(shop_provenance.get("verified_at") or "").strip()
+        try:
+            confirmed = datetime.fromisoformat(confirmed_at.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if confirmed.tzinfo is None:
+            confirmed = confirmed.replace(tzinfo=UTC)
+        age_seconds = max(0, int((datetime.now(UTC) - confirmed).total_seconds()))
+        if age_seconds > 15 * 60:
+            return None
+        if _normalize_search_query(str(state.get("query") or "")) != _normalize_search_query(
+            product
+        ):
+            return None
+        if str(state.get("criterion") or criterion) != criterion:
+            return None
+        state_constraints = state.get("constraints")
+        if isinstance(state_constraints, dict) and state_constraints != constraints:
+            return None
+        candidates = [
+            item
+            for item in (state.get("candidates") or [])
+            if isinstance(item, dict)
+            and item.get("url")
+            and (
+                resolved_source := get_shop_source_by_host(
+                    urlparse(str(item["url"])).hostname
+                )
+            )
+            is not None
+            and resolved_source.key == shop_key
+        ][:8]
+        if not candidates:
+            return None
+        target_price = _float_or_none(constraints.get("target_price"))
+        ranked = _sort_shopping_candidates(
+            candidates,
+            criterion=criterion,
+            target_price=target_price,
+        )
+        lines = [
+            f"Не удалось обновить каталог магазина: {failure}.",
+            (
+                f"Показываю последний подтверждённый результат от {confirmed_at} "
+                f"({age_seconds} с назад). Это кэш: цены и наличие могли измениться."
+            ),
+        ]
+        for index, item in enumerate(ranked[:8], start=1):
+            price = item.get("price") or item.get("price_text") or "цена не считана"
+            lines.append(f"{index}. {price} — {item.get('title')}\n{item.get('url')}")
+        event = ChatEvent(
+            type="tool_call",
+            title="shopping.cache",
+            content="Live catalog refresh failed; reused a recent verified catalog snapshot.",
+            payload={
+                "tool": "web.shop_search",
+                "state": "cached_fallback",
+                "shop": shop_key,
+                "query": product,
+                "confirmed_at": confirmed_at,
+                "age_seconds": age_seconds,
+                "items": len(ranked),
+                "provenance": state.get("provenance"),
+            },
+        )
+        return "\n".join(lines), event
 
     def _shopping_research_state(self, conversation_id: str) -> dict[str, Any] | None:
         value = self.storage.get_runtime_value(_shopping_research_key(conversation_id), None)
@@ -3869,12 +4112,14 @@ class AgentRuntime:
         *,
         criterion: str = "price_asc",
         require_metric: bool,
+        target_price: float | None = None,
         context: AgentContext | None = None,
     ) -> DirectAction:
         candidate = _best_shopping_candidate(
             candidates,
             criterion=criterion,
             require_metric=require_metric,
+            target_price=target_price,
         )
         if candidate is None:
             return DirectAction(
@@ -3914,7 +4159,7 @@ class AgentRuntime:
         else:
             missing_metric = (
                 "Цена не подтверждена"
-                if criterion in {"price_asc", "price_desc"}
+                if criterion in {"price_asc", "price_desc", "price_nearest"}
                 else "Признак для выбранного критерия не подтверждён"
             )
             answer = (
@@ -4112,13 +4357,19 @@ class AgentRuntime:
 
         research_query = _web_research_query_from_message(message)
         if research_query is not None:
+            research_intent = _research_intent_from_message(normalized)
+            named_catalog = (
+                research_intent == "shopping_research"
+                and bool(find_shop_sources(normalized))
+                and _looks_like_shopping_query(normalized)
+            )
             return TaskKernelPlan(
                 route="web_research",
                 mode=task_mode,
-                intent=_research_intent_from_message(normalized),
+                intent=research_intent,
                 confidence=0.82,
                 query=research_query,
-                tools=("web.search", "web.fetch"),
+                tools=("web.shop_search",) if named_catalog else ("web.search", "web.fetch"),
                 completion_criteria=(
                     "search current public sources",
                     "fetch the best available results",
@@ -7301,6 +7552,8 @@ def _web_research_query_from_message(
         normalized
     ):
         return None
+    if explicit_open and re.search(r"https?://[^\s)>\]]+", message, re.IGNORECASE):
+        return None
     if explicit_open and not (
         _contains_any(normalized, search_verbs)
         or _contains_any(normalized, live_data_markers)
@@ -8154,6 +8407,27 @@ def _shop_key_from_message(normalized: str) -> str | None:
     return source.key if source else None
 
 
+def _deterministic_named_shop_keys(
+    message: str,
+    task_plan: TaskKernelPlan | None,
+) -> list[str]:
+    """Bind only explicit registered-shop catalog requests without an LLM hop."""
+
+    if (
+        task_plan is None
+        or task_plan.route != "web_research"
+        or task_plan.intent != "shopping_research"
+    ):
+        return []
+    normalized = message.casefold()
+    if not _looks_like_shopping_query(normalized):
+        return []
+    product = _compact_shopping_subject(_clean_shopping_subject(message) or message)
+    if not product:
+        return []
+    return _dedupe([source.key for source in find_shop_sources(normalized)])[:4]
+
+
 def _shop_search_url_for(shop_key: str, query: str) -> str:
     return shop_search_url(shop_key, query)
 
@@ -8167,9 +8441,17 @@ def _format_shop_search_answer(data: dict[str, Any], product: str) -> str:
     metric_key = str(comparison.get("metric_key") or "")
     lines: list[str] = []
     subject = product.strip() or "товар"
-    if criterion in {"price_asc", "price_desc"} and (best or cheapest):
-        price_winner = best or cheapest or {}
-        if criterion == "price_desc":
+    price_winner = best if criterion == "price_nearest" else best or cheapest
+    if criterion in {"price_asc", "price_desc", "price_nearest"} and price_winner:
+        target_price = _float_or_none((data.get("constraints") or {}).get("target_price"))
+        if criterion == "price_nearest":
+            target_label = _format_ruble_amount(target_price)
+            cheapest_label = (
+                f"Ближе всего к ориентиру {target_label}"
+                if target_label
+                else "Ближе всего к ценовому ориентиру"
+            )
+        elif criterion == "price_desc":
             cheapest_label = "Самая дорогая из найденных"
         else:
             cheapest_label = (
@@ -8224,6 +8506,14 @@ def _format_shop_search_answer(data: dict[str, Any], product: str) -> str:
         list_label = "Все варианты по возрастанию цены:"
     elif criterion == "price_desc":
         list_label = "Все варианты по убыванию цены:"
+    elif criterion == "price_nearest":
+        target_price = _float_or_none((data.get("constraints") or {}).get("target_price"))
+        target_label = _format_ruble_amount(target_price)
+        list_label = (
+            f"Варианты по близости к ориентиру {target_label}:"
+            if target_label
+            else "Варианты по близости к ценовому ориентиру:"
+        )
     else:
         list_label = "Варианты по запрошенному критерию:"
     lines.append(list_label)
@@ -8239,10 +8529,111 @@ def _format_shop_search_answer(data: dict[str, Any], product: str) -> str:
             f"{index}. {price}{metric_text}{rating_text}{shop_text} — "
             f"{item.get('title')}\n{item.get('url')}"
         )
+    cache = data.get("cache") if isinstance(data.get("cache"), dict) else {}
+    cache_status = str(cache.get("status") or "")
+    if cache_status in {"fresh_hit", "stale_on_live_failure"}:
+        cached_at = str(cache.get("cached_at") or "время не записано")
+        age_seconds = max(0, int(_float_or_none(cache.get("age_sec")) or 0))
+        if cache_status == "stale_on_live_failure":
+            lines.append(
+                "\nАктуальное обновление не удалось; показан последний подтверждённый "
+                f"снимок каталога от {cached_at} ({age_seconds} с назад). "
+                "Цены и наличие могли измениться."
+            )
+        else:
+            lines.append(
+                f"\nПодтверждённый снимок каталога от {cached_at} "
+                f"({age_seconds} с назад)."
+            )
+    lines.extend(_multi_shop_provenance_lines(data))
     city = str(data.get("city") or "").strip()
     if city:
         lines.append(f"\nКаталог и цены показаны для города: {city}.")
     return "\n".join(lines)
+
+
+def _format_ruble_amount(value: float | None) -> str:
+    if value is None:
+        return ""
+    rounded = round(value)
+    amount = f"{rounded:,}".replace(",", " ") if abs(value - rounded) < 0.01 else f"{value:g}"
+    return f"{amount} ₽"
+
+
+def _catalog_verified_at(data: dict[str, Any]) -> str | None:
+    cache = data.get("cache") if isinstance(data.get("cache"), dict) else {}
+    provenance = (
+        data.get("provenance") if isinstance(data.get("provenance"), dict) else {}
+    )
+    for value in (
+        cache.get("cached_at"),
+        provenance.get("verified_at"),
+        provenance.get("cached_at"),
+    ):
+        stamp = str(value or "").strip()
+        if stamp:
+            return stamp
+    return None
+
+
+def _catalog_provenance(data: dict[str, Any]) -> dict[str, Any]:
+    cache = data.get("cache") if isinstance(data.get("cache"), dict) else {}
+    provenance = (
+        data.get("provenance") if isinstance(data.get("provenance"), dict) else {}
+    )
+    return {
+        "verified_at": _catalog_verified_at(data),
+        "cache": dict(cache),
+        "provenance": dict(provenance),
+    }
+
+
+def _oldest_catalog_verified_at(values: Sequence[str | None]) -> str | None:
+    parsed: list[tuple[datetime, str]] = []
+    for value in values:
+        stamp = str(value or "").strip()
+        if not stamp:
+            continue
+        try:
+            moment = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=UTC)
+        parsed.append((moment.astimezone(UTC), stamp))
+    return min(parsed, key=lambda item: item[0])[1] if parsed else None
+
+
+def _multi_shop_provenance_lines(data: dict[str, Any]) -> list[str]:
+    raw = data.get("shop_provenance")
+    if not isinstance(raw, dict) or not raw:
+        return []
+    lines = ["\nИсточники данных по магазинам:"]
+    for shop_key in sorted(raw):
+        item = raw.get(shop_key)
+        if not isinstance(item, dict):
+            continue
+        cache = item.get("cache") if isinstance(item.get("cache"), dict) else {}
+        provenance = (
+            item.get("provenance")
+            if isinstance(item.get("provenance"), dict)
+            else {}
+        )
+        if not cache and not provenance and not item.get("verified_at"):
+            continue
+        status = str(cache.get("status") or "")
+        confirmed_at = str(item.get("verified_at") or "время не записано")
+        if status == "stale_on_live_failure":
+            lines.append(
+                f"- {shop_key}: обновление не удалось; подтверждённый снимок от "
+                f"{confirmed_at}, цены и наличие могли измениться."
+            )
+        elif status == "fresh_hit":
+            lines.append(f"- {shop_key}: подтверждённый кэш от {confirmed_at}.")
+        else:
+            source = str(provenance.get("source") or "live_catalog")
+            lines.append(f"- {shop_key}: {source}, проверено {confirmed_at}.")
+    return lines if len(lines) > 1 else []
 
 
 def _unique_search_queries(candidates: list[str], current_query: str) -> list[str]:
@@ -8260,6 +8651,7 @@ _SHOPPING_SUBJECT_STOPWORDS = {
     "а",
     "и",
     "или",
+    "но",
     "во",
     "в",
     "на",
@@ -8331,6 +8723,7 @@ _SHOPPING_SUBJECT_STOPWORDS = {
     "рублей",
     "рубля",
     "руб",
+    "бюджет",
 }
 
 
@@ -8362,15 +8755,28 @@ _SHOPPING_MONEY_AMOUNT_RE = (
     rf"(?:\s*{_SHOPPING_THOUSANDS_RE}(?:\s*{_SHOPPING_CURRENCY_RE})?"
     rf"|\s*{_SHOPPING_CURRENCY_RE}))"
 )
-_SHOPPING_MAX_PRICE_PATTERNS = (
+_SHOPPING_TARGET_PRICE_PATTERNS = (
     re.compile(
-        rf"\b(?:до|не\s+дороже|максимум|в\s+районе|около|примерно|порядка)\s*"
+        rf"\b(?:в\s+районе|около|примерно|порядка)\s*"
         rf"({_SHOPPING_MONEY_AMOUNT_RE})(?![a-zа-яё0-9])",
         flags=re.IGNORECASE,
     ),
     re.compile(
         rf"\b(?:цена|стоимость|бюджет)\w*[^\d]{{0,24}}"
-        rf"(?:до|не\s+дороже|максимум|в\s+районе|около|примерно|порядка)?\s*"
+        rf"(?:в\s+районе|около|примерно|порядка)\s*"
+        rf"({_SHOPPING_MONEY_AMOUNT_RE})(?![a-zа-яё0-9])",
+        flags=re.IGNORECASE,
+    ),
+)
+_SHOPPING_MAX_PRICE_PATTERNS = (
+    re.compile(
+        rf"\b(?:до|не\s+дороже|максимум)\s*"
+        rf"({_SHOPPING_MONEY_AMOUNT_RE})(?![a-zа-яё0-9])",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\b(?:цена|стоимость|бюджет)\w*[^\d]{{0,24}}"
+        rf"(?:до|не\s+дороже|максимум)?\s*"
         rf"({_SHOPPING_MONEY_AMOUNT_RE})(?![a-zа-яё0-9])",
         flags=re.IGNORECASE,
     ),
@@ -8442,6 +8848,9 @@ _SHOPPING_CRITERION_NOISE: dict[str, tuple[str, ...]] = {
         r"\b(?:сам\w+\s+)?(?:дешев|дешёв|недорог|бюджетн)\w*\b",
         r"\bминимальн\w*\s+цен\w*\b",
     ),
+    "price_nearest": (
+        r"\b(?:в\s+районе|около|примерно|порядка)\b",
+    ),
     "price_desc": (
         r"\b(?:сам\w+\s+)?(?:дорог|премиальн)\w*\b",
         r"\bмаксимальн\w*\s+цен\w*\b",
@@ -8475,7 +8884,11 @@ def _strip_shopping_criterion_noise(value: str, original_query: str) -> str:
 
 def _clean_shopping_subject(query: str) -> str:
     cleaned = _clean_research_subject(query)
-    for pattern in (*_SHOPPING_MAX_PRICE_PATTERNS, *_SHOPPING_MIN_PRICE_PATTERNS):
+    for pattern in (
+        *_SHOPPING_TARGET_PRICE_PATTERNS,
+        *_SHOPPING_MAX_PRICE_PATTERNS,
+        *_SHOPPING_MIN_PRICE_PATTERNS,
+    ):
         cleaned = pattern.sub(" ", cleaned)
     cleaned = re.sub(
         r"\b(?:с\s+)?рейтинг\w*\s*(?:не\s+ниже|от|>=?|выше)\s*"
@@ -8555,11 +8968,24 @@ def _clean_shopping_subject(query: str) -> str:
 
 def _shopping_constraints_from_message(message: str) -> dict[str, float]:
     constraints: dict[str, float] = {}
+    for pattern in _SHOPPING_TARGET_PRICE_PATTERNS:
+        match = pattern.search(message)
+        if not match:
+            continue
+        value = _metric_number_from_text(match.group(1))
+        if value is not None:
+            constraints["target_price"] = value
+        break
     for key, patterns in (
         ("max_price", _SHOPPING_MAX_PRICE_PATTERNS),
         ("min_price", _SHOPPING_MIN_PRICE_PATTERNS),
     ):
-        for pattern in patterns:
+        active_patterns = (
+            patterns[:1]
+            if key == "max_price" and "target_price" in constraints
+            else patterns
+        )
+        for pattern in active_patterns:
             match = pattern.search(message)
             if not match:
                 continue
@@ -9224,6 +9650,8 @@ def _ranking_criterion_from_message(message: str) -> str | None:
         normalized,
     ):
         return "runtime_desc"
+    if any(pattern.search(message) for pattern in _SHOPPING_TARGET_PRICE_PATTERNS):
+        return "price_nearest"
     if _contains_any(normalized, ("дешев", "дешёв", "бюджет", "недорог")) or re.search(
         r"\bминимальн\w*\s+цен\w*\b",
         normalized,
@@ -9400,15 +9828,47 @@ def _sort_shopping_candidates(
     candidates: list[dict[str, Any]],
     *,
     criterion: str = "price_asc",
+    target_price: float | None = None,
 ) -> list[dict[str, Any]]:
-    return sorted(candidates, key=lambda item: _candidate_sort_key(item, criterion))
+    return sorted(
+        candidates,
+        key=lambda item: _candidate_sort_key(item, criterion, target_price=target_price),
+    )
 
 
-def _candidate_sort_key(item: dict[str, Any], criterion: str) -> tuple[int, float, int]:
+def _shopping_item_matches_hard_constraints(
+    item: dict[str, Any],
+    constraints: dict[str, float],
+) -> bool:
+    price = _float_or_none(item.get("price_value"))
+    minimum = _float_or_none(constraints.get("min_price"))
+    maximum = _float_or_none(constraints.get("max_price"))
+    if minimum is not None and (price is None or price < minimum):
+        return False
+    if maximum is not None and (price is None or price > maximum):
+        return False
+    minimum_rating = _float_or_none(constraints.get("min_rating"))
+    rating = _float_or_none(item.get("rating_value"))
+    return minimum_rating is None or (
+        rating is not None and rating >= minimum_rating
+    )
+
+
+def _candidate_sort_key(
+    item: dict[str, Any],
+    criterion: str,
+    *,
+    target_price: float | None = None,
+) -> tuple[int, float, int]:
     rank = int(item.get("rank") or 999)
     if criterion == "price_desc":
         value = item.get("price_value")
         return (0, -float(value), rank) if value is not None else (1, 0.0, rank)
+    if criterion == "price_nearest":
+        value = item.get("price_value")
+        if value is None or target_price is None:
+            return (1, 0.0, rank)
+        return (0, abs(float(value) - target_price), rank)
     if criterion == "age_asc":
         age = item.get("age_value")
         if age is not None:
@@ -9440,7 +9900,7 @@ def _candidate_sort_key(item: dict[str, Any], criterion: str) -> tuple[int, floa
 
 
 def _candidate_metric(item: dict[str, Any], criterion: str) -> float | None:
-    if criterion in {"price_asc", "price_desc"}:
+    if criterion in {"price_asc", "price_desc", "price_nearest"}:
         return _float_or_none(item.get("price_value"))
     if criterion in {"age_asc", "age_desc"}:
         return _float_or_none(item.get("age_value") or item.get("year_value"))
@@ -9456,8 +9916,13 @@ def _best_shopping_candidate(
     *,
     criterion: str,
     require_metric: bool,
+    target_price: float | None = None,
 ) -> dict[str, Any] | None:
-    for candidate in _sort_shopping_candidates(candidates, criterion=criterion):
+    for candidate in _sort_shopping_candidates(
+        candidates,
+        criterion=criterion,
+        target_price=target_price,
+    ):
         if not candidate.get("url"):
             continue
         if require_metric and _candidate_metric(candidate, criterion) is None:
@@ -9485,6 +9950,7 @@ def _ranking_criterion_label(criterion: str) -> str:
     return {
         "price_asc": "минимальная цена",
         "price_desc": "максимальная цена",
+        "price_nearest": "цена, ближайшая к заданному ориентиру",
         "age_asc": "самый молодой / минимальный возраст",
         "age_desc": "самый старший / максимальный возраст",
         "power_desc": "максимальная мощность/производительность",

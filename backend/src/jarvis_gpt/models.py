@@ -478,7 +478,11 @@ class RuntimePreferencesResponse(BaseModel):
     communication_style: Literal["concise", "balanced", "detailed"]
     daily_briefing: bool
     voice_reply: bool
-    preferred_profile: Literal["gemma4-turbo", "gemma4-mono"]
+    preferred_profile: Literal[
+        "gemma4-turbo",
+        "gemma4-mono",
+        "gemma4-mono-perf",
+    ]
     quiet_hours: str
     working_roots: list[str] = Field(default_factory=list)
 
@@ -488,7 +492,11 @@ class RuntimePreferencesUpdateRequest(BaseModel):
     communication_style: Literal["concise", "balanced", "detailed"] | None = None
     daily_briefing: bool | None = None
     voice_reply: bool | None = None
-    preferred_profile: Literal["gemma4-turbo", "gemma4-mono"] | None = None
+    preferred_profile: Literal[
+        "gemma4-turbo",
+        "gemma4-mono",
+        "gemma4-mono-perf",
+    ] | None = None
     quiet_hours: str | None = Field(default=None, max_length=80)
     working_roots: list[str] | None = None
 
@@ -566,6 +574,7 @@ class BenchmarkResponse(BaseModel):
     telemetry: dict[str, Any] = Field(default_factory=dict)
     dispatcher: dict[str, Any] = Field(default_factory=dict)
     llm: dict[str, Any] = Field(default_factory=dict)
+    inference: dict[str, Any] = Field(default_factory=dict)
     recommendations: list[str] = Field(default_factory=list)
     history: list[dict[str, Any]] = Field(default_factory=list)
 

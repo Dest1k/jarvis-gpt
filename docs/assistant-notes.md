@@ -9,6 +9,35 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-12 - Codex (vLLM-only performance and resilient catalog integration)
+
+- Runtime remains vLLM-only. `gemma4-turbo` is bound exclusively to
+  `gemma4-26b-a4b-nvfp4`; both mono profiles are bound exclusively to
+  `gemma4-31b-it-nvfp4`. No alternate inference integration or fallback remains.
+- Certified `gemma4-mono-perf` for the 31B model with text-only loading,
+  2.5 GiB CPU weight offload, FP8 KV, 4k context and one sequence. Live p50 was
+  899 ms TTFT / 2.446 tok/s decode (about 4.1x the previous offloaded profile).
+  Final turbo live benchmark is 405 ms TTFT / 122.3 tok/s decode.
+- Explicit registered-shop catalog requests now bypass the LLM intent hop in
+  chat and streaming, preserve started/completed progress events, parse soft
+  price targets separately from hard caps, and rank nearest-price results after
+  hard constraints. Explicit product URLs still route to `browser.open`.
+- Catalog reads use per-shop singleflight, verified exact-key cache (5 min fresh,
+  6 h stale), strict registered-domain provenance, bounded queue admission and a
+  30 s cold anti-bot deadline. DNS uses a persistent stable-Chrome profile with
+  proxy propagation and bounded fallback cleanup; Qrator cards are read only
+  after prices render. A fresh-profile smoke returned 20 ranked products in
+  24.5 s; the final exact operator request refreshed 24 products in 6.6 s and
+  selected the verified 48,999 RUB item; the next cache hit completed in 42 ms.
+- Foreground LLM calls preempt/defer background cognition. Admission release is
+  authoritative under repeated cancellation, preventing a stranded background
+  lease from deadlocking later foreground turns. The inference benchmark now
+  records three bounded streaming runs with TTFT, decode rate and usage.
+- Validation at handoff: focused shopping/LLM slice 91 passed; late-lock race
+  stress 20/20; Ruff and compileall clean; frontend typecheck/build and Windows
+  PowerShell launcher parse/ASCII checks clean; full backend suite 817 passed,
+  13 skipped.
+
 ### 2026-07-12 - Grok (live DNS shopping metrics on turbo + budget parse)
 
 Branch: `main` @ `bc08d12`. Stack: `gemma4-turbo` / `gemma4-26b-a4b-nvfp4`, dispatcher healthy.

@@ -4,7 +4,7 @@ import sqlite3
 from pathlib import Path
 
 import pytest
-from jarvis_gpt.config import ensure_runtime_dirs, load_settings
+from jarvis_gpt.config import PROFILES, ensure_runtime_dirs, load_settings
 from jarvis_gpt.storage import JarvisStorage, _recoverable_fts_error
 
 
@@ -27,6 +27,22 @@ def test_settings_use_external_home(monkeypatch, tmp_path):
     assert settings.database_path.parent.exists()
     assert settings.model_root == tmp_path / "models"
     assert settings.model_dir.name == "gemma4-31b-it-nvfp4"
+
+
+def test_mono_perf_profile_preserves_certified_fractional_vllm_tuning():
+    profile = PROFILES["gemma4-mono-perf"]
+
+    assert profile.model_dir_name == "gemma4-31b-it-nvfp4"
+    assert profile.cpu_offload_gb == 2.5
+    assert profile.gpu_memory_utilization == 0.93
+    assert profile.max_model_len == 4096
+    assert profile.eager_mode is True
+    assert profile.kv_cache_dtype == "fp8"
+    assert profile.max_num_seqs == 1
+    assert profile.vllm_extra_args.language_model_only is True
+    assert profile.vllm_extra_args.skip_mm_profiling is True
+    assert profile.vllm_extra_args.mm_processor_cache_gb == 0
+    assert profile.vllm_extra_args.max_num_batched_tokens == 512
 
 
 def test_storage_only_degrades_for_expected_fts_errors(tmp_path):

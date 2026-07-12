@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from .llm import LLMRouter
+from .llm import LLMRouter, background_llm_priority
 from .storage import JarvisStorage
 
 
@@ -97,24 +97,25 @@ class LearningEngine:
         signal_text = _learning_signal_text(inputs=inputs, deterministic=deterministic)
         if not signal_text:
             return []
-        result = await self.llm.complete(
-            [
-                {
-                    "role": "system",
-                    "content": (
-                        "You distill operator/runtime feedback into durable behavioral lessons "
-                        "for a local assistant. Return strict JSON only: "
-                        '{"lessons":[{"content":"...","tags":["learning","distilled"],'
-                        '"importance":0.0}]}. Keep at most 2 lessons, each actionable, '
-                        "short, non-secret, and grounded only in the provided signals."
-                    ),
-                },
-                {"role": "user", "content": signal_text},
-            ],
-            temperature=0.1,
-            max_tokens=700,
-            thinking_enabled=False,
-        )
+        with background_llm_priority(self.llm):
+            result = await self.llm.complete(
+                [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You distill operator/runtime feedback into durable behavioral lessons "
+                            "for a local assistant. Return strict JSON only: "
+                            '{"lessons":[{"content":"...","tags":["learning","distilled"],'
+                            '"importance":0.0}]}. Keep at most 2 lessons, each actionable, '
+                            "short, non-secret, and grounded only in the provided signals."
+                        ),
+                    },
+                    {"role": "user", "content": signal_text},
+                ],
+                temperature=0.1,
+                max_tokens=700,
+                thinking_enabled=False,
+            )
         if not result.ok:
             return []
         try:

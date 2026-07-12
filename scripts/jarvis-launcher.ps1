@@ -625,6 +625,10 @@ function Get-DispatcherContainerRuntime {
     cpu_offload_gb = Get-DispatcherFlagValue -Command $Command -Name "cpu-offload-gb"
     kv_offloading_gb = Get-DispatcherFlagValue -Command $Command -Name "kv-offloading-size"
     kv_offloading_backend = Get-DispatcherFlagValue -Command $Command -Name "kv-offloading-backend"
+    language_model_only = [bool]($Command -contains "--language-model-only")
+    skip_mm_profiling = [bool]($Command -contains "--skip-mm-profiling")
+    mm_processor_cache_gb = Get-DispatcherFlagValue -Command $Command -Name "mm-processor-cache-gb"
+    max_num_batched_tokens = Get-DispatcherFlagValue -Command $Command -Name "max-num-batched-tokens"
   }
 }
 
@@ -735,6 +739,9 @@ function Write-LlmReadinessBlock {
     Write-Host ("| vLLM:    gpu-util {0,-6} kv {1,-5} seqs {2}" -f $runtime["gpu_memory_utilization"], $runtime["kv_cache_dtype"], $runtime["max_num_seqs"])
     if ($runtime["cpu_offload_gb"] -or $runtime["kv_offloading_gb"]) {
       Write-Host ("| Offload: cpu {0} GB  kv {1} GB ({2})" -f $runtime["cpu_offload_gb"], $runtime["kv_offloading_gb"], $(if ($runtime["kv_offloading_backend"]) { $runtime["kv_offloading_backend"] } else { "native" }))
+    }
+    if ($runtime["language_model_only"]) {
+      Write-Host ("| Text:    LM-only  batch-tokens {0}  MM cache {1} GB" -f $runtime["max_num_batched_tokens"], $runtime["mm_processor_cache_gb"])
     }
   }
   Write-Host ("| Docker:  {0,-10} Container: {1}" -f $Readiness.container.state, $Readiness.container.status)
@@ -1781,19 +1788,19 @@ function Invoke-Menu {
   if ($choice.Value -in @("start", "app", "restart")) {
     $profiles = @(
       @{
-        Label = "Turbo 26B - fast"
+        Label = "Turbo 26B - recommended interactive"
         Value = "gemma4-turbo"
-        Hint  = "gemma4-26b-a4b-nvfp4 | no offload | fastest interactive"
+        Hint  = "gemma4-26b-a4b-nvfp4 | vLLM | no offload | fastest interactive"
       },
       @{
-        Label = "Mono 31B - interactive"
+        Label = "Mono 31B - text quality (improved, slow)"
         Value = "gemma4-mono-perf"
-        Hint  = "gemma4-31b-it-nvfp4 | min offload 12GB | eager | 8k | recommended 31B chat"
+        Hint  = "gemma4-31b-it-nvfp4 | vLLM text-only | ~2.45 tok/s measured | 4k"
       },
       @{
-        Label = "Mono 31B - stable offload"
+        Label = "Mono 31B - experimental long-context (slowest)"
         Value = "gemma4-mono"
-        Hint  = "gemma4-31b-it-nvfp4 | CPU offload | 16k | slow decode | long-context/OOM-safe"
+        Hint  = "gemma4-31b-it-nvfp4 | heavy Docker/WSL offload | below 1 tok/s | 16k"
       }
     )
     $profileChoice = Select-Menu -Title "Select LLM profile (arrows + Enter)" -Items $profiles

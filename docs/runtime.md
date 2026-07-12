@@ -1166,16 +1166,20 @@ D:\jarvis\data\models
 
 ### 31B on RTX 5090 (32GB) + 128GB RAM
 
-- Use `gemma4-mono-perf` for interactive 31B chat: ~12GB CPU weight offload only
-  (checkpoint ~31.2 GiB so zero-offload cannot leave KV room on 32GB), eager
-  mode required with offload, util 0.92, 8k context, 1 concurrent seq.
-- Use `gemma4-mono` only when stability/long-context matters: partial weight
+- Use `gemma4-turbo` as the recommended interactive vLLM profile. It keeps the 26B
+  checkpoint GPU-resident and avoids the Docker/WSL CPU weight path.
+- `gemma4-mono-perf` is the vLLM 31B text-only quality profile: 2.5GB CPU weight
+  offload, eager mode, FP8 KV, util 0.93, 4k context and 1 concurrent seq. It
+  disables multimodal profiling/cache and caps batched tokens at 512. A 3x32
+  streaming certification measured p50 TTFT 899.3ms and 2.446 tok/s decode
+  (~4.1x the old profile), but it is still not the recommended interactive path.
+- `gemma4-mono` is experimental and only for stability/long-context checks: partial weight
   offload (24GB CPU) + native KV offload (16GB), eager mode, util 0.85, 16k
-  context, 1 concurrent seq. Decode is intentionally slow (PCIe weight stream).
+  context, 1 concurrent seq. Measured decode is below 1 tok/s.
 - Avoid `gpu_memory_utilization` ≥ 0.94 with 16k context on 31B — that profile
   historically OOMs and can cascade into driver faults.
 - Launcher: `.\jarvis.cmd` → Start/Restart → arrow-select profile
-  (Turbo 26B / Mono 31B interactive / Mono 31B offload-stable).
+  (recommended Turbo 26B / experimental Docker/WSL Mono profiles).
 
 Dispatcher запускается отдельно, чтобы не грузить GPU при обычном старте Command Center:
 

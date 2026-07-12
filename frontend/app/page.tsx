@@ -515,7 +515,10 @@ type RuntimePreferences = {
   communication_style: "concise" | "balanced" | "detailed";
   daily_briefing: boolean;
   voice_reply: boolean;
-  preferred_profile: "gemma4-turbo" | "gemma4-mono";
+  preferred_profile:
+    | "gemma4-turbo"
+    | "gemma4-mono"
+    | "gemma4-mono-perf";
   quiet_hours: string;
   working_roots: string[];
 };

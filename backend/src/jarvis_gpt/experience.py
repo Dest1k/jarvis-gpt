@@ -249,7 +249,7 @@ class ExperienceManager:
         dispatcher: Any,
     ) -> dict[str, Any]:
         started = time.perf_counter()
-        metrics: dict[str, float | int] = {}
+        metrics: dict[str, Any] = {}
 
         lap = time.perf_counter()
         self.storage.ping()
@@ -271,6 +271,34 @@ class ExperienceManager:
         lap = time.perf_counter()
         llm_health = await llm.health()
         metrics["llm_health_ms"] = _elapsed_ms(lap)
+
+        lap = time.perf_counter()
+        benchmark_inference = getattr(llm, "benchmark_inference", None)
+        if callable(benchmark_inference) and llm_health.get("ok"):
+            try:
+                inference = await benchmark_inference(
+                    runs=3,
+                    max_tokens=64,
+                    timeout_sec=30.0,
+                )
+            except Exception as exc:  # noqa: BLE001 - benchmark reports failure structurally
+                inference = {
+                    "ok": False,
+                    "requested_runs": 3,
+                    "successful_runs": 0,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "runs": [],
+                    "aggregate": {},
+                }
+        else:
+            inference = {
+                "ok": False,
+                "available": False,
+                "error": "Inference benchmark is unavailable or LLM health failed.",
+                "runs": [],
+                "aggregate": {},
+            }
+        metrics["inference_ms"] = _elapsed_ms(lap)
         metrics["total_ms"] = _elapsed_ms(started)
         metrics["runtime_records"] = sum(int(value) for value in counters.values())
 
@@ -280,15 +308,22 @@ class ExperienceManager:
         report = {
             "ts": utc_now(),
             "profile": self.settings.profile.name,
-            "summary": _benchmark_summary(compact_dispatcher, compact_llm, compact_telemetry),
+            "summary": _benchmark_summary(
+                compact_dispatcher,
+                compact_llm,
+                compact_telemetry,
+                inference,
+            ),
             "metrics": metrics,
             "telemetry": compact_telemetry,
             "dispatcher": compact_dispatcher,
             "llm": compact_llm,
+            "inference": inference,
             "recommendations": _benchmark_recommendations(
                 telemetry=compact_telemetry,
                 dispatcher=compact_dispatcher,
                 llm=compact_llm,
+                inference=inference,
                 policy=self.autonomy_policy(),
             ),
         }
@@ -318,7 +353,11 @@ def _normalize_preferences(value: dict[str, Any]) -> dict[str, Any]:
     if style not in {"concise", "balanced", "detailed"}:
         style = DEFAULT_PREFERENCES["communication_style"]
     profile = value.get("preferred_profile")
-    if profile not in {"gemma4-turbo", "gemma4-mono"}:
+    if profile not in {
+        "gemma4-turbo",
+        "gemma4-mono",
+        "gemma4-mono-perf",
+    }:
         profile = DEFAULT_PREFERENCES["preferred_profile"]
     return {
         "operator_name": str(value.get("operator_name") or "Admin")[:80],
@@ -609,16 +648,22 @@ def _benchmark_summary(
     dispatcher: dict[str, Any],
     llm: dict[str, Any],
     telemetry: dict[str, Any],
+    inference: dict[str, Any],
 ) -> str:
-    if dispatcher.get("port_open") and llm.get("ok"):
-        return "Runtime benchmark is healthy."
     if not dispatcher.get("port_open"):
         return "Benchmark completed with dispatcher offline."
     if not llm.get("ok"):
         return "Benchmark completed with LLM warning."
+    if not inference.get("ok"):
+        return "Runtime health passed, but bounded inference benchmark failed."
     if not telemetry:
         return "Benchmark completed without telemetry."
-    return "Benchmark completed."
+    aggregate = _dict(inference.get("aggregate"))
+    ttft = aggregate.get("ttft_ms_p50")
+    decode = aggregate.get("decode_tokens_per_sec_p50")
+    if ttft is not None and decode is not None:
+        return f"Inference p50: TTFT {ttft} ms, decode {decode} tok/s."
+    return "Runtime and bounded inference benchmark are healthy."
 
 
 def _benchmark_recommendations(
@@ -626,6 +671,7 @@ def _benchmark_recommendations(
     telemetry: dict[str, Any],
     dispatcher: dict[str, Any],
     llm: dict[str, Any],
+    inference: dict[str, Any],
     policy: dict[str, Any],
 ) -> list[str]:
     recommendations: list[str] = []
@@ -633,6 +679,10 @@ def _benchmark_recommendations(
         recommendations.append("Start dispatcher before LLM latency checks.")
     if not llm.get("ok"):
         recommendations.append("Inspect LLM health and dispatcher logs.")
+    elif not inference.get("ok"):
+        recommendations.append(
+            "Inspect per-run inference errors; endpoint health alone does not prove usable latency."
+        )
     guard = _dict(policy.get("resource_guard"))
     if _ratio(telemetry.get("memory_used_ratio")) > _ratio(guard.get("max_memory_ratio")):
         recommendations.append("Lower background load or switch to the safe profile.")
@@ -645,14 +695,20 @@ def _benchmark_recommendations(
 
 def _compact_benchmark(report: dict[str, Any]) -> dict[str, Any]:
     metrics = _dict(report.get("metrics"))
+    inference = _dict(report.get("inference"))
+    aggregate = _dict(inference.get("aggregate"))
     return {
         "ts": report.get("ts"),
         "profile": report.get("profile"),
         "summary": report.get("summary"),
         "total_ms": metrics.get("total_ms"),
         "llm_health_ms": metrics.get("llm_health_ms"),
+        "inference_ms": metrics.get("inference_ms"),
+        "ttft_ms_p50": aggregate.get("ttft_ms_p50"),
+        "decode_tokens_per_sec_p50": aggregate.get("decode_tokens_per_sec_p50"),
         "dispatcher_online": _dict(report.get("dispatcher")).get("port_open"),
         "llm_ok": _dict(report.get("llm")).get("ok"),
+        "inference_ok": inference.get("ok"),
     }
 
 

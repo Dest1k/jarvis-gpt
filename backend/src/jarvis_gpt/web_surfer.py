@@ -50,6 +50,7 @@ from collections.abc import Iterable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
 from html import unescape
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote_plus, unquote, urlencode, urljoin, urlparse
 
@@ -106,6 +107,8 @@ def shop_search_url(
     return _shop_search_url(shop, query, criterion=criterion)
 
 LOGGER = logging.getLogger("jarvis.web_surfer")
+_CLEANUP_TIMEOUT_SEC = 0.5
+_PERSISTENT_CONTEXT_CLEANUP_TIMEOUT_SEC = 1.5
 
 
 # --------------------------------------------------------------------------- #
@@ -241,6 +244,8 @@ class SurferConfig:
     # off-screen.  The retry is never attempted in the Linux container runtime.
     headful_shop_fallback: bool = True
     headful_browser_channel: str = "chrome"
+    shop_storage_state_dir: str = ""
+    shop_persistent_profile_dir: str = ""
 
     def __post_init__(self) -> None:
         if not self.user_agents:
@@ -479,7 +484,9 @@ class JarvisWebSurfer:
 
         if self._browser is not None:
             with suppress(Exception):
-                await self._browser.close()
+                await asyncio.wait_for(
+                    self._browser.close(), timeout=_CLEANUP_TIMEOUT_SEC
+                )
             self._browser = None
         await self._safe_stop_playwright()
         self._started = False
@@ -487,7 +494,9 @@ class JarvisWebSurfer:
     async def _safe_stop_playwright(self) -> None:
         if self._playwright is not None:
             with suppress(Exception):
-                await self._playwright.stop()
+                await asyncio.wait_for(
+                    self._playwright.stop(), timeout=_CLEANUP_TIMEOUT_SEC
+                )
             self._playwright = None
 
     def _ensure_started(self) -> Browser:
@@ -516,6 +525,7 @@ class JarvisWebSurfer:
         rotate_proxy: bool = True,
         browser: Browser | None = None,
         use_config_user_agent: bool = True,
+        storage_state_path: Path | None = None,
     ) -> BrowserContext:
         browser = browser or self._ensure_started()
         proxy = self._next_proxy() if rotate_proxy else None
@@ -536,15 +546,59 @@ class JarvisWebSurfer:
         }
         if use_config_user_agent:
             context_kwargs["user_agent"] = self._next_user_agent()
+        if storage_state_path is not None and storage_state_path.is_file():
+            context_kwargs["storage_state"] = str(storage_state_path)
         try:
             context = await browser.new_context(**context_kwargs)
         except (PlaywrightError, ValueError) as exc:
+            if "storage_state" in context_kwargs:
+                context_kwargs.pop("storage_state", None)
+                try:
+                    context = await browser.new_context(**context_kwargs)
+                except (PlaywrightError, ValueError):
+                    pass
+                else:
+                    context.set_default_timeout(self.config.default_timeout_ms)
+                    context.set_default_navigation_timeout(self.config.nav_timeout_ms)
+                    return context
             if proxy is not None:
                 raise ProxyError(f"Proxy context failed: {exc}") from exc
             raise BrowserLaunchError(f"Could not create browser context: {exc}") from exc
         context.set_default_timeout(self.config.default_timeout_ms)
         context.set_default_navigation_timeout(self.config.nav_timeout_ms)
         return context
+
+    def _shop_storage_state_path(self, shop: str | None) -> Path | None:
+        root = str(self.config.shop_storage_state_dir or "").strip()
+        source = get_shop_source(shop)
+        if not root or source is None:
+            return None
+        safe_name = re.sub(r"[^a-z0-9_.-]+", "_", source.key.casefold()).strip("._")
+        return Path(root) / f"{safe_name or 'shop'}.json"
+
+    def _shop_persistent_profile_path(self, shop: str | None) -> Path | None:
+        root = str(self.config.shop_persistent_profile_dir or "").strip()
+        source = get_shop_source(shop)
+        if not root or source is None:
+            return None
+        safe_name = re.sub(r"[^a-z0-9_.-]+", "_", source.key.casefold()).strip("._")
+        return Path(root) / (safe_name or "shop")
+
+    async def _persist_shop_storage_state(
+        self,
+        context: BrowserContext,
+        shop: str | None,
+    ) -> None:
+        path = self._shop_storage_state_path(shop)
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            await asyncio.wait_for(
+                context.storage_state(path=str(path)), timeout=_CLEANUP_TIMEOUT_SEC
+            )
+        except (AttributeError, OSError, PlaywrightError, TimeoutError, TypeError):
+            return
 
     async def _new_page(self, context: BrowserContext, *, use_stealth: bool | None = None) -> Page:
         page = await context.new_page()
@@ -592,12 +646,19 @@ class JarvisWebSurfer:
         *,
         wait_until: str = "domcontentloaded",
     ) -> Response | None:
-        try:
-            response = await page.goto(
+        navigation = asyncio.create_task(
+            page.goto(
                 url,
                 wait_until=wait_until,  # type: ignore[arg-type]
                 timeout=self.config.nav_timeout_ms,
             )
+        )
+        try:
+            response = await navigation
+        except asyncio.CancelledError:
+            navigation.cancel()
+            await asyncio.gather(navigation, return_exceptions=True)
+            raise
         except PlaywrightTimeoutError as exc:
             raise NavigationError(f"Navigation timed out: {url}") from exc
         except PlaywrightError as exc:
@@ -906,7 +967,7 @@ class JarvisWebSurfer:
             return None
         finally:
             with suppress(Exception):
-                await context.close()
+                await asyncio.wait_for(context.close(), timeout=_CLEANUP_TIMEOUT_SEC)
 
     async def shop_search(
         self,
@@ -958,6 +1019,16 @@ class JarvisWebSurfer:
                 criterion=criterion,
                 criterion_label=criterion_label,
             )
+        if criterion == "price_nearest" and constraints.get("target_price", 0) <= 0:
+            return _shop_search_result(
+                query,
+                shop,
+                ok=False,
+                error="price_nearest requires a positive target_price constraint",
+                criterion=criterion,
+                criterion_label=criterion_label,
+                constraints=constraints,
+            )
         if not url:
             return _shop_search_result(
                 query,
@@ -992,7 +1063,7 @@ class JarvisWebSurfer:
             comparison = current.get("comparison") or {}
             if (
                 not wildberries_api_enabled
-                or criterion in {"price_asc", "price_desc"}
+                or criterion in {"price_asc", "price_desc", "price_nearest"}
                 or comparison.get("complete")
             ):
                 return current
@@ -1016,14 +1087,29 @@ class JarvisWebSurfer:
                 if api_result.get("items"):
                     api_fallback = api_result
                 if api_result.get("items") and (
-                    criterion in {"price_asc", "price_desc"}
+                    criterion in {"price_asc", "price_desc", "price_nearest"}
                     or comparison.get("complete")
                 ):
                     return api_result
             except (TimeoutError, PlaywrightError, WebSurferError, ValueError):
                 pass
-        want_cities = list(cities) if cities else ["Донецк", "Москва"]
+        want_cities = list(cities or [])
         started = time.monotonic()
+        stages: list[dict[str, Any]] = []
+
+        def finish(value: dict[str, Any]) -> dict[str, Any]:
+            output = dict(value)
+            output["stages"] = stages
+            output["timings"] = {
+                "total_ms": max(0, round((time.monotonic() - started) * 1000)),
+                **{
+                    f"{stage['name']}_ms": stage["elapsed_ms"]
+                    for stage in stages
+                    if stage.get("name") and isinstance(stage.get("elapsed_ms"), int)
+                },
+            }
+            return output
+
         primary_error = ""
         can_retry_headful = (
             self.config.headless
@@ -1031,9 +1117,80 @@ class JarvisWebSurfer:
             and sys.platform == "win32"
             and self._playwright is not None
         )
+        stable_first = can_retry_headful and _normalize_shop(shop) == "dns"
+        if stable_first:
+            stage_started = time.monotonic()
+            stable_error = ""
+            stable_error_code = ""
+            try:
+                stable_result = await asyncio.wait_for(
+                    self._shop_search_headful_chrome(
+                        query,
+                        shop or "",
+                        url,
+                        max_items,
+                        want_cities,
+                        criterion,
+                        criterion_label,
+                        search_query,
+                        constraints,
+                    ),
+                    timeout=self.config.shopping_budget_sec,
+                )
+                stable_ok = bool(stable_result.get("ok") and stable_result.get("items"))
+                stable_error = str(stable_result.get("error") or "no products parsed")
+                stable_error_code = "empty_catalog" if not stable_ok else ""
+            except TimeoutError:
+                stable_result = None
+                stable_ok = False
+                stable_error = "stable Chrome shop search exceeded total budget"
+                stable_error_code = "stable_timeout"
+            except BrowserLaunchError as exc:
+                stable_result = None
+                stable_ok = False
+                stable_error = f"stable Chrome unavailable: {exc}"
+                stable_error_code = "stable_unavailable"
+            except NavigationError as exc:
+                stable_result = None
+                stable_ok = False
+                stable_error = f"stable Chrome navigation failed: {exc}"
+                stable_error_code = "stable_navigation"
+            except (PlaywrightError, OSError, WebSurferError) as exc:
+                stable_result = None
+                stable_ok = False
+                stable_error = f"stable Chrome failed: {exc}"
+                stable_error_code = "stable_failure"
+            stages.append(
+                {
+                    "name": "stable_chrome",
+                    "ok": stable_ok,
+                    "elapsed_ms": max(0, round((time.monotonic() - stage_started) * 1000)),
+                    "error_code": stable_error_code or None,
+                    "error": stable_error if not stable_ok else None,
+                }
+            )
+            if stable_ok and stable_result is not None:
+                return finish(await retry_api_for_incomplete(stable_result))
+            if api_fallback is not None:
+                return finish(api_fallback)
+            failed = _shop_search_result(
+                query,
+                shop,
+                url=url,
+                ok=False,
+                error=stable_error,
+                criterion=criterion,
+                criterion_label=criterion_label,
+                search_query=search_query,
+                constraints=constraints,
+            )
+            failed["error_code"] = stable_error_code
+            return finish(failed)
+
         primary_timeout = self.config.shopping_budget_sec
         if can_retry_headful:
             primary_timeout = min(primary_timeout, max(5.0, primary_timeout * 0.4))
+        stage_started = time.monotonic()
         try:
             result = await asyncio.wait_for(
                 self._shop_search_impl(
@@ -1049,15 +1206,52 @@ class JarvisWebSurfer:
                 ),
                 timeout=primary_timeout,
             )
-            if result.get("ok") and result.get("items"):
-                return await retry_api_for_incomplete(result)
+            primary_ok = bool(result.get("ok") and result.get("items"))
             primary_error = str(result.get("error") or "no products parsed")
+            stages.append(
+                {
+                    "name": "headless_chromium",
+                    "ok": primary_ok,
+                    "elapsed_ms": max(0, round((time.monotonic() - stage_started) * 1000)),
+                    "error_code": None if primary_ok else "empty_catalog",
+                    "error": None if primary_ok else primary_error,
+                }
+            )
+            if primary_ok:
+                return finish(await retry_api_for_incomplete(result))
         except TimeoutError:
             primary_error = "shop_search exceeded budget"
+            stages.append(
+                {
+                    "name": "headless_chromium",
+                    "ok": False,
+                    "elapsed_ms": max(0, round((time.monotonic() - stage_started) * 1000)),
+                    "error_code": "headless_timeout",
+                    "error": primary_error,
+                }
+            )
         except AntiBotError as exc:
             primary_error = f"anti-bot: {exc}"
+            stages.append(
+                {
+                    "name": "headless_chromium",
+                    "ok": False,
+                    "elapsed_ms": max(0, round((time.monotonic() - stage_started) * 1000)),
+                    "error_code": "anti_bot",
+                    "error": primary_error,
+                }
+            )
         except WebSurferError as exc:
             primary_error = str(exc)
+            stages.append(
+                {
+                    "name": "headless_chromium",
+                    "ok": False,
+                    "elapsed_ms": max(0, round((time.monotonic() - stage_started) * 1000)),
+                    "error_code": "headless_failure",
+                    "error": primary_error,
+                }
+            )
 
         # DNS/Qrator currently serves a 401/403 shell to Playwright headless but
         # lets the installed stable Chrome complete its JS proof-of-work.  Retry
@@ -1066,6 +1260,7 @@ class JarvisWebSurfer:
         if can_retry_headful:
             remaining = self.config.shopping_budget_sec - (time.monotonic() - started)
             if remaining > 3:
+                stage_started = time.monotonic()
                 try:
                     fallback = await asyncio.wait_for(
                         self._shop_search_headful_chrome(
@@ -1081,19 +1276,79 @@ class JarvisWebSurfer:
                         ),
                         timeout=remaining,
                     )
-                    if fallback.get("ok") and fallback.get("items"):
-                        return await retry_api_for_incomplete(fallback)
+                    fallback_ok = bool(fallback.get("ok") and fallback.get("items"))
                     fallback_error = str(fallback.get("error") or "no products parsed")
+                    stages.append(
+                        {
+                            "name": "stable_chrome",
+                            "ok": fallback_ok,
+                            "elapsed_ms": max(
+                                0, round((time.monotonic() - stage_started) * 1000)
+                            ),
+                            "error_code": None if fallback_ok else "empty_catalog",
+                            "error": None if fallback_ok else fallback_error,
+                        }
+                    )
+                    if fallback_ok:
+                        return finish(await retry_api_for_incomplete(fallback))
                     primary_error = f"{primary_error}; stable Chrome: {fallback_error}"
                 except TimeoutError:
                     primary_error = f"{primary_error}; stable Chrome retry timed out"
-                except (PlaywrightError, OSError, WebSurferError) as exc:
+                    stages.append(
+                        {
+                            "name": "stable_chrome",
+                            "ok": False,
+                            "elapsed_ms": max(
+                                0, round((time.monotonic() - stage_started) * 1000)
+                            ),
+                            "error_code": "stable_timeout",
+                            "error": "stable Chrome retry timed out",
+                        }
+                    )
+                except BrowserLaunchError as exc:
                     primary_error = f"{primary_error}; stable Chrome unavailable: {exc}"
+                    stages.append(
+                        {
+                            "name": "stable_chrome",
+                            "ok": False,
+                            "elapsed_ms": max(
+                                0, round((time.monotonic() - stage_started) * 1000)
+                            ),
+                            "error_code": "stable_unavailable",
+                            "error": str(exc),
+                        }
+                    )
+                except NavigationError as exc:
+                    primary_error = f"{primary_error}; stable Chrome navigation failed: {exc}"
+                    stages.append(
+                        {
+                            "name": "stable_chrome",
+                            "ok": False,
+                            "elapsed_ms": max(
+                                0, round((time.monotonic() - stage_started) * 1000)
+                            ),
+                            "error_code": "stable_navigation",
+                            "error": str(exc),
+                        }
+                    )
+                except (PlaywrightError, OSError, WebSurferError) as exc:
+                    primary_error = f"{primary_error}; stable Chrome failed: {exc}"
+                    stages.append(
+                        {
+                            "name": "stable_chrome",
+                            "ok": False,
+                            "elapsed_ms": max(
+                                0, round((time.monotonic() - stage_started) * 1000)
+                            ),
+                            "error_code": "stable_failure",
+                            "error": str(exc),
+                        }
+                    )
 
         if api_fallback is not None:
-            return api_fallback
+            return finish(api_fallback)
 
-        return _shop_search_result(
+        return finish(_shop_search_result(
             query,
             shop,
             url=url,
@@ -1103,7 +1358,7 @@ class JarvisWebSurfer:
             criterion_label=criterion_label,
             search_query=search_query,
             constraints=constraints,
-        )
+        ))
 
     async def _wildberries_api_shop_search(
         self,
@@ -1185,6 +1440,7 @@ class JarvisWebSurfer:
             items,
             criterion=criterion,
             metric_key=metric_key,
+            target_price=constraints.get("target_price"),
         )[:max_items]
         priced = [
             item
@@ -1224,7 +1480,9 @@ class JarvisWebSurfer:
         search_query: str,
         constraints: dict[str, float],
     ) -> dict[str, Any]:
-        context = await self._new_context()
+        context = await self._new_context(
+            storage_state_path=self._shop_storage_state_path(shop)
+        )
         try:
             page = await self._new_page(context)
             return await self._shop_search_page(
@@ -1242,8 +1500,9 @@ class JarvisWebSurfer:
                 constraints=constraints,
             )
         finally:
+            await self._persist_shop_storage_state(context, shop)
             with suppress(Exception):
-                await context.close()
+                await asyncio.wait_for(context.close(), timeout=_CLEANUP_TIMEOUT_SEC)
 
     async def _shop_search_headful_chrome(
         self,
@@ -1266,23 +1525,58 @@ class JarvisWebSurfer:
         if self._playwright is None:
             raise BrowserLaunchError("Playwright is not started")
         channel = str(self.config.headful_browser_channel or "chrome").strip() or "chrome"
-        browser = await self._playwright.chromium.launch(
-            channel=channel,
-            headless=False,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
-                "--window-position=-32000,-32000",
-                "--window-size=1366,900",
-            ],
-        )
+        launch_args = [
+            "--disable-blink-features=AutomationControlled",
+            "--disable-dev-shm-usage",
+            "--window-position=-32000,-32000",
+            "--window-size=1366,900",
+        ]
+        browser: Browser | None = None
         context: BrowserContext | None = None
         try:
-            context = await self._new_context(
-                browser=browser,
-                use_config_user_agent=False,
-            )
-            page = await self._new_page(context, use_stealth=False)
+            profile_path = self._shop_persistent_profile_path(shop)
+            if profile_path is not None and _normalize_shop(shop) == "dns":
+                profile_path.mkdir(parents=True, exist_ok=True)
+                persistent_kwargs: dict[str, Any] = {
+                    "channel": channel,
+                    "headless": False,
+                    "locale": self.config.locale,
+                    "timezone_id": self.config.timezone_id,
+                    "viewport": {
+                        "width": self.config.viewport_width,
+                        "height": self.config.viewport_height,
+                    },
+                    "extra_http_headers": {
+                        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+                        **self.config.extra_headers,
+                    },
+                    "ignore_https_errors": True,
+                    "args": launch_args,
+                }
+                proxy = self._next_proxy()
+                if proxy is not None:
+                    persistent_kwargs["proxy"] = proxy
+                context = await self._playwright.chromium.launch_persistent_context(
+                    str(profile_path),
+                    **persistent_kwargs,
+                )
+                context.set_default_timeout(self.config.default_timeout_ms)
+                context.set_default_navigation_timeout(self.config.nav_timeout_ms)
+            else:
+                browser = await self._playwright.chromium.launch(
+                    channel=channel,
+                    headless=False,
+                    args=launch_args,
+                )
+                context = await self._new_context(
+                    browser=browser,
+                    use_config_user_agent=False,
+                    storage_state_path=self._shop_storage_state_path(shop),
+                )
+            if browser is None and context.pages:
+                page = context.pages[0]
+            else:
+                page = await self._new_page(context, use_stealth=False)
             return await self._shop_search_page(
                 page,
                 query=query,
@@ -1299,10 +1593,27 @@ class JarvisWebSurfer:
             )
         finally:
             if context is not None:
+                await self._persist_shop_storage_state(context, shop)
+                context_browser = getattr(context, "browser", None)
+                try:
+                    await asyncio.wait_for(
+                        context.close(),
+                        timeout=(
+                            _PERSISTENT_CONTEXT_CLEANUP_TIMEOUT_SEC
+                            if browser is None
+                            else _CLEANUP_TIMEOUT_SEC
+                        ),
+                    )
+                except Exception:
+                    if browser is None and context_browser is not None:
+                        with suppress(Exception):
+                            await asyncio.wait_for(
+                                context_browser.close(),
+                                timeout=_CLEANUP_TIMEOUT_SEC,
+                            )
+            if browser is not None:
                 with suppress(Exception):
-                    await context.close()
-            with suppress(Exception):
-                await browser.close()
+                    await asyncio.wait_for(browser.close(), timeout=_CLEANUP_TIMEOUT_SEC)
 
     async def _shop_search_page(
         self,
@@ -1321,36 +1632,76 @@ class JarvisWebSurfer:
         constraints: dict[str, float],
     ) -> dict[str, Any]:
         await _install_shop_navigation_guard(page, shop=shop, initial_url=url)
-        response = await self._goto(page, url, wait_until="domcontentloaded")
+        try:
+            response = await self._goto(page, url, wait_until="domcontentloaded")
+        except NavigationError as exc:
+            if (
+                not wait_for_challenge
+                or "timed out" not in str(exc).casefold()
+                or not await _shop_page_has_product_dom(page)
+            ):
+                raise
+            # Qrator can replace the document with a usable catalog while the
+            # original navigation promise still times out. Continue from the
+            # independently inspected DOM instead of misclassifying Chrome as
+            # unavailable.
+            response = None
+        catalog_ready = False
         if wait_for_challenge:
             # Qrator initially answers 401, runs a browser proof-of-work, then
             # replaces the page with the catalog without a normal navigation.
+            catalog_selector = (
+                ".catalog-product:has-text('₽')"
+                if _normalize_shop(shop) == "dns"
+                else (
+                    "a[href*='/product/'], a[href*='/detail.aspx'], "
+                    ".catalog-product, article.product-card"
+                )
+            )
             with suppress(PlaywrightError, PlaywrightTimeoutError):
                 await page.wait_for_selector(
-                    "a[href*='/product/'], a[href*='/detail.aspx'], "
-                    ".catalog-product, article.product-card",
+                    catalog_selector,
                     timeout=10_000,
                 )
-        await self._human_mouse_move(page)
-        city = await self._try_set_city(page, cities)
-        if not city:
+            if _normalize_shop(shop) == "dns":
+                with suppress(PlaywrightError):
+                    catalog_ready = (
+                        await page.locator(".catalog-product:has-text('₽')").count()
+                        > 0
+                    )
+            else:
+                catalog_ready = await _shop_page_has_product_dom(page)
+        sorted_url = _shop_price_sorted_url(shop, page.url or url, criterion=criterion)
+        challenge_catalog_ready = (
+            wait_for_challenge
+            and catalog_ready
+            and not cities
+            and (not sorted_url or sorted_url == (page.url or ""))
+        )
+        if challenge_catalog_ready:
+            city = ""
             with suppress(PlaywrightError):
                 city = _city_label_from_cookies(await page.context.cookies())
-        sorted_url = _shop_price_sorted_url(shop, page.url or url, criterion=criterion)
-        if sorted_url and sorted_url != (page.url or ""):
-            with suppress(PlaywrightError, PlaywrightTimeoutError, NavigationError):
-                response = await self._goto(page, sorted_url, wait_until="domcontentloaded")
-                await page.wait_for_selector(
-                    "a[href*='/product/'], a[href*='/detail.aspx'], "
-                    ".catalog-product, article.product-card",
-                    timeout=10_000,
-                )
-        with suppress(PlaywrightError):
-            await page.wait_for_load_state("networkidle", timeout=9_000)
-        for _ in range(3):
+        else:
+            await self._human_mouse_move(page)
+            city = await self._try_set_city(page, cities)
+            if not city:
+                with suppress(PlaywrightError):
+                    city = _city_label_from_cookies(await page.context.cookies())
+            if sorted_url and sorted_url != (page.url or ""):
+                with suppress(PlaywrightError, PlaywrightTimeoutError, NavigationError):
+                    response = await self._goto(page, sorted_url, wait_until="domcontentloaded")
+                    await page.wait_for_selector(
+                        "a[href*='/product/'], a[href*='/detail.aspx'], "
+                        ".catalog-product, article.product-card",
+                        timeout=10_000,
+                    )
             with suppress(PlaywrightError):
-                await page.mouse.wheel(0, 2200)
-            await self._human_pause(0.5)
+                await page.wait_for_load_state("networkidle", timeout=9_000)
+            for _ in range(3):
+                with suppress(PlaywrightError):
+                    await page.mouse.wheel(0, 2200)
+                await self._human_pause(0.5)
         html = ""
         with suppress(PlaywrightError):
             html = await page.content()
@@ -1364,7 +1715,10 @@ class JarvisWebSurfer:
             if key in {"min_price", "max_price"}
         }
         items = _filter_catalog_constraints(items, price_constraints)
-        if criterion not in {"price_asc", "price_desc"} or "min_rating" in constraints:
+        if (
+            criterion not in {"price_asc", "price_desc", "price_nearest"}
+            or "min_rating" in constraints
+        ):
             if _normalize_shop(shop) == "wildberries":
                 await _enrich_wildberries_catalog_items(page.context, items[:max_items])
             else:
@@ -1381,6 +1735,7 @@ class JarvisWebSurfer:
             items,
             criterion=criterion,
             metric_key=metric_key,
+            target_price=constraints.get("target_price"),
         )[:max_items]
         priced = [
             item
@@ -2054,6 +2409,23 @@ async def _install_shop_navigation_guard(
     await page.route("**/*", guard)
 
 
+async def _shop_page_has_product_dom(page: Page) -> bool:
+    selectors = (
+        "a[href*='/product/'], a[href*='/detail.aspx'], "
+        ".catalog-product, article.product-card"
+    )
+    with suppress(Exception):
+        if await page.locator(selectors).count() > 0:
+            return True
+    with suppress(Exception):
+        html = (await page.content()).casefold()
+        return any(
+            marker in html
+            for marker in ("/product/", "/detail.aspx", "catalog-product", "product-card")
+        )
+    return False
+
+
 def _shop_search_url(
     shop: str | None,
     query: str,
@@ -2621,6 +2993,7 @@ async def _enrich_wildberries_catalog_items(
 _CATALOG_CRITERIA = {
     "price_asc",
     "price_desc",
+    "price_nearest",
     "power_desc",
     "speed_desc",
     "capacity_desc",
@@ -2647,7 +3020,7 @@ def _normalize_catalog_constraints(value: Any) -> dict[str, float]:
     if not isinstance(value, dict):
         return {}
     normalized: dict[str, float] = {}
-    for key in ("max_price", "min_price", "min_rating"):
+    for key in ("max_price", "min_price", "min_rating", "target_price"):
         try:
             number = float(value.get(key))
         except (TypeError, ValueError):
@@ -3028,7 +3401,7 @@ _CRITERION_METRIC_KEYS = {
 
 
 def _select_catalog_metric_key(items: Sequence[dict[str, Any]], criterion: str) -> str:
-    if criterion in {"price_asc", "price_desc"}:
+    if criterion in {"price_asc", "price_desc", "price_nearest"}:
         return "price_value"
     candidates = _CRITERION_METRIC_KEYS.get(criterion, ())
     if not candidates:
@@ -3065,6 +3438,7 @@ def _rank_catalog_items(
     *,
     criterion: str = "price_asc",
     metric_key: str = "",
+    target_price: float | None = None,
 ) -> list[dict[str, Any]]:
     descending = criterion not in {
         "price_asc",
@@ -3078,13 +3452,16 @@ def _rank_catalog_items(
         out_of_stock = 1 if stock is False else 0
         availability_tie = 0 if stock is True else 1 if stock is None else 2
         effective_metric_key = metric_key
-        if not effective_metric_key and criterion in {"price_asc", "price_desc"}:
+        if not effective_metric_key and criterion in {"price_asc", "price_desc", "price_nearest"}:
             effective_metric_key = "price_value"
         metric = _catalog_metric(item, effective_metric_key)
         if metric is None:
             return (out_of_stock, 1, 0.0, availability_tie)
         value = float(metric["value"])
-        metric_value = -value if descending else value
+        if criterion == "price_nearest" and isinstance(target_price, int | float):
+            metric_value = abs(value - float(target_price))
+        else:
+            metric_value = -value if descending else value
         return (out_of_stock, 0, metric_value, availability_tie)
 
     return sorted(items, key=_key)
@@ -3164,13 +3541,17 @@ def _shop_search_result(
         _catalog_metric(
             item,
             metric_key
-            or ("price_value" if criterion in {"price_asc", "price_desc"} else ""),
+            or (
+                "price_value"
+                if criterion in {"price_asc", "price_desc", "price_nearest"}
+                else ""
+            ),
         )
         is not None
         for item in (items or [])
         if item.get("in_stock") is not False
     )
-    is_price = criterion in {"price_asc", "price_desc"}
+    is_price = criterion in {"price_asc", "price_desc", "price_nearest"}
     comparison_complete = public_best is not None and (is_price or compared_count >= 2)
     output_best = public_best if comparison_complete else None
     comparison = {
@@ -3188,6 +3569,12 @@ def _shop_search_result(
             else None
         ),
     }
+    target_price = (constraints or {}).get("target_price")
+    if criterion == "price_nearest" and isinstance(target_price, int | float):
+        comparison["target_price"] = float(target_price)
+        best_price = best.get("price_value") if isinstance(best, dict) else None
+        if isinstance(best_price, int | float):
+            comparison["distance_to_target"] = abs(float(best_price) - float(target_price))
     return {
         "ok": ok,
         "query": query,

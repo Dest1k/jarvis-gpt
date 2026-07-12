@@ -1389,6 +1389,20 @@ def test_stream_chat_opens_explicit_url_without_approval(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_explicit_shop_product_url_is_opened_not_catalog_searched(monkeypatch, tmp_path):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    target = "https://www.dns-shop.ru/product/123"
+
+    response = asyncio.run(agent.chat(f"открой {target}"))
+
+    run = _operator_tool_run(storage, "browser.open")
+    task_plan = next(event for event in response.events if event.title == "Task kernel")
+    assert run["arguments"] == {"url": target}
+    assert task_plan.payload["route"] == "local_action"
+    assert all(item["tool"] != "web.shop_search" for item in storage.list_tool_runs())
+    storage.close()
+
+
 def test_agent_opens_file_with_default_windows_application(monkeypatch, tmp_path):
     agent, storage = _agent_without_llm(monkeypatch, tmp_path)
     target = tmp_path / "report.txt"

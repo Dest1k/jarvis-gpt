@@ -15,10 +15,11 @@ import socket
 import subprocess
 import tempfile
 import threading
+import time
 import zipfile
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html import unescape
 from pathlib import Path, PureWindowsPath
@@ -190,6 +191,17 @@ WEB_FETCH_CACHE_MAX_RECORDS = 100
 WEB_ANSWER_CACHE_KEY = "web.answer.cache"
 WEB_ANSWER_CACHE_TTL_SEC = 600
 WEB_ANSWER_CACHE_MAX_RECORDS = 80
+WEB_SHOP_CACHE_KEY = "web.shop_search.cache"
+WEB_SHOP_CACHE_FRESH_TTL_SEC = 300
+WEB_SHOP_CACHE_STALE_TTL_SEC = 21_600
+WEB_SHOP_CACHE_MAX_RECORDS = 40
+WEB_SHOP_LIVE_TIMEOUT_SEC = 30.0
+
+
+def _shop_deadline_remaining(absolute_deadline: float) -> float:
+    return absolute_deadline - time.monotonic()
+
+
 def _load_web_news_timezone() -> Any:
     try:
         return ZoneInfo("Europe/Moscow")
@@ -297,6 +309,7 @@ class ToolContext:
     safe_gate: SafeGate
     playbooks: ExecutionPlaybookStore | None = None
     web_surfer: WebSurferAdapter | None = None
+    shop_search_locks: dict[str, asyncio.Lock] | None = None
     executive: ExecutiveCoordinator | None = None
     approved: bool = False
     mission_id: str | None = None
@@ -500,6 +513,7 @@ class ToolRegistry:
         )
         self.playbooks = playbooks
         self.web_surfer = web_surfer or WebSurferAdapter()
+        self._shop_search_locks: dict[str, asyncio.Lock] = {}
         self.executive = executive
         self._tools: dict[str, ToolSpec] = {}
         self._register_defaults()
@@ -590,6 +604,7 @@ class ToolRegistry:
                 safe_gate=self.safe_gate,
                 playbooks=self.playbooks,
                 web_surfer=self.web_surfer,
+                shop_search_locks=self._shop_search_locks,
                 executive=self.executive,
                 approved=approved,
                 mission_id=mission_id,
@@ -1673,12 +1688,15 @@ class ToolRegistry:
                     "max_items": "Maximum products to return (default 24)",
                     "cities": "Optional ordered city names; default Донецк, Москва",
                     "criterion": (
-                        "price_asc, price_desc, power_desc, speed_desc, capacity_desc, "
+                        "price_asc, price_desc, price_nearest, power_desc, speed_desc, "
+                        "capacity_desc, "
                         "range_desc, runtime_desc, age_asc, age_desc, size_asc, size_desc, "
                         "weight_asc, weight_desc, date_desc, rating_desc, popularity_desc"
                     ),
                     "criterion_label": "Human-readable requested comparison criterion",
-                    "constraints": "Optional max_price, min_price and min_rating filters",
+                    "constraints": (
+                        "Optional max_price, min_price, target_price and min_rating values"
+                    ),
                 },
                 handler=_web_shop_search,
             )
@@ -5188,6 +5206,316 @@ def _web_surfer_proxies() -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+def _shop_search_key_payload(
+    *,
+    query: str,
+    shop: str | None,
+    search_url: str | None,
+    max_items: int,
+    cities: list[str] | None,
+    criterion: str,
+    constraints: dict[str, float],
+) -> dict[str, Any]:
+    source = get_shop_source(shop)
+    return {
+        "query": " ".join(query.casefold().split()),
+        "shop": source.key if source is not None else str(shop or "").casefold(),
+        "search_url": str(search_url or "").strip(),
+        "max_items": max_items,
+        "cities": [" ".join(item.casefold().split()) for item in (cities or [])],
+        "criterion": criterion,
+        "constraints": {key: constraints[key] for key in sorted(constraints)},
+    }
+
+
+def _shop_search_key_from_arguments(arguments: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    query = " ".join(str(arguments.get("query") or "").split())
+    shop = str(arguments.get("shop") or "").strip() or None
+    search_url = str(arguments.get("search_url") or "").strip() or None
+    if not shop and search_url:
+        shop_source = get_shop_source_by_host(urlparse(search_url).hostname)
+        shop = shop_source.key if shop_source is not None else None
+    max_items = _int_arg(arguments.get("max_items"), default=24, minimum=1, maximum=60)
+    cities = _string_list_arg(arguments.get("cities"), limit=6) or None
+    criterion = " ".join(
+        str(arguments.get("criterion") or "price_asc").split()
+    ).casefold()
+    constraints: dict[str, float] = {}
+    raw_constraints = arguments.get("constraints")
+    if isinstance(raw_constraints, dict):
+        for key in ("max_price", "min_price", "min_rating", "target_price"):
+            try:
+                value = float(raw_constraints.get(key))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value) and value >= 0 and (
+                key != "min_rating" or value <= 5
+            ):
+                constraints[key] = value
+    payload = _shop_search_key_payload(
+        query=query,
+        shop=shop,
+        search_url=search_url,
+        max_items=max_items,
+        cities=cities,
+        criterion=criterion,
+        constraints=constraints,
+    )
+    return _operator_arguments_sha256(payload), payload
+
+
+def _shop_cache_age_seconds(value: Any) -> float | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return max(0.0, (datetime.now(UTC) - parsed.astimezone(UTC)).total_seconds())
+
+
+def _verified_shop_result(
+    result: Any,
+    *,
+    shop: str | None,
+    criterion: str,
+) -> bool:
+    if not isinstance(result, dict) or not result.get("ok"):
+        return False
+    source = get_shop_source(shop)
+    if source is None:
+        return False
+    items = result.get("items")
+    if not isinstance(items, list) or not items:
+        return False
+    verified_items = 0
+    priced_items = 0
+    for item in items:
+        if not isinstance(item, dict) or not str(item.get("title") or "").strip():
+            return False
+        hostname = (urlparse(str(item.get("url") or "")).hostname or "").casefold()
+        if hostname != source.domain and not hostname.endswith(f".{source.domain}"):
+            return False
+        verified_items += 1
+        price = item.get("price_value")
+        if isinstance(price, int | float) and math.isfinite(float(price)) and float(price) >= 0:
+            priced_items += 1
+    if verified_items == 0:
+        return False
+    return criterion not in {"price_asc", "price_desc", "price_nearest"} or priced_items > 0
+
+
+def _shop_cache_records(storage: JarvisStorage) -> list[dict[str, Any]]:
+    records = storage.get_runtime_value(WEB_SHOP_CACHE_KEY, [])
+    return [item for item in records if isinstance(item, dict)] if isinstance(records, list) else []
+
+
+def _shop_cache_lookup(
+    storage: JarvisStorage,
+    *,
+    cache_key: str,
+    shop: str | None,
+    criterion: str,
+) -> dict[str, Any] | None:
+    for entry in _shop_cache_records(storage):
+        if entry.get("key") != cache_key:
+            continue
+        age_sec = _shop_cache_age_seconds(entry.get("cached_at"))
+        if age_sec is None or age_sec > WEB_SHOP_CACHE_STALE_TTL_SEC:
+            return None
+        data = entry.get("data")
+        if not _verified_shop_result(data, shop=shop, criterion=criterion):
+            return None
+        return {**entry, "age_sec": age_sec}
+    return None
+
+
+def _shop_cache_store(
+    storage: JarvisStorage,
+    *,
+    cache_key: str,
+    key_payload: dict[str, Any],
+    result: dict[str, Any],
+    source: str,
+    cached_at: str | None = None,
+    tool_run_id: str | None = None,
+) -> dict[str, Any]:
+    clean_result = {key: value for key, value in result.items() if key != "cache"}
+    stamp = str(cached_at or utc_now())
+    entry = {
+        "key": cache_key,
+        "key_payload": key_payload,
+        "cached_at": stamp,
+        "source": source,
+        "tool_run_id": tool_run_id,
+        "data": clean_result,
+    }
+    records = _shop_cache_records(storage)
+    fresh = [item for item in records if item.get("key") != cache_key]
+    storage.set_runtime_value(
+        WEB_SHOP_CACHE_KEY,
+        [entry, *fresh][:WEB_SHOP_CACHE_MAX_RECORDS],
+    )
+    return {**entry, "age_sec": _shop_cache_age_seconds(stamp) or 0.0}
+
+
+def _shop_cache_hydrate_from_tool_runs(
+    storage: JarvisStorage,
+    *,
+    cache_key: str,
+    key_payload: dict[str, Any],
+    shop: str | None,
+    criterion: str,
+) -> dict[str, Any] | None:
+    for run in storage.list_tool_runs(limit=250):
+        if run.get("tool") != "web.shop_search" or not run.get("ok"):
+            continue
+        arguments = run.get("arguments")
+        if not isinstance(arguments, dict):
+            continue
+        run_key, _run_payload = _shop_search_key_from_arguments(arguments)
+        if run_key != cache_key:
+            continue
+        data = run.get("data")
+        if not _verified_shop_result(data, shop=shop, criterion=criterion):
+            continue
+        provenance = data.get("provenance") if isinstance(data, dict) else None
+        cache_metadata = data.get("cache") if isinstance(data, dict) else None
+        if isinstance(provenance, dict):
+            if provenance.get("source") != "live_catalog":
+                continue
+            if isinstance(cache_metadata, dict) and cache_metadata.get("status") not in {
+                None,
+                "miss_stored",
+            }:
+                continue
+            original_timestamp = (
+                provenance.get("verified_at")
+                or (cache_metadata or {}).get("cached_at")
+                or run.get("ts")
+            )
+        elif cache_metadata:
+            # Cached/stale responses are recorded as successful tool runs too.
+            # Without original live provenance they must never become fresh again.
+            continue
+        elif data.get("browser_mode") in {
+            "headful_stable_chrome",
+            "headless_chromium",
+            "wildberries_catalog_api",
+        }:
+            # Backward-compatible hydration for pre-cache genuine browser/API runs.
+            original_timestamp = run.get("ts")
+        else:
+            continue
+        age_sec = _shop_cache_age_seconds(original_timestamp)
+        if age_sec is None or age_sec > WEB_SHOP_CACHE_STALE_TTL_SEC:
+            continue
+        return _shop_cache_store(
+            storage,
+            cache_key=cache_key,
+            key_payload=key_payload,
+            result=data,
+            source="tool_run_history_live_catalog",
+            cached_at=str(original_timestamp or utc_now()),
+            tool_run_id=str(run.get("id") or "") or None,
+        )
+    return None
+
+
+def _shop_cached_result(
+    entry: dict[str, Any],
+    *,
+    status: str,
+    live_failure: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    data = dict(entry.get("data") or {})
+    cache = {
+        "status": status,
+        "key": entry.get("key"),
+        "cached_at": entry.get("cached_at"),
+        "age_sec": round(float(entry.get("age_sec") or 0.0), 3),
+        "fresh_ttl_sec": WEB_SHOP_CACHE_FRESH_TTL_SEC,
+        "stale_ttl_sec": WEB_SHOP_CACHE_STALE_TTL_SEC,
+        "provenance": {
+            "source": entry.get("source"),
+            "tool_run_id": entry.get("tool_run_id"),
+            "verified_catalog_result": True,
+        },
+    }
+    if live_failure is not None:
+        cache["live_failure"] = live_failure
+    data["cache"] = cache
+    data["provenance"] = {
+        "source": "verified_catalog_cache",
+        "cached_at": entry.get("cached_at"),
+        "original_source": entry.get("source"),
+    }
+    return data
+
+
+def _shop_search_response(
+    *,
+    query: str,
+    result: dict[str, Any],
+    criterion: str,
+    criterion_label: str,
+) -> ToolRunResponse:
+    items = result.get("items") or []
+    best = result.get("best")
+    comparison = result.get("comparison") if isinstance(result.get("comparison"), dict) else {}
+    criterion = str(comparison.get("criterion") or criterion)
+    if not result.get("ok") or not items:
+        reason = result.get("error") or "no products parsed"
+        return ToolRunResponse(
+            tool="web.shop_search",
+            ok=False,
+            summary=f"No ranked products for '{query}' ({reason}).",
+            data=result,
+        )
+    lines = []
+    if criterion in {"price_asc", "price_desc", "price_nearest"} and best:
+        if criterion == "price_nearest":
+            price_label = "Ближе всего к целевой цене"
+        elif criterion == "price_asc" and result.get("price_sort_confirmed"):
+            price_label = "Дешевле всего"
+        else:
+            price_label = "Лидер по цене среди найденного"
+        lines.append(f"{price_label}: {best.get('price_text')} — {best.get('title')}")
+    elif best and comparison.get("complete"):
+        best_metric = comparison.get("best_metric") or {}
+        lines.append(
+            f"Лидер по критерию {comparison.get('metric_label')}: "
+            f"{best_metric.get('text')} — {best.get('title')}"
+        )
+    elif items:
+        lines.append(
+            f"Нет сопоставимой характеристики '{criterion_label or criterion}' "
+            "в найденных карточках."
+        )
+    for index, item in enumerate(items[:10], start=1):
+        price = item.get("price_text") or "цена не считана"
+        metric = (item.get("metrics") or {}).get(comparison.get("metric_key")) or {}
+        metric_suffix = f"; {metric.get('text')}" if metric.get("text") else ""
+        lines.append(f"{index}. {price}{metric_suffix} — {item.get('title')}")
+    city = result.get("city")
+    summary = f"{len(items)} товар(ов) по '{query}'"
+    if city:
+        summary += f" (город: {city})"
+    cache = result.get("cache") if isinstance(result.get("cache"), dict) else {}
+    if cache:
+        summary += f"; cache={cache.get('status')} age={cache.get('age_sec')}s"
+    summary += f"; criterion={criterion}. " + " | ".join(lines[:3])
+    return ToolRunResponse(
+        tool="web.shop_search",
+        ok=True,
+        summary=summary[:900],
+        data={**result, "ranked_lines": lines},
+    )
+
+
 async def _web_shop_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     query = " ".join(str(args.get("query") or "").split())
     shop = str(args.get("shop") or "").strip() or None
@@ -5199,7 +5527,7 @@ async def _web_shop_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRes
     constraints: dict[str, float] = {}
     raw_constraints = args.get("constraints")
     if isinstance(raw_constraints, dict):
-        for key in ("max_price", "min_price", "min_rating"):
+        for key in ("max_price", "min_price", "min_rating", "target_price"):
             try:
                 value = float(raw_constraints.get(key))
             except (TypeError, ValueError):
@@ -5213,6 +5541,12 @@ async def _web_shop_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRes
     ):
         constraints.pop("min_price", None)
         constraints.pop("max_price", None)
+    if criterion == "price_nearest" and constraints.get("target_price", 0) <= 0:
+        return ToolRunResponse(
+            tool="web.shop_search",
+            ok=False,
+            summary="price_nearest requires a positive constraints.target_price value.",
+        )
     if not query:
         return ToolRunResponse(
             tool="web.shop_search", ok=False, summary="Search query is required."
@@ -5246,6 +5580,40 @@ async def _web_shop_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRes
                 ),
             )
         shop = url_source.key
+
+    cache_key, key_payload = _shop_search_key_from_arguments(
+        {
+            "query": query,
+            "shop": shop,
+            "search_url": search_url,
+            "max_items": max_items,
+            "cities": cities,
+            "criterion": criterion,
+            "constraints": constraints,
+        }
+    )
+    cached = _shop_cache_lookup(
+        ctx.storage,
+        cache_key=cache_key,
+        shop=shop,
+        criterion=criterion,
+    )
+    if cached is None:
+        cached = _shop_cache_hydrate_from_tool_runs(
+            ctx.storage,
+            cache_key=cache_key,
+            key_payload=key_payload,
+            shop=shop,
+            criterion=criterion,
+        )
+    if cached is not None and float(cached.get("age_sec") or 0) <= WEB_SHOP_CACHE_FRESH_TTL_SEC:
+        return _shop_search_response(
+            query=query,
+            result=_shop_cached_result(cached, status="fresh_hit"),
+            criterion=criterion,
+            criterion_label=criterion_label,
+        )
+
     try:
         from .web_surfer import JarvisWebSurfer, SurferConfig
     except ImportError:
@@ -5260,75 +5628,271 @@ async def _web_shop_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRes
             data={"needs_install": True},
         )
 
-    config = SurferConfig(headless=True, proxies=_web_surfer_proxies())
+    lock_map = ctx.shop_search_locks if ctx.shop_search_locks is not None else {}
+    lock_key = str(shop or urlparse(search_url or "").hostname or "unknown").casefold()
+    shop_lock = lock_map.setdefault(lock_key, asyncio.Lock())
+    operation_started = time.monotonic()
+    absolute_deadline = operation_started + WEB_SHOP_LIVE_TIMEOUT_SEC
+    queue_started = time.monotonic()
+    lock_acquired = False
     try:
-        async with JarvisWebSurfer(config=config) as surfer:
-            result = await surfer.shop_search(
-                query,
-                shop=shop,
-                search_url=search_url,
-                max_items=max_items,
-                cities=cities,
+        try:
+            await asyncio.wait_for(
+                shop_lock.acquire(),
+                timeout=max(0.001, _shop_deadline_remaining(absolute_deadline)),
+            )
+        except TimeoutError:
+            elapsed_ms = max(0, round((time.monotonic() - operation_started) * 1000))
+            queue_failure = {
+                "ok": False,
+                "query": query,
+                "shop": shop,
+                "items": [],
+                "error": (
+                    "shop_search total deadline exceeded in queue "
+                    f"({WEB_SHOP_LIVE_TIMEOUT_SEC:g}s)"
+                ),
+                "error_code": "queue_timeout",
+                "timings": {"total_ms": elapsed_ms, "queue_ms": elapsed_ms},
+                "stages": [
+                    {
+                        "name": "singleflight_queue",
+                        "ok": False,
+                        "elapsed_ms": elapsed_ms,
+                        "error_code": "queue_timeout",
+                    }
+                ],
+            }
+            if cached is not None:
+                queue_failure = _shop_cached_result(
+                    cached,
+                    status="stale_on_live_failure",
+                    live_failure={
+                        "error": queue_failure["error"],
+                        "error_code": queue_failure["error_code"],
+                        "timings": queue_failure["timings"],
+                        "stages": queue_failure["stages"],
+                    },
+                )
+            return _shop_search_response(
+                query=query,
+                result=queue_failure,
                 criterion=criterion,
                 criterion_label=criterion_label,
-                constraints=constraints or None,
             )
-    except Exception as exc:  # noqa: BLE001 - browser/proxy failures degrade honestly
-        return ToolRunResponse(
-            tool="web.shop_search",
-            ok=False,
-            summary=f"Browser shop search failed: {exc}",
-            data={"query": query, "shop": shop},
+        lock_acquired = True
+        queue_ms = max(0, round((time.monotonic() - queue_started) * 1000))
+        refreshed_cache = _shop_cache_lookup(
+            ctx.storage,
+            cache_key=cache_key,
+            shop=shop,
+            criterion=criterion,
         )
+        if (
+            refreshed_cache is not None
+            and float(refreshed_cache.get("age_sec") or 0) <= WEB_SHOP_CACHE_FRESH_TTL_SEC
+        ):
+            return _shop_search_response(
+                query=query,
+                result=_shop_cached_result(refreshed_cache, status="fresh_hit"),
+                criterion=criterion,
+                criterion_label=criterion_label,
+            )
 
-    items = result.get("items") or []
-    best = result.get("best")
-    comparison = result.get("comparison") if isinstance(result.get("comparison"), dict) else {}
-    criterion = str(comparison.get("criterion") or criterion)
-    if not result.get("ok") or not items:
-        reason = result.get("error") or "no products parsed"
-        return ToolRunResponse(
-            tool="web.shop_search",
-            ok=False,
-            summary=f"No ranked products for '{query}' ({reason}).",
-            data=result,
+        remaining_sec = max(0.0, _shop_deadline_remaining(absolute_deadline))
+        cleanup_reserve_target_sec = min(
+            3.5,
+            max(0.01, WEB_SHOP_LIVE_TIMEOUT_SEC * 0.125),
         )
-    lines = []
-    if criterion in {"price_asc", "price_desc"} and best:
-        cheapest_label = (
-            "Дешевле всего"
-            if criterion == "price_asc" and result.get("price_sort_confirmed")
-            else "Лидер по цене среди найденного"
+        minimum_live_window_sec = min(
+            1.5,
+            max(0.01, WEB_SHOP_LIVE_TIMEOUT_SEC * 0.075),
         )
-        lines.append(
-            f"{cheapest_label}: {best.get('price_text')} — {best.get('title')}"
+        minimum_start_window_sec = (
+            cleanup_reserve_target_sec + minimum_live_window_sec
         )
-    elif best and comparison.get("complete"):
-        best_metric = comparison.get("best_metric") or {}
-        lines.append(
-            f"Лидер по критерию {comparison.get('metric_label')}: "
-            f"{best_metric.get('text')} — {best.get('title')}"
+        if remaining_sec <= minimum_start_window_sec:
+            elapsed_ms = max(0, round((time.monotonic() - operation_started) * 1000))
+            queue_failure = {
+                "ok": False,
+                "query": query,
+                "shop": shop,
+                "items": [],
+                "error": (
+                    "shop_search queue left insufficient time for a safe live run "
+                    f"({WEB_SHOP_LIVE_TIMEOUT_SEC:g}s total deadline)"
+                ),
+                "error_code": "queue_budget_exhausted",
+                "timings": {"total_ms": elapsed_ms, "queue_ms": queue_ms},
+                "stages": [
+                    {
+                        "name": "singleflight_queue",
+                        "ok": False,
+                        "elapsed_ms": queue_ms,
+                        "error_code": "queue_budget_exhausted",
+                    }
+                ],
+            }
+            stale = refreshed_cache or cached
+            if stale is not None:
+                queue_failure = _shop_cached_result(
+                    stale,
+                    status="stale_on_live_failure",
+                    live_failure={
+                        "error": queue_failure["error"],
+                        "error_code": queue_failure["error_code"],
+                        "timings": queue_failure["timings"],
+                        "stages": queue_failure["stages"],
+                    },
+                )
+            return _shop_search_response(
+                query=query,
+                result=queue_failure,
+                criterion=criterion,
+                criterion_label=criterion_label,
+            )
+
+        cleanup_reserve_sec = cleanup_reserve_target_sec
+        live_timeout_sec = max(0.001, remaining_sec - cleanup_reserve_sec)
+        config = SurferConfig(
+            headless=True,
+            proxies=_web_surfer_proxies(),
+            nav_timeout_ms=8_000,
+            default_timeout_ms=5_000,
+            shopping_budget_sec=max(0.1, live_timeout_sec),
+            shop_storage_state_dir=str(
+                ctx.settings.cache_dir / "web-surfer" / "shop-state"
+            ),
+            shop_persistent_profile_dir=str(
+                ctx.settings.cache_dir / "web-surfer" / "shop-profile"
+            ),
         )
-    elif items:
-        lines.append(
-            f"Нет сопоставимой характеристики '{criterion_label or criterion}' "
-            "в найденных карточках."
-        )
-    for index, item in enumerate(items[:10], start=1):
-        price = item.get("price_text") or "цена не считана"
-        metric = (item.get("metrics") or {}).get(comparison.get("metric_key")) or {}
-        metric_suffix = f"; {metric.get('text')}" if metric.get("text") else ""
-        lines.append(f"{index}. {price}{metric_suffix} — {item.get('title')}")
-    city = result.get("city")
-    summary = f"{len(items)} товар(ов) по '{query}'"
-    if city:
-        summary += f" (город: {city})"
-    summary += f"; criterion={criterion}. " + " | ".join(lines[:3])
-    return ToolRunResponse(
-        tool="web.shop_search",
-        ok=True,
-        summary=summary[:900],
-        data={**result, "ranked_lines": lines},
+        async def run_live() -> dict[str, Any]:
+            surfer = JarvisWebSurfer(config=config)
+            try:
+                await surfer.start()
+                return await surfer.shop_search(
+                    query,
+                    shop=shop,
+                    search_url=search_url,
+                    max_items=max_items,
+                    cities=cities,
+                    criterion=criterion,
+                    criterion_label=criterion_label,
+                    constraints=constraints or None,
+                )
+            finally:
+                close_task = asyncio.create_task(surfer.close())
+                try:
+                    await asyncio.wait_for(close_task, timeout=cleanup_reserve_sec)
+                except TimeoutError:
+                    close_task.cancel()
+                    await asyncio.gather(close_task, return_exceptions=True)
+
+        try:
+            result = await asyncio.wait_for(run_live(), timeout=live_timeout_sec)
+        except TimeoutError:
+            elapsed_ms = max(0, round((time.monotonic() - operation_started) * 1000))
+            result = {
+                "ok": False,
+                "query": query,
+                "shop": shop,
+                "items": [],
+                "error": f"shop_search total deadline exceeded ({WEB_SHOP_LIVE_TIMEOUT_SEC:g}s)",
+                "error_code": "total_timeout",
+                "timings": {"total_ms": elapsed_ms, "queue_ms": queue_ms},
+                "stages": [
+                    {
+                        "name": "live_catalog",
+                        "ok": False,
+                        "elapsed_ms": elapsed_ms,
+                        "error_code": "total_timeout",
+                    }
+                ],
+            }
+        except Exception as exc:  # noqa: BLE001 - browser/proxy failures degrade honestly
+            elapsed_ms = max(0, round((time.monotonic() - operation_started) * 1000))
+            result = {
+                "ok": False,
+                "query": query,
+                "shop": shop,
+                "items": [],
+                "error": f"Browser shop search failed: {exc}",
+                "error_code": "browser_failure",
+                "timings": {"total_ms": elapsed_ms, "queue_ms": queue_ms},
+                "stages": [
+                    {
+                        "name": "live_catalog",
+                        "ok": False,
+                        "elapsed_ms": elapsed_ms,
+                        "error_code": "browser_failure",
+                        "error": str(exc)[:1000],
+                    }
+                ],
+            }
+
+        result_timings = result.get("timings")
+        if not isinstance(result_timings, dict):
+            result_timings = {}
+        result["timings"] = {
+            **result_timings,
+            "queue_ms": queue_ms,
+            "orchestration_total_ms": max(
+                0, round((time.monotonic() - operation_started) * 1000)
+            ),
+        }
+
+        if _verified_shop_result(result, shop=shop, criterion=criterion):
+            live_result = dict(result)
+            cached_at = utc_now()
+            live_result["cache"] = {
+                "status": "miss_stored",
+                "key": cache_key,
+                "cached_at": cached_at,
+                "age_sec": 0.0,
+                "fresh_ttl_sec": WEB_SHOP_CACHE_FRESH_TTL_SEC,
+                "stale_ttl_sec": WEB_SHOP_CACHE_STALE_TTL_SEC,
+                "provenance": {
+                    "source": "live_catalog",
+                    "verified_catalog_result": True,
+                },
+            }
+            live_result["provenance"] = {
+                "source": "live_catalog",
+                "verified_at": cached_at,
+                "browser_mode": live_result.get("browser_mode"),
+            }
+            _shop_cache_store(
+                ctx.storage,
+                cache_key=cache_key,
+                key_payload=key_payload,
+                result=live_result,
+                source="live_catalog",
+                cached_at=cached_at,
+            )
+            result = live_result
+        else:
+            stale = refreshed_cache or cached
+            if stale is not None:
+                result = _shop_cached_result(
+                    stale,
+                    status="stale_on_live_failure",
+                    live_failure={
+                        "error": result.get("error"),
+                        "error_code": result.get("error_code"),
+                        "timings": result.get("timings"),
+                        "stages": result.get("stages"),
+                    },
+                )
+    finally:
+        if lock_acquired:
+            shop_lock.release()
+
+    return _shop_search_response(
+        query=query,
+        result=result,
+        criterion=criterion,
+        criterion_label=criterion_label,
     )
 
 

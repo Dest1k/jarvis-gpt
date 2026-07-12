@@ -34,7 +34,7 @@
 - Autonomous supervisor: безопасный фоновой цикл собирает telemetry и запускает learning tick.
 - Исполнение следующего шага mission plan с прогрессом задач и журналом tool runs.
 - SQLite WAL-хранилище в `D:\jarvis\data\jarvis-gpt\state\jarvis.sqlite3`.
-- Runtime-профили под RTX 5090 32GB + 128GB RAM: `gemma4-turbo` (26B fast), `gemma4-mono` (31B partial offload), `gemma4-mono-perf` (31B GPU-first).
+- Runtime-профили под RTX 5090 32GB + 128GB RAM: `gemma4-turbo` (26B fast), `gemma4-mono` (31B heavy offload), `gemma4-mono-perf` (31B text-only quality).
 - Next.js Command Center: чат, статус runtime, миссии и диагностика.
 - Command Center показывает файлы, поиск по чанкам, ручную память, tools и audit stream.
 - Command Center показывает локальные модели, approvals, активный профиль и dispatcher-конфигурацию.
@@ -166,12 +166,17 @@ py -3.11 .\jarvis.py mission-run <mission_id> --max-steps 8
 .\scripts\doctor.ps1
 ```
 
-`gemma4-mono-perf` — 31B IT NVFP4 min-offload interactive (8k; checkpoint ~31.2GiB).  
-`gemma4-mono` — 31B IT NVFP4 со partial CPU offload + native KV offload (стабильность/long-context; decode медленный).
-`gemma4-mono-perf` — тот же 31B, но GPU-first (без offload, CUDA graphs, context 8k) для максимальной скорости.
-`gemma4-turbo` — 26B A4B NVFP4, быстрый warmed path без offload.
+`gemma4-turbo` — рекомендуемый интерактивный vLLM-профиль: 26B A4B NVFP4 без
+weight offload.
 
-`gemma4-turbo` — быстрый профиль на `gemma4-26b-a4b-nvfp4` для прогретого runtime.
+`gemma4-mono-perf` — vLLM-профиль качества 31B IT NVFP4 для text-only задач:
+4k, 2.5GB CPU offload, eager, FP8 KV и один sequence. На целевой RTX 5090
+измерено около 2.45 tok/s (примерно в 4.1 раза быстрее старой конфигурации),
+но для интерактивного Command Center по-прежнему рекомендуется turbo.
+
+`gemma4-mono` — экспериментальный 31B long-context профиль с тяжёлым CPU/KV
+offload; измеренная скорость ниже 1 tok/s. Оба mono-профиля не подходят для
+интерактивного Command Center.
 
 ## Docker
 

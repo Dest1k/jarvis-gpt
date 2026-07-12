@@ -31,6 +31,10 @@ RUNTIME_COMPATIBILITY_FIELDS = (
     "tokenizer_mode",
     "safetensors_load_strategy",
     "prefix_caching",
+    "language_model_only",
+    "skip_mm_profiling",
+    "mm_processor_cache_gb",
+    "max_num_batched_tokens",
     "host",
     "port",
 )
@@ -406,11 +410,11 @@ def _runtime_from_env(env: dict[str, str]) -> dict[str, Any]:
         "gpu_memory_utilization": _float_or_none(env.get("JARVIS_QWEN_GPU_UTIL")),
         "kv_cache_dtype": env.get("JARVIS_QWEN_KV_DTYPE", ""),
         "max_num_seqs": _int_or_none(env.get("JARVIS_QWEN_MAX_NUM_SEQS")),
-        "cpu_offload_gb": _arg_value_from_string(
+        "cpu_offload_gb": _float_arg_value_from_string(
             env.get("JARVIS_QWEN_CPU_OFFLOAD_ARGS"),
             "cpu-offload-gb",
         ),
-        "kv_offloading_gb": _arg_value_from_string(
+        "kv_offloading_gb": _int_arg_value_from_string(
             env.get("JARVIS_QWEN_KV_OFFLOAD_ARGS"),
             "kv-offloading-size",
         ),
@@ -423,6 +427,18 @@ def _runtime_from_env(env: dict[str, str]) -> dict[str, Any]:
             "JARVIS_QWEN_SAFETENSORS_LOAD_STRATEGY", ""
         ),
         "prefix_caching": True,
+        "language_model_only": _bool_flag_from_string(
+            env.get("JARVIS_QWEN_EXTRA_ARGS"), "language-model-only"
+        ),
+        "skip_mm_profiling": _bool_flag_from_string(
+            env.get("JARVIS_QWEN_EXTRA_ARGS"), "skip-mm-profiling"
+        ),
+        "mm_processor_cache_gb": _float_arg_value_from_string(
+            env.get("JARVIS_QWEN_EXTRA_ARGS"), "mm-processor-cache-gb"
+        ),
+        "max_num_batched_tokens": _int_arg_value_from_string(
+            env.get("JARVIS_QWEN_EXTRA_ARGS"), "max-num-batched-tokens"
+        ),
         "host": "0.0.0.0",
         "port": 8001,
     }
@@ -444,7 +460,7 @@ def _runtime_from_command(command: list[str]) -> dict[str, Any]:
         "gpu_memory_utilization": _float_or_none(flags.get("gpu-memory-utilization")),
         "kv_cache_dtype": str(flags.get("kv-cache-dtype") or ""),
         "max_num_seqs": _int_or_none(flags.get("max-num-seqs")),
-        "cpu_offload_gb": _int_or_none(flags.get("cpu-offload-gb")),
+        "cpu_offload_gb": _float_or_none(flags.get("cpu-offload-gb")),
         "kv_offloading_gb": _int_or_none(flags.get("kv-offloading-size")),
         "kv_offloading_backend": (
             str(flags.get("kv-offloading-backend") or "") or None
@@ -454,6 +470,10 @@ def _runtime_from_command(command: list[str]) -> dict[str, Any]:
             flags.get("safetensors-load-strategy") or ""
         ),
         "prefix_caching": "enable-prefix-caching" in flags,
+        "language_model_only": "language-model-only" in flags,
+        "skip_mm_profiling": "skip-mm-profiling" in flags,
+        "mm_processor_cache_gb": _float_or_none(flags.get("mm-processor-cache-gb")),
+        "max_num_batched_tokens": _int_or_none(flags.get("max-num-batched-tokens")),
         "host": str(flags.get("host") or ""),
         "port": _int_or_none(flags.get("port")),
     }
@@ -540,11 +560,25 @@ def _float_or_none(value: object) -> float | None:
         return None
 
 
-def _arg_value_from_string(raw: str | None, key: str) -> int | None:
+def _int_arg_value_from_string(raw: str | None, key: str) -> int | None:
     if not raw:
         return None
     flags = _parse_flags([item for item in raw.split() if item])
     return _int_or_none(flags.get(key))
+
+
+def _float_arg_value_from_string(raw: str | None, key: str) -> float | None:
+    if not raw:
+        return None
+    flags = _parse_flags([item for item in raw.split() if item])
+    return _float_or_none(flags.get(key))
+
+
+def _bool_flag_from_string(raw: str | None, key: str) -> bool:
+    if not raw:
+        return False
+    flags = _parse_flags([item for item in raw.split() if item])
+    return key in flags
 
 
 def _flag_value_from_string(raw: str | None, key: str) -> str | None:

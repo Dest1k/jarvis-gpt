@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .config import PROFILES, JarvisSettings
+from .config import PROFILES, JarvisSettings, RuntimeProfile
 from .storage import JarvisStorage
 
 MODEL_OVERRIDE_KEY = "models.active_override"
@@ -115,7 +115,7 @@ class ModelCatalog:
                 "JARVIS_QWEN_MAX_NUM_SEQS": str(int(profile.max_num_seqs)),
                 "JARVIS_QWEN_ENFORCE_EAGER": "--enforce-eager" if profile.eager_mode else "",
                 "JARVIS_QWEN_CPU_OFFLOAD_ARGS": (
-                    f"--cpu-offload-gb {int(profile.cpu_offload_gb)}"
+                    f"--cpu-offload-gb {_format_number(profile.cpu_offload_gb)}"
                     if profile.cpu_offload_gb > 0
                     else ""
                 ),
@@ -129,6 +129,7 @@ class ModelCatalog:
                     if profile.kv_offloading_gb > 0
                     else ""
                 ),
+                "JARVIS_QWEN_EXTRA_ARGS": _vllm_extra_args(profile),
                 "JARVIS_ENABLE_UITARS": "0",
             },
         }
@@ -141,6 +142,26 @@ def model_allowed_for_profile(settings: JarvisSettings, model_dir_name: str) -> 
         model_dir_name not in PROFILE_MODEL_DIR_NAMES
         or model_dir_name == settings.profile.model_dir_name
     )
+
+
+def _vllm_extra_args(profile: RuntimeProfile) -> str:
+    options = profile.vllm_extra_args
+    args: list[str] = []
+    if options.language_model_only:
+        args.append("--language-model-only")
+    if options.skip_mm_profiling:
+        args.append("--skip-mm-profiling")
+    if options.mm_processor_cache_gb is not None:
+        args.extend(
+            ["--mm-processor-cache-gb", _format_number(options.mm_processor_cache_gb)]
+        )
+    if options.max_num_batched_tokens is not None:
+        args.extend(["--max-num-batched-tokens", str(options.max_num_batched_tokens)])
+    return " ".join(args)
+
+
+def _format_number(value: float | int) -> str:
+    return f"{value:g}"
 
 
 def _read_json(path: Path) -> dict[str, Any]:

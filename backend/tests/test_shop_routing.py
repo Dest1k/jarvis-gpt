@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 
 from jarvis_gpt.agent import (
     AgentRuntime,
@@ -122,7 +124,20 @@ def test_price_constraints_do_not_capture_product_specs():
     ) == {"max_price": 3000.0}
     assert _shopping_constraints_from_message(
         "найди мне на днс ryzen 9 в районе 50 тысяч рублей любой"
-    ) == {"max_price": 50000.0}
+    ) == {"target_price": 50000.0}
+    assert (
+        _ranking_criterion_from_message(
+            "найди мне на днс ryzen 9 в районе 50 тысяч рублей любой"
+        )
+        == "price_nearest"
+    )
+    mixed = "найди ryzen 9 на днс около 50 тысяч, но не дороже 55 тысяч рублей"
+    assert _shopping_constraints_from_message(mixed) == {
+        "target_price": 50000.0,
+        "max_price": 55000.0,
+    }
+    assert _ranking_criterion_from_message(mixed) == "price_nearest"
+    assert _clean_shopping_subject(mixed) == "ryzen 9"
     assert (
         _clean_shopping_subject(
             "найди мне на днс ryzen 9 в районе 50 тысяч рублей любой"
@@ -220,6 +235,53 @@ def test_format_shop_search_answer_lists_cheapest_first():
     assert "для города: Москва" in answer
     # cheapest appears before the pricier card
     assert answer.index("409 999") < answer.index("499 999")
+
+
+def test_format_shop_search_answer_names_nearest_target_instead_of_cheapest():
+    nearest = {
+        "title": "Ryzen 9 9900X",
+        "url": "https://www.dns-shop.ru/product/nearest/",
+        "price_text": "49 990 ₽",
+        "price_value": 49990.0,
+    }
+    answer = _format_shop_search_answer(
+        {
+            "items": [
+                nearest,
+                {
+                    "title": "Ryzen 9 5950X",
+                    "url": "https://www.dns-shop.ru/product/cheap/",
+                    "price_text": "31 999 ₽",
+                    "price_value": 31999.0,
+                },
+            ],
+            "best": nearest,
+            "cheapest": {
+                "title": "Ryzen 9 5950X",
+                "url": "https://www.dns-shop.ru/product/cheap/",
+                "price_text": "31 999 ₽",
+                "price_value": 31999.0,
+            },
+            "constraints": {"target_price": 50000.0},
+            "cache": {
+                "status": "fresh_hit",
+                "cached_at": "2026-07-12T17:49:42+00:00",
+                "age_sec": 120,
+            },
+            "comparison": {
+                "criterion": "price_nearest",
+                "metric_key": "price_value",
+                "complete": True,
+            },
+        },
+        "ryzen 9",
+    )
+
+    assert "Ближе всего к ориентиру 50 000 ₽" in answer
+    assert "49 990 ₽" in answer
+    assert "Варианты по близости к ориентиру 50 000 ₽" in answer
+    assert "Подтверждённый снимок каталога от 2026-07-12T17:49:42+00:00" in answer
+    assert "Самая дешёвая" not in answer
 
 
 def test_format_non_price_comparison_refuses_unsupported_winner():
@@ -341,6 +403,112 @@ def test_shopping_dns_query_routes_to_shop_search_not_web_answer(monkeypatch, tm
     storage.close()
 
 
+def test_exact_named_shop_request_bypasses_llm_and_chat_stream_match(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr("jarvis_gpt.agent._web_surfer_available", lambda: True)
+    agent, storage = _agent(monkeypatch, tmp_path)
+    agent.settings = replace(agent.settings, llm_enabled=True)
+    message = "найди мне на днс ryzen 9 в районе 50 тысяч рублей любой"
+    captured: list[dict] = []
+    nearest = {
+        "title": "Процессор AMD Ryzen 9 9900X",
+        "url": "https://www.dns-shop.ru/product/nearest/",
+        "price_text": "49 990 ₽",
+        "price_value": 49990.0,
+        "in_stock": True,
+    }
+
+    async def llm_must_not_run(*_args, **_kwargs):
+        raise AssertionError("explicit named-shop request must bypass the intent LLM")
+
+    async def fake_run(name, arguments=None, **_kwargs):
+        assert name == "web.shop_search"
+        captured.append(dict(arguments or {}))
+        return ToolRunResponse(
+            tool=name,
+            ok=True,
+            summary="catalog ok",
+            data={
+                "ok": True,
+                "shop": "dns",
+                "city": "Москва",
+                "items": [nearest],
+                "best": nearest,
+                "cheapest": nearest,
+                "constraints": {"target_price": 50000.0},
+                "comparison": {
+                    "criterion": "price_nearest",
+                    "criterion_label": "цена, ближайшая к заданному ориентиру",
+                    "metric_key": "price_value",
+                    "metric_label": "цена",
+                    "complete": True,
+                    "compared_count": 1,
+                    "discovered_count": 1,
+                    "best_metric": {
+                        "value": 49990.0,
+                        "text": "49 990 ₽",
+                        "unit": "RUB",
+                    },
+                },
+            },
+        )
+
+    monkeypatch.setattr(agent.llm, "complete", llm_must_not_run)
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+
+    chat = asyncio.run(agent.chat(message, thinking_enabled=True))
+
+    async def collect_stream():
+        return [item async for item in agent.stream_chat(message, thinking_enabled=True)]
+
+    streamed = asyncio.run(collect_stream())
+    done = next(item for item in streamed if item["type"] == "done")
+
+    assert chat.answer == done["answer"]
+    assert "Ближе всего к ориентиру 50 000 ₽" in chat.answer
+    chat_plan = next(event for event in chat.events if event.title == "Task kernel")
+    stream_plan = next(
+        item["event"]
+        for item in streamed
+        if item["type"] == "event" and item["event"]["title"] == "Task kernel"
+    )
+    assert chat_plan.payload["route"] == "web_research"
+    assert chat_plan.payload["intent"] == "shopping_research"
+    assert stream_plan["payload"]["route"] == "web_research"
+    assert stream_plan["payload"]["intent"] == "shopping_research"
+    assert captured == [
+        {
+            "query": "ryzen 9",
+            "shop": "dns",
+            "criterion": "price_nearest",
+            "criterion_label": "цена, ближайшая к заданному ориентиру",
+            "constraints": {"target_price": 50000.0},
+        },
+        {
+            "query": "ryzen 9",
+            "shop": "dns",
+            "criterion": "price_nearest",
+            "criterion_label": "цена, ближайшая к заданному ориентиру",
+            "constraints": {"target_price": 50000.0},
+        },
+    ]
+    chat_states = [
+        event.payload.get("state")
+        for event in chat.events
+        if event.title == "web.shop_search"
+    ]
+    stream_states = [
+        item["event"]["payload"].get("state")
+        for item in streamed
+        if item["type"] == "event" and item["event"]["title"] == "web.shop_search"
+    ]
+    assert chat_states == ["started", "completed"]
+    assert stream_states == ["started", "completed"]
+    storage.close()
+
+
 def test_wildberries_power_query_routes_to_typed_comparison(monkeypatch, tmp_path):
     monkeypatch.setattr("jarvis_gpt.agent._web_surfer_available", lambda: True)
     agent, storage = _agent(monkeypatch, tmp_path)
@@ -427,6 +595,19 @@ def test_explicit_multi_shop_query_compares_every_named_catalog(monkeypatch, tmp
                 "items": [item],
                 "best": item,
                 "cheapest": item,
+                "cache": {
+                    "status": (
+                        "stale_on_live_failure" if shop == "wildberries" else "miss_stored"
+                    ),
+                    "cached_at": "2026-07-12T17:49:42+00:00",
+                    "age_sec": 90 if shop == "wildberries" else 0,
+                },
+                "provenance": {
+                    "source": (
+                        "verified_catalog_cache" if shop == "wildberries" else "live_catalog"
+                    ),
+                    "verified_at": "2026-07-12T17:49:42+00:00",
+                },
                 "comparison": {
                     "criterion": "price_asc",
                     "metric_key": "price_value",
@@ -449,6 +630,66 @@ def test_explicit_multi_shop_query_compares_every_named_catalog(monkeypatch, tmp
     assert "900 ₽" in action.answer
     assert "wildberries" in action.answer
     assert "ozon" in action.answer
+    assert "wildberries: обновление не удалось" in action.answer
+    assert "ozon: live_catalog" in action.answer
+    assert [event.payload["cache"]["status"] for event in action.events] == [
+        "stale_on_live_failure",
+        "miss_stored",
+    ]
+    storage.close()
+
+
+def test_multi_shop_nearest_price_applies_hard_cap_before_ranking(monkeypatch, tmp_path):
+    agent, storage = _agent(monkeypatch, tmp_path)
+    captured: list[dict] = []
+
+    async def fake_run(name, arguments=None, **_kwargs):
+        assert name == "web.shop_search"
+        captured.append(dict(arguments or {}))
+        shop = arguments["shop"]
+        prices = [49500.0, 60000.0] if shop == "dns" else [51000.0]
+        items = [
+            {
+                "title": f"Ryzen {int(price)} {shop}",
+                "url": f"https://{shop}.example/product/{int(price)}",
+                "price_text": f"{int(price):,} ₽".replace(",", " "),
+                "price_value": price,
+                "in_stock": True,
+            }
+            for price in prices
+        ]
+        return ToolRunResponse(
+            tool=name,
+            ok=True,
+            summary="catalog",
+            data={
+                "items": items,
+                "best": items[0],
+                "cheapest": min(items, key=lambda item: item["price_value"]),
+                "comparison": {
+                    "criterion": "price_nearest",
+                    "metric_key": "price_value",
+                    "metric_label": "цена",
+                    "complete": True,
+                },
+            },
+        )
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+    action = asyncio.run(
+        agent._run_multi_shop_search(
+            "сравни ryzen 9 на днс и Ozon около 50 тысяч, но не дороже 55 тысяч рублей",
+            ["dns", "ozon"],
+        )
+    )
+
+    assert [item["constraints"] for item in captured] == [
+        {"target_price": 50000.0, "max_price": 55000.0},
+        {"target_price": 50000.0, "max_price": 55000.0},
+    ]
+    assert "49 500 ₽" in action.answer
+    assert "60 000 ₽" not in action.answer
+    assert "Ближе всего к ориентиру 50 000 ₽" in action.answer
     storage.close()
 
 
@@ -505,4 +746,147 @@ def test_shop_search_soft_failure_stays_honest_and_does_not_fall_back(monkeypatc
     assert "anti-bot" in action.answer
     assert "не подменяю результат общим веб-поиском" in action.answer
     assert "dns-shop.ru/search" in action.answer
+    storage.close()
+
+
+def test_shop_search_live_failure_reuses_only_recent_labelled_catalog_cache(
+    monkeypatch,
+    tmp_path,
+):
+    agent, storage = _agent(monkeypatch, tmp_path)
+    conversation_id = storage.create_conversation("shop cache")
+    calls = 0
+    confirmed_at = (datetime.now(UTC) - timedelta(seconds=30)).isoformat()
+    item = {
+        "title": "Процессор AMD Ryzen 9 9900X",
+        "url": "https://www.dns-shop.ru/product/nearest/",
+        "price_text": "49 990 ₽",
+        "price_value": 49990.0,
+    }
+
+    async def fake_run(name, arguments=None, **_kwargs):
+        nonlocal calls
+        assert name == "web.shop_search"
+        calls += 1
+        if calls <= 2:
+            return ToolRunResponse(
+                tool=name,
+                ok=True,
+                summary="fresh catalog",
+                data={
+                    "items": [item],
+                    "best": item,
+                    "cheapest": item,
+                    "constraints": {"target_price": 50000.0},
+                    "cache": {
+                        "status": "stale_on_live_failure",
+                        "cached_at": confirmed_at,
+                        "age_sec": 30,
+                    },
+                    "provenance": {
+                        "source": "verified_catalog_cache",
+                        "cached_at": confirmed_at,
+                    },
+                    "comparison": {
+                        "criterion": "price_nearest",
+                        "metric_key": "price_value",
+                        "complete": True,
+                    },
+                },
+            )
+        return ToolRunResponse(
+            tool=name,
+            ok=False,
+            summary="navigation timeout",
+            data={"error": "navigation timeout"},
+        )
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+    first = asyncio.run(
+        agent._run_shop_search(
+            "найди на днс ryzen 9 около 50 тысяч рублей",
+            "dns",
+            conversation_id=conversation_id,
+        )
+    )
+    second = asyncio.run(
+        agent._run_shop_search(
+            "найди на днс ryzen 9 около 50 тысяч рублей",
+            "dns",
+            conversation_id=conversation_id,
+        )
+    )
+    third = asyncio.run(
+        agent._run_shop_search(
+            "найди на днс ryzen 9 около 50 тысяч рублей",
+            "dns",
+            conversation_id=conversation_id,
+        )
+    )
+
+    assert "49 990 ₽" in first.answer
+    assert "Актуальное обновление не удалось" in first.answer
+    assert "Актуальное обновление не удалось" in second.answer
+    assert agent._shopping_research_state(conversation_id)["updated_at"] == confirmed_at
+    assert f"Показываю последний подтверждённый результат от {confirmed_at}" in third.answer
+    assert "Это кэш: цены и наличие могли измениться" in third.answer
+    assert "49 990 ₽" in third.answer
+    assert [event.payload.get("state") for event in third.events] == [
+        "completed",
+        "cached_fallback",
+    ]
+    storage.close()
+
+
+def test_shop_failure_never_relabels_generic_or_lookalike_results_as_verified(
+    monkeypatch,
+    tmp_path,
+):
+    agent, storage = _agent(monkeypatch, tmp_path)
+    conversation_id = storage.create_conversation("unverified shop fallback")
+    confirmed_at = datetime.now(UTC).isoformat()
+    arguments = {
+        "conversation_id": conversation_id,
+        "shop_key": "dns",
+        "product": "ryzen 9",
+        "criterion": "price_asc",
+        "constraints": {},
+        "failure": "catalog unavailable",
+    }
+
+    agent._remember_shopping_research(
+        conversation_id=conversation_id,
+        query="ryzen 9",
+        candidates=[
+            {
+                "title": "Generic search snippet",
+                "url": "https://www.dns-shop.ru/product/unverified/",
+                "price_value": 49990.0,
+            }
+        ],
+    )
+    assert agent._cached_shop_failure_answer(**arguments) is None
+
+    agent._remember_shopping_research(
+        conversation_id=conversation_id,
+        query="ryzen 9",
+        candidates=[
+            {
+                "title": "Lookalike domain",
+                "url": "https://evildns-shop.ru/product/fake/",
+                "price_value": 49990.0,
+            }
+        ],
+        shops=["dns"],
+        criterion="price_asc",
+        confirmed_at=confirmed_at,
+        provenance={
+            "dns": {
+                "verified_at": confirmed_at,
+                "cache": {"status": "miss_stored"},
+                "provenance": {"source": "live_catalog"},
+            }
+        },
+    )
+    assert agent._cached_shop_failure_answer(**arguments) is None
     storage.close()

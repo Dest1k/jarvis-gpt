@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import sys
 import types
+from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs, urlparse
 
 import pytest
+from jarvis_gpt import tools as tools_module
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
 from jarvis_gpt.llm import LLMRouter
 from jarvis_gpt.storage import JarvisStorage
@@ -465,7 +467,7 @@ def test_catalog_query_filter_ignores_inflected_product_category_word():
     assert ws._filter_catalog_items_for_query([item], "видеокарту rtx 5090") == [item]
 
 
-def test_shop_search_retries_blocked_headless_catalog_in_stable_chrome(monkeypatch):
+def test_dns_shop_search_uses_stable_chrome_without_known_bad_headless_probe(monkeypatch):
     surfer = ws.JarvisWebSurfer(
         ws.SurferConfig(headless=True, shopping_budget_sec=10, headful_shop_fallback=True)
     )
@@ -499,10 +501,158 @@ def test_shop_search_retries_blocked_headless_catalog_in_stable_chrome(monkeypat
     monkeypatch.setattr(surfer, "_shop_search_impl", blocked)
     monkeypatch.setattr(surfer, "_shop_search_headful_chrome", stable)
     result = asyncio.run(surfer.shop_search("5090", shop="dns"))
-    assert calls == ["headless", "stable"]
+    assert calls == ["stable"]
     assert result["ok"] is True
     assert result["cheapest"]["price_value"] == 409999.0
     assert result["browser_mode"] == "headful_stable_chrome"
+    assert result["stages"][0]["name"] == "stable_chrome"
+    assert result["stages"][0]["ok"] is True
+
+
+def test_dns_stable_navigation_failure_is_not_reported_as_browser_unavailable(monkeypatch):
+    surfer = ws.JarvisWebSurfer(
+        ws.SurferConfig(headless=True, shopping_budget_sec=1, headful_shop_fallback=True)
+    )
+    surfer._playwright = object()
+
+    async def headless_must_not_run(*_args, **_kwargs):
+        raise AssertionError("DNS must skip the known-bad headless probe on Windows")
+
+    async def navigation_failure(*_args, **_kwargs):
+        raise ws.NavigationError("Navigation timed out: https://www.dns-shop.ru/search/")
+
+    monkeypatch.setattr(ws.sys, "platform", "win32")
+    monkeypatch.setattr(surfer, "_shop_search_impl", headless_must_not_run)
+    monkeypatch.setattr(surfer, "_shop_search_headful_chrome", navigation_failure)
+
+    result = asyncio.run(surfer.shop_search("5090", shop="dns"))
+
+    assert result["ok"] is False
+    assert result["error_code"] == "stable_navigation"
+    assert "navigation failed" in result["error"]
+    assert "unavailable" not in result["error"]
+
+
+def test_shop_browser_context_loads_and_persists_per_shop_storage_state(tmp_path):
+    state_dir = tmp_path / "shop-state"
+    state_path = state_dir / "dns.json"
+    state_dir.mkdir()
+    state_path.write_text('{"cookies":[],"origins":[]}', encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    class Context:
+        def set_default_timeout(self, value):
+            captured["default_timeout"] = value
+
+        def set_default_navigation_timeout(self, value):
+            captured["nav_timeout"] = value
+
+        async def storage_state(self, *, path):
+            captured["saved_path"] = path
+
+    class Browser:
+        async def new_context(self, **kwargs):
+            captured["kwargs"] = kwargs
+            return Context()
+
+    surfer = ws.JarvisWebSurfer(
+        ws.SurferConfig(
+            shop_storage_state_dir=str(state_dir),
+            shop_persistent_profile_dir=str(tmp_path / "shop-profile"),
+        )
+    )
+
+    async def exercise():
+        context = await surfer._new_context(
+            browser=Browser(),
+            storage_state_path=surfer._shop_storage_state_path("dns"),
+        )
+        await surfer._persist_shop_storage_state(context, "dns")
+
+    asyncio.run(exercise())
+
+    assert captured["kwargs"]["storage_state"] == str(state_path)
+    assert captured["saved_path"] == str(state_path)
+    assert surfer._shop_persistent_profile_path("dns") == tmp_path / "shop-profile" / "dns"
+
+
+def test_dns_persistent_profile_keeps_proxy_and_falls_back_on_slow_close(
+    monkeypatch,
+    tmp_path,
+):
+    captured: dict[str, object] = {}
+
+    class FallbackBrowser:
+        async def close(self):
+            captured["fallback_browser_closed"] = True
+
+    class Context:
+        browser = FallbackBrowser()
+        pages = [object()]
+
+        def set_default_timeout(self, value):
+            captured["default_timeout"] = value
+
+        def set_default_navigation_timeout(self, value):
+            captured["nav_timeout"] = value
+
+        async def new_page(self):
+            return object()
+
+        async def storage_state(self, *, path):
+            captured["saved_path"] = path
+
+        async def close(self):
+            captured["context_close_started"] = True
+            await asyncio.Event().wait()
+
+    class Chromium:
+        async def launch_persistent_context(self, path, **kwargs):
+            captured["profile_path"] = path
+            captured["launch_kwargs"] = kwargs
+            return Context()
+
+        async def launch(self, **_kwargs):
+            raise AssertionError("DNS must use its persistent stable-Chrome profile")
+
+    surfer = ws.JarvisWebSurfer(
+        ws.SurferConfig(
+            proxies=["http://user:pass@127.0.0.1:8080"],
+            shop_storage_state_dir=str(tmp_path / "shop-state"),
+            shop_persistent_profile_dir=str(tmp_path / "shop-profile"),
+        )
+    )
+    surfer._playwright = types.SimpleNamespace(chromium=Chromium())
+
+    async def parsed(*_args, **_kwargs):
+        return {"ok": True, "items": [{"title": "Ryzen"}]}
+
+    monkeypatch.setattr(surfer, "_shop_search_page", parsed)
+    monkeypatch.setattr(ws, "_PERSISTENT_CONTEXT_CLEANUP_TIMEOUT_SEC", 0.01)
+
+    result = asyncio.run(
+        surfer._shop_search_headful_chrome(
+            "ryzen 9",
+            "dns",
+            "https://www.dns-shop.ru/search/?q=ryzen+9",
+            20,
+            [],
+            "price_nearest",
+            "nearest price",
+            "ryzen 9",
+            {"target_price": 50000.0},
+        )
+    )
+
+    assert result["ok"] is True
+    assert captured["profile_path"] == str(tmp_path / "shop-profile" / "dns")
+    assert captured["launch_kwargs"]["proxy"] == {
+        "server": "http://127.0.0.1:8080",
+        "username": "user",
+        "password": "pass",
+    }
+    assert captured["context_close_started"] is True
+    assert captured["fallback_browser_closed"] is True
 
 
 def test_wildberries_api_candidates_survive_browser_enrichment_failure(monkeypatch):
@@ -758,7 +908,7 @@ def test_web_shop_search_forwards_non_price_criterion_without_guessing(
         captured.update({"query": query, **kwargs})
         item = {
             "title": "Пылесос без указанной мощности",
-            "url": "https://shop.example/product/1",
+            "url": "https://www.wildberries.ru/catalog/1/detail.aspx",
             "price_text": "10 000 ₽",
             "price_value": 10000.0,
             "in_stock": True,
@@ -795,4 +945,376 @@ def test_web_shop_search_forwards_non_price_criterion_without_guessing(
     assert captured["criterion_label"] == "максимальная мощность"
     assert "Нет сопоставимой характеристики" in result.summary
     assert result.data["best"] is None
+    storage.close()
+
+
+def _dns_result(query: str = "ryzen 9", *, price: float = 49_000.0):
+    item = {
+        "title": "AMD Ryzen 9",
+        "url": "https://www.dns-shop.ru/product/test/amd-ryzen-9/",
+        "price_text": f"{int(price):,} ₽".replace(",", " "),
+        "price_value": price,
+        "in_stock": True,
+    }
+    return ws._shop_search_result(
+        query,
+        "dns",
+        ok=True,
+        items=[item],
+        cheapest=item,
+        best=item,
+        browser_mode="headful_stable_chrome",
+        price_sort_confirmed=True,
+        criterion="price_asc",
+        metric_key="price_value",
+    )
+
+
+def test_price_nearest_ranks_by_distance_and_reports_target():
+    items = [
+        {"title": "low", "url": "low", "price_value": 32_000.0},
+        {"title": "near", "url": "near", "price_value": 49_000.0},
+        {"title": "high", "url": "high", "price_value": 55_000.0},
+    ]
+
+    ranked = ws._rank_catalog_items(
+        items,
+        criterion="price_nearest",
+        metric_key="price_value",
+        target_price=50_000.0,
+    )
+    result = ws._shop_search_result(
+        "ryzen 9",
+        "dns",
+        ok=True,
+        items=ranked,
+        best=ranked[0],
+        criterion="price_nearest",
+        metric_key="price_value",
+        constraints={"target_price": 50_000.0},
+    )
+
+    assert ranked[0]["title"] == "near"
+    assert result["comparison"]["target_price"] == 50_000.0
+    assert result["comparison"]["distance_to_target"] == 1_000.0
+
+
+def test_web_shop_search_singleflight_populates_exact_fresh_cache(monkeypatch, tmp_path):
+    calls = 0
+    captured_state_dir = ""
+
+    async def fake_start(self):
+        self._started = True
+
+    async def fake_close(self):
+        self._started = False
+
+    async def fake_shop_search(self, query, **_kwargs):
+        nonlocal calls, captured_state_dir
+        calls += 1
+        captured_state_dir = self.config.shop_storage_state_dir
+        await asyncio.sleep(0.02)
+        return _dns_result(query)
+
+    monkeypatch.setattr(ws.JarvisWebSurfer, "start", fake_start)
+    monkeypatch.setattr(ws.JarvisWebSurfer, "close", fake_close)
+    monkeypatch.setattr(ws.JarvisWebSurfer, "shop_search", fake_shop_search)
+    tools, storage = _registry(monkeypatch, tmp_path)
+
+    async def run_two():
+        arguments = {"query": "ryzen 9", "shop": "dns", "criterion": "price_asc"}
+        return await asyncio.gather(
+            tools.run("web.shop_search", arguments),
+            tools.run("web.shop_search", arguments),
+        )
+
+    first, second = asyncio.run(run_two())
+
+    assert first.ok is True and second.ok is True
+    assert calls == 1
+    assert {first.data["cache"]["status"], second.data["cache"]["status"]} == {
+        "miss_stored",
+        "fresh_hit",
+    }
+    assert captured_state_dir.startswith(str(tmp_path))
+    assert captured_state_dir.endswith("shop-state")
+    storage.close()
+
+
+def test_web_shop_search_hydrates_fresh_cache_from_verified_tool_run(
+    monkeypatch,
+    tmp_path,
+):
+    arguments = {"query": "ryzen 9", "shop": "dns", "criterion": "price_asc"}
+    tools, storage = _registry(monkeypatch, tmp_path)
+    prior = storage.record_tool_run(
+        tool="web.shop_search",
+        ok=True,
+        summary="verified DNS catalog",
+        arguments=arguments,
+        data=_dns_result(),
+    )
+
+    async def must_not_start(_self):
+        raise AssertionError("fresh history cache must avoid browser startup")
+
+    monkeypatch.setattr(ws.JarvisWebSurfer, "start", must_not_start)
+    result = asyncio.run(tools.run("web.shop_search", arguments))
+
+    assert result.ok is True
+    assert result.data["cache"]["status"] == "fresh_hit"
+    assert result.data["cache"]["provenance"] == {
+        "source": "tool_run_history_live_catalog",
+        "tool_run_id": prior["id"],
+        "verified_catalog_result": True,
+    }
+    storage.close()
+
+
+def test_history_hydration_rejects_cached_run_and_preserves_original_live_timestamp(
+    monkeypatch,
+    tmp_path,
+):
+    arguments = {"query": "ryzen 9", "shop": "dns", "criterion": "price_asc"}
+    tools, storage = _registry(monkeypatch, tmp_path)
+    verified_at = (
+        datetime.now(UTC)
+        - timedelta(seconds=tools_module.WEB_SHOP_CACHE_FRESH_TTL_SEC + 30)
+    ).isoformat(timespec="seconds")
+    original_live = _dns_result()
+    original_live["provenance"] = {
+        "source": "live_catalog",
+        "verified_at": verified_at,
+    }
+    original_live["cache"] = {
+        "status": "miss_stored",
+        "cached_at": verified_at,
+        "provenance": {"source": "live_catalog"},
+    }
+    storage.record_tool_run(
+        tool="web.shop_search",
+        ok=True,
+        summary="original live DNS catalog",
+        arguments=arguments,
+        data=original_live,
+    )
+    replayed_cache = _dns_result()
+    replayed_cache["provenance"] = {
+        "source": "verified_catalog_cache",
+        "cached_at": verified_at,
+    }
+    replayed_cache["cache"] = {
+        "status": "fresh_hit",
+        "cached_at": datetime.now(UTC).isoformat(timespec="seconds"),
+        "provenance": {"source": "tool_run_history_live_catalog"},
+    }
+    storage.record_tool_run(
+        tool="web.shop_search",
+        ok=True,
+        summary="cached replay must not become live",
+        arguments=arguments,
+        data=replayed_cache,
+    )
+    live_calls = 0
+
+    async def fake_start(self):
+        self._started = True
+
+    async def fake_close(self):
+        self._started = False
+
+    async def live_failure(_self, query, **_kwargs):
+        nonlocal live_calls
+        live_calls += 1
+        return {
+            "ok": False,
+            "query": query,
+            "shop": "dns",
+            "items": [],
+            "error": "anti-bot",
+            "error_code": "anti_bot",
+        }
+
+    monkeypatch.setattr(ws.JarvisWebSurfer, "start", fake_start)
+    monkeypatch.setattr(ws.JarvisWebSurfer, "close", fake_close)
+    monkeypatch.setattr(ws.JarvisWebSurfer, "shop_search", live_failure)
+
+    result = asyncio.run(tools.run("web.shop_search", arguments))
+
+    assert live_calls == 1
+    assert result.ok is True
+    assert result.data["cache"]["status"] == "stale_on_live_failure"
+    assert result.data["cache"]["cached_at"] == verified_at
+    assert result.data["cache"]["provenance"]["source"] == (
+        "tool_run_history_live_catalog"
+    )
+    storage.close()
+
+
+def test_web_shop_search_returns_stale_verified_cache_after_live_failure(
+    monkeypatch,
+    tmp_path,
+):
+    mode = "success"
+
+    async def fake_start(self):
+        self._started = True
+
+    async def fake_close(self):
+        self._started = False
+
+    async def fake_shop_search(_self, query, **_kwargs):
+        if mode == "success":
+            return _dns_result(query)
+        return {
+            "ok": False,
+            "query": query,
+            "shop": "dns",
+            "items": [],
+            "error": "stable Chrome navigation failed",
+            "error_code": "stable_navigation",
+            "timings": {"total_ms": 8000},
+            "stages": [{"name": "stable_chrome", "ok": False}],
+        }
+
+    monkeypatch.setattr(ws.JarvisWebSurfer, "start", fake_start)
+    monkeypatch.setattr(ws.JarvisWebSurfer, "close", fake_close)
+    monkeypatch.setattr(ws.JarvisWebSurfer, "shop_search", fake_shop_search)
+    tools, storage = _registry(monkeypatch, tmp_path)
+    arguments = {"query": "ryzen 9", "shop": "dns", "criterion": "price_asc"}
+
+    async def exercise():
+        nonlocal mode
+        first = await tools.run("web.shop_search", arguments)
+        records = storage.get_runtime_value(tools_module.WEB_SHOP_CACHE_KEY, [])
+        records[0]["cached_at"] = (
+            datetime.now(UTC)
+            - timedelta(seconds=tools_module.WEB_SHOP_CACHE_FRESH_TTL_SEC + 5)
+        ).isoformat(timespec="seconds")
+        storage.set_runtime_value(tools_module.WEB_SHOP_CACHE_KEY, records)
+        mode = "failure"
+        second = await tools.run("web.shop_search", arguments)
+        return first, second
+
+    first, second = asyncio.run(exercise())
+
+    assert first.ok is True
+    assert second.ok is True
+    assert second.data["items"] == first.data["items"]
+    assert second.data["cache"]["status"] == "stale_on_live_failure"
+    assert second.data["cache"]["live_failure"]["error_code"] == "stable_navigation"
+    assert second.data["cache"]["cached_at"]
+    storage.close()
+
+
+def test_web_shop_search_singleflight_queue_wait_obeys_absolute_deadline(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(tools_module, "WEB_SHOP_LIVE_TIMEOUT_SEC", 0.05)
+    tools, storage = _registry(monkeypatch, tmp_path)
+    monkeypatch.setattr(storage, "record_tool_run", lambda **_kwargs: {})
+    monkeypatch.setattr(storage, "add_event", lambda **_kwargs: {})
+    browser_started = False
+
+    async def must_not_start(_self):
+        nonlocal browser_started
+        browser_started = True
+
+    monkeypatch.setattr(ws.JarvisWebSurfer, "start", must_not_start)
+
+    async def exercise():
+        lock = tools._shop_search_locks.setdefault("dns", asyncio.Lock())
+        await lock.acquire()
+        try:
+            started = asyncio.get_running_loop().time()
+            result = await tools.run(
+                "web.shop_search",
+                {"query": "queued", "shop": "dns"},
+            )
+            elapsed = asyncio.get_running_loop().time() - started
+        finally:
+            lock.release()
+        return result, elapsed
+
+    result, elapsed = asyncio.run(exercise())
+
+    assert result.ok is False
+    assert result.data["error_code"] == "queue_timeout"
+    assert browser_started is False
+    assert elapsed < 0.15
+    storage.close()
+
+
+def test_web_shop_search_does_not_start_live_browser_after_late_lock_acquire(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(tools_module, "WEB_SHOP_LIVE_TIMEOUT_SEC", 0.05)
+    remaining = iter((0.05, 0.005))
+    monkeypatch.setattr(
+        tools_module,
+        "_shop_deadline_remaining",
+        lambda _deadline: next(remaining),
+    )
+    tools, storage = _registry(monkeypatch, tmp_path)
+    monkeypatch.setattr(storage, "record_tool_run", lambda **_kwargs: {})
+    monkeypatch.setattr(storage, "add_event", lambda **_kwargs: {})
+    browser_started = False
+
+    async def must_not_start(_self):
+        nonlocal browser_started
+        browser_started = True
+
+    monkeypatch.setattr(ws.JarvisWebSurfer, "start", must_not_start)
+
+    async def exercise():
+        return await tools.run(
+            "web.shop_search",
+            {"query": "queued", "shop": "dns"},
+        )
+
+    result = asyncio.run(exercise())
+
+    assert result.ok is False
+    assert result.data["error_code"] == "queue_budget_exhausted"
+    assert browser_started is False
+    storage.close()
+
+
+def test_web_shop_search_total_deadline_cancels_and_drains_live_call(monkeypatch, tmp_path):
+    cancelled = asyncio.Event()
+
+    async def fake_start(self):
+        self._started = True
+
+    async def fake_close(self):
+        self._started = False
+
+    async def hanging_shop_search(_self, _query, **_kwargs):
+        try:
+            await asyncio.sleep(60)
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(ws.JarvisWebSurfer, "start", fake_start)
+    monkeypatch.setattr(ws.JarvisWebSurfer, "close", fake_close)
+    monkeypatch.setattr(ws.JarvisWebSurfer, "shop_search", hanging_shop_search)
+    monkeypatch.setattr(tools_module, "WEB_SHOP_LIVE_TIMEOUT_SEC", 0.05)
+    tools, storage = _registry(monkeypatch, tmp_path)
+
+    async def exercise():
+        started = asyncio.get_running_loop().time()
+        result = await tools.run(
+            "web.shop_search",
+            {"query": "never", "shop": "dns"},
+        )
+        return result, asyncio.get_running_loop().time() - started
+
+    result, elapsed = asyncio.run(exercise())
+
+    assert result.ok is False
+    assert result.data["error_code"] == "total_timeout"
+    assert cancelled.is_set()
+    assert elapsed < 1.0
     storage.close()
