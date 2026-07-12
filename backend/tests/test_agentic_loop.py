@@ -10,6 +10,7 @@ from jarvis_gpt.config import ensure_runtime_dirs, load_settings
 from jarvis_gpt.dispatcher import DispatcherManager
 from jarvis_gpt.event_bus import EventBus
 from jarvis_gpt.executive_runtime import ExecutiveCoordinator
+from jarvis_gpt.ingest import FileIngestor
 from jarvis_gpt.llm import LLMStreamChunk
 from jarvis_gpt.storage import JarvisStorage
 
@@ -91,6 +92,53 @@ def test_agentic_loop_runs_safe_tool_then_answers(monkeypatch, tmp_path):
         event.type == "tool_call" and event.payload.get("autonomous")
         for event in response.events
     )
+    storage.close()
+
+
+def test_agentic_loop_recalls_persisted_document_then_summarizes(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "1")
+    monkeypatch.setenv("JARVIS_EMBEDDINGS_ENABLED", "0")
+
+    class RecallThenAnswerLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.observation = ""
+
+        async def complete(self, messages, *, temperature=None, max_tokens=None, **kwargs):
+            self.calls += 1
+            rendered = "\n".join(item["content"] for item in messages)
+            assert "documents.recall(query?" in rendered
+            self.observation = rendered
+            return _result(
+                "Phoenix готов к выпуску; перед релизом нужно проверить резервную копию."
+            )
+
+    llm = RecallThenAnswerLLM()
+    agent, storage = _agent(monkeypatch, tmp_path, llm)
+    storage.set_runtime_value("experience.autonomy_policy", {"verify_answers": False})
+    source = tmp_path / "phoenix-report.txt"
+    source.write_text(
+        "Phoenix release is ready. Required before launch: validate the backup.",
+        encoding="utf-8",
+    )
+    ingested = FileIngestor(agent.settings, storage).ingest_path(source)
+
+    response = asyncio.run(
+        agent.chat("Дай резюме сохраненного документа Phoenix")
+    )
+
+    assert llm.calls == 1
+    assert "validate the backup" in llm.observation
+    assert "untrusted document/file evidence" in llm.observation
+    assert "резервную копию" in response.answer
+    assert any(
+        event.type == "tool_call"
+        and event.payload.get("tool") == "documents.recall"
+        and event.payload.get("ok") is True
+        and event.payload.get("prefetch") is True
+        for event in response.events
+    )
+    assert storage.get_file(ingested["file"]["id"])["status"] == "indexed"
     storage.close()
 
 

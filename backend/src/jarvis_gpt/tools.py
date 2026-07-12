@@ -45,6 +45,7 @@ from .cognitive_memory import ExecutionPlaybookStore
 from .config import JarvisSettings
 from .diagnostics import run_diagnostics
 from .dispatcher import DispatcherManager
+from .document_memory import DocumentMemory
 from .document_runtime import (
     DocumentRuntimeError,
     apply_document_replacements,
@@ -73,6 +74,7 @@ from .execution_protocol import (
 from .execution_session import SessionStatus, StepStatus
 from .executive_runtime import ExecutiveCoordinator
 from .host_bridge import HostBridgeClient, HostBridgeStatus
+from .ingest import extract_file_index
 from .learning import LearningEngine
 from .llm import LLMRouter
 from .model_catalog import ModelCatalog
@@ -1268,10 +1270,33 @@ class ToolRegistry:
         self.add(
             ToolSpec(
                 name="files.search",
-                description="Search indexed file chunks for local project context.",
+                description=(
+                    "Search persisted files by filename and indexed content; returns stable "
+                    "file ids for document tools."
+                ),
                 category="memory",
                 input_schema={"query": "Text query", "limit": "Maximum chunk hits"},
                 handler=_files_search,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="documents.recall",
+                description=(
+                    "Retrieve previously uploaded/indexed documents from durable file memory, "
+                    "read their bounded content, analyze them, and prepare corpus evidence for "
+                    "a source-named summary. Use this for earlier documents without a current "
+                    "attachment."
+                ),
+                category="documents",
+                input_schema={
+                    "query": "Natural-language recall or summary request",
+                    "file_ids": "Optional explicit persisted file ids",
+                    "focus": "Optional analysis/summary focus",
+                    "max_files": "Maximum recalled documents (1..8)",
+                    "max_chars": "Maximum extracted characters per document",
+                },
+                handler=_documents_recall,
             )
         )
         self.add(
@@ -4455,11 +4480,65 @@ def _files_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
         )
     limit = _int_arg(args.get("limit"), default=8, minimum=1, maximum=30)
     hits = ctx.storage.search_file_chunks(query, limit=limit)
+    files = ctx.storage.search_files(query, limit=limit)
     return ToolRunResponse(
         tool="files.search",
         ok=True,
-        summary=f"File search returned {len(hits)} chunk(s).",
-        data={"hits": hits, "query": query, "limit": limit},
+        summary=f"File search returned {len(files)} file(s) and {len(hits)} chunk(s).",
+        data={"files": files, "hits": hits, "query": query, "limit": limit},
+    )
+
+
+def _documents_recall(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    query = " ".join(str(args.get("query") or "").split()).strip()
+    file_ids = args.get("file_ids")
+    if isinstance(file_ids, str):
+        file_ids = [file_ids]
+    if not isinstance(file_ids, list):
+        file_ids = []
+    max_files = _int_arg(args.get("max_files"), default=3, minimum=1, maximum=8)
+    max_chars = _int_arg(args.get("max_chars"), default=60000, minimum=1000, maximum=80000)
+    focus = " ".join(str(args.get("focus") or "").split()).strip() or None
+    try:
+        memory = DocumentMemory(storage=ctx.storage, surfer=_document_surfer_for(ctx))
+        result = memory.recall(
+            query,
+            file_ids=[str(item) for item in file_ids[:8]],
+            max_files=max_files,
+            max_chars=max_chars,
+            focus=focus,
+        )
+    except (ValueError, DocumentSurferError) as exc:
+        return ToolRunResponse(tool="documents.recall", ok=False, summary=str(exc))
+    selection = result.get("selection") if isinstance(result.get("selection"), dict) else {}
+    matched = int(selection.get("matched") or 0)
+    analyzed = int(selection.get("analyzed") or 0)
+    if not result.get("ok"):
+        summary = (
+            "Multiple persisted documents match; an explicit file_id is required."
+            if selection.get("ambiguous")
+            else "No readable persisted document matched the request."
+        )
+        return ToolRunResponse(
+            tool="documents.recall",
+            ok=False,
+            summary=summary,
+            data=result,
+        )
+    ambiguity = " Candidate selection is ambiguous." if selection.get("ambiguous") else ""
+    bounded = (
+        f" Selection was bounded to {int(selection.get('limit') or max_files)} documents."
+        if selection.get("truncated")
+        else ""
+    )
+    return ToolRunResponse(
+        tool="documents.recall",
+        ok=True,
+        summary=(
+            f"Recalled {matched} persisted document(s); analyzed {analyzed}."
+            f"{ambiguity}{bounded}"
+        ),
+        data=result,
     )
 
 
@@ -9523,11 +9602,8 @@ def _record_generated_document(ctx: ToolContext, path: Path) -> dict[str, Any]:
     data = path.read_bytes()
     digest = hashlib.sha256(data).hexdigest()
     try:
-        document = extract_document(path, max_chars=200000)
-        chunks = _document_chunks(str(document.get("text") or ""))
-        status = "indexed" if chunks else "stored"
-        error = None
-    except (DocumentRuntimeError, OSError, zipfile.BadZipFile) as exc:
+        chunks, status, error = extract_file_index(path, document_mime_type(path))
+    except OSError as exc:
         chunks = []
         status = "stored"
         error = f"Generated document indexing skipped: {exc}"
@@ -9546,23 +9622,6 @@ def _record_generated_document(ctx: ToolContext, path: Path) -> dict[str, Any]:
         ctx.storage.add_file_chunks(file_record["id"], chunks)
         file_record = ctx.storage.get_file(file_record["id"]) or file_record
     return file_record
-
-
-def _document_chunks(text: str, *, chunk_size: int = 1800, overlap: int = 180) -> list[str]:
-    normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
-    if not normalized:
-        return []
-    chunks: list[str] = []
-    start = 0
-    while start < len(normalized):
-        end = min(len(normalized), start + chunk_size)
-        chunk = normalized[start:end].strip()
-        if chunk:
-            chunks.append(chunk)
-        if end >= len(normalized):
-            break
-        start = max(start + 1, end - overlap)
-    return chunks
 
 
 def _run_docker(args: list[str], *, timeout: int) -> dict[str, Any]:

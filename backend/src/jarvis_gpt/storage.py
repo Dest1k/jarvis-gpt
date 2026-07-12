@@ -259,6 +259,7 @@ def _decorate_file_hit(row: dict[str, Any], query: str | None) -> dict[str, Any]
     searchable = " ".join([str(row.get("file_name") or ""), str(row.get("content") or "")])
     matched = _matched_terms(searchable, terms)
     row["matched_terms"] = matched
+    row["exact_matched_terms"] = _matched_terms_exact(searchable, terms)
     row["snippet"] = _snippet(str(row.get("content") or ""), matched or terms)
     row["relevance"] = _relevance(
         row.get("rank"),
@@ -272,6 +273,19 @@ def _decorate_file_hit(row: dict[str, Any], query: str | None) -> dict[str, Any]
 def _matched_terms(text: str, terms: list[str]) -> list[str]:
     lowered = text.casefold()
     return [term for term in terms if term.casefold() in lowered]
+
+
+def _matched_terms_exact(text: str, terms: list[str]) -> list[str]:
+    lowered = text.casefold()
+    return [
+        term
+        for term in terms
+        if re.search(
+            rf"(?<!\w){re.escape(term.casefold())}(?!\w)",
+            lowered,
+            flags=re.UNICODE,
+        )
+    ]
 
 
 def _snippet(text: str, terms: list[str], *, max_chars: int = 260) -> str:
@@ -1840,41 +1854,114 @@ class JarvisStorage:
             self.connect().commit()
         return row
 
-    def add_file_chunks(self, file_id: str, chunks: list[str]) -> None:
+    def add_file_chunks(
+        self,
+        file_id: str,
+        chunks: list[str],
+        *,
+        status: str | None = None,
+        error: str | None = None,
+    ) -> None:
         now = utc_now()
         with self._lock:
             conn = self.connect()
-            conn.execute("DELETE FROM file_chunks WHERE file_id = ?", (file_id,))
-            if self._file_fts_available:
-                conn.execute("DELETE FROM file_chunks_fts WHERE file_id = ?", (file_id,))
-            for position, content in enumerate(chunks, start=1):
-                chunk_id = new_id("chunk")
+            self._replace_file_chunks(conn, file_id, chunks, now=now)
+            if status is None:
                 conn.execute(
                     """
-                    INSERT INTO file_chunks(id, file_id, position, content, char_count, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    UPDATE files
+                    SET chunk_count = ?, updated_at = ?
+                    WHERE id = ?
                     """,
-                    (chunk_id, file_id, position, content, len(content), now),
+                    (len(chunks), now, file_id),
                 )
-                if self._file_fts_available:
-                    conn.execute(
-                        """
-                        INSERT INTO file_chunks_fts(file_id, chunk_id, content)
-                        VALUES (?, ?, ?)
-                        """,
-                        (file_id, chunk_id, content),
-                    )
-            conn.execute(
-                """
-                UPDATE files
-                SET chunk_count = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (len(chunks), now, file_id),
-            )
+            else:
+                conn.execute(
+                    """
+                    UPDATE files
+                    SET chunk_count = ?, status = ?, error = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (len(chunks), status[:40], error, now, file_id),
+                )
             conn.commit()
 
-    def list_files(self, limit: int = 50) -> list[dict[str, Any]]:
+    def reindex_file(
+        self,
+        file_id: str,
+        chunks: list[str],
+        *,
+        name: str,
+        stored_path: Path,
+        size: int,
+        mime_type: str,
+        status: str,
+        error: str | None,
+        source_path: Path | None = None,
+    ) -> dict[str, Any] | None:
+        """Atomically replace a legacy file's metadata and searchable index."""
+
+        now = utc_now()
+        with self._lock:
+            conn = self.connect()
+            try:
+                self._replace_file_chunks(conn, file_id, chunks, now=now)
+                conn.execute(
+                    """
+                    UPDATE files
+                    SET name = ?, source_path = ?, stored_path = ?, mime_type = ?, size = ?,
+                        chunk_count = ?, status = ?, error = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        name[:260],
+                        str(source_path) if source_path else None,
+                        str(stored_path),
+                        mime_type[:120],
+                        int(size),
+                        len(chunks),
+                        status[:40],
+                        error,
+                        now,
+                        file_id,
+                    ),
+                )
+                conn.commit()
+            except Exception:  # noqa: BLE001 - transaction must roll back on any failure
+                conn.rollback()
+                raise
+        return self.get_file(file_id)
+
+    def _replace_file_chunks(
+        self,
+        conn: sqlite3.Connection,
+        file_id: str,
+        chunks: list[str],
+        *,
+        now: str,
+    ) -> None:
+        conn.execute("DELETE FROM file_chunks WHERE file_id = ?", (file_id,))
+        if self._file_fts_available:
+            conn.execute("DELETE FROM file_chunks_fts WHERE file_id = ?", (file_id,))
+        for position, content in enumerate(chunks, start=1):
+            chunk_id = new_id("chunk")
+            conn.execute(
+                """
+                INSERT INTO file_chunks(id, file_id, position, content, char_count, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (chunk_id, file_id, position, content, len(content), now),
+            )
+            if self._file_fts_available:
+                conn.execute(
+                    """
+                    INSERT INTO file_chunks_fts(file_id, chunk_id, content)
+                    VALUES (?, ?, ?)
+                    """,
+                    (file_id, chunk_id, content),
+                )
+
+    def list_files(self, limit: int = 50, *, offset: int = 0) -> list[dict[str, Any]]:
         with self._lock:
             rows = self.connect().execute(
                 """
@@ -1883,11 +1970,136 @@ class JarvisStorage:
                     status, error, chunk_count, created_at, updated_at
                 FROM files
                 ORDER BY updated_at DESC, rowid DESC
-                LIMIT ?
+                LIMIT ? OFFSET ?
                 """,
-                (limit,),
+                (limit, max(0, offset)),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def search_files(self, query: str, limit: int = 20) -> list[dict[str, Any]]:
+        """Resolve persisted files by filename and indexed content.
+
+        ``file_chunks_fts`` stores only chunk text, so an FTS-only lookup cannot
+        find a remembered filename or a stored document without extractable text.
+        Fuse bounded chunk hits with filename matches and return stable file ids
+        for follow-on document tools.
+        """
+
+        query = " ".join(str(query or "").split()).strip()
+        if not query:
+            return []
+        limit = max(1, min(50, int(limit)))
+        terms = _query_terms(query, limit=12)
+        if not terms:
+            return []
+
+        chunk_hits = self.search_file_chunks(query, limit=max(40, limit * 8))
+        chunks_by_file: dict[str, list[dict[str, Any]]] = {}
+        chunk_scores: dict[str, float] = {}
+        for hit in chunk_hits:
+            file_id = str(hit.get("file_id") or "")
+            if not file_id:
+                continue
+            snippets = chunks_by_file.setdefault(file_id, [])
+            if len(snippets) < 4:
+                snippets.append(
+                    {
+                        "chunk_id": hit.get("chunk_id"),
+                        "position": hit.get("position"),
+                        "snippet": hit.get("snippet")
+                        or _snippet(str(hit.get("content") or ""), terms),
+                        "matched_terms": list(hit.get("matched_terms") or []),
+                        "exact_matched_terms": list(
+                            hit.get("exact_matched_terms") or []
+                        ),
+                        "relevance": float(hit.get("relevance") or 0.0),
+                    }
+                )
+            chunk_scores[file_id] = max(
+                chunk_scores.get(file_id, 0.0),
+                2.0 + float(hit.get("relevance") or 0.0),
+            )
+
+        records_by_id: dict[str, dict[str, Any]] = {}
+        for file_id in chunks_by_file:
+            record = self.get_file(file_id)
+            if record is not None:
+                records_by_id[file_id] = record
+        name_clauses = " OR ".join("name LIKE ?" for _term in terms)
+        name_params = [f"%{term}%" for term in terms]
+        with self._lock:
+            name_rows = self.connect().execute(
+                f"""
+                SELECT
+                    id, name, source_path, stored_path, mime_type, size, sha256,
+                    status, error, chunk_count, created_at, updated_at
+                FROM files
+                WHERE {name_clauses}
+                ORDER BY updated_at DESC, rowid DESC
+                LIMIT ?
+                """,
+                (*name_params, max(100, limit * 20)),
+            ).fetchall()
+        for row in name_rows:
+            record = dict(row)
+            records_by_id.setdefault(str(record["id"]), record)
+        if any(not term.isascii() for term in terms):
+            offset = 0
+            while True:
+                batch = self.list_files(limit=500, offset=offset)
+                if not batch:
+                    break
+                for record in batch:
+                    folded_name = str(record.get("name") or "").casefold()
+                    if any(term.casefold() in folded_name for term in terms):
+                        records_by_id.setdefault(str(record["id"]), record)
+                offset += len(batch)
+                if len(batch) < 500:
+                    break
+        records = list(records_by_id.values())
+        normalized_query = query.casefold()
+        ranked: list[tuple[float, int, dict[str, Any]]] = []
+        for recency, record in enumerate(records):
+            file_id = str(record.get("id") or "")
+            name = str(record.get("name") or "")
+            matched_name_terms = _matched_terms(name, terms)
+            exact_name_terms = _matched_terms_exact(name, terms)
+            sources: list[str] = []
+            score = chunk_scores.get(file_id, 0.0)
+            if file_id in chunks_by_file:
+                sources.append("content")
+            if matched_name_terms:
+                sources.append("name")
+                score += 3.0 + (2.0 * len(matched_name_terms) / max(1, len(terms)))
+            if normalized_query and normalized_query in name.casefold():
+                if "name" not in sources:
+                    sources.append("name")
+                score += 4.0
+            if not sources:
+                continue
+            matched_content_terms = {
+                term
+                for chunk in chunks_by_file.get(file_id, [])
+                for term in chunk.get("exact_matched_terms") or []
+            }
+            ranked.append(
+                (
+                    score,
+                    recency,
+                    {
+                        **record,
+                        "match_sources": sources,
+                        "matched_terms": sorted(
+                            {*exact_name_terms, *matched_content_terms},
+                            key=str.casefold,
+                        ),
+                        "match_score": round(score, 4),
+                        "matched_chunks": chunks_by_file.get(file_id, []),
+                    },
+                )
+            )
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        return [item[2] for item in ranked[:limit]]
 
     def get_file(self, file_id: str) -> dict[str, Any] | None:
         with self._lock:

@@ -7,8 +7,8 @@
 - FastAPI backend с `/health`, `/api/status`, `/api/models`, `/api/chat`, `/api/chat/stream`, `/api/missions`, `/api/memory`, `/api/files`, `/api/approvals`, `/api/audit`, `/api/diagnostics`.
 - Offline-first агент: сохраняет диалоги, создаёт mission plans и деградирует корректно, если локальная LLM не поднята.
 - Safe tools runtime: диагностика, статус, память, публичный web fetch/search/render/download с SSRF-защитой, evidence ledger/extract/verify, schema.org/OpenGraph/readability extraction, quarantine download inspection, semantic review-gated Chrome CDP read/click/type/select/screenshot plus human handoff status, validated browser open без approval для явных запросов открыть URL, Docker ps/logs для Jarvis-контейнеров, файловое чтение в разрешённых корнях, approval-gated sandbox write, token-auth host bridge и execution brief для миссий.
-- File ingestion: загрузка текстовых, Word/Excel/PDF файлов, хранение в `D:\jarvis\data\jarvis-gpt\files`, document extraction, chunk search и audit trail.
-- Document surfer: изолированный black-box обработчик документов (`document_surfer`, аналог `web_surfer`) — inspect/read/analyze/compare/search/corpus/generate/convert для Word/Excel/PDF/PPTX/текста, copy-on-write правки и генерация md/docx/xlsx без перезаписи оригиналов.
+- File ingestion: загрузка текстовых, Word/Excel/PDF/PPTX/ODT/RTF файлов, хранение в `D:\jarvis\data\jarvis-gpt\files`, document extraction, chunk search и audit trail.
+- Document surfer: изолированный black-box обработчик документов (`document_surfer`, аналог `web_surfer`) — durable recall из файловой памяти, inspect/read/analyze/compare/search/corpus/generate/convert для Word/Excel/PDF/PPTX/текста, copy-on-write правки и генерация md/docx/xlsx без перезаписи оригиналов.
 - Model catalog: активные профили знают реальные Gemma 4 веса в `D:\jarvis\data\models`.
 - HITL approvals: незапрошенные опасные действия оформляются как durable approval gates; точная
   явная команда текущего сообщения получает одноразовое argument-bound разрешение и выполняется сразу.
@@ -203,9 +203,13 @@ docker compose --profile llm up -d dispatcher
   фоновый job kind `web.watch` следят за изменением страницы (цена, наличие,
   статус) и при изменении поднимают событие и durable-память.
 - Document intelligence surface: uploaded files or local paths can use
-  `documents.inspect`, `documents.review`, `documents.read`,
+  `documents.recall`, `documents.inspect`, `documents.review`, `documents.read`,
   `documents.compare`, `documents.edit.plan`, and
   `documents.apply_replacements` for Word/Excel/PDF and text-like files.
+  `documents.recall` resolves earlier uploads by filename and indexed content,
+  reads the persisted source, returns bounded passages plus structural analysis,
+  and gives the chat model enough evidence for a source-named summary without a
+  current attachment.
   `documents.review` reports OCR need, Word redline readiness, and Excel
   formula/style audit. Edited copies are written under `data/document-outputs`
   without overwriting originals.

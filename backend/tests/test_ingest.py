@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import zipfile
+from pathlib import Path
 
 import pytest
 from jarvis_gpt import ingest as ingest_module
@@ -55,6 +57,18 @@ def _write_minimal_xlsx(path, text: str) -> None:
                 '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
                 '<sheetData><row r="1"><c r="A1" t="s"><v>0</v></c>'
                 '<c r="B1"><f>1+1</f><v>2</v></c></row></sheetData></worksheet>'
+            ),
+        )
+
+
+def _write_minimal_pptx(path, text: str) -> None:
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            "ppt/slides/slide1.xml",
+            (
+                '<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" '
+                'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+                f"<p:cSld><a:t>{text}</a:t></p:cSld></p:sld>"
             ),
         )
 
@@ -136,6 +150,108 @@ def test_file_ingestor_indexes_office_documents(monkeypatch, tmp_path):
         docx_result["file"]["id"],
         xlsx_result["file"]["id"],
     }
+    storage.close()
+
+
+def test_file_ingestor_indexes_extended_document_surfer_formats(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    source = tmp_path / "roadmap.pptx"
+    _write_minimal_pptx(source, "Roadmap Phoenix launch September")
+
+    result = FileIngestor(settings=settings, storage=storage).ingest_path(source)
+    hits = storage.search_file_chunks("Phoenix September", limit=5)
+
+    assert result["file"]["status"] == "indexed"
+    assert result["chunks_indexed"] == 1
+    assert hits[0]["file_id"] == result["file"]["id"]
+    assert "Roadmap Phoenix" in hits[0]["content"]
+    storage.close()
+
+
+def test_file_ingestor_reindexes_legacy_stored_extended_document(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    source = tmp_path / "legacy-roadmap.pptx"
+    _write_minimal_pptx(source, "Legacy Phoenix roadmap content")
+    legacy = storage.create_file_record(
+        name=source.name,
+        stored_path=source,
+        sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+        size=source.stat().st_size,
+        mime_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        status="stored",
+        error="Binary or unsupported text format; file stored without chunks.",
+        chunk_count=0,
+    )
+
+    result = FileIngestor(settings=settings, storage=storage).ingest_path(source)
+    hits = storage.search_file_chunks("Legacy Phoenix", limit=5)
+
+    assert result["file"]["id"] == legacy["id"]
+    assert result["deduplicated"] is True
+    assert result["reindexed"] is True
+    assert result["file"]["status"] == "indexed"
+    assert hits[0]["file_id"] == legacy["id"]
+    storage.close()
+
+
+def test_file_ingestor_reindexes_duplicate_with_corrected_extension(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    corrected = tmp_path / "deck.pptx"
+    disguised = tmp_path / "deck.bin"
+    _write_minimal_pptx(corrected, "Corrected Phoenix presentation metadata")
+    disguised.write_bytes(corrected.read_bytes())
+    ingestor = FileIngestor(settings=settings, storage=storage)
+
+    first = ingestor.ingest_path(disguised)
+    old_stored_path = first["file"]["stored_path"]
+    second = ingestor.ingest_path(corrected)
+    hits = storage.search_file_chunks("Corrected Phoenix", limit=5)
+
+    assert first["file"]["status"] == "stored"
+    assert second["file"]["id"] == first["file"]["id"]
+    assert second["deduplicated"] is True
+    assert second["reindexed"] is True
+    assert second["file"]["name"] == "deck.pptx"
+    assert second["file"]["status"] == "indexed"
+    assert second["file"]["mime_type"].endswith("presentationml.presentation")
+    assert second["file"]["stored_path"].endswith("_deck.pptx")
+    assert not Path(old_stored_path).exists()
+    assert hits[0]["file_id"] == first["file"]["id"]
+    storage.close()
+
+
+@pytest.mark.parametrize("filename", ["script.py", "config.yaml", "task.ps1"])
+def test_file_ingestor_keeps_regular_text_formats_on_text_path(
+    monkeypatch,
+    tmp_path,
+    filename,
+):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    source = tmp_path / filename
+    source.write_text("Phoenix regular text indexing marker", encoding="utf-8")
+
+    result = FileIngestor(settings=settings, storage=storage).ingest_path(source)
+    hits = storage.search_file_chunks("regular text indexing", limit=5)
+
+    assert result["file"]["status"] == "indexed"
+    assert result["chunks_indexed"] == 1
+    assert hits[0]["file_id"] == result["file"]["id"]
     storage.close()
 
 

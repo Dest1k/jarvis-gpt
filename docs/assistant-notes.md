@@ -9,6 +9,29 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-12 - Codex (durable document memory and recall)
+
+- Added `jarvis.document-memory.v1` and safe `documents.recall`: persisted files are resolved
+  by stable `file_id`, Unicode filename, and indexed content, then read and analyzed through
+  `document_surfer` with bounded passages, source metadata, corpus signals, and explicit
+  untrusted-data labeling.
+- Selection fails closed for missing/partial/ambiguous identities, uses token-boundary evidence,
+  never broadens a failed named request to an unrelated recent file, and selects the newest only
+  inside a validated temporal match set. Multi-document recall is explicitly bounded.
+- Chat and streaming routes deterministically prefetch historical document evidence before the
+  LLM. Successful source ids persist in assistant metadata for deictic follow-ups; singular
+  attachment follow-ups bind to the latest attachment-bearing turn. Persisted archives use a
+  separate `archive_memory` route and `documents.archive.*` tools.
+- Ingestion now persistently indexes PPTX/ODT/RTF alongside existing text/Office/PDF formats.
+  Generated and archive-extracted documents use the same index path. Legacy deduplicated files
+  can be reindexed under corrected filename/MIME/path metadata while retaining their stable id.
+- Main implementation: `document_memory.py`, `storage.py`, `ingest.py`, `document_surfer.py`,
+  `tools.py`, and `agent.py`; behavior and handoff documentation updated in `README.md`,
+  `docs/architecture.md`, and `docs/runtime.md`; focused regressions added across document,
+  ingest, tools, agent, archive, follow-up, and streaming flows.
+- Verification: full backend suite `757 passed, 13 skipped`; full Ruff, compileall, and
+  `git diff --check` clean. No known blockers.
+
 ### 2026-07-12 - Grok (document_surfer + archives + 31B RTX 5090 profiles)
 
 Branch: `feature/ideal-jarvis-all-enhancements`  

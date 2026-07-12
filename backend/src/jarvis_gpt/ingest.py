@@ -16,6 +16,11 @@ from .document_runtime import (
     extract_document,
     is_supported_document,
 )
+from .document_surfer import (
+    DocumentSurferError,
+    JarvisDocumentSurfer,
+    is_document_path_supported,
+)
 from .storage import JarvisStorage, new_id
 
 TEXT_EXTENSIONS = {
@@ -55,6 +60,7 @@ MAX_TEXT_BYTES = 5 * 1024 * 1024
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 CHUNK_CHARS = 1_800
 CHUNK_OVERLAP = 180
+SURFER_ONLY_DOCUMENT_EXTENSIONS = {".odt", ".pptx", ".rtf"}
 
 
 @dataclass(frozen=True)
@@ -183,51 +189,55 @@ class FileIngestor:
     ) -> dict[str, Any]:
         existing = self.storage.get_file_by_sha256(stored.sha256)
         if existing is not None:
-            if Path(existing["stored_path"]).resolve(strict=False) != stored.path.resolve(
-                strict=False
-            ):
-                stored.path.unlink(missing_ok=True)
+            existing_path = Path(existing["stored_path"]).resolve(strict=False)
+            reindexed = False
+            if existing.get("status") != "indexed" and stored.path.is_file():
+                chunks, status, error = self._extract_index(stored)
+                updated = self.storage.reindex_file(
+                    str(existing["id"]),
+                    chunks,
+                    name=stored.name,
+                    source_path=source_path,
+                    stored_path=stored.path,
+                    size=stored.size,
+                    mime_type=stored.mime_type,
+                    status=status,
+                    error=error,
+                )
+                existing = updated or existing
+                reindexed = bool(chunks)
+                if reindexed:
+                    self.storage.record_audit(
+                        actor="operator",
+                        action="file.reindex",
+                        target_type="file",
+                        target_id=str(existing["id"]),
+                        summary=(
+                            f"File reindexed: {existing['name']} ({len(chunks)} chunk(s))."
+                        ),
+                            after={"file": existing, "chunks_indexed": len(chunks)},
+                        )
+            active_path = Path(existing["stored_path"]).resolve(strict=False)
+            for obsolete_path in (existing_path, stored.path.resolve(strict=False)):
+                if obsolete_path != active_path:
+                    obsolete_path.unlink(missing_ok=True)
             self.storage.add_event(
                 kind="file.ingest.deduplicated",
                 title=f"File already indexed: {existing['name']}",
-                payload={"file_id": existing["id"], "sha256": stored.sha256},
+                payload={
+                    "file_id": existing["id"],
+                    "sha256": stored.sha256,
+                    "reindexed": reindexed,
+                },
             )
             return {
                 "file": existing,
                 "chunks_indexed": int(existing.get("chunk_count") or 0),
                 "deduplicated": True,
+                "reindexed": reindexed,
             }
 
-        chunks: list[str] = []
-        status = "stored"
-        error: str | None = None
-        if _is_text_file(stored):
-            if stored.size > MAX_TEXT_BYTES:
-                status = "stored"
-                error = f"Text indexing skipped: file is larger than {MAX_TEXT_BYTES} bytes."
-            else:
-                try:
-                    text = stored.path.read_text(encoding="utf-8", errors="replace")
-                    chunks = _chunk_text(text)
-                    status = "indexed" if chunks else "stored"
-                except OSError as exc:
-                    status = "failed"
-                    error = str(exc)
-        elif is_supported_document(stored.name, stored.mime_type):
-            try:
-                document = extract_document(stored.path, max_chars=200_000)
-                chunks = _chunk_text(str(document.get("text") or ""))
-                status = "indexed" if chunks else "stored"
-                warnings = (
-                    document.get("warnings") if isinstance(document.get("warnings"), list) else []
-                )
-                error = "; ".join(str(item) for item in warnings[:3]) or None
-            except (DocumentRuntimeError, OSError, zipfile.BadZipFile) as exc:
-                status = "failed"
-                error = f"Document indexing failed: {exc}"
-        else:
-            error = "Binary or unsupported text format; file stored without chunks."
-
+        chunks, status, error = self._extract_index(stored)
         file_record = self.storage.create_file_record(
             name=stored.name,
             source_path=source_path,
@@ -258,6 +268,68 @@ class FileIngestor:
         )
         return {"file": file_record, "chunks_indexed": len(chunks)}
 
+    @staticmethod
+    def _extract_index(stored: StoredFile) -> tuple[list[str], str, str | None]:
+        chunks: list[str] = []
+        status = "stored"
+        error: str | None = None
+        if _is_surfer_only_document(stored):
+            try:
+                result = JarvisDocumentSurfer().read(stored.path, max_chars=200_000)
+                document = (
+                    result.get("document") if isinstance(result.get("document"), dict) else {}
+                )
+                chunks = _chunk_text(str(result.get("text") or ""))
+                status = "indexed" if chunks else "stored"
+                warnings = (
+                    document.get("warnings") if isinstance(document.get("warnings"), list) else []
+                )
+                error = "; ".join(str(item) for item in warnings[:3]) or None
+            except (DocumentSurferError, OSError, zipfile.BadZipFile) as exc:
+                status = "failed"
+                error = f"Document indexing failed: {exc}"
+        elif _is_text_file(stored):
+            if stored.size > MAX_TEXT_BYTES:
+                status = "stored"
+                error = f"Text indexing skipped: file is larger than {MAX_TEXT_BYTES} bytes."
+            else:
+                try:
+                    text = stored.path.read_text(encoding="utf-8", errors="replace")
+                    chunks = _chunk_text(text)
+                    status = "indexed" if chunks else "stored"
+                except OSError as exc:
+                    status = "failed"
+                    error = str(exc)
+        elif is_supported_document(stored.name, stored.mime_type):
+            try:
+                document = extract_document(stored.path, max_chars=200_000)
+                chunks = _chunk_text(str(document.get("text") or ""))
+                status = "indexed" if chunks else "stored"
+                warnings = (
+                    document.get("warnings") if isinstance(document.get("warnings"), list) else []
+                )
+                error = "; ".join(str(item) for item in warnings[:3]) or None
+            except (DocumentRuntimeError, OSError, zipfile.BadZipFile) as exc:
+                status = "failed"
+                error = f"Document indexing failed: {exc}"
+        else:
+            error = "Binary or unsupported text format; file stored without chunks."
+        return chunks, status, error
+
+
+def extract_file_index(path: str | Path, mime_type: str = "") -> tuple[list[str], str, str | None]:
+    """Extract index chunks through the same core/extended document policy as uploads."""
+
+    resolved = Path(path).resolve(strict=False)
+    stored = StoredFile(
+        name=resolved.name,
+        path=resolved,
+        sha256="",
+        size=resolved.stat().st_size,
+        mime_type=mime_type or mimetypes.guess_type(resolved.name)[0] or "application/octet-stream",
+    )
+    return FileIngestor._extract_index(stored)
+
 
 def _safe_filename(filename: str) -> str:
     raw = Path(filename or "upload.txt").name
@@ -274,9 +346,22 @@ def _is_text_file(stored: StoredFile) -> bool:
     )
 
 
+def _is_surfer_only_document(stored: StoredFile) -> bool:
+    return (
+        Path(stored.name).suffix.lower() in SURFER_ONLY_DOCUMENT_EXTENSIONS
+        and not is_supported_document(stored.name, stored.mime_type)
+        and is_document_path_supported(stored.path, stored.mime_type)
+    )
+
+
 def _looks_indexable_path(path: Path) -> bool:
     suffix = path.suffix.lower()
-    if suffix in TEXT_EXTENSIONS or suffix in EXTENSION_MIME_TYPES or is_supported_document(path):
+    if (
+        suffix in TEXT_EXTENSIONS
+        or suffix in EXTENSION_MIME_TYPES
+        or suffix in SURFER_ONLY_DOCUMENT_EXTENSIONS
+        or is_supported_document(path)
+    ):
         return True
     mime_type = mimetypes.guess_type(path.name)[0] or ""
     return mime_type.startswith("text/") or mime_type in TEXT_MIME_TYPES
