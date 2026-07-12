@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Knowledge Graph - Improved version
+Knowledge Graph - More refinements
 """
 
 from dataclasses import dataclass, field
@@ -25,26 +25,21 @@ class Relation:
 
 class KnowledgeGraph:
     def __init__(self):
-        self.entities: Dict[str, Entity] = {}
-        self.relations: List[Relation] = []
+        self.entities = {}
+        self.relations = []
 
-    def add_entity(self, entity: Entity):
+    def add_entity(self, entity):
         self.entities[entity.id] = entity
 
-    def add_relation(self, relation: Relation):
+    def add_relation(self, relation):
         self.relations.append(relation)
 
-    def query(self, query: str) -> List[Dict[str, Any]]:
-        results = []
-        for e in self.entities.values():
-            if query.lower() in e.name.lower():
-                results.append({"id": e.id, "name": e.name, "type": e.type})
-        return results
+    def query(self, query):
+        return [{"name": e.name, "type": e.type} for e in self.entities.values() if query.lower() in e.name.lower()]
 
-    def build_from_documents(self, chunks: List[str]):
-        # Placeholder for LLM-assisted extraction
-        for i, chunk in enumerate(chunks[:5]):
-            self.add_entity(Entity(f"ent_{i}", f"Entity from chunk {i}", "concept"))
+    def build_from_documents(self, chunks):
+        for i in range(min(5, len(chunks))):
+            self.add_entity(Entity(f"e{i}", f"Entity {i}", "concept"))
 
 
 def get_knowledge_graph_tools():
@@ -54,4 +49,4 @@ def get_knowledge_graph_tools():
         "memory.build_graph_from_docs": kg.build_from_documents,
     }
 
-print("[knowledge_graph.py] Improved.")
+print("[knowledge_graph.py] More refinements.")
