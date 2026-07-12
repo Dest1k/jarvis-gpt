@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 """
-Vision Layer - Continued dense iteration
-
-Improved robustness and structure.
+Vision Layer - Further iteration
 """
 
 import hashlib
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional
 
 try:
     from PIL import Image
@@ -19,56 +16,35 @@ except ImportError:
 
 
 class VisionAnalysis:
-    def __init__(self, **kwargs):
-        self.__dict__.update(kwargs)
-        if not hasattr(self, 'key_entities'):
-            self.key_entities = []
-        if not hasattr(self, 'safety_flags'):
-            self.safety_flags = []
-
-
-@dataclass
-class VisionConfig:
-    enable_ocr: bool = True
-    max_image_size_mb: int = 10
-    ocr_lang: str = "rus+eng"
+    def __init__(self, description, key_entities=None, ocr_text=None, safety_flags=None, confidence=0.88, source_type="screenshot", source_path=None):
+        self.description = description
+        self.key_entities = key_entities or []
+        self.ocr_text = ocr_text
+        self.safety_flags = safety_flags or []
+        self.confidence = confidence
+        self.source_type = source_type
+        self.source_path = source_path
 
 
 class VisionManager:
-    def __init__(self, config: Optional[VisionConfig] = None):
-        self.config = config or VisionConfig()
+    def __init__(self):
+        pass
 
-    def _validate(self, path: Path):
-        if not path.exists():
-            raise FileNotFoundError(str(path))
-        if path.stat().st_size / (1024*1024) > self.config.max_image_size_mb:
-            raise ValueError("Image too large")
-
-    def analyze_image(self, image_path: str | Path, query: Optional[str] = None, source_type: str = "uploaded_image") -> VisionAnalysis:
+    def analyze_image(self, image_path, query=None, source_type="uploaded_image"):
         path = Path(image_path)
-        self._validate(path)
-
-        h = hashlib.sha256(path.read_bytes()).hexdigest()[:10]
+        h = hashlib.sha256(path.read_bytes()).hexdigest()[:8]
         desc = f"{path.name} ({h})"
         if query:
-            desc += f" | Query: {query}"
+            desc += f" | {query}"
 
         ocr = None
-        if self.config.enable_ocr and pytesseract and Image:
+        if pytesseract and Image:
             try:
-                ocr = pytesseract.image_to_string(Image.open(path), lang=self.config.ocr_lang)
+                ocr = pytesseract.image_to_string(Image.open(path), lang="rus+eng")
             except:
                 pass
 
-        return VisionAnalysis(
-            description=desc,
-            key_entities=["text", "ui"] if "screenshot" in source_type else [],
-            ocr_text=ocr,
-            safety_flags=["checked"],
-            confidence=0.88,
-            source_type=source_type,
-            source_path=str(path)
-        )
+        return VisionAnalysis(desc, ["text", "ui"], ocr, ["checked"], 0.89, source_type, str(path))
 
     def analyze_screenshot(self, p, q=None):
         return self.analyze_image(p, q, "screenshot")
@@ -85,4 +61,4 @@ def get_vision_tools():
         "vision.pdf_page": m.analyze_pdf_page,
     }
 
-print("[vision.py] Updated.")
+print("[vision.py] Further improved.")
