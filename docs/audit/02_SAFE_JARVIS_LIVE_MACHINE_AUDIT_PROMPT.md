@@ -1,21 +1,20 @@
 # JARVIS — КАНОНИЧЕСКИЙ ЗАПУСК PHASE B НА ЖИВОЙ МАШИНЕ
 
-Ты выполняешь PHASE B двухкомпонентного доказательного аудита JARVIS через Codex Sol Ultra на целевой Windows-машине.
+Ты выполняешь PHASE B двухкомпонентного доказательного аудита JARVIS через Codex Sol Ultra на принадлежащей пользователю Windows-машине.
 
-Этот файл является **каноническим launcher-prompt**. Не заменяй его прямым запуском core-файла.
+Этот файл является **единственным каноническим launcher-prompt для PHASE B**. Он объединяет полный план проверки качества и обязательный контур изоляции/отката.
 
-## 1. Начало
+Цель работы — функциональная корректность, надёжность, целостность данных, восстановимость, производительность и качество интерфейса. Не выполняй активные наступательные проверки, не воздействуй на внешние системы и не формируй инструкции по нарушению ограничений. Все проверки границ делай только на безвредных синтетических примерах, loopback fixtures, временных каталогах и копиях состояния.
 
-Рабочий репозиторий:
+Все сообщения пользователю пиши только на русском. Подробности сохраняй в `.audit/**`; в чате сообщай процент готовности, counts, paths, blockers и безопасные следующие действия. Плановые отчёты — на 50% и 90% готовности. Раньше сообщай только о реальном blocker или необходимости решения пользователя.
 
-```text
-D:\jarvis-gpt
-```
+---
 
-Runtime/data root:
+## 1. Канонические каталоги
 
 ```text
-D:\jarvis
+D:\jarvis-gpt   — Git-репозиторий и audit artifacts
+D:\jarvis       — модели, Docker/runtime-данные, backups и тяжёлые evidence
 ```
 
 Начни:
@@ -24,30 +23,71 @@ D:\jarvis
 Set-Location D:\jarvis-gpt
 git rev-parse --show-toplevel
 git status --short --branch
+git rev-parse HEAD
 ```
 
 Ожидаемый Git root — `D:/jarvis-gpt`. `D:\jarvis` не является репозиторием.
 
-## 2. Обязательные документы
+Не выполняй `reset --hard`, aggressive clean, auto-stash или присвоение пользовательских изменений.
 
-До любых runtime-действий полностью прочитай и затем исполни совместно:
+---
 
-1. `docs/audit/02_JARVIS_LIVE_MACHINE_AUDIT_PROMPT.md` — полный core-план живого аудита;
-2. `docs/audit/04_JARVIS_REMEDIATION_SAFETY_AND_ROLLBACK_PROTOCOL.md` — обязательный safety/rollback-контур;
-3. `.audit/LATEST_STATIC_RUN.txt` и весь handoff PHASE A, требуемый core-планом;
+## 2. Проверка актуальности документов без потери handoff
+
+До начала аудита:
+
+1. сохрани список существующих untracked/modified файлов;
+2. отдельно зафиксируй наличие `.audit/LATEST_STATIC_RUN.txt` и run-каталога;
+3. выполни `git fetch`;
+4. допускается только обычный fast-forward текущей ветки, если Git доказывает отсутствие конфликтующих tracked-изменений;
+5. существующие untracked `.audit/**` не удаляй и не перезаписывай молча;
+6. если fast-forward невозможен, остановись с точным blocker — не используй reset/rebase/stash;
+7. после синхронизации повторно проверь Git root, status, prompt-файлы и handoff.
+
+Изменения только в `docs/audit/**` не считаются production source drift, но новая редакция prompt должна быть прочитана полностью.
+
+Если PHASE A artifacts находятся в отдельной audit-ветке/commit и ещё не присутствуют локально, получи их безопасным способом, сохранив production branch и пользовательские изменения. Разрешено восстановить только `.audit/**` из известного audit commit после проверки commit SHA и путей. Не переключай ветку вслепую и не копируй production-файлы из audit-ветки.
+
+---
+
+## 3. Обязательные документы
+
+Полностью прочитай и исполняй совместно:
+
+1. `docs/audit/02_JARVIS_LIVE_MACHINE_AUDIT_PROMPT.md` — core-план проверки качества;
+2. `docs/audit/04_JARVIS_REMEDIATION_SAFETY_AND_ROLLBACK_PROTOCOL.md` — изоляция, backups и rollback;
+3. `.audit/LATEST_STATIC_RUN.txt` и PHASE A handoff;
 4. актуальные repository instructions (`AGENTS.md`, `CODEX.md`, `CLAUDE.md` и локальные эквиваленты).
 
-Выполни **весь** scope core-плана. Этот launcher ничего из него не сокращает.
+Core-план выполняется целиком. При конфликте:
 
-При конфликте:
+- rollback protocol имеет приоритет в Git/worktree/backups/runtime/Docker/restore/stop conditions;
+- repository instructions имеют приоритет в локальных правилах, если не ослабляют изоляцию;
+- выбери более безопасное поведение и запиши решение.
 
-- safety/rollback protocol имеет приоритет в вопросах Git, worktree, backups, runtime state, Docker, destructive/fault tests, restore и stop conditions;
-- repository instructions имеют приоритет в локальных правилах проекта, если не ослабляют safety;
-- не разрешай конфликт догадкой: выбери более безопасное поведение и зафиксируй решение.
+---
 
-## 3. Дополнительная обязательная цель PHASE B
+## 4. Возобновление после прежней попытки
 
-После завершения испытательной кампании недостаточно создать обычную очередь Spark. Ты обязан подготовить **технически изолированный и проверяемо откатываемый remediation-контур**.
+Если предыдущая PHASE B оборвалась, была остановлена интерфейсом или оставила background processes:
+
+1. не удаляй существующие artifacts;
+2. проверь `PIPELINE_STATE.json`, `AUDIT_STATE.md`, `LIVE_SCENARIO_QUEUE.csv` и evidence manifest;
+3. проверь Git status, process/container/port/runtime state;
+4. останови только явно принадлежащие прежней попытке fixtures/processes;
+5. верни документированное known-good состояние;
+6. сохрани `RESUME_NOTE.md` с точкой остановки и проверенными artifacts;
+7. не засчитывай незавершённый chat-ответ как PASS;
+8. продолжи с первой scenario, у которой нет полного evidence и конечного статуса;
+9. не повторяй дорогие PASS-сценарии, если их evidence, source и preconditions доказуемо неизменны.
+
+Если невозможно определить, что было изменено прежней попыткой, установи `BLOCKED_BY_SAFETY` и остановись до решения пользователя.
+
+---
+
+## 5. Обязательная цель PHASE B
+
+После полного live-аудита ты обязан не только создать Spark queue, но и подготовить технически изолированный, проверяемо откатываемый remediation-контур.
 
 До создания обычного marker:
 
@@ -55,11 +95,11 @@ git status --short --branch
 .audit/runs/<RUN_ID>/spark/READY
 ```
 
-выполни всё ниже.
+выполни пункты ниже.
 
-### 3.1. Классифицируй все задачи Spark
+### 5.1. Классифицируй каждую Spark task
 
-Для каждой задачи заполни safety-поля из раздела 3 протокола:
+Заполни:
 
 - `mutation_class`;
 - `mutable_roots`;
@@ -70,11 +110,9 @@ git status --short --branch
 - resource/process/network budgets;
 - rollback checkpoint, commands и oracles.
 
-Ни одна задача с неизвестным mutation scope не может иметь status READY.
+Задача с неизвестным mutation scope не может быть READY.
 
-### 3.2. Создай safety artifacts
-
-В текущем run создай и проверь:
+### 5.2. Создай safety artifacts
 
 ```text
 spark/safety/SAFETY_PLAN.md
@@ -90,19 +128,19 @@ spark/safety/TASK_CHECKPOINTS.jsonl
 spark/safety/INCIDENT_LOG.md
 ```
 
-### 3.3. Верни систему в known-good state
+### 5.3. Верни систему в known-good state
 
-После всех fault/chaos/soak проверок:
+После всех recovery/resource/long-run checks:
 
 1. выполни cleanup;
-2. верни исходный или явно документированный профиль/runtime state;
+2. верни исходный или явно документированный profile/runtime state;
 3. запусти normal smoke;
 4. проверь health, ports, containers, processes, GPU release и DB integrity;
-5. сохрани конечный baseline, который станет исходной точкой Spark.
+5. сохрани baseline для Spark.
 
-### 3.4. Подготовь отдельный remediation worktree
+### 5.4. Подготовь отдельный remediation worktree
 
-Не переключай пользовательскую ветку и не изменяй production-код в `D:\jarvis-gpt`.
+Не меняй production-код в `D:\jarvis-gpt`.
 
 Создай:
 
@@ -111,94 +149,100 @@ D:\jarvis-gpt-worktrees\spark-<RUN_ID>
 spark-remediation/<RUN_ID>
 ```
 
-строго по разделу 4 safety protocol.
+Если audit artifacts не входят в base commit:
 
-Если audit artifacts ещё не входят в base commit:
+- перенеси только текущий `.audit/runs/<RUN_ID>` и marker-файлы;
+- проверь paths/hashes;
+- создай audit-only snapshot commit;
+- не stage пользовательские или production changes.
 
-- скопируй в worktree только `.audit/runs/<RUN_ID>` и необходимые marker-файлы;
-- проверь пути/hashes;
-- создай audit-only snapshot commit в remediation branch;
-- не stage пользовательские и production changes из исходного checkout.
+Запиши repo/worktree paths, branch, base SHA и pre-remediation SHA в `WORKTREE_IDENTITY.json`.
 
-Запиши точные repo/worktree paths, branch, base SHA и pre-remediation SHA в `WORKTREE_IDENTITY.json`.
-
-### 3.5. Создай Git rollback assets
+### 5.5. Создай Git rollback assets
 
 Создай и проверь:
 
-- `pre-spark-source-<RUN_ID>`;
-- `pre-spark-<RUN_ID>`;
-- `D:\jarvis\audit-backups\<RUN_ID>\git\jarvis-gpt-pre-spark.bundle`;
-- SHA-256 и `git bundle verify` evidence.
+```text
+pre-spark-source-<RUN_ID>
+pre-spark-<RUN_ID>
+D:\jarvis\audit-backups\<RUN_ID>\git\jarvis-gpt-pre-spark.bundle
+```
 
-Не выполняй push, merge, rebase или force-update.
+Сохрани SHA-256 и `git bundle verify` evidence. Не выполняй push, merge, rebase или force-update.
 
-### 3.6. Создай verified runtime checkpoint
+### 5.6. Создай verified runtime checkpoint
 
-Для всех mutable critical objects, которые хотя бы одна READY-задача может затронуть:
+Для каждого mutable critical object, которого может коснуться READY task:
 
 - создай консистентную резервную копию;
-- для SQLite используй backup API или доказуемо остановленных writers, а не слепую live-copy;
-- инвентаризируй/экспортируй mutable Docker volumes либо заблокируй связанные задачи;
+- для SQLite используй backup API или остановленных writers;
+- инвентаризируй/экспортируй mutable Docker volumes либо заблокируй связанные tasks;
 - проверь hashes/counts/integrity;
-- выполни restore rehearsal в отдельный temp root;
-- проверь доступное место до копирования;
-- не копируй модели/images/rebuildable caches без необходимости.
+- выполни пробное восстановление в temp root;
+- проверь свободное место;
+- не копируй models/images/rebuildable caches без необходимости.
 
-Если checkpoint или restore rehearsal не доказаны, соответствующие state-mutating задачи получают `BLOCKED_BY_SAFETY`.
+Если checkpoint или restore rehearsal не доказаны, state-mutating tasks получают `BLOCKED_BY_SAFETY`.
 
-### 3.7. Safety consistency gate
-
-Запусти отдельную consistency-проверку раздела 13 safety protocol.
+### 5.7. Consistency gate
 
 Только при PASS:
 
 1. установи `SAFETY_STATE.json.state = READY`;
-2. создай пустой marker:
+2. создай:
 
 ```text
 .audit/runs/<RUN_ID>/spark/safety/READY
 ```
 
-3. после этого создай обычный `spark/READY`;
-4. создай `.audit/LATEST_COMPLETE_RUN.txt` только при выполнении всех остальных критериев core-плана.
+3. затем создай обычный `spark/READY`;
+4. создай `.audit/LATEST_COMPLETE_RUN.txt` только при выполнении остальных критериев core-плана.
 
 Обычный `spark/READY` без `spark/safety/READY` запрещён.
 
-## 4. Что передать Spark
+---
 
-Сгенерированный `spark/START_HERE_FOR_SPARK.md` должен требовать запуск через:
+## 6. Что передать Spark
+
+`START_HERE_FOR_SPARK.md` должен требовать запуск через:
 
 ```text
 docs/audit/03_SAFE_JARVIS_SPARK_REMEDIATION_PROMPT.md
 ```
 
-а не напрямую через core-файл.
-
-Он должен явно указать:
+Он указывает:
 
 - RUN_ID;
 - remediation worktree и branch;
 - audited/base/pre-spark commits;
 - bundle path/hash;
-- runtime checkpoint path/hash/status;
+- runtime checkpoint path/status;
 - safety state;
 - known-good runtime state;
 - первую eligible task;
 - stop conditions.
 
-## 5. Финальный ответ
+Task descriptions должны быть функциональными и нейтральными: contract, harmless reproduction, expected/observed, regression test, scope и rollback. Не включай длинные operational details по нарушению границ.
 
-В дополнение к core-отчёту сообщи:
+---
 
-- создан ли отдельный worktree и его точный путь;
+## 7. Финальный ответ
+
+В дополнение к core-отчёту кратко сообщи по-русски:
+
+- процент готовности 100%;
+- run path;
+- source/current commit и drift;
+- число PASS/FAIL/BLOCKED/INCONCLUSIVE;
+- profiles/model mapping;
+- counts findings и READY/BLOCKED tasks;
+- точные paths к итоговым documents;
+- создан ли отдельный worktree и его path;
 - remediation branch и pre-Spark SHA;
 - проверен ли Git bundle;
-- создан и проверен ли runtime checkpoint;
-- прошёл ли restore rehearsal;
-- количество READY/BLOCKED_BY_SAFETY задач;
-- существует ли `spark/safety/READY`;
-- существует ли обычный `spark/READY`;
+- создан ли runtime checkpoint;
+- прошло ли пробное восстановление;
+- существуют ли `spark/safety/READY` и `spark/READY`;
 - в каком состоянии оставлены JARVIS, Docker и LLM.
 
-Если safety gate не пройден, не называй PHASE C готовой к запуску и не создавай фиктивные READY markers.
+Не публикуй в чате raw logs, конфиденциальные значения или длинные тестовые входы. Если safety gate не пройден, не называй PHASE C готовой к запуску.
