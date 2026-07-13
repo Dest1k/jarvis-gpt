@@ -1,0 +1,449 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jarvis.local/schemas/upstream-candidate-1.0.json",
+  "title": "JARVIS upstream adoption candidate",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "candidate_id",
+    "component",
+    "origin_kind"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "candidate_id": {
+      "type": "string",
+      "pattern": "^[A-Z0-9][A-Z0-9._-]{2,63}$"
+    },
+    "component": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "origin_kind": {
+      "$ref": "#/$defs/origin_kind"
+    },
+    "finding_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "capability_gap": {
+      "type": "string",
+      "minLength": 1
+    },
+    "commissioned_by": {
+      "type": "string",
+      "minLength": 1
+    },
+    "implementation_agent": {
+      "type": "string",
+      "minLength": 1
+    },
+    "external_code_imported": {
+      "type": "boolean"
+    },
+    "adoption_mode": {
+      "$ref": "#/$defs/adoption_mode"
+    },
+    "repository_url": {
+      "type": "string",
+      "format": "uri",
+      "pattern": "^https://[^?#]+$"
+    },
+    "pinned_commit_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "license": {
+      "$ref": "#/$defs/license_record"
+    },
+    "source_files": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/source_file"
+      },
+      "uniqueItems": true
+    },
+    "dependency_review": {
+      "$ref": "#/$defs/gate_review"
+    },
+    "security_review": {
+      "$ref": "#/$defs/gate_review"
+    },
+    "isolated_spike": {
+      "$ref": "#/$defs/gate_review"
+    },
+    "tests": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "regression",
+        "failure",
+        "rollback"
+      ],
+      "properties": {
+        "regression": {
+          "$ref": "#/$defs/nonempty_evidence_list"
+        },
+        "failure": {
+          "$ref": "#/$defs/nonempty_evidence_list"
+        },
+        "rollback": {
+          "$ref": "#/$defs/nonempty_evidence_list"
+        }
+      }
+    },
+    "provenance_record": {
+      "$ref": "#/$defs/evidence_reference"
+    },
+    "human_approval": {
+      "$ref": "#/$defs/human_approval"
+    }
+  },
+  "anyOf": [
+    {
+      "required": [
+        "finding_ids"
+      ],
+      "properties": {
+        "finding_ids": {
+          "minItems": 1
+        }
+      }
+    },
+    {
+      "required": [
+        "capability_gap"
+      ]
+    }
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "origin_kind": {
+            "const": "commissioned_internal"
+          }
+        },
+        "required": [
+          "origin_kind"
+        ]
+      },
+      "then": {
+        "required": [
+          "commissioned_by",
+          "implementation_agent",
+          "external_code_imported"
+        ],
+        "properties": {
+          "external_code_imported": {
+            "const": false
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "origin_kind": {
+            "enum": [
+              "inspired_by",
+              "external_dependency",
+              "external_adapter",
+              "vendored",
+              "ported_code",
+              "forked"
+            ]
+          }
+        },
+        "required": [
+          "origin_kind"
+        ]
+      },
+      "then": {
+        "required": [
+          "external_code_imported",
+          "adoption_mode",
+          "repository_url",
+          "pinned_commit_sha",
+          "license",
+          "source_files",
+          "dependency_review",
+          "security_review",
+          "isolated_spike",
+          "tests",
+          "provenance_record",
+          "human_approval"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "adoption_mode": {
+            "enum": [
+              "test_corpus",
+              "ported_module",
+              "fork"
+            ]
+          }
+        },
+        "required": [
+          "adoption_mode"
+        ]
+      },
+      "then": {
+        "properties": {
+          "external_code_imported": {
+            "const": true
+          },
+          "source_files": {
+            "minItems": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "adoption_mode": {
+            "const": "idea_only"
+          }
+        },
+        "required": [
+          "adoption_mode"
+        ]
+      },
+      "then": {
+        "properties": {
+          "external_code_imported": {
+            "const": false
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "origin_kind": {
+      "type": "string",
+      "enum": [
+        "internal_human",
+        "commissioned_internal",
+        "inspired_by",
+        "external_dependency",
+        "external_adapter",
+        "vendored",
+        "ported_code",
+        "forked",
+        "generated_fixture"
+      ]
+    },
+    "adoption_mode": {
+      "type": "string",
+      "enum": [
+        "idea_only",
+        "test_corpus",
+        "external_dependency",
+        "black_box_adapter",
+        "ported_module",
+        "fork"
+      ]
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "evidence_reference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "pattern": "^(docs/upstream|docs/assurance|qa)/[^\\\\:]+$"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "nonempty_evidence_list": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/evidence_reference"
+      }
+    },
+    "source_file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "gate_review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "PASS",
+            "FAIL",
+            "BLOCKED",
+            "NOT_REVIEWED"
+          ]
+        },
+        "evidence": {
+          "$ref": "#/$defs/evidence_reference"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "enum": [
+                  "PASS",
+                  "FAIL"
+                ]
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "required": [
+              "evidence"
+            ]
+          }
+        }
+      ]
+    },
+    "license_record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "classification",
+        "identifier",
+        "verification_status",
+        "repository_path",
+        "notice_verified"
+      ],
+      "properties": {
+        "classification": {
+          "enum": [
+            "permissive",
+            "weak_copyleft",
+            "strong_copyleft",
+            "custom",
+            "source_available",
+            "no_license",
+            "unknown"
+          ]
+        },
+        "identifier": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "verification_status": {
+          "enum": [
+            "VERIFIED",
+            "EXPLICIT_REVIEW_APPROVED",
+            "EXPLICIT_REVIEW_REQUIRED",
+            "BLOCKED",
+            "UNKNOWN"
+          ]
+        },
+        "repository_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "notice_verified": {
+          "type": "boolean"
+        },
+        "evidence": {
+          "$ref": "#/$defs/evidence_reference"
+        }
+      }
+    },
+    "human_approval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "APPROVED",
+            "REJECTED",
+            "PENDING"
+          ]
+        },
+        "approved_by": {
+          "type": "string",
+          "minLength": 1
+        },
+        "approved_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "evidence": {
+          "$ref": "#/$defs/evidence_reference"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "enum": [
+                  "APPROVED",
+                  "REJECTED"
+                ]
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "required": [
+              "approved_by",
+              "approved_at",
+              "evidence"
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

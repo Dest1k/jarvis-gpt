@@ -1,0 +1,97 @@
+{
+  "schema": "jarvis.assurance-foundation-state.v1",
+  "run_id": "20260713T002206Z_686424795712",
+  "recorded_at_utc": "2026-07-13T20:19:43Z",
+  "state": "ASSURANCE_FOUNDATION_CANDIDATE_FOR_REVIEW",
+  "git": {
+    "main_checkout": "D:\\jarvis-gpt",
+    "main_branch": "main",
+    "main_head": "b2c481de1a9e68079a67ff49790eb685a09e80e5",
+    "origin_main": "b2c481de1a9e68079a67ff49790eb685a09e80e5",
+    "foundation_worktree": "D:\\jarvis-gpt-worktrees\\assurance-20260713T002206Z_686424795712",
+    "foundation_branch": "foundation/assurance-upstream/20260713T002206Z_686424795712",
+    "foundation_base": "b2c481de1a9e68079a67ff49790eb685a09e80e5",
+    "head_before_final_foundation_commit": "924bef7caf9a328a3353f8a7380cc986b744aa01",
+    "final_head_resolution": "git rev-parse HEAD on the foundation branch",
+    "substantive_commits": [
+      "573bd20b680b6dbc8201e303112e1b4c8e2630a0",
+      "924bef7caf9a328a3353f8a7380cc986b744aa01"
+    ],
+    "push_performed": false,
+    "merge_performed": false
+  },
+  "fixed_context": {
+    "functional_audit_completion_commit": "5aae9855f0779c746ec9287c2ec8917637fedb36",
+    "tested_production_head": "3fda655e4f723a0d8f58a4edfb4b3ee7dda079fe",
+    "functional_status": "COMPLETE_WITH_BLOCKERS",
+    "functional_progress_percent": 100,
+    "functional_ready": false,
+    "spark_ready": true,
+    "spark_tasks": 17,
+    "not_run_tasks": 0
+  },
+  "checkpoint": {
+    "tag": "pre-assurance-bootstrap-20260713T002206Z_686424795712",
+    "tag_target": "b2c481de1a9e68079a67ff49790eb685a09e80e5",
+    "bundle_verified": true,
+    "bundle_sha256": "ab31161a3aee6372a2432c0531c6c3ce48c9a8a25dd027c7270f7595e572dcb2",
+    "untracked_baseline_count": 269,
+    "untracked_baseline_sha256": "443722c67fed1727728d3a0242d4bf4573549784a58536328a99c191e1f87fbc"
+  },
+  "immutable_tree_oids": {
+    ".audit": "ec672e1a1fbd966ae86c76ad59b1f5f7a1738742",
+    "backend/src": "6bfbb9c3cd23f3895c136ffa536345501411b4cc",
+    "frontend/app": "cd1d06531bb0f3c793316fa774f72d45e90c3d5a",
+    "docker-compose.yml": "4b69ade267c2504b3939b2d491cf4498fa7535df",
+    "scripts/doctor.ps1": "0802bbad4eb4c731782ceeaa546be225162c7cf7",
+    "scripts/jarvis-launcher.ps1": "243135360828d08c1e56e8e5e03e5308fef7dd62",
+    "functional_spark_queue": "36282aa80d93a694439b71b9fcf47799f20a7057"
+  },
+  "validation": {
+    "pytest": {
+      "passed": 41,
+      "failed": 0,
+      "core": 23,
+      "review_cli": 5,
+      "upstream": 13
+    },
+    "ruff": "PASS",
+    "compileall": "PASS",
+    "git_diff_check": "PASS",
+    "suite_scenarios": 1,
+    "evidence_records": 8,
+    "replay": {
+      "matched": 8,
+      "mismatches": 0,
+      "PASS": 1,
+      "FAIL": 6,
+      "INCONCLUSIVE": 1
+    },
+    "review_packets": 8,
+    "separate_semantic_review_outputs": 2,
+    "semantic_disagreement_result": "INCONCLUSIVE",
+    "deterministic_fail_override_attempt_result": "FAIL",
+    "upstream_gate_fixtures": "PASS",
+    "overlay_source_hashes": "4/4 MATCH",
+    "overlay_task_coverage": "17/17"
+  },
+  "scope": {
+    "audit_modified": false,
+    "production_source_modified": false,
+    "frontend_modified": false,
+    "production_scripts_modified": false,
+    "docker_configuration_modified": false,
+    "runtime_state_modified": false,
+    "dependencies_installed": false,
+    "external_code_executed": false,
+    "functional_ready_created": false
+  },
+  "wave_0": {
+    "protocol_path": "docs/audit/10_JARVIS_FUNCTIONAL_REMEDIATION_WAVES_PROMPT.md",
+    "protocol_structurally_ready": true,
+    "execution_allowed_before_review": false,
+    "required_precondition": "explicit independently reviewed local foundation commit"
+  },
+  "residual_blockers": [],
+  "review_status": "PENDING_INDEPENDENT_REVIEW"
+}

@@ -1,0 +1,313 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jarvis.local/schemas/upstream-provenance-1.0.json",
+  "title": "JARVIS upstream engineering provenance record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "record_id",
+    "candidate_id",
+    "component",
+    "origin_kind",
+    "recorded_at",
+    "recorded_by"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "record_id": {
+      "type": "string",
+      "pattern": "^[A-Z0-9][A-Z0-9._-]{2,63}$"
+    },
+    "candidate_id": {
+      "type": "string",
+      "pattern": "^[A-Z0-9][A-Z0-9._-]{2,63}$"
+    },
+    "component": {
+      "type": "string",
+      "minLength": 1
+    },
+    "origin_kind": {
+      "$ref": "#/$defs/origin_kind"
+    },
+    "commissioned_by": {
+      "type": "string",
+      "minLength": 1
+    },
+    "implementation_agent": {
+      "type": "string",
+      "minLength": 1
+    },
+    "adoption_mode": {
+      "$ref": "#/$defs/adoption_mode"
+    },
+    "repository_url": {
+      "type": "string",
+      "format": "uri",
+      "pattern": "^https://[^?#]+$"
+    },
+    "pinned_commit_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "license_snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "identifier",
+        "repository_path",
+        "sha256"
+      ],
+      "properties": {
+        "identifier": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repository_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sha256": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "external_code_imported": {
+      "type": "boolean"
+    },
+    "source_files": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/source_file"
+      },
+      "uniqueItems": true
+    },
+    "imported_paths": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/imported_path"
+      }
+    },
+    "transformation_notes": {
+      "type": "string"
+    },
+    "retained_notices": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "recorded_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "recorded_by": {
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "origin_kind": {
+            "const": "commissioned_internal"
+          }
+        },
+        "required": [
+          "origin_kind"
+        ]
+      },
+      "then": {
+        "required": [
+          "commissioned_by",
+          "implementation_agent",
+          "external_code_imported"
+        ],
+        "properties": {
+          "external_code_imported": {
+            "const": false
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "origin_kind": {
+            "enum": [
+              "inspired_by",
+              "external_dependency",
+              "external_adapter",
+              "vendored",
+              "ported_code",
+              "forked"
+            ]
+          }
+        },
+        "required": [
+          "origin_kind"
+        ]
+      },
+      "then": {
+        "required": [
+          "adoption_mode",
+          "repository_url",
+          "pinned_commit_sha",
+          "license_snapshot",
+          "external_code_imported",
+          "source_files",
+          "imported_paths",
+          "transformation_notes",
+          "retained_notices"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "adoption_mode": {
+            "enum": [
+              "test_corpus",
+              "ported_module",
+              "fork"
+            ]
+          }
+        },
+        "required": [
+          "adoption_mode"
+        ]
+      },
+      "then": {
+        "properties": {
+          "external_code_imported": {
+            "const": true
+          },
+          "source_files": {
+            "minItems": 1
+          },
+          "imported_paths": {
+            "minItems": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "adoption_mode": {
+            "enum": [
+              "idea_only",
+              "external_dependency",
+              "black_box_adapter"
+            ]
+          }
+        },
+        "required": [
+          "adoption_mode"
+        ]
+      },
+      "then": {
+        "properties": {
+          "external_code_imported": {
+            "const": false
+          },
+          "imported_paths": {
+            "maxItems": 0
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "origin_kind": {
+      "type": "string",
+      "enum": [
+        "internal_human",
+        "commissioned_internal",
+        "inspired_by",
+        "external_dependency",
+        "external_adapter",
+        "vendored",
+        "ported_code",
+        "forked",
+        "generated_fixture"
+      ]
+    },
+    "adoption_mode": {
+      "type": "string",
+      "enum": [
+        "idea_only",
+        "test_corpus",
+        "external_dependency",
+        "black_box_adapter",
+        "ported_module",
+        "fork"
+      ]
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "source_file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "imported_path": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_path",
+        "destination_path",
+        "source_sha256",
+        "result_sha256",
+        "transformation"
+      ],
+      "properties": {
+        "source_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "destination_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "result_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "transformation": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

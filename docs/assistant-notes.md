@@ -9,6 +9,38 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-13 - Codex (PHASE B.5 assurance and upstream foundation)
+
+- Work is isolated on
+  `foundation/assurance-upstream/20260713T002206Z_686424795712` at
+  `D:\jarvis-gpt-worktrees\assurance-20260713T002206Z_686424795712`, based on
+  orchestration HEAD `b2c481de1a9e68079a67ff49790eb685a09e80e5`. The
+  completed functional-audit commit remains `5aae9855...`; the production code
+  exercised by that campaign remains `3fda655e...`. These SHAs are not
+  interchangeable.
+- Added permanent offline-first `qa/` tooling: loopback-only HTTP with
+  `trust_env=False`, exact CLI allowlists with `shell=False`, unique campaign
+  namespaces, append-only sanitized JSONL, deterministic response/stream/
+  artifact/state/format validators, replay, explicit reviewer independence,
+  immutable review outputs, and fail-closed adjudication.
+- Added the offline upstream candidate/provenance gate under `qa/upstream/` and
+  `docs/upstream/`. The donor registry is empty. `web_surfer` and
+  `document_surfer` are engineering-provenance records marked
+  `commissioned_internal`; no external code is claimed or imported.
+- Added the remediation overlay and
+  `docs/audit/10_JARVIS_FUNCTIONAL_REMEDIATION_WAVES_PROMPT.md`. It removes the
+  false `functional/READY` precondition, permits exactly one explicit reviewed
+  wave per run, and leaves `SPARK-0013` behind separate `PROFILE-SAFETY` /
+  `PROFILE-RESEARCH` product decisions. Do not run protocol `07`.
+- Offline validation at handoff: `41 passed`; Ruff, compileall, suite/evidence
+  validation, and replay are clean. Calibration replay reproduces 1 PASS,
+  6 FAIL, and 1 INCONCLUSIVE with zero mismatches. Separate synthetic reviews
+  preserve disagreement, and two semantic PASS votes cannot override a
+  deterministic FAIL.
+- No `.audit/**`, backend/frontend production source, Docker/launcher config,
+  or runtime state was changed. No push or merge was performed. Review the
+  local foundation commits before using protocol `10` for `WAVE-0`.
+
 ### 2026-07-12 - Codex (vLLM-only performance and resilient catalog integration)
 
 - Runtime remains vLLM-only. `gemma4-turbo` is bound exclusively to

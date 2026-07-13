@@ -1,0 +1,271 @@
+schema_version: 1
+kind: jarvis_functional_remediation_overlay
+run_id: "20260713T002206Z_686424795712"
+status: "FOUNDATION_CANDIDATE"
+
+git_context:
+  orchestration_foundation_base: "b2c481de1a9e68079a67ff49790eb685a09e80e5"
+  phase_b_completion_commit: "5aae9855f0779c746ec9287c2ec8917637fedb36"
+  tested_production_head: "3fda655e4f723a0d8f58a4edfb4b3ee7dda079fe"
+  remediation_base: "REVIEWED_FOUNDATION_COMMIT_REQUIRED_AT_EXECUTION"
+
+immutable_sources:
+  functional_run: ".audit/runs/20260713T002206Z_686424795712/functional"
+  state:
+    path: ".audit/runs/20260713T002206Z_686424795712/functional/FUNCTIONAL_STATE.json"
+    sha256: "f4ef88248fd2d09933799ea217e484f8361fb3fa2690714d2825a9853aeb6aa2"
+  findings_index:
+    path: ".audit/runs/20260713T002206Z_686424795712/functional/FUNCTIONAL_FINDINGS_INDEX.md"
+    sha256: "0eba14a00dc56e9da85f9719df6b048db41523a8b06e9bbc184a4b0a348940dd"
+  queue:
+    path: ".audit/runs/20260713T002206Z_686424795712/functional/spark/QUEUE.csv"
+    sha256: "3e923271c433de160431f35a11c8c1a743cf4bdef9fbc53fea46537da66ae138"
+  task_schema:
+    path: ".audit/runs/20260713T002206Z_686424795712/functional/spark/TASK_SCHEMA.md"
+    sha256: "1afbfc0d47313790a91065944925bee61be12c9aac947bd322094296ca4f45d7"
+
+preconditions:
+  allowed_functional_statuses:
+    - "COMPLETE_WITH_BLOCKERS"
+    - "COMPLETE"
+  progress_percent: 100
+  spark_ready_state: true
+  spark_ready_marker_required: true
+  functional_ready_marker_required: false
+  scenario_not_run_count: 0
+  every_fail_requires_finding: true
+  every_finding_requires_task: true
+  reviewed_foundation_commit_required: true
+
+execution:
+  explicit_target_required: true
+  allowed_targets:
+    - "WAVE-0"
+    - "WAVE-1"
+    - "WAVE-2"
+  one_wave_per_run: true
+  strict_task_order: true
+  one_local_commit_per_task: true
+  stop_on_task_blocker: true
+  inter_wave_review_required: true
+  automatic_next_wave: false
+  push_allowed: false
+  merge_allowed: false
+  modify_audit_evidence: false
+  create_functional_ready: false
+  live_full_suite_required: false
+  bounded_post_fix_replay_required: true
+
+waves:
+  - id: "WAVE-0"
+    name: "security_truthfulness_isolation"
+    rationale: "Evidence, success status, credentials, and UI/runtime isolation must be trustworthy before larger reruns."
+    review_before: null
+    review_after: "REQUIRED"
+    candidate_state: "WAVE_0_CANDIDATE_FOR_REVIEW"
+    tasks:
+      - order: 1
+        task_id: "SPARK-0017"
+        finding_id: "FUNC-FIND-017"
+        priority: "P1"
+        title: "Doctor token redaction"
+        task_path: ".audit/runs/20260713T002206Z_686424795712/functional/spark/tasks/SPARK-0017.md"
+        affected_cases:
+          - "FUNC-0074 docker compose config check"
+        acceptance: "Canary credentials are absent from doctor stdout, stderr, JSON, and persisted logs."
+      - order: 2
+        task_id: "SPARK-0016"
+        finding_id: "FUNC-FIND-016"
+        priority: "P1"
+        title: "Doctor exit-code truthfulness"
+        task_path: ".audit/runs/20260713T002206Z_686424795712/functional/spark/tasks/SPARK-0016.md"
+        affected_cases:
+          - "FUNC-0074"
+        acceptance: "Required failure exits nonzero, clean suite exits zero, and tests receive a sanitized deployment environment."
+      - order: 3
+        task_id: "SPARK-0006"
+        finding_id: "FUNC-FIND-006"
+        priority: "P1"
+        title: "Internal tool-envelope containment"
+        task_path: ".audit/runs/20260713T002206Z_686424795712/functional/spark/tasks/SPARK-0006.md"
+        affected_cases:
+          - "OP-0025"
+          - "OP-0028"
+          - "OP-0029"
+          - "OP-0030"
+          - "OP-0034"
+          - "OP-0036"
+          - "OP-0044"
+        acceptance: "Known marker scan finds zero tool envelopes in DOM, NDJSON deltas, and terminal answers."
+      - order: 4
+        task_id: "SPARK-0009"
+        finding_id: "FUNC-FIND-009"
+        priority: "P1"
+        title: "Canonical approval action"
+        task_path: ".audit/runs/20260713T002206Z_686424795712/functional/spark/tasks/SPARK-0009.md"
+        affected_cases:
+          - "OP-0037 repeats 1-3"
+        acceptance: "Three approvals bind fs.mkdir and create only the approved path exactly once."
+      - order: 5
+        task_id: "SPARK-0015"
+        finding_id: "FUNC-FIND-015"
+        priority: "P1"
+        title: "Runtime-home transcript isolation"
+        task_path: ".audit/runs/20260713T002206Z_686424795712/functional/spark/tasks/SPARK-0015.md"
+        affected_cases:
+          - "FUNC-0085 preflight"
+        acceptance: "Three runtime-home switches show no old messages and DOM/history equals the new backend state."
+      - order: 6
+        task_id: "SPARK-0011"
+        finding_id: "FUNC-FIND-011"
+        priority: "P1"
+        title: "Interrupted-stream placeholder cleanup"
+        task_path: ".audit/runs/20260713T002206Z_686424795712/functional/spark/tasks/SPARK-0011.md"
+        affected_cases:
+          - "OP-0040 repeats 1-3"
+        acceptance: "Interruption and retry produce no empty, duplicate, or stale final, and persisted history matches DOM."
+
+  - id: "WAVE-1"
+    name: "lifecycle_and_documents"
+    rationale: "Lifecycle stability and document identity precede document write and recovery validation."
+    review_before:
+      wave: "WAVE-0"
+      status: "APPROVED"
+      reviewed_head_required: true
+    review_after: "REQUIRED"
+    candidate_state: "WAVE_1_CANDIDATE_FOR_REVIEW"
+    tasks:
+      - order: 1
+        task_id: "SPARK-0014"
+        finding_id: "FUNC-FIND-014"
+        priority: "P2"
+        title: "Repeated-start idempotency"
+        task_path: ".audit/runs/20260713T002206Z_686424795712/functional/spark/tasks/SPARK-0014.md"
+        affected_cases:
+          - "FUNC-0070"
+        acceptance: "Three repeated starts return zero, preserve identities, and truthfully report already running."
+      - order: 2
+        task_id: "SPARK-0007"
+        finding_id: "FUNC-FIND-007"
+        priority: "P1"
+        title: "Stable uploaded-document identity and recall"
+        task_path: ".audit/runs/20260713T002206Z_686424795712/functional/spark/tasks/SPARK-0007.md"
+        affected_cases:
+          - "OP-0016"
+          - "OP-0026"
+          - "OP-0032"
+          - "OP-0039"
+          - "OP-0050"
+        acceptance: "Fresh and prior uploads resolve by exact name or ID and complete fact, comparison, retry, and mission cases."
+      - order: 3
+        task_id: "SPARK-0003"
+        finding_id: "FUNC-FIND-003"
+        priority: "P1"
+        title: "Atomic artifact path, write, and verification"
+        task_path: ".audit/runs/20260713T002206Z_686424795712/functional/spark/tasks/SPARK-0003.md"
+        affected_cases:
+          - "OP-0013"
+          - "OP-0029"
+          - "OP-0030"
+          - "OP-0031"
+          - "OP-0034"
+        acceptance: "Exact-path, copy-only, conversion, and three-way collision cases create validated artifacts with unchanged sources."
+      - order: 4
+        task_id: "SPARK-0008"
+        finding_id: "FUNC-FIND-008"
+        priority: "P2"
+        title: "Corrupt-document recovery"
+        task_path: ".audit/runs/20260713T002206Z_686424795712/functional/spark/tasks/SPARK-0008.md"
+        affected_cases:
+          - "OP-0033 repeats 1-3"
+        acceptance: "Three corrupt-to-valid retries show one actionable error and one clean result without stale content."
+
+  - id: "WAVE-2"
+    name: "operator_behavior"
+    rationale: "Behavioral contracts run after evidence integrity, isolation, lifecycle, and document foundations are reviewed."
+    review_before:
+      wave: "WAVE-1"
+      status: "APPROVED"
+      reviewed_head_required: true
+    review_after: "REQUIRED"
+    candidate_state: "WAVE_2_CANDIDATE_FOR_REVIEW"
+    tasks:
+      - order: 1
+        task_id: "SPARK-0002"
+        finding_id: "FUNC-FIND-002"
+        priority: "P2"
+        title: "Exact response constraints"
+        task_path: ".audit/runs/20260713T002206Z_686424795712/functional/spark/tasks/SPARK-0002.md"
+        affected_cases:
+          - "OP-0007"
+          - "OP-0010"
+          - "OP-0024"
+        acceptance: "All cases pass deterministic parser and count validators in three consecutive runs."
+      - order: 2
+        task_id: "SPARK-0004"
+        finding_id: "FUNC-FIND-004"
+        priority: "P2"
+        title: "Multi-turn references"
+        task_path: ".audit/runs/20260713T002206Z_686424795712/functional/spark/tasks/SPARK-0004.md"
+        affected_cases:
+          - "OP-0014"
+          - "OP-0016"
+          - "OP-0032"
+        acceptance: "All cases resolve the exact prior object in three repeats without cross-window state."
+      - order: 3
+        task_id: "SPARK-0005"
+        finding_id: "FUNC-FIND-005"
+        priority: "P2"
+        title: "Clarification before mission"
+        task_path: ".audit/runs/20260713T002206Z_686424795712/functional/spark/tasks/SPARK-0005.md"
+        affected_cases:
+          - "OP-0023 repeats 1-2"
+        acceptance: "No mission or artifact exists before one exact clarification, and the follow-up resumes the goal."
+      - order: 4
+        task_id: "SPARK-0012"
+        finding_id: "FUNC-FIND-012"
+        priority: "P2"
+        title: "Memory namespace isolation"
+        task_path: ".audit/runs/20260713T002206Z_686424795712/functional/spark/tasks/SPARK-0012.md"
+        affected_cases:
+          - "OP-0041 repeats 1-2"
+        acceptance: "Writes and recall use the exact requested namespace while operator and default remain unchanged."
+      - order: 5
+        task_id: "SPARK-0001"
+        finding_id: "FUNC-FIND-001"
+        priority: "P2"
+        title: "DNS and network versus shopping routing"
+        task_path: ".audit/runs/20260713T002206Z_686424795712/functional/spark/tasks/SPARK-0001.md"
+        affected_cases:
+          - "OP-0006 repeats 1-2"
+        acceptance: "Both repeats route to DNS or network lookup and return one factual sentence without shopping output."
+      - order: 6
+        task_id: "SPARK-0010"
+        finding_id: "FUNC-FIND-010"
+        priority: "P2"
+        title: "Cited usable web synthesis"
+        task_path: ".audit/runs/20260713T002206Z_686424795712/functional/spark/tasks/SPARK-0010.md"
+        affected_cases:
+          - "OP-0038 repeats 1-3"
+        acceptance: "Three runs contain supported claims with direct URLs, or one precise actionable unavailability message."
+
+product_decision_gate:
+  task_id: "SPARK-0013"
+  finding_id: "FUNC-FIND-013"
+  included_in_numbered_waves: false
+  automatic_execution_allowed: false
+  decision_status: "PENDING_HUMAN_DECISION"
+  confirmed_interactive_profile: "gemma4-turbo"
+  non_certified_profiles:
+    - "gemma4-mono-perf"
+    - "gemma4-mono"
+  tracks:
+    - id: "PROFILE-SAFETY"
+      purpose: "Fail-closed certification metadata, numeric readiness deadline, output health probe, and profile selection safety."
+      production_fix_guaranteed: false
+      separate_approval_required: true
+    - id: "PROFILE-RESEARCH"
+      purpose: "Bounded model, chat-template, and runtime configuration spike."
+      production_fix_guaranteed: false
+      external_download_allowed: false
+      separate_approval_required: true

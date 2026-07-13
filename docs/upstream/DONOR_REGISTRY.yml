@@ -1,0 +1,11 @@
+{
+  "schema_version": "1.0",
+  "record_kind": "upstream_donor_registry",
+  "allowed_statuses": [
+    "UNVERIFIED",
+    "REJECTED",
+    "APPROVED"
+  ],
+  "policy": "An entry is research metadata only. APPROVED requires a matching candidate, provenance record, validator PASS, and recorded human decision.",
+  "donors": []
+}
