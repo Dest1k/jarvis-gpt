@@ -1,0 +1,1439 @@
+﻿[
+    {
+        "path":  "/health",
+        "status":  "PASS",
+        "elapsed_ms":  69.57,
+        "response":  {
+                         "ok":  true,
+                         "profile":  "gemma4-turbo",
+                         "home":  "D:\\jarvis"
+                     }
+    },
+    {
+        "path":  "/api/status",
+        "status":  "PASS",
+        "elapsed_ms":  12.42,
+        "response":  {
+                         "settings":  {
+                                          "home":  "D:\\jarvis",
+                                          "profile":  {
+                                                          "name":  "gemma4-turbo",
+                                                          "title":  "Gemma 4 Turbo",
+                                                          "description":  "Recommended interactive Gemma 4 26B A4B NVFP4 profile for RTX 5090. It fits GPU memory without CPU weight offload.",
+                                                          "eager_mode":  false,
+                                                          "max_steps":  24,
+                                                          "temperature":  0.25,
+                                                          "max_model_len":  32768,
+                                                          "gpu_memory_utilization":  0.82,
+                                                          "kv_cache_dtype":  "fp8",
+                                                          "max_num_seqs":  16,
+                                                          "cpu_offload_gb":  0,
+                                                          "kv_offloading_gb":  0,
+                                                          "vllm_extra_args":  {
+                                                                                  "language_model_only":  false,
+                                                                                  "skip_mm_profiling":  false,
+                                                                                  "mm_processor_cache_gb":  null,
+                                                                                  "max_num_batched_tokens":  null
+                                                                              }
+                                                      },
+                                          "paths":  {
+                                                        "data":  "D:\\jarvis\\data\\jarvis-gpt",
+                                                        "files":  "D:\\jarvis\\data\\jarvis-gpt\\files",
+                                                        "cache":  "D:\\jarvis\\cache\\jarvis-gpt",
+                                                        "logs":  "D:\\jarvis\\logs\\jarvis-gpt",
+                                                        "models":  "D:\\jarvis\\data\\models",
+                                                        "active_model":  "D:\\jarvis\\data\\models\\gemma4-26b-a4b-nvfp4",
+                                                        "docker":  "D:\\jarvis\\docker\\jarvis-gpt",
+                                                        "state":  "D:\\jarvis\\data\\jarvis-gpt\\state",
+                                                        "database":  "D:\\jarvis\\data\\jarvis-gpt\\state\\jarvis.sqlite3",
+                                                        "memory_vault":  "D:\\jarvis\\data\\jarvis-gpt\\memory-vault",
+                                                        "host_profile":  "D:\\jarvis\\host_profile.json",
+                                                        "execution_playbooks":  "D:\\jarvis\\data\\jarvis-gpt\\state\\execution-playbooks.sqlite3"
+                                                    },
+                                          "llm":  {
+                                                      "enabled":  true,
+                                                      "base_url":  "http://localhost:8001/v1",
+                                                      "model":  "dispatcher",
+                                                      "timeout_sec":  240.0,
+                                                      "max_tokens":  2048,
+                                                      "verify_answers":  true
+                                                  },
+                                          "embeddings":  {
+                                                             "enabled":  false,
+                                                             "base_url":  "http://localhost:8001/v1",
+                                                             "model":  ""
+                                                         },
+                                          "autonomy":  {
+                                                           "enabled":  true,
+                                                           "telemetry_interval_sec":  120,
+                                                           "health_interval_sec":  300,
+                                                           "learning_interval_sec":  120,
+                                                           "cognition_enabled":  true,
+                                                           "cognition_interval_sec":  300,
+                                                           "cognition_max_tokens":  512,
+                                                           "mission_interval_sec":  120
+                                                       },
+                                          "api":  {
+                                                      "host":  "127.0.0.1",
+                                                      "port":  8000,
+                                                      "require_token_on_loopback":  false
+                                                  }
+                                      },
+                         "counters":  {
+                                          "runtime_kv":  114,
+                                          "conversations":  64,
+                                          "messages":  172,
+                                          "memories":  1294,
+                                          "missions":  2,
+                                          "mission_tasks":  12,
+                                          "files":  1,
+                                          "file_chunks":  2,
+                                          "tool_runs":  363,
+                                          "learning_observations":  879,
+                                          "approvals":  5,
+                                          "telemetry_snapshots":  3394,
+                                          "audit_log":  1808
+                                      },
+                         "health":  [
+                                        {
+                                            "name":  "docker",
+                                            "status":  "ok",
+                                            "message":  "Docker version 29.6.1, build 8900f1d",
+                                            "details":  {
+                                                            "path":  "C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.EXE",
+                                                            "returncode":  0
+                                                        }
+                                        },
+                                        {
+                                            "name":  "git",
+                                            "status":  "ok",
+                                            "message":  "git version 2.54.0.windows.1",
+                                            "details":  {
+                                                            "path":  "C:\\Program Files\\Git\\cmd\\git.EXE",
+                                                            "returncode":  0
+                                                        }
+                                        },
+                                        {
+                                            "name":  "llm.router",
+                                            "status":  "ok",
+                                            "message":  "LLM endpoint is responding",
+                                            "details":  {
+                                                            "ok":  true,
+                                                            "status_code":  200,
+                                                            "served_models":  [
+                                                                                  "dispatcher"
+                                                                              ],
+                                                            "configured_model":  "dispatcher",
+                                                            "local":  {
+                                                                          "root":  "D:\\jarvis\\data\\models",
+                                                                          "active_profile":  "gemma4-turbo",
+                                                                          "active_model":  {
+                                                                                               "id":  "gemma4-26b-a4b-nvfp4",
+                                                                                               "path":  "D:\\jarvis\\data\\models\\gemma4-26b-a4b-nvfp4",
+                                                                                               "exists":  true,
+                                                                                               "active":  true,
+                                                                                               "size_bytes":  18825679760,
+                                                                                               "shard_count":  2,
+                                                                                               "modified_at":  "2026-06-29T10:32:56+00:00",
+                                                                                               "model_type":  "gemma4",
+                                                                                               "architectures":  [
+                                                                                                                     "Gemma4ForConditionalGeneration"
+                                                                                                                 ],
+                                                                                               "dtype":  "bfloat16",
+                                                                                               "quantization":  "NVFP4",
+                                                                                               "metadata":  {
+                                                                                                                "config.json":  true,
+                                                                                                                "generation_config.json":  true,
+                                                                                                                "hf_quant_config.json":  true,
+                                                                                                                "model.safetensors.index.json":  true,
+                                                                                                                "tokenizer_config.json":  true
+                                                                                                            },
+                                                                                               "generation":  {
+                                                                                                                  "temperature":  1.0,
+                                                                                                                  "top_p":  0.95,
+                                                                                                                  "max_length":  null
+                                                                                                              }
+                                                                                           },
+                                                                          "models":  [
+                                                                                         {
+                                                                                             "id":  "gemma4-26b-a4b-nvfp4",
+                                                                                             "path":  "D:\\jarvis\\data\\models\\gemma4-26b-a4b-nvfp4",
+                                                                                             "exists":  true,
+                                                                                             "active":  true,
+                                                                                             "size_bytes":  18825679760,
+                                                                                             "shard_count":  2,
+                                                                                             "modified_at":  "2026-06-29T10:32:56+00:00",
+                                                                                             "model_type":  "gemma4",
+                                                                                             "architectures":  [
+                                                                                                                   "Gemma4ForConditionalGeneration"
+                                                                                                               ],
+                                                                                             "dtype":  "bfloat16",
+                                                                                             "quantization":  "NVFP4",
+                                                                                             "metadata":  {
+                                                                                                              "config.json":  true,
+                                                                                                              "generation_config.json":  true,
+                                                                                                              "hf_quant_config.json":  true,
+                                                                                                              "model.safetensors.index.json":  true,
+                                                                                                              "tokenizer_config.json":  true
+                                                                                                          },
+                                                                                             "generation":  {
+                                                                                                                "temperature":  1.0,
+                                                                                                                "top_p":  0.95,
+                                                                                                                "max_length":  null
+                                                                                                            }
+                                                                                         },
+                                                                                         {
+                                                                                             "id":  "gemma4-31b-it-nvfp4",
+                                                                                             "path":  "D:\\jarvis\\data\\models\\gemma4-31b-it-nvfp4",
+                                                                                             "exists":  true,
+                                                                                             "active":  false,
+                                                                                             "size_bytes":  32666144074,
+                                                                                             "shard_count":  4,
+                                                                                             "modified_at":  "2026-07-03T11:37:53+00:00",
+                                                                                             "model_type":  "gemma4",
+                                                                                             "architectures":  [
+                                                                                                                   "Gemma4ForConditionalGeneration"
+                                                                                                               ],
+                                                                                             "dtype":  "bfloat16",
+                                                                                             "quantization":  "NVFP4",
+                                                                                             "metadata":  {
+                                                                                                              "config.json":  true,
+                                                                                                              "generation_config.json":  true,
+                                                                                                              "hf_quant_config.json":  true,
+                                                                                                              "model.safetensors.index.json":  true,
+                                                                                                              "tokenizer_config.json":  true
+                                                                                                          },
+                                                                                             "generation":  {
+                                                                                                                "temperature":  1.0,
+                                                                                                                "top_p":  0.95,
+                                                                                                                "max_length":  null
+                                                                                                            }
+                                                                                         },
+                                                                                         {
+                                                                                             "id":  "ui-tars",
+                                                                                             "path":  "D:\\jarvis\\data\\models\\ui-tars",
+                                                                                             "exists":  true,
+                                                                                             "active":  false,
+                                                                                             "size_bytes":  9785467987,
+                                                                                             "shard_count":  2,
+                                                                                             "modified_at":  "2026-06-28T16:09:00+00:00",
+                                                                                             "model_type":  "qwen2_vl",
+                                                                                             "architectures":  [
+                                                                                                                   "Qwen2VLForConditionalGeneration"
+                                                                                                               ],
+                                                                                             "dtype":  "bfloat16",
+                                                                                             "quantization":  null,
+                                                                                             "metadata":  {
+                                                                                                              "config.json":  true,
+                                                                                                              "generation_config.json":  false,
+                                                                                                              "hf_quant_config.json":  false,
+                                                                                                              "model.safetensors.index.json":  true,
+                                                                                                              "tokenizer_config.json":  true
+                                                                                                          },
+                                                                                             "generation":  {
+                                                                                                                "temperature":  null,
+                                                                                                                "top_p":  null,
+                                                                                                                "max_length":  null
+                                                                                                            }
+                                                                                         },
+                                                                                         {
+                                                                                             "id":  "ui-tars-1.5-7b-awq",
+                                                                                             "path":  "D:\\jarvis\\data\\models\\ui-tars-1.5-7b-awq",
+                                                                                             "exists":  true,
+                                                                                             "active":  false,
+                                                                                             "size_bytes":  6939947860,
+                                                                                             "shard_count":  2,
+                                                                                             "modified_at":  "2026-06-29T10:43:15+00:00",
+                                                                                             "model_type":  "qwen2_5_vl",
+                                                                                             "architectures":  [
+                                                                                                                   "Qwen2_5_VLForConditionalGeneration"
+                                                                                                               ],
+                                                                                             "dtype":  "bfloat16",
+                                                                                             "quantization":  null,
+                                                                                             "metadata":  {
+                                                                                                              "config.json":  true,
+                                                                                                              "generation_config.json":  true,
+                                                                                                              "hf_quant_config.json":  false,
+                                                                                                              "model.safetensors.index.json":  true,
+                                                                                                              "tokenizer_config.json":  true
+                                                                                                          },
+                                                                                             "generation":  {
+                                                                                                                "temperature":  null,
+                                                                                                                "top_p":  null,
+                                                                                                                "max_length":  null
+                                                                                                            }
+                                                                                         }
+                                                                                     ],
+                                                                          "dispatcher":  {
+                                                                                             "base_url":  "http://localhost:8001/v1",
+                                                                                             "served_model_name":  "dispatcher",
+                                                                                             "model_path":  "D:\\jarvis\\data\\models\\gemma4-26b-a4b-nvfp4",
+                                                                                             "docker_model_path":  "/models/gemma4-26b-a4b-nvfp4",
+                                                                                             "engine":  "vllm-openai",
+                                                                                             "env":  {
+                                                                                                         "JARVIS_QWEN_MODEL_NAME":  "dispatcher",
+                                                                                                         "JARVIS_QWEN_MODEL_PATH":  "/models/gemma4-26b-a4b-nvfp4",
+                                                                                                         "JARVIS_QWEN_DTYPE":  "auto",
+                                                                                                         "JARVIS_QWEN_GPU_UTIL":  "0.82",
+                                                                                                         "JARVIS_QWEN_MAX_LEN":  "32768",
+                                                                                                         "JARVIS_QWEN_KV_DTYPE":  "fp8",
+                                                                                                         "JARVIS_QWEN_TOKENIZER_MODE":  "slow",
+                                                                                                         "JARVIS_QWEN_SAFETENSORS_LOAD_STRATEGY":  "prefetch",
+                                                                                                         "JARVIS_QWEN_MAX_NUM_SEQS":  "16",
+                                                                                                         "JARVIS_QWEN_ENFORCE_EAGER":  "",
+                                                                                                         "JARVIS_QWEN_CPU_OFFLOAD_ARGS":  "",
+                                                                                                         "JARVIS_QWEN_KV_OFFLOAD_ARGS":  "",
+                                                                                                         "JARVIS_QWEN_EXTRA_ARGS":  "",
+                                                                                                         "JARVIS_ENABLE_UITARS":  "0"
+                                                                                                     }
+                                                                                         }
+                                                                      }
+                                                        }
+                                        },
+                                        {
+                                            "name":  "models.profile",
+                                            "status":  "ok",
+                                            "message":  "gemma4-turbo -\u003e D:\\jarvis\\data\\models\\gemma4-26b-a4b-nvfp4",
+                                            "details":  {
+                                                            "active_model":  {
+                                                                                 "id":  "gemma4-26b-a4b-nvfp4",
+                                                                                 "path":  "D:\\jarvis\\data\\models\\gemma4-26b-a4b-nvfp4",
+                                                                                 "exists":  true,
+                                                                                 "active":  true,
+                                                                                 "size_bytes":  18825679760,
+                                                                                 "shard_count":  2,
+                                                                                 "modified_at":  "2026-06-29T10:32:56+00:00",
+                                                                                 "model_type":  "gemma4",
+                                                                                 "architectures":  [
+                                                                                                       "Gemma4ForConditionalGeneration"
+                                                                                                   ],
+                                                                                 "dtype":  "bfloat16",
+                                                                                 "quantization":  "NVFP4",
+                                                                                 "metadata":  {
+                                                                                                  "config.json":  true,
+                                                                                                  "generation_config.json":  true,
+                                                                                                  "hf_quant_config.json":  true,
+                                                                                                  "model.safetensors.index.json":  true,
+                                                                                                  "tokenizer_config.json":  true
+                                                                                              },
+                                                                                 "generation":  {
+                                                                                                    "temperature":  1.0,
+                                                                                                    "top_p":  0.95,
+                                                                                                    "max_length":  null
+                                                                                                }
+                                                                             },
+                                                            "model_count":  4,
+                                                            "dispatcher":  {
+                                                                               "base_url":  "http://localhost:8001/v1",
+                                                                               "served_model_name":  "dispatcher",
+                                                                               "model_path":  "D:\\jarvis\\data\\models\\gemma4-26b-a4b-nvfp4",
+                                                                               "docker_model_path":  "/models/gemma4-26b-a4b-nvfp4",
+                                                                               "engine":  "vllm-openai",
+                                                                               "env":  {
+                                                                                           "JARVIS_QWEN_MODEL_NAME":  "dispatcher",
+                                                                                           "JARVIS_QWEN_MODEL_PATH":  "/models/gemma4-26b-a4b-nvfp4",
+                                                                                           "JARVIS_QWEN_DTYPE":  "auto",
+                                                                                           "JARVIS_QWEN_GPU_UTIL":  "0.82",
+                                                                                           "JARVIS_QWEN_MAX_LEN":  "32768",
+                                                                                           "JARVIS_QWEN_KV_DTYPE":  "fp8",
+                                                                                           "JARVIS_QWEN_TOKENIZER_MODE":  "slow",
+                                                                                           "JARVIS_QWEN_SAFETENSORS_LOAD_STRATEGY":  "prefetch",
+                                                                                           "JARVIS_QWEN_MAX_NUM_SEQS":  "16",
+                                                                                           "JARVIS_QWEN_ENFORCE_EAGER":  "",
+                                                                                           "JARVIS_QWEN_CPU_OFFLOAD_ARGS":  "",
+                                                                                           "JARVIS_QWEN_KV_OFFLOAD_ARGS":  "",
+                                                                                           "JARVIS_QWEN_EXTRA_ARGS":  "",
+                                                                                           "JARVIS_ENABLE_UITARS":  "0"
+                                                                                       }
+                                                                           }
+                                                        }
+                                        },
+                                        {
+                                            "name":  "models.root",
+                                            "status":  "ok",
+                                            "message":  "D:\\jarvis\\data\\models is available",
+                                            "details":  {
+                                                            "path":  "D:\\jarvis\\data\\models",
+                                                            "is_dir":  true
+                                                        }
+                                        },
+                                        {
+                                            "name":  "python",
+                                            "status":  "ok",
+                                            "message":  "3.11.9",
+                                            "details":  {
+                                                            "platform":  "Windows-10-10.0.26200-SP0"
+                                                        }
+                                        },
+                                        {
+                                            "name":  "runtime.cache",
+                                            "status":  "ok",
+                                            "message":  "D:\\jarvis\\cache\\jarvis-gpt is available",
+                                            "details":  {
+                                                            "path":  "D:\\jarvis\\cache\\jarvis-gpt",
+                                                            "is_dir":  true
+                                                        }
+                                        },
+                                        {
+                                            "name":  "runtime.data",
+                                            "status":  "ok",
+                                            "message":  "D:\\jarvis\\data\\jarvis-gpt is available",
+                                            "details":  {
+                                                            "path":  "D:\\jarvis\\data\\jarvis-gpt",
+                                                            "is_dir":  true
+                                                        }
+                                        },
+                                        {
+                                            "name":  "runtime.home",
+                                            "status":  "ok",
+                                            "message":  "D:\\jarvis is available",
+                                            "details":  {
+                                                            "path":  "D:\\jarvis",
+                                                            "is_dir":  true
+                                                        }
+                                        },
+                                        {
+                                            "name":  "runtime.logs",
+                                            "status":  "ok",
+                                            "message":  "D:\\jarvis\\logs\\jarvis-gpt is available",
+                                            "details":  {
+                                                            "path":  "D:\\jarvis\\logs\\jarvis-gpt",
+                                                            "is_dir":  true
+                                                        }
+                                        },
+                                        {
+                                            "name":  "storage.sqlite",
+                                            "status":  "ok",
+                                            "message":  "SQLite storage is responding",
+                                            "details":  {
+                                                            "path":  "D:\\jarvis\\data\\jarvis-gpt\\state\\jarvis.sqlite3"
+                                                        }
+                                        }
+                                    ],
+                         "recent_events":  [
+                                               {
+                                                   "id":  "evt_5963eb1be4e942c9",
+                                                   "ts":  "2026-07-13T16:27:39+00:00",
+                                                   "level":  "info",
+                                                   "kind":  "autonomy.learning",
+                                                   "title":  "Autonomous learning saved 1 lesson(s)",
+                                                   "payload":  {
+                                                                   "audit":  20,
+                                                                   "tool_runs":  20,
+                                                                   "approvals":  5,
+                                                                   "learning_observations":  80
+                                                               }
+                                               },
+                                               {
+                                                   "id":  "evt_a87c74da51854b3c",
+                                                   "ts":  "2026-07-13T16:27:39+00:00",
+                                                   "level":  "info",
+                                                   "kind":  "learning.tick",
+                                                   "title":  "Learning tick saved 1 lesson(s)",
+                                                   "payload":  {
+                                                                   "saved":  1,
+                                                                   "skipped_duplicates":  6,
+                                                                   "examined":  125
+                                                               }
+                                               },
+                                               {
+                                                   "id":  "evt_165c42e59bfa432e",
+                                                   "ts":  "2026-07-13T16:26:37+00:00",
+                                                   "level":  "info",
+                                                   "kind":  "cognition.pulse",
+                                                   "title":  "System stabilized post-backend restart; high-frequency learning cycles and hardware procurement tasks are active.",
+                                                   "payload":  {
+                                                                   "insights":  [
+                                                                                    "High learning density observed (878 observations) following system stabilization.",
+                                                                                    "System health is nominal with 0 errors/warnings reported in recent autonomy snapshots.",
+                                                                                    "Active task focus is currently centered on Ryzen 9 hardware procurement and learning cycle optimization."
+                                                                                ],
+                                                                   "questions":  [
+                                                                                     "Should the high-frequency learning cycle intensity be throttled to preserve telemetry bandwidth?",
+                                                                                     "Are there specific procurement constraints for the Ryzen 9 hardware tasks?"
+                                                                                 ],
+                                                                   "suggested_jobs":  [
+                                                                                          {
+                                                                                              "title":  "Learning Efficiency Audit",
+                                                                                              "kind":  "benchmark",
+                                                                                              "cadence":  "once",
+                                                                                              "priority":  25,
+                                                                                              "payload":  {
+                                                                                                              "target":  "learning_observations",
+                                                                                                              "metric":  "retention_rate"
+                                                                                                          }
+                                                                                          },
+                                                                                          {
+                                                                                              "title":  "Hardware Procurement Status Check",
+                                                                                              "kind":  "diagnostics",
+                                                                                              "cadence":  "periodic",
+                                                                                              "priority":  25,
+                                                                                              "payload":  {
+                                                                                                              "task_id":  "ryzen_9_procurement",
+                                                                                                              "scope":  "inventory_sync"
+                                                                                                          }
+                                                                                          }
+                                                                                      ]
+                                                               }
+                                               },
+                                               {
+                                                   "id":  "evt_8533fde1d62e48d3",
+                                                   "ts":  "2026-07-13T16:26:30+00:00",
+                                                   "level":  "info",
+                                                   "kind":  "autonomy.health",
+                                                   "title":  "Autonomous health snapshot: 0 error(s), 0 warn(s)",
+                                                   "payload":  {
+                                                                   "checks":  11,
+                                                                   "ok":  true
+                                                               }
+                                               },
+                                               {
+                                                   "id":  "evt_c529d91b9067471a",
+                                                   "ts":  "2026-07-13T16:25:38+00:00",
+                                                   "level":  "info",
+                                                   "kind":  "autonomy.learning",
+                                                   "title":  "Autonomous learning saved 1 lesson(s)",
+                                                   "payload":  {
+                                                                   "audit":  20,
+                                                                   "tool_runs":  20,
+                                                                   "approvals":  5,
+                                                                   "learning_observations":  80
+                                                               }
+                                               },
+                                               {
+                                                   "id":  "evt_a62b41bdde494ff2",
+                                                   "ts":  "2026-07-13T16:25:38+00:00",
+                                                   "level":  "info",
+                                                   "kind":  "learning.tick",
+                                                   "title":  "Learning tick saved 1 lesson(s)",
+                                                   "payload":  {
+                                                                   "saved":  1,
+                                                                   "skipped_duplicates":  6,
+                                                                   "examined":  125
+                                                               }
+                                               },
+                                               {
+                                                   "id":  "evt_61300419f29c4361",
+                                                   "ts":  "2026-07-13T16:23:37+00:00",
+                                                   "level":  "info",
+                                                   "kind":  "autonomy.learning",
+                                                   "title":  "Autonomous learning saved 4 lesson(s)",
+                                                   "payload":  {
+                                                                   "audit":  20,
+                                                                   "tool_runs":  20,
+                                                                   "approvals":  5,
+                                                                   "learning_observations":  80
+                                                               }
+                                               },
+                                               {
+                                                   "id":  "evt_1db8a22ad6f148f6",
+                                                   "ts":  "2026-07-13T16:23:37+00:00",
+                                                   "level":  "info",
+                                                   "kind":  "learning.tick",
+                                                   "title":  "Learning tick saved 4 lesson(s)",
+                                                   "payload":  {
+                                                                   "saved":  4,
+                                                                   "skipped_duplicates":  3,
+                                                                   "examined":  125
+                                                               }
+                                               },
+                                               {
+                                                   "id":  "evt_7ed416b572d84b14",
+                                                   "ts":  "2026-07-13T16:22:34+00:00",
+                                                   "level":  "info",
+                                                   "kind":  "agent.assistant_done",
+                                                   "title":  "Streaming answer received",
+                                                   "payload":  {
+                                                                   "source":  "llm",
+                                                                   "stream":  true,
+                                                                   "finish_reason":  "stop",
+                                                                   "tool_steps":  0,
+                                                                   "continuations":  0
+                                                               }
+                                               },
+                                               {
+                                                   "id":  "evt_f28df82058ac4898",
+                                                   "ts":  "2026-07-13T16:22:33+00:00",
+                                                   "level":  "info",
+                                                   "kind":  "agent.tool_call",
+                                                   "title":  "LLM router",
+                                                   "payload":  {
+                                                                   "enabled":  true,
+                                                                   "max_tokens":  128,
+                                                                   "stream":  true
+                                                               }
+                                               },
+                                               {
+                                                   "id":  "evt_53039ec82cea4a75",
+                                                   "ts":  "2026-07-13T16:22:33+00:00",
+                                                   "level":  "info",
+                                                   "kind":  "agent.task_kernel",
+                                                   "title":  "Task kernel",
+                                                   "payload":  {
+                                                                   "route":  "chat",
+                                                                   "mode":  "concise",
+                                                                   "intent":  "general_chat",
+                                                                   "confidence":  0.58,
+                                                                   "tools":  [
+
+                                                                             ],
+                                                                   "completion_criteria":  [
+                                                                                               "answer directly",
+                                                                                               "keep the operator preference in mind"
+                                                                                           ],
+                                                                   "needs_clarification":  false,
+                                                                   "rationale":  "No tool or specialized route is required.",
+                                                                   "profile":  "gemma4-turbo",
+                                                                   "model":  "dispatcher",
+                                                                   "conversation_id":  "conv_f58566a3491842dc"
+                                                               }
+                                               },
+                                               {
+                                                   "id":  "evt_cfa0b9a874224b57",
+                                                   "ts":  "2026-07-13T16:22:33+00:00",
+                                                   "level":  "info",
+                                                   "kind":  "agent.thought",
+                                                   "title":  "Accepted task",
+                                                   "payload":  {
+                                                                   "profile":  "gemma4-turbo"
+                                                               }
+                                               },
+                                               {
+                                                   "id":  "evt_da4a2e08579747e0",
+                                                   "ts":  "2026-07-13T16:22:10+00:00",
+                                                   "level":  "info",
+                                                   "kind":  "agent.assistant_done",
+                                                   "title":  "Streaming answer received",
+                                                   "payload":  {
+                                                                   "source":  "llm",
+                                                                   "stream":  true,
+                                                                   "finish_reason":  "stop",
+                                                                   "tool_steps":  0,
+                                                                   "continuations":  0
+                                                               }
+                                               },
+                                               {
+                                                   "id":  "evt_3d9341d389f84d99",
+                                                   "ts":  "2026-07-13T16:22:09+00:00",
+                                                   "level":  "info",
+                                                   "kind":  "agent.tool_call",
+                                                   "title":  "LLM router",
+                                                   "payload":  {
+                                                                   "enabled":  true,
+                                                                   "max_tokens":  128,
+                                                                   "stream":  true
+                                                               }
+                                               },
+                                               {
+                                                   "id":  "evt_57c69c954df2434f",
+                                                   "ts":  "2026-07-13T16:22:09+00:00",
+                                                   "level":  "info",
+                                                   "kind":  "agent.task_kernel",
+                                                   "title":  "Task kernel",
+                                                   "payload":  {
+                                                                   "route":  "chat",
+                                                                   "mode":  "concise",
+                                                                   "intent":  "general_chat",
+                                                                   "confidence":  0.58,
+                                                                   "tools":  [
+
+                                                                             ],
+                                                                   "completion_criteria":  [
+                                                                                               "answer directly",
+                                                                                               "keep the operator preference in mind"
+                                                                                           ],
+                                                                   "needs_clarification":  false,
+                                                                   "rationale":  "No tool or specialized route is required.",
+                                                                   "profile":  "gemma4-turbo",
+                                                                   "model":  "dispatcher",
+                                                                   "conversation_id":  "conv_ab74bb3b2a8941d9"
+                                                               }
+                                               },
+                                               {
+                                                   "id":  "evt_60a83ee877fc4e46",
+                                                   "ts":  "2026-07-13T16:22:09+00:00",
+                                                   "level":  "info",
+                                                   "kind":  "agent.thought",
+                                                   "title":  "Accepted task",
+                                                   "payload":  {
+                                                                   "profile":  "gemma4-turbo"
+                                                               }
+                                               },
+                                               {
+                                                   "id":  "evt_c60b1087e82e4c58",
+                                                   "ts":  "2026-07-13T16:21:35+00:00",
+                                                   "level":  "info",
+                                                   "kind":  "autonomy.learning",
+                                                   "title":  "Autonomous learning saved 2 lesson(s)",
+                                                   "payload":  {
+                                                                   "audit":  20,
+                                                                   "tool_runs":  20,
+                                                                   "approvals":  5,
+                                                                   "learning_observations":  80
+                                                               }
+                                               },
+                                               {
+                                                   "id":  "evt_813c1da31b3244e5",
+                                                   "ts":  "2026-07-13T16:21:35+00:00",
+                                                   "level":  "info",
+                                                   "kind":  "learning.tick",
+                                                   "title":  "Learning tick saved 2 lesson(s)",
+                                                   "payload":  {
+                                                                   "saved":  2,
+                                                                   "skipped_duplicates":  5,
+                                                                   "examined":  125
+                                                               }
+                                               },
+                                               {
+                                                   "id":  "evt_08d5d3b16d394d19",
+                                                   "ts":  "2026-07-13T16:21:34+00:00",
+                                                   "level":  "info",
+                                                   "kind":  "cognition.pulse",
+                                                   "title":  "System stabilized following backend restart; high-frequency learning cycles and Ryzen 9 hardware procurement tasks are currently active.",
+                                                   "payload":  {
+                                                                   "insights":  [
+                                                                                    "High learning density observed (873 observations) relative to tool runs (363), suggesting intensive pattern recognition post-restart.",
+                                                                                    "System health is nominal with 0 errors/warnings reported in recent autonomy snapshots.",
+                                                                                    "Redundancy in cognition.pulse observations suggests a high-frequency logging state for stabilization monitoring."
+                                                                                ],
+                                                                   "questions":  [
+                                                                                     "Should the high-frequency learning cycle frequency be throttled once hardware procurement tasks reach a steady state?",
+                                                                                     "Are there specific procurement constraints for the Ryzen 9 tasks that require manual oversight?"
+                                                                                 ],
+                                                                   "suggested_jobs":  [
+                                                                                          {
+                                                                                              "title":  "Learning Pattern Audit",
+                                                                                              "kind":  "benchmark",
+                                                                                              "cadence":  "once",
+                                                                                              "priority":  25,
+                                                                                              "payload":  {
+                                                                                                              "target":  "learning_observations",
+                                                                                                              "metric":  "redundancy_ratio"
+                                                                                                          }
+                                                                                          },
+                                                                                          {
+                                                                                              "title":  "Procurement Status Check",
+                                                                                              "kind":  "diagnostics",
+                                                                                              "cadence":  "periodic",
+                                                                                              "priority":  25,
+                                                                                              "payload":  {
+                                                                                                              "task_id":  "ryzen_9_procurement",
+                                                                                                              "check_type":  "workflow_integrity"
+                                                                                                          }
+                                                                                          }
+                                                                                      ]
+                                                               }
+                                               },
+                                               {
+                                                   "id":  "evt_b654a31a6f6d427e",
+                                                   "ts":  "2026-07-13T16:21:30+00:00",
+                                                   "level":  "info",
+                                                   "kind":  "autonomy.health",
+                                                   "title":  "Autonomous health snapshot: 0 error(s), 0 warn(s)",
+                                                   "payload":  {
+                                                                   "checks":  11,
+                                                                   "ok":  true
+                                                               }
+                                               },
+                                               {
+                                                   "id":  "evt_2b6c47cb2845466f",
+                                                   "ts":  "2026-07-13T16:21:25+00:00",
+                                                   "level":  "info",
+                                                   "kind":  "agent.assistant_done",
+                                                   "title":  "Streaming answer received",
+                                                   "payload":  {
+                                                                   "source":  "llm",
+                                                                   "stream":  true,
+                                                                   "finish_reason":  "stop",
+                                                                   "tool_steps":  0,
+                                                                   "continuations":  0
+                                                               }
+                                               },
+                                               {
+                                                   "id":  "evt_d375d11dcf8a45da",
+                                                   "ts":  "2026-07-13T16:21:24+00:00",
+                                                   "level":  "info",
+                                                   "kind":  "agent.tool_call",
+                                                   "title":  "LLM router",
+                                                   "payload":  {
+                                                                   "enabled":  true,
+                                                                   "max_tokens":  128,
+                                                                   "stream":  true
+                                                               }
+                                               },
+                                               {
+                                                   "id":  "evt_673a45a658d74dba",
+                                                   "ts":  "2026-07-13T16:21:24+00:00",
+                                                   "level":  "info",
+                                                   "kind":  "agent.task_kernel",
+                                                   "title":  "Task kernel",
+                                                   "payload":  {
+                                                                   "route":  "chat",
+                                                                   "mode":  "concise",
+                                                                   "intent":  "general_chat",
+                                                                   "confidence":  0.58,
+                                                                   "tools":  [
+
+                                                                             ],
+                                                                   "completion_criteria":  [
+                                                                                               "answer directly",
+                                                                                               "keep the operator preference in mind"
+                                                                                           ],
+                                                                   "needs_clarification":  false,
+                                                                   "rationale":  "No tool or specialized route is required.",
+                                                                   "profile":  "gemma4-turbo",
+                                                                   "model":  "dispatcher",
+                                                                   "conversation_id":  "conv_417d37fc35d14d64"
+                                                               }
+                                               },
+                                               {
+                                                   "id":  "evt_229b936098714db0",
+                                                   "ts":  "2026-07-13T16:21:24+00:00",
+                                                   "level":  "info",
+                                                   "kind":  "agent.thought",
+                                                   "title":  "Accepted task",
+                                                   "payload":  {
+                                                                   "profile":  "gemma4-turbo"
+                                                               }
+                                               },
+                                               {
+                                                   "id":  "evt_73888011e14a4ac0",
+                                                   "ts":  "2026-07-13T16:19:33+00:00",
+                                                   "level":  "info",
+                                                   "kind":  "autonomy.learning",
+                                                   "title":  "Autonomous learning saved 1 lesson(s)",
+                                                   "payload":  {
+                                                                   "audit":  20,
+                                                                   "tool_runs":  20,
+                                                                   "approvals":  5,
+                                                                   "learning_observations":  80
+                                                               }
+                                               }
+                                           ]
+                     }
+    },
+    {
+        "path":  "/api/model-profiles",
+        "status":  "PASS",
+        "elapsed_ms":  1.12,
+        "response":  {
+                         "active_profile":  "gemma4-turbo",
+                         "active_model":  "gemma4-26b-a4b-nvfp4",
+                         "profiles":  [
+                                          {
+                                              "id":  "gemma4-mono",
+                                              "title":  "Gemma 4 Mono (Offload)",
+                                              "role":  "local-alternative",
+                                              "status":  "available",
+                                              "model_hint":  "gemma4-31b-it-nvfp4",
+                                              "notes":  [
+                                                            "Experimental Docker/WSL Gemma 4 31B IT NVFP4 stability profile. Partial CPU weight offload + native KV offload, eager mode, single-seq. Measured decode is below 1 tok/s on RTX 5090; use only for long-context quality checks, never interactive chat. Prefer gemma4-turbo.",
+                                                            "context=16384",
+                                                            "temperature=0.15"
+                                                        ]
+                                          },
+                                          {
+                                              "id":  "gemma4-mono-perf",
+                                              "title":  "Gemma 4 Mono Perf",
+                                              "role":  "local-alternative",
+                                              "status":  "available",
+                                              "model_hint":  "gemma4-31b-it-nvfp4",
+                                              "notes":  [
+                                                            "Experimental Docker/WSL Gemma 4 31B IT NVFP4 quality profile. Minimal CPU weight offload (2.5GB), eager mode, 4k context and text-only execution. Measured around 2.45 tok/s on RTX 5090: much faster than the old mono profile, but still not an interactive runtime. Use gemma4-turbo for Command Center chat.",
+                                                            "context=4096",
+                                                            "temperature=0.15"
+                                                        ]
+                                          },
+                                          {
+                                              "id":  "gemma4-turbo",
+                                              "title":  "Gemma 4 Turbo",
+                                              "role":  "current-runtime",
+                                              "status":  "active",
+                                              "model_hint":  "gemma4-26b-a4b-nvfp4",
+                                              "notes":  [
+                                                            "Recommended interactive Gemma 4 26B A4B NVFP4 profile for RTX 5090. It fits GPU memory without CPU weight offload.",
+                                                            "context=32768",
+                                                            "temperature=0.25"
+                                                        ]
+                                          },
+                                          {
+                                              "id":  "planner-70b-80b",
+                                              "title":  "Future Planner",
+                                              "role":  "planning, code review, difficult intent arbitration",
+                                              "status":  "future",
+                                              "model_hint":  "70B/80B instruct model when VRAM/RAM allows",
+                                              "notes":  [
+                                                            "Use as slow high-quality planner/reviewer.",
+                                                            "Keep current Gemma profile as executor for routine safe tools."
+                                                        ]
+                                          },
+                                          {
+                                              "id":  "executor-fast",
+                                              "title":  "Future Fast Executor",
+                                              "role":  "short tool loops and UI replies",
+                                              "status":  "future",
+                                              "model_hint":  "small/fast local instruct model",
+                                              "notes":  [
+                                                            "Reserved for routing once multiple live model endpoints are available."
+                                                        ]
+                                          }
+                                      ]
+                     }
+    },
+    {
+        "path":  "/api/models",
+        "status":  "PASS",
+        "elapsed_ms":  41.05,
+        "response":  {
+                         "root":  "D:\\jarvis\\data\\models",
+                         "active_profile":  "gemma4-turbo",
+                         "active_model":  {
+                                              "id":  "gemma4-26b-a4b-nvfp4",
+                                              "path":  "D:\\jarvis\\data\\models\\gemma4-26b-a4b-nvfp4",
+                                              "exists":  true,
+                                              "active":  true,
+                                              "size_bytes":  18825679760,
+                                              "shard_count":  2,
+                                              "modified_at":  "2026-06-29T10:32:56+00:00",
+                                              "model_type":  "gemma4",
+                                              "architectures":  [
+                                                                    "Gemma4ForConditionalGeneration"
+                                                                ],
+                                              "dtype":  "bfloat16",
+                                              "quantization":  "NVFP4",
+                                              "metadata":  {
+                                                               "config.json":  true,
+                                                               "generation_config.json":  true,
+                                                               "hf_quant_config.json":  true,
+                                                               "model.safetensors.index.json":  true,
+                                                               "tokenizer_config.json":  true
+                                                           },
+                                              "generation":  {
+                                                                 "temperature":  1.0,
+                                                                 "top_p":  0.95,
+                                                                 "max_length":  null
+                                                             },
+                                              "fit":  {
+
+                                                      }
+                                          },
+                         "models":  [
+                                        {
+                                            "id":  "gemma4-26b-a4b-nvfp4",
+                                            "path":  "D:\\jarvis\\data\\models\\gemma4-26b-a4b-nvfp4",
+                                            "exists":  true,
+                                            "active":  true,
+                                            "size_bytes":  18825679760,
+                                            "shard_count":  2,
+                                            "modified_at":  "2026-06-29T10:32:56+00:00",
+                                            "model_type":  "gemma4",
+                                            "architectures":  [
+                                                                  "Gemma4ForConditionalGeneration"
+                                                              ],
+                                            "dtype":  "bfloat16",
+                                            "quantization":  "NVFP4",
+                                            "metadata":  {
+                                                             "config.json":  true,
+                                                             "generation_config.json":  true,
+                                                             "hf_quant_config.json":  true,
+                                                             "model.safetensors.index.json":  true,
+                                                             "tokenizer_config.json":  true
+                                                         },
+                                            "generation":  {
+                                                               "temperature":  1.0,
+                                                               "top_p":  0.95,
+                                                               "max_length":  null
+                                                           },
+                                            "fit":  {
+                                                        "status":  "fits",
+                                                        "label":  "Ð·Ð°Ð²ÐµÐ´ÑÑÑÑ",
+                                                        "confidence":  "medium",
+                                                        "required_bytes":  21461274926,
+                                                        "weights_bytes":  18825679760,
+                                                        "kv_cache_bytes":  0,
+                                                        "overhead_bytes":  2635595166,
+                                                        "gpu_total_bytes":  34190917632,
+                                                        "gpu_free_bytes":  4215275520,
+                                                        "context_tokens":  8192,
+                                                        "quant_bits":  4.5,
+                                                        "parameters":  26000000000,
+                                                        "warnings":  [
+                                                                         "ÐÑÑÐ¼Ð¾ ÑÐµÐ¹ÑÐ°Ñ ÑÐ²Ð¾Ð±Ð¾Ð´Ð½Ð¾Ð¹ VRAM Ð½ÐµÐ´Ð¾ÑÑÐ°ÑÐ¾ÑÐ½Ð¾ Ð±ÐµÐ· Ð¾ÑÑÐ°Ð½Ð¾Ð²ÐºÐ¸ ÑÐµÐºÑÑÐµÐ¹ Ð½Ð°Ð³ÑÑÐ·ÐºÐ¸.",
+                                                                         "ÐÐµÑÐ°Ð´Ð°Ð½Ð½ÑÐµ Ð½ÐµÐ¿Ð¾Ð»Ð½ÑÐµ; Ð¾ÑÐµÐ½ÐºÐ° Ð¿ÑÐ¸Ð±Ð»Ð¸Ð·Ð¸ÑÐµÐ»ÑÐ½Ð°Ñ."
+                                                                     ]
+                                                    }
+                                        },
+                                        {
+                                            "id":  "gemma4-31b-it-nvfp4",
+                                            "path":  "D:\\jarvis\\data\\models\\gemma4-31b-it-nvfp4",
+                                            "exists":  true,
+                                            "active":  false,
+                                            "size_bytes":  32666144074,
+                                            "shard_count":  4,
+                                            "modified_at":  "2026-07-03T11:37:53+00:00",
+                                            "model_type":  "gemma4",
+                                            "architectures":  [
+                                                                  "Gemma4ForConditionalGeneration"
+                                                              ],
+                                            "dtype":  "bfloat16",
+                                            "quantization":  "NVFP4",
+                                            "metadata":  {
+                                                             "config.json":  true,
+                                                             "generation_config.json":  true,
+                                                             "hf_quant_config.json":  true,
+                                                             "model.safetensors.index.json":  true,
+                                                             "tokenizer_config.json":  true
+                                                         },
+                                            "generation":  {
+                                                               "temperature":  1.0,
+                                                               "top_p":  0.95,
+                                                               "max_length":  null
+                                                           },
+                                            "fit":  {
+                                                        "status":  "no",
+                                                        "label":  "Ð½Ðµ Ð·Ð°Ð²ÐµÐ´ÑÑÑÑ",
+                                                        "confidence":  "medium",
+                                                        "required_bytes":  37239404244,
+                                                        "weights_bytes":  32666144074,
+                                                        "kv_cache_bytes":  0,
+                                                        "overhead_bytes":  4573260170,
+                                                        "gpu_total_bytes":  34190917632,
+                                                        "gpu_free_bytes":  4215275520,
+                                                        "context_tokens":  8192,
+                                                        "quant_bits":  4.5,
+                                                        "parameters":  31000000000,
+                                                        "warnings":  [
+                                                                         "ÐÑÐµÐ½ÐºÐ° Ð²ÑÑÐµ Ð´Ð¾ÑÑÑÐ¿Ð½Ð¾Ð¹ VRAM; Ð½ÑÐ¶ÐµÐ½ Ð¼ÐµÐ½ÑÑÐ¸Ð¹ ÐºÐ²Ð°Ð½Ñ, offload Ð¸Ð»Ð¸ Ð´ÑÑÐ³Ð°Ñ Ð¼Ð¾Ð´ÐµÐ»Ñ.",
+                                                                         "ÐÑÑÐ¼Ð¾ ÑÐµÐ¹ÑÐ°Ñ ÑÐ²Ð¾Ð±Ð¾Ð´Ð½Ð¾Ð¹ VRAM Ð½ÐµÐ´Ð¾ÑÑÐ°ÑÐ¾ÑÐ½Ð¾ Ð±ÐµÐ· Ð¾ÑÑÐ°Ð½Ð¾Ð²ÐºÐ¸ ÑÐµÐºÑÑÐµÐ¹ Ð½Ð°Ð³ÑÑÐ·ÐºÐ¸.",
+                                                                         "ÐÐµÑÐ°Ð´Ð°Ð½Ð½ÑÐµ Ð½ÐµÐ¿Ð¾Ð»Ð½ÑÐµ; Ð¾ÑÐµÐ½ÐºÐ° Ð¿ÑÐ¸Ð±Ð»Ð¸Ð·Ð¸ÑÐµÐ»ÑÐ½Ð°Ñ."
+                                                                     ]
+                                                    }
+                                        },
+                                        {
+                                            "id":  "ui-tars",
+                                            "path":  "D:\\jarvis\\data\\models\\ui-tars",
+                                            "exists":  true,
+                                            "active":  false,
+                                            "size_bytes":  9785467987,
+                                            "shard_count":  2,
+                                            "modified_at":  "2026-06-28T16:09:00+00:00",
+                                            "model_type":  "qwen2_vl",
+                                            "architectures":  [
+                                                                  "Qwen2VLForConditionalGeneration"
+                                                              ],
+                                            "dtype":  "bfloat16",
+                                            "quantization":  null,
+                                            "metadata":  {
+                                                             "config.json":  true,
+                                                             "generation_config.json":  false,
+                                                             "hf_quant_config.json":  false,
+                                                             "model.safetensors.index.json":  true,
+                                                             "tokenizer_config.json":  true
+                                                         },
+                                            "generation":  {
+                                                               "temperature":  null,
+                                                               "top_p":  null,
+                                                               "max_length":  null
+                                                           },
+                                            "fit":  {
+                                                        "status":  "fits",
+                                                        "label":  "Ð·Ð°Ð²ÐµÐ´ÑÑÑÑ",
+                                                        "confidence":  "high",
+                                                        "required_bytes":  12100723795,
+                                                        "weights_bytes":  9785467987,
+                                                        "kv_cache_bytes":  704643072,
+                                                        "overhead_bytes":  1610612736,
+                                                        "gpu_total_bytes":  34190917632,
+                                                        "gpu_free_bytes":  4215275520,
+                                                        "context_tokens":  8192,
+                                                        "quant_bits":  16,
+                                                        "parameters":  null,
+                                                        "warnings":  [
+                                                                         "ÐÑÑÐ¼Ð¾ ÑÐµÐ¹ÑÐ°Ñ ÑÐ²Ð¾Ð±Ð¾Ð´Ð½Ð¾Ð¹ VRAM Ð½ÐµÐ´Ð¾ÑÑÐ°ÑÐ¾ÑÐ½Ð¾ Ð±ÐµÐ· Ð¾ÑÑÐ°Ð½Ð¾Ð²ÐºÐ¸ ÑÐµÐºÑÑÐµÐ¹ Ð½Ð°Ð³ÑÑÐ·ÐºÐ¸."
+                                                                     ]
+                                                    }
+                                        },
+                                        {
+                                            "id":  "ui-tars-1.5-7b-awq",
+                                            "path":  "D:\\jarvis\\data\\models\\ui-tars-1.5-7b-awq",
+                                            "exists":  true,
+                                            "active":  false,
+                                            "size_bytes":  6939947860,
+                                            "shard_count":  2,
+                                            "modified_at":  "2026-06-29T10:43:15+00:00",
+                                            "model_type":  "qwen2_5_vl",
+                                            "architectures":  [
+                                                                  "Qwen2_5_VLForConditionalGeneration"
+                                                              ],
+                                            "dtype":  "bfloat16",
+                                            "quantization":  null,
+                                            "metadata":  {
+                                                             "config.json":  true,
+                                                             "generation_config.json":  true,
+                                                             "hf_quant_config.json":  false,
+                                                             "model.safetensors.index.json":  true,
+                                                             "tokenizer_config.json":  true
+                                                         },
+                                            "generation":  {
+                                                               "temperature":  null,
+                                                               "top_p":  null,
+                                                               "max_length":  null
+                                                           },
+                                            "fit":  {
+                                                        "status":  "fits",
+                                                        "label":  "Ð·Ð°Ð²ÐµÐ´ÑÑÑÑ",
+                                                        "confidence":  "high",
+                                                        "required_bytes":  10194727764,
+                                                        "weights_bytes":  6939947860,
+                                                        "kv_cache_bytes":  1644167168,
+                                                        "overhead_bytes":  1610612736,
+                                                        "gpu_total_bytes":  34190917632,
+                                                        "gpu_free_bytes":  4215275520,
+                                                        "context_tokens":  8192,
+                                                        "quant_bits":  16,
+                                                        "parameters":  7000000000,
+                                                        "warnings":  [
+                                                                         "ÐÑÑÐ¼Ð¾ ÑÐµÐ¹ÑÐ°Ñ ÑÐ²Ð¾Ð±Ð¾Ð´Ð½Ð¾Ð¹ VRAM Ð½ÐµÐ´Ð¾ÑÑÐ°ÑÐ¾ÑÐ½Ð¾ Ð±ÐµÐ· Ð¾ÑÑÐ°Ð½Ð¾Ð²ÐºÐ¸ ÑÐµÐºÑÑÐµÐ¹ Ð½Ð°Ð³ÑÑÐ·ÐºÐ¸."
+                                                                     ]
+                                                    }
+                                        }
+                                    ],
+                         "dispatcher":  {
+                                            "base_url":  "http://localhost:8001/v1",
+                                            "served_model_name":  "dispatcher",
+                                            "model_path":  "D:\\jarvis\\data\\models\\gemma4-26b-a4b-nvfp4",
+                                            "docker_model_path":  "/models/gemma4-26b-a4b-nvfp4",
+                                            "engine":  "vllm-openai",
+                                            "env":  {
+                                                        "JARVIS_QWEN_MODEL_NAME":  "dispatcher",
+                                                        "JARVIS_QWEN_MODEL_PATH":  "/models/gemma4-26b-a4b-nvfp4",
+                                                        "JARVIS_QWEN_DTYPE":  "auto",
+                                                        "JARVIS_QWEN_GPU_UTIL":  "0.82",
+                                                        "JARVIS_QWEN_MAX_LEN":  "32768",
+                                                        "JARVIS_QWEN_KV_DTYPE":  "fp8",
+                                                        "JARVIS_QWEN_TOKENIZER_MODE":  "slow",
+                                                        "JARVIS_QWEN_SAFETENSORS_LOAD_STRATEGY":  "prefetch",
+                                                        "JARVIS_QWEN_MAX_NUM_SEQS":  "16",
+                                                        "JARVIS_QWEN_ENFORCE_EAGER":  "",
+                                                        "JARVIS_QWEN_CPU_OFFLOAD_ARGS":  "",
+                                                        "JARVIS_QWEN_KV_OFFLOAD_ARGS":  "",
+                                                        "JARVIS_QWEN_EXTRA_ARGS":  "",
+                                                        "JARVIS_ENABLE_UITARS":  "0"
+                                                    }
+                                        },
+                         "vram":  {
+                                      "available":  true,
+                                      "name":  "NVIDIA GeForce RTX 5090",
+                                      "total_bytes":  34190917632,
+                                      "used_bytes":  29975642112,
+                                      "free_bytes":  4215275520
+                                  },
+                         "downloads":  [
+
+                                       ]
+                     }
+    },
+    {
+        "path":  "/api/dispatcher",
+        "status":  "PASS",
+        "elapsed_ms":  102.22,
+        "response":  {
+                         "service":  "dispatcher",
+                         "container":  "jarvis-gpt-dispatcher",
+                         "docker_available":  true,
+                         "docker_path":  "C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.EXE",
+                         "port":  8001,
+                         "port_open":  true,
+                         "base_url":  "http://localhost:8001/v1",
+                         "model":  "dispatcher",
+                         "active_model":  {
+                                              "id":  "gemma4-26b-a4b-nvfp4",
+                                              "path":  "D:\\jarvis\\data\\models\\gemma4-26b-a4b-nvfp4",
+                                              "exists":  true,
+                                              "active":  true,
+                                              "size_bytes":  18825679760,
+                                              "shard_count":  2,
+                                              "modified_at":  "2026-06-29T10:32:56+00:00",
+                                              "model_type":  "gemma4",
+                                              "architectures":  [
+                                                                    "Gemma4ForConditionalGeneration"
+                                                                ],
+                                              "dtype":  "bfloat16",
+                                              "quantization":  "NVFP4",
+                                              "metadata":  {
+                                                               "config.json":  true,
+                                                               "generation_config.json":  true,
+                                                               "hf_quant_config.json":  true,
+                                                               "model.safetensors.index.json":  true,
+                                                               "tokenizer_config.json":  true
+                                                           },
+                                              "generation":  {
+                                                                 "temperature":  1.0,
+                                                                 "top_p":  0.95,
+                                                                 "max_length":  null
+                                                             }
+                                          },
+                         "desired_model":  {
+                                               "id":  "gemma4-26b-a4b-nvfp4",
+                                               "path":  "D:\\jarvis\\data\\models\\gemma4-26b-a4b-nvfp4",
+                                               "exists":  true,
+                                               "active":  true,
+                                               "size_bytes":  18825679760,
+                                               "shard_count":  2,
+                                               "modified_at":  "2026-06-29T10:32:56+00:00",
+                                               "model_type":  "gemma4",
+                                               "architectures":  [
+                                                                     "Gemma4ForConditionalGeneration"
+                                                                 ],
+                                               "dtype":  "bfloat16",
+                                               "quantization":  "NVFP4",
+                                               "metadata":  {
+                                                                "config.json":  true,
+                                                                "generation_config.json":  true,
+                                                                "hf_quant_config.json":  true,
+                                                                "model.safetensors.index.json":  true,
+                                                                "tokenizer_config.json":  true
+                                                            },
+                                               "generation":  {
+                                                                  "temperature":  1.0,
+                                                                  "top_p":  0.95,
+                                                                  "max_length":  null
+                                                              }
+                                           },
+                         "runtime":  {
+                                         "source":  "container-command",
+                                         "model_path":  "/models/gemma4-26b-a4b-nvfp4",
+                                         "model_id":  "gemma4-26b-a4b-nvfp4",
+                                         "served_model_name":  "dispatcher",
+                                         "dtype":  "auto",
+                                         "enforce_eager":  false,
+                                         "max_model_len":  32768,
+                                         "gpu_memory_utilization":  0.82,
+                                         "kv_cache_dtype":  "fp8",
+                                         "max_num_seqs":  16,
+                                         "cpu_offload_gb":  null,
+                                         "kv_offloading_gb":  null,
+                                         "kv_offloading_backend":  null,
+                                         "tokenizer_mode":  "slow",
+                                         "safetensors_load_strategy":  "prefetch",
+                                         "prefix_caching":  true,
+                                         "language_model_only":  false,
+                                         "skip_mm_profiling":  false,
+                                         "mm_processor_cache_gb":  null,
+                                         "max_num_batched_tokens":  null,
+                                         "host":  "0.0.0.0",
+                                         "port":  8001
+                                     },
+                         "desired_runtime":  {
+                                                 "source":  "desired-env",
+                                                 "model_path":  "/models/gemma4-26b-a4b-nvfp4",
+                                                 "model_id":  "gemma4-26b-a4b-nvfp4",
+                                                 "served_model_name":  "dispatcher",
+                                                 "dtype":  "auto",
+                                                 "enforce_eager":  false,
+                                                 "max_model_len":  32768,
+                                                 "gpu_memory_utilization":  0.82,
+                                                 "kv_cache_dtype":  "fp8",
+                                                 "max_num_seqs":  16,
+                                                 "cpu_offload_gb":  null,
+                                                 "kv_offloading_gb":  null,
+                                                 "kv_offloading_backend":  null,
+                                                 "tokenizer_mode":  "slow",
+                                                 "safetensors_load_strategy":  "prefetch",
+                                                 "prefix_caching":  true,
+                                                 "language_model_only":  false,
+                                                 "skip_mm_profiling":  false,
+                                                 "mm_processor_cache_gb":  null,
+                                                 "max_num_batched_tokens":  null,
+                                                 "host":  "0.0.0.0",
+                                                 "port":  8001
+                                             },
+                         "actual_image":  "vllm/vllm-openai:v0.23.0",
+                         "desired_image":  "vllm/vllm-openai:v0.23.0",
+                         "runtime_matches_desired":  true,
+                         "runtime_mismatches":  {
+
+                                                },
+                         "compose":  [
+                                         "docker",
+                                         "compose",
+                                         "--profile",
+                                         "llm",
+                                         "up",
+                                         "-d",
+                                         "dispatcher"
+                                     ],
+                         "container_status":  {
+                                                  "ok":  true,
+                                                  "exists":  true,
+                                                  "name":  "jarvis-gpt-dispatcher",
+                                                  "status":  "Up 17 minutes (healthy)",
+                                                  "ports":  "127.0.0.1:8001-\u003e8001/tcp",
+                                                  "image":  "vllm/vllm-openai:v0.23.0",
+                                                  "command":  [
+                                                                  "--model",
+                                                                  "/models/gemma4-26b-a4b-nvfp4",
+                                                                  "--served-model-name",
+                                                                  "dispatcher",
+                                                                  "--dtype",
+                                                                  "auto",
+                                                                  "--max-model-len",
+                                                                  "32768",
+                                                                  "--gpu-memory-utilization",
+                                                                  "0.82",
+                                                                  "--kv-cache-dtype",
+                                                                  "fp8",
+                                                                  "--tokenizer-mode",
+                                                                  "slow",
+                                                                  "--safetensors-load-strategy",
+                                                                  "prefetch",
+                                                                  "--enable-prefix-caching",
+                                                                  "--max-num-seqs",
+                                                                  "16",
+                                                                  "--host",
+                                                                  "0.0.0.0",
+                                                                  "--port",
+                                                                  "8001"
+                                                              ]
+                                              },
+                         "env":  {
+                                     "JARVIS_HOST_HOME":  "D:\\jarvis",
+                                     "JARVIS_MODEL_ROOT":  "D:\\jarvis\\data\\models",
+                                     "JARVIS_VLLM_IMAGE":  "vllm/vllm-openai:v0.23.0",
+                                     "VLLM_USE_V2_MODEL_RUNNER":  "0",
+                                     "VLLM_WEIGHT_OFFLOADING_DISABLE_UVA":  "1",
+                                     "CUDA_VISIBLE_DEVICES":  "0",
+                                     "CUDA_DEVICE_ORDER":  "PCI_BUS_ID",
+                                     "CUDA_DISABLE_P2P":  "1",
+                                     "NCCL_P2P_DISABLE":  "1",
+                                     "HF_TOKEN":  "",
+                                     "JARVIS_QWEN_MODEL_NAME":  "dispatcher",
+                                     "JARVIS_QWEN_MODEL_PATH":  "/models/gemma4-26b-a4b-nvfp4",
+                                     "JARVIS_QWEN_DTYPE":  "auto",
+                                     "JARVIS_QWEN_GPU_UTIL":  "0.82",
+                                     "JARVIS_QWEN_MAX_LEN":  "32768",
+                                     "JARVIS_QWEN_KV_DTYPE":  "fp8",
+                                     "JARVIS_QWEN_TOKENIZER_MODE":  "slow",
+                                     "JARVIS_QWEN_SAFETENSORS_LOAD_STRATEGY":  "prefetch",
+                                     "JARVIS_QWEN_MAX_NUM_SEQS":  "16",
+                                     "JARVIS_QWEN_ENFORCE_EAGER":  "",
+                                     "JARVIS_QWEN_CPU_OFFLOAD_ARGS":  "",
+                                     "JARVIS_QWEN_KV_OFFLOAD_ARGS":  "",
+                                     "JARVIS_QWEN_EXTRA_ARGS":  "",
+                                     "JARVIS_ENABLE_UITARS":  "0"
+                                 }
+                     }
+    },
+    {
+        "path":  "/api/telemetry/live",
+        "status":  "PASS",
+        "elapsed_ms":  37.8,
+        "response":  {
+                         "ts":  "2026-07-13T16:28:06+00:00",
+                         "host":  {
+                                      "hostname":  "DESKTOP-ESPSBSE",
+                                      "platform":  "Windows-10-10.0.26200-SP0",
+                                      "cpu_count":  24
+                                  },
+                         "memory":  {
+                                        "total":  136658415616,
+                                        "available":  109274955776,
+                                        "used":  27383459840,
+                                        "used_ratio":  0.20037887689950606
+                                    },
+                         "disks":  [
+
+                                   ],
+                         "gpu":  {
+                                     "available":  true,
+                                     "gpus":  [
+                                                  {
+                                                      "name":  "NVIDIA GeForce RTX 5090",
+                                                      "memory_total_mb":  32607.0,
+                                                      "memory_used_mb":  28587.0,
+                                                      "memory_used_ratio":  0.8767135891066336,
+                                                      "utilization_gpu":  0.0,
+                                                      "temperature_c":  43.0,
+                                                      "power_w":  27.83
+                                                  }
+                                              ]
+                                 },
+                         "docker":  {
+                                        "available":  true,
+                                        "containers":  [
+                                                           {
+                                                               "name":  "jarvis-gpt-dispatcher",
+                                                               "image":  "vllm/vllm-openai:v0.23.0",
+                                                               "status":  "Up 11 minutes (healthy)",
+                                                               "ports":  "127.0.0.1:8001-\u003e8001/tcp"
+                                                           }
+                                                       ]
+                                    },
+                         "performance":  {
+                                             "profile":  "gemma4-turbo",
+                                             "model":  "gemma4-26b-a4b-nvfp4",
+                                             "max_model_len":  32768,
+                                             "gpu_memory_utilization":  0.82,
+                                             "kv_cache_dtype":  "fp8",
+                                             "max_num_seqs":  16,
+                                             "eager_mode":  false,
+                                             "cpu_offload_gb":  0,
+                                             "kv_offloading_gb":  0,
+                                             "vllm_extra_args":  {
+                                                                     "language_model_only":  false,
+                                                                     "skip_mm_profiling":  false,
+                                                                     "mm_processor_cache_gb":  null,
+                                                                     "max_num_batched_tokens":  null
+                                                                 },
+                                             "recommended_dispatcher":  {
+                                                                            "port":  8001,
+                                                                            "image":  "vllm/vllm-openai:v0.23.0",
+                                                                            "vllm_use_v2_model_runner":  "0",
+                                                                            "vllm_weight_offloading_disable_uva":  "1",
+                                                                            "cuda_visible_devices":  "0",
+                                                                            "tokenizer_mode":  "slow",
+                                                                            "safetensors_load_strategy":  "prefetch",
+                                                                            "model_path":  "/models/gemma4-26b-a4b-nvfp4"
+                                                                        },
+                                             "resource_policy":  {
+                                                                     "backend":  "keep lightweight; no model weights in process",
+                                                                     "dispatcher":  "own GPU/VRAM through vLLM profile",
+                                                                     "storage":  "SQLite WAL with FTS for local single-user latency",
+                                                                     "frontend":  "poll compact snapshots; heavy work remains in backend/dispatcher"
+                                                                 }
+                                         }
+                     }
+    },
+    {
+        "path":  "/api/host-bridge",
+        "status":  "PASS",
+        "elapsed_ms":  292.93,
+        "response":  {
+                         "name":  "windows_rpc_bridge",
+                         "host":  "127.0.0.1",
+                         "port":  8765,
+                         "port_open":  true,
+                         "token_path":  "D:\\jarvis\\.jarvis\\bridge.token",
+                         "token_available":  true,
+                         "script_path":  "D:\\jarvis-gpt\\scripts\\windows_rpc_bridge.py",
+                         "deployed_script_path":  "D:\\jarvis\\windows_rpc_bridge.py",
+                         "bundled_script_path":  "D:\\jarvis-gpt\\scripts\\windows_rpc_bridge.py",
+                         "script_available":  true,
+                         "start_command":  "python D:\\jarvis-gpt\\scripts\\windows_rpc_bridge.py --port 8765",
+                         "native_capabilities":  [
+                                                     "app.open_and_type",
+                                                     "capabilities",
+                                                     "chrome.launch",
+                                                     "console.show_processes",
+                                                     "keyboard.send",
+                                                     "process.start",
+                                                     "process.top",
+                                                     "screen.capture",
+                                                     "url.open",
+                                                     "window.focus",
+                                                     "window.list",
+                                                     "wmi.query"
+                                                 ]
+                     }
+    }
+]

@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "run_id": "20260713T002206Z_686424795712",
+  "functional_run_path": ".audit/runs/20260713T002206Z_686424795712/functional",
+  "status": "COMPLETE_WITH_BLOCKERS",
+  "operator_ready": true,
+  "started_at_utc": "2026-07-13T16:08:36Z",
+  "completed_at_utc": "2026-07-13T19:01:17.602729+00:00",
+  "source_head_at_start": "3fda655e4f723a0d8f58a4edfb4b3ee7dda079fe",
+  "source_head_tested": "3fda655e4f723a0d8f58a4edfb4b3ee7dda079fe",
+  "source_drift": "AUDIT_DOCS_AND_FUNCTIONAL_ARTIFACTS_ONLY",
+  "checkpoint_path": "D:\\jarvis\\audit-backups\\20260713T002206Z_686424795712\\pre-functional-resume\\checkpoint-20260713T160611Z",
+  "progress_percent": 100,
+  "counts": {
+    "scenarios": 86,
+    "scenario_statuses": {
+      "BLOCKED_BY_ENV": 1,
+      "BLOCKED_BY_SPEC": 1,
+      "FAIL": 30,
+      "INCONCLUSIVE": 34,
+      "PASS": 20
+    },
+    "operator_cases": 68,
+    "operator_repeats": 169,
+    "operator_repeat_statuses": {
+      "FAIL": 49,
+      "INCONCLUSIVE": 74,
+      "PASS": 46
+    },
+    "findings": 17,
+    "spark_tasks": 17
+  },
+  "profiles": [
+    "gemma4-turbo",
+    "gemma4-mono-perf",
+    "gemma4-mono"
+  ],
+  "markers": {
+    "functional_ready": false,
+    "spark_ready": true
+  }
+}

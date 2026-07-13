@@ -1,0 +1,50 @@
+{
+  "schema": "jarvis.functional-final-consistency.v2",
+  "recorded_at": "2026-07-13T19:12:33.703515+00:00",
+  "checks": {
+    "required_files": true,
+    "results_86_unique": true,
+    "results_terminal": true,
+    "queue_matches_results": true,
+    "feature_map_terminal": true,
+    "operator_169_unique": true,
+    "operator_terminal": true,
+    "operator_two_reviews": true,
+    "all_scenario_fails_have_findings": true,
+    "all_operator_fails_have_findings": true,
+    "spark_one_per_finding": true,
+    "spark_tasks_exist": true,
+    "spark_ready_valid": true,
+    "spark_task_contracts": true,
+    "spark_allowed_paths_exist": true,
+    "markers": true,
+    "functional_state": true,
+    "pipeline_state": true,
+    "latest_pointer": true,
+    "no_old_complete_pointer": true,
+    "final_ports_closed": true,
+    "final_container_absent": true,
+    "final_machine_baseline_restored": true,
+    "raw_doctor_not_referenced": true
+  },
+  "details": {
+    "scenario_statuses": {
+      "BLOCKED_BY_ENV": 1,
+      "BLOCKED_BY_SPEC": 1,
+      "FAIL": 30,
+      "INCONCLUSIVE": 34,
+      "PASS": 20
+    },
+    "operator_statuses": {
+      "FAIL": 49,
+      "INCONCLUSIVE": 74,
+      "PASS": 46
+    },
+    "scenario_fail_rows": 30,
+    "operator_fail_rows": 49,
+    "findings": 17,
+    "spark_tasks": 17,
+    "failed_checks": []
+  },
+  "ok": true
+}

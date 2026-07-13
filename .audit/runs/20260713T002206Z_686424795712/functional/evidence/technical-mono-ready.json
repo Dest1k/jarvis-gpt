@@ -1,0 +1,571 @@
+{
+  "recorded_at": "2026-07-13T18:27:43Z",
+  "repo": "D:\\jarvis-gpt",
+  "home": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712",
+  "profile": "gemma4-mono",
+  "api": {
+    "health": {
+      "ok": true,
+      "status": 200,
+      "elapsed_ms": 3.94,
+      "body": {
+        "ok": true,
+        "profile": "gemma4-mono",
+        "home": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712"
+      }
+    },
+    "status": {
+      "ok": true,
+      "status": 200,
+      "elapsed_ms": 2.87,
+      "home": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712",
+      "profile": "gemma4-mono",
+      "max_model_len": 16384,
+      "active_model": "D:\\jarvis\\data\\models\\gemma4-31b-it-nvfp4",
+      "counters": {
+        "runtime_kv": 7,
+        "conversations": 152,
+        "messages": 388,
+        "memories": 92,
+        "missions": 4,
+        "mission_tasks": 16,
+        "files": 50,
+        "file_chunks": 48,
+        "tool_runs": 68,
+        "learning_observations": 479,
+        "approvals": 3,
+        "telemetry_snapshots": 333,
+        "audit_log": 217
+      },
+      "health": [
+        {
+          "name": "docker",
+          "status": "ok",
+          "message": "Docker version 29.6.1, build 8900f1d"
+        },
+        {
+          "name": "git",
+          "status": "ok",
+          "message": "git version 2.54.0.windows.1"
+        },
+        {
+          "name": "llm.router",
+          "status": "ok",
+          "message": "LLM endpoint is responding"
+        },
+        {
+          "name": "models.profile",
+          "status": "ok",
+          "message": "gemma4-mono -> D:\\jarvis\\data\\models\\gemma4-31b-it-nvfp4"
+        },
+        {
+          "name": "models.root",
+          "status": "ok",
+          "message": "D:\\jarvis\\data\\models is available"
+        },
+        {
+          "name": "python",
+          "status": "ok",
+          "message": "3.11.9"
+        },
+        {
+          "name": "runtime.cache",
+          "status": "ok",
+          "message": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\cache\\jarvis-gpt is available"
+        },
+        {
+          "name": "runtime.data",
+          "status": "ok",
+          "message": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt is available"
+        },
+        {
+          "name": "runtime.home",
+          "status": "ok",
+          "message": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712 is available"
+        },
+        {
+          "name": "runtime.logs",
+          "status": "ok",
+          "message": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\logs\\jarvis-gpt is available"
+        },
+        {
+          "name": "storage.sqlite",
+          "status": "ok",
+          "message": "SQLite storage is responding"
+        }
+      ]
+    },
+    "models": {
+      "ok": true,
+      "status": 200,
+      "elapsed_ms": 72.41,
+      "body": {
+        "root": "D:\\jarvis\\data\\models",
+        "active_profile": "gemma4-mono",
+        "active_model": {
+          "id": "gemma4-31b-it-nvfp4",
+          "path": "D:\\jarvis\\data\\models\\gemma4-31b-it-nvfp4",
+          "exists": true,
+          "active": true,
+          "size_bytes": 32666144074,
+          "shard_count": 4,
+          "modified_at": "2026-07-03T11:37:53+00:00",
+          "model_type": "gemma4",
+          "architectures": [
+            "Gemma4ForConditionalGeneration"
+          ],
+          "dtype": "bfloat16",
+          "quantization": "NVFP4",
+          "metadata": {
+            "config.json": true,
+            "generation_config.json": true,
+            "hf_quant_config.json": true,
+            "model.safetensors.index.json": true,
+            "tokenizer_config.json": true
+          },
+          "generation": {
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "max_length": null
+          },
+          "fit": {}
+        },
+        "models": [
+          {
+            "id": "gemma4-26b-a4b-nvfp4",
+            "path": "D:\\jarvis\\data\\models\\gemma4-26b-a4b-nvfp4",
+            "exists": true,
+            "active": false,
+            "size_bytes": 18825679760,
+            "shard_count": 2,
+            "modified_at": "2026-06-29T10:32:56+00:00",
+            "model_type": "gemma4",
+            "architectures": [
+              "Gemma4ForConditionalGeneration"
+            ],
+            "dtype": "bfloat16",
+            "quantization": "NVFP4",
+            "metadata": {
+              "config.json": true,
+              "generation_config.json": true,
+              "hf_quant_config.json": true,
+              "model.safetensors.index.json": true,
+              "tokenizer_config.json": true
+            },
+            "generation": {
+              "temperature": 1.0,
+              "top_p": 0.95,
+              "max_length": null
+            },
+            "fit": {
+              "status": "fits",
+              "label": "заведётся",
+              "confidence": "medium",
+              "required_bytes": 21461274926,
+              "weights_bytes": 18825679760,
+              "kv_cache_bytes": 0,
+              "overhead_bytes": 2635595166,
+              "gpu_total_bytes": 34190917632,
+              "gpu_free_bytes": 575668224,
+              "context_tokens": 8192,
+              "quant_bits": 4.5,
+              "parameters": 26000000000,
+              "warnings": [
+                "Прямо сейчас свободной VRAM недостаточно без остановки текущей нагрузки.",
+                "Метаданные неполные; оценка приблизительная."
+              ]
+            }
+          },
+          {
+            "id": "gemma4-31b-it-nvfp4",
+            "path": "D:\\jarvis\\data\\models\\gemma4-31b-it-nvfp4",
+            "exists": true,
+            "active": true,
+            "size_bytes": 32666144074,
+            "shard_count": 4,
+            "modified_at": "2026-07-03T11:37:53+00:00",
+            "model_type": "gemma4",
+            "architectures": [
+              "Gemma4ForConditionalGeneration"
+            ],
+            "dtype": "bfloat16",
+            "quantization": "NVFP4",
+            "metadata": {
+              "config.json": true,
+              "generation_config.json": true,
+              "hf_quant_config.json": true,
+              "model.safetensors.index.json": true,
+              "tokenizer_config.json": true
+            },
+            "generation": {
+              "temperature": 1.0,
+              "top_p": 0.95,
+              "max_length": null
+            },
+            "fit": {
+              "status": "no",
+              "label": "не заведётся",
+              "confidence": "medium",
+              "required_bytes": 37239404244,
+              "weights_bytes": 32666144074,
+              "kv_cache_bytes": 0,
+              "overhead_bytes": 4573260170,
+              "gpu_total_bytes": 34190917632,
+              "gpu_free_bytes": 575668224,
+              "context_tokens": 8192,
+              "quant_bits": 4.5,
+              "parameters": 31000000000,
+              "warnings": [
+                "Оценка выше доступной VRAM; нужен меньший квант, offload или другая модель.",
+                "Прямо сейчас свободной VRAM недостаточно без остановки текущей нагрузки.",
+                "Метаданные неполные; оценка приблизительная."
+              ]
+            }
+          },
+          {
+            "id": "ui-tars",
+            "path": "D:\\jarvis\\data\\models\\ui-tars",
+            "exists": true,
+            "active": false,
+            "size_bytes": 9785467987,
+            "shard_count": 2,
+            "modified_at": "2026-06-28T16:09:00+00:00",
+            "model_type": "qwen2_vl",
+            "architectures": [
+              "Qwen2VLForConditionalGeneration"
+            ],
+            "dtype": "bfloat16",
+            "quantization": null,
+            "metadata": {
+              "config.json": true,
+              "generation_config.json": false,
+              "hf_quant_config.json": false,
+              "model.safetensors.index.json": true,
+              "tokenizer_config.json": true
+            },
+            "generation": {
+              "temperature": null,
+              "top_p": null,
+              "max_length": null
+            },
+            "fit": {
+              "status": "fits",
+              "label": "заведётся",
+              "confidence": "high",
+              "required_bytes": 12100723795,
+              "weights_bytes": 9785467987,
+              "kv_cache_bytes": 704643072,
+              "overhead_bytes": 1610612736,
+              "gpu_total_bytes": 34190917632,
+              "gpu_free_bytes": 575668224,
+              "context_tokens": 8192,
+              "quant_bits": 16,
+              "parameters": null,
+              "warnings": [
+                "Прямо сейчас свободной VRAM недостаточно без остановки текущей нагрузки."
+              ]
+            }
+          },
+          {
+            "id": "ui-tars-1.5-7b-awq",
+            "path": "D:\\jarvis\\data\\models\\ui-tars-1.5-7b-awq",
+            "exists": true,
+            "active": false,
+            "size_bytes": 6939947860,
+            "shard_count": 2,
+            "modified_at": "2026-06-29T10:43:15+00:00",
+            "model_type": "qwen2_5_vl",
+            "architectures": [
+              "Qwen2_5_VLForConditionalGeneration"
+            ],
+            "dtype": "bfloat16",
+            "quantization": null,
+            "metadata": {
+              "config.json": true,
+              "generation_config.json": true,
+              "hf_quant_config.json": false,
+              "model.safetensors.index.json": true,
+              "tokenizer_config.json": true
+            },
+            "generation": {
+              "temperature": null,
+              "top_p": null,
+              "max_length": null
+            },
+            "fit": {
+              "status": "fits",
+              "label": "заведётся",
+              "confidence": "high",
+              "required_bytes": 10194727764,
+              "weights_bytes": 6939947860,
+              "kv_cache_bytes": 1644167168,
+              "overhead_bytes": 1610612736,
+              "gpu_total_bytes": 34190917632,
+              "gpu_free_bytes": 575668224,
+              "context_tokens": 8192,
+              "quant_bits": 16,
+              "parameters": 7000000000,
+              "warnings": [
+                "Прямо сейчас свободной VRAM недостаточно без остановки текущей нагрузки."
+              ]
+            }
+          }
+        ],
+        "dispatcher": {
+          "base_url": "http://localhost:8001/v1",
+          "served_model_name": "dispatcher",
+          "model_path": "D:\\jarvis\\data\\models\\gemma4-31b-it-nvfp4",
+          "docker_model_path": "/models/gemma4-31b-it-nvfp4",
+          "engine": "vllm-openai",
+          "env": {
+            "JARVIS_QWEN_MODEL_NAME": "dispatcher",
+            "JARVIS_QWEN_MODEL_PATH": "/models/gemma4-31b-it-nvfp4",
+            "JARVIS_QWEN_DTYPE": "auto",
+            "JARVIS_QWEN_GPU_UTIL": "0.85",
+            "JARVIS_QWEN_MAX_LEN": "16384",
+            "JARVIS_QWEN_KV_DTYPE": "fp8",
+            "JARVIS_QWEN_TOKENIZER_MODE": "slow",
+            "JARVIS_QWEN_SAFETENSORS_LOAD_STRATEGY": "prefetch",
+            "JARVIS_QWEN_MAX_NUM_SEQS": "1",
+            "JARVIS_QWEN_ENFORCE_EAGER": "--enforce-eager",
+            "JARVIS_QWEN_CPU_OFFLOAD_ARGS": "--cpu-offload-gb 24",
+            "JARVIS_QWEN_KV_OFFLOAD_ARGS": "--kv-offloading-size 16 --kv-offloading-backend native",
+            "JARVIS_QWEN_EXTRA_ARGS": "",
+            "JARVIS_ENABLE_UITARS": "0"
+          }
+        },
+        "vram": {
+          "available": true,
+          "name": "NVIDIA GeForce RTX 5090",
+          "total_bytes": 34190917632,
+          "used_bytes": 33615249408,
+          "free_bytes": 575668224
+        },
+        "downloads": []
+      }
+    },
+    "backup": {
+      "ok": true,
+      "status": 200,
+      "elapsed_ms": 45.39,
+      "body": {
+        "ok": true,
+        "path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\state\\backups\\jarvis-20260713T182743Z.sqlite3",
+        "size": 5087232,
+        "created_at": "2026-07-13T18:27:43+00:00"
+      }
+    }
+  },
+  "persistence_copy": {
+    "backup_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\state\\backups\\jarvis-20260713T182743Z.sqlite3",
+    "backup_sha256": "2412e52d8be911278483b117c26c5aead59afc3f7b9d61bc46d384a59dbd005c",
+    "backup_size": 5087232,
+    "backup_integrity": "ok",
+    "user_version": 0,
+    "restored_copy": ".audit\\runs\\20260713T002206Z_686424795712\\functional\\tmp\\persistence-mono-ready\\restored-copy.sqlite3",
+    "restored_sha256": "2412e52d8be911278483b117c26c5aead59afc3f7b9d61bc46d384a59dbd005c",
+    "restored_integrity": "ok",
+    "final_integrity": "ok",
+    "table_counts_equal": true,
+    "table_count": 27,
+    "row_count": 3850,
+    "lock_error": "database is locked",
+    "lock_probe_pass": true,
+    "readonly_error": "attempt to write a readonly database",
+    "readonly_probe_pass": true,
+    "temp_error": "not a writable directory",
+    "temp_probe_pass": true
+  },
+  "cli_matrix": [
+    {
+      "command": [
+        "profiles"
+      ],
+      "returncode": 0,
+      "elapsed_ms": 642.58,
+      "stdout_sha256": "176b7b3ce7b05602a9600dca0a3748358534a6b0b005fc6a3538ac494f4858c2",
+      "stdout_preview": "{\n  \"gemma4-mono\": {\n    \"title\": \"Gemma 4 Mono (Offload)\",\n    \"description\": \"Experimental Docker/WSL Gemma 4 31B IT NVFP4 stability profile. Partial CPU weight offload + native KV offload, eager mode, single-seq. Measured decode is below 1 tok/s on RTX 5090; use only for long-context quality checks, never interactive chat. Prefer gemma4-turbo.\",\n    \"model_dir_name\": \"gemma4-31b-it-nvfp4\",\n    \"eager_mode\": true,\n    \"max_steps\": 12\n  },\n  \"gemma4-mono-perf\": {\n    \"title\": \"Gemma 4 Mono Perf\",\n    \"description\": \"Experimental Docker/WSL Gemma 4 31B IT NVFP4 quality profile. Minimal CPU weight offload (2.5GB), eager mode, 4k context and text-only execution. Measured around 2.45 tok/s on RTX 5090: much faster than the old mono profile, but still not an interactive runtime. Use gemma4-turbo for Command Center chat.\",\n    \"model_dir_name\": \"gemma4-31b-it-nvfp4\",\n    \"eager_mode\": true,\n    \"max_steps\": 16\n  },\n  \"gemma4-turbo\": {\n    \"title\": \"Gemma 4 Turbo\",\n    \"description\": \"Recommended interactive Gemma 4 26B A4B NVFP4 profile for RTX 5090. It fits GPU memory without CPU weight offload.\",\n    \"model_dir_name\": \"gemma4-26b-a4b-nvfp4\",\n    \"eager_mode\": false,\n    \"max_steps\": 24\n  }\n}\n",
+      "stderr_preview": "",
+      "status": "PASS"
+    },
+    {
+      "command": [
+        "status"
+      ],
+      "returncode": 0,
+      "elapsed_ms": 661.84,
+      "stdout_sha256": "30e73987a6c9253e90f0e35719269b59364f9f1a40abbfe15d3d8dc5c6b117c5",
+      "stdout_preview": "{\n  \"settings\": {\n    \"home\": \"D:\\\\jarvis\\\\audit-functional\\\\20260713T002206Z_686424795712\",\n    \"profile\": {\n      \"name\": \"gemma4-mono\",\n      \"title\": \"Gemma 4 Mono (Offload)\",\n      \"description\": \"Experimental Docker/WSL Gemma 4 31B IT NVFP4 stability profile. Partial CPU weight offload + native KV offload, eager mode, single-seq. Measured decode is below 1 tok/s on RTX 5090; use only for long-context quality checks, never interactive chat. Prefer gemma4-turbo.\",\n      \"eager_mode\": true,\n      \"max_steps\": 12,\n      \"temperature\": 0.15,\n      \"max_model_len\": 16384,\n      \"gpu_memory_utilization\": 0.85,\n      \"kv_cache_dtype\": \"fp8\",\n      \"max_num_seqs\": 1,\n      \"cpu_offload_gb\": 24,\n      \"kv_offloading_gb\": 16,\n      \"vllm_extra_args\": {\n        \"language_model_only\": false,\n        \"skip_mm_profiling\": false,\n        \"mm_processor_cache_gb\": null,\n        \"max_num_batched_tokens\": null\n      }\n    },\n    \"paths\": {\n      \"data\": \"D:\\\\jarvis\\\\audit-functional\\\\20260713T002206Z_686424795712\\\\data\\\\jarvis-gpt\",\n      \"files\": \"D:\\\\jarvis\\\\audit-functional\\\\20260713T002206Z_686424795712\\\\data\\\\jarvis-gpt\\\\files\",\n      \"cache\": \"D:\\\\jarvis\\\\audit-functional\\\\20260713T002206Z_686424795712\\\\cache\\\\jarvis-gpt\",\n      \"logs\": \"D:\\\\jarvis\\\\audit-functional\\\\20260713T002206Z_686424795712\\\\logs\\\\jarvis-gpt\",\n      \"models\": \"D:\\\\jarvis\\\\data\\\\models\",\n      \"active_model\": \"D:\\\\jarvis\\\\data\\\\models\\\\gemma4-31b-it-nvfp4\",\n      \"docker\": \"D:\\\\jarvis\\\\audit-functional\\\\20260713T002206Z_686424795712\\\\docker\\\\jarvis-gpt\",\n      \"state\": \"D:\\\\jarvis\\\\audit-functional\\\\20260713T002206Z_686424795712\\\\data\\\\jarvis-gpt\\\\state\",\n      \"database\": \"D:\\\\jarvis\\\\audit-functional\\\\20260713T002206Z_686424795712\\\\data\\\\jarvis-gpt\\\\state\\\\jarvis.sqlite3\",\n      \"memory_vault\": \"D:\\\\jarvis\\\\audit-functional\\\\20260713T002206Z_686424795712\\\\data\\\\jarvis-gpt\\\\memory-vault\",\n      \"host_profile\": \"D:\\\\jarvis\\\\audit-functional\\\\20260713T002206Z_686424795712\\\\host_profile.json\",\n      \"exe",
+      "stderr_preview": "",
+      "status": "PASS"
+    },
+    {
+      "command": [
+        "models"
+      ],
+      "returncode": 0,
+      "elapsed_ms": 659.11,
+      "stdout_sha256": "255ec322aeb1c14d3f66ea6bb92cb9824e747ecb6b53b6f5004e0f57e299d3b3",
+      "stdout_preview": "{\n  \"root\": \"D:\\\\jarvis\\\\data\\\\models\",\n  \"active_profile\": \"gemma4-mono\",\n  \"active_model\": {\n    \"id\": \"gemma4-31b-it-nvfp4\",\n    \"path\": \"D:\\\\jarvis\\\\data\\\\models\\\\gemma4-31b-it-nvfp4\",\n    \"exists\": true,\n    \"active\": true,\n    \"size_bytes\": 32666144074,\n    \"shard_count\": 4,\n    \"modified_at\": \"2026-07-03T11:37:53+00:00\",\n    \"model_type\": \"gemma4\",\n    \"architectures\": [\n      \"Gemma4ForConditionalGeneration\"\n    ],\n    \"dtype\": \"bfloat16\",\n    \"quantization\": \"NVFP4\",\n    \"metadata\": {\n      \"config.json\": true,\n      \"generation_config.json\": true,\n      \"hf_quant_config.json\": true,\n      \"model.safetensors.index.json\": true,\n      \"tokenizer_config.json\": true\n    },\n    \"generation\": {\n      \"temperature\": 1.0,\n      \"top_p\": 0.95,\n      \"max_length\": null\n    }\n  },\n  \"models\": [\n    {\n      \"id\": \"gemma4-26b-a4b-nvfp4\",\n      \"path\": \"D:\\\\jarvis\\\\data\\\\models\\\\gemma4-26b-a4b-nvfp4\",\n      \"exists\": true,\n      \"active\": false,\n      \"size_bytes\": 18825679760,\n      \"shard_count\": 2,\n      \"modified_at\": \"2026-06-29T10:32:56+00:00\",\n      \"model_type\": \"gemma4\",\n      \"architectures\": [\n        \"Gemma4ForConditionalGeneration\"\n      ],\n      \"dtype\": \"bfloat16\",\n      \"quantization\": \"NVFP4\",\n      \"metadata\": {\n        \"config.json\": true,\n        \"generation_config.json\": true,\n        \"hf_quant_config.json\": true,\n        \"model.safetensors.index.json\": true,\n        \"tokenizer_config.json\": true\n      },\n      \"generation\": {\n        \"temperature\": 1.0,\n        \"top_p\": 0.95,\n        \"max_length\": null\n      }\n    },\n    {\n      \"id\": \"gemma4-31b-it-nvfp4\",\n      \"path\": \"D:\\\\jarvis\\\\data\\\\models\\\\gemma4-31b-it-nvfp4\",\n      \"exists\": true,\n      \"active\": true,\n      \"size_bytes\": 32666144074,\n      \"shard_count\": 4,\n      \"modified_at\": \"2026-07-03T11:37:53+00:00\",\n      \"model_type\": \"gemma4\",\n      \"architectures\": [\n        \"Gemma4ForConditionalGeneration\"\n      ],\n      \"dtype\": \"bfloat16\",\n      \"quantization\": \"NVFP4\",\n      \"metadata\": {\n  ",
+      "stderr_preview": "",
+      "status": "PASS"
+    },
+    {
+      "command": [
+        "models",
+        "--env"
+      ],
+      "returncode": 0,
+      "elapsed_ms": 665.36,
+      "stdout_sha256": "765f92d339e218b3a58f432d3b11071fcd712c9762ab0e4f2c28397fa9a1da49",
+      "stdout_preview": "{\n  \"JARVIS_QWEN_MODEL_NAME\": \"dispatcher\",\n  \"JARVIS_QWEN_MODEL_PATH\": \"/models/gemma4-31b-it-nvfp4\",\n  \"JARVIS_QWEN_DTYPE\": \"auto\",\n  \"JARVIS_QWEN_GPU_UTIL\": \"0.85\",\n  \"JARVIS_QWEN_MAX_LEN\": \"16384\",\n  \"JARVIS_QWEN_KV_DTYPE\": \"fp8\",\n  \"JARVIS_QWEN_TOKENIZER_MODE\": \"slow\",\n  \"JARVIS_QWEN_SAFETENSORS_LOAD_STRATEGY\": \"prefetch\",\n  \"JARVIS_QWEN_MAX_NUM_SEQS\": \"1\",\n  \"JARVIS_QWEN_ENFORCE_EAGER\": \"--enforce-eager\",\n  \"JARVIS_QWEN_CPU_OFFLOAD_ARGS\": \"--cpu-offload-gb 24\",\n  \"JARVIS_QWEN_KV_OFFLOAD_ARGS\": \"--kv-offloading-size 16 --kv-offloading-backend native\",\n  \"JARVIS_QWEN_EXTRA_ARGS\": \"\",\n  \"JARVIS_ENABLE_UITARS\": \"0\"\n}\n",
+      "stderr_preview": "",
+      "status": "PASS"
+    },
+    {
+      "command": [
+        "diag"
+      ],
+      "returncode": 1,
+      "elapsed_ms": 639.75,
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stdout_preview": "",
+      "stderr_preview": "Jarvis API currently owns executive state; use its API or stop it before running a mutating CLI command.\n",
+      "status": "FAIL"
+    },
+    {
+      "command": [
+        "tools"
+      ],
+      "returncode": 0,
+      "elapsed_ms": 1251.27,
+      "stdout_sha256": "9b7f8ecaeaab9a9439f9dcbe98a3e00c6cd06e913397dc811d321ef24e5fa72a",
+      "stdout_preview": "[\n  {\n    \"name\": \"approval.request\",\n    \"description\": \"Create a human approval gate for a risky or irreversible action.\",\n    \"category\": \"safety\",\n    \"input_schema\": {\n      \"title\": \"Short title\",\n      \"description\": \"Why approval is needed\",\n      \"requested_action\": \"Action identifier\",\n      \"risk\": \"review or danger\",\n      \"payload\": \"Structured action details\"\n    },\n    \"danger_level\": \"review\"\n  },\n  {\n    \"name\": \"browser.chrome.launch\",\n    \"description\": \"Launch Chrome with a dedicated Jarvis profile and local DevTools endpoint.\",\n    \"category\": \"browser\",\n    \"input_schema\": {\n      \"debug_port\": \"Local DevTools port, default 9222\",\n      \"profile_dir\": \"Optional profile directory under allowed roots\",\n      \"start_url\": \"Optional HTTP(S) URL to open\"\n    },\n    \"danger_level\": \"review\"\n  },\n  {\n    \"name\": \"browser.chrome.status\",\n    \"description\": \"Check the local Chrome DevTools endpoint used for browser reading.\",\n    \"category\": \"browser\",\n    \"input_schema\": {\n      \"debug_url\": \"Local Chrome DevTools URL, default 127.0.0.1:9222\"\n    },\n    \"danger_level\": \"safe\"\n  },\n  {\n    \"name\": \"browser.click\",\n    \"description\": \"Click a CSS selector in a local Chrome CDP session after review.\",\n    \"category\": \"browser\",\n    \"input_schema\": {\n      \"url\": \"HTTP(S) URL to open\",\n      \"selector\": \"Optional CSS selector to click\",\n      \"target\": \"Optional visible text/aria/name hint to find semantically\",\n      \"wait_ms\": \"Milliseconds to wait for page load\"\n    },\n    \"danger_level\": \"review\"\n  },\n  {\n    \"name\": \"browser.handoff.status\",\n    \"description\": \"Return the current browser human-handoff checkpoint for CAPTCHA, login, or sensitive-form continuation.\",\n    \"category\": \"browser\",\n    \"input_schema\": {},\n    \"danger_level\": \"safe\"\n  },\n  {\n    \"name\": \"browser.open\",\n    \"description\": \"Open a validated HTTP(S) URL through the native host browser.\",\n    \"category\": \"browser\",\n    \"input_schema\": {\n      \"url\": \"HTTP(S) URL to open\"\n    },\n ",
+      "stderr_preview": "",
+      "status": "PASS"
+    },
+    {
+      "command": [
+        "llm-health"
+      ],
+      "returncode": 0,
+      "elapsed_ms": 1072.79,
+      "stdout_sha256": "781e7a1d200d8f666375936ec788edf54d51af4ec51c2a07ae758369046946e9",
+      "stdout_preview": "{\n  \"ok\": true,\n  \"status_code\": 200,\n  \"served_models\": [\n    \"dispatcher\"\n  ],\n  \"configured_model\": \"dispatcher\",\n  \"local\": {\n    \"root\": \"D:\\\\jarvis\\\\data\\\\models\",\n    \"active_profile\": \"gemma4-mono\",\n    \"active_model\": {\n      \"id\": \"gemma4-31b-it-nvfp4\",\n      \"path\": \"D:\\\\jarvis\\\\data\\\\models\\\\gemma4-31b-it-nvfp4\",\n      \"exists\": true,\n      \"active\": true,\n      \"size_bytes\": 32666144074,\n      \"shard_count\": 4,\n      \"modified_at\": \"2026-07-03T11:37:53+00:00\",\n      \"model_type\": \"gemma4\",\n      \"architectures\": [\n        \"Gemma4ForConditionalGeneration\"\n      ],\n      \"dtype\": \"bfloat16\",\n      \"quantization\": \"NVFP4\",\n      \"metadata\": {\n        \"config.json\": true,\n        \"generation_config.json\": true,\n        \"hf_quant_config.json\": true,\n        \"model.safetensors.index.json\": true,\n        \"tokenizer_config.json\": true\n      },\n      \"generation\": {\n        \"temperature\": 1.0,\n        \"top_p\": 0.95,\n        \"max_length\": null\n      }\n    },\n    \"models\": [\n      {\n        \"id\": \"gemma4-26b-a4b-nvfp4\",\n        \"path\": \"D:\\\\jarvis\\\\data\\\\models\\\\gemma4-26b-a4b-nvfp4\",\n        \"exists\": true,\n        \"active\": false,\n        \"size_bytes\": 18825679760,\n        \"shard_count\": 2,\n        \"modified_at\": \"2026-06-29T10:32:56+00:00\",\n        \"model_type\": \"gemma4\",\n        \"architectures\": [\n          \"Gemma4ForConditionalGeneration\"\n        ],\n        \"dtype\": \"bfloat16\",\n        \"quantization\": \"NVFP4\",\n        \"metadata\": {\n          \"config.json\": true,\n          \"generation_config.json\": true,\n          \"hf_quant_config.json\": true,\n          \"model.safetensors.index.json\": true,\n          \"tokenizer_config.json\": true\n        },\n        \"generation\": {\n          \"temperature\": 1.0,\n          \"top_p\": 0.95,\n          \"max_length\": null\n        }\n      },\n      {\n        \"id\": \"gemma4-31b-it-nvfp4\",\n        \"path\": \"D:\\\\jarvis\\\\data\\\\models\\\\gemma4-31b-it-nvfp4\",\n        \"exists\": true,\n        \"active\": true,\n        \"size_bytes\": 32666144074,\n     ",
+      "stderr_preview": "",
+      "status": "PASS"
+    },
+    {
+      "command": [
+        "dispatcher-status"
+      ],
+      "returncode": 0,
+      "elapsed_ms": 774.06,
+      "stdout_sha256": "7480fed308a95bc74bce7746e27684a2c47a7c54a41ef52d0a6b082068170210",
+      "stdout_preview": "{\n  \"service\": \"dispatcher\",\n  \"container\": \"jarvis-gpt-dispatcher\",\n  \"docker_available\": true,\n  \"docker_path\": \"C:\\\\Program Files\\\\Docker\\\\Docker\\\\resources\\\\bin\\\\docker.EXE\",\n  \"port\": 8001,\n  \"port_open\": true,\n  \"base_url\": \"http://localhost:8001/v1\",\n  \"model\": \"dispatcher\",\n  \"active_model\": {\n    \"id\": \"gemma4-31b-it-nvfp4\",\n    \"path\": \"D:\\\\jarvis\\\\data\\\\models\\\\gemma4-31b-it-nvfp4\",\n    \"exists\": true,\n    \"active\": true,\n    \"size_bytes\": 32666144074,\n    \"shard_count\": 4,\n    \"modified_at\": \"2026-07-03T11:37:53+00:00\",\n    \"model_type\": \"gemma4\",\n    \"architectures\": [\n      \"Gemma4ForConditionalGeneration\"\n    ],\n    \"dtype\": \"bfloat16\",\n    \"quantization\": \"NVFP4\",\n    \"metadata\": {\n      \"config.json\": true,\n      \"generation_config.json\": true,\n      \"hf_quant_config.json\": true,\n      \"model.safetensors.index.json\": true,\n      \"tokenizer_config.json\": true\n    },\n    \"generation\": {\n      \"temperature\": 1.0,\n      \"top_p\": 0.95,\n      \"max_length\": null\n    }\n  },\n  \"desired_model\": {\n    \"id\": \"gemma4-31b-it-nvfp4\",\n    \"path\": \"D:\\\\jarvis\\\\data\\\\models\\\\gemma4-31b-it-nvfp4\",\n    \"exists\": true,\n    \"active\": true,\n    \"size_bytes\": 32666144074,\n    \"shard_count\": 4,\n    \"modified_at\": \"2026-07-03T11:37:53+00:00\",\n    \"model_type\": \"gemma4\",\n    \"architectures\": [\n      \"Gemma4ForConditionalGeneration\"\n    ],\n    \"dtype\": \"bfloat16\",\n    \"quantization\": \"NVFP4\",\n    \"metadata\": {\n      \"config.json\": true,\n      \"generation_config.json\": true,\n      \"hf_quant_config.json\": true,\n      \"model.safetensors.index.json\": true,\n      \"tokenizer_config.json\": true\n    },\n    \"generation\": {\n      \"temperature\": 1.0,\n      \"top_p\": 0.95,\n      \"max_length\": null\n    }\n  },\n  \"runtime\": {\n    \"source\": \"container-command\",\n    \"model_path\": \"/models/gemma4-31b-it-nvfp4\",\n    \"model_id\": \"gemma4-31b-it-nvfp4\",\n    \"served_model_name\": \"dispatcher\",\n    \"dtype\": \"auto\",\n    \"enforce_eager\": true,\n    \"max_model_len\": 16384,\n    \"gpu_memory_utilization\": 0.8",
+      "stderr_preview": "",
+      "status": "PASS"
+    },
+    {
+      "command": [
+        "dispatcher-compose"
+      ],
+      "returncode": 0,
+      "elapsed_ms": 638.73,
+      "stdout_sha256": "6c294dd6e95d25557b0f783143aa737461364b51a55cb8095e83788eac303622",
+      "stdout_preview": "{\n  \"up\": [\n    \"docker\",\n    \"compose\",\n    \"--profile\",\n    \"llm\",\n    \"up\",\n    \"-d\",\n    \"dispatcher\"\n  ],\n  \"down\": [\n    \"docker\",\n    \"compose\",\n    \"--profile\",\n    \"llm\",\n    \"stop\",\n    \"dispatcher\"\n  ],\n  \"logs\": [\n    \"docker\",\n    \"compose\",\n    \"--profile\",\n    \"llm\",\n    \"logs\",\n    \"--tail\",\n    \"80\",\n    \"dispatcher\"\n  ],\n  \"env\": {\n    \"JARVIS_HOST_HOME\": \"D:\\\\jarvis\\\\audit-functional\\\\20260713T002206Z_686424795712\",\n    \"JARVIS_MODEL_ROOT\": \"D:\\\\jarvis\\\\data\\\\models\",\n    \"JARVIS_VLLM_IMAGE\": \"vllm/vllm-openai:v0.23.0\",\n    \"VLLM_USE_V2_MODEL_RUNNER\": \"0\",\n    \"VLLM_WEIGHT_OFFLOADING_DISABLE_UVA\": \"1\",\n    \"CUDA_VISIBLE_DEVICES\": \"0\",\n    \"CUDA_DEVICE_ORDER\": \"PCI_BUS_ID\",\n    \"CUDA_DISABLE_P2P\": \"1\",\n    \"NCCL_P2P_DISABLE\": \"1\",\n    \"HF_TOKEN\": \"\",\n    \"JARVIS_QWEN_MODEL_NAME\": \"dispatcher\",\n    \"JARVIS_QWEN_MODEL_PATH\": \"/models/gemma4-31b-it-nvfp4\",\n    \"JARVIS_QWEN_DTYPE\": \"auto\",\n    \"JARVIS_QWEN_GPU_UTIL\": \"0.85\",\n    \"JARVIS_QWEN_MAX_LEN\": \"16384\",\n    \"JARVIS_QWEN_KV_DTYPE\": \"fp8\",\n    \"JARVIS_QWEN_TOKENIZER_MODE\": \"slow\",\n    \"JARVIS_QWEN_SAFETENSORS_LOAD_STRATEGY\": \"prefetch\",\n    \"JARVIS_QWEN_MAX_NUM_SEQS\": \"1\",\n    \"JARVIS_QWEN_ENFORCE_EAGER\": \"--enforce-eager\",\n    \"JARVIS_QWEN_CPU_OFFLOAD_ARGS\": \"--cpu-offload-gb 24\",\n    \"JARVIS_QWEN_KV_OFFLOAD_ARGS\": \"--kv-offloading-size 16 --kv-offloading-backend native\",\n    \"JARVIS_QWEN_EXTRA_ARGS\": \"\",\n    \"JARVIS_ENABLE_UITARS\": \"0\"\n  }\n}\n",
+      "stderr_preview": "",
+      "status": "PASS"
+    },
+    {
+      "command": [
+        "dispatcher-compose",
+        "--env"
+      ],
+      "returncode": 0,
+      "elapsed_ms": 654.22,
+      "stdout_sha256": "7c0270727d1db43f0fdadcb8869c82ffdffa0454356e1ae059dbebce53d03881",
+      "stdout_preview": "{\n  \"JARVIS_HOST_HOME\": \"D:\\\\jarvis\\\\audit-functional\\\\20260713T002206Z_686424795712\",\n  \"JARVIS_MODEL_ROOT\": \"D:\\\\jarvis\\\\data\\\\models\",\n  \"JARVIS_VLLM_IMAGE\": \"vllm/vllm-openai:v0.23.0\",\n  \"VLLM_USE_V2_MODEL_RUNNER\": \"0\",\n  \"VLLM_WEIGHT_OFFLOADING_DISABLE_UVA\": \"1\",\n  \"CUDA_VISIBLE_DEVICES\": \"0\",\n  \"CUDA_DEVICE_ORDER\": \"PCI_BUS_ID\",\n  \"CUDA_DISABLE_P2P\": \"1\",\n  \"NCCL_P2P_DISABLE\": \"1\",\n  \"HF_TOKEN\": \"\",\n  \"JARVIS_QWEN_MODEL_NAME\": \"dispatcher\",\n  \"JARVIS_QWEN_MODEL_PATH\": \"/models/gemma4-31b-it-nvfp4\",\n  \"JARVIS_QWEN_DTYPE\": \"auto\",\n  \"JARVIS_QWEN_GPU_UTIL\": \"0.85\",\n  \"JARVIS_QWEN_MAX_LEN\": \"16384\",\n  \"JARVIS_QWEN_KV_DTYPE\": \"fp8\",\n  \"JARVIS_QWEN_TOKENIZER_MODE\": \"slow\",\n  \"JARVIS_QWEN_SAFETENSORS_LOAD_STRATEGY\": \"prefetch\",\n  \"JARVIS_QWEN_MAX_NUM_SEQS\": \"1\",\n  \"JARVIS_QWEN_ENFORCE_EAGER\": \"--enforce-eager\",\n  \"JARVIS_QWEN_CPU_OFFLOAD_ARGS\": \"--cpu-offload-gb 24\",\n  \"JARVIS_QWEN_KV_OFFLOAD_ARGS\": \"--kv-offloading-size 16 --kv-offloading-backend native\",\n  \"JARVIS_QWEN_EXTRA_ARGS\": \"\",\n  \"JARVIS_ENABLE_UITARS\": \"0\"\n}\n",
+      "stderr_preview": "",
+      "status": "PASS"
+    },
+    {
+      "command": [
+        "telemetry"
+      ],
+      "returncode": 0,
+      "elapsed_ms": 790.54,
+      "stdout_sha256": "a3e831d5f847b06504d901dc2a80f0be1f6e5c48007cc850b86834a01a9efbfc",
+      "stdout_preview": "{\n  \"ts\": \"2026-07-13T18:27:51+00:00\",\n  \"host\": {\n    \"hostname\": \"DESKTOP-ESPSBSE\",\n    \"platform\": \"Windows-10-10.0.26200-SP0\",\n    \"cpu_count\": 24\n  },\n  \"memory\": {\n    \"total\": 136658415616,\n    \"available\": 81874366464,\n    \"used\": 54784049152,\n    \"used_ratio\": 0.4008830989665438\n  },\n  \"disks\": [\n    {\n      \"path\": \"D:\\\\jarvis\\\\audit-functional\\\\20260713T002206Z_686424795712\",\n      \"total\": 1677960671232,\n      \"used\": 936179658752,\n      \"free\": 741781012480,\n      \"used_ratio\": 0.5579270568151242\n    },\n    {\n      \"path\": \"D:\\\\jarvis\\\\audit-functional\\\\20260713T002206Z_686424795712\\\\data\\\\jarvis-gpt\",\n      \"total\": 1677960671232,\n      \"used\": 936179658752,\n      \"free\": 741781012480,\n      \"used_ratio\": 0.5579270568151242\n    },\n    {\n      \"path\": \"D:\\\\jarvis\\\\audit-functional\\\\20260713T002206Z_686424795712\\\\cache\\\\jarvis-gpt\",\n      \"total\": 1677960671232,\n      \"used\": 936179658752,\n      \"free\": 741781012480,\n      \"used_ratio\": 0.5579270568151242\n    },\n    {\n      \"path\": \"D:\\\\jarvis\\\\data\\\\models\",\n      \"total\": 1677960671232,\n      \"used\": 936179658752,\n      \"free\": 741781012480,\n      \"used_ratio\": 0.5579270568151242\n    }\n  ],\n  \"gpu\": {\n    \"available\": true,\n    \"gpus\": [\n      {\n        \"name\": \"NVIDIA GeForce RTX 5090\",\n        \"memory_total_mb\": 32607.0,\n        \"memory_used_mb\": 32017.0,\n        \"memory_used_ratio\": 0.9819057257644064,\n        \"utilization_gpu\": 9.0,\n        \"temperature_c\": 41.0,\n        \"power_w\": 59.86\n      }\n    ]\n  },\n  \"docker\": {\n    \"available\": true,\n    \"containers\": [\n      {\n        \"name\": \"jarvis-gpt-dispatcher\",\n        \"image\": \"vllm/vllm-openai:v0.23.0\",\n        \"status\": \"Up 40 minutes (healthy)\",\n        \"ports\": \"127.0.0.1:8001->8001/tcp\"\n      }\n    ]\n  },\n  \"performance\": {\n    \"profile\": \"gemma4-mono\",\n    \"model\": \"gemma4-31b-it-nvfp4\",\n    \"max_model_len\": 16384,\n    \"gpu_memory_utilization\": 0.85,\n    \"kv_cache_dtype\": \"fp8\",\n    \"max_num_seqs\": 1,\n    \"eager_mode\": true,\n    \"cpu_offload_",
+      "stderr_preview": "",
+      "status": "PASS"
+    },
+    {
+      "command": [
+        "autonomy"
+      ],
+      "returncode": 0,
+      "elapsed_ms": 662.57,
+      "stdout_sha256": "6d0861c72035965573ee69f529c97a8fd59ba970682923b140ab6fb26284fb05",
+      "stdout_preview": "{\n  \"enabled\": true,\n  \"started_at\": null,\n  \"running_tasks\": [],\n  \"telemetry_interval_sec\": 120,\n  \"health_interval_sec\": 300,\n  \"learning_interval_sec\": 120,\n  \"cognition_enabled\": true,\n  \"cognition_interval_sec\": 300,\n  \"cognition_max_tokens\": 512,\n  \"mission_interval_sec\": 120,\n  \"last_telemetry_at\": null,\n  \"last_health_at\": null,\n  \"last_learning_at\": null,\n  \"last_cognition_at\": null,\n  \"last_cognition_error\": null,\n  \"last_background_job_at\": null,\n  \"last_error\": null,\n  \"llm_admission\": {\n    \"priority\": \"foreground\",\n    \"foreground_active\": 0,\n    \"foreground_waiting\": 0,\n    \"background_active\": 0,\n    \"background_waiting\": 0,\n    \"foreground_requests\": 0,\n    \"background_requests\": 0,\n    \"foreground_completed\": 0,\n    \"background_completed\": 0,\n    \"background_deferred\": 0,\n    \"background_preemptions\": 0\n  },\n  \"capabilities\": [\n    \"telemetry.persist\",\n    \"health.persist\",\n    \"learning.tick\",\n    \"learning.observe_dialogues\",\n    \"learning.observe_web\",\n    \"learning.append_only_journal\",\n    \"learning.deduplicate\",\n    \"cognition.background_pulse\",\n    \"cognition.observe_runtime\",\n    \"cognition.persist_insights\",\n    \"background.mission.scheduler\",\n    \"background.mission.runner\",\n    \"background.mission.budgeted\",\n    \"audit.observe\",\n    \"approval.respect\"\n  ]\n}\n",
+      "stderr_preview": "",
+      "status": "PASS"
+    },
+    {
+      "command": [
+        "persona"
+      ],
+      "returncode": 0,
+      "elapsed_ms": 652.89,
+      "stdout_sha256": "4b63d3ce385e07211ec18f5a9a6f14065a71676b6c99ba5e5966e77eb7ff162f",
+      "stdout_preview": "{\n  \"display_name\": \"\",\n  \"headline\": \"\",\n  \"role\": \"��������� ������������� / �������\",\n  \"location\": \"\",\n  \"timezone\": \"\",\n  \"notes\": \"\",\n  \"languages\": [\n    \"ru\"\n  ],\n  \"expertise\": [],\n  \"tech_stack\": [],\n  \"interests\": [],\n  \"current_focus\": [],\n  \"standing_instructions\": [],\n  \"glossary\": {}\n}\n",
+      "stderr_preview": "",
+      "status": "PASS"
+    },
+    {
+      "command": [
+        "files",
+        "--limit",
+        "5"
+      ],
+      "returncode": 0,
+      "elapsed_ms": 643.61,
+      "stdout_sha256": "22b85d506f24839b85dcc1bf39a108b4ced00a5e1f2b499c783d72991e7e92dc",
+      "stdout_preview": "[\n  {\n    \"id\": \"file_b6357b6a99704ec8\",\n    \"name\": \"mono-perf-good-3.pdf\",\n    \"source_path\": null,\n    \"stored_path\": \"D:\\\\jarvis\\\\audit-functional\\\\20260713T002206Z_686424795712\\\\data\\\\jarvis-gpt\\\\files\\\\49e777aee412_mono-perf-good-3.pdf\",\n    \"mime_type\": \"application/pdf\",\n    \"size\": 1875,\n    \"sha256\": \"49e777aee412e11bb359fc906cb63bf87010a93aed22012b5a80de17dd0eed23\",\n    \"status\": \"indexed\",\n    \"error\": \"Used basic PDF extraction; scanned/compressed PDFs may need OCR.\",\n    \"chunk_count\": 1,\n    \"created_at\": \"2026-07-13T17:23:17+00:00\",\n    \"updated_at\": \"2026-07-13T17:23:17+00:00\"\n  },\n  {\n    \"id\": \"file_bad6f56b497f47d9\",\n    \"name\": \"mono-perf-good-2.pdf\",\n    \"source_path\": null,\n    \"stored_path\": \"D:\\\\jarvis\\\\audit-functional\\\\20260713T002206Z_686424795712\\\\data\\\\jarvis-gpt\\\\files\\\\133852d7a1be_mono-perf-good-2.pdf\",\n    \"mime_type\": \"application/pdf\",\n    \"size\": 1874,\n    \"sha256\": \"133852d7a1bed10459cbf08350b189c3dab6bd2027c7dfd265c3d1fe2e31a36a\",\n    \"status\": \"indexed\",\n    \"error\": \"Used basic PDF extraction; scanned/compressed PDFs may need OCR.\",\n    \"chunk_count\": 1,\n    \"created_at\": \"2026-07-13T17:23:17+00:00\",\n    \"updated_at\": \"2026-07-13T17:23:17+00:00\"\n  },\n  {\n    \"id\": \"file_44f0cdb200f94f2f\",\n    \"name\": \"mono-perf-good-1.pdf\",\n    \"source_path\": null,\n    \"stored_path\": \"D:\\\\jarvis\\\\audit-functional\\\\20260713T002206Z_686424795712\\\\data\\\\jarvis-gpt\\\\files\\\\f2cc10346b01_mono-perf-good-1.pdf\",\n    \"mime_type\": \"application/pdf\",\n    \"size\": 1875,\n    \"sha256\": \"f2cc10346b014fe16e6a642aebc9c212224d28e313a48fdcc9831fff8af43d15\",\n    \"status\": \"indexed\",\n    \"error\": \"Used basic PDF extraction; scanned/compressed PDFs may need OCR.\",\n    \"chunk_count\": 1,\n    \"created_at\": \"2026-07-13T17:23:17+00:00\",\n    \"updated_at\": \"2026-07-13T17:23:17+00:00\"\n  },\n  {\n    \"id\": \"file_4181d2ed70384c1f\",\n    \"name\": \"mono-perf-doc-2.txt\",\n    \"source_path\": null,\n    \"stored_path\": \"D:\\\\jarvis\\\\audit-functional\\\\20260713T002206Z_686424795712\\\\data\\\\",
+      "stderr_preview": "",
+      "status": "PASS"
+    },
+    {
+      "command": [
+        "audit",
+        "--limit",
+        "5"
+      ],
+      "returncode": 0,
+      "elapsed_ms": 655.33,
+      "stdout_sha256": "288a7af4352df9c88b5376f5384e0097d51cde52a43444c026b5619872e4dc8c",
+      "stdout_preview": "[\n  {\n    \"id\": \"aud_60041e0decc047e4\",\n    \"ts\": \"2026-07-13T18:27:43+00:00\",\n    \"actor\": \"operator\",\n    \"action\": \"runtime.backup\",\n    \"target_type\": \"runtime\",\n    \"target_id\": \"sqlite\",\n    \"summary\": \"Runtime database backup created\",\n    \"before\": {},\n    \"after\": {\n      \"ok\": true,\n      \"path\": \"D:\\\\jarvis\\\\audit-functional\\\\20260713T002206Z_686424795712\\\\data\\\\jarvis-gpt\\\\state\\\\backups\\\\jarvis-20260713T182743Z.sqlite3\",\n      \"size\": 5087232,\n      \"created_at\": \"2026-07-13T18:27:43+00:00\"\n    }\n  },\n  {\n    \"id\": \"aud_664eeb0471f54595\",\n    \"ts\": \"2026-07-13T18:03:55+00:00\",\n    \"actor\": \"operator\",\n    \"action\": \"runtime.backup\",\n    \"target_type\": \"runtime\",\n    \"target_id\": \"sqlite\",\n    \"summary\": \"Runtime database backup created\",\n    \"before\": {},\n    \"after\": {\n      \"ok\": true,\n      \"path\": \"D:\\\\jarvis\\\\audit-functional\\\\20260713T002206Z_686424795712\\\\data\\\\jarvis-gpt\\\\state\\\\backups\\\\jarvis-20260713T180355Z.sqlite3\",\n      \"size\": 4800512,\n      \"created_at\": \"2026-07-13T18:03:55+00:00\"\n    }\n  },\n  {\n    \"id\": \"aud_5cece2ab1070435f\",\n    \"ts\": \"2026-07-13T17:49:48+00:00\",\n    \"actor\": \"system\",\n    \"action\": \"memory.create\",\n    \"target_type\": \"memory\",\n    \"target_id\": \"mem_b8c3976f93ad449f\",\n    \"summary\": \"Memory saved in namespace learning.\",\n    \"before\": {},\n    \"after\": {\n      \"id\": \"mem_b8c3976f93ad449f\",\n      \"namespace\": \"learning\",\n      \"content\": \"Recent failed tools should be checked before autonomous execution: documents.recall, execution.apply, execution.inspect, execution.preflight, web.fetch\",\n      \"tags\": [\n        \"learning\",\n        \"tools\",\n        \"failure\"\n      ],\n      \"importance\": 0.72,\n      \"created_at\": \"2026-07-13T17:49:48+00:00\",\n      \"updated_at\": \"2026-07-13T17:49:48+00:00\"\n    }\n  },\n  {\n    \"id\": \"aud_0187878476ef4acf\",\n    \"ts\": \"2026-07-13T17:49:48+00:00\",\n    \"actor\": \"system\",\n    \"action\": \"memory.create\",\n    \"target_type\": \"memory\",\n    \"target_id\": \"mem_7254ed217e4a4f39\",\n    \"summary\": \"Memo",
+      "stderr_preview": "",
+      "status": "PASS"
+    },
+    {
+      "command": [
+        "approvals",
+        "--limit",
+        "5"
+      ],
+      "returncode": 0,
+      "elapsed_ms": 779.7,
+      "stdout_sha256": "5b64d2188156abee55b6bb2b41f09f1e76a20a249b2cad1b6ca0766e06d22a47",
+      "stdout_preview": "[\n  {\n    \"id\": \"apr_9b074a4016304c97\",\n    \"created_at\": \"2026-07-13T17:07:41+00:00\",\n    \"updated_at\": \"2026-07-13T17:10:00+00:00\",\n    \"status\": \"rejected\",\n    \"risk\": \"danger\",\n    \"title\": \"���������� ������ ����������� execution.apply\",\n    \"description\": \"������ ����� ������� execution.apply (danger) �� ����� ������ ��������� conv_6f38e5c4f47944ca.\",\n    \"requested_action\": \"tool.run\",\n    \"payload\": {\n      \"tool\": \"execution.apply\",\n      \"arguments\": {\n        \"payload\": {\n          \"kind\": \"filesystem.create_directory\",\n          \"action\": \"create_directory\",\n          \"path\": \"D:\\\\jarvis\\\\audit-functional\\\\20260713T002206Z_686424795712\\\\data\\\\jarvis-gpt\\\\functional-fixtures\\\\approval-2\"\n        },\n        \"protocol\": \"jarvis.execution.v1\"\n      }\n    },\n    \"result\": {\n      \"source\": \"command-center\"\n    }\n  },\n  {\n    \"id\": \"apr_2639b225d9bd4892\",\n    \"created_at\": \"2026-07-13T17:08:21+00:00\",\n    \"updated_at\": \"2026-07-13T17:09:20+00:00\",\n    \"status\": \"failed\",\n    \"risk\": \"danger\",\n    \"title\": \"���������� ������ ����������� execution.apply\",\n    \"description\": \"������ ����� ������� execution.apply (danger) �� ����� ������ ��������� conv_40939b6ff8c04e60.\",\n    \"requested_action\": \"tool.run\",\n    \"payload\": {\n      \"tool\": \"execution.apply\",\n      \"arguments\": {\n        \"payload\": {\n          \"protocol\": \"jarvis.execution.v1\",\n          \"action\": {\n            \"kind\": \"filesystem.mkdir\",\n            \"path\": \"D:\\\\jarvis\\\\audit-functional\\\\20260713T002206Z_686424795712\\\\data\\\\jarvis-gpt\\\\functional-fixtures\\\\approval-3\"\n          }\n        }\n      }\n    },\n    \"result\": {\n      \"ok\": false,\n      \"summary\": \"Invalid execution payload: 1 validation error for ActionEnvelope\\naction\\n  Input tag 'filesystem.mkdir' found using 'kind' does not match any of the expected tags: 'fs.stat', 'fs.list', 'fs.read', 'fs.mkdir', 'fs.write', 'fs.copy', 'fs.move', 'fs.delete', 'process.run', 'process.terminate', 'network.resolve', 'network.tcp_probe', 'registry.get',",
+      "stderr_preview": "",
+      "status": "PASS"
+    }
+  ],
+  "summary": {
+    "api_pass": true,
+    "cli_pass": 15,
+    "cli_total": 16,
+    "persistence_pass": true
+  }
+}

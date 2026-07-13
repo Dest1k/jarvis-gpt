@@ -1,0 +1,46 @@
+﻿{
+    "record_version":  2,
+    "profile":  "gemma4-turbo",
+    "home_path":  "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712",
+    "launcher_wrapper_pid":  28640,
+    "wrapper_running":  false,
+    "state_file":  "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\state\\launcher-state.json",
+    "state":  {
+                  "profile":  "gemma4-turbo",
+                  "home":  "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712",
+                  "lan":  false,
+                  "lan_ip":  null,
+                  "frontend_url":  "http://127.0.0.1:3000",
+                  "backend_url":  "http://127.0.0.1:8000",
+                  "backend_environment_sha256":  "165389d0586894ec5598dbc38b6a842b40d3eef3bfe10d3d362314ba0e819cc5",
+                  "frontend_environment_sha256":  "cb3e143afa532ad392c5f1f62318af65529f4a38f372a87ad352966c10070a1d",
+                  "started_at":  "2026-07-13T19:30:01.5276327+03:00",
+                  "services":  {
+                                   "dispatcher":  {
+                                                      "profile":  "gemma4-turbo",
+                                                      "container_id":  "578d04c1285a",
+                                                      "started_by_launcher":  true,
+                                                      "docker":  true,
+                                                      "reused":  false
+                                                  },
+                                   "backend":  {
+                                                   "port":  8000,
+                                                   "host":  "127.0.0.1",
+                                                   "pid":  15660
+                                               },
+                                   "frontend":  {
+                                                    "port":  3000,
+                                                    "host":  "127.0.0.1",
+                                                    "pid":  29036
+                                                },
+                                   "bridge":  {
+                                                  "port":  8765,
+                                                  "contract":  "action.v1",
+                                                  "policy_revision":  "native-app-v2",
+                                                  "reused":  false,
+                                                  "pid":  10596
+                                              }
+                               }
+              },
+    "note":  "v1 home field used case-insensitive PowerShell automatic HOME variable; v2 is authoritative"
+}

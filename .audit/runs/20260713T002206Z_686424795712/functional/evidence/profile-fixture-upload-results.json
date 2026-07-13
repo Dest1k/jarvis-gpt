@@ -1,0 +1,332 @@
+{
+  "schema": "jarvis.functional-profile-fixture-uploads.v1",
+  "recorded_at": "2026-07-13T17:23:17.724066+00:00",
+  "expected_home": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712",
+  "profile": "gemma4-mono-perf",
+  "count": 14,
+  "successful": 14,
+  "results": [
+    {
+      "name": "mono-mission-a-1.txt",
+      "bytes": 29,
+      "sha256": "8b159a58c0e4a70925b6085df5d02607374fdeb6543d7ff1c644938ecff21b2a",
+      "status_code": 200,
+      "response": {
+        "file": {
+          "id": "file_1045b023cb07415f",
+          "name": "mono-mission-a-1.txt",
+          "source_path": null,
+          "stored_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\files\\8b159a58c0e4_mono-mission-a-1.txt",
+          "mime_type": "text/plain",
+          "size": 29,
+          "sha256": "8b159a58c0e4a70925b6085df5d02607374fdeb6543d7ff1c644938ecff21b2a",
+          "status": "indexed",
+          "error": null,
+          "chunk_count": 1,
+          "created_at": "2026-07-13T17:23:17+00:00",
+          "updated_at": "2026-07-13T17:23:17+00:00"
+        },
+        "chunks_indexed": 1
+      }
+    },
+    {
+      "name": "mono-mission-a-2.txt",
+      "bytes": 29,
+      "sha256": "f4269ca95ed2d8b005f2246bf87b429119ff92ad4dd08bfd5d0642060868786b",
+      "status_code": 200,
+      "response": {
+        "file": {
+          "id": "file_a1540b3aff374649",
+          "name": "mono-mission-a-2.txt",
+          "source_path": null,
+          "stored_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\files\\f4269ca95ed2_mono-mission-a-2.txt",
+          "mime_type": "text/plain",
+          "size": 29,
+          "sha256": "f4269ca95ed2d8b005f2246bf87b429119ff92ad4dd08bfd5d0642060868786b",
+          "status": "indexed",
+          "error": null,
+          "chunk_count": 1,
+          "created_at": "2026-07-13T17:23:17+00:00",
+          "updated_at": "2026-07-13T17:23:17+00:00"
+        },
+        "chunks_indexed": 1
+      }
+    },
+    {
+      "name": "mono-mission-a-3.txt",
+      "bytes": 29,
+      "sha256": "543ea5333051875ff6f28dd4bfdca24c07586e85c9cbfa01df99dd3726a9b729",
+      "status_code": 200,
+      "response": {
+        "file": {
+          "id": "file_fde7db36cc564e02",
+          "name": "mono-mission-a-3.txt",
+          "source_path": null,
+          "stored_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\files\\543ea5333051_mono-mission-a-3.txt",
+          "mime_type": "text/plain",
+          "size": 29,
+          "sha256": "543ea5333051875ff6f28dd4bfdca24c07586e85c9cbfa01df99dd3726a9b729",
+          "status": "indexed",
+          "error": null,
+          "chunk_count": 1,
+          "created_at": "2026-07-13T17:23:17+00:00",
+          "updated_at": "2026-07-13T17:23:17+00:00"
+        },
+        "chunks_indexed": 1
+      }
+    },
+    {
+      "name": "mono-mission-b-1.txt",
+      "bytes": 28,
+      "sha256": "3e5b9a26872b17efea33d597db31147ce9a39bdd14c81ba8b0f6d707550b80ac",
+      "status_code": 200,
+      "response": {
+        "file": {
+          "id": "file_53b2a3f3aa9a4af5",
+          "name": "mono-mission-b-1.txt",
+          "source_path": null,
+          "stored_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\files\\3e5b9a26872b_mono-mission-b-1.txt",
+          "mime_type": "text/plain",
+          "size": 28,
+          "sha256": "3e5b9a26872b17efea33d597db31147ce9a39bdd14c81ba8b0f6d707550b80ac",
+          "status": "indexed",
+          "error": null,
+          "chunk_count": 1,
+          "created_at": "2026-07-13T17:23:17+00:00",
+          "updated_at": "2026-07-13T17:23:17+00:00"
+        },
+        "chunks_indexed": 1
+      }
+    },
+    {
+      "name": "mono-mission-b-2.txt",
+      "bytes": 28,
+      "sha256": "da0d8df126d226c273569a39f81c38061cf112bc426c10af6df0b49fb7e71c3a",
+      "status_code": 200,
+      "response": {
+        "file": {
+          "id": "file_25615cc9ff2648c6",
+          "name": "mono-mission-b-2.txt",
+          "source_path": null,
+          "stored_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\files\\da0d8df126d2_mono-mission-b-2.txt",
+          "mime_type": "text/plain",
+          "size": 28,
+          "sha256": "da0d8df126d226c273569a39f81c38061cf112bc426c10af6df0b49fb7e71c3a",
+          "status": "indexed",
+          "error": null,
+          "chunk_count": 1,
+          "created_at": "2026-07-13T17:23:17+00:00",
+          "updated_at": "2026-07-13T17:23:17+00:00"
+        },
+        "chunks_indexed": 1
+      }
+    },
+    {
+      "name": "mono-mission-b-3.txt",
+      "bytes": 28,
+      "sha256": "9e5f683b26823516a8ad7faeee486438999e7d37bafa1fc1f57a08b4309ba509",
+      "status_code": 200,
+      "response": {
+        "file": {
+          "id": "file_d10abb3fb1ed4994",
+          "name": "mono-mission-b-3.txt",
+          "source_path": null,
+          "stored_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\files\\9e5f683b2682_mono-mission-b-3.txt",
+          "mime_type": "text/plain",
+          "size": 28,
+          "sha256": "9e5f683b26823516a8ad7faeee486438999e7d37bafa1fc1f57a08b4309ba509",
+          "status": "indexed",
+          "error": null,
+          "chunk_count": 1,
+          "created_at": "2026-07-13T17:23:17+00:00",
+          "updated_at": "2026-07-13T17:23:17+00:00"
+        },
+        "chunks_indexed": 1
+      }
+    },
+    {
+      "name": "mono-perf-bad-1.pdf",
+      "bytes": 54,
+      "sha256": "f190c2ec3258b8bfe68d2cb9d3e4da380acf207bf391c8f74e8b859023054722",
+      "status_code": 200,
+      "response": {
+        "file": {
+          "id": "file_4c9003b59a0c4e5f",
+          "name": "mono-perf-bad-1.pdf",
+          "source_path": null,
+          "stored_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\files\\f190c2ec3258_mono-perf-bad-1.pdf",
+          "mime_type": "application/pdf",
+          "size": 54,
+          "sha256": "f190c2ec3258b8bfe68d2cb9d3e4da380acf207bf391c8f74e8b859023054722",
+          "status": "stored",
+          "error": "Used basic PDF extraction; scanned/compressed PDFs may need OCR.",
+          "chunk_count": 0,
+          "created_at": "2026-07-13T17:23:17+00:00",
+          "updated_at": "2026-07-13T17:23:17+00:00"
+        },
+        "chunks_indexed": 0
+      }
+    },
+    {
+      "name": "mono-perf-bad-2.pdf",
+      "bytes": 54,
+      "sha256": "f190c2ec3258b8bfe68d2cb9d3e4da380acf207bf391c8f74e8b859023054722",
+      "status_code": 200,
+      "response": {
+        "file": {
+          "id": "file_4c9003b59a0c4e5f",
+          "name": "mono-perf-bad-2.pdf",
+          "source_path": null,
+          "stored_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\files\\f190c2ec3258_mono-perf-bad-2.pdf",
+          "mime_type": "application/pdf",
+          "size": 54,
+          "sha256": "f190c2ec3258b8bfe68d2cb9d3e4da380acf207bf391c8f74e8b859023054722",
+          "status": "stored",
+          "error": "Used basic PDF extraction; scanned/compressed PDFs may need OCR.",
+          "chunk_count": 0,
+          "created_at": "2026-07-13T17:23:17+00:00",
+          "updated_at": "2026-07-13T17:23:17+00:00"
+        },
+        "chunks_indexed": 0
+      }
+    },
+    {
+      "name": "mono-perf-bad-3.pdf",
+      "bytes": 54,
+      "sha256": "f190c2ec3258b8bfe68d2cb9d3e4da380acf207bf391c8f74e8b859023054722",
+      "status_code": 200,
+      "response": {
+        "file": {
+          "id": "file_4c9003b59a0c4e5f",
+          "name": "mono-perf-bad-3.pdf",
+          "source_path": null,
+          "stored_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\files\\f190c2ec3258_mono-perf-bad-3.pdf",
+          "mime_type": "application/pdf",
+          "size": 54,
+          "sha256": "f190c2ec3258b8bfe68d2cb9d3e4da380acf207bf391c8f74e8b859023054722",
+          "status": "stored",
+          "error": "Used basic PDF extraction; scanned/compressed PDFs may need OCR.",
+          "chunk_count": 0,
+          "created_at": "2026-07-13T17:23:17+00:00",
+          "updated_at": "2026-07-13T17:23:17+00:00"
+        },
+        "chunks_indexed": 0
+      }
+    },
+    {
+      "name": "mono-perf-doc-1.txt",
+      "bytes": 42,
+      "sha256": "744d44ea5f45f17ac3c4dc63a25c3492dbd2b1b2d4d7be577c287aeca0c2b2a6",
+      "status_code": 200,
+      "response": {
+        "file": {
+          "id": "file_212a682d98f149bc",
+          "name": "mono-perf-doc-1.txt",
+          "source_path": null,
+          "stored_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\files\\744d44ea5f45_mono-perf-doc-1.txt",
+          "mime_type": "text/plain",
+          "size": 42,
+          "sha256": "744d44ea5f45f17ac3c4dc63a25c3492dbd2b1b2d4d7be577c287aeca0c2b2a6",
+          "status": "indexed",
+          "error": null,
+          "chunk_count": 1,
+          "created_at": "2026-07-13T17:23:17+00:00",
+          "updated_at": "2026-07-13T17:23:17+00:00"
+        },
+        "chunks_indexed": 1
+      }
+    },
+    {
+      "name": "mono-perf-doc-2.txt",
+      "bytes": 42,
+      "sha256": "671f1f6dd887fd5dc2f3a080f3938ff6476507c4088384b29685c52d3457272d",
+      "status_code": 200,
+      "response": {
+        "file": {
+          "id": "file_4181d2ed70384c1f",
+          "name": "mono-perf-doc-2.txt",
+          "source_path": null,
+          "stored_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\files\\671f1f6dd887_mono-perf-doc-2.txt",
+          "mime_type": "text/plain",
+          "size": 42,
+          "sha256": "671f1f6dd887fd5dc2f3a080f3938ff6476507c4088384b29685c52d3457272d",
+          "status": "indexed",
+          "error": null,
+          "chunk_count": 1,
+          "created_at": "2026-07-13T17:23:17+00:00",
+          "updated_at": "2026-07-13T17:23:17+00:00"
+        },
+        "chunks_indexed": 1
+      }
+    },
+    {
+      "name": "mono-perf-good-1.pdf",
+      "bytes": 1875,
+      "sha256": "f2cc10346b014fe16e6a642aebc9c212224d28e313a48fdcc9831fff8af43d15",
+      "status_code": 200,
+      "response": {
+        "file": {
+          "id": "file_44f0cdb200f94f2f",
+          "name": "mono-perf-good-1.pdf",
+          "source_path": null,
+          "stored_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\files\\f2cc10346b01_mono-perf-good-1.pdf",
+          "mime_type": "application/pdf",
+          "size": 1875,
+          "sha256": "f2cc10346b014fe16e6a642aebc9c212224d28e313a48fdcc9831fff8af43d15",
+          "status": "indexed",
+          "error": "Used basic PDF extraction; scanned/compressed PDFs may need OCR.",
+          "chunk_count": 1,
+          "created_at": "2026-07-13T17:23:17+00:00",
+          "updated_at": "2026-07-13T17:23:17+00:00"
+        },
+        "chunks_indexed": 1
+      }
+    },
+    {
+      "name": "mono-perf-good-2.pdf",
+      "bytes": 1874,
+      "sha256": "133852d7a1bed10459cbf08350b189c3dab6bd2027c7dfd265c3d1fe2e31a36a",
+      "status_code": 200,
+      "response": {
+        "file": {
+          "id": "file_bad6f56b497f47d9",
+          "name": "mono-perf-good-2.pdf",
+          "source_path": null,
+          "stored_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\files\\133852d7a1be_mono-perf-good-2.pdf",
+          "mime_type": "application/pdf",
+          "size": 1874,
+          "sha256": "133852d7a1bed10459cbf08350b189c3dab6bd2027c7dfd265c3d1fe2e31a36a",
+          "status": "indexed",
+          "error": "Used basic PDF extraction; scanned/compressed PDFs may need OCR.",
+          "chunk_count": 1,
+          "created_at": "2026-07-13T17:23:17+00:00",
+          "updated_at": "2026-07-13T17:23:17+00:00"
+        },
+        "chunks_indexed": 1
+      }
+    },
+    {
+      "name": "mono-perf-good-3.pdf",
+      "bytes": 1875,
+      "sha256": "49e777aee412e11bb359fc906cb63bf87010a93aed22012b5a80de17dd0eed23",
+      "status_code": 200,
+      "response": {
+        "file": {
+          "id": "file_b6357b6a99704ec8",
+          "name": "mono-perf-good-3.pdf",
+          "source_path": null,
+          "stored_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\files\\49e777aee412_mono-perf-good-3.pdf",
+          "mime_type": "application/pdf",
+          "size": 1875,
+          "sha256": "49e777aee412e11bb359fc906cb63bf87010a93aed22012b5a80de17dd0eed23",
+          "status": "indexed",
+          "error": "Used basic PDF extraction; scanned/compressed PDFs may need OCR.",
+          "chunk_count": 1,
+          "created_at": "2026-07-13T17:23:17+00:00",
+          "updated_at": "2026-07-13T17:23:17+00:00"
+        },
+        "chunks_indexed": 1
+      }
+    }
+  ]
+}

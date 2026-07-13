@@ -1,0 +1,62 @@
+{
+  "schema": "jarvis.functional-campaign.v1",
+  "started_at": "2026-07-13T16:37:18.074115+00:00",
+  "base_url": "http://127.0.0.1:8000",
+  "token_present": true,
+  "repo_root": "D:\\jarvis-gpt",
+  "configuration": {
+    "parallel_chats": 4,
+    "read_concurrency": 12,
+    "read_latency_budget_ms": 3000.0,
+    "chat_latency_budget_ms": 180000.0,
+    "skip_cli": false,
+    "keep_conversations": true
+  },
+  "safety": {
+    "loopback_only": true,
+    "approval_execute": false,
+    "model_actions": false,
+    "dispatcher_actions": false,
+    "host_actions": false,
+    "cleanup_endpoint": false,
+    "arbitrary_tools": false
+  },
+  "campaign_id": "jarvis-functional-turbo-20260713T163718Z-7c4de202d0f4",
+  "namespace": "functional_acceptance.20260713T163718Z.7c4de202d0f4",
+  "finished_at": "2026-07-13T16:37:20.679337+00:00",
+  "verdict": "FAIL",
+  "counts": {
+    "PASS": 2,
+    "FAIL": 27,
+    "ERROR": 1,
+    "SKIP": 24
+  },
+  "required_skips": [
+    "F007",
+    "F008",
+    "F009",
+    "F010",
+    "F012",
+    "F013",
+    "F014",
+    "F015",
+    "F016",
+    "F023",
+    "F027",
+    "F028",
+    "F032",
+    "F035",
+    "F036",
+    "F038",
+    "F039",
+    "F040",
+    "F042",
+    "F043",
+    "F044",
+    "F049"
+  ],
+  "evidence": {
+    "jsonl": "D:\\jarvis-gpt\\.audit\\runs\\20260713T002206Z_686424795712\\functional\\evidence\\jarvis-functional-turbo-20260713T163718Z-7c4de202d0f4.jsonl",
+    "csv": "D:\\jarvis-gpt\\.audit\\runs\\20260713T002206Z_686424795712\\functional\\evidence\\jarvis-functional-turbo-20260713T163718Z-7c4de202d0f4.csv"
+  }
+}

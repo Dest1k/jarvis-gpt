@@ -1,0 +1,172 @@
+{
+  "schema": "jarvis.functional-profile-model-probe.v1",
+  "recorded_at": "2026-07-13T17:32:58.612578+00:00",
+  "profile": "gemma4-mono-perf",
+  "expected_home": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712",
+  "health": {
+    "ok": true,
+    "profile": "gemma4-mono-perf",
+    "home": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712"
+  },
+  "models": {
+    "object": "list",
+    "data": [
+      {
+        "id": "dispatcher",
+        "object": "model",
+        "created": 1783963957,
+        "owned_by": "vllm",
+        "root": "/models/gemma4-31b-it-nvfp4",
+        "parent": null,
+        "max_model_len": 4096,
+        "permission": [
+          {
+            "id": "modelperm-9432d70baab6739e",
+            "object": "model_permission",
+            "created": 1783963957,
+            "allow_create_engine": false,
+            "allow_sampling": true,
+            "allow_logprobs": true,
+            "allow_search_indices": false,
+            "allow_view": true,
+            "allow_fine_tuning": false,
+            "organization": "*",
+            "group": null,
+            "is_blocking": false
+          }
+        ]
+      }
+    ]
+  },
+  "probes": [
+    {
+      "repeat": 1,
+      "status_code": 200,
+      "elapsed_ms": 6972.881,
+      "response": {
+        "id": "chatcmpl-a7820bf847e0ff9c",
+        "object": "chat.completion",
+        "created": 1783963957,
+        "model": "dispatcher",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": " cyclic cyclic cyclic cyclic cyclic cyclic cyclic cyclic cyclic cyclic cyclic cyclic cyclic cyclic cyclic cyclic",
+              "refusal": null,
+              "annotations": null,
+              "audio": null,
+              "function_call": null,
+              "tool_calls": [],
+              "reasoning": null
+            },
+            "logprobs": null,
+            "finish_reason": "length",
+            "stop_reason": null,
+            "token_ids": null,
+            "routed_experts": null
+          }
+        ],
+        "service_tier": null,
+        "system_fingerprint": "vllm-0.23.0-cb5ab6dd",
+        "usage": {
+          "prompt_tokens": 28,
+          "total_tokens": 44,
+          "completion_tokens": 16,
+          "prompt_tokens_details": null
+        },
+        "prompt_logprobs": null,
+        "prompt_token_ids": null,
+        "prompt_text": null,
+        "kv_transfer_params": null
+      }
+    },
+    {
+      "repeat": 2,
+      "status_code": 200,
+      "elapsed_ms": 7258.715,
+      "response": {
+        "id": "chatcmpl-ad3456db28ac09e9",
+        "object": "chat.completion",
+        "created": 1783963964,
+        "model": "dispatcher",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": " cyclic cyclic cyclic cyclic cyclic cyclic cyclic cyclic cyclic cyclic cyclic cyclic cyclic cyclic cyclic cyclic",
+              "refusal": null,
+              "annotations": null,
+              "audio": null,
+              "function_call": null,
+              "tool_calls": [],
+              "reasoning": null
+            },
+            "logprobs": null,
+            "finish_reason": "length",
+            "stop_reason": null,
+            "token_ids": null,
+            "routed_experts": null
+          }
+        ],
+        "service_tier": null,
+        "system_fingerprint": "vllm-0.23.0-cb5ab6dd",
+        "usage": {
+          "prompt_tokens": 28,
+          "total_tokens": 44,
+          "completion_tokens": 16,
+          "prompt_tokens_details": null
+        },
+        "prompt_logprobs": null,
+        "prompt_token_ids": null,
+        "prompt_text": null,
+        "kv_transfer_params": null
+      }
+    },
+    {
+      "repeat": 3,
+      "status_code": 200,
+      "elapsed_ms": 7332.357,
+      "response": {
+        "id": "chatcmpl-ad5a0777898a602a",
+        "object": "chat.completion",
+        "created": 1783963971,
+        "model": "dispatcher",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": " cyclic cyclic cyclic cyclic cyclic cyclic cyclic cyclic cyclic cyclic cyclic cyclic cyclic cyclic cyclic cyclic",
+              "refusal": null,
+              "annotations": null,
+              "audio": null,
+              "function_call": null,
+              "tool_calls": [],
+              "reasoning": null
+            },
+            "logprobs": null,
+            "finish_reason": "length",
+            "stop_reason": null,
+            "token_ids": null,
+            "routed_experts": null
+          }
+        ],
+        "service_tier": null,
+        "system_fingerprint": "vllm-0.23.0-cb5ab6dd",
+        "usage": {
+          "prompt_tokens": 28,
+          "total_tokens": 44,
+          "completion_tokens": 16,
+          "prompt_tokens_details": null
+        },
+        "prompt_logprobs": null,
+        "prompt_token_ids": null,
+        "prompt_text": null,
+        "kv_transfer_params": null
+      }
+    }
+  ]
+}

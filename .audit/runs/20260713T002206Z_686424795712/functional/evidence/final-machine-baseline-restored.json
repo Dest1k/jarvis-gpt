@@ -1,0 +1,58 @@
+{
+  "schema": "jarvis.functional-final-machine-state.v1",
+  "recorded_at": "2026-07-13T19:09:31.173725+00:00",
+  "ports": {
+    "3000": false,
+    "8000": false,
+    "8001": false,
+    "8765": false
+  },
+  "docker_desktop_status": {
+    "arguments": [
+      "docker",
+      "desktop",
+      "status"
+    ],
+    "returncode": 1,
+    "stdout": "",
+    "stderr": "Could not retrieve status. Is Docker Desktop running?\nYou can start Docker Desktop by running 'docker desktop start'.\n"
+  },
+  "docker_engine_info": {
+    "arguments": [
+      "docker",
+      "info",
+      "--format",
+      "{{.ServerVersion}}"
+    ],
+    "returncode": 1,
+    "stdout": "\n",
+    "stderr": "failed to connect to the docker API at npipe:////./pipe/dockerDesktopLinuxEngine; check if the path is correct and if the daemon is running: open //./pipe/dockerDesktopLinuxEngine: The system cannot find the file specified.\n"
+  },
+  "wsl": {
+    "arguments": [
+      "wsl.exe",
+      "--list",
+      "--verbose"
+    ],
+    "returncode": 0,
+    "stdout": "  NAME              STATE           VERSION\n\n* Ubuntu-24.04      Stopped         2\n\n  docker-desktop    Stopped         2\n\n",
+    "stderr": ""
+  },
+  "candidate_processes": {
+    "arguments": [
+      "powershell.exe",
+      "-NoProfile",
+      "-Command",
+      "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*jarvis-gpt*' -or $_.CommandLine -like '*audit-functional*' -or $_.Name -in @('vllm.exe','node.exe') } | Select-Object ProcessId,ParentProcessId,Name,CommandLine | ConvertTo-Json -Depth 3"
+    ],
+    "returncode": 0,
+    "stdout": "[\n    {\n        \"ProcessId\":  30936,\n        \"ParentProcessId\":  5784,\n        \"Name\":  \"node.exe\",\n        \"CommandLine\":  \"\\\"C:\\\\Users\\\\Admin\\\\AppData\\\\Local\\\\OpenAI\\\\Codex\\\\runtimes\\\\cua_node\\\\ecfc0d9aa02807e3\\\\bin\\\\node.exe\\\" --experimental-vm-modules C:\\\\Users\\\\Admin\\\\AppData\\\\Local\\\\Temp\\\\.tmpmO2iM0\\\\kernel.js --session-id fa03b7f199fd49909c42dff23b10cd36 --working-dir \\\"C:\\\\Users\\\\Admin\\\\Documents\\\\Jarvis 3\\\"\"\n    },\n    {\n        \"ProcessId\":  30640,\n        \"ParentProcessId\":  10336,\n        \"Name\":  \"powershell.exe\",\n        \"CommandLine\":  \"powershell.exe -NoProfile -Command \\\"Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like \\u0027*jarvis-gpt*\\u0027 -or $_.CommandLine -like \\u0027*audit-functional*\\u0027 -or $_.Name -in @(\\u0027vllm.exe\\u0027,\\u0027node.exe\\u0027) } | Select-Object ProcessId,ParentProcessId,Name,CommandLine | ConvertTo-Json -Depth 3\\\"\"\n    }\n]\n",
+    "stderr": ""
+  },
+  "summary": {
+    "ports_closed": true,
+    "docker_desktop_stopped": true,
+    "docker_engine_unavailable": true,
+    "wsl_docker_desktop_stopped": true
+  }
+}

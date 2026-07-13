@@ -1683,3 +1683,48 @@ Claude Sync Note
 - The already running stale 26B/nightly container was intentionally not mutated. The next
   full launcher start with a mono profile will detect and replace it with the 31B/pinned-image
   runtime.
+
+## 2026-07-13 Codex handoff: functional runtime acceptance campaign
+
+[Campaign]
+
+- Completed the live functional campaign under
+  `.audit/runs/20260713T002206Z_686424795712/functional` without changing production runtime
+  code. The tested source HEAD was `3fda655e4f723a0d8f58a4edfb4b3ee7dda079fe`;
+  source drift from the static baseline remained limited to audit documentation.
+- Preserved all prior partial `.audit` artifacts and captured the required external checkpoint
+  at
+  `D:\jarvis\audit-backups\20260713T002206Z_686424795712\pre-functional-resume\checkpoint-20260713T160611Z`.
+- Executed 86 scenarios and all 169 required operator repeats with two independent semantic
+  reviews: 46 PASS, 49 FAIL, 74 INCONCLUSIVE. Scenario totals are 20 PASS, 30 FAIL,
+  34 INCONCLUSIVE, 1 BLOCKED_BY_ENV, and 1 BLOCKED_BY_SPEC.
+- Created 17 reproduced findings and 17 one-root-cause Spark tasks. Product readiness remains
+  blocked, so `functional/READY` is absent. The internally consistent remediation queue has
+  `functional/spark/READY` and must run only through
+  `docs/audit/07_JARVIS_FUNCTIONAL_SPARK_REMEDIATION_PROMPT.md`.
+
+[Key results]
+
+- Turbo was interactive and completed a 120-second watchdog soak with 19/19 healthy samples
+  and 4/4 chats. Both 31B profiles were unusable: direct probes emitted repeated `cyclic`;
+  mono crossed a 20-minute readiness deadline and decoded near 0.1-0.4 tok/s.
+- Reproduced raw tool-envelope leakage, unreliable document recall/exact artifact paths,
+  approval action-schema mismatch, memory namespace mismatch, stale GUI state after runtime
+  home change, non-idempotent repeat start, and web/mission recovery failures.
+- Full doctor reported 816 passed, 13 skipped, and 1 required failure, but `jarvis.cmd doctor`
+  returned zero. The failure passes in a targeted clean environment, proving deployment
+  environment leakage into tests. Doctor also exposed `JARVIS_API_TOKEN` through raw Compose
+  output; only `doctor-full-final-sanitized-v2.json` is safe to commit or share.
+- Occupied-port and interrupted-start owned fixtures cleaned up correctly. Backup integrity,
+  restored-copy equality, DB lock, read-only, temp failure, guarded CLI mutation, final normal
+  API/GUI smoke, and final offline cleanup passed. Docker Desktop was started only for the
+  campaign and then returned to the initial stopped state; the engine is unavailable and the
+  `docker-desktop` WSL distribution is stopped. The generated isolated home is retained at
+  `D:\jarvis\audit-functional\20260713T002206Z_686424795712` for evidence.
+
+[Next]
+
+- Start remediation from `functional/FUNCTIONAL_FINDINGS_INDEX.md` and
+  `functional/spark/QUEUE.csv`. Do not import the older static findings queue wholesale.
+- Never stage the local raw `functional/evidence/doctor-full-final.json`; it contains the
+  reproduced credential leak. Use the redacted v2 evidence file referenced by reports.

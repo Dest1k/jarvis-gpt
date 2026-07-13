@@ -1,0 +1,39 @@
+{
+  "schema": "jarvis.functional-campaign.v1",
+  "started_at": "2026-07-13T16:38:21.984623+00:00",
+  "base_url": "http://127.0.0.1:8000",
+  "token_present": true,
+  "repo_root": "D:\\jarvis-gpt",
+  "configuration": {
+    "parallel_chats": 4,
+    "read_concurrency": 12,
+    "read_latency_budget_ms": 3000.0,
+    "chat_latency_budget_ms": 180000.0,
+    "skip_cli": false,
+    "keep_conversations": true
+  },
+  "safety": {
+    "loopback_only": true,
+    "approval_execute": false,
+    "model_actions": false,
+    "dispatcher_actions": false,
+    "host_actions": false,
+    "cleanup_endpoint": false,
+    "arbitrary_tools": false
+  },
+  "campaign_id": "jarvis-functional-turbo-v2-20260713T163821Z-88fd91140364",
+  "namespace": "functional_acceptance.20260713T163821Z.88fd91140364",
+  "finished_at": "2026-07-13T16:38:36.867364+00:00",
+  "verdict": "PASS",
+  "counts": {
+    "PASS": 52,
+    "FAIL": 0,
+    "ERROR": 0,
+    "SKIP": 2
+  },
+  "required_skips": [],
+  "evidence": {
+    "jsonl": "D:\\jarvis-gpt\\.audit\\runs\\20260713T002206Z_686424795712\\functional\\evidence\\jarvis-functional-turbo-v2-20260713T163821Z-88fd91140364.jsonl",
+    "csv": "D:\\jarvis-gpt\\.audit\\runs\\20260713T002206Z_686424795712\\functional\\evidence\\jarvis-functional-turbo-v2-20260713T163821Z-88fd91140364.csv"
+  }
+}

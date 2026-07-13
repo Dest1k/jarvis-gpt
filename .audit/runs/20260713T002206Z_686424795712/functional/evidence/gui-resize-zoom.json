@@ -1,0 +1,9 @@
+{
+  "recorded_at": "2026-07-13T18:44:23.354Z",
+  "resize": {
+    "error": "TypeError: tab.playwright.setViewportSize is not a function"
+  },
+  "zoom": {
+    "error": "Error: Unable to translate Input.dispatchKeyEvent in the in-app browser: Focused input target no longer matches the resolved locator\nlocator.press failed for selector body"
+  }
+}

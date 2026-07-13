@@ -1,0 +1,14 @@
+{
+  "schema": "jarvis.functional-profile-model-probe.v1",
+  "recorded_at": "2026-07-13T18:08:59.785144+00:00",
+  "profile": "gemma4-mono",
+  "expected_home": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712",
+  "health": {
+    "ok": true,
+    "profile": "gemma4-mono",
+    "home": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712"
+  },
+  "models": null,
+  "model_error": "RemoteProtocolError: Server disconnected without sending a response.",
+  "probes": []
+}

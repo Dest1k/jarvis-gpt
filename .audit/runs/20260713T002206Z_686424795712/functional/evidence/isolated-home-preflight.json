@@ -1,0 +1,50 @@
+﻿{
+    "recorded_at_utc":  "2026-07-13T16:36:11.8697346Z",
+    "expected_home":  "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712",
+    "actual_home":  "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712",
+    "home_created_utc":  "2026-07-13T16:29:47.4576691Z",
+    "home_attributes":  "Directory",
+    "policy_before":  {
+                          "mode":  "balanced",
+                          "allow_safe_tools":  true,
+                          "allow_review_tools":  false,
+                          "allow_danger_tools":  false,
+                          "allow_background_learning":  true,
+                          "allow_self_healing_suggestions":  true,
+                          "approval_required_for":  [
+                                                        "execution.apply",
+                                                        "execution.transaction",
+                                                        "execution.cancel",
+                                                        "filesystem.write_text",
+                                                        "dispatcher.start",
+                                                        "dispatcher.stop"
+                                                    ],
+                          "max_autonomous_steps":  3,
+                          "resource_guard":  {
+                                                 "max_memory_ratio":  0.92,
+                                                 "max_gpu_memory_ratio":  0.9
+                                             }
+                      },
+    "policy_after":  {
+                         "mode":  "balanced",
+                         "allow_safe_tools":  false,
+                         "allow_review_tools":  false,
+                         "allow_danger_tools":  false,
+                         "allow_background_learning":  false,
+                         "allow_self_healing_suggestions":  false,
+                         "approval_required_for":  [
+                                                       "execution.apply",
+                                                       "execution.transaction",
+                                                       "execution.cancel",
+                                                       "filesystem.write_text",
+                                                       "dispatcher.start",
+                                                       "dispatcher.stop"
+                                                   ],
+                         "max_autonomous_steps":  1,
+                         "resource_guard":  {
+                                                "max_memory_ratio":  0.92,
+                                                "max_gpu_memory_ratio":  0.9
+                                            }
+                     },
+    "cleanup_policy":  "keep conversations; dispose entire single-owner home after campaign"
+}

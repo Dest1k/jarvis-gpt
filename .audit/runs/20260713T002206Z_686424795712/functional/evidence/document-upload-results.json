@@ -1,0 +1,711 @@
+{
+  "schema": "jarvis.functional-document-uploads.v1",
+  "recorded_at": "2026-07-13T16:58:35.417150+00:00",
+  "base_url": "http://127.0.0.1:8000",
+  "expected_home": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712",
+  "fixture_root": "D:\\jarvis-gpt\\.audit\\runs\\20260713T002206Z_686424795712\\functional\\evidence\\gui-fixtures",
+  "count": 28,
+  "successful": 28,
+  "results": [
+    {
+      "name": "synthetic-summary-1.txt",
+      "path": "D:\\jarvis-gpt\\.audit\\runs\\20260713T002206Z_686424795712\\functional\\evidence\\gui-fixtures\\synthetic-summary-1.txt",
+      "bytes": 82,
+      "sha256": "1f5e915e51848c7c93f996ef10467428b9caab0e56dfe2148be4ffbf3dd09d48",
+      "content_type": "text/plain",
+      "status_code": 200,
+      "response": {
+        "file": {
+          "id": "file_bef49b84fff54d2e",
+          "name": "synthetic-summary-1.txt",
+          "source_path": null,
+          "stored_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\files\\1f5e915e5184_synthetic-summary-1.txt",
+          "mime_type": "text/plain",
+          "size": 82,
+          "sha256": "1f5e915e51848c7c93f996ef10467428b9caab0e56dfe2148be4ffbf3dd09d48",
+          "status": "indexed",
+          "error": null,
+          "chunk_count": 1,
+          "created_at": "2026-07-13T16:58:35+00:00",
+          "updated_at": "2026-07-13T16:58:35+00:00"
+        },
+        "chunks_indexed": 1
+      }
+    },
+    {
+      "name": "synthetic-summary-2.txt",
+      "path": "D:\\jarvis-gpt\\.audit\\runs\\20260713T002206Z_686424795712\\functional\\evidence\\gui-fixtures\\synthetic-summary-2.txt",
+      "bytes": 82,
+      "sha256": "0fb558ddf5f819c3797c03abf5c88173145d5f18a90a08f8604381fdcdcdfb5c",
+      "content_type": "text/plain",
+      "status_code": 200,
+      "response": {
+        "file": {
+          "id": "file_61578426c6aa4a8c",
+          "name": "synthetic-summary-2.txt",
+          "source_path": null,
+          "stored_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\files\\0fb558ddf5f8_synthetic-summary-2.txt",
+          "mime_type": "text/plain",
+          "size": 82,
+          "sha256": "0fb558ddf5f819c3797c03abf5c88173145d5f18a90a08f8604381fdcdcdfb5c",
+          "status": "indexed",
+          "error": null,
+          "chunk_count": 1,
+          "created_at": "2026-07-13T16:58:35+00:00",
+          "updated_at": "2026-07-13T16:58:35+00:00"
+        },
+        "chunks_indexed": 1
+      }
+    },
+    {
+      "name": "synthetic-summary-3.txt",
+      "path": "D:\\jarvis-gpt\\.audit\\runs\\20260713T002206Z_686424795712\\functional\\evidence\\gui-fixtures\\synthetic-summary-3.txt",
+      "bytes": 82,
+      "sha256": "b3b51a3961e6047846513ec652be522264433781733f43241f5aa68dbb962889",
+      "content_type": "text/plain",
+      "status_code": 200,
+      "response": {
+        "file": {
+          "id": "file_735eedcf6e2a4285",
+          "name": "synthetic-summary-3.txt",
+          "source_path": null,
+          "stored_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\files\\b3b51a3961e6_synthetic-summary-3.txt",
+          "mime_type": "text/plain",
+          "size": 82,
+          "sha256": "b3b51a3961e6047846513ec652be522264433781733f43241f5aa68dbb962889",
+          "status": "indexed",
+          "error": null,
+          "chunk_count": 1,
+          "created_at": "2026-07-13T16:58:35+00:00",
+          "updated_at": "2026-07-13T16:58:35+00:00"
+        },
+        "chunks_indexed": 1
+      }
+    },
+    {
+      "name": "synthetic-fact-1.txt",
+      "path": "D:\\jarvis-gpt\\.audit\\runs\\20260713T002206Z_686424795712\\functional\\evidence\\gui-fixtures\\synthetic-fact-1.txt",
+      "bytes": 63,
+      "sha256": "a13b658ce98416a12a32065e2ba01e192812936d017d174920f5f44dc2b04dee",
+      "content_type": "text/plain",
+      "status_code": 200,
+      "response": {
+        "file": {
+          "id": "file_2526ad9152bf4966",
+          "name": "synthetic-fact-1.txt",
+          "source_path": null,
+          "stored_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\files\\a13b658ce984_synthetic-fact-1.txt",
+          "mime_type": "text/plain",
+          "size": 63,
+          "sha256": "a13b658ce98416a12a32065e2ba01e192812936d017d174920f5f44dc2b04dee",
+          "status": "indexed",
+          "error": null,
+          "chunk_count": 1,
+          "created_at": "2026-07-13T16:58:35+00:00",
+          "updated_at": "2026-07-13T16:58:35+00:00"
+        },
+        "chunks_indexed": 1
+      }
+    },
+    {
+      "name": "synthetic-fact-2.txt",
+      "path": "D:\\jarvis-gpt\\.audit\\runs\\20260713T002206Z_686424795712\\functional\\evidence\\gui-fixtures\\synthetic-fact-2.txt",
+      "bytes": 63,
+      "sha256": "5134f9ffc380a3a47cac39f7af6404e281abffa4e1132a2d5f9ecdad60f55d57",
+      "content_type": "text/plain",
+      "status_code": 200,
+      "response": {
+        "file": {
+          "id": "file_18e0d89773b34217",
+          "name": "synthetic-fact-2.txt",
+          "source_path": null,
+          "stored_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\files\\5134f9ffc380_synthetic-fact-2.txt",
+          "mime_type": "text/plain",
+          "size": 63,
+          "sha256": "5134f9ffc380a3a47cac39f7af6404e281abffa4e1132a2d5f9ecdad60f55d57",
+          "status": "indexed",
+          "error": null,
+          "chunk_count": 1,
+          "created_at": "2026-07-13T16:58:35+00:00",
+          "updated_at": "2026-07-13T16:58:35+00:00"
+        },
+        "chunks_indexed": 1
+      }
+    },
+    {
+      "name": "synthetic-fact-3.txt",
+      "path": "D:\\jarvis-gpt\\.audit\\runs\\20260713T002206Z_686424795712\\functional\\evidence\\gui-fixtures\\synthetic-fact-3.txt",
+      "bytes": 63,
+      "sha256": "44d9f7d715fb5e711a0bde804fddbc4eee3ad645b7ca14d3a89b0b42fe8f5529",
+      "content_type": "text/plain",
+      "status_code": 200,
+      "response": {
+        "file": {
+          "id": "file_f29c7128644b4408",
+          "name": "synthetic-fact-3.txt",
+          "source_path": null,
+          "stored_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\files\\44d9f7d715fb_synthetic-fact-3.txt",
+          "mime_type": "text/plain",
+          "size": 63,
+          "sha256": "44d9f7d715fb5e711a0bde804fddbc4eee3ad645b7ca14d3a89b0b42fe8f5529",
+          "status": "indexed",
+          "error": null,
+          "chunk_count": 1,
+          "created_at": "2026-07-13T16:58:35+00:00",
+          "updated_at": "2026-07-13T16:58:35+00:00"
+        },
+        "chunks_indexed": 1
+      }
+    },
+    {
+      "name": "structured-1.md",
+      "path": "D:\\jarvis-gpt\\.audit\\runs\\20260713T002206Z_686424795712\\functional\\evidence\\gui-fixtures\\structured-1.md",
+      "bytes": 102,
+      "sha256": "9cec5a3cf5022ff79788d18f5a5431f394a9afaff996b36aa42027c45749d32b",
+      "content_type": "application/octet-stream",
+      "status_code": 200,
+      "response": {
+        "file": {
+          "id": "file_9129e3e9ce56459a",
+          "name": "structured-1.md",
+          "source_path": null,
+          "stored_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\files\\9cec5a3cf502_structured-1.md",
+          "mime_type": "text/markdown",
+          "size": 102,
+          "sha256": "9cec5a3cf5022ff79788d18f5a5431f394a9afaff996b36aa42027c45749d32b",
+          "status": "indexed",
+          "error": null,
+          "chunk_count": 1,
+          "created_at": "2026-07-13T16:58:35+00:00",
+          "updated_at": "2026-07-13T16:58:35+00:00"
+        },
+        "chunks_indexed": 1
+      }
+    },
+    {
+      "name": "structured-2.md",
+      "path": "D:\\jarvis-gpt\\.audit\\runs\\20260713T002206Z_686424795712\\functional\\evidence\\gui-fixtures\\structured-2.md",
+      "bytes": 102,
+      "sha256": "ca04ed31673aacc424f491bfa8caa6437ca34de7ea8b8f81c69c40a1884c492e",
+      "content_type": "application/octet-stream",
+      "status_code": 200,
+      "response": {
+        "file": {
+          "id": "file_6bb7142bd8704f79",
+          "name": "structured-2.md",
+          "source_path": null,
+          "stored_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\files\\ca04ed31673a_structured-2.md",
+          "mime_type": "text/markdown",
+          "size": 102,
+          "sha256": "ca04ed31673aacc424f491bfa8caa6437ca34de7ea8b8f81c69c40a1884c492e",
+          "status": "indexed",
+          "error": null,
+          "chunk_count": 1,
+          "created_at": "2026-07-13T16:58:35+00:00",
+          "updated_at": "2026-07-13T16:58:35+00:00"
+        },
+        "chunks_indexed": 1
+      }
+    },
+    {
+      "name": "structured-3.md",
+      "path": "D:\\jarvis-gpt\\.audit\\runs\\20260713T002206Z_686424795712\\functional\\evidence\\gui-fixtures\\structured-3.md",
+      "bytes": 102,
+      "sha256": "8d9329e404baba1efa21763bb82991dcdd01ff6d009af2ade5052bf08d82a909",
+      "content_type": "application/octet-stream",
+      "status_code": 200,
+      "response": {
+        "file": {
+          "id": "file_7400b978de574b8c",
+          "name": "structured-3.md",
+          "source_path": null,
+          "stored_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\files\\8d9329e404ba_structured-3.md",
+          "mime_type": "text/markdown",
+          "size": 102,
+          "sha256": "8d9329e404baba1efa21763bb82991dcdd01ff6d009af2ade5052bf08d82a909",
+          "status": "indexed",
+          "error": null,
+          "chunk_count": 1,
+          "created_at": "2026-07-13T16:58:35+00:00",
+          "updated_at": "2026-07-13T16:58:35+00:00"
+        },
+        "chunks_indexed": 1
+      }
+    },
+    {
+      "name": "campaign-recall-1.txt",
+      "path": "D:\\jarvis-gpt\\.audit\\runs\\20260713T002206Z_686424795712\\functional\\evidence\\gui-fixtures\\campaign-recall-1.txt",
+      "bytes": 55,
+      "sha256": "f3ee1a104a732d3222387da386dadf1a5d45390ed9e5ead0c8866486d63b22f3",
+      "content_type": "text/plain",
+      "status_code": 200,
+      "response": {
+        "file": {
+          "id": "file_d9196f9c603c45d7",
+          "name": "campaign-recall-1.txt",
+          "source_path": null,
+          "stored_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\files\\f3ee1a104a73_campaign-recall-1.txt",
+          "mime_type": "text/plain",
+          "size": 55,
+          "sha256": "f3ee1a104a732d3222387da386dadf1a5d45390ed9e5ead0c8866486d63b22f3",
+          "status": "indexed",
+          "error": null,
+          "chunk_count": 1,
+          "created_at": "2026-07-13T16:58:35+00:00",
+          "updated_at": "2026-07-13T16:58:35+00:00"
+        },
+        "chunks_indexed": 1
+      }
+    },
+    {
+      "name": "campaign-recall-2.txt",
+      "path": "D:\\jarvis-gpt\\.audit\\runs\\20260713T002206Z_686424795712\\functional\\evidence\\gui-fixtures\\campaign-recall-2.txt",
+      "bytes": 55,
+      "sha256": "1b00e7529ca23349c8a2899b7d4a117ffb4e87435211203c49f20bc07db8dc5f",
+      "content_type": "text/plain",
+      "status_code": 200,
+      "response": {
+        "file": {
+          "id": "file_c3c76d9240a244d0",
+          "name": "campaign-recall-2.txt",
+          "source_path": null,
+          "stored_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\files\\1b00e7529ca2_campaign-recall-2.txt",
+          "mime_type": "text/plain",
+          "size": 55,
+          "sha256": "1b00e7529ca23349c8a2899b7d4a117ffb4e87435211203c49f20bc07db8dc5f",
+          "status": "indexed",
+          "error": null,
+          "chunk_count": 1,
+          "created_at": "2026-07-13T16:58:35+00:00",
+          "updated_at": "2026-07-13T16:58:35+00:00"
+        },
+        "chunks_indexed": 1
+      }
+    },
+    {
+      "name": "campaign-recall-3.txt",
+      "path": "D:\\jarvis-gpt\\.audit\\runs\\20260713T002206Z_686424795712\\functional\\evidence\\gui-fixtures\\campaign-recall-3.txt",
+      "bytes": 55,
+      "sha256": "01ff34e1343f59a39580aecd915ed62a7147fa29250ce597fd8fd22a67f9e502",
+      "content_type": "text/plain",
+      "status_code": 200,
+      "response": {
+        "file": {
+          "id": "file_048f967d97f94fe5",
+          "name": "campaign-recall-3.txt",
+          "source_path": null,
+          "stored_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\files\\01ff34e1343f_campaign-recall-3.txt",
+          "mime_type": "text/plain",
+          "size": 55,
+          "sha256": "01ff34e1343f59a39580aecd915ed62a7147fa29250ce597fd8fd22a67f9e502",
+          "status": "indexed",
+          "error": null,
+          "chunk_count": 1,
+          "created_at": "2026-07-13T16:58:35+00:00",
+          "updated_at": "2026-07-13T16:58:35+00:00"
+        },
+        "chunks_indexed": 1
+      }
+    },
+    {
+      "name": "source-copy-1.docx",
+      "path": "D:\\jarvis-gpt\\.audit\\runs\\20260713T002206Z_686424795712\\functional\\evidence\\gui-fixtures\\source-copy-1.docx",
+      "bytes": 36793,
+      "sha256": "1ab717580ce8fdbfbe5a3e080d06bd3a5b7d90d8fc44c08a0da56021f3becef7",
+      "content_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      "status_code": 200,
+      "response": {
+        "file": {
+          "id": "file_64ea767aa0f34bc3",
+          "name": "source-copy-1.docx",
+          "source_path": null,
+          "stored_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\files\\1ab717580ce8_source-copy-1.docx",
+          "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+          "size": 36793,
+          "sha256": "1ab717580ce8fdbfbe5a3e080d06bd3a5b7d90d8fc44c08a0da56021f3becef7",
+          "status": "indexed",
+          "error": null,
+          "chunk_count": 1,
+          "created_at": "2026-07-13T16:58:35+00:00",
+          "updated_at": "2026-07-13T16:58:35+00:00"
+        },
+        "chunks_indexed": 1
+      }
+    },
+    {
+      "name": "source-copy-2.docx",
+      "path": "D:\\jarvis-gpt\\.audit\\runs\\20260713T002206Z_686424795712\\functional\\evidence\\gui-fixtures\\source-copy-2.docx",
+      "bytes": 36793,
+      "sha256": "59fd5e4ef4c8f5207530920700d04cc0b6d174c35832e4416bfd3a3f1c03a7aa",
+      "content_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      "status_code": 200,
+      "response": {
+        "file": {
+          "id": "file_25843b7223ea4b62",
+          "name": "source-copy-2.docx",
+          "source_path": null,
+          "stored_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\files\\59fd5e4ef4c8_source-copy-2.docx",
+          "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+          "size": 36793,
+          "sha256": "59fd5e4ef4c8f5207530920700d04cc0b6d174c35832e4416bfd3a3f1c03a7aa",
+          "status": "indexed",
+          "error": null,
+          "chunk_count": 1,
+          "created_at": "2026-07-13T16:58:35+00:00",
+          "updated_at": "2026-07-13T16:58:35+00:00"
+        },
+        "chunks_indexed": 1
+      }
+    },
+    {
+      "name": "source-copy-3.docx",
+      "path": "D:\\jarvis-gpt\\.audit\\runs\\20260713T002206Z_686424795712\\functional\\evidence\\gui-fixtures\\source-copy-3.docx",
+      "bytes": 36794,
+      "sha256": "eeb9f5e6cb9fe173c22fa372bd00803323ebd55182cf0e8ee74d57d9981def67",
+      "content_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      "status_code": 200,
+      "response": {
+        "file": {
+          "id": "file_a9272ed873e94171",
+          "name": "source-copy-3.docx",
+          "source_path": null,
+          "stored_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\files\\eeb9f5e6cb9f_source-copy-3.docx",
+          "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+          "size": 36794,
+          "sha256": "eeb9f5e6cb9fe173c22fa372bd00803323ebd55182cf0e8ee74d57d9981def67",
+          "status": "indexed",
+          "error": null,
+          "chunk_count": 1,
+          "created_at": "2026-07-13T16:58:35+00:00",
+          "updated_at": "2026-07-13T16:58:35+00:00"
+        },
+        "chunks_indexed": 1
+      }
+    },
+    {
+      "name": "convert-1.md",
+      "path": "D:\\jarvis-gpt\\.audit\\runs\\20260713T002206Z_686424795712\\functional\\evidence\\gui-fixtures\\convert-1.md",
+      "bytes": 101,
+      "sha256": "5525442d9707fb4d3db88fab5ca35cf12e3dfe20baa40a34fb6925a30132338e",
+      "content_type": "application/octet-stream",
+      "status_code": 200,
+      "response": {
+        "file": {
+          "id": "file_1addc3bef7584d2c",
+          "name": "convert-1.md",
+          "source_path": null,
+          "stored_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\files\\5525442d9707_convert-1.md",
+          "mime_type": "text/markdown",
+          "size": 101,
+          "sha256": "5525442d9707fb4d3db88fab5ca35cf12e3dfe20baa40a34fb6925a30132338e",
+          "status": "indexed",
+          "error": null,
+          "chunk_count": 1,
+          "created_at": "2026-07-13T16:58:35+00:00",
+          "updated_at": "2026-07-13T16:58:35+00:00"
+        },
+        "chunks_indexed": 1
+      }
+    },
+    {
+      "name": "convert-2.md",
+      "path": "D:\\jarvis-gpt\\.audit\\runs\\20260713T002206Z_686424795712\\functional\\evidence\\gui-fixtures\\convert-2.md",
+      "bytes": 101,
+      "sha256": "d84608bbcc898a657fc14e173ee8d8dd5cf66072eb4e46730c60c3a344f0017c",
+      "content_type": "application/octet-stream",
+      "status_code": 200,
+      "response": {
+        "file": {
+          "id": "file_a6c6bf5a85be40e6",
+          "name": "convert-2.md",
+          "source_path": null,
+          "stored_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\files\\d84608bbcc89_convert-2.md",
+          "mime_type": "text/markdown",
+          "size": 101,
+          "sha256": "d84608bbcc898a657fc14e173ee8d8dd5cf66072eb4e46730c60c3a344f0017c",
+          "status": "indexed",
+          "error": null,
+          "chunk_count": 1,
+          "created_at": "2026-07-13T16:58:35+00:00",
+          "updated_at": "2026-07-13T16:58:35+00:00"
+        },
+        "chunks_indexed": 1
+      }
+    },
+    {
+      "name": "corrupt-1.pdf",
+      "path": "D:\\jarvis-gpt\\.audit\\runs\\20260713T002206Z_686424795712\\functional\\evidence\\gui-fixtures\\corrupt-1.pdf",
+      "bytes": 62,
+      "sha256": "753e65cdf6cc0168f841fddae86439c4abafaffb038074069362db5166f739a1",
+      "content_type": "application/pdf",
+      "status_code": 200,
+      "response": {
+        "file": {
+          "id": "file_ad24e4cfa6014911",
+          "name": "corrupt-1.pdf",
+          "source_path": null,
+          "stored_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\files\\753e65cdf6cc_corrupt-1.pdf",
+          "mime_type": "application/pdf",
+          "size": 62,
+          "sha256": "753e65cdf6cc0168f841fddae86439c4abafaffb038074069362db5166f739a1",
+          "status": "stored",
+          "error": "Used basic PDF extraction; scanned/compressed PDFs may need OCR.",
+          "chunk_count": 0,
+          "created_at": "2026-07-13T16:58:35+00:00",
+          "updated_at": "2026-07-13T16:58:35+00:00"
+        },
+        "chunks_indexed": 0
+      }
+    },
+    {
+      "name": "corrupt-2.pdf",
+      "path": "D:\\jarvis-gpt\\.audit\\runs\\20260713T002206Z_686424795712\\functional\\evidence\\gui-fixtures\\corrupt-2.pdf",
+      "bytes": 62,
+      "sha256": "753e65cdf6cc0168f841fddae86439c4abafaffb038074069362db5166f739a1",
+      "content_type": "application/pdf",
+      "status_code": 200,
+      "response": {
+        "file": {
+          "id": "file_ad24e4cfa6014911",
+          "name": "corrupt-2.pdf",
+          "source_path": null,
+          "stored_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\files\\753e65cdf6cc_corrupt-2.pdf",
+          "mime_type": "application/pdf",
+          "size": 62,
+          "sha256": "753e65cdf6cc0168f841fddae86439c4abafaffb038074069362db5166f739a1",
+          "status": "stored",
+          "error": "Used basic PDF extraction; scanned/compressed PDFs may need OCR.",
+          "chunk_count": 0,
+          "created_at": "2026-07-13T16:58:35+00:00",
+          "updated_at": "2026-07-13T16:58:35+00:00"
+        },
+        "chunks_indexed": 0
+      }
+    },
+    {
+      "name": "corrupt-3.pdf",
+      "path": "D:\\jarvis-gpt\\.audit\\runs\\20260713T002206Z_686424795712\\functional\\evidence\\gui-fixtures\\corrupt-3.pdf",
+      "bytes": 62,
+      "sha256": "753e65cdf6cc0168f841fddae86439c4abafaffb038074069362db5166f739a1",
+      "content_type": "application/pdf",
+      "status_code": 200,
+      "response": {
+        "file": {
+          "id": "file_ad24e4cfa6014911",
+          "name": "corrupt-3.pdf",
+          "source_path": null,
+          "stored_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\files\\753e65cdf6cc_corrupt-3.pdf",
+          "mime_type": "application/pdf",
+          "size": 62,
+          "sha256": "753e65cdf6cc0168f841fddae86439c4abafaffb038074069362db5166f739a1",
+          "status": "stored",
+          "error": "Used basic PDF extraction; scanned/compressed PDFs may need OCR.",
+          "chunk_count": 0,
+          "created_at": "2026-07-13T16:58:35+00:00",
+          "updated_at": "2026-07-13T16:58:35+00:00"
+        },
+        "chunks_indexed": 0
+      }
+    },
+    {
+      "name": "alpha-1.txt",
+      "path": "D:\\jarvis-gpt\\.audit\\runs\\20260713T002206Z_686424795712\\functional\\evidence\\gui-fixtures\\alpha-1.txt",
+      "bytes": 42,
+      "sha256": "fe43c4ac3dca6ee8beeaca97c82ab6bdec2a51334c9b90c4700812f3a185bbd0",
+      "content_type": "text/plain",
+      "status_code": 200,
+      "response": {
+        "file": {
+          "id": "file_efc2ee19531a4f43",
+          "name": "alpha-1.txt",
+          "source_path": null,
+          "stored_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\files\\fe43c4ac3dca_alpha-1.txt",
+          "mime_type": "text/plain",
+          "size": 42,
+          "sha256": "fe43c4ac3dca6ee8beeaca97c82ab6bdec2a51334c9b90c4700812f3a185bbd0",
+          "status": "indexed",
+          "error": null,
+          "chunk_count": 1,
+          "created_at": "2026-07-13T16:58:35+00:00",
+          "updated_at": "2026-07-13T16:58:35+00:00"
+        },
+        "chunks_indexed": 1
+      }
+    },
+    {
+      "name": "alpha-2.txt",
+      "path": "D:\\jarvis-gpt\\.audit\\runs\\20260713T002206Z_686424795712\\functional\\evidence\\gui-fixtures\\alpha-2.txt",
+      "bytes": 42,
+      "sha256": "e9f71fa27e9466dd5e4e0bbf4ca48998ac870d7462e1f85ddf07f775678cd2c5",
+      "content_type": "text/plain",
+      "status_code": 200,
+      "response": {
+        "file": {
+          "id": "file_e78c67f20eb64683",
+          "name": "alpha-2.txt",
+          "source_path": null,
+          "stored_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\files\\e9f71fa27e94_alpha-2.txt",
+          "mime_type": "text/plain",
+          "size": 42,
+          "sha256": "e9f71fa27e9466dd5e4e0bbf4ca48998ac870d7462e1f85ddf07f775678cd2c5",
+          "status": "indexed",
+          "error": null,
+          "chunk_count": 1,
+          "created_at": "2026-07-13T16:58:35+00:00",
+          "updated_at": "2026-07-13T16:58:35+00:00"
+        },
+        "chunks_indexed": 1
+      }
+    },
+    {
+      "name": "alpha-3.txt",
+      "path": "D:\\jarvis-gpt\\.audit\\runs\\20260713T002206Z_686424795712\\functional\\evidence\\gui-fixtures\\alpha-3.txt",
+      "bytes": 42,
+      "sha256": "84cdcd26cc67b003fb42642ab3c305f1589d1615ef70ed1af03dfe809bd986b5",
+      "content_type": "text/plain",
+      "status_code": 200,
+      "response": {
+        "file": {
+          "id": "file_b33345148ca54c04",
+          "name": "alpha-3.txt",
+          "source_path": null,
+          "stored_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\files\\84cdcd26cc67_alpha-3.txt",
+          "mime_type": "text/plain",
+          "size": 42,
+          "sha256": "84cdcd26cc67b003fb42642ab3c305f1589d1615ef70ed1af03dfe809bd986b5",
+          "status": "indexed",
+          "error": null,
+          "chunk_count": 1,
+          "created_at": "2026-07-13T16:58:35+00:00",
+          "updated_at": "2026-07-13T16:58:35+00:00"
+        },
+        "chunks_indexed": 1
+      }
+    },
+    {
+      "name": "beta-1.txt",
+      "path": "D:\\jarvis-gpt\\.audit\\runs\\20260713T002206Z_686424795712\\functional\\evidence\\gui-fixtures\\beta-1.txt",
+      "bytes": 42,
+      "sha256": "5928685dbd4ed67e654606514938869ca613bb6e24e3ac45ed5a7ae19bca0906",
+      "content_type": "text/plain",
+      "status_code": 200,
+      "response": {
+        "file": {
+          "id": "file_5321ee5f39d8438b",
+          "name": "beta-1.txt",
+          "source_path": null,
+          "stored_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\files\\5928685dbd4e_beta-1.txt",
+          "mime_type": "text/plain",
+          "size": 42,
+          "sha256": "5928685dbd4ed67e654606514938869ca613bb6e24e3ac45ed5a7ae19bca0906",
+          "status": "indexed",
+          "error": null,
+          "chunk_count": 1,
+          "created_at": "2026-07-13T16:58:35+00:00",
+          "updated_at": "2026-07-13T16:58:35+00:00"
+        },
+        "chunks_indexed": 1
+      }
+    },
+    {
+      "name": "beta-2.txt",
+      "path": "D:\\jarvis-gpt\\.audit\\runs\\20260713T002206Z_686424795712\\functional\\evidence\\gui-fixtures\\beta-2.txt",
+      "bytes": 42,
+      "sha256": "0919d171ce74cecbb66fdf8c5f225e9ae28475ccb6d8541d658d305bc4d88a62",
+      "content_type": "text/plain",
+      "status_code": 200,
+      "response": {
+        "file": {
+          "id": "file_8ae981eee90e4d85",
+          "name": "beta-2.txt",
+          "source_path": null,
+          "stored_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\files\\0919d171ce74_beta-2.txt",
+          "mime_type": "text/plain",
+          "size": 42,
+          "sha256": "0919d171ce74cecbb66fdf8c5f225e9ae28475ccb6d8541d658d305bc4d88a62",
+          "status": "indexed",
+          "error": null,
+          "chunk_count": 1,
+          "created_at": "2026-07-13T16:58:35+00:00",
+          "updated_at": "2026-07-13T16:58:35+00:00"
+        },
+        "chunks_indexed": 1
+      }
+    },
+    {
+      "name": "beta-3.txt",
+      "path": "D:\\jarvis-gpt\\.audit\\runs\\20260713T002206Z_686424795712\\functional\\evidence\\gui-fixtures\\beta-3.txt",
+      "bytes": 42,
+      "sha256": "cec8cdfb46da7eff1663aec86e4f242ec10bd27f665190c2949542c1981fd84e",
+      "content_type": "text/plain",
+      "status_code": 200,
+      "response": {
+        "file": {
+          "id": "file_97233a07938245a7",
+          "name": "beta-3.txt",
+          "source_path": null,
+          "stored_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\files\\cec8cdfb46da_beta-3.txt",
+          "mime_type": "text/plain",
+          "size": 42,
+          "sha256": "cec8cdfb46da7eff1663aec86e4f242ec10bd27f665190c2949542c1981fd84e",
+          "status": "indexed",
+          "error": null,
+          "chunk_count": 1,
+          "created_at": "2026-07-13T16:58:35+00:00",
+          "updated_at": "2026-07-13T16:58:35+00:00"
+        },
+        "chunks_indexed": 1
+      }
+    },
+    {
+      "name": "mission-alpha.txt",
+      "path": "D:\\jarvis-gpt\\.audit\\runs\\20260713T002206Z_686424795712\\functional\\evidence\\gui-fixtures\\mission-alpha.txt",
+      "bytes": 51,
+      "sha256": "8fb400f91aabb50ad832a8c6df8c2a69c9284014a410dd5d726b82f8640689dc",
+      "content_type": "text/plain",
+      "status_code": 200,
+      "response": {
+        "file": {
+          "id": "file_37e8032c800e431d",
+          "name": "mission-alpha.txt",
+          "source_path": null,
+          "stored_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\files\\8fb400f91aab_mission-alpha.txt",
+          "mime_type": "text/plain",
+          "size": 51,
+          "sha256": "8fb400f91aabb50ad832a8c6df8c2a69c9284014a410dd5d726b82f8640689dc",
+          "status": "indexed",
+          "error": null,
+          "chunk_count": 1,
+          "created_at": "2026-07-13T16:58:35+00:00",
+          "updated_at": "2026-07-13T16:58:35+00:00"
+        },
+        "chunks_indexed": 1
+      }
+    },
+    {
+      "name": "mission-beta.txt",
+      "path": "D:\\jarvis-gpt\\.audit\\runs\\20260713T002206Z_686424795712\\functional\\evidence\\gui-fixtures\\mission-beta.txt",
+      "bytes": 52,
+      "sha256": "e4a21675ecd49ac0af6cbb1e023a7d0c3eb0d3b77a1e0592baa58d4058886737",
+      "content_type": "text/plain",
+      "status_code": 200,
+      "response": {
+        "file": {
+          "id": "file_6b34d3f3bb9c409c",
+          "name": "mission-beta.txt",
+          "source_path": null,
+          "stored_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\files\\e4a21675ecd4_mission-beta.txt",
+          "mime_type": "text/plain",
+          "size": 52,
+          "sha256": "e4a21675ecd49ac0af6cbb1e023a7d0c3eb0d3b77a1e0592baa58d4058886737",
+          "status": "indexed",
+          "error": null,
+          "chunk_count": 1,
+          "created_at": "2026-07-13T16:58:35+00:00",
+          "updated_at": "2026-07-13T16:58:35+00:00"
+        },
+        "chunks_indexed": 1
+      }
+    }
+  ]
+}

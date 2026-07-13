@@ -1,0 +1,92 @@
+{
+  "recorded_at": "2026-07-13T18:59:42.274775+00:00",
+  "profile": "gemma4-turbo",
+  "note": "final expected offline state after standard stop; API/model health should be unreachable and container absent",
+  "backend_health": {
+    "ok": false,
+    "status": null,
+    "elapsed_ms": 2022.6,
+    "error": "URLError: <urlopen error [WinError 10061] Подключение не установлено, т.к. конечный компьютер отверг запрос на подключение>"
+  },
+  "backend_status": {
+    "ok": false,
+    "status": null,
+    "elapsed_ms": 2057.94,
+    "error": "URLError: <urlopen error [WinError 10061] Подключение не установлено, т.к. конечный компьютер отверг запрос на подключение>"
+  },
+  "model_health": {
+    "ok": false,
+    "status": null,
+    "elapsed_ms": 2068.53,
+    "error": "URLError: <urlopen error [WinError 10061] Подключение не установлено, т.к. конечный компьютер отверг запрос на подключение>"
+  },
+  "model_catalog": {
+    "ok": false,
+    "status": null,
+    "elapsed_ms": 2049.49,
+    "error": "URLError: <urlopen error [WinError 10061] Подключение не установлено, т.к. конечный компьютер отверг запрос на подключение>"
+  },
+  "docker_ps": {
+    "arguments": [
+      "docker",
+      "ps",
+      "--filter",
+      "name=jarvis-gpt-dispatcher",
+      "--format",
+      "{{json .}}"
+    ],
+    "returncode": 0,
+    "elapsed_ms": 45.0,
+    "stdout": "",
+    "stderr": ""
+  },
+  "docker_inspect": {
+    "arguments": [
+      "docker",
+      "inspect",
+      "jarvis-gpt-dispatcher"
+    ],
+    "returncode": 1,
+    "elapsed_ms": 51.98,
+    "stdout": "[]\n",
+    "stderr": "error: no such object: jarvis-gpt-dispatcher\n"
+  },
+  "docker_stats": {
+    "arguments": [
+      "docker",
+      "stats",
+      "--no-stream",
+      "--format",
+      "{{json .}}",
+      "jarvis-gpt-dispatcher"
+    ],
+    "returncode": 1,
+    "elapsed_ms": 36.5,
+    "stdout": "",
+    "stderr": "Error response from daemon: No such container: jarvis-gpt-dispatcher\n"
+  },
+  "docker_logs_tail": {
+    "arguments": [
+      "docker",
+      "logs",
+      "--tail",
+      "250",
+      "jarvis-gpt-dispatcher"
+    ],
+    "returncode": 1,
+    "elapsed_ms": 35.34,
+    "stdout": "",
+    "stderr": "Error response from daemon: No such container: jarvis-gpt-dispatcher\n"
+  },
+  "nvidia_smi": {
+    "arguments": [
+      "nvidia-smi",
+      "--query-gpu=utilization.gpu,memory.used,memory.free,temperature.gpu,power.draw",
+      "--format=csv,noheader"
+    ],
+    "returncode": 0,
+    "elapsed_ms": 37.37,
+    "stdout": "10 %, 739 MiB, 31448 MiB, 42, 60.99 W\n",
+    "stderr": ""
+  }
+}

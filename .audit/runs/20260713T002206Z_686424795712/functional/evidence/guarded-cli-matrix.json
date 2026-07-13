@@ -1,0 +1,80 @@
+{
+  "schema": "jarvis.functional-guarded-cli-matrix.v1",
+  "recorded_at": "2026-07-13T18:46:54.882645+00:00",
+  "home": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712",
+  "health": {
+    "ok": true,
+    "profile": "gemma4-turbo",
+    "home": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712"
+  },
+  "rows": [
+    {
+      "arguments": [
+        "persona-set",
+        "--set",
+        "functional_guard_probe=SHOULD_NOT_APPLY"
+      ],
+      "returncode": 1,
+      "elapsed_ms": 641.6,
+      "stdout": "",
+      "stderr": "Jarvis API currently owns executive state; use its API or stop it before running a mutating CLI command.\n",
+      "guard_message": true
+    },
+    {
+      "arguments": [
+        "approval-request",
+        "Functional guard probe",
+        "This request must be rejected while the API owns executive state.",
+        "--risk",
+        "review",
+        "--action",
+        "fs.write",
+        "--payload",
+        "{}"
+      ],
+      "returncode": 1,
+      "elapsed_ms": 617.94,
+      "stdout": "",
+      "stderr": "Jarvis API currently owns executive state; use its API or stop it before running a mutating CLI command.\n",
+      "guard_message": true
+    },
+    {
+      "arguments": [
+        "tool-run",
+        "filesystem.write_text",
+        "--arguments",
+        "{\"path\": \"D:\\\\jarvis\\\\audit-functional\\\\20260713T002206Z_686424795712\\\\data\\\\jarvis-gpt\\\\functional-cli-guard-probe.txt\", \"content\": \"SHOULD_NOT_EXIST\", \"mode\": \"create\"}"
+      ],
+      "returncode": 1,
+      "elapsed_ms": 622.03,
+      "stdout": "",
+      "stderr": "Jarvis API currently owns executive state; use its API or stop it before running a mutating CLI command.\n",
+      "guard_message": true
+    },
+    {
+      "arguments": [
+        "mission-run",
+        "functional-missing-mission",
+        "--max-steps",
+        "1"
+      ],
+      "returncode": 1,
+      "elapsed_ms": 643.37,
+      "stdout": "",
+      "stderr": "Jarvis API currently owns executive state; use its API or stop it before running a mutating CLI command.\n",
+      "guard_message": true
+    }
+  ],
+  "before_after": {
+    "persona_equal": true,
+    "approvals_equal": true,
+    "policy_equal": true,
+    "probe_path_exists": false
+  },
+  "summary": {
+    "commands": 4,
+    "nonzero": 4,
+    "guarded": 4,
+    "state_unchanged": true
+  }
+}

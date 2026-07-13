@@ -1,0 +1,25 @@
+{
+  "schema": "jarvis.functional-command-evidence.v1",
+  "started_at": "2026-07-13T18:47:14.613242+00:00",
+  "finished_at": "2026-07-13T18:47:14.905821+00:00",
+  "elapsed_ms": 292.44,
+  "cwd": "D:\\jarvis-gpt",
+  "command": [
+    "py",
+    "-3.11",
+    "-m",
+    "pytest",
+    "backend/tests/test_config_storage.py::test_settings_use_external_home",
+    "-q"
+  ],
+  "unset_env": [
+    "JARVIS_HOME",
+    "JARVIS_MODEL_ROOT",
+    "JARVIS_PROFILE"
+  ],
+  "timeout_sec": 120,
+  "timed_out": false,
+  "returncode": 0,
+  "stdout": ".                                                                        [100%]\n1 passed in 0.03s\n",
+  "stderr": ""
+}

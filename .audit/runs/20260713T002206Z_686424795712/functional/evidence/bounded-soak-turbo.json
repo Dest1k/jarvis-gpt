@@ -1,0 +1,818 @@
+{
+  "schema": "jarvis.functional-bounded-soak.v1",
+  "recorded_at": "2026-07-13T18:51:07.360098+00:00",
+  "home": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712",
+  "profile": "gemma4-turbo",
+  "marker": "functional-soak-617c5aebe2e2",
+  "configured_duration_sec": 120,
+  "elapsed_sec": 120.0,
+  "samples": [
+    {
+      "at_sec": 0.172,
+      "health_status": 200,
+      "health": {
+        "ok": true,
+        "profile": "gemma4-turbo",
+        "home": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712"
+      },
+      "status_status": 200,
+      "counters": {
+        "runtime_kv": 7,
+        "conversations": 153,
+        "messages": 390,
+        "memories": 102,
+        "missions": 4,
+        "mission_tasks": 16,
+        "files": 50,
+        "file_chunks": 48,
+        "tool_runs": 68,
+        "learning_observations": 484,
+        "approvals": 3,
+        "telemetry_snapshots": 346,
+        "audit_log": 229
+      },
+      "docker_stats": {
+        "returncode": 0,
+        "stdout": "{\"BlockIO\":\"10.9MB / 110MB\",\"CPUPerc\":\"1.10%\",\"Container\":\"jarvis-gpt-dispatcher\",\"ID\":\"f2f731caea64\",\"MemPerc\":\"5.65%\",\"MemUsage\":\"5.326GiB / 94.29GiB\",\"Name\":\"jarvis-gpt-dispatcher\",\"NetIO\":\"194kB / 86.1kB\",\"PIDs\":\"217\"}",
+        "stderr": ""
+      },
+      "nvidia_smi": {
+        "returncode": 0,
+        "stdout": "10 %, 28173 MiB, 4014 MiB, 42, 60.06 W",
+        "stderr": ""
+      },
+      "sizes": {
+        "state": 17896164,
+        "logs": 225715,
+        "cache": 29948675
+      }
+    },
+    {
+      "at_sec": 7.657,
+      "health_status": 200,
+      "health": {
+        "ok": true,
+        "profile": "gemma4-turbo",
+        "home": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712"
+      },
+      "status_status": 200,
+      "counters": {
+        "runtime_kv": 7,
+        "conversations": 154,
+        "messages": 392,
+        "memories": 102,
+        "missions": 4,
+        "mission_tasks": 16,
+        "files": 50,
+        "file_chunks": 48,
+        "tool_runs": 68,
+        "learning_observations": 486,
+        "approvals": 3,
+        "telemetry_snapshots": 346,
+        "audit_log": 229
+      },
+      "docker_stats": {
+        "returncode": 0,
+        "stdout": "{\"BlockIO\":\"10.9MB / 110MB\",\"CPUPerc\":\"1.03%\",\"Container\":\"jarvis-gpt-dispatcher\",\"ID\":\"f2f731caea64\",\"MemPerc\":\"5.65%\",\"MemUsage\":\"5.326GiB / 94.29GiB\",\"Name\":\"jarvis-gpt-dispatcher\",\"NetIO\":\"220kB / 87.7kB\",\"PIDs\":\"217\"}",
+        "stderr": ""
+      },
+      "nvidia_smi": {
+        "returncode": 0,
+        "stdout": "10 %, 28172 MiB, 4015 MiB, 42, 61.21 W",
+        "stderr": ""
+      },
+      "sizes": {
+        "state": 18056844,
+        "logs": 227086,
+        "cache": 29948675
+      }
+    },
+    {
+      "at_sec": 13.766,
+      "health_status": 200,
+      "health": {
+        "ok": true,
+        "profile": "gemma4-turbo",
+        "home": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712"
+      },
+      "status_status": 200,
+      "counters": {
+        "runtime_kv": 7,
+        "conversations": 154,
+        "messages": 392,
+        "memories": 102,
+        "missions": 4,
+        "mission_tasks": 16,
+        "files": 50,
+        "file_chunks": 48,
+        "tool_runs": 68,
+        "learning_observations": 486,
+        "approvals": 3,
+        "telemetry_snapshots": 346,
+        "audit_log": 229
+      },
+      "docker_stats": {
+        "returncode": 0,
+        "stdout": "{\"BlockIO\":\"10.9MB / 110MB\",\"CPUPerc\":\"1.03%\",\"Container\":\"jarvis-gpt-dispatcher\",\"ID\":\"f2f731caea64\",\"MemPerc\":\"5.65%\",\"MemUsage\":\"5.326GiB / 94.29GiB\",\"Name\":\"jarvis-gpt-dispatcher\",\"NetIO\":\"220kB / 88kB\",\"PIDs\":\"217\"}",
+        "stderr": ""
+      },
+      "nvidia_smi": {
+        "returncode": 0,
+        "stdout": "10 %, 28170 MiB, 4017 MiB, 42, 59.85 W",
+        "stderr": ""
+      },
+      "sizes": {
+        "state": 18056844,
+        "logs": 228324,
+        "cache": 29948675
+      }
+    },
+    {
+      "at_sec": 19.891,
+      "health_status": 200,
+      "health": {
+        "ok": true,
+        "profile": "gemma4-turbo",
+        "home": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712"
+      },
+      "status_status": 200,
+      "counters": {
+        "runtime_kv": 7,
+        "conversations": 154,
+        "messages": 392,
+        "memories": 102,
+        "missions": 4,
+        "mission_tasks": 16,
+        "files": 50,
+        "file_chunks": 48,
+        "tool_runs": 68,
+        "learning_observations": 486,
+        "approvals": 3,
+        "telemetry_snapshots": 347,
+        "audit_log": 229
+      },
+      "docker_stats": {
+        "returncode": 0,
+        "stdout": "{\"BlockIO\":\"10.9MB / 110MB\",\"CPUPerc\":\"1.16%\",\"Container\":\"jarvis-gpt-dispatcher\",\"ID\":\"f2f731caea64\",\"MemPerc\":\"5.65%\",\"MemUsage\":\"5.325GiB / 94.29GiB\",\"Name\":\"jarvis-gpt-dispatcher\",\"NetIO\":\"221kB / 89.1kB\",\"PIDs\":\"217\"}",
+        "stderr": ""
+      },
+      "nvidia_smi": {
+        "returncode": 0,
+        "stdout": "10 %, 28215 MiB, 3972 MiB, 43, 61.34 W",
+        "stderr": ""
+      },
+      "sizes": {
+        "state": 18275204,
+        "logs": 229633,
+        "cache": 29948675
+      }
+    },
+    {
+      "at_sec": 26.938,
+      "health_status": 200,
+      "health": {
+        "ok": true,
+        "profile": "gemma4-turbo",
+        "home": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712"
+      },
+      "status_status": 200,
+      "counters": {
+        "runtime_kv": 7,
+        "conversations": 154,
+        "messages": 392,
+        "memories": 102,
+        "missions": 4,
+        "mission_tasks": 16,
+        "files": 50,
+        "file_chunks": 48,
+        "tool_runs": 68,
+        "learning_observations": 487,
+        "approvals": 3,
+        "telemetry_snapshots": 347,
+        "audit_log": 229
+      },
+      "docker_stats": {
+        "returncode": 0,
+        "stdout": "{\"BlockIO\":\"10.9MB / 110MB\",\"CPUPerc\":\"63.57%\",\"Container\":\"jarvis-gpt-dispatcher\",\"ID\":\"f2f731caea64\",\"MemPerc\":\"5.65%\",\"MemUsage\":\"5.326GiB / 94.29GiB\",\"Name\":\"jarvis-gpt-dispatcher\",\"NetIO\":\"231kB / 92kB\",\"PIDs\":\"217\"}",
+        "stderr": ""
+      },
+      "nvidia_smi": {
+        "returncode": 0,
+        "stdout": "97 %, 28173 MiB, 4014 MiB, 49, 154.07 W",
+        "stderr": ""
+      },
+      "sizes": {
+        "state": 18337004,
+        "logs": 230934,
+        "cache": 29948675
+      }
+    },
+    {
+      "at_sec": 33.063,
+      "health_status": 200,
+      "health": {
+        "ok": true,
+        "profile": "gemma4-turbo",
+        "home": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712"
+      },
+      "status_status": 200,
+      "counters": {
+        "runtime_kv": 7,
+        "conversations": 154,
+        "messages": 392,
+        "memories": 105,
+        "missions": 4,
+        "mission_tasks": 16,
+        "files": 50,
+        "file_chunks": 48,
+        "tool_runs": 68,
+        "learning_observations": 487,
+        "approvals": 3,
+        "telemetry_snapshots": 347,
+        "audit_log": 232
+      },
+      "docker_stats": {
+        "returncode": 0,
+        "stdout": "{\"BlockIO\":\"10.9MB / 110MB\",\"CPUPerc\":\"1.12%\",\"Container\":\"jarvis-gpt-dispatcher\",\"ID\":\"f2f731caea64\",\"MemPerc\":\"5.65%\",\"MemUsage\":\"5.326GiB / 94.29GiB\",\"Name\":\"jarvis-gpt-dispatcher\",\"NetIO\":\"231kB / 93.6kB\",\"PIDs\":\"217\"}",
+        "stderr": ""
+      },
+      "nvidia_smi": {
+        "returncode": 0,
+        "stdout": "9 %, 28175 MiB, 4012 MiB, 45, 62.66 W",
+        "stderr": ""
+      },
+      "sizes": {
+        "state": 18608924,
+        "logs": 232454,
+        "cache": 29948675
+      }
+    },
+    {
+      "at_sec": 39.797,
+      "health_status": 200,
+      "health": {
+        "ok": true,
+        "profile": "gemma4-turbo",
+        "home": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712"
+      },
+      "status_status": 200,
+      "counters": {
+        "runtime_kv": 7,
+        "conversations": 155,
+        "messages": 394,
+        "memories": 105,
+        "missions": 4,
+        "mission_tasks": 16,
+        "files": 50,
+        "file_chunks": 48,
+        "tool_runs": 68,
+        "learning_observations": 489,
+        "approvals": 3,
+        "telemetry_snapshots": 347,
+        "audit_log": 232
+      },
+      "docker_stats": {
+        "returncode": 0,
+        "stdout": "{\"BlockIO\":\"19.4MB / 110MB\",\"CPUPerc\":\"1.29%\",\"Container\":\"jarvis-gpt-dispatcher\",\"ID\":\"f2f731caea64\",\"MemPerc\":\"5.65%\",\"MemUsage\":\"5.326GiB / 94.29GiB\",\"Name\":\"jarvis-gpt-dispatcher\",\"NetIO\":\"262kB / 96.9kB\",\"PIDs\":\"217\"}",
+        "stderr": ""
+      },
+      "nvidia_smi": {
+        "returncode": 0,
+        "stdout": "10 %, 28170 MiB, 4017 MiB, 45, 62.30 W",
+        "stderr": ""
+      },
+      "sizes": {
+        "state": 18744884,
+        "logs": 233825,
+        "cache": 29948675
+      }
+    },
+    {
+      "at_sec": 45.907,
+      "health_status": 200,
+      "health": {
+        "ok": true,
+        "profile": "gemma4-turbo",
+        "home": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712"
+      },
+      "status_status": 200,
+      "counters": {
+        "runtime_kv": 7,
+        "conversations": 155,
+        "messages": 394,
+        "memories": 105,
+        "missions": 4,
+        "mission_tasks": 16,
+        "files": 50,
+        "file_chunks": 48,
+        "tool_runs": 68,
+        "learning_observations": 489,
+        "approvals": 3,
+        "telemetry_snapshots": 347,
+        "audit_log": 232
+      },
+      "docker_stats": {
+        "returncode": 0,
+        "stdout": "{\"BlockIO\":\"19.4MB / 110MB\",\"CPUPerc\":\"1.34%\",\"Container\":\"jarvis-gpt-dispatcher\",\"ID\":\"f2f731caea64\",\"MemPerc\":\"5.65%\",\"MemUsage\":\"5.326GiB / 94.29GiB\",\"Name\":\"jarvis-gpt-dispatcher\",\"NetIO\":\"262kB / 97.2kB\",\"PIDs\":\"217\"}",
+        "stderr": ""
+      },
+      "nvidia_smi": {
+        "returncode": 0,
+        "stdout": "17 %, 28177 MiB, 4010 MiB, 46, 62.12 W",
+        "stderr": ""
+      },
+      "sizes": {
+        "state": 18744884,
+        "logs": 235063,
+        "cache": 29948675
+      }
+    },
+    {
+      "at_sec": 52.0,
+      "health_status": 200,
+      "health": {
+        "ok": true,
+        "profile": "gemma4-turbo",
+        "home": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712"
+      },
+      "status_status": 200,
+      "counters": {
+        "runtime_kv": 7,
+        "conversations": 155,
+        "messages": 394,
+        "memories": 105,
+        "missions": 4,
+        "mission_tasks": 16,
+        "files": 50,
+        "file_chunks": 48,
+        "tool_runs": 68,
+        "learning_observations": 489,
+        "approvals": 3,
+        "telemetry_snapshots": 347,
+        "audit_log": 232
+      },
+      "docker_stats": {
+        "returncode": 0,
+        "stdout": "{\"BlockIO\":\"19.4MB / 110MB\",\"CPUPerc\":\"1.24%\",\"Container\":\"jarvis-gpt-dispatcher\",\"ID\":\"f2f731caea64\",\"MemPerc\":\"5.65%\",\"MemUsage\":\"5.326GiB / 94.29GiB\",\"Name\":\"jarvis-gpt-dispatcher\",\"NetIO\":\"263kB / 97.5kB\",\"PIDs\":\"217\"}",
+        "stderr": ""
+      },
+      "nvidia_smi": {
+        "returncode": 0,
+        "stdout": "10 %, 28173 MiB, 4014 MiB, 46, 61.61 W",
+        "stderr": ""
+      },
+      "sizes": {
+        "state": 18744884,
+        "logs": 236301,
+        "cache": 29948675
+      }
+    },
+    {
+      "at_sec": 58.11,
+      "health_status": 200,
+      "health": {
+        "ok": true,
+        "profile": "gemma4-turbo",
+        "home": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712"
+      },
+      "status_status": 200,
+      "counters": {
+        "runtime_kv": 7,
+        "conversations": 155,
+        "messages": 394,
+        "memories": 105,
+        "missions": 4,
+        "mission_tasks": 16,
+        "files": 50,
+        "file_chunks": 48,
+        "tool_runs": 68,
+        "learning_observations": 489,
+        "approvals": 3,
+        "telemetry_snapshots": 347,
+        "audit_log": 232
+      },
+      "docker_stats": {
+        "returncode": 0,
+        "stdout": "{\"BlockIO\":\"19.4MB / 110MB\",\"CPUPerc\":\"1.10%\",\"Container\":\"jarvis-gpt-dispatcher\",\"ID\":\"f2f731caea64\",\"MemPerc\":\"5.65%\",\"MemUsage\":\"5.326GiB / 94.29GiB\",\"Name\":\"jarvis-gpt-dispatcher\",\"NetIO\":\"263kB / 97.8kB\",\"PIDs\":\"217\"}",
+        "stderr": ""
+      },
+      "nvidia_smi": {
+        "returncode": 0,
+        "stdout": "10 %, 28173 MiB, 4014 MiB, 46, 61.54 W",
+        "stderr": ""
+      },
+      "sizes": {
+        "state": 18744884,
+        "logs": 237539,
+        "cache": 29948675
+      }
+    },
+    {
+      "at_sec": 64.235,
+      "health_status": 200,
+      "health": {
+        "ok": true,
+        "profile": "gemma4-turbo",
+        "home": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712"
+      },
+      "status_status": 200,
+      "counters": {
+        "runtime_kv": 7,
+        "conversations": 155,
+        "messages": 394,
+        "memories": 105,
+        "missions": 4,
+        "mission_tasks": 16,
+        "files": 50,
+        "file_chunks": 48,
+        "tool_runs": 68,
+        "learning_observations": 489,
+        "approvals": 3,
+        "telemetry_snapshots": 347,
+        "audit_log": 232
+      },
+      "docker_stats": {
+        "returncode": 0,
+        "stdout": "{\"BlockIO\":\"19.4MB / 110MB\",\"CPUPerc\":\"1.04%\",\"Container\":\"jarvis-gpt-dispatcher\",\"ID\":\"f2f731caea64\",\"MemPerc\":\"5.65%\",\"MemUsage\":\"5.326GiB / 94.29GiB\",\"Name\":\"jarvis-gpt-dispatcher\",\"NetIO\":\"264kB / 98.1kB\",\"PIDs\":\"217\"}",
+        "stderr": ""
+      },
+      "nvidia_smi": {
+        "returncode": 0,
+        "stdout": "9 %, 28173 MiB, 4014 MiB, 46, 62.19 W",
+        "stderr": ""
+      },
+      "sizes": {
+        "state": 18744884,
+        "logs": 238777,
+        "cache": 29948675
+      }
+    },
+    {
+      "at_sec": 71.079,
+      "health_status": 200,
+      "health": {
+        "ok": true,
+        "profile": "gemma4-turbo",
+        "home": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712"
+      },
+      "status_status": 200,
+      "counters": {
+        "runtime_kv": 7,
+        "conversations": 156,
+        "messages": 396,
+        "memories": 105,
+        "missions": 4,
+        "mission_tasks": 16,
+        "files": 50,
+        "file_chunks": 48,
+        "tool_runs": 68,
+        "learning_observations": 491,
+        "approvals": 3,
+        "telemetry_snapshots": 347,
+        "audit_log": 232
+      },
+      "docker_stats": {
+        "returncode": 0,
+        "stdout": "{\"BlockIO\":\"19.4MB / 110MB\",\"CPUPerc\":\"1.06%\",\"Container\":\"jarvis-gpt-dispatcher\",\"ID\":\"f2f731caea64\",\"MemPerc\":\"5.65%\",\"MemUsage\":\"5.327GiB / 94.29GiB\",\"Name\":\"jarvis-gpt-dispatcher\",\"NetIO\":\"290kB / 99.7kB\",\"PIDs\":\"217\"}",
+        "stderr": ""
+      },
+      "nvidia_smi": {
+        "returncode": 0,
+        "stdout": "10 %, 28174 MiB, 4013 MiB, 47, 64.09 W",
+        "stderr": ""
+      },
+      "sizes": {
+        "state": 18880844,
+        "logs": 240219,
+        "cache": 29948675
+      }
+    },
+    {
+      "at_sec": 77.985,
+      "health_status": 200,
+      "health": {
+        "ok": true,
+        "profile": "gemma4-turbo",
+        "home": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712"
+      },
+      "status_status": 200,
+      "counters": {
+        "runtime_kv": 7,
+        "conversations": 156,
+        "messages": 396,
+        "memories": 105,
+        "missions": 4,
+        "mission_tasks": 16,
+        "files": 50,
+        "file_chunks": 48,
+        "tool_runs": 68,
+        "learning_observations": 491,
+        "approvals": 3,
+        "telemetry_snapshots": 347,
+        "audit_log": 232
+      },
+      "docker_stats": {
+        "returncode": 0,
+        "stdout": "{\"BlockIO\":\"19.4MB / 110MB\",\"CPUPerc\":\"1.06%\",\"Container\":\"jarvis-gpt-dispatcher\",\"ID\":\"f2f731caea64\",\"MemPerc\":\"5.65%\",\"MemUsage\":\"5.327GiB / 94.29GiB\",\"Name\":\"jarvis-gpt-dispatcher\",\"NetIO\":\"291kB / 100kB\",\"PIDs\":\"217\"}",
+        "stderr": ""
+      },
+      "nvidia_smi": {
+        "returncode": 0,
+        "stdout": "10 %, 28174 MiB, 4013 MiB, 47, 64.79 W",
+        "stderr": ""
+      },
+      "sizes": {
+        "state": 18880844,
+        "logs": 241735,
+        "cache": 29948675
+      }
+    },
+    {
+      "at_sec": 84.11,
+      "health_status": 200,
+      "health": {
+        "ok": true,
+        "profile": "gemma4-turbo",
+        "home": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712"
+      },
+      "status_status": 200,
+      "counters": {
+        "runtime_kv": 7,
+        "conversations": 156,
+        "messages": 396,
+        "memories": 105,
+        "missions": 4,
+        "mission_tasks": 16,
+        "files": 50,
+        "file_chunks": 48,
+        "tool_runs": 68,
+        "learning_observations": 491,
+        "approvals": 3,
+        "telemetry_snapshots": 347,
+        "audit_log": 232
+      },
+      "docker_stats": {
+        "returncode": 0,
+        "stdout": "{\"BlockIO\":\"19.4MB / 110MB\",\"CPUPerc\":\"1.09%\",\"Container\":\"jarvis-gpt-dispatcher\",\"ID\":\"f2f731caea64\",\"MemPerc\":\"5.65%\",\"MemUsage\":\"5.325GiB / 94.29GiB\",\"Name\":\"jarvis-gpt-dispatcher\",\"NetIO\":\"291kB / 100kB\",\"PIDs\":\"217\"}",
+        "stderr": ""
+      },
+      "nvidia_smi": {
+        "returncode": 0,
+        "stdout": "9 %, 28174 MiB, 4013 MiB, 47, 63.51 W",
+        "stderr": ""
+      },
+      "sizes": {
+        "state": 18880844,
+        "logs": 243040,
+        "cache": 29948675
+      }
+    },
+    {
+      "at_sec": 90.204,
+      "health_status": 200,
+      "health": {
+        "ok": true,
+        "profile": "gemma4-turbo",
+        "home": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712"
+      },
+      "status_status": 200,
+      "counters": {
+        "runtime_kv": 7,
+        "conversations": 156,
+        "messages": 396,
+        "memories": 105,
+        "missions": 4,
+        "mission_tasks": 16,
+        "files": 50,
+        "file_chunks": 48,
+        "tool_runs": 68,
+        "learning_observations": 491,
+        "approvals": 3,
+        "telemetry_snapshots": 347,
+        "audit_log": 232
+      },
+      "docker_stats": {
+        "returncode": 0,
+        "stdout": "{\"BlockIO\":\"19.4MB / 110MB\",\"CPUPerc\":\"1.24%\",\"Container\":\"jarvis-gpt-dispatcher\",\"ID\":\"f2f731caea64\",\"MemPerc\":\"5.65%\",\"MemUsage\":\"5.324GiB / 94.29GiB\",\"Name\":\"jarvis-gpt-dispatcher\",\"NetIO\":\"292kB / 101kB\",\"PIDs\":\"217\"}",
+        "stderr": ""
+      },
+      "nvidia_smi": {
+        "returncode": 0,
+        "stdout": "9 %, 28208 MiB, 3979 MiB, 48, 63.67 W",
+        "stderr": ""
+      },
+      "sizes": {
+        "state": 18880844,
+        "logs": 244349,
+        "cache": 29948675
+      }
+    },
+    {
+      "at_sec": 97.657,
+      "health_status": 200,
+      "health": {
+        "ok": true,
+        "profile": "gemma4-turbo",
+        "home": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712"
+      },
+      "status_status": 200,
+      "counters": {
+        "runtime_kv": 7,
+        "conversations": 157,
+        "messages": 398,
+        "memories": 105,
+        "missions": 4,
+        "mission_tasks": 16,
+        "files": 50,
+        "file_chunks": 48,
+        "tool_runs": 68,
+        "learning_observations": 493,
+        "approvals": 3,
+        "telemetry_snapshots": 347,
+        "audit_log": 232
+      },
+      "docker_stats": {
+        "returncode": 0,
+        "stdout": "{\"BlockIO\":\"24.6MB / 110MB\",\"CPUPerc\":\"1.45%\",\"Container\":\"jarvis-gpt-dispatcher\",\"ID\":\"f2f731caea64\",\"MemPerc\":\"5.65%\",\"MemUsage\":\"5.325GiB / 94.29GiB\",\"Name\":\"jarvis-gpt-dispatcher\",\"NetIO\":\"317kB / 102kB\",\"PIDs\":\"217\"}",
+        "stderr": ""
+      },
+      "nvidia_smi": {
+        "returncode": 0,
+        "stdout": "12 %, 28157 MiB, 4030 MiB, 48, 70.94 W",
+        "stderr": ""
+      },
+      "sizes": {
+        "state": 18992084,
+        "logs": 245649,
+        "cache": 29948675
+      }
+    },
+    {
+      "at_sec": 103.75,
+      "health_status": 200,
+      "health": {
+        "ok": true,
+        "profile": "gemma4-turbo",
+        "home": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712"
+      },
+      "status_status": 200,
+      "counters": {
+        "runtime_kv": 7,
+        "conversations": 157,
+        "messages": 398,
+        "memories": 105,
+        "missions": 4,
+        "mission_tasks": 16,
+        "files": 50,
+        "file_chunks": 48,
+        "tool_runs": 68,
+        "learning_observations": 493,
+        "approvals": 3,
+        "telemetry_snapshots": 347,
+        "audit_log": 232
+      },
+      "docker_stats": {
+        "returncode": 0,
+        "stdout": "{\"BlockIO\":\"24.6MB / 110MB\",\"CPUPerc\":\"1.49%\",\"Container\":\"jarvis-gpt-dispatcher\",\"ID\":\"f2f731caea64\",\"MemPerc\":\"5.65%\",\"MemUsage\":\"5.325GiB / 94.29GiB\",\"Name\":\"jarvis-gpt-dispatcher\",\"NetIO\":\"318kB / 103kB\",\"PIDs\":\"217\"}",
+        "stderr": ""
+      },
+      "nvidia_smi": {
+        "returncode": 0,
+        "stdout": "13 %, 28159 MiB, 4028 MiB, 49, 66.92 W",
+        "stderr": ""
+      },
+      "sizes": {
+        "state": 18992084,
+        "logs": 246887,
+        "cache": 29948675
+      }
+    },
+    {
+      "at_sec": 109.86,
+      "health_status": 200,
+      "health": {
+        "ok": true,
+        "profile": "gemma4-turbo",
+        "home": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712"
+      },
+      "status_status": 200,
+      "counters": {
+        "runtime_kv": 7,
+        "conversations": 157,
+        "messages": 398,
+        "memories": 105,
+        "missions": 4,
+        "mission_tasks": 16,
+        "files": 50,
+        "file_chunks": 48,
+        "tool_runs": 68,
+        "learning_observations": 493,
+        "approvals": 3,
+        "telemetry_snapshots": 347,
+        "audit_log": 232
+      },
+      "docker_stats": {
+        "returncode": 0,
+        "stdout": "{\"BlockIO\":\"24.6MB / 110MB\",\"CPUPerc\":\"1.35%\",\"Container\":\"jarvis-gpt-dispatcher\",\"ID\":\"f2f731caea64\",\"MemPerc\":\"5.65%\",\"MemUsage\":\"5.324GiB / 94.29GiB\",\"Name\":\"jarvis-gpt-dispatcher\",\"NetIO\":\"318kB / 103kB\",\"PIDs\":\"217\"}",
+        "stderr": ""
+      },
+      "nvidia_smi": {
+        "returncode": 0,
+        "stdout": "12 %, 28159 MiB, 4028 MiB, 49, 68.31 W",
+        "stderr": ""
+      },
+      "sizes": {
+        "state": 18992084,
+        "logs": 248125,
+        "cache": 29948675
+      }
+    },
+    {
+      "at_sec": 115.954,
+      "health_status": 200,
+      "health": {
+        "ok": true,
+        "profile": "gemma4-turbo",
+        "home": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712"
+      },
+      "status_status": 200,
+      "counters": {
+        "runtime_kv": 7,
+        "conversations": 157,
+        "messages": 398,
+        "memories": 105,
+        "missions": 4,
+        "mission_tasks": 16,
+        "files": 50,
+        "file_chunks": 48,
+        "tool_runs": 68,
+        "learning_observations": 493,
+        "approvals": 3,
+        "telemetry_snapshots": 347,
+        "audit_log": 232
+      },
+      "docker_stats": {
+        "returncode": 0,
+        "stdout": "{\"BlockIO\":\"24.6MB / 110MB\",\"CPUPerc\":\"1.83%\",\"Container\":\"jarvis-gpt-dispatcher\",\"ID\":\"f2f731caea64\",\"MemPerc\":\"5.65%\",\"MemUsage\":\"5.327GiB / 94.29GiB\",\"Name\":\"jarvis-gpt-dispatcher\",\"NetIO\":\"319kB / 103kB\",\"PIDs\":\"217\"}",
+        "stderr": ""
+      },
+      "nvidia_smi": {
+        "returncode": 0,
+        "stdout": "13 %, 28157 MiB, 4030 MiB, 49, 68.54 W",
+        "stderr": ""
+      },
+      "sizes": {
+        "state": 18992084,
+        "logs": 249363,
+        "cache": 29948675
+      }
+    }
+  ],
+  "chats": [
+    {
+      "prompt": "[functional-soak-617c5aebe2e2:1] Ответь одним словом: стабильно.",
+      "status": 200,
+      "elapsed_ms": 731.02,
+      "conversation_id": "conv_eb46c58c43c74758",
+      "message_id": "msg_1cc8d678fe1643ab",
+      "answer": "Стабильно.",
+      "duration_ms": 727
+    },
+    {
+      "prompt": "[functional-soak-617c5aebe2e2:2] Ответь одним словом: стабильно.",
+      "status": 200,
+      "elapsed_ms": 613.89,
+      "conversation_id": "conv_93d254c17d1d40b8",
+      "message_id": "msg_6ceee820fb46452c",
+      "answer": "Стабильно.",
+      "duration_ms": 611
+    },
+    {
+      "prompt": "[functional-soak-617c5aebe2e2:3] Ответь одним словом: стабильно.",
+      "status": 200,
+      "elapsed_ms": 722.0,
+      "conversation_id": "conv_4e510ac0a38b4c51",
+      "message_id": "msg_718fd53ca7fc4008",
+      "answer": "Стабильно.",
+      "duration_ms": 716
+    },
+    {
+      "prompt": "[functional-soak-617c5aebe2e2:4] Ответь одним словом: стабильно.",
+      "status": 200,
+      "elapsed_ms": 653.74,
+      "conversation_id": "conv_80f6814e944d4c85",
+      "message_id": "msg_a7afa9a60bff49a0",
+      "answer": "Стабильно.",
+      "duration_ms": 650
+    }
+  ],
+  "failures": [],
+  "summary": {
+    "sample_count": 19,
+    "valid_sample_count": 19,
+    "chat_count": 4,
+    "chat_http_200": 4,
+    "chat_nonempty": 4,
+    "watchdog_respected": true
+  }
+}

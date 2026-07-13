@@ -1,0 +1,153 @@
+{
+  "schema": "jarvis.functional-frontend-freshness.v1",
+  "recorded_at": "2026-07-13T18:43:38.213825+00:00",
+  "base_url": "http://localhost:3000/",
+  "root": {
+    "url": "http://localhost:3000/",
+    "status": 200,
+    "content_type": "text/html; charset=utf-8",
+    "cache_control": "s-maxage=31536000",
+    "etag": "\"y7y3qxrn68ifq\"",
+    "size": 24522,
+    "sha256": "f35e9f2adb160f6d39a51fc5155ecfc49702033aba1b48f8079a691335ad6939"
+  },
+  "assets": [
+    {
+      "url": "http://localhost:3000/_next/static/chunks/3fcwq1dyfkgnj.css",
+      "status": 200,
+      "content_type": "text/css; charset=UTF-8",
+      "cache_control": "public, max-age=31536000, immutable",
+      "etag": "W/\"c882-19f5be803dc\"",
+      "size": 51330,
+      "sha256": "3e221a68310a3f29e7b6286df598f1655d4524444704779c919ec35e81e4283d"
+    },
+    {
+      "url": "http://localhost:3000/_next/static/chunks/07-hzktxqjvzd.js",
+      "status": 200,
+      "content_type": "application/javascript; charset=UTF-8",
+      "cache_control": "public, max-age=31536000, immutable",
+      "etag": "W/\"cf9d-19f5be803dc\"",
+      "size": 53149,
+      "sha256": "e4f0fa52acb0a9bda9415665fda33177adbc7828c9656918ce2e1a1be40d79c2"
+    },
+    {
+      "url": "http://localhost:3000/_next/static/chunks/3rxl-jt3pdxgx.js",
+      "status": 200,
+      "content_type": "application/javascript; charset=UTF-8",
+      "cache_control": "public, max-age=31536000, immutable",
+      "etag": "W/\"378d2-19f5be803dc\"",
+      "size": 227538,
+      "sha256": "dfa58a0bec19af1dccd5dab0f65d810211dfdd1192e7698cfd4e89ba24af2a4b"
+    },
+    {
+      "url": "http://localhost:3000/_next/static/chunks/3ph-k7hes6w94.js",
+      "status": 200,
+      "content_type": "application/javascript; charset=UTF-8",
+      "cache_control": "public, max-age=31536000, immutable",
+      "etag": "W/\"241ae-19f5be803dc\"",
+      "size": 147886,
+      "sha256": "bb3ce5bf1e8f45d56219e9c894cc6731c6c8a56181193fc0fdcdbbc61c8cdab3"
+    },
+    {
+      "url": "http://localhost:3000/_next/static/chunks/turbopack-2tz8zrn_1yit9.js",
+      "status": 200,
+      "content_type": "application/javascript; charset=UTF-8",
+      "cache_control": "public, max-age=31536000, immutable",
+      "etag": "W/\"2954-19f5be803dc\"",
+      "size": 10580,
+      "sha256": "809f787a840dfcac3e6fbd1f3c9c28dab3f72a5ad191f14622b6e8f6e91cc72a"
+    },
+    {
+      "url": "http://localhost:3000/_next/static/chunks/158myu8e_yme3.js",
+      "status": 200,
+      "content_type": "application/javascript; charset=UTF-8",
+      "cache_control": "public, max-age=31536000, immutable",
+      "etag": "W/\"e235-19f5be803dc\"",
+      "size": 57909,
+      "sha256": "59d6d2186868625417737f3f33980e55f778eb3672cd03a10cf26b1259ca2314"
+    },
+    {
+      "url": "http://localhost:3000/_next/static/chunks/3sh1-nhilp02s.js",
+      "status": 200,
+      "content_type": "application/javascript; charset=UTF-8",
+      "cache_control": "public, max-age=31536000, immutable",
+      "etag": "W/\"106d-19f5be803dc\"",
+      "size": 4205,
+      "sha256": "fe2b8ca4a313babae6078b5783386c267b4eeb8f3aec905db452d2b4a286883a"
+    },
+    {
+      "url": "http://localhost:3000/_next/static/chunks/2u4f1vz-cs1yv.js",
+      "status": 200,
+      "content_type": "application/javascript; charset=UTF-8",
+      "cache_control": "public, max-age=31536000, immutable",
+      "etag": "W/\"198aa-19f5be803dc\"",
+      "size": 104618,
+      "sha256": "1238561babe892797155e92640b5baeda765c519ddc6e8c86f6cf7757cb734ab"
+    },
+    {
+      "url": "http://localhost:3000/manifest.webmanifest",
+      "status": 200,
+      "content_type": "application/manifest+json",
+      "cache_control": "public, max-age=0",
+      "etag": "W/\"14b-19f4c1dd580\"",
+      "size": 331,
+      "sha256": "249b50d1120ab4bf356be4f1b75fe009ef5cae077a3c825857d49a501851dfc3"
+    },
+    {
+      "url": "http://localhost:3000/icon.svg",
+      "status": 200,
+      "content_type": "image/svg+xml",
+      "cache_control": "public, max-age=0",
+      "etag": "W/\"14b-19f40e0237e\"",
+      "size": 331,
+      "sha256": "894aa21dd94608f6726b9a5e1a68169fb9aa9d1a2e277ef7bd93a06a822261af"
+    },
+    {
+      "url": "http://localhost:3000/_next/static/chunks/0cz1d0mv5g_q7.js",
+      "status": 200,
+      "content_type": "application/javascript; charset=UTF-8",
+      "cache_control": "public, max-age=31536000, immutable",
+      "etag": "W/\"1b7d2-19f5be803dc\"",
+      "size": 112594,
+      "sha256": "0973c1d64c88adc8e3c950410cb58b288f72118d5965b78049438deb8f2f9683"
+    },
+    {
+      "url": "http://localhost:3000/_next/static/chunks/1jq4o6yq14o4c.js",
+      "status": 200,
+      "content_type": "application/javascript; charset=UTF-8",
+      "cache_control": "public, max-age=31536000, immutable",
+      "etag": "W/\"4442-19f5be803dc\"",
+      "size": 17474,
+      "sha256": "b2b0fb9dbb3e38abc0110efd9dc4c5ec29e2e7c6cff449d61c95f354b4014f5b"
+    }
+  ],
+  "service_worker": {
+    "url": "http://localhost:3000/sw.js",
+    "status": 200,
+    "content_type": "application/javascript; charset=UTF-8",
+    "cache_control": "public, max-age=0",
+    "etag": "W/\"852-19f4c1dd580\"",
+    "size": 2130,
+    "sha256": "9a450d13e0edc48cef2996c4a25c4553844f6367b36de055dddbb73e256c8dee",
+    "source_sha256": "9a450d13e0edc48cef2996c4a25c4553844f6367b36de055dddbb73e256c8dee",
+    "matches_source": true
+  },
+  "manifest": {
+    "url": "http://localhost:3000/manifest.webmanifest",
+    "status": 200,
+    "content_type": "application/manifest+json",
+    "cache_control": "public, max-age=0",
+    "etag": "W/\"14b-19f4c1dd580\"",
+    "size": 331,
+    "sha256": "249b50d1120ab4bf356be4f1b75fe009ef5cae077a3c825857d49a501851dfc3",
+    "source_sha256": "249b50d1120ab4bf356be4f1b75fe009ef5cae077a3c825857d49a501851dfc3",
+    "matches_source": true
+  },
+  "summary": {
+    "root_ok": true,
+    "assets_ok": true,
+    "asset_count": 12,
+    "service_worker_matches": true,
+    "manifest_matches": true
+  }
+}

@@ -1,0 +1,2 @@
+JARVIS functional marker: jarvis-functional-turbo-v2-20260713T163821Z-88fd91140364:b2e2d66d
+Synthetic plain text fixture.

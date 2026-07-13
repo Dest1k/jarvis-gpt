@@ -1,0 +1,81 @@
+{
+  "recorded_at": "2026-07-13T18:28:26.292863+00:00",
+  "home": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712",
+  "health": {
+    "ok": true,
+    "profile": "gemma4-mono",
+    "home": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712"
+  },
+  "before": {
+    "mode": "balanced",
+    "allow_safe_tools": true,
+    "allow_review_tools": false,
+    "allow_danger_tools": false,
+    "allow_background_learning": false,
+    "allow_self_healing_suggestions": false,
+    "approval_required_for": [
+      "execution.apply",
+      "execution.transaction",
+      "execution.cancel",
+      "filesystem.write_text",
+      "dispatcher.start",
+      "dispatcher.stop"
+    ],
+    "max_autonomous_steps": 2,
+    "resource_guard": {
+      "max_memory_ratio": 0.92,
+      "max_gpu_memory_ratio": 0.9
+    }
+  },
+  "requested": {
+    "allow_safe_tools": false,
+    "allow_review_tools": false,
+    "allow_danger_tools": false,
+    "allow_background_learning": false,
+    "allow_self_healing_suggestions": false,
+    "max_autonomous_steps": 1
+  },
+  "updated": {
+    "mode": "balanced",
+    "allow_safe_tools": false,
+    "allow_review_tools": false,
+    "allow_danger_tools": false,
+    "allow_background_learning": false,
+    "allow_self_healing_suggestions": false,
+    "approval_required_for": [
+      "execution.apply",
+      "execution.transaction",
+      "execution.cancel",
+      "filesystem.write_text",
+      "dispatcher.start",
+      "dispatcher.stop"
+    ],
+    "max_autonomous_steps": 1,
+    "resource_guard": {
+      "max_memory_ratio": 0.92,
+      "max_gpu_memory_ratio": 0.9
+    }
+  },
+  "after": {
+    "mode": "balanced",
+    "allow_safe_tools": false,
+    "allow_review_tools": false,
+    "allow_danger_tools": false,
+    "allow_background_learning": false,
+    "allow_self_healing_suggestions": false,
+    "approval_required_for": [
+      "execution.apply",
+      "execution.transaction",
+      "execution.cancel",
+      "filesystem.write_text",
+      "dispatcher.start",
+      "dispatcher.stop"
+    ],
+    "max_autonomous_steps": 1,
+    "resource_guard": {
+      "max_memory_ratio": 0.92,
+      "max_gpu_memory_ratio": 0.9
+    }
+  },
+  "verified": true
+}

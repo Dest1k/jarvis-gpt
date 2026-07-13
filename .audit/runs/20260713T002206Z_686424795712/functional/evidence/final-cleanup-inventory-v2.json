@@ -1,0 +1,110 @@
+{
+  "recorded_at": "2026-07-13T19:00:37.459874+00:00",
+  "profile": "gemma4-turbo",
+  "note": "authoritative final offline inventory with all four ports and candidate processes",
+  "backend_health": {
+    "ok": false,
+    "status": null,
+    "elapsed_ms": 2029.38,
+    "error": "URLError: <urlopen error [WinError 10061] Подключение не установлено, т.к. конечный компьютер отверг запрос на подключение>"
+  },
+  "backend_status": {
+    "ok": false,
+    "status": null,
+    "elapsed_ms": 2041.39,
+    "error": "URLError: <urlopen error [WinError 10061] Подключение не установлено, т.к. конечный компьютер отверг запрос на подключение>"
+  },
+  "model_health": {
+    "ok": false,
+    "status": null,
+    "elapsed_ms": 2053.24,
+    "error": "URLError: <urlopen error [WinError 10061] Подключение не установлено, т.к. конечный компьютер отверг запрос на подключение>"
+  },
+  "model_catalog": {
+    "ok": false,
+    "status": null,
+    "elapsed_ms": 2028.87,
+    "error": "URLError: <urlopen error [WinError 10061] Подключение не установлено, т.к. конечный компьютер отверг запрос на подключение>"
+  },
+  "docker_ps": {
+    "arguments": [
+      "docker",
+      "ps",
+      "--filter",
+      "name=jarvis-gpt-dispatcher",
+      "--format",
+      "{{json .}}"
+    ],
+    "returncode": 0,
+    "elapsed_ms": 45.54,
+    "stdout": "",
+    "stderr": ""
+  },
+  "docker_inspect": {
+    "arguments": [
+      "docker",
+      "inspect",
+      "jarvis-gpt-dispatcher"
+    ],
+    "returncode": 1,
+    "elapsed_ms": 47.46,
+    "stdout": "[]\n",
+    "stderr": "error: no such object: jarvis-gpt-dispatcher\n"
+  },
+  "docker_stats": {
+    "arguments": [
+      "docker",
+      "stats",
+      "--no-stream",
+      "--format",
+      "{{json .}}",
+      "jarvis-gpt-dispatcher"
+    ],
+    "returncode": 1,
+    "elapsed_ms": 35.42,
+    "stdout": "",
+    "stderr": "Error response from daemon: No such container: jarvis-gpt-dispatcher\n"
+  },
+  "docker_logs_tail": {
+    "arguments": [
+      "docker",
+      "logs",
+      "--tail",
+      "250",
+      "jarvis-gpt-dispatcher"
+    ],
+    "returncode": 1,
+    "elapsed_ms": 37.08,
+    "stdout": "",
+    "stderr": "Error response from daemon: No such container: jarvis-gpt-dispatcher\n"
+  },
+  "nvidia_smi": {
+    "arguments": [
+      "nvidia-smi",
+      "--query-gpu=utilization.gpu,memory.used,memory.free,temperature.gpu,power.draw",
+      "--format=csv,noheader"
+    ],
+    "returncode": 0,
+    "elapsed_ms": 39.88,
+    "stdout": "9 %, 674 MiB, 31513 MiB, 41, 59.41 W\n",
+    "stderr": ""
+  },
+  "ports": {
+    "3000": false,
+    "8000": false,
+    "8001": false,
+    "8765": false
+  },
+  "candidate_processes": {
+    "arguments": [
+      "powershell.exe",
+      "-NoProfile",
+      "-Command",
+      "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*jarvis-gpt*' -or $_.CommandLine -like '*audit-functional*' } | Select-Object ProcessId,ParentProcessId,Name,CommandLine | ConvertTo-Json -Depth 3"
+    ],
+    "returncode": 0,
+    "elapsed_ms": 312.87,
+    "stdout": "{\n    \"ProcessId\":  31228,\n    \"ParentProcessId\":  21704,\n    \"Name\":  \"powershell.exe\",\n    \"CommandLine\":  \"powershell.exe -NoProfile -Command \\\"Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like \\u0027*jarvis-gpt*\\u0027 -or $_.CommandLine -like \\u0027*audit-functional*\\u0027 } | Select-Object ProcessId,ParentProcessId,Name,CommandLine | ConvertTo-Json -Depth 3\\\"\"\n}\n",
+    "stderr": ""
+  }
+}

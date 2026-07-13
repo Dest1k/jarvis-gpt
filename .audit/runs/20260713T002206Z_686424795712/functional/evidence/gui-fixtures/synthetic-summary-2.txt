@@ -1,0 +1,4 @@
+Project Aurora
+Owner: Elena
+Decision: proceed with pilot
+summary_marker=SUMMARY-2

@@ -1,0 +1,21 @@
+{
+  "schema": "jarvis.functional-launcher-action.v1",
+  "started_at": "2026-07-13T18:43:01.089518+00:00",
+  "finished_at": "2026-07-13T18:43:02.527198+00:00",
+  "elapsed_ms": 1437.11,
+  "command": [
+    "D:\\jarvis-gpt\\jarvis.cmd",
+    "status",
+    "-Profile",
+    "gemma4-turbo",
+    "-HomePath",
+    "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712",
+    "-ModelRoot",
+    "D:\\jarvis\\data\\models"
+  ],
+  "timeout_sec": 60,
+  "timed_out": false,
+  "returncode": 0,
+  "stdout": "+--------------------------------------------------------------+\n|                            JARVIS                            |\n+--------------------------------------------------------------+\n| Repo:    D:\\jarvis-gpt\n| Home:    D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\n| Profile: gemma4-turbo\n+--------------------------------------------------------------+\n\n+----------------+----------+-------------+----------------------------+\n| Service        | State    | Process     | URL                        |\n+----------------+----------+-------------+----------------------------+\n| Backend        | online   | pid 10496   | http://127.0.0.1:8000      |\n| Frontend       | online   | pid 8728    | http://127.0.0.1:3000      |\n| Host bridge    | online   | pid 31352   | http://127.0.0.1:8765      |\n| Dispatcher     | online   | docker/host | http://127.0.0.1:8001/v1   |\n+----------------+----------+-------------+----------------------------+\n\n+--------------------------------------------------------------+\n|                         LLM READINESS                        |\n+--------------------------------------------------------------+\n| State:   READY      Phase: ready                        At: 21:43:02\n| Profile: gemma4-turbo       Endpoint: http://127.0.0.1:8001/v1\n| Runtime: gemma4-26b-a4b-nvfp4         Mode: cuda-graph  Ctx: 32768\n| vLLM:    gpu-util 0.82   kv fp8   seqs 16\n| Docker:  running    Container: Up 13 minutes (healthy)\n| Port:    True       /health: True     /v1/models: True\n| Served:  dispatcher\n+--------------------------------------------------------------+\nRecent dispatcher load signals:\n  (EngineCore pid=137) 2026-07-13 18:31:34,011 - INFO - autotuner.py:622 - flashinfer.jit: [Autotuner]: Autotuning process starts ...\n\nState file: D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\state\\launcher-state.json\nLogs:       D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\logs\\jarvis-gpt\n",
+  "stderr": ""
+}

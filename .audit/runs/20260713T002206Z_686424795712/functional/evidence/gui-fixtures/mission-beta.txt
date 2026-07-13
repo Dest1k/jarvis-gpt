@@ -1,0 +1,4 @@
+service=api
+port=8100
+mode=standby
+marker=MISSION-B

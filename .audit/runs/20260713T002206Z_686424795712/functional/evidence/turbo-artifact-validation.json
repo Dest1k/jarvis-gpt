@@ -1,0 +1,79 @@
+{
+  "schema": "jarvis.functional.turbo-artifact-validation.v1",
+  "generated_at": "2026-07-13T17:28:43.191Z",
+  "campaign_id": "20260713T002206Z_686424795712",
+  "profile": "gemma4-turbo",
+  "scope": ["OP-0013", "OP-0029", "OP-0030", "OP-0031", "OP-0034"],
+  "overall_verdict": "FAIL",
+  "evidence": {
+    "operator_catalog": ".audit/runs/20260713T002206Z_686424795712/functional/OPERATOR_TASK_CATALOG.csv",
+    "gui_jsonl": ".audit/runs/20260713T002206Z_686424795712/functional/evidence/gui_operator_runs.jsonl",
+    "gui_records": "78-91",
+    "fixture_manifest": ".audit/runs/20260713T002206Z_686424795712/functional/evidence/gui-fixtures/fixtures-manifest.json",
+    "isolated_root": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt"
+  },
+  "namespace_inventory": {
+    "in_scope_output_count": 9,
+    "unique_names": true,
+    "unique_sha256": true,
+    "unaccounted_in_scope_outputs": []
+  },
+  "source_integrity": [
+    {"name": "1ab717580ce8_source-copy-1.docx", "sha256": "1ab717580ce8fdbfbe5a3e080d06bd3a5b7d90d8fc44c08a0da56021f3becef7", "matches_manifest": true},
+    {"name": "59fd5e4ef4c8_source-copy-2.docx", "sha256": "59fd5e4ef4c8f5207530920700d04cc0b6d174c35832e4416bfd3a3f1c03a7aa", "matches_manifest": true},
+    {"name": "eeb9f5e6cb9f_source-copy-3.docx", "sha256": "eeb9f5e6cb9fe173c22fa372bd00803323ebd55182cf0e8ee74d57d9981def67", "matches_manifest": true},
+    {"name": "5525442d9707_convert-1.md", "sha256": "5525442d9707fb4d3db88fab5ca35cf12e3dfe20baa40a34fb6925a30132338e", "matches_manifest": true},
+    {"name": "d84608bbcc89_convert-2.md", "sha256": "d84608bbcc898a657fc14e173ee8d8dd5cf66072eb4e46730c60c3a344f0017c", "matches_manifest": true}
+  ],
+  "operations": {
+    "OP-0013": {
+      "verdict": "FAIL",
+      "reason": "All exact requested paths are missing; files were emitted in the parent directory with non-exact generator wrapper content.",
+      "repeats": [
+        {"repeat": 1, "requested_path_exists": false, "actual_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\document-outputs\\OP-0013-1.md", "sha256": "97642043c8506ddb73111a5ec0f321ef90d98a0fa5ee87ac9e29e60e5642a21a", "strict_utf8": true, "heading_present": true, "marker_present": true, "exact_body": false, "verdict": "FAIL"},
+        {"repeat": 2, "requested_path_exists": false, "actual_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\document-outputs\\OP-0013-2.md", "sha256": "dceb72468234215cf1d12be290961cb51df6e52468ce8a10264013a64ae8f3cb", "strict_utf8": true, "heading_present": true, "marker_present": true, "exact_body": false, "verdict": "FAIL"},
+        {"repeat": 3, "requested_path_exists": false, "actual_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\document-outputs\\OP-0013-3.md", "sha256": "4b9756bfdf5dc6f6779d2fd7b3af91fa8d37dd6cf6f1aa9c92e3a6d17feff1ad", "strict_utf8": true, "heading_present": true, "marker_present": true, "exact_body": false, "gui_path_claim_matches": false, "verdict": "FAIL"}
+      ]
+    },
+    "OP-0029": {
+      "verdict": "FAIL",
+      "repeats": [
+        {"repeat": 1, "path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\document-outputs\\functional-report-1.md", "exists": true, "sha256": "fe39246d8a8d8ea814a3fc1fbfd7876121723ab67cea2b8d472a2f61736f0d27", "strict_utf8": true, "heading_present": true, "marker_present": true, "exact_body": false, "verdict": "FAIL"},
+        {"repeat": 2, "expected_name": "functional-report-2.md", "exists": false, "gui_final_exposes_tool_call": true, "verdict": "FAIL"},
+        {"repeat": 3, "expected_name": "functional-report-3.md", "exists": false, "gui_final_exposes_tool_call": true, "verdict": "FAIL"}
+      ]
+    },
+    "OP-0030": {
+      "verdict": "FAIL",
+      "repeats": [
+        {"repeat": 1, "output_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\document-outputs\\source-copy-1_STATUS_NEW.docx", "exists": true, "sha256": "9193651c4ce38e4d160cf62199c90717fe2df513ba79f0fc7ea2c8a41d461993", "zip_valid": true, "zip_entry_count": 17, "duplicate_zip_members": 0, "required_members_present": true, "xml_parse_errors": 0, "status_old_count": 0, "status_new_count": 1, "exact_single_xml_replacement": true, "changed_zip_members": ["word/document.xml"], "source_unchanged": true, "verdict": "PASS"},
+        {"repeat": 2, "expected_name": "source-copy-2_STATUS_NEW.docx", "exists": false, "source_unchanged": true, "gui_final_exposes_tool_call": true, "verdict": "FAIL"},
+        {"repeat": 3, "expected_name": "source-copy-3_STATUS_NEW.docx", "exists": false, "source_unchanged": true, "gui_final_exposes_tool_call": true, "verdict": "FAIL"}
+      ]
+    },
+    "OP-0031": {
+      "verdict": "FAIL",
+      "repeats": [
+        {"repeat": 1, "output_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\document-outputs\\convert-1.docx", "exists": true, "sha256": "336399edcdbe051ab75cb0815ef5448228cc4f65a8eea92440369e37422dc4cf", "zip_valid": true, "zip_entry_count": 4, "duplicate_zip_members": 0, "required_members_present": true, "xml_parse_errors": 0, "source_unchanged": true, "source_heading_text_present": true, "word_heading_style_preserved": false, "word_table_count": 0, "markdown_table_left_as_literal_text": true, "verdict": "FAIL"},
+        {"repeat": 2, "output_path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\document-outputs\\d84608bbcc89_convert-2.md.docx", "exists": true, "sha256": "f9ffdece3db3d376aeb23ffac3bac80589e196d21ce6e531f43b8d6c1f9908f0", "zip_valid": true, "zip_entry_count": 4, "duplicate_zip_members": 0, "required_members_present": true, "xml_parse_errors": 0, "source_unchanged": true, "source_heading_text_present": true, "word_heading_style_preserved": false, "word_table_count": 0, "markdown_table_left_as_literal_text": true, "verdict": "FAIL"}
+      ]
+    },
+    "OP-0034": {
+      "verdict": "FAIL",
+      "repeats": [
+        {"repeat": 1, "concurrent_started": true, "artifacts": [{"window": "A", "path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\document-outputs\\report.md", "sha256": "ee8a9c72c4f61c3bb637d903a32e319989023436b7098df6dca8fb13c8e2d6c0", "marker": "OP-0034-A-1"}, {"window": "B", "path": "D:\\jarvis\\audit-functional\\20260713T002206Z_686424795712\\data\\jarvis-gpt\\document-outputs\\report.20260713170348.md", "sha256": "44ff884ac651cca40e49aa223c18e29cbf55db2c5921a5f509414f8a709c39c3", "marker": "OP-0034-B-1"}], "unique_paths": true, "unique_hashes": true, "marker_mix": false, "overwrite_detected": false, "verdict": "PASS"},
+        {"repeat": 2, "concurrent_started": true, "artifact_count": 0, "expected_artifact_count": 2, "verdict": "FAIL"},
+        {"repeat": 3, "concurrent_started": true, "artifact_count": 0, "expected_artifact_count": 2, "verdict": "FAIL"}
+      ]
+    }
+  },
+  "docx_visual_qa": {
+    "status": "BLOCKED",
+    "attempted_outputs": ["source-copy-1_STATUS_NEW.docx", "convert-1.docx", "d84608bbcc89_convert-2.md.docx"],
+    "renderer": "render_docx.py with bundled Python 3.12.13",
+    "error": "FileNotFoundError: [WinError 2] while launching soffice",
+    "png_count": 0,
+    "impact": "ZIP/XML and semantic tree checks completed; visual layout is not independently certified."
+  },
+  "artifacts_modified_by_validator": false
+}
