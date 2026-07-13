@@ -2,24 +2,36 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
-from collections.abc import Iterable, Mapping
-from dataclasses import asdict
+from collections import Counter
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import asdict, dataclass
+from dataclasses import field as dataclass_field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from .models import CampaignIdentity, CampaignSummary, CaseResult, Scenario, Verdict
-from .redaction import credential_like_paths, redact_value
+from .output import safe_json_bytes, sanitize_output, write_json_exclusive
+from .redaction import credential_like_paths
 from .safe_paths import (
+    MAX_CONFIGURABLE_FILE_BYTES,
+    SafePathError,
+    bounded_file_bytes,
     canonical_directory,
     safe_output_path,
     validate_campaign_identifier,
     validate_case_id,
 )
+from .trusted_anchors import trusted_manifest_sha256
 
 EVIDENCE_SCHEMA = "jarvis.qa.evidence.v1"
+MANIFEST_SCHEMA = "jarvis.qa.campaign-manifest.v2"
+_ZERO_DIGEST = "0" * 64
+_SHA256_LENGTH = 64
+_EVIDENCE_VERIFICATION_TOKEN = object()
 EVIDENCE_REQUIRED_FIELDS = frozenset(
     {
         "schema",
@@ -54,6 +66,160 @@ CLASSIFICATION_REPLAY_VERDICTS = frozenset(
         Verdict.ERROR,
     }
 )
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceIntegrity:
+    evidence_path: Path
+    manifest_path: Path
+    evidence_sha256: str
+    manifest_sha256: str
+    evidence_size: int
+    record_sha256s: tuple[str, ...]
+    record_canonical_sha256s: tuple[str, ...]
+    terminal_chain_sha256: str
+    _verification_token: object | None = dataclass_field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+
+    @property
+    def provenance_verified(self) -> bool:
+        return self._verification_token is _EVIDENCE_VERIFICATION_TOKEN
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceAnchor:
+    evidence_sha256: str
+    manifest_sha256: str
+
+
+def evidence_manifest_path(evidence_path: Path) -> Path:
+    return evidence_path.with_suffix(".manifest.json")
+
+
+def _strict_json_loads(payload: str, *, label: str) -> Any:
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        document: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in document:
+                raise ValueError("duplicate JSON object key")
+            document[key] = value
+        return document
+
+    try:
+        return json.loads(
+            payload,
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                ValueError(f"non-finite JSON constant {value}")
+            ),
+        )
+    except (json.JSONDecodeError, ValueError) as exc:
+        detail = exc.msg if isinstance(exc, json.JSONDecodeError) else str(exc)
+        raise ValueError(f"{label}: invalid JSON: {detail}") from exc
+
+
+def _raw_lines(payload: bytes, *, label: str) -> list[bytes]:
+    if not payload:
+        raise ValueError(f"{label}: evidence is empty")
+    if not payload.endswith(b"\n"):
+        raise ValueError(f"{label}: evidence must end with a newline")
+    lines = payload.splitlines(keepends=True)
+    if not lines or any(not line.strip() for line in lines):
+        raise ValueError(f"{label}: blank JSONL record")
+    return lines
+
+
+def _parse_evidence_bytes(
+    payload: bytes, *, label: str
+) -> tuple[list[dict[str, Any]], list[bytes]]:
+    lines = _raw_lines(payload, label=label)
+    records: list[dict[str, Any]] = []
+    for line_number, raw_line in enumerate(lines, start=1):
+        try:
+            text = raw_line.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"{label}:{line_number}: invalid UTF-8") from exc
+        record = _strict_json_loads(text, label=f"{label}:{line_number}")
+        if not isinstance(record, dict):
+            raise ValueError(f"{label}:{line_number}: record must be an object")
+        records.append(record)
+    return records, lines
+
+
+def _record_sha256s(lines: Sequence[bytes]) -> tuple[str, ...]:
+    return tuple(hashlib.sha256(line).hexdigest() for line in lines)
+
+
+def canonical_record_sha256(record: Mapping[str, Any]) -> str:
+    payload = json.dumps(
+        record,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _terminal_chain(record_digests: Sequence[str]) -> str:
+    chain = _ZERO_DIGEST
+    for digest in record_digests:
+        chain = hashlib.sha256(bytes.fromhex(chain) + bytes.fromhex(digest)).hexdigest()
+    return chain
+
+
+def _record_counts(records: Sequence[Mapping[str, Any]]) -> dict[str, int]:
+    counter = Counter(record.get("verdict") for record in records)
+    return {verdict.value: counter.get(verdict.value, 0) for verdict in Verdict}
+
+
+def _record_exit_code(records: Sequence[Mapping[str, Any]]) -> int:
+    if not records or any(record.get("verdict") == Verdict.ERROR.value for record in records):
+        return 3
+    if any(record.get("verdict") == Verdict.FAIL.value for record in records):
+        return 1
+    incomplete = {
+        Verdict.INCONCLUSIVE.value,
+        Verdict.BLOCKED_BY_ENV.value,
+        Verdict.BLOCKED_BY_SPEC.value,
+        Verdict.SKIP.value,
+    }
+    if any(
+        record.get("required") is True and record.get("verdict") in incomplete
+        for record in records
+    ):
+        return 2
+    return 0
+
+
+def _manifest_document(
+    records: Sequence[Mapping[str, Any]],
+    evidence_name: str,
+    evidence_bytes: bytes,
+    lines: Sequence[bytes],
+) -> dict[str, Any]:
+    record_digests = _record_sha256s(lines)
+    return {
+        "schema": MANIFEST_SCHEMA,
+        "campaign_id": records[0]["campaign_id"],
+        "namespace": records[0]["namespace"],
+        "evidence_file": evidence_name,
+        "evidence_sha256": hashlib.sha256(evidence_bytes).hexdigest(),
+        "evidence_size": len(evidence_bytes),
+        "record_count": len(records),
+        "case_ids": [record["case_id"] for record in records],
+        "record_sha256s": list(record_digests),
+        "record_canonical_sha256s": [
+            canonical_record_sha256(record) for record in records
+        ],
+        "terminal_chain_sha256": _terminal_chain(record_digests),
+        "counts": _record_counts(records),
+        "exit_code": _record_exit_code(records),
+    }
 
 
 def _replay_contract(result: CaseResult) -> dict[str, Any]:
@@ -133,23 +299,8 @@ def validate_replay_contract(record: Mapping[str, Any], verdict: Verdict) -> lis
     return errors
 
 
-def _bound_sanitized(value: Any, depth: int = 0) -> Any:
-    if depth >= 10:
-        return "[MAX_DEPTH]"
-    if isinstance(value, str):
-        return value if len(value) <= 20_000 else value[:20_000] + "[TRUNCATED]"
-    if isinstance(value, Mapping):
-        return {
-            str(key): _bound_sanitized(item, depth + 1)
-            for key, item in list(value.items())[:200]
-        }
-    if isinstance(value, list | tuple):
-        return [_bound_sanitized(item, depth + 1) for item in value[:200]]
-    return value
-
-
 class EvidenceStore:
-    """A campaign-owned JSONL file created once and only appended thereafter."""
+    """A campaign-owned JSONL file finalized once with a raw-byte manifest."""
 
     def __init__(
         self,
@@ -167,10 +318,21 @@ class EvidenceStore:
         self.manifest_path = safe_output_path(
             self.output_root, f"{identity.campaign_id}.manifest.json"
         )
-        with self.path.open("x", encoding="utf-8", newline="\n"):
-            pass
+        self._handle = self.path.open("x+b")
+        self._finalized = False
+        self._case_ids: set[str] = set()
+        self._written_size = 0
+        self._written_sha256 = hashlib.sha256()
+        self._written_record_sha256s: list[str] = []
+        self.anchor: EvidenceAnchor | None = None
 
     def append(self, scenario: Scenario, result: CaseResult) -> dict[str, Any]:
+        if self._finalized or self._handle.closed:
+            raise RuntimeError("evidence store is finalized")
+        if scenario.scenario_id != result.case_id:
+            raise ValueError("scenario and result case identifiers differ")
+        if result.case_id in self._case_ids:
+            raise ValueError("duplicate evidence case identifier")
         record: dict[str, Any] = {
             "schema": EVIDENCE_SCHEMA,
             "campaign_id": self.identity.campaign_id,
@@ -191,53 +353,205 @@ class EvidenceStore:
             "error": result.error,
             "observed_at_utc": result.observed_at_utc,
         }
-        sanitized = redact_value(record, self.canaries)
-        persisted = dict(_bound_sanitized(sanitized.value))
+        sanitized = sanitize_output(record, canaries=self.canaries)
+        persisted = dict(sanitized.value)
         persisted["redaction_event_count"] = len(sanitized.events)
-        line = json.dumps(persisted, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        with self.path.open("a", encoding="utf-8", newline="\n") as handle:
-            handle.write(line + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+        record_errors = validate_evidence_records([persisted])
+        if record_errors:
+            raise ValueError(f"refusing invalid evidence record: {'; '.join(record_errors)}")
+        line = safe_json_bytes(
+            persisted,
+            canaries=self.canaries,
+            separators=(",", ":"),
+            append_newline=True,
+        )
+        self._handle.seek(0, os.SEEK_END)
+        self._handle.write(line)
+        self._handle.flush()
+        os.fsync(self._handle.fileno())
+        self._written_size += len(line)
+        self._written_sha256.update(line)
+        self._written_record_sha256s.append(hashlib.sha256(line).hexdigest())
+        self._case_ids.add(result.case_id)
         return persisted
 
-    def write_manifest(self, summary: CampaignSummary) -> None:
-        document = {
-            "schema": "jarvis.qa.campaign-manifest.v1",
-            "campaign_id": summary.identity.campaign_id,
-            "namespace": summary.identity.namespace,
-            "evidence_file": self.path.name,
-            "counts": summary.counts,
-            "exit_code": summary.exit_code,
-        }
-        sanitized = redact_value(document, self.canaries)
-        with self.manifest_path.open("x", encoding="utf-8", newline="\n") as handle:
-            json.dump(sanitized.value, handle, ensure_ascii=False, indent=2, sort_keys=True)
-            handle.write("\n")
+    def write_manifest(self, summary: CampaignSummary) -> EvidenceAnchor:
+        if self._finalized or self._handle.closed:
+            raise RuntimeError("evidence store is finalized")
+        self._handle.flush()
+        os.fsync(self._handle.fileno())
+        self._handle.seek(0)
+        evidence_bytes = self._handle.read()
+        records, lines = _parse_evidence_bytes(evidence_bytes, label=str(self.path))
+        if (
+            len(evidence_bytes) != self._written_size
+            or hashlib.sha256(evidence_bytes).digest()
+            != self._written_sha256.digest()
+            or _record_sha256s(lines) != tuple(self._written_record_sha256s)
+        ):
+            raise ValueError("persisted evidence changed after append")
+        validation_errors = validate_evidence_records(records)
+        if validation_errors:
+            raise ValueError(f"cannot finalize invalid evidence: {'; '.join(validation_errors)}")
+        if summary.identity != self.identity:
+            raise ValueError("campaign summary identity mismatch")
+        if summary.counts != _record_counts(records) or summary.exit_code != _record_exit_code(
+            records
+        ):
+            raise ValueError("campaign summary does not match persisted evidence")
+        if [result.case_id for result in summary.results] != [
+            record["case_id"] for record in records
+        ]:
+            raise ValueError("campaign summary order does not match persisted evidence")
+        document = _manifest_document(records, self.path.name, evidence_bytes, lines)
+        manifest_bytes = write_json_exclusive(
+            self.manifest_path,
+            document,
+            canaries=self.canaries,
+        )
+        self._finalized = True
+        self._handle.close()
+        self.anchor = EvidenceAnchor(
+            evidence_sha256=document["evidence_sha256"],
+            manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+        )
+        return self.anchor
+
+    def close(self) -> None:
+        if not self._handle.closed:
+            self._handle.close()
 
 
 def load_evidence(path: Path) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    with path.open(encoding="utf-8") as handle:
-        for line_number, line in enumerate(handle, start=1):
-            if not line.strip():
-                raise ValueError(f"{path}:{line_number}: blank JSONL record")
-            try:
-                record = json.loads(
-                    line,
-                    parse_constant=lambda value: (_ for _ in ()).throw(
-                        ValueError(f"non-finite JSON constant {value}")
-                    ),
-                )
-            except (json.JSONDecodeError, ValueError) as exc:
-                detail = exc.msg if isinstance(exc, json.JSONDecodeError) else str(exc)
-                raise ValueError(f"{path}:{line_number}: invalid JSON: {detail}") from exc
-            if not isinstance(record, dict):
-                raise ValueError(f"{path}:{line_number}: record must be an object")
-            records.append(record)
-    if not records:
-        raise ValueError(f"{path}: evidence is empty")
+    root = canonical_directory(path.parent)
+    payload = bounded_file_bytes(
+        root,
+        path.name,
+        max_bytes=MAX_CONFIGURABLE_FILE_BYTES,
+    )
+    records, _ = _parse_evidence_bytes(payload, label=str(path))
     return records
+
+
+def _manifest_errors(
+    manifest: Mapping[str, Any],
+    expected: Mapping[str, Any],
+) -> list[str]:
+    fields = set(expected)
+    errors: list[str] = []
+    missing = sorted(fields - set(manifest))
+    unexpected = sorted(set(manifest) - fields)
+    if missing:
+        errors.append(f"manifest missing fields: {', '.join(missing)}")
+    if unexpected:
+        errors.append(f"manifest unexpected fields: {', '.join(unexpected)}")
+    if missing or unexpected:
+        return errors
+    for field in (
+        "schema",
+        "campaign_id",
+        "namespace",
+        "evidence_file",
+        "evidence_sha256",
+        "terminal_chain_sha256",
+    ):
+        if not isinstance(manifest.get(field), str):
+            errors.append(f"manifest {field} must be a string")
+    for field in ("evidence_size", "record_count", "exit_code"):
+        value = manifest.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            errors.append(f"manifest {field} must be a non-negative integer")
+    for field in ("case_ids", "record_sha256s", "record_canonical_sha256s"):
+        value = manifest.get(field)
+        if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+            errors.append(f"manifest {field} must be a string array")
+    counts = manifest.get("counts")
+    expected_count_fields = {verdict.value for verdict in Verdict}
+    if not isinstance(counts, Mapping) or set(counts) != expected_count_fields or any(
+        not isinstance(value, int) or isinstance(value, bool) or value < 0
+        for value in counts.values()
+    ):
+        errors.append("manifest counts must contain exact non-negative verdict counts")
+    for field, expected_value in expected.items():
+        if manifest.get(field) != expected_value:
+            errors.append(f"manifest {field} mismatch")
+    return errors
+
+
+def verify_evidence_bundle(
+    path: Path,
+    *,
+    expected_manifest_sha256: str | None = None,
+) -> tuple[list[dict[str, Any]], list[str], EvidenceIntegrity | None]:
+    root = canonical_directory(path.parent)
+    evidence_bytes = bounded_file_bytes(
+        root,
+        path.name,
+        max_bytes=MAX_CONFIGURABLE_FILE_BYTES,
+    )
+    records, lines = _parse_evidence_bytes(evidence_bytes, label=str(path))
+    errors = validate_evidence_records(records)
+    if errors:
+        return records, errors, None
+    expected_manifest = _manifest_document(records, path.name, evidence_bytes, lines)
+    manifest_path = evidence_manifest_path(path)
+    try:
+        manifest_bytes = bounded_file_bytes(
+            root,
+            manifest_path.name,
+            max_bytes=MAX_CONFIGURABLE_FILE_BYTES,
+        )
+    except (SafePathError, ValueError) as exc:
+        errors.append(f"manifest unavailable: {getattr(exc, 'code', type(exc).__name__)}")
+        return records, errors, None
+    try:
+        manifest_text = manifest_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        errors.append("manifest is not valid UTF-8")
+        return records, errors, None
+    try:
+        manifest = _strict_json_loads(manifest_text, label=str(manifest_path))
+    except ValueError as exc:
+        errors.append(str(exc))
+        return records, errors, None
+    if not isinstance(manifest, Mapping):
+        errors.append("manifest must be an object")
+        return records, errors, None
+    errors.extend(_manifest_errors(manifest, expected_manifest))
+    manifest_digest = hashlib.sha256(manifest_bytes).hexdigest()
+    trusted_digest = expected_manifest_sha256
+    if trusted_digest is None:
+        trusted_digest = trusted_manifest_sha256(path)
+    if trusted_digest is None:
+        errors.append("trusted manifest SHA-256 anchor is required")
+    elif (
+        not isinstance(trusted_digest, str)
+        or len(trusted_digest) != 64
+        or any(character not in "0123456789abcdef" for character in trusted_digest)
+    ):
+        errors.append("trusted manifest SHA-256 anchor is invalid")
+    elif manifest_digest != trusted_digest:
+        errors.append("trusted manifest SHA-256 anchor mismatch")
+    if errors:
+        return records, errors, None
+    integrity = EvidenceIntegrity(
+        evidence_path=path.resolve(),
+        manifest_path=manifest_path.resolve(),
+        evidence_sha256=expected_manifest["evidence_sha256"],
+        manifest_sha256=manifest_digest,
+        evidence_size=expected_manifest["evidence_size"],
+        record_sha256s=tuple(expected_manifest["record_sha256s"]),
+        record_canonical_sha256s=tuple(
+            expected_manifest["record_canonical_sha256s"]
+        ),
+        terminal_chain_sha256=expected_manifest["terminal_chain_sha256"],
+    )
+    object.__setattr__(
+        integrity,
+        "_verification_token",
+        _EVIDENCE_VERIFICATION_TOKEN,
+    )
+    return records, [], integrity
 
 
 def validate_evidence_records(records: list[Mapping[str, Any]]) -> list[str]:
@@ -388,9 +702,16 @@ def validate_evidence_records(records: list[Mapping[str, Any]]) -> list[str]:
     return errors
 
 
-def validate_evidence_file(path: Path) -> tuple[list[dict[str, Any]], list[str]]:
-    records = load_evidence(path)
-    return records, validate_evidence_records(records)
+def validate_evidence_file(
+    path: Path,
+    *,
+    expected_manifest_sha256: str | None = None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    records, errors, _ = verify_evidence_bundle(
+        path,
+        expected_manifest_sha256=expected_manifest_sha256,
+    )
+    return records, errors
 
 
 def result_record(result: CaseResult) -> dict[str, Any]:

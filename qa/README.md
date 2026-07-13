@@ -23,9 +23,26 @@ The three source identities are intentionally separate:
 - Every campaign receives a timestamp-and-random campaign ID and a separate
   namespace.
 - Evidence files and manifests use exclusive-create. JSONL is flushed and
-  synced after every case; old runs are never overwritten.
-- Recursive key, text, bearer, and disposable-canary redaction runs before
-  bounded evidence is serialized.
+  synced after every case, then finalized once. The manifest binds the exact
+  evidence bytes, size, ordered raw-line digests, terminal chain digest,
+  verdict counts, and campaign exit code. The store tracks those bytes as they
+  are appended and refuses to finalize if the open file changed; the returned
+  manifest anchor hashes the exact bytes supplied to the exclusive writer.
+- Evidence validation requires the paired manifest plus a manifest SHA-256
+  retained out of band when the bundle is finalized. Replay independently
+  recomputes both raw-file digests and its own deterministic digest. Review
+  packets can be built only from a fresh verified replay and carry the record,
+  evidence, manifest, and replay SHA-256 bindings. The committed calibration
+  fixture is the only bundle with a repository-reviewed built-in anchor.
+  Deserialized integrity/replay fields are structural claims only; packet
+  creation reopens the anchored evidence and performs a new deterministic
+  replay before it accepts them. Deserialized packets and reviews likewise
+  remain unverified until adjudication re-derives the complete immutable packet
+  from anchored evidence; a matching replay digest alone grants no provenance.
+- One output boundary recursively redacts credential-bearing keys and text,
+  private/session/cookie/OAuth/JWT/password/connection material, and explicit
+  disposable canaries before bounding and strict serialization. A post-scan
+  fails closed before a file is created if any material remains.
 - A `PASS` needs at least one factual assertion. A deterministic failure cannot
   be promoted by semantic review.
 - Scenario and validator control objects reject unknown fields and wrong types;
@@ -49,14 +66,23 @@ Run from the repository root with the existing Python 3.11 environment:
 py -3.11 -m qa.cli validate-suite qa\suites\operator_core
 py -3.11 -m qa.cli validate-evidence qa\tests\fixtures\calibration_evidence.jsonl
 py -3.11 -m qa.cli replay qa\tests\fixtures\calibration_evidence.jsonl
-py -3.11 -m qa.cli build-review-packets <evidence.jsonl> --output-dir <new-directory>
-py -3.11 -m qa.cli adjudicate <review-1.json> <review-2.json> --output <new-file.json>
+py -3.11 -m qa.cli validate-evidence <evidence.jsonl> --expected-manifest-sha256 <retained-sha256>
+py -3.11 -m qa.cli replay <evidence.jsonl> --expected-manifest-sha256 <retained-sha256>
+py -3.11 -m qa.cli build-review-packets <evidence.jsonl> --expected-manifest-sha256 <retained-sha256> --output-dir <new-directory>
+py -3.11 -m qa.cli adjudicate <review-1.json> <review-2.json> --replay <replay.json> --evidence <evidence.jsonl> --expected-manifest-sha256 <retained-sha256> --output <new-file.json>
 py -3.11 -m qa.cli run-suite <suite-directory> --output-root <new-directory>
 ```
 
 `run-suite` accepts `--base-url` only for loopback scenarios. Without it, HTTP
 cases return `BLOCKED_BY_ENV`; offline cases remain usable. Review packet,
-review result, adjudication, evidence, and manifest writers refuse overwrite.
+review result, adjudication, replay-report, evidence, and manifest writers
+refuse overwrite. `run-suite` emits `manifest_sha256`; retain that value
+separately before the evidence bundle enters untrusted storage or transport.
+Recomputing the anchor from a manifest presented alongside evidence does not
+establish trust and cannot detect paired substitution. `adjudicate` reopens
+that anchored evidence, performs a fresh replay, and requires every persisted
+packet field—including request, output, and bounded evidence—to equal the
+newly derived packet before either review can influence a verdict.
 
 Runner exit codes are:
 
@@ -75,22 +101,27 @@ typed runner classifications validate and preserve `BLOCKED_BY_ENV`,
 `adjudicate` returns `0`, `1`, or `2` for `PASS`, `FAIL`, or `INCONCLUSIVE`
 respectively.
 
+SHA-256 binding detects mutation and substitution relative to a previously
+trusted anchor; it is integrity evidence, not signer authentication.
+
 ## Layout
 
-- `models.py`, `runner.py`, `evidence.py`, `redaction.py`: campaign execution
-  and append-only evidence.
+- `models.py`, `runner.py`, `evidence.py`, `redaction.py`, `output.py`: campaign
+  execution, content-bound evidence, and the common safe-output boundary.
 - `validators/`: exact format/JSON, response, stream, artifact, identity,
   claimed-state, canary, and exit-result checks.
 - `review/`: immutable packets, explicit independence labels, separate review
   outputs, and fail-closed adjudication.
 - `replay.py`: offline deterministic replay of sanitized JSONL.
 - `upstream/`: offline provenance/adoption gate.
-- `schemas/`: machine-readable scenario, evidence, review, and verdict
-  contracts.
+- `schemas/`: machine-readable scenario, evidence, manifest, replay, review,
+  packet, and verdict contracts.
 - `suites/`: permanent scenario namespaces. The initial committed suite is
   intentionally small; remediation work adds task-specific scenarios here.
 - `tests/fixtures/calibration_evidence.jsonl`: sanitized, offline calibration
   derived from committed campaign findings. It contains no runtime credential.
+- `tests/fixtures/calibration_evidence.manifest.json`: raw-byte integrity
+  binding for that calibration corpus.
 
 ## Validation
 

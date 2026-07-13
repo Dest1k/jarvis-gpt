@@ -260,6 +260,7 @@ class AssuranceRunner:
     def close(self) -> None:
         if self.http_executor is not None:
             self.http_executor.close()
+        self.evidence_store.close()
 
     def _execute(self, scenario: Scenario) -> Mapping[str, Any]:
         if scenario.transport == "offline":

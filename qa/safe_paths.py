@@ -231,12 +231,13 @@ def _opened_file_path(descriptor: int) -> Path | None:
     return None
 
 
-def bounded_file_digest(
+def _bounded_file_read(
     root: str | os.PathLike[str],
     relative: object,
     *,
     max_bytes: int = DEFAULT_MAX_FILE_BYTES,
-) -> BoundedFileDigest:
+    collect: bool,
+) -> tuple[BoundedFileDigest, bytes | None]:
     if (
         not isinstance(max_bytes, int)
         or isinstance(max_bytes, bool)
@@ -264,6 +265,7 @@ def bounded_file_digest(
         ) from exc
     digest = hashlib.sha256()
     consumed = 0
+    chunks: list[bytes] | None = [] if collect else None
     try:
         opened = os.fstat(descriptor)
         if not stat.S_ISREG(opened.st_mode):
@@ -287,6 +289,8 @@ def bounded_file_digest(
             if consumed > max_bytes:
                 raise SafePathError("FILE_TOO_LARGE", "bounded target exceeded the size cap")
             digest.update(block)
+            if chunks is not None:
+                chunks.append(block)
         try:
             opened_path_after = _opened_file_path(descriptor)
             resolved_after = target.resolve(strict=True)
@@ -312,4 +316,30 @@ def bounded_file_digest(
             raise SafePathError("FILE_CHANGED", "bounded target changed during hashing")
     finally:
         os.close(descriptor)
-    return BoundedFileDigest(digest.hexdigest(), consumed)
+    return BoundedFileDigest(digest.hexdigest(), consumed), (
+        b"".join(chunks) if chunks is not None else None
+    )
+
+
+def bounded_file_digest(
+    root: str | os.PathLike[str],
+    relative: object,
+    *,
+    max_bytes: int = DEFAULT_MAX_FILE_BYTES,
+) -> BoundedFileDigest:
+    result, _ = _bounded_file_read(root, relative, max_bytes=max_bytes, collect=False)
+    return result
+
+
+def bounded_file_bytes(
+    root: str | os.PathLike[str],
+    relative: object,
+    *,
+    max_bytes: int = DEFAULT_MAX_FILE_BYTES,
+) -> bytes:
+    """Read bounded regular-file bytes only after verified handle containment."""
+
+    _, content = _bounded_file_read(root, relative, max_bytes=max_bytes, collect=True)
+    if content is None:  # pragma: no cover - internal invariant
+        raise SafePathError("FILE_OPEN_FAILED", "bounded content was not collected")
+    return content

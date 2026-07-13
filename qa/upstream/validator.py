@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 import re
+import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -19,6 +20,8 @@ from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import urlsplit
+
+from ..output import safe_json_text
 
 ORIGIN_KINDS = (
     "internal_human",
@@ -949,11 +952,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         args = _build_parser().parse_args(argv)
         result = validate_candidate_file(args.candidate, evidence_root=args.evidence_root)
-        print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+        sys.stdout.write(
+            safe_json_text(result.to_dict(), indent=2, append_newline=True)
+        )
         return {Verdict.PASS: 0, Verdict.FAIL: 1, Verdict.BLOCKED: 2}[result.verdict]
     except Exception as exc:  # pragma: no cover - defensive CLI boundary
-        print(
-            json.dumps(
+        sys.stdout.write(
+            safe_json_text(
                 {
                     "verdict": "VALIDATOR_ERROR",
                     "issues": [
@@ -966,7 +971,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     ],
                 },
                 indent=2,
-                sort_keys=True,
+                append_newline=True,
             )
         )
         return 3

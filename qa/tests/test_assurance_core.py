@@ -8,15 +8,18 @@ from pathlib import Path
 
 import pytest
 
+import qa.evidence as evidence_module
 import qa.safe_paths as safe_paths
 from qa import _trusted_jarvis_cli
 from qa.evidence import (
     EVIDENCE_ALLOWED_FIELDS,
     EVIDENCE_REQUIRED_FIELDS,
     EvidenceStore,
+    evidence_manifest_path,
     load_evidence,
     validate_evidence_file,
     validate_evidence_records,
+    verify_evidence_bundle,
 )
 from qa.models import (
     EXIT_FAIL,
@@ -30,7 +33,8 @@ from qa.models import (
     Scenario,
     Verdict,
 )
-from qa.redaction import REDACTED, redact_value
+from qa.output import UnsafeOutputError, safe_json_bytes, write_json_exclusive
+from qa.redaction import REDACTED, credential_like_paths, redact_value
 from qa.replay import replay_file
 from qa.runner import (
     AllowlistedCliExecutor,
@@ -47,6 +51,21 @@ from qa.validators.format_contracts import validate_json_schema
 
 ROOT = Path(__file__).resolve().parents[2]
 CALIBRATION = Path(__file__).parent / "fixtures" / "calibration_evidence.jsonl"
+
+
+def copy_calibration_bundle(tmp_path: Path, name: str = "evidence") -> Path:
+    evidence = tmp_path / f"{name}.jsonl"
+    evidence.write_bytes(CALIBRATION.read_bytes())
+    evidence_manifest_path(evidence).write_bytes(
+        evidence_manifest_path(CALIBRATION).read_bytes()
+    )
+    manifest = json.loads(evidence_manifest_path(evidence).read_text(encoding="utf-8"))
+    manifest["evidence_file"] = evidence.name
+    evidence_manifest_path(evidence).write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return evidence
 
 
 def make_scenario(
@@ -254,6 +273,251 @@ def test_recursive_redaction_handles_keys_text_and_dynamic_canary() -> None:
     assert result.events
 
 
+def test_redaction_covers_private_session_cookie_oauth_and_connection_material() -> None:
+    canary = "canary" + "://credential/disposable-b05"
+    private_material = (
+        "-----BEGIN PRIVATE KEY-----\n"
+        "DISPOSABLEQAONLYMATERIAL\n"
+        "-----END PRIVATE KEY-----"
+    )
+    disposable_jwt = "eyJkaXNwb3NhYmxlIjoxfQ.eyJxYSI6dHJ1ZX0.signatureonly"
+    document = {
+        "privateKey": private_material,
+        "refresh_token": "disposable-refresh-value",
+        "session_cookie": "disposable-session-value",
+        "csrfToken": "disposable-csrf-value",
+        "oauth_token": "disposable-oauth-value",
+        "workerToken": "disposable-suffix-token",
+        "proxyAuthorization": "disposable-proxy-auth",
+        "awsSecretAccessKey": "disposable-access-key",
+        "clientAssertion": "disposable-client-assertion",
+        "nested": (
+            {"connection_string": "postgresql://qa:disposable-password@localhost/db"},
+            {
+                "diagnostic": (
+                    f"Cookie: sid=disposable-cookie\nAuthorization: Bearer "
+                    f"disposable-bearer-value\njwt={disposable_jwt}\n{private_material}\n"
+                    f"workerToken=disposable-worker-text\n"
+                    f"service_password=disposable-service-text\nmarker={canary}"
+                )
+            },
+        ),
+    }
+    sanitized = redact_value(document, [canary])
+    serialized = json.dumps(sanitized.value, ensure_ascii=False)
+    for disposable in (
+        canary,
+        private_material,
+        disposable_jwt,
+        "disposable-refresh-value",
+        "disposable-session-value",
+        "disposable-csrf-value",
+        "disposable-oauth-value",
+        "disposable-suffix-token",
+        "disposable-proxy-auth",
+        "disposable-access-key",
+        "disposable-client-assertion",
+        "disposable-password",
+        "disposable-cookie",
+        "disposable-bearer-value",
+        "disposable-worker-text",
+        "disposable-service-text",
+    ):
+        assert disposable not in serialized
+    assert credential_like_paths(sanitized.value, canaries=[canary]) == ()
+
+
+def test_redaction_covers_aliases_escaped_json_and_preserves_benign_types() -> None:
+    pgp_private_material = (
+        "-----BEGIN PGP PRIVATE KEY BLOCK-----\n"
+        "DISPOSABLEPGPQAONLY\n"
+        "-----END PGP PRIVATE KEY BLOCK-----"
+    )
+    disposable = {
+        "accessKey": "disposable-access-key",
+        "awsAccessKeyId": "disposable-aws-id",
+        "accessKeyId": "disposable-access-id",
+        "basicAuth": "disposable-basic-auth",
+        "authorizationHeader": "disposable-authorization-header",
+        "authHeader": "disposable-auth-header",
+        "cookieHeader": "disposable-cookie-header",
+        "setCookieHeader": "disposable-set-cookie-header",
+        "authorizationCode": "disposable-auth-code",
+        "oauthCode": "disposable-oauth-code",
+        "sessionTicket": "disposable-session-ticket",
+        "clientAssertion": "disposable-client-assertion-alias",
+        "PHPSESSID": "disposable-php-session",
+        "SESSIONID": "disposable-session-id",
+        "connect.sid": "disposable-connect-session",
+        "laravel_session": "disposable-laravel-session",
+        "auth_session": "disposable-auth-session",
+        "csrftoken": "disposable-csrf-alias",
+        "_csrf": "disposable-csrf-short",
+        "xsrf": "disposable-xsrf-short",
+        "csrfmiddlewaretoken": "disposable-csrf-middleware",
+        "pwd": "disposable-password-alias",
+        "CF_Authorization": "disposable-cf-authorization",
+        ".AspNetCore.Cookies": "disposable-aspnet-cookie",
+        "__Host-session": "disposable-host-session",
+        "__Secure-session": "disposable-secure-session",
+        "subscriptionKey": "disposable-subscription-key",
+        "ocpApimSubscriptionKey": "disposable-apim-subscription-key",
+        "codeVerifier": "disposable-code-verifier",
+        "deviceCode": "disposable-device-code",
+        "passphrase": "disposable-passphrase",
+    }
+    document = {
+        **disposable,
+        "clientAssertionType": "urn:example:benign-type",
+        "authorizationCodeChallengeMethod": "S256",
+        "basicAuthScheme": "Basic",
+        "authorizationHeaderName": "Authorization",
+        "cookieHeaderName": "Cookie",
+        "proxyAuthorizationHeaderScheme": "Basic",
+        "csrfEnabled": True,
+        "subscriptionKeyName": "subscription-key-name",
+        "codeVerifierMethod": "S256",
+        "deviceCodeEndpoint": "/device",
+        "passphrasePolicy": "required",
+        "diagnostic": (
+            "awsSecretAccessKey=disposable-aws-secret\n"
+            "basicAuth=disposable-text-basic-auth\n"
+            "authorizationHeader=disposable-text-authorization-header\n"
+            "proxyAuthorizationHeader=disposable-text-proxy-header\n"
+            "vendorApiKey=disposable-vendor-api-key\n"
+            "client_assertion=disposable-query-assertion&"
+            "authorization_code=disposable-query-code\n"
+            "oauthCode=disposable-text-oauth\n"
+            "sessionTicket=disposable-text-ticket\n"
+            "OPENAI_API_SECRET=disposable-openai-secret\n"
+            "OPENAI_API_TOKEN=disposable-openai-token\n"
+            "VENDOR_CLIENT_SECRET=disposable-vendor-secret\n"
+            "VENDOR_DB_PASSWORD=disposable-vendor-password\n"
+            "CF_Authorization=disposable-cf-authorization-text\n"
+            "PHPSESSID=disposable-php-session-text\n"
+            "SESSIONID=disposable-session-id-text\n"
+            "connect.sid=disposable-connect-session-text\n"
+            "laravel_session=disposable-laravel-session-text\n"
+            "auth_session=disposable-auth-session-text\n"
+            "csrftoken=disposable-csrf-text\n"
+            "_csrf=disposable-csrf-short-text\n"
+            "xsrf=disposable-xsrf-short-text\n"
+            "csrfmiddlewaretoken=disposable-csrf-middleware-text\n"
+            "pwd=disposable-pwd-text\n"
+            "--api-token=disposable-cli-api-token\n"
+            "-password:disposable-cli-password\n"
+            "--api-key disposable-space-api-key\n"
+            "--password 'disposable-space-password'\n"
+            "-Password disposable-powershell-password\n"
+            ".AspNetCore.Cookies=disposable-aspnet-cookie-text\n"
+            "__Host-session=disposable-host-session-text\n"
+            "__Secure-session=disposable-secure-session-text\n"
+            "subscriptionKey=disposable-subscription-key-text\n"
+            "ocpApimSubscriptionKey=disposable-apim-subscription-key-text\n"
+            "codeVerifier=disposable-code-verifier-text\n"
+            "deviceCode=disposable-device-code-text\n"
+            "passphrase=disposable-passphrase-text\n"
+            'password="disposable-quoted-head-\\"disposable-quoted-tail\\nmore"\n'
+            r'{\"password\":\"disposable-escaped-password\"}'
+            "\n"
+            r'{\"clientAssertion\":\"disposable-escaped-assertion\"}'
+            "\n"
+            r'{\\\"password\\\":\\\"disposable-layered-password\\\"}'
+            "\n"
+            r'{\u0022password\u0022:\u0022disposable-unicode-password\u0022}'
+            "\n"
+            f"{pgp_private_material}\n"
+        ),
+        "benign_diagnostic": (
+            "clientAssertionType=urn:example:benign-type "
+            "authorizationCodeChallengeMethod=S256 "
+            "basicAuthScheme=Basic authorizationHeaderName=Authorization"
+            " cookieHeaderName=Cookie proxyAuthorizationHeaderScheme=Basic"
+            " csrfEnabled=true subscriptionKeyName=subscription-key-name"
+            " codeVerifierMethod=S256 deviceCodeEndpoint=/device"
+            " passphrasePolicy=required"
+        ),
+    }
+    sanitized = redact_value(document)
+    serialized = json.dumps(sanitized.value, ensure_ascii=False)
+    for value in (
+        *disposable.values(),
+        "disposable-aws-secret",
+        "disposable-text-basic-auth",
+        "disposable-text-authorization-header",
+        "disposable-text-proxy-header",
+        "disposable-vendor-api-key",
+        "disposable-query-assertion",
+        "disposable-query-code",
+        "disposable-text-oauth",
+        "disposable-text-ticket",
+        "disposable-openai-secret",
+        "disposable-openai-token",
+        "disposable-vendor-secret",
+        "disposable-vendor-password",
+        "disposable-cf-authorization-text",
+        "disposable-php-session-text",
+        "disposable-session-id-text",
+        "disposable-connect-session-text",
+        "disposable-laravel-session-text",
+        "disposable-auth-session-text",
+        "disposable-csrf-text",
+        "disposable-csrf-short-text",
+        "disposable-xsrf-short-text",
+        "disposable-csrf-middleware-text",
+        "disposable-pwd-text",
+        "disposable-cli-api-token",
+        "disposable-cli-password",
+        "disposable-space-api-key",
+        "disposable-space-password",
+        "disposable-powershell-password",
+        "disposable-aspnet-cookie-text",
+        "disposable-host-session-text",
+        "disposable-secure-session-text",
+        "disposable-subscription-key-text",
+        "disposable-apim-subscription-key-text",
+        "disposable-code-verifier-text",
+        "disposable-device-code-text",
+        "disposable-passphrase-text",
+        "disposable-quoted-head",
+        "disposable-quoted-tail",
+        "disposable-escaped-password",
+        "disposable-escaped-assertion",
+        "disposable-layered-password",
+        "disposable-unicode-password",
+        pgp_private_material,
+    ):
+        assert value not in serialized
+    assert sanitized.value["clientAssertionType"] == "urn:example:benign-type"
+    assert sanitized.value["authorizationCodeChallengeMethod"] == "S256"
+    assert sanitized.value["basicAuthScheme"] == "Basic"
+    assert sanitized.value["authorizationHeaderName"] == "Authorization"
+    assert sanitized.value["cookieHeaderName"] == "Cookie"
+    assert sanitized.value["proxyAuthorizationHeaderScheme"] == "Basic"
+    assert sanitized.value["csrfEnabled"] is True
+    assert sanitized.value["subscriptionKeyName"] == "subscription-key-name"
+    assert sanitized.value["codeVerifierMethod"] == "S256"
+    assert sanitized.value["deviceCodeEndpoint"] == "/device"
+    assert sanitized.value["passphrasePolicy"] == "required"
+    assert sanitized.value["benign_diagnostic"] == document["benign_diagnostic"]
+    assert credential_like_paths(sanitized.value) == ()
+
+
+def test_output_boundary_fails_before_creation_for_unresolved_canary_key(
+    tmp_path: Path,
+) -> None:
+    canary = "canary" + "://credential/unresolved-key"
+    output = tmp_path / "must-not-exist.json"
+    with pytest.raises(UnsafeOutputError):
+        write_json_exclusive(
+            output,
+            {f"unsafe-{canary}": "value"},
+            canaries=[canary],
+        )
+    assert not output.exists()
+    assert canary not in safe_json_bytes({"safe": "value"}, canaries=[canary]).decode()
+
+
 def test_evidence_is_exclusive_append_only_and_sanitized(tmp_path: Path) -> None:
     identity = CampaignIdentity.create("evidence-test")
     canary = "canary" + "://" + "exclusive-secret"
@@ -267,11 +531,104 @@ def test_evidence_is_exclusive_append_only_and_sanitized(tmp_path: Path) -> None
     )
     store.append(scenario, result)
     assert canary not in store.path.read_text(encoding="utf-8")
-    records, errors = validate_evidence_file(store.path)
+    anchor = store.write_manifest(CampaignSummary(identity, (result,)))
+    records, errors = validate_evidence_file(
+        store.path,
+        expected_manifest_sha256=anchor.manifest_sha256,
+    )
     assert len(records) == 1
     assert errors == []
     with pytest.raises(FileExistsError):
         EvidenceStore(tmp_path, identity)
+
+
+def test_evidence_finalization_rejects_preseal_content_mutation(tmp_path: Path) -> None:
+    identity = CampaignIdentity.create("preseal-mutation")
+    scenario = make_scenario(
+        observation={"final": "answer"},
+        validators=[{"kind": "format_contract", "field": "final", "exact": "answer"}],
+    )
+    result = CaseResult(
+        scenario.scenario_id,
+        Verdict.PASS,
+        (AssertionResult("format.exact", True, "answer", "answer"),),
+        observation={"final": "answer"},
+        bounded_evidence={"source": "original fixture"},
+    )
+    store = EvidenceStore(tmp_path, identity)
+    try:
+        persisted = store.append(scenario, result)
+        persisted["bounded_evidence"] = {"source": "modified fixture"}
+        mutated = safe_json_bytes(
+            persisted,
+            separators=(",", ":"),
+            append_newline=True,
+        )
+        assert len(mutated) == store.path.stat().st_size
+        store.path.write_bytes(mutated)
+
+        with pytest.raises(ValueError, match="changed after append"):
+            store.write_manifest(CampaignSummary(identity, (result,)))
+        assert store.anchor is None
+        assert not store.manifest_path.exists()
+    finally:
+        store.close()
+
+
+def test_manifest_anchor_uses_exact_written_bytes_during_substitution_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = CampaignIdentity.create("manifest-race")
+    scenario = make_scenario(
+        observation={"final": "answer"},
+        validators=[{"kind": "format_contract", "field": "final", "exact": "answer"}],
+    )
+    original_result = CaseResult(
+        scenario.scenario_id,
+        Verdict.PASS,
+        (AssertionResult("format.exact", True, "answer", "answer"),),
+        observation={"final": "answer"},
+        bounded_evidence={"source": "original fixture"},
+    )
+    replacement_result = CaseResult(
+        scenario.scenario_id,
+        Verdict.PASS,
+        (AssertionResult("format.exact", True, "answer", "answer"),),
+        observation={"final": "answer"},
+        bounded_evidence={"source": "modified fixture"},
+    )
+    replacement = EvidenceStore(tmp_path / "replacement", identity)
+    replacement.append(scenario, replacement_result)
+    replacement.write_manifest(CampaignSummary(identity, (replacement_result,)))
+
+    store = EvidenceStore(tmp_path / "target", identity)
+    store.append(scenario, original_result)
+    original_writer = evidence_module.write_json_exclusive
+    written_manifest = b""
+
+    def substitute_after_write(path: Path, value: object, **kwargs: object) -> bytes:
+        nonlocal written_manifest
+        written_manifest = original_writer(path, value, **kwargs)
+        path.write_bytes(replacement.manifest_path.read_bytes())
+        return written_manifest
+
+    monkeypatch.setattr(
+        evidence_module,
+        "write_json_exclusive",
+        substitute_after_write,
+    )
+    anchor = store.write_manifest(CampaignSummary(identity, (original_result,)))
+    store.path.write_bytes(replacement.path.read_bytes())
+
+    assert anchor.manifest_sha256 == hashlib.sha256(written_manifest).hexdigest()
+    assert anchor.manifest_sha256 != hashlib.sha256(store.manifest_path.read_bytes()).hexdigest()
+    _, errors, integrity = verify_evidence_bundle(
+        store.path,
+        expected_manifest_sha256=anchor.manifest_sha256,
+    )
+    assert "trusted manifest SHA-256 anchor mismatch" in errors
+    assert integrity is None
 
 
 def test_response_integrity_detects_known_failures() -> None:
@@ -729,6 +1086,9 @@ def test_runner_classifications_have_typed_replay_contracts(
             {"observation": {"final": "no assertions"}},
         )
     )
+    anchor = store.write_manifest(
+        CampaignSummary(identity, (blocked_env, blocked_spec, skipped, errored))
+    )
     runner.close()
 
     assert [blocked_env.verdict, blocked_spec.verdict, skipped.verdict, errored.verdict] == [
@@ -737,10 +1097,16 @@ def test_runner_classifications_have_typed_replay_contracts(
         Verdict.SKIP,
         Verdict.ERROR,
     ]
-    records, errors = validate_evidence_file(store.path)
+    records, errors = validate_evidence_file(
+        store.path,
+        expected_manifest_sha256=anchor.manifest_sha256,
+    )
     assert errors == []
     assert {record["replay"]["mode"] for record in records} == {"classification"}
-    replay = replay_file(store.path)
+    replay = replay_file(
+        store.path,
+        expected_manifest_sha256=anchor.manifest_sha256,
+    )
     assert replay.errors == ()
     assert replay.mismatches == ()
     assert replay.counts == {
@@ -876,6 +1242,17 @@ def test_committed_suite_and_schema_files_are_valid_json() -> None:
     )
     assert set(evidence_schema["required"]) == EVIDENCE_REQUIRED_FIELDS
     assert set(evidence_schema["properties"]) == EVIDENCE_ALLOWED_FIELDS
+    manifest_schema = json.loads(
+        (ROOT / "qa" / "schemas" / "manifest.schema.json").read_text(encoding="utf-8")
+    )
+    manifest = json.loads(
+        evidence_manifest_path(CALIBRATION).read_text(encoding="utf-8")
+    )
+    assert validate_json_schema(manifest, manifest_schema) == []
+    replay_schema = json.loads(
+        (ROOT / "qa" / "schemas" / "replay.schema.json").read_text(encoding="utf-8")
+    )
+    assert validate_json_schema(replay_file(CALIBRATION).to_dict(), replay_schema) == []
 
 
 def test_calibration_evidence_validates_and_replays_exactly() -> None:
@@ -895,3 +1272,143 @@ def test_calibration_evidence_validates_and_replays_exactly() -> None:
     assert "state.exit_code_matches_result" in failures["CAL-FAIL-EXIT-MISMATCH"]
     assert "artifact.exact_path" in failures["CAL-FAIL-ARTIFACT"]
     assert "identity.transcript_runtime" in failures["CAL-FAIL-CROSS-RUNTIME"]
+
+
+def test_evidence_manifest_and_replay_bind_actual_raw_bytes() -> None:
+    records, errors, integrity = verify_evidence_bundle(CALIBRATION)
+    assert len(records) == 8
+    assert errors == []
+    assert integrity is not None
+    assert integrity.evidence_sha256 == hashlib.sha256(CALIBRATION.read_bytes()).hexdigest()
+    assert integrity.manifest_sha256 == hashlib.sha256(
+        evidence_manifest_path(CALIBRATION).read_bytes()
+    ).hexdigest()
+    assert len(integrity.record_sha256s) == 8
+    replay = replay_file(CALIBRATION)
+    assert replay.integrity_verified
+    assert replay.evidence_sha256 == integrity.evidence_sha256
+    assert replay.manifest_sha256 == integrity.manifest_sha256
+    assert replay.replay_digest == replay.expected_digest()
+
+
+@pytest.mark.parametrize("mutation", ["bytes", "reorder", "truncate"])
+def test_evidence_raw_mutation_reorder_and_truncation_fail_closed(
+    tmp_path: Path, mutation: str
+) -> None:
+    evidence = copy_calibration_bundle(tmp_path, mutation)
+    manifest_anchor = hashlib.sha256(evidence_manifest_path(evidence).read_bytes()).hexdigest()
+    lines = evidence.read_bytes().splitlines(keepends=True)
+    if mutation == "bytes":
+        lines[0] = lines[0].replace(b"functional", b"functionaL", 1)
+    elif mutation == "reorder":
+        lines[0], lines[1] = lines[1], lines[0]
+    else:
+        lines = lines[:-1]
+    evidence.write_bytes(b"".join(lines))
+    replay = replay_file(evidence, expected_manifest_sha256=manifest_anchor)
+    assert replay.errors
+    assert replay.integrity_verified is False
+    assert replay.cases == ()
+
+
+def test_missing_and_substituted_manifest_fail_closed(tmp_path: Path) -> None:
+    missing = tmp_path / "missing.jsonl"
+    missing.write_bytes(CALIBRATION.read_bytes())
+    records, errors = validate_evidence_file(missing)
+    assert len(records) == 8
+    assert any("manifest unavailable" in error for error in errors)
+
+    substituted = copy_calibration_bundle(tmp_path, "substituted")
+    manifest_anchor = hashlib.sha256(
+        evidence_manifest_path(substituted).read_bytes()
+    ).hexdigest()
+    identity = CampaignIdentity.create("manifest-substitute")
+    scenario = make_scenario("MANIFEST-SUBSTITUTE-001")
+    result = CaseResult(
+        scenario.scenario_id,
+        Verdict.PASS,
+        (AssertionResult("format.exact", True, "Готово", "Готово"),),
+        observation={"final": "Готово"},
+    )
+    other_store = EvidenceStore(tmp_path / "other", identity)
+    other_store.append(scenario, result)
+    other_store.write_manifest(CampaignSummary(identity, (result,)))
+    evidence_manifest_path(substituted).write_bytes(other_store.manifest_path.read_bytes())
+    replay = replay_file(
+        substituted,
+        expected_manifest_sha256=manifest_anchor,
+    )
+    assert replay.errors
+    assert replay.integrity_verified is False
+
+
+def test_paired_evidence_and_manifest_substitution_fails_trusted_anchor(
+    tmp_path: Path,
+) -> None:
+    target = copy_calibration_bundle(tmp_path, "paired-substitution")
+    expected_manifest_sha256 = hashlib.sha256(
+        evidence_manifest_path(target).read_bytes()
+    ).hexdigest()
+
+    identity = CampaignIdentity.create("paired-substitute")
+    scenario = make_scenario("PAIRED-SUBSTITUTE-001")
+    result = CaseResult(
+        scenario.scenario_id,
+        Verdict.PASS,
+        (AssertionResult("format.exact", True, "answer", "answer"),),
+        observation={"final": "answer"},
+    )
+    replacement = EvidenceStore(tmp_path / "replacement", identity)
+    replacement.append(scenario, result)
+    replacement.write_manifest(CampaignSummary(identity, (result,)))
+    target.write_bytes(replacement.path.read_bytes())
+    manifest = json.loads(replacement.manifest_path.read_text(encoding="utf-8"))
+    manifest["evidence_file"] = target.name
+    evidence_manifest_path(target).write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    records, errors = validate_evidence_file(
+        target,
+        expected_manifest_sha256=expected_manifest_sha256,
+    )
+    assert len(records) == 1
+    assert "trusted manifest SHA-256 anchor mismatch" in errors
+    replay = replay_file(
+        target,
+        expected_manifest_sha256=expected_manifest_sha256,
+    )
+    assert replay.integrity_verified is False
+    assert replay.cases == ()
+
+
+def test_generated_bundle_requires_out_of_band_manifest_anchor(tmp_path: Path) -> None:
+    identity = CampaignIdentity.create("anchor-required")
+    scenario = make_scenario("ANCHOR-REQUIRED-001")
+    result = CaseResult(
+        scenario.scenario_id,
+        Verdict.PASS,
+        (AssertionResult("format.exact", True, "answer", "answer"),),
+        observation={"final": "answer"},
+    )
+    store = EvidenceStore(tmp_path, identity)
+    store.append(scenario, result)
+    anchor = store.write_manifest(CampaignSummary(identity, (result,)))
+
+    _, errors = validate_evidence_file(store.path)
+    assert errors == ["trusted manifest SHA-256 anchor is required"]
+    _, errors = validate_evidence_file(
+        store.path,
+        expected_manifest_sha256=anchor.manifest_sha256,
+    )
+    assert errors == []
+
+
+def test_malformed_evidence_never_produces_verified_replay(tmp_path: Path) -> None:
+    evidence = tmp_path / "malformed.jsonl"
+    evidence.write_bytes(b'{"schema":NaN}\n')
+    replay = replay_file(evidence)
+    assert replay.errors
+    assert replay.integrity_verified is False
+    assert replay.cases == ()

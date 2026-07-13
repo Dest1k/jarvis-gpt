@@ -11,9 +11,9 @@ ready.
 scenario JSON
     -> safe executor (offline | allowlisted loopback HTTP | allowlisted CLI)
     -> deterministic validators
-    -> pre-write redaction
-    -> append-only JSONL + exclusive manifest
-    -> offline replay
+    -> common redact/bound/serialize/post-scan boundary
+    -> append-only JSONL + raw-byte-bound exclusive manifest
+    -> independently content-bound offline replay
     -> isolated review packet A / review packet B
     -> fail-closed adjudication
 ```
@@ -50,12 +50,40 @@ creates its manifest exclusively. Reusing a campaign path is an error.
 ### Evidence
 
 Validators see the bounded observation needed to produce factual assertions.
-Before persistence, evidence is recursively sanitized for credential-bearing
-keys, textual assignments, bearer credentials, and explicitly supplied
-disposable canaries. Sanitized values are bounded only after redaction, so
-truncation cannot expose an unprocessed suffix. Reviewers receive only the
-sanitized request, expected contract, actual output, bounded evidence, and
-authoritative deterministic failures.
+Before persistence, every generated JSON output passes one boundary that
+recursively sanitizes credential-bearing keys and text, including private-key,
+refresh/session/cookie, CSRF/OAuth/JWT, password/connection, bearer, and
+explicit disposable-canary material. Values are bounded only after redaction,
+strictly serialized, then scanned again. Unresolved material prevents output
+creation. Evidence, manifests, replay reports, review packets/results,
+adjudications, CLI JSON, and upstream-validator diagnostics use this boundary.
+
+The campaign manifest binds the exact raw JSONL bytes, ordered raw-line
+digests, terminal chain, counts, and exit code. Finalization first compares the
+open file with the exact size, full digest, and ordered line digests recorded by
+each append, then derives the retained manifest anchor from the exact bytes
+given to the exclusive writer rather than reopening the path. Replay recomputes
+the evidence and manifest digests from the actual files, compares the manifest
+digest with that out-of-band anchor, and content-addresses its own result. A
+self-consistent evidence/manifest pair is therefore insufficient:
+paired substitution fails against the retained anchor. Generic bundles have no
+implicit trust; the committed sanitized calibration fixture is the sole exact
+repository path with a reviewed built-in pin. A review packet is created only
+by the workflow that just completed that verified replay; it carries source
+record/evidence/manifest/replay digests and uses replayed deterministic
+failures. These hashes detect mutation and substitution relative to the trusted
+anchor but do not authenticate a signer.
+
+Integrity and replay provenance are process-local verifier results and are not
+serialized as trusted booleans. A loaded replay report is structural data until
+it is compared with a new replay of the anchored evidence. The packet factory
+performs that verification itself and also rebinds the ordered canonical record
+hashes, so caller-modified records or self-asserted digest objects cannot mint a
+verified packet. Packet JSON content is recursively immutable after creation.
+A deserialized packet or review is still unverified: replay-field agreement
+alone grants no provenance. Before adjudication, the verifier reopens anchored
+evidence, performs a fresh replay, re-derives the complete packet, and requires
+exact equality of every field, including request, output, and bounded evidence.
 
 ### Verdict authority
 

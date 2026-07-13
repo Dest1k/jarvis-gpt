@@ -5,6 +5,7 @@ import json
 from copy import deepcopy
 from pathlib import Path
 
+from qa.redaction import credential_like_paths
 from qa.upstream import (
     ADOPTION_MODES,
     ORIGIN_KINDS,
@@ -174,6 +175,15 @@ def test_offline_cli_reports_machine_readable_pass(tmp_path: Path, capsys) -> No
 
     assert exit_code == 0
     assert output == {"issues": [], "verdict": "PASS"}
+
+
+def test_offline_cli_redacts_credential_like_diagnostics(tmp_path: Path, capsys) -> None:
+    canary = "canary-token-disposable-upstream"
+    exit_code = main([str(tmp_path / f"missing-{canary}.json")])
+    rendered = capsys.readouterr().out
+    assert exit_code == 1
+    assert canary not in rendered
+    assert credential_like_paths(json.loads(rendered)) == ()
 
 
 def test_missing_commit_sha_fails(tmp_path: Path) -> None:

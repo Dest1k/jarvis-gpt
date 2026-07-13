@@ -9,6 +9,23 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-14 - Codex (assurance remediation Commit B)
+
+- Closed B03/B05 with append-time evidence byte tracking, exact manifest-byte
+  anchors, trusted out-of-band pins, fresh record-bound replay, recursively
+  immutable review packets, and full anchored packet re-derivation before
+  persisted reviews can reach adjudication.
+- Unified all generated JSON outputs behind recursive redact/bound/serialize/
+  post-scan handling. Positive and negative regressions cover private/session/
+  cookie/CSRF/OAuth/API/password/connection material, escaped and CLI forms,
+  disposable canaries, benign controls, pre-seal mutation, paired substitution,
+  forged replay/packet provenance, and whole-output-tree leakage.
+- Validation before commit: `103 passed, 2 skipped`; Ruff, compileall, diff
+  check, suite/evidence validation, and calibration replay are green. Calibration
+  remains exactly 8/8 with 1 PASS / 6 FAIL / 1 INCONCLUSIVE / 0 mismatches.
+- No `.audit/**`, production source, runtime state, dependency, network, push,
+  merge, or review-attestation operation was used. Next batch is B07 only.
+
 ### 2026-07-14 - Codex (assurance remediation Commit A)
 
 - Isolated remediation branch

@@ -15,7 +15,27 @@ Every JSONL record is `jarvis.qa.evidence.v1` and binds:
 
 Records are append-only. The campaign path and final manifest are
 exclusive-create. A process flush and filesystem sync follows every case so a
-later harness failure does not erase earlier evidence.
+later harness failure does not erase earlier evidence. Finalization computes a
+manifest from the persisted raw bytes. It binds file size and SHA-256, ordered
+raw-line digests, a terminal chain digest, case order, counts, and exit code.
+The store records exact size, full digest, and ordered line digests during each
+append and rejects any pre-seal file change. Finalization returns the SHA-256
+of the exact manifest bytes supplied to the exclusive writer for separate
+retention; it never trusts a later reopen of that path.
+Validation requires this trusted out-of-band anchor plus the paired manifest
+and independently recomputes every field. A generic bundle presented without
+that anchor fails closed; only the exact committed calibration fixture has a
+reviewed repository pin.
+
+Verifier provenance is deliberately not serialized. A self-consistent replay
+document or in-memory digest object is not sufficient: replay rechecks the
+ordered canonical record hashes, and packet creation reopens the evidence,
+checks the trusted manifest anchor, and performs a fresh replay. Persisted replay
+reports regain verified status only after the same anchored comparison.
+Persisted packets and reviews remain unverified until their complete packet
+content is re-derived from anchored evidence. Matching replay fields alone are
+insufficient; request, output, bounded evidence, verdicts, failures, and every
+source binding must match before adjudication.
 
 ## Statuses
 
@@ -36,9 +56,11 @@ promoted by a model reviewer.
 ## Sanitization
 
 Real runtime credentials are prohibited. Tests construct disposable canaries
-at runtime. Key-aware and textual redaction runs before serialization and
-records only redaction event paths/reasons. Evidence validation rejects
-credential-like values that remain. CLI summaries contain counts, paths,
+at runtime. The common output boundary performs recursive key/text redaction,
+then bounds values, strictly serializes JSON, and scans the structured and raw
+result again. Private-key, session/cookie, CSRF/OAuth/JWT, password/connection,
+authorization, and explicit-canary material share that boundary. Unresolved
+material prevents file creation. CLI summaries contain counts, paths,
 verdicts, and bounded redacted diagnostics; they do not echo observations.
 
 ## Replay calibration
@@ -58,6 +80,11 @@ derived from the completed campaign reports. It exercises:
 Replay recomputes deterministic assertions and compares the new verdict with
 the recorded verdict. The replay command succeeds only when every verdict
 matches. It does not reinterpret a known calibrated `FAIL` as harness failure.
+Replay binds the actual evidence and manifest byte digests and content-addresses
+its own deterministic result. Review packets are created only after a fresh
+verified replay and include the raw record, evidence, manifest, and replay
+digests; deterministic failures come from replay rather than mutable record
+metadata.
 For runner-produced `BLOCKED_BY_ENV`, `BLOCKED_BY_SPEC`, optional `SKIP`, and
 `ERROR`, replay instead verifies the exact typed runner assertion, its pass/fail
 polarity, the requirement flag, and a reason bound to the recorded error before
@@ -74,3 +101,7 @@ Schema validity proves structure, not truth. A reviewer cannot infer a license,
 security result, action completion, or product readiness from a declaration
 without referenced evidence. Missing evidence remains `INCONCLUSIVE` or
 `BLOCKED`; it never becomes `PASS`.
+
+SHA-256 bindings detect mutation, reorder, truncation, and paired substitution
+relative to a previously trusted manifest anchor. They are not signatures and
+do not authenticate an author or source.

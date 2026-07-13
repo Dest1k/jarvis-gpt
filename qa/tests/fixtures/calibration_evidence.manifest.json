@@ -1,0 +1,50 @@
+{
+  "campaign_id": "calibration-20260713",
+  "case_ids": [
+    "CAL-PASS-STREAM",
+    "CAL-FAIL-TOOL-ENVELOPE",
+    "CAL-FAIL-EMPTY-DUPLICATE",
+    "CAL-FAIL-CANARY",
+    "CAL-FAIL-EXIT-MISMATCH",
+    "CAL-FAIL-ARTIFACT",
+    "CAL-FAIL-CROSS-RUNTIME",
+    "CAL-INCONCLUSIVE-TRANSPORT"
+  ],
+  "counts": {
+    "BLOCKED_BY_ENV": 0,
+    "BLOCKED_BY_SPEC": 0,
+    "ERROR": 0,
+    "FAIL": 6,
+    "INCONCLUSIVE": 1,
+    "PASS": 1,
+    "SKIP": 0
+  },
+  "evidence_file": "calibration_evidence.jsonl",
+  "evidence_sha256": "482382d0222d7317b574629558082d5765043db8f64b2ff082b926523e360397",
+  "evidence_size": 6574,
+  "exit_code": 1,
+  "namespace": "qa.calibration.20260713",
+  "record_canonical_sha256s": [
+    "4d6f12ff192989e5a36c42ac4b456b7af197d849014b2065b3a94efbf89617c9",
+    "989ead70c1f0ecc3f9b281f722386d6f9566b9d85a8009b4f0f7e22632d85676",
+    "4919c612eb9d4a0b8dbcdba91db413ce581134b48adc2b5d364d1cb335a9967c",
+    "da11daf3a1c237477f9f3c545ad50f95ccb08b7fc29fa5a8a858478625d0f96b",
+    "7a4808a7781ee24f17a3102e2bcff91005c252cc28260ad8e52d9957bbe3ce0d",
+    "97d2e0fca1b985754b2e3c046a9e25d509603d90ab876ea7f0697a8b5150d472",
+    "519aa22585774b86cee25c633ae6f083f40ed257490b9b03ff19ac30a32d9733",
+    "d1e191950a4e74bb283531778c3bfd1ab8d4f38075c74ae45263e6d2208e06db"
+  ],
+  "record_count": 8,
+  "record_sha256s": [
+    "755ce1e9fd3931af1a31ab2e9e9fed84bd6d0e8c075936180b820d0db93efea0",
+    "d3d08a3c2a58272062616f1c975238fd96d3aa39072308a87f354b824fa90cc3",
+    "18afaeda45d1b06db0ad218481602ed042f13c3e96c85562280ed3eb26880627",
+    "c359313afdfac7a4b52aafda52d27ab18bae858ae4c8811f247c53c4f27d1ba1",
+    "865e94c0cbc5ca024123cff2fe9f5939060edd1c202d2f162a5b3adf46d90fe9",
+    "39b14c72b7b222330c6db684c887f00c1ef69e33c13c18e7d9594fa78cd693c0",
+    "bf9e3a9821dd36d086c2135e447db667d06bfb01d574f660bdc0502768eed7ec",
+    "4e694c581b21d2284bcdefce7cdd9adf07212f30acf6e5ac8664dba0b1e577f1"
+  ],
+  "schema": "jarvis.qa.campaign-manifest.v2",
+  "terminal_chain_sha256": "d77b59450e88cbc70b4a8986876feafaef1eaaca4618ac8107b6b5cf1f47e25e"
+}

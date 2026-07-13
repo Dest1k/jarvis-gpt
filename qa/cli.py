@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import argparse
-import json
 import sys
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -18,16 +17,19 @@ from .models import (
     CampaignIdentity,
     Verdict,
 )
+from .output import safe_json_text
 from .redaction import redact_text
-from .replay import replay_file
+from .replay import replay_file, write_replay_report
 from .review.adjudicator import adjudicate_files, write_adjudication
 from .review.reviewer import build_review_packets
 from .runner import AssuranceRunner, LoopbackHttpExecutor
 from .scenario_loader import load_suite, validate_suite
 
 
-def _emit(document: dict[str, Any]) -> None:
-    print(json.dumps(document, ensure_ascii=False, sort_keys=True))
+def _emit(document: dict[str, Any], *, canaries: Iterable[str] = ()) -> None:
+    sys.stdout.write(
+        safe_json_text(document, canaries=canaries, append_newline=True)
+    )
 
 
 def _cmd_validate_suite(args: argparse.Namespace) -> int:
@@ -44,7 +46,10 @@ def _cmd_validate_suite(args: argparse.Namespace) -> int:
 
 
 def _cmd_validate_evidence(args: argparse.Namespace) -> int:
-    records, errors = validate_evidence_file(args.evidence)
+    records, errors = validate_evidence_file(
+        args.evidence,
+        expected_manifest_sha256=args.expected_manifest_sha256,
+    )
     _emit(
         {
             "command": "validate-evidence",
@@ -57,7 +62,13 @@ def _cmd_validate_evidence(args: argparse.Namespace) -> int:
 
 
 def _cmd_replay(args: argparse.Namespace) -> int:
-    summary = replay_file(args.evidence)
+    summary = replay_file(
+        args.evidence,
+        expected_manifest_sha256=args.expected_manifest_sha256,
+    )
+    output = None
+    if args.output is not None:
+        output = str(write_replay_report(args.output, summary))
     _emit(
         {
             "command": "replay",
@@ -66,6 +77,10 @@ def _cmd_replay(args: argparse.Namespace) -> int:
             "counts": summary.counts,
             "mismatches": list(summary.mismatches),
             "errors": list(summary.errors),
+            "evidence_sha256": summary.evidence_sha256,
+            "manifest_sha256": summary.manifest_sha256,
+            "replay_digest": summary.replay_digest,
+            "output": output,
         }
     )
     return summary.exit_code
@@ -73,7 +88,11 @@ def _cmd_replay(args: argparse.Namespace) -> int:
 
 def _cmd_build_review_packets(args: argparse.Namespace) -> int:
     output = args.output_dir or args.evidence.with_suffix(".review-packets")
-    paths = build_review_packets(args.evidence, output)
+    paths = build_review_packets(
+        args.evidence,
+        output,
+        expected_manifest_sha256=args.expected_manifest_sha256,
+    )
     _emit(
         {
             "command": "build-review-packets",
@@ -86,7 +105,13 @@ def _cmd_build_review_packets(args: argparse.Namespace) -> int:
 
 
 def _cmd_adjudicate(args: argparse.Namespace) -> int:
-    result = adjudicate_files(args.review_1, args.review_2)
+    result = adjudicate_files(
+        args.review_1,
+        args.review_2,
+        replay_path=args.replay,
+        evidence_path=args.evidence,
+        expected_manifest_sha256=args.expected_manifest_sha256,
+    )
     default_name = f"{result.reviews[0].packet.case_id}.adjudication.json"
     output = args.output or args.review_1.parent / default_name
     write_adjudication(output, result)
@@ -123,6 +148,8 @@ def _cmd_run_suite(args: argparse.Namespace) -> int:
             "counts": summary.counts,
             "exit_code": summary.exit_code,
             "evidence": str(store.path),
+            "evidence_sha256": store.anchor.evidence_sha256 if store.anchor else None,
+            "manifest_sha256": store.anchor.manifest_sha256 if store.anchor else None,
         }
     )
     return summary.exit_code
@@ -138,20 +165,27 @@ def build_parser() -> argparse.ArgumentParser:
 
     validate_evidence_parser = subparsers.add_parser("validate-evidence")
     validate_evidence_parser.add_argument("evidence", type=Path)
+    validate_evidence_parser.add_argument("--expected-manifest-sha256")
     validate_evidence_parser.set_defaults(handler=_cmd_validate_evidence)
 
     replay_parser = subparsers.add_parser("replay")
     replay_parser.add_argument("evidence", type=Path)
+    replay_parser.add_argument("--expected-manifest-sha256")
+    replay_parser.add_argument("--output", type=Path)
     replay_parser.set_defaults(handler=_cmd_replay)
 
     packets_parser = subparsers.add_parser("build-review-packets")
     packets_parser.add_argument("evidence", type=Path)
     packets_parser.add_argument("--output-dir", type=Path)
+    packets_parser.add_argument("--expected-manifest-sha256")
     packets_parser.set_defaults(handler=_cmd_build_review_packets)
 
     adjudicate_parser = subparsers.add_parser("adjudicate")
     adjudicate_parser.add_argument("review_1", type=Path)
     adjudicate_parser.add_argument("review_2", type=Path)
+    adjudicate_parser.add_argument("--replay", type=Path, required=True)
+    adjudicate_parser.add_argument("--evidence", type=Path, required=True)
+    adjudicate_parser.add_argument("--expected-manifest-sha256")
     adjudicate_parser.add_argument("--output", type=Path)
     adjudicate_parser.set_defaults(handler=_cmd_adjudicate)
 
