@@ -46,7 +46,7 @@
     "repository_url": {
       "type": "string",
       "format": "uri",
-      "pattern": "^https://[^?#]+$"
+      "pattern": "^https://[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*(?:/[A-Za-z0-9](?:[A-Za-z0-9._~-]*[A-Za-z0-9])?){2,}$"
     },
     "pinned_commit_sha": {
       "type": "string",
@@ -71,7 +71,8 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "pattern": "^(?!(?:\\.{1,2}|\\.audit|\\.git)(?:/|$))(?!.*(?:/)(?:\\.{1,2}|\\.audit|\\.git)(?:/|$))[A-Za-z0-9._~-]+(?:/[A-Za-z0-9._~-]+)*$"
         },
         "sha256": {
           "type": [
@@ -80,7 +81,23 @@
           ],
           "pattern": "^[0-9a-f]{64}$"
         }
-      }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "identifier": {"type": "null"},
+            "repository_path": {"type": "null"},
+            "sha256": {"type": "null"}
+          }
+        },
+        {
+          "properties": {
+            "identifier": {"type": "string", "pattern": "\\S"},
+            "repository_path": {"type": "string", "minLength": 1},
+            "sha256": {"$ref": "#/$defs/sha256"}
+          }
+        }
+      ]
     },
     "external_code_imported": {
       "type": "boolean"
@@ -140,6 +157,50 @@
           "external_code_imported": {
             "const": false
           }
+        },
+        "not": {
+          "anyOf": [
+            {"required": ["adoption_mode"]},
+            {"required": ["repository_url"]},
+            {"required": ["pinned_commit_sha"]},
+            {"required": ["license_snapshot"]},
+            {"required": ["source_files"]},
+            {"required": ["imported_paths"]},
+            {"required": ["transformation_notes"]},
+            {"required": ["retained_notices"]}
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "origin_kind": {
+            "enum": [
+              "internal_human",
+              "generated_fixture"
+            ]
+          }
+        },
+        "required": ["origin_kind"]
+      },
+      "then": {
+        "properties": {
+          "external_code_imported": {"const": false}
+        },
+        "not": {
+          "anyOf": [
+            {"required": ["commissioned_by"]},
+            {"required": ["implementation_agent"]},
+            {"required": ["adoption_mode"]},
+            {"required": ["repository_url"]},
+            {"required": ["pinned_commit_sha"]},
+            {"required": ["license_snapshot"]},
+            {"required": ["source_files"]},
+            {"required": ["imported_paths"]},
+            {"required": ["transformation_notes"]},
+            {"required": ["retained_notices"]}
+          ]
         }
       }
     },
@@ -172,7 +233,13 @@
           "imported_paths",
           "transformation_notes",
           "retained_notices"
-        ]
+        ],
+        "not": {
+          "anyOf": [
+            {"required": ["commissioned_by"]},
+            {"required": ["implementation_agent"]}
+          ]
+        }
       }
     },
     {
@@ -271,7 +338,9 @@
       "properties": {
         "path": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "pattern": "^(?!(?:\\.{1,2}|\\.audit|\\.git)(?:/|$))(?!.*(?:/)(?:\\.{1,2}|\\.audit|\\.git)(?:/|$))[A-Za-z0-9._~-]+(?:/[A-Za-z0-9._~-]+)*$",
+          "description": "Canonical path beneath the explicit reviewed source root."
         },
         "sha256": {
           "$ref": "#/$defs/sha256"
@@ -291,11 +360,14 @@
       "properties": {
         "source_path": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "pattern": "^(?!(?:\\.{1,2}|\\.audit|\\.git)(?:/|$))(?!.*(?:/)(?:\\.{1,2}|\\.audit|\\.git)(?:/|$))[A-Za-z0-9._~-]+(?:/[A-Za-z0-9._~-]+)*$"
         },
         "destination_path": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "pattern": "^(?!(?:\\.{1,2}|\\.audit|\\.git)(?:/|$))(?!.*(?:/)(?:\\.{1,2}|\\.audit|\\.git)(?:/|$))[A-Za-z0-9._~-]+(?:/[A-Za-z0-9._~-]+)*$",
+          "description": "Canonical path beneath the explicit destination root."
         },
         "source_sha256": {
           "$ref": "#/$defs/sha256"

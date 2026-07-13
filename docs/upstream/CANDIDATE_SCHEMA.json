@@ -55,7 +55,7 @@
     "repository_url": {
       "type": "string",
       "format": "uri",
-      "pattern": "^https://[^?#]+$"
+      "pattern": "^https://[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*(?:/[A-Za-z0-9](?:[A-Za-z0-9._~-]*[A-Za-z0-9])?){2,}$"
     },
     "pinned_commit_sha": {
       "type": "string",
@@ -146,6 +146,56 @@
           "external_code_imported": {
             "const": false
           }
+        },
+        "not": {
+          "anyOf": [
+            {"required": ["adoption_mode"]},
+            {"required": ["repository_url"]},
+            {"required": ["pinned_commit_sha"]},
+            {"required": ["license"]},
+            {"required": ["source_files"]},
+            {"required": ["dependency_review"]},
+            {"required": ["security_review"]},
+            {"required": ["isolated_spike"]},
+            {"required": ["tests"]},
+            {"required": ["provenance_record"]},
+            {"required": ["human_approval"]}
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "origin_kind": {
+            "enum": [
+              "internal_human",
+              "generated_fixture"
+            ]
+          }
+        },
+        "required": ["origin_kind"]
+      },
+      "then": {
+        "properties": {
+          "external_code_imported": {"const": false}
+        },
+        "not": {
+          "anyOf": [
+            {"required": ["commissioned_by"]},
+            {"required": ["implementation_agent"]},
+            {"required": ["adoption_mode"]},
+            {"required": ["repository_url"]},
+            {"required": ["pinned_commit_sha"]},
+            {"required": ["license"]},
+            {"required": ["source_files"]},
+            {"required": ["dependency_review"]},
+            {"required": ["security_review"]},
+            {"required": ["isolated_spike"]},
+            {"required": ["tests"]},
+            {"required": ["provenance_record"]},
+            {"required": ["human_approval"]}
+          ]
         }
       }
     },
@@ -181,7 +231,13 @@
           "tests",
           "provenance_record",
           "human_approval"
-        ]
+        ],
+        "not": {
+          "anyOf": [
+            {"required": ["commissioned_by"]},
+            {"required": ["implementation_agent"]}
+          ]
+        }
       }
     },
     {
@@ -270,7 +326,7 @@
       "properties": {
         "path": {
           "type": "string",
-          "pattern": "^(docs/upstream|docs/assurance|qa)/[^\\\\:]+$"
+          "pattern": "^(?:docs/upstream|docs/assurance|qa)/(?!(?:\\.{1,2}|\\.audit|\\.git)(?:/|$))(?!.*(?:/)(?:\\.{1,2}|\\.audit|\\.git)(?:/|$))[A-Za-z0-9._~-]+(?:/[A-Za-z0-9._~-]+)*$"
         },
         "sha256": {
           "$ref": "#/$defs/sha256"
@@ -294,7 +350,9 @@
       "properties": {
         "path": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "pattern": "^(?!(?:\\.{1,2}|\\.audit|\\.git)(?:/|$))(?!.*(?:/)(?:\\.{1,2}|\\.audit|\\.git)(?:/|$))[A-Za-z0-9._~-]+(?:/[A-Za-z0-9._~-]+)*$",
+          "description": "Canonical path beneath the explicit reviewed source root."
         },
         "sha256": {
           "$ref": "#/$defs/sha256"
@@ -384,7 +442,8 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "pattern": "^(?!(?:\\.{1,2}|\\.audit|\\.git)(?:/|$))(?!.*(?:/)(?:\\.{1,2}|\\.audit|\\.git)(?:/|$))[A-Za-z0-9._~-]+(?:/[A-Za-z0-9._~-]+)*$"
         },
         "notice_verified": {
           "type": "boolean"
@@ -392,7 +451,31 @@
         "evidence": {
           "$ref": "#/$defs/evidence_reference"
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "verification_status": {
+                "enum": ["VERIFIED", "EXPLICIT_REVIEW_APPROVED"]
+              }
+            },
+            "required": ["verification_status"]
+          },
+          "then": {
+            "required": ["identifier", "repository_path", "evidence"],
+            "properties": {
+              "identifier": {
+                "type": "string",
+                "pattern": "\\S"
+              },
+              "repository_path": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      ]
     },
     "human_approval": {
       "type": "object",

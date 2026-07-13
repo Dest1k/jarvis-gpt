@@ -9,6 +9,25 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-14 - Codex (assurance remediation Commit D)
+
+- Closed B08-B11 with exact source-to-destination manifests, independent
+  raw-byte hashing under explicit safe roots, verified license-snapshot digest
+  binding, and strict offline canonical repository/commit provenance.
+- Internal origins reject external-only metadata; external origins reject
+  commissioning metadata. Missing, stale, unmapped, escaped, or reparse-backed
+  source, destination, license, and evidence paths fail closed.
+- Positive/negative regressions cover source/destination mutation or removal,
+  mapping substitution, license mutation/removal/substitution, schema/runtime
+  license parity, malformed repository metadata, internal/external field
+  conflicts, root containment, and simulated or real reparse boundaries.
+- Validation before commit: `59 passed, 1 skipped`; Ruff, compileall, and diff
+  check are green. The skip is the host-privilege-dependent real symlink case;
+  deterministic reparse simulation and an independent Windows junction probe
+  pass. Two independent scoped reviews returned GO for B08-B11.
+- No `.audit/**`, production source, runtime state, dependency, network, push,
+  merge, or review-attestation operation was used. Next batch is B12-B14 only.
+
 ### 2026-07-14 - Codex (assurance remediation Commit C)
 
 - Closed B07 with immutable review/context/packet digests, typed citable

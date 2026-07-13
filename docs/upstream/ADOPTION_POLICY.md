@@ -33,6 +33,9 @@ Every component or candidate uses exactly one origin kind:
 `commissioned_internal` is an engineering provenance label. It requires
 `commissioned_by`, `implementation_agent`, and
 `external_code_imported: false`; it does not require an upstream repository.
+Internal origins reject repository, commit, license-snapshot, source-manifest,
+imported-path, adoption-mode, and other external-only fields. External origins
+likewise reject internal commissioning fields.
 If external code is later imported, the affected work must use the external
 candidate gate and must not remain represented as purely commissioned internal
 work.
@@ -47,18 +50,29 @@ human-approval requirements for an adoption decision.
 
 `test_corpus`, `ported_module`, and `fork` are copied-code modes. They require
 the exact upstream source file list, a provenance record, imported destination
-paths, and source/result hashes. Other non-idea modes still require the exact
-upstream files reviewed for the proposed adoption.
+paths, and source/result hashes. Each `source_files.path` is resolved beneath a
+separately supplied reviewed-source root and its declared SHA-256 is recomputed
+from the exact raw bytes. Every imported source must match exactly one such
+manifest entry; every destination is resolved beneath a separately supplied
+destination root and its result SHA-256 is independently recomputed. Missing,
+unmapped, stale, escaped, non-regular, oversized, symlink, junction, and reparse
+paths fail. Transformation prose never substitutes for either hash. Other
+non-idea modes still require the exact upstream files reviewed for the proposed
+adoption. `idea_only` cannot declare imported code or destinations.
 
 ## Required gate evidence
 
 No external candidate may pass without all of the following:
 
 1. A reproduced finding ID or a concrete capability gap.
-2. The exact canonical HTTPS repository URL.
+2. The exact canonical HTTPS repository URL: lowercase host, no credentials,
+   port, query, fragment, whitespace, backslash, percent encoding, dot segment,
+   repeated separator, or trailing slash.
 3. A pinned 40-character Git commit SHA, never a branch or tag.
-4. A license record taken from that repository, including its path and a
-   content hash when verification or review is claimed.
+4. A license record taken from that repository. Its repository-relative path is
+   distinct from the local sanitized evidence path. Verified or explicitly
+   approved claims require that local evidence; the validator rehashes its exact
+   raw bytes and requires the provenance `license_snapshot.sha256` to match.
 5. The exact upstream source files reviewed, except that `idea_only` may use an
    empty list.
 6. One declared adoption mode.
@@ -73,6 +87,10 @@ Evidence references are repository-relative paths beneath `docs/upstream/`,
 absolute paths, traversal paths, or unsanitized credential material. Every
 asserted evidence reference carries a SHA-256 digest. The validator reads only
 the explicitly referenced files and performs no network access or discovery.
+The matched allowed-prefix directory is resolved as the exact read root;
+descriptor-based bounded reads reject symlink/reparse escapes and path changes
+before consuming bytes. Source and destination roots are explicit independent
+inputs and use the same canonical-path and bounded-read policy.
 
 ## License handling
 
@@ -88,7 +106,9 @@ The policy records engineering controls, not a legal conclusion. A permissive
 classification requires `VERIFIED` status and verified notices. Copyleft,
 custom, and source-available classifications require
 `EXPLICIT_REVIEW_APPROVED`. `NO_LICENSE`, `UNKNOWN`, and pending review states
-remain `BLOCKED`.
+remain `BLOCKED`. A permissive identifier never waives notice verification or
+the separately recorded human adoption decision. The outer provenance-record
+hash does not replace the license-snapshot byte binding.
 
 ## Verdicts and decision ownership
 
@@ -109,9 +129,13 @@ until a completed decision record says so.
 From the repository root:
 
 ```powershell
-py -3.11 -m qa.upstream docs\upstream\candidates\<candidate>.json --evidence-root .
+py -3.11 -m qa.upstream docs\upstream\candidates\<candidate>.json --evidence-root <sanitized-evidence-root> --source-root <reviewed-source-root> --destination-root <adoption-destination-root>
 ```
 
 Exit codes are `0=PASS`, `1=FAIL`, `2=BLOCKED`, and `3=VALIDATOR_ERROR`.
 Validation never downloads a repository, installs a dependency, executes donor
-code, or modifies candidate/evidence files.
+code, or modifies candidate/evidence files. Omitting a root required by the
+selected adoption mode yields `BLOCKED`; malformed or contradictory metadata
+and byte mismatches yield `FAIL`. Standalone provenance validation without its
+candidate/root context is structural only and cannot establish an adoption
+`PASS`.
