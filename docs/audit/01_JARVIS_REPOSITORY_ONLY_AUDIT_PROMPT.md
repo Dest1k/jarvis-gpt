@@ -1,126 +1,123 @@
-# JARVIS — PHASE A: ПОЛНЫЙ АУДИТ РЕПОЗИТОРИЯ БЕЗ ДОСТУПА К ЖИВОЙ МАШИНЕ
+# JARVIS — PHASE A: ПОЛНЫЙ РЕПОЗИТОРНЫЙ АУДИТ БЕЗ ЖИВОЙ МАШИНЫ
 
-Ты работаешь как главный инженер по качеству, системный архитектор, специалист по надёжности и безопасности, adversarial reviewer и координатор независимых субагентов. Выполни **первую половину двухкомпонентного доказательного аудита JARVIS**: максимально глубокое исследование репозитория, которое возможно без доступа к целевой Windows-машине, её Docker/WSL/GPU, локальным моделям, пользовательским данным и реально запущенному приложению.
+Ты работаешь как главный инженер по качеству, надёжности и архитектуре ПО. Выполни **первую половину двухкомпонентного доказательного аудита JARVIS**: максимально глубокое исследование текущего репозитория, которое возможно без доступа к целевой Windows-машине, Docker/WSL/GPU, локальным моделям, пользовательским данным и реально запущенному приложению.
 
-Это не поверхностное code review. Твоя задача — исчерпывающе разобрать кодовую базу, контракты, конфигурацию, тесты, переходы состояний, доверительные границы и потенциальные классы отказов; выполнить все безопасные и воспроизводимые проверки, которые можно провести в изолированном checkout; затем сохранить в репозитории строгий handoff для второй фазы, которая будет запущена на живой машине через Codex Sol Ultra.
+Это защитный аудит принадлежащего пользователю проекта. Его цель — качество, корректность, устойчивость, сопровождаемость и безопасный дизайн. Не выполняй активные атаки, не создавай эксплуатационные сценарии, вредоносные payloads или инструкции по компрометации систем. Связанные с защитой выводы формулируй как review архитектуры, валидации, разрешений, обработки чувствительных данных и границ доверия. Любую проверку, которой нужен реальный runtime, переноси в PHASE B как безопасный функциональный сценарий без наступательных деталей.
 
-После второй фазы итоговый аудит должен превратиться в атомарную очередь исправлений для Codex Spark. **На этой фазе не выпускай финальную READY-очередь для Spark:** runtime-гипотезы ещё не подтверждены. Подготовь кандидатов и всю необходимую контекстную базу, но оставь Spark заблокированным до завершения PHASE B.
+После PHASE A локальный Sol Ultra продолжит тот же audit run на живой машине. Только после PHASE B будет создана окончательная атомарная очередь исправлений для Codex Spark.
 
 ---
 
-## 0. Контракт всей трёхступенчатой кампании
-
-Кампания состоит из трёх последовательных исполнителей:
+## 0. Контракт кампании
 
 ```text
 PHASE A — этот prompt, Sol Ultra в Work / облачном checkout
-  └─ статический, контрактный и hermetic-аудит репозитория
-  └─ карта системы, инварианты, тестовый инвентарь, findings
-  └─ точная очередь runtime-сценариев для живой машины
+  └─ repository inventory, architecture, contracts, tests, static findings
+  └─ безопасные hermetic-проверки
+  └─ точная очередь функциональных runtime-сценариев для PHASE B
 
 PHASE B — Sol Ultra через локальный Codex на целевой машине
   └─ продолжает тот же RUN_ID
-  └─ проверяет реальное поведение Windows/Docker/WSL/GPU/LLM/GUI
-  └─ подтверждает или опровергает findings PHASE A
-  └─ создаёт финальную очередь задач для Spark
+  └─ проверяет Windows/Docker/WSL/GPU/LLM/GUI/runtime/persistence
+  └─ подтверждает или опровергает выводы PHASE A
+  └─ создаёт итоговую очередь задач для Spark
 
 PHASE C — Codex Spark через локальный Codex
-  └─ читает только завершённый объединённый аудит
-  └─ чинит по одной атомарной задаче
-  └─ добавляет regression tests и повторно валидирует результат
+  └─ работает только по подтверждённым атомарным задачам
+  └─ сначала воспроизводит, затем добавляет regression test и исправляет
 ```
 
-Твоя работа обязана быть пригодной для бесшовного продолжения PHASE B без доступа к твоему контексту, скрытым рассуждениям или сообщениям чата.
+PHASE A не имеет права разблокировать Spark.
 
 ---
 
 ## 1. Репозиторий и границы среды
 
-Целевой репозиторий: `Dest1k/jarvis-gpt`.
-
-В Work/облачной среде путь checkout заранее неизвестен. Найди фактический корень командой:
-
-```bash
-git rev-parse --show-toplevel
-```
-
-Работай только внутри найденного Git-корня. Не требуй наличия Windows-пути и не создавай фиктивные каталоги диска `D:`.
-
-На реальной машине позднее используются два разных корня:
+Целевой репозиторий:
 
 ```text
-D:\jarvis-gpt   — рабочий Git-репозиторий и исходный код
-D:\jarvis       — тяжёлые runtime-данные, модели, Docker-данные, кеши,
-                  пользовательские данные, большие логи и evidence
+Dest1k/jarvis-gpt
 ```
 
-На PHASE A:
+Найди фактический Git root текущего checkout и зафиксируй его. В облачной среде не предполагай Windows-путь.
 
-- у тебя **нет** достоверного доступа к `D:\jarvis-gpt` как к локальному Windows checkout;
-- у тебя **нет** доступа к содержимому `D:\jarvis`;
-- ты не можешь подтверждать наличие моделей, образов, volumes, портов, GPU, драйверов, WSL или работающих сервисов;
-- не имитируй такую доступность и не объявляй runtime-сценарии пройденными по чтению кода;
-- любые выводы о живой системе должны получить статус `RUNTIME_CONFIRMATION_REQUIRED`, `NOT_RUN` либо `BLOCKED_BY_ENV`.
+На реальной машине используются разные каталоги:
 
-### Установка исключена из аудита
+```text
+D:\jarvis-gpt   — Git-репозиторий и исходный код
+D:\jarvis       — модели, Docker/runtime-данные, кеши, пользовательские данные,
+                  большие логи и evidence
+```
 
-Не проверяй и не проектируй сценарии первичной установки на чистую машину. Считай, что к PHASE B продукт уже установлен, модели и необходимые образы каким-то образом получены, а базовый запуск в принципе возможен.
+На PHASE A у тебя нет достоверного доступа к `D:\jarvis`. Поэтому нельзя объявлять подтверждёнными:
 
-В scope остаются только свойства готового изделия: запуск из подготовленного состояния, повторный запуск, конфигурация, runtime, деградация, восстановление, безопасность, целостность, UX и длительная эксплуатация.
+- запуск приложения;
+- наличие моделей и образов;
+- фактическое разрешение профиля в runtime;
+- Docker/WSL/GPU behavior;
+- GUI behavior;
+- offline behavior;
+- производительность;
+- восстановление реальной БД или runtime state.
 
----
+Такие выводы получают статус `RUNTIME_CONFIRMATION_REQUIRED`, `BLOCKED_BY_ENV` или `NOT_RUN`.
 
-## 2. Жёсткие правила
+### Установка вне scope
 
-1. **Не изменяй production-код, production-конфигурацию, lockfiles и штатные тесты ради исправления найденных дефектов.** Объект аудита должен оставаться неизменным.
-2. Разрешены только артефакты под `.audit/`, изолированные harness/repro-файлы под текущим run-каталогом и временные файлы вне tracked source.
-3. Не запускай Docker daemon, `docker compose up`, WSL, GPU workloads, vLLM, реальную модель, локальные backend/frontend services, browser automation против внешних сайтов или host-level команды.
-4. Не выполняй внешние действия, которые могут затронуть реальные аккаунты, сайты, машины или данные.
-5. Репозиторные тесты разрешены только тогда, когда они полностью изолированы от живой машины и не требуют реальных моделей, host bridge, Docker runtime, пользовательской БД или внешней сети.
-6. Можно установить pinned development dependencies **только внутри одноразовой облачной среды**, если это не меняет tracked-файлы и необходимо для hermetic-тестов. Зафиксируй точные команды и версии. Невозможность установки — `BLOCKED_BY_ENV`, а не дефект JARVIS.
-7. Можно выполнять compile/lint/type/schema/unit/property/fuzz/mutation checks в sandbox с жёсткими лимитами времени, памяти и диска.
-8. Можно выполнять `docker compose config` или эквивалентный статический рендер конфигурации только без запуска сервисов, pull образов и обращения к host runtime; используй синтетические не секретные env-значения.
-9. Не записывай секреты, токены или приватные данные в аудит. Любое найденное потенциальное значение маскируй.
-10. Не используй `git reset --hard`, `git clean`, массовое удаление или перезапись пользовательских изменений.
-11. Не выдавай подозрительный код за подтверждённый runtime-дефект. Строго разделяй доказанное статически, подтверждённое hermetic-тестом, вероятное и требующее живого воспроизведения.
-12. Не останавливай весь аудит после первого красного теста. Зафиксируй результат и продолжай независимые направления.
-13. Не спрашивай пользователя о каждом неоднозначном месте. Извлекай контракт из доступных источников; при конфликте создавай `SPEC_GAP`.
-14. В финале сохрани все артефакты в Git checkout. Если среда Work поддерживает commit/publish — создай один commit только с `.audit/**`; не меняй production-файлы и не делай merge. Если commit недоступен, оставь полный diff и явно сообщи это.
+Не проверяй первичную установку на чистую машину. Считай, что к PHASE B продукт уже установлен, необходимые assets получены, а базовый запуск в принципе возможен.
 
 ---
 
-## 3. Не навязывай проекту устаревшую картину
+## 2. Обязательные правила
+
+1. Не исправляй production-код, production-конфигурацию, штатные tests и lockfiles.
+2. Разрешены только новые артефакты под `.audit/**` и временные harness-файлы внутри текущего audit run.
+3. Не запускай Docker services, WSL workloads, реальную LLM, backend/frontend servers, browser automation, host bridge и внешние сетевые проверки.
+4. Не обращайся к реальным аккаунтам, сайтам, локальным данным пользователя или внешним системам.
+5. Запускай только изолированные проверки, которые работают на текущем checkout с fake/mock/synthetic data.
+6. Можно устанавливать pinned development dependencies только в одноразовой облачной среде, не меняя tracked-файлы. Все команды и версии фиксируй.
+7. Не записывай секреты, токены и приватные данные. Потенциально чувствительные значения маскируй.
+8. Не используй destructive Git-команды, не переписывай историю и не сбрасывай чужие изменения.
+9. Не называй runtime-дефект подтверждённым только по чтению кода.
+10. Не останавливай весь аудит после первой ошибки: зафиксируй её и продолжай независимые направления.
+11. При конфликте документации, tests, config и implementation создавай `SPEC_GAP`, а не угадывай.
+12. Отчёт должен быть воспроизводимым: path, symbol, command, exit code, duration, evidence и связь с требованием.
+13. Не публикуй exploit-ready детали. Для защитных findings достаточно boundary, impact, affected flow и безопасной рекомендации.
+14. В финале сохрани audit artifacts в репозитории. Если Work поддерживает Git-изменения, создай отдельную audit-ветку и один или несколько audit-only commits. Не меняй default branch production-кодом.
+
+---
+
+## 3. Не навязывай устаревшую картину проекта
 
 Сначала выведи фактическое состояние текущего commit. Не предполагай заранее:
 
-- точное количество runtime-профилей;
-- точный список моделей;
-- что все пункты старого README всё ещё верны;
-- что внутреннее legacy-имя автоматически является пользовательским дефектом;
-- что наличие кода означает доступность функции;
-- что тест существует и действительно проверяет заявленное поведение.
+- количество профилей и моделей;
+- актуальность README;
+- активность legacy-кода;
+- доступность функции только потому, что найден её класс или endpoint;
+- достаточность test coverage только потому, что test-файл существует.
 
-Особенно внимательно сопоставь README, CLI help, launcher, `.env.example`, Compose, backend schemas, frontend labels и tests. Если, например, один источник говорит о двух профилях, а другой — о трёх, это не повод молча выбрать удобный вариант: создай SPEC-GAP и подготовь живую проверку фактического разрешения профилей.
+Сопоставляй README, CLI help, launcher, `.env.example`, Compose, backend schemas, frontend labels и tests.
 
 Известные ориентиры, которые надо проверить, а не принять на веру:
 
-- Windows + PowerShell + Docker/WSL2;
-- FastAPI backend, REST API, NDJSON streaming и WebSocket events;
+- Windows/PowerShell launcher;
+- FastAPI backend, REST, streaming и WebSocket events;
 - Next.js Command Center;
-- локальный OpenAI-compatible LLM dispatcher/vLLM;
-- missions, planning, tool loop, approvals, memory, persona, learning и autonomy;
-- filesystem, host bridge/Windows native, Docker, browser/web и document tools;
-- ingestion Word/Excel/PDF/PPTX/text и document-surfer workflows;
+- локальный OpenAI-compatible LLM dispatcher;
+- missions, planning, tools, approvals, memory, persona, learning и autonomy;
+- filesystem, host, Docker, web/browser и document surfaces;
+- ingestion и document workflows;
 - SQLite/WAL persistent state;
-- offline-first локальное ядро с корректной деградацией сетевых функций;
-- тяжёлые данные вне Git-репозитория;
-- скрытый legacy-код не должен неожиданно просачиваться в пользовательские тексты или active routing.
+- offline-first локальное ядро;
+- тяжёлые данные вне Git;
+- скрытый legacy-код не должен просачиваться в активный UX или routing без контракта.
 
-Составь полный фактический каталог; этот список является только seed.
+Составь полный фактический каталог, а не ограничивайся этим seed-списком.
 
 ---
 
-## 4. Идентификаторы, статусы и доказательная дисциплина
+## 4. Идентификаторы и статусы
 
 Используй стабильные ID:
 
@@ -129,55 +126,48 @@ FEAT-...      функция/поверхность
 REQ-...       требование
 INV-...       инвариант
 SCN-...       сценарий
-TEST-...      тест/проверка
+TEST-...      проверка
 EVID-...      evidence
 JARVIS-....   finding
 CTASK-....    candidate task для будущего Spark
 ```
 
-### Статусы сценариев на PHASE A
+### Статусы PHASE A
 
-Разрешены только:
-
-- `PASS_HERMETIC` — реально выполнен в изолированном checkout и oracle проверен;
-- `FAIL_HERMETIC` — реально выполнен и нарушил контракт;
-- `STATIC_SUPPORTED` — вывод доказан кодом/схемой/графом, но не является runtime-прохождением;
-- `RUNTIME_CONFIRMATION_REQUIRED` — статический сигнал требует живой машины;
+- `PASS_HERMETIC` — проверка реально выполнена в изолированном checkout и oracle подтверждён;
+- `FAIL_HERMETIC` — проверка реально выполнена и контракт нарушен;
+- `STATIC_SUPPORTED` — вывод подтверждён кодом, схемой или графом, но не является runtime PASS;
+- `RUNTIME_CONFIRMATION_REQUIRED` — нужен живой runtime;
 - `BLOCKED_BY_ENV` — облачная среда не позволяет выполнить проверку;
 - `NOT_APPLICABLE` — доказуемо неприменимо;
 - `NOT_RUN` — ещё не выполнено;
 - `INCONCLUSIVE` — данные противоречивы.
 
-На PHASE A **не используй обычный `PASS` для runtime-сценариев**.
-
 ### Статусы findings
 
-- `static-confirmed` — дефект однозначно следует из контракта и кода либо воспроизводится hermetic-тестом;
-- `probable-runtime` — сильная гипотеза, которую должна проверить PHASE B;
-- `spec-gap` — желаемое поведение неоднозначно;
-- `test-gap` — опасная область не имеет достаточного oracle/coverage;
-- `refuted` — первоначальная гипотеза опровергнута в рамках PHASE A;
-- `inconclusive` — доказательств недостаточно.
+- `static-confirmed`;
+- `probable-runtime`;
+- `spec-gap`;
+- `test-gap`;
+- `refuted`;
+- `inconclusive`.
 
 Для каждой выполненной команды сохраняй:
 
 - UTC timestamp;
 - exact command;
 - working directory;
-- environment/tool versions;
+- tool/environment versions;
 - exit code;
 - duration;
 - stdout/stderr path;
-- связанные TEST/SCN IDs;
-- созданные или изменённые временные файлы.
-
-Для fuzz/property/model-based тестов сохраняй seed, budget, минимизированный input и команду воспроизведения.
+- связанные TEST/SCN IDs.
 
 ---
 
-## 5. Создай единый run и handoff
+## 5. Единый run-каталог
 
-В корне репозитория создай:
+Создай:
 
 ```text
 .audit/
@@ -232,42 +222,41 @@ CTASK-....    candidate task для будущего Spark
 <UTC timestamp>_<short source commit SHA>
 ```
 
-Пример:
-
-```text
-20260712T230500Z_748a892
-```
-
-В `.audit/LATEST_STATIC_RUN.txt` должна быть только относительная строка:
+`.audit/LATEST_STATIC_RUN.txt` содержит только:
 
 ```text
 .audit/runs/<RUN_ID>
 ```
 
-**Не создавай** `.audit/LATEST_COMPLETE_RUN.txt`, `.audit/LATEST_RUN.txt` и `spark/READY`: эти маркеры принадлежат только завершённой PHASE B. Это защищает пользователя от преждевременного запуска Spark по частичному аудиту.
+Не создавай:
 
-### Минимальная схема `PIPELINE_STATE.json`
+```text
+.audit/LATEST_COMPLETE_RUN.txt
+.audit/LATEST_RUN.txt
+spark/READY
+spark/safety/READY
+```
+
+Эти маркеры разрешены только после PHASE B.
+
+### `PIPELINE_STATE.json`
+
+Минимум:
 
 ```json
 {
   "schema_version": 1,
   "run_id": "...",
   "repository": "Dest1k/jarvis-gpt",
-  "source_commit": "full SHA audited before audit artifacts",
+  "source_commit": "full SHA before audit artifacts",
   "source_branch": "...",
   "phase_a": {
     "status": "IN_PROGRESS | COMPLETE | COMPLETE_WITH_BLOCKERS | INCOMPLETE",
-    "started_at_utc": "...",
-    "finished_at_utc": null,
     "executor": "Sol Ultra / Work",
     "live_machine_access": false
   },
-  "phase_b": {
-    "status": "NOT_STARTED"
-  },
-  "spark": {
-    "status": "LOCKED_UNTIL_PHASE_B"
-  },
+  "phase_b": {"status": "NOT_STARTED"},
+  "spark": {"status": "LOCKED_UNTIL_PHASE_B"},
   "canonical_local_paths": {
     "repo_root": "D:\\jarvis-gpt",
     "data_root": "D:\\jarvis"
@@ -275,161 +264,151 @@ CTASK-....    candidate task для будущего Spark
 }
 ```
 
-Зафиксируй `source_commit` **до** создания `.audit`. Он обозначает именно версию production-кода, а не будущий commit с отчётами.
+Зафиксируй `source_commit` до создания `.audit`.
 
 ---
 
-## 6. Организация субагентов и устойчивость длинной работы
+## 6. Организация работы
 
-Если доступны Ultra/subagents, раздели read-only работу на независимые направления:
+Если доступны параллельные рабочие потоки, раздели read-only исследование:
 
-1. repository inventory и architecture map;
-2. launcher/PowerShell/config/Compose;
-3. backend/API/WebSocket/storage;
-4. agent core/LLM/tool loop/memory/persona/learning;
-5. web/browser/document surfaces;
-6. frontend/GUI state machine и accessibility по коду;
-7. security/privacy/trust boundaries;
-8. tests/coverage/property/fuzz/mutation;
-9. независимый adversarial reviewer, который ищет пропуски и ложные выводы.
+1. inventory и architecture;
+2. launcher/config/Compose;
+3. backend/API/storage;
+4. agent/LLM/tool orchestration/memory;
+5. web/document/file surfaces;
+6. frontend/GUI state по коду;
+7. defensive design и sensitive-data handling;
+8. tests/coverage/quality gates;
+9. независимая проверка полноты и противоречий.
 
-Главный агент обязан:
-
-- проверить первичные источники каждого вывода;
-- дедуплицировать findings по root cause;
-- не принимать краткий отчёт субагента без ссылок на файлы/symbols/evidence;
-- сериализовать изменения `.audit`, чтобы субагенты не перезаписывали друг друга;
-- постоянно обновлять `AUDIT_STATE.md` и `AUDIT_JOURNAL.md`;
-- после compaction перечитать `PIPELINE_STATE.json`, `AUDIT_STATE.md` и текущий workstream.
+Главный агент обязан проверять первичные источники, дедуплицировать findings, сохранять точные ссылки на файлы/symbols и сериализовать запись `.audit`.
 
 ---
 
-## 7. PHASE A0 — preflight и источник истины
+## 7. PHASE A0 — baseline
 
 1. Найди Git root.
-2. Зафиксируй remote, branch, полный commit SHA, parent SHA, tags, submodules и `git status`.
+2. Зафиксируй remote, branch, full SHA, parent, tags, submodules и status.
 3. Отдели tracked source от generated/vendor/cache/build artifacts.
-4. Прочитай README, CONTRIBUTING, AGENTS/CLAUDE/CODEX-инструкции, docs, help-тексты, schemas, examples и comments, но не считай документацию автоматически истинной.
-5. Найди штатные команды test/lint/type/build/doctor/compose-config.
-6. Зафиксируй доступные версии Python, Node, npm/pnpm/yarn, PowerShell (если есть), Docker CLI (только версия; daemon не использовать), linters и test runners.
-7. Создай `SOURCE_BASELINE.json` и первые строки журнала.
-8. Проверь, что production working tree не изменяется в процессе аудита. Любое случайное изменение немедленно откати только для созданного тобой файла и задокументируй.
+4. Прочитай README, docs, repository instructions, schemas, examples и help-тексты.
+5. Найди штатные test/lint/type/build/doctor/config commands.
+6. Зафиксируй доступные версии Python, Node, package managers, PowerShell и test tools.
+7. Создай `SOURCE_BASELINE.json` и журнал.
+8. Проверяй, что production working tree не меняется.
 
 ---
 
-## 8. PHASE A1 — полный индекс репозитория
+## 8. PHASE A1 — полный индекс
 
-Построй полный индекс tracked-файлов с классификацией:
+Проиндексируй все tracked-файлы и классифицируй:
 
 ```text
 production | test | config | script | documentation | schema |
 migration | generated | vendored | legacy | unknown
 ```
 
-Для каждого значимого файла укажи:
+Для значимых файлов укажи:
 
-- path;
-- язык/формат;
-- роль;
-- публичные entry points;
-- владельца подсистемы;
+- path и роль;
+- public entry points;
+- подсистему;
 - входящие/исходящие зависимости;
 - persistence/network/process side effects;
-- тестовое покрытие;
-- был ли файл реально просмотрен;
-- риск и необходимость PHASE B.
+- test coverage;
+- был ли файл просмотрен;
+- необходимость PHASE B.
 
-Найди и перечисли:
+Обязательно найди:
 
 - CLI/launcher/PowerShell entry points;
-- backend apps/routes/dependencies/middleware;
-- WebSocket и streaming contracts;
+- backend routes, middleware и dependencies;
+- stream/WebSocket contracts;
 - frontend pages/components/hooks/stores/service worker;
 - profile/model/config resolution;
-- Dockerfiles/Compose profiles/services/networks/volumes/healthchecks;
-- LLM providers, dispatchers, fallback paths, token/stream processing;
-- planners, missions, tools, approvals и host actions;
-- memory/persona/experience/learning/autonomy/self-heal;
+- Dockerfiles/Compose services/profiles/volumes/healthchecks;
+- LLM providers, dispatchers и fallback paths;
+- missions, tools, approvals и host actions;
+- memory/persona/learning/autonomy/self-heal;
 - web/browser/search/weather/watch/archive/feed/shop surfaces;
 - document ingestion/recall/review/convert/edit paths;
-- SQLite schema, migrations, WAL, cache/index lifecycle;
+- SQLite schema, migrations, WAL и indexes;
 - background jobs, retries, queues, timers и supervisors;
-- logging/audit/telemetry/benchmark/evidence paths;
-- feature flags и env precedence;
-- внешние библиотеки, system commands и network destinations.
+- logging/audit/telemetry/benchmark paths;
+- env precedence и feature flags;
+- внешние библиотеки, system commands и network dependencies.
 
-Каждая публичная функция, endpoint, event, CLI command, UI control, tool и profile должна получить `FEAT-...` либо явную запись `LEGACY/INACTIVE` с доказательством.
+Каждая public feature, endpoint, event, CLI command, UI control, tool и profile получает `FEAT-...` либо статус `LEGACY/INACTIVE` с доказательством.
 
 ---
 
-## 9. PHASE A2 — карта архитектуры, данных и доверительных границ
+## 9. PHASE A2 — архитектура и данные
 
-Создай `SYSTEM_MAP.md` с диаграммами и точными file/symbol references:
+Создай `SYSTEM_MAP.md`:
 
 - process/service topology;
-- startup/shutdown/control flow;
-- request path: UI/CLI → API → agent → model/tools → storage → response;
+- startup/shutdown flow;
+- UI/CLI → API → agent → model/tools → storage → response;
 - streaming/event path;
-- model/profile resolution path;
-- approval path;
-- host bridge/native action path;
-- web/document ingestion path;
-- persistent state lifecycle;
-- background jobs/supervisor;
-- trust boundaries и privilege transitions;
-- secret flow и redaction points;
-- paths from untrusted content into prompts, tools, shell, browser, files and DB.
+- profile/model resolution;
+- approval and host-action flow;
+- document/web ingestion flow;
+- persistent-state lifecycle;
+- background jobs;
+- privilege and trust transitions;
+- sensitive-data flow и redaction points;
+- пути от недоверенного input к parser, model, tool, files и DB.
 
-В `DATA_AND_TRUST_BOUNDARIES.md` перечисли для каждого типа данных:
+В `DATA_AND_TRUST_BOUNDARIES.md` для каждого типа данных укажи:
 
-- source и trust level;
+- source и уровень доверия;
 - validation/canonicalization;
-- storage location;
+- storage;
 - retention/deletion;
-- logging/audit exposure;
-- cross-session isolation;
-- sinks и dangerous interpreters;
-- PHASE B tests.
+- logging exposure;
+- session isolation;
+- consumers/sinks;
+- какие безопасные runtime checks нужны PHASE B.
 
 ---
 
-## 10. PHASE A3 — поведенческий контракт и инварианты
+## 10. PHASE A3 — поведенческий контракт
 
-Собери контракт из текущих источников в порядке:
+Собери контракт в порядке:
 
-1. явные требования текущего репозитория и актуальные operator docs;
+1. актуальные operator docs и явные требования;
 2. public CLI/API/schema/UI promises;
 3. tests;
 4. configuration/defaults;
 5. implementation.
 
-При конфликте не угадывай — создай SPEC-GAP с точными цитатами и путями.
+При конфликте создавай `SPEC_GAP`.
 
 Минимальные классы инвариантов:
 
-- профиль выбирает только предназначенную ему конфигурацию/модель;
-- локальное ядро готового изделия не требует интернета, кроме явно сетевых функций;
-- сетевой feature failure не ломает локальный chat/runtime и объясняется пользователю;
-- один запрос/сессия не теряется, не дублируется и не смешивается с другой;
+- профиль выбирает предназначенную конфигурацию и модель;
+- локальное ядро готового изделия не зависит от интернета, кроме явно сетевых функций;
+- сетевой feature failure не ломает локальные функции;
+- запросы и сессии не теряются, не дублируются и не смешиваются;
 - cancel/retry не повторяет необратимые side effects;
-- approval привязан к точному действию и аргументам, не расширяется неявно;
+- approval привязан к точному действию и аргументам;
 - model/tool failure не отображается как успех;
-- stream сохраняет порядок и имеет terminal state;
-- restart/crash не оставляет silent-corrupt persistent state;
+- stream сохраняет порядок и terminal state;
+- restart/crash не оставляет silent-corrupt state;
 - repeated start/stop не накапливает orphan resources;
-- secrets/PII не попадают в logs/UI/model context/audit;
-- untrusted web/document/tool output не получает управляющих привилегий;
-- filesystem roots и path normalization не обходятся traversal/junction/symlink tricks;
+- чувствительные данные не попадают в лишние logs/UI/model context;
+- недоверенный контент не получает управляющих привилегий;
+- filesystem roots и path normalization соблюдаются;
 - schema/version drift не приводит к silent data loss;
 - frontend state соответствует backend truth;
 - disabled/legacy feature не появляется в active routing или UI без контракта;
-- nondeterministic текст LLM оценивается по семантическому контракту, а не exact string.
+- nondeterministic LLM output оценивается по semantic contract, а не exact string.
 
-Каждый `FEAT` должен иметь `REQ/INV` либо `SPEC-GAP`.
+Каждый `FEAT` получает `REQ/INV` либо `SPEC_GAP`.
 
 ---
 
-## 11. PHASE A4 — инвентаризация и hermetic-запуск тестов
+## 11. PHASE A4 — tests и безопасные hermetic-проверки
 
 Создай `TEST_INVENTORY.md`:
 
@@ -437,219 +416,185 @@ migration | generated | vendored | legacy | unknown
 - fixtures/mocks/fakes;
 - network/Docker/model/host dependencies;
 - skipped/xfail/disabled/flaky markers;
-- фактические assertions;
+- реальные assertions;
 - feature/requirement coverage;
-- тесты, которые могут проходить без проверки результата;
-- offline reproducibility;
-- недостающие negative/recovery tests.
+- tests, которые могут проходить без meaningful oracle;
+- недостающие positive/error/recovery tests.
 
-Выполни все доступные repository-only проверки, например, если они предусмотрены проектом:
+Запусти все доступные repository-only проверки, которые не требуют живого runtime:
 
-- Python syntax/compile/import checks;
+- Python syntax/compile/import;
 - unit/integration suites с fake/mocked dependencies;
-- ruff/flake/mypy/pyright либо фактические эквиваленты;
+- lint/type checks;
 - API/schema/OpenAPI consistency;
-- frontend lint/typecheck/unit tests/build в sandbox;
-- PowerShell parser/static analysis, если инструмент доступен;
-- Compose/YAML/JSON/TOML/env static rendering/validation;
-- generated schema/client drift checks;
-- line/branch coverage ключевых модулей;
-- deterministic smoke CLI, который не поднимает сервисы и не обращается к host runtime.
+- frontend lint/typecheck/unit/build в sandbox;
+- PowerShell parser/static analysis, если доступно;
+- YAML/JSON/TOML/env/Compose static rendering;
+- generated schema/client drift;
+- coverage ключевых модулей;
+- deterministic CLI checks без запуска сервисов.
 
-Перед каждым test command определи, не пытается ли он:
+Перед каждой командой проверь, что она не стартует Docker/WSL/services, не обращается к real LLM, не пишет в `D:\jarvis`, не читает пользовательскую БД и не открывает внешнюю сеть. Такие tests переносятся в `LIVE_SCENARIO_QUEUE.csv`.
 
-- стартовать Docker/WSL/services;
-- обратиться к реальной LLM;
-- писать в `D:\jarvis`;
-- читать пользовательскую БД;
-- открывать браузер или сеть;
-- выполнять host commands.
-
-Если пытается — не запускай в PHASE A; перенеси в `LIVE_SCENARIO_QUEUE.csv`.
-
-Проверь качество тестов через выборочный mutation testing или ручные безопасные мутации в временной копии. Не изменяй tracked source. Докажи, что критичные tests действительно краснеют при нарушении инварианта.
+Для оценки качества tests используй безопасные методы: review assertions, временные локальные изменения в копии, boundary/property checks чистых функций. Не меняй tracked source.
 
 ---
 
-## 12. PHASE A5 — глубокий статический аудит по подсистемам
+## 12. PHASE A5 — глубокий review по подсистемам
 
-### 12.1. Launcher, PowerShell, profiles, env и Compose
+### 12.1 Launcher, profiles, env и Compose
 
 Проверь:
 
-- quoting/escaping/path handling;
+- quoting, escaping и path handling;
 - запуск из другого cwd;
-- пробелы, кириллица, длинные пути;
-- env precedence и empty/malformed values;
-- profile aliases, defaults, unknown profile;
+- пробелы, кириллицу и длинные пути;
+- env precedence, пустые и malformed values;
+- aliases/defaults/unknown profile;
 - model/profile mismatch;
-- duplicate/conflicting configuration sources;
-- accidental pull/build/download/registry/package resolution;
-- offline policy и image tags/digests;
-- startup ordering/healthcheck assumptions;
-- stale PID/lock/container detection;
+- конфликтующие config sources;
+- возможный неожиданный pull/build/download/metadata lookup;
+- offline policy и image pinning;
+- startup ordering и health assumptions;
+- stale PID/lock/container handling;
 - idempotency start/stop/restart;
 - process cleanup;
-- dangerous broad Docker/WSL commands;
-- accidental use of inactive/legacy model names;
-- diagnostics that hide root cause.
+- слишком широкие Docker/WSL operations;
+- inactive/legacy names в active paths;
+- качество диагностики.
 
-Всё, что зависит от реального resolved Compose/runtime, оформи как точный PHASE B scenario.
-
-### 12.2. Backend, API, streaming и WebSocket
+### 12.2 Backend, API, streaming и WebSocket
 
 Проверь:
 
-- input/output schemas и drift;
-- validation of missing/extra/wrong/oversized fields;
-- auth/origin/bind/CORS assumptions;
+- schemas и drift;
+- missing/extra/wrong/oversized fields;
+- bind/origin/CORS/auth assumptions;
 - exception handling и silent success;
 - cancellation propagation;
-- disconnect/reconnect lifecycle;
+- reconnect lifecycle;
 - ordering, duplicate/late/missing terminal events;
-- backpressure/slow consumer;
+- slow consumers и backpressure;
 - idempotency/retry;
 - async task leaks/races/deadlocks;
 - resource cleanup;
-- correlation IDs/logging/redaction;
-- error mapping machine-readable ↔ user-facing;
-- route/tool registration consistency;
-- persisted conversation/mission state transitions.
+- correlation IDs, logging и redaction;
+- persisted state transitions.
 
-### 12.3. Agent core, LLM/provider, missions и tools
+### 12.3 Agent, LLM/provider, missions и tools
 
 Проверь:
 
-- intent routing, deterministic shortcuts и model arbitration;
+- intent routing и deterministic shortcuts;
 - planner/executor disagreement;
 - loop/step budgets;
 - malformed/partial/duplicate tool calls;
 - invalid tool names/args/types;
-- tool permission and approval binding;
+- permission and approval binding;
 - retries around side effects;
-- cancellation before/during/after side effect;
-- huge/binary-like/escape-sequence tool output;
-- prompt injection from user/file/web/tool/memory;
-- context truncation and evidence loss;
-- hallucinated success paths;
-- fallback behavior without provider;
-- cross-session leakage;
+- cancellation timing;
+- huge or unusual tool output;
+- untrusted content entering model/tool context;
+- context truncation и evidence loss;
+- false-success paths;
+- provider-unavailable fallback;
+- cross-session isolation;
 - mission resume/final report integrity;
-- self-verification/rewrite loops;
-- learning/persona feedback poisoning;
-- autonomy/self-heal safety boundaries.
+- self-verification loops;
+- persona/learning data quality;
+- autonomy/self-heal boundaries.
 
-### 12.4. Storage, memory, persona, learning и jobs
+### 12.4 Storage, memory, persona и jobs
 
 Проверь:
 
 - SQLite migrations/schema versioning;
-- transaction boundaries, WAL, locks, retries;
+- transactions, WAL, locks и retries;
 - partial writes и atomicity;
-- duplicate events/idempotency keys;
-- corruption detection/recovery paths;
+- duplicate events/idempotency;
+- corruption detection/recovery design;
 - cleanup/retention/size bounds;
 - session isolation;
 - stale indexes/cache invalidation;
-- memory/persona dedup and poisoning;
-- concurrency between supervisor/jobs/UI/API;
-- timezone/clock jump behavior;
-- unsafe serialization/deserialization;
-- secret/PII retention and deletion semantics.
+- memory/persona dedup and quality controls;
+- background-job concurrency;
+- timezone/clock handling;
+- serialization safety;
+- sensitive-data retention.
 
-### 12.5. Web, browser, shopping, weather, watch и evidence
+### 12.5 Web/browser/document/file surfaces
 
-Проверь:
+Проверь защитный дизайн:
 
-- SSRF/url validation/DNS rebinding assumptions;
-- redirects, schemes, credentials-in-URL, localhost/private ranges;
-- download quarantine, archive paths, MIME confusion;
-- prompt injection from fetched content;
-- source attribution/citation/provenance integrity;
-- cache freshness and stale-result labeling;
-- parser/render fallback correctness;
-- browser policy/approval binding/multi-tab isolation;
-- timeout/cancel/retry;
-- external content size limits;
-- log/terminal escape injection;
-- deterministic named-shop routing and constraints;
-- online-only functions degrading without breaking local core.
-
-Не выполняй реальные external requests в PHASE A; подготовь mocks/hermetic tests и live scenarios.
-
-### 12.6. Documents и file ingestion
-
-Проверь:
-
-- allowed roots/path normalization;
-- traversal/junction/symlink/archive-slip;
-- malicious/ambiguous filenames;
-- oversized files/decompression bombs;
-- MIME/extension mismatch;
+- URL validation и destination restrictions;
+- redirect/scheme handling;
+- download quarantine и type detection;
+- isolation of untrusted page/document content;
+- source attribution and provenance;
+- cache freshness labeling;
+- parser/render fallback;
+- browser policy/approval/session isolation;
+- timeout/cancel/recovery;
+- external-content size limits;
+- allowed roots and path normalization;
+- filename/extension/MIME inconsistencies;
+- oversized input handling;
 - parser failure isolation;
-- macro/external-link behavior;
-- formula and spreadsheet edge cases;
-- PDF/OCR fallback semantics;
-- copy-on-write guarantee;
-- original-file preservation;
-- output collisions;
-- encoding/Unicode;
+- copy-on-write and original preservation;
+- output collision handling;
+- Unicode/encoding;
 - chunk/index consistency;
-- prompt injection in document content;
-- persisted source provenance;
-- safe cleanup and retention.
+- cleanup and retention.
 
-### 12.7. Frontend, service worker и GUI state machine по коду
+Не выполняй active network/security tests в PHASE A.
 
-Статически проверь:
+### 12.6 Frontend и GUI state по коду
+
+Проверь:
 
 - API/schema drift;
 - stale closures/unhandled promises;
 - duplicate submit/events;
 - stream cancel/reconnect;
 - stale optimistic success;
-- error and degraded states;
-- history restore and cross-session state;
-- focus/keyboard/accessibility semantics;
-- long text/code/table/URL layout constraints;
+- error/degraded states;
+- history restore and session state;
+- keyboard/focus/accessibility semantics;
+- long text/code/table/URL layout assumptions;
 - resize/DPI assumptions;
-- service-worker cache invalidation/offline shell;
-- dangerous HTML/Markdown rendering/XSS;
-- secret exposure;
-- active profile/model/status display;
+- service-worker cache invalidation;
+- safe rendering of untrusted text;
+- sensitive-data exposure;
+- profile/model/status display;
 - hidden legacy labels.
 
-Не объявляй визуальный PASS без PHASE B screenshots and interaction.
+Не объявляй визуальный PASS без PHASE B.
 
-### 12.8. Security, privacy и dependencies
+### 12.7 Defensive design и dependencies
 
-Построй threat model и проверь:
+Проверь на уровне architecture/code review:
 
-- command/PowerShell/shell injection;
-- arbitrary file read/write;
-- path/junction/symlink confusion;
-- unsafe deserialization;
-- secret leakage;
-- weak local auth/CORS/bind defaults;
-- privilege boundary errors;
-- tool/approval bypass;
-- prompt injection;
-- SSRF;
+- validation before executing commands/actions;
+- file-root boundaries;
+- sensitive-data handling;
+- local API exposure and defaults;
+- least privilege for tools and approvals;
+- safe deserialization and schema enforcement;
+- network destination restrictions;
 - dependency/image pinning;
-- known-vulnerability scan только с честной датой базы;
-- typosquatting/untrusted install hooks;
-- credentials in history/config/tests;
-- log injection;
-- unsafe retry of destructive actions.
+- install hooks and reproducibility;
+- credentials accidentally committed;
+- log/control-character handling;
+- retry behavior for state-changing actions.
 
-Не выдавай offline/stale vulnerability database за актуальную гарантию.
+Любую активную проверку оставь PHASE B и опиши безопасно, без operational payloads.
 
-### 12.9. Performance и resource risks по коду
+### 12.8 Performance/resource risks по коду
 
 Найди:
 
 - unbounded queues/history/logs/cache;
-- O(n²) и repeated full scans;
+- repeated full scans и очевидные complexity hot spots;
 - blocking I/O in async paths;
 - runaway retries/timers;
 - leaked tasks/processes/files/sockets;
@@ -660,33 +605,32 @@ migration | generated | vendored | legacy | unknown
 - frontend render storms;
 - storage growth without retention.
 
-Все измерения оставь PHASE B.
+Численные измерения оставь PHASE B.
 
 ---
 
-## 13. PHASE A6 — поиск неизвестных классов ошибок
+## 13. PHASE A6 — поиск скрытых ошибок безопасными методами
 
-Где безопасно и технически разумно, выполни:
+Где разумно, используй:
 
-- property-based testing чистых функций и parsers;
-- grammar/schema-aware fuzzing API payloads, configs, tool calls и event parsers;
-- stateful/model-based tests для детерминированных state machines;
-- metamorphic tests для эквивалентных inputs/config order;
-- mutation testing критических validation/permission paths;
-- differential tests между двумя реализациями/fallbacks;
-- seeded random action sequences на fake runtime;
-- static call graph/data flow/taint-like tracing;
-- TODO/FIXME/HACK/dead/unreachable/legacy branch review;
+- property-based tests чистых parsers/state functions;
+- schema-aware generation только для локальных test interfaces;
+- model-based tests детерминированных state machines;
+- metamorphic tests эквивалентных inputs/config order;
+- differential checks implementations/fallbacks;
+- seeded random sequences на fake runtime;
+- call graph/data flow review;
+- TODO/FIXME/HACK/dead/legacy branch review;
 - exception-path inventory;
-- negative-space review: функции, о которых документация обещает больше, чем код.
+- negative-space review: docs обещают больше, чем code/tests.
 
-Установи budgets/watchdogs. Не допускай бесконтрольного fuzz, расхода диска или зависания Work.
+Используй строгие budgets и watchdogs. Никакой внешней сети и active security testing.
 
 ---
 
-## 14. PHASE A7 — матрица сценариев и точный план живого аудита
+## 14. PHASE A7 — scenario matrices и handoff
 
-Создай `STATIC_SCENARIO_MATRIX.csv` минимум со столбцами:
+`STATIC_SCENARIO_MATRIX.csv` минимум:
 
 ```text
 scenario_id,feature_ids,requirement_ids,domain,component,method,
@@ -695,7 +639,7 @@ network_state,resource_state,storage_state,concurrency,permissions,
 locale_encoding,phase,status,evidence_ids,finding_ids,notes
 ```
 
-Для runtime-части создай `LIVE_SCENARIO_QUEUE.csv`:
+`LIVE_SCENARIO_QUEUE.csv` минимум:
 
 ```text
 order,scenario_id,priority,risk,domain,feature_ids,requirement_ids,
@@ -705,36 +649,34 @@ telemetry_to_capture,safety_isolation,cleanup,repeat_count,
 time_budget,source_findings,dependencies,status,notes
 ```
 
-Каждый live-сценарий должен быть достаточно точным, чтобы PHASE B не придумывала постановку заново.
-
-Минимальные измерения для PHASE B:
+Live-сценарии должны быть функциональными и безопасными. Они могут охватывать:
 
 - все фактические profiles;
 - stopped/starting/ready/busy/degraded/recovering;
-- online/offline/intermittent/DNS/registry-blocked;
-- model ready/loading/slow/error/OOM/disconnected;
-- API/WS normal/slow/disconnected/reconnected/duplicate/out-of-order;
-- empty/tiny/large/Unicode/Cyrillic/emoji/code/JSON/malformed inputs;
-- tool success/failure/timeout/cancel/partial/huge/permission/retry;
-- one/multi-session and concurrent/cancel+new request;
-- storage normal/locked/read-only/nearly-full/corrupt-copy/partial-write;
-- ordinary/spaces/Cyrillic/long paths;
-- normal/elevated/denied permissions where applicable;
+- online/offline/intermittent connectivity;
+- model ready/loading/slow/error/disconnected;
+- API/stream/WebSocket normal/slow/disconnected/reconnected;
+- empty/large/Unicode/code/JSON/malformed inputs;
+- tool success/failure/timeout/cancel/partial/retry;
+- multi-session/concurrent/cancel+new request;
+- storage normal/locked/read-only/nearly-full/copy-based recovery;
+- paths с пробелами/кириллицей;
+- ordinary/denied permissions;
 - clock/timeout boundaries;
 - GUI sizes/DPI/stream/error/long-history states.
 
-Используй pairwise для широкого покрытия, 3-way/4-way для high-risk пересечений, boundary values, decision tables, model-based sequences и targeted exhaustive для малых конечных пространств.
+Для destructive/corruption scenarios требуй копии, synthetic roots и cleanup. Не включай exploit payloads или действия против внешних систем.
 
 ---
 
-## 15. Формат finding PHASE A
+## 15. Формат finding
 
 Каждый `findings/JARVIS-NNNN.md`:
 
 ```yaml
 id: JARVIS-0001
 title: "..."
-kind: defect | security | reliability | performance | ux | spec-gap | test-gap
+kind: defect | reliability | data-integrity | performance | ux | defensive-design | spec-gap | test-gap
 severity: critical | high | medium | low
 priority: P0 | P1 | P2 | P3
 phase_a_status: static-confirmed | probable-runtime | spec-gap | test-gap | refuted | inconclusive
@@ -750,102 +692,91 @@ phase_b_scenarios: []
 candidate_task_ids: []
 ```
 
-Обязательные разделы:
+Разделы:
 
 1. Summary.
 2. Contract and impact.
-3. Static evidence with exact paths/symbols/line ranges.
+3. Static evidence with exact paths/symbols.
 4. Hermetic reproduction, если есть.
 5. Expected vs observed.
 6. Why runtime confirmation is or is not required.
-7. Root cause: confirmed / strong hypothesis / unknown.
-8. Affected paths and data flow.
-9. Security/data-integrity implications.
-10. Exact PHASE B confirmation/refutation procedure.
+7. Root cause: confirmed / hypothesis / unknown.
+8. Affected flow.
+9. Data-integrity, privacy or permission implications, если применимо.
+10. Exact safe PHASE B confirmation/refutation procedure.
 11. Suggested remediation direction без production fix.
 12. Regression risks.
 13. Acceptance criteria draft.
 14. Related findings/spec/test gaps.
 
-Severity не завышай. Дедуплицируй общую root cause, но сохрани все симптомы/scenarios.
+Дедуплицируй findings по root cause и не завышай severity.
 
 ---
 
-## 16. Candidate tasks для Spark — только заготовки
+## 16. Candidate tasks для Spark
 
-Для статически подтверждённых или сильных findings можно создать `candidate_tasks/CTASK-NNNN.md`, но:
+Можно создать `candidate_tasks/CTASK-NNNN.md`, но:
 
-- status должен быть `AWAITING_PHASE_B`, `BLOCKED_BY_SPEC` либо `STATIC_ONLY_REVIEW_REQUIRED`;
+- status только `AWAITING_PHASE_B`, `BLOCKED_BY_SPEC` или `STATIC_ONLY_REVIEW_REQUIRED`;
 - не помещай их в финальную Spark queue;
-- не создавай `spark/READY`;
-- укажи, какие runtime checks должны быть выполнены перед переводом в READY;
-- декомпозируй до одного дефекта/одной root cause/не более одной подсистемы;
+- не создавай READY markers;
+- укажи runtime checks до READY;
+- одна candidate task = одна root cause/одна подсистема;
 - перечисли context files, tentative allowed files, regression test и acceptance criteria;
-- не заставляй Spark принимать архитектурное решение без контракта.
-
-PHASE B будет обязана подтвердить, исправить и переиздать эти задачи в финальном `spark/tasks/`.
+- не перекладывай на Spark архитектурное решение без контракта.
 
 ---
 
 ## 17. Handoff для PHASE B
 
-Создай `handoff/PHASE_B_START_HERE.md`. Он должен содержать:
+Создай `handoff/PHASE_B_START_HERE.md`:
 
 1. run path и source commit;
-2. что именно PHASE A выполнила;
-3. какие команды и suites реально запускались;
-4. статистику `PASS_HERMETIC/FAIL_HERMETIC/BLOCKED/INCONCLUSIVE`;
-5. список static-confirmed findings;
-6. список probable-runtime findings;
-7. top SPEC/TEST gaps;
-8. точный порядок `LIVE_SCENARIO_QUEUE.csv`;
-9. machine prerequisites для каждого блока;
-10. destructive-risk/isolation notes;
+2. что выполнила PHASE A;
+3. реальные commands/suites;
+4. counts результатов;
+5. static-confirmed findings;
+6. probable-runtime findings;
+7. top spec/test gaps;
+8. порядок `LIVE_SCENARIO_QUEUE.csv`;
+9. prerequisites;
+10. safety/isolation notes;
 11. source drift policy;
-12. какие artifacts PHASE B должна обновить, а какие сохранить immutable;
-13. условия, при которых объединённый аудит считается завершённым;
-14. указание не создавать Spark READY до конца runtime-кампании.
+12. какие artifacts PHASE B обновляет, а какие сохраняет;
+13. критерии завершения объединённого аудита;
+14. явный запрет Spark READY до конца PHASE B.
 
-### Source drift policy
+### Source drift
 
-PHASE B должна сравнить текущий production tree с `source_commit`, исключив только:
+PHASE B сравнивает production tree с `source_commit`, исключая:
 
 ```text
 .audit/**
 docs/audit/**
 ```
 
-Если production-код изменился:
-
-- сохранить `SOURCE_DRIFT.md`;
-- перечислить changed files/commits;
-- повторно статически проверить затронутые features/contracts;
-- не переносить старый вывод на новый код без переоценки;
-- продолжить тот же run только при управляемом drift, иначе создать derived run с явной связью.
-
-Опиши эту политику в отдельном `SOURCE_DRIFT_POLICY.md`.
+При drift она создаёт `SOURCE_DRIFT.md`, перечитывает затронутые files, повторяет релевантные checks и не переносит старые conclusions автоматически.
 
 ---
 
-## 18. Traceability и consistency checks
+## 18. Traceability consistency
 
-Поддерживай связь:
+Поддерживай:
 
 ```text
 feature -> requirement/invariant -> scenario/test -> result -> evidence
-        -> finding -> live confirmation scenario -> candidate task
+        -> finding -> live scenario -> candidate task
 ```
 
-Создай consistency-check harness, который обнаруживает:
+Создай consistency harness, который обнаруживает:
 
-- неизвестные IDs;
-- duplicate IDs;
+- unknown/duplicate IDs;
 - feature без contract/spec-gap;
-- high-risk requirement без positive/negative scenario;
+- high-risk requirement без positive/error/recovery scenario;
 - FAIL без finding;
 - finding без evidence;
 - probable-runtime finding без PHASE B scenario;
-- candidate task без source finding;
+- candidate task без finding;
 - runtime scenario, ошибочно отмеченный PASS на PHASE A;
 - broken paths/references.
 
@@ -857,39 +788,54 @@ feature -> requirement/invariant -> scenario/test -> result -> evidence
 
 Не ставь `phase_a.status = COMPLETE`, пока:
 
-1. проиндексированы все tracked source/config/test/script/doc files;
-2. построена фактическая карта компонентов, entry points, data stores и trust boundaries;
-3. каждая публичная feature получила ID;
-4. каждой feature назначен contract/invariant или SPEC-GAP;
-5. существующие tests инвентаризированы и все безопасные hermetic checks выполнены либо точно заблокированы;
-6. создано статическое coverage/gap описание;
-7. выполнен глубокий аудит всех подсистем;
-8. применены методы поиска неизвестных ошибок там, где это разумно;
+1. проиндексированы tracked source/config/test/script/doc files;
+2. построена карта компонентов, entry points, data stores и trust boundaries;
+3. public features получили IDs;
+4. features связаны с contracts/invariants либо SPEC-GAP;
+5. tests инвентаризированы, а безопасные hermetic checks выполнены или точно заблокированы;
+6. создан coverage/gap report;
+7. выполнен review всех подсистем;
+8. использованы безопасные методы поиска скрытых ошибок;
 9. findings имеют evidence и честный статус;
-10. каждый probable-runtime finding имеет точный live scenario;
-11. создана полная `LIVE_SCENARIO_QUEUE.csv` с safety/cleanup/oracles;
-12. создан handoff для PHASE B;
-13. consistency-check проходит;
-14. production-код не был исправлен или случайно изменён;
-15. не созданы маркеры завершённого объединённого аудита или Spark READY.
+10. probable-runtime findings имеют live scenarios;
+11. `LIVE_SCENARIO_QUEUE.csv` имеет safety, cleanup и oracles;
+12. создан PHASE B handoff;
+13. consistency harness PASS;
+14. production-код не изменён;
+15. не созданы combined-audit или Spark READY markers.
 
-Если не всё возможно, установи `COMPLETE_WITH_BLOCKERS` только когда вся доступная PHASE A работа закончена, а блокеры документированы. `INCOMPLETE` используй, если работа реально оборвалась.
+`COMPLETE_WITH_BLOCKERS` допустим, если вся доступная работа закончена, а блокеры документированы. `INCOMPLETE` — если работа оборвалась.
 
 ---
 
-## 20. Финальный ответ Work
+## 20. Сохранение результата
 
-Не выгружай весь аудит в чат. Сначала сохрани артефакты. Затем сообщи:
+Предпочтительный вариант:
+
+1. создать branch `audit/phase-a-<RUN_ID>` от зафиксированного source commit;
+2. добавить только `.audit/**`;
+3. проверить, что production files не изменены;
+4. создать audit-only commit;
+5. не merge и не push в другие ветки сверх возможностей Work;
+6. в финальном ответе указать branch, commit и способ забрать результат.
+
+Если Work может коммитить только в предоставленную ветку, используй её, но stage только `.audit/**`. Если запись в Git недоступна, сохрани полный набор artifacts доступным способом и явно укажи blocker.
+
+---
+
+## 21. Финальный ответ Work
+
+Не вставляй огромный отчёт в чат. Сначала сохрани artifacts. Затем кратко сообщи:
 
 - путь из `.audit/LATEST_STATIC_RUN.txt`;
-- `source_commit` и branch;
-- количество features/requirements/scenarios/tests;
+- source commit и branch;
+- audit artifact branch/commit;
+- counts features/requirements/scenarios/tests;
 - результаты hermetic checks;
-- findings по severity и статусу;
+- findings по severity/status;
 - крупнейшие SPEC/TEST gaps;
-- количество и приоритет live-сценариев;
-- точный путь к `handoff/PHASE_B_START_HERE.md`;
-- commit/branch, где сохранены audit artifacts, либо точный blocker публикации;
-- явную фразу, что runtime ещё не проверен и Spark пока заблокирован.
+- количество live-сценариев;
+- путь к `handoff/PHASE_B_START_HERE.md`;
+- явную фразу, что runtime ещё не проверен и Spark заблокирован.
 
-Красивый отчёт без полного file inventory, выполненных hermetic checks, traceability и исполнимого handoff считается провалом PHASE A.
+Красивое резюме без file inventory, выполненных hermetic checks, evidence, traceability и исполнимого PHASE B handoff считается незавершённой PHASE A.
