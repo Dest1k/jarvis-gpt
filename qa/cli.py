@@ -27,9 +27,13 @@ from .scenario_loader import load_suite, validate_suite
 
 
 def _emit(document: dict[str, Any], *, canaries: Iterable[str] = ()) -> None:
-    sys.stdout.write(
-        safe_json_text(document, canaries=canaries, append_newline=True)
-    )
+    sys.stdout.write(safe_json_text(document, canaries=canaries, append_newline=True))
+
+
+def _sha256_anchor(value: str) -> str:
+    if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+        raise argparse.ArgumentTypeError("anchor must be a lowercase SHA-256 digest")
+    return value
 
 
 def _cmd_validate_suite(args: argparse.Namespace) -> int:
@@ -110,16 +114,28 @@ def _cmd_adjudicate(args: argparse.Namespace) -> int:
         args.review_2,
         replay_path=args.replay,
         evidence_path=args.evidence,
+        expected_context_digests=(args.context_anchor_1, args.context_anchor_2),
+        expected_review_digests=(args.review_anchor_1, args.review_anchor_2),
         expected_manifest_sha256=args.expected_manifest_sha256,
     )
     default_name = f"{result.reviews[0].packet.case_id}.adjudication.json"
     output = args.output or args.review_1.parent / default_name
-    write_adjudication(output, result)
+    write_adjudication(
+        output,
+        result,
+        expected_context_digests=(args.context_anchor_1, args.context_anchor_2),
+        expected_review_digests=(args.review_anchor_1, args.review_anchor_2),
+    )
     _emit(
         {
             "command": "adjudicate",
             "ok": True,
             "verdict": result.verdict.value,
+            "independence_verified": result.independence_verified,
+            "review_anchors_verified": result.review_anchors_verified,
+            "independence_level": (
+                result.independence_level.value if result.independence_level else None
+            ),
             "output": str(output),
         }
     )
@@ -185,6 +201,10 @@ def build_parser() -> argparse.ArgumentParser:
     adjudicate_parser.add_argument("review_2", type=Path)
     adjudicate_parser.add_argument("--replay", type=Path, required=True)
     adjudicate_parser.add_argument("--evidence", type=Path, required=True)
+    adjudicate_parser.add_argument("--context-anchor-1", required=True, type=_sha256_anchor)
+    adjudicate_parser.add_argument("--context-anchor-2", required=True, type=_sha256_anchor)
+    adjudicate_parser.add_argument("--review-anchor-1", required=True, type=_sha256_anchor)
+    adjudicate_parser.add_argument("--review-anchor-2", required=True, type=_sha256_anchor)
     adjudicate_parser.add_argument("--expected-manifest-sha256")
     adjudicate_parser.add_argument("--output", type=Path)
     adjudicate_parser.set_defaults(handler=_cmd_adjudicate)

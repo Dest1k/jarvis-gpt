@@ -89,9 +89,22 @@ exact equality of every field, including request, output, and bounded evidence.
 
 Deterministic validators are primary. An empty assertion set is a harness
 error, and an empty `PASS` is rejected by the typed model. Semantic reviewers
-cannot edit files, runtime, or evidence. Adjudication embeds both immutable
-review outputs. A deterministic failure always yields `FAIL`; disagreement or
-missing evidence yields `INCONCLUSIVE`.
+cannot edit files, runtime, or evidence. Each review binds a typed factual
+context, packet digest, and exact packet citation IDs. Pairwise independence is
+computed from distinct context IDs/nonces and actual provider/model/profile
+differences; no review-supplied level is trusted. Each context digest must match
+its positional anchor retained out of band when the context was issued, and
+each completed review digest must match the positional anchor retained before
+the result entered untrusted storage. The review anchor binds the verdict,
+rationale, citations, context, and complete packet. Missing, mismatched,
+swapped, or reused anchors make independence unverifiable. Only exact typed
+bounded-evidence envelopes with linked assertion IDs and substantive content
+receive evidence IDs; arbitrary and metadata-only fields remain uncitable.
+Semantic `PASS`/`FAIL` requires both an evidence and assertion citation. Adjudication
+rechecks review digests and embeds both immutable outputs. A deterministic
+failure always yields `FAIL`; repeated or unverifiable contexts, disagreement,
+or missing evidence yield `INCONCLUSIVE`. These digests detect mutation relative
+to retained anchors but do not authenticate provider identity.
 
 ## Validators
 

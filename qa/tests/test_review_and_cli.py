@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from collections.abc import Mapping
@@ -28,7 +29,12 @@ from qa.replay import (
     write_replay_report,
 )
 from qa.review.adjudicator import adjudicate, adjudicate_files, write_adjudication
-from qa.review.independence import IndependenceLevel, is_independent_model
+from qa.review.independence import (
+    IndependenceLevel,
+    ReviewContext,
+    assess_independence,
+    is_independent_model,
+)
 from qa.review.reviewer import (
     SyntheticReviewer,
     build_review_packets,
@@ -112,17 +118,69 @@ def generated_packet(tmp_path: Path, *, bounded_evidence: dict[str, object]) -> 
     )[0]
 
 
+def review_context(
+    context_id: str,
+    *,
+    run_nonce: str | None = None,
+    provider: str = "fixture-provider",
+    model: str = "fixture-model",
+    profile: str = "fixture-profile",
+) -> ReviewContext:
+    return ReviewContext.create(
+        context_id=context_id,
+        run_nonce=run_nonce or hashlib.sha256(context_id.encode("utf-8")).hexdigest()[:32],
+        provider=provider,
+        model=model,
+        profile=profile,
+    )
+
+
 def review(
-    packet: ReviewPacket, reviewer_id: str, verdict: Verdict, rationale: str = "bounded review"
+    packet: ReviewPacket,
+    reviewer_id: str,
+    verdict: Verdict,
+    rationale: str = "bounded review",
+    *,
+    context: ReviewContext | None = None,
+    citations: tuple[str, ...] | None = None,
 ) -> ReviewResult:
     return ReviewResult.create(
         review_id=f"review-{reviewer_id}",
         reviewer_id=reviewer_id,
-        independence_level=IndependenceLevel.SAME_MODEL_CLEAN_CONTEXT,
+        context=context or review_context(f"context-{reviewer_id}"),
         verdict=verdict,
         rationale=rationale,
-        evidence_citations=("excerpt",),
+        evidence_citations=citations or tuple(sorted(packet.evidence_ids + packet.assertion_ids)),
         packet=packet,
+    )
+
+
+def context_anchors(
+    first: ReviewResult,
+    second: ReviewResult,
+) -> tuple[str, str]:
+    return first.context.context_digest, second.context.context_digest
+
+
+def review_anchors(
+    first: ReviewResult,
+    second: ReviewResult,
+) -> tuple[str, str]:
+    return first.review_digest, second.review_digest
+
+
+def adjudicate_reviews(
+    first: ReviewResult,
+    second: ReviewResult,
+    *,
+    replay_summary: ReplaySummary | None = None,
+):
+    return adjudicate(
+        first,
+        second,
+        replay_summary=replay_summary,
+        expected_context_digests=context_anchors(first, second),
+        expected_review_digests=review_anchors(first, second),
     )
 
 
@@ -130,13 +188,13 @@ def test_review_outputs_are_separate_immutable_and_digest_checked(tmp_path: Path
     packet = bound_packet()
     first = SyntheticReviewer(
         "context-a",
-        IndependenceLevel.SAME_MODEL_CLEAN_CONTEXT,
+        review_context("context-a"),
         Verdict.PASS,
         "review A",
     ).review(packet)
     second = SyntheticReviewer(
         "context-b",
-        IndependenceLevel.DIFFERENT_MODEL,
+        review_context("context-b", model="fixture-model-b"),
         Verdict.FAIL,
         "review B",
     ).review(packet)
@@ -148,8 +206,17 @@ def test_review_outputs_are_separate_immutable_and_digest_checked(tmp_path: Path
         write_review_result(first_path, first)
     assert first_path.read_bytes() != second_path.read_bytes()
     assert load_review_result(first_path) == first
-    assert is_independent_model(second.independence_level)
-    assert not is_independent_model(first.independence_level)
+    review_schema = json.loads(
+        (ROOT / "qa" / "schemas" / "review.schema.json").read_text(encoding="utf-8")
+    )
+    assert validate_json_schema(first.to_dict(), review_schema) == []
+    independence = assess_independence(
+        first.context,
+        second.context,
+        expected_context_digests=context_anchors(first, second),
+    )
+    assert independence.level is IndependenceLevel.DIFFERENT_MODEL
+    assert is_independent_model(independence.level)
 
     tampered = json.loads(first_path.read_text(encoding="utf-8"))
     tampered["rationale"] = "changed after review"
@@ -158,14 +225,377 @@ def test_review_outputs_are_separate_immutable_and_digest_checked(tmp_path: Path
         load_review_result(first_path)
 
 
+@pytest.mark.parametrize(
+    ("second_context", "expected"),
+    [
+        (
+            review_context("pair-profile", profile="fixture-profile-b"),
+            IndependenceLevel.DIFFERENT_PROFILE,
+        ),
+        (review_context("pair-model", model="fixture-model-b"), IndependenceLevel.DIFFERENT_MODEL),
+        (
+            review_context("pair-provider", provider="fixture-provider-b"),
+            IndependenceLevel.DIFFERENT_PROVIDER,
+        ),
+        (review_context("pair-context"), IndependenceLevel.SAME_MODEL_CLEAN_CONTEXT),
+    ],
+)
+def test_independence_is_computed_from_factual_context_differences(
+    second_context: ReviewContext,
+    expected: IndependenceLevel,
+) -> None:
+    first_context = review_context("pair-first")
+    assessment = assess_independence(
+        first_context,
+        second_context,
+        expected_context_digests=(
+            first_context.context_digest,
+            second_context.context_digest,
+        ),
+    )
+    assert assessment.verified
+    assert assessment.level is expected
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("context_id", ""),
+        ("run_nonce", 1),
+        ("provider", "Fixture-Provider"),
+        ("model", None),
+        ("profile", "../profile"),
+        ("context_digest", "0" * 64),
+    ],
+)
+def test_review_context_rejects_missing_wrong_type_or_noncanonical_facts(
+    field: str,
+    value: object,
+) -> None:
+    document: dict[str, object] = review_context("strict-context").to_dict()
+    document[field] = value
+    with pytest.raises(ValueError):
+        ReviewContext.from_dict(document)
+    document = review_context("strict-context").to_dict()
+    document.pop(field)
+    with pytest.raises(ValueError, match="incomplete or unexpected"):
+        ReviewContext.from_dict(document)
+
+
+def test_review_context_factory_rejects_explicit_empty_nonce() -> None:
+    with pytest.raises(ValueError, match="run_nonce"):
+        ReviewContext.create(
+            context_id="empty-nonce",
+            run_nonce="",
+            provider="fixture-provider",
+            model="fixture-model",
+            profile="fixture-profile",
+        )
+
+
+def test_review_context_direct_construction_and_replace_validate_facts() -> None:
+    context = review_context("direct-context")
+    with pytest.raises(ValueError, match="canonical identifier"):
+        ReviewContext(
+            context_id="Direct-Context",
+            run_nonce=context.run_nonce,
+            provider=context.provider,
+            model=context.model,
+            profile=context.profile,
+            context_digest=context.context_digest,
+        )
+    with pytest.raises(ValueError, match="canonical identifier"):
+        replace(context, provider="Fixture-Provider")
+
+
+def test_missing_or_swapped_context_anchors_cannot_authorize_pass() -> None:
+    packet = bound_packet()
+    first = review(packet, "anchor-a", Verdict.PASS)
+    second = review(packet, "anchor-b", Verdict.PASS)
+
+    missing = adjudicate(first, second)
+    assert missing.verdict is Verdict.INCONCLUSIVE
+    assert missing.independence_verified is False
+    assert missing.context_anchor_sha256s == ()
+    assert missing.review_anchors_verified is False
+    assert missing.review_anchor_sha256s == ()
+    adjudication_schema = json.loads(
+        (ROOT / "qa" / "schemas" / "adjudication.schema.json").read_text(encoding="utf-8")
+    )
+    assert validate_json_schema(missing.to_dict(), adjudication_schema) == []
+
+    swapped = adjudicate(
+        first,
+        second,
+        expected_context_digests=(
+            second.context.context_digest,
+            first.context.context_digest,
+        ),
+        expected_review_digests=review_anchors(first, second),
+    )
+    assert swapped.verdict is Verdict.INCONCLUSIVE
+    assert swapped.independence_verified is False
+
+    with pytest.raises(ValueError, match="context anchors"):
+        adjudicate(
+            first,
+            second,
+            expected_context_digests=("not-a-digest", "also-not-a-digest"),
+            expected_review_digests=review_anchors(first, second),
+        )
+
+
+def test_review_result_requires_exact_top_level_packet_digest() -> None:
+    document = review(bound_packet(), "packet-binding", Verdict.PASS).to_dict()
+    document["packet_digest"] = "0" * 64
+    body = dict(document)
+    body.pop("review_digest")
+    document["review_digest"] = canonical_digest(body)
+    with pytest.raises(ValueError, match="packet digest binding mismatch"):
+        ReviewResult.from_dict(document)
+
+
+@pytest.mark.parametrize("collision", ["context_id", "run_nonce"])
+def test_duplicate_context_or_run_nonce_cannot_authorize_pass(collision: str) -> None:
+    packet = bound_packet()
+    first_context = review_context("collision-a", run_nonce="a" * 32)
+    second_context = review_context(
+        "collision-a" if collision == "context_id" else "collision-b",
+        run_nonce="b" * 32 if collision == "context_id" else "a" * 32,
+    )
+    result = adjudicate_reviews(
+        review(packet, "collision-review-a", Verdict.PASS, context=first_context),
+        review(packet, "collision-review-b", Verdict.PASS, context=second_context),
+    )
+    assert result.verdict is Verdict.INCONCLUSIVE
+    assert result.independence_verified is False
+    assert result.independence_level is None
+
+
+@pytest.mark.parametrize(
+    "citations",
+    [
+        (),
+        ("",),
+        ("source",),
+        ("evidence:*",),
+        ("evidence:missing",),
+        ("evidence:source.child",),
+        ("evidence:source", "evidence:source"),
+        ("assertion:calibration.recorded",),
+        ("evidence:source",),
+        (1,),
+    ],
+)
+def test_substantive_review_rejects_invalid_or_insufficient_citations(
+    citations: tuple[object, ...],
+) -> None:
+    packet = bound_packet()
+    with pytest.raises(ValueError):
+        ReviewResult.create(
+            review_id="invalid-citations",
+            reviewer_id="invalid-citations",
+            context=review_context("invalid-citations"),
+            verdict=Verdict.PASS,
+            rationale="bounded review",
+            evidence_citations=citations,
+            packet=packet,
+        )
+
+
+def test_exact_packet_citations_and_separate_contexts_can_pass() -> None:
+    packet = bound_packet()
+    assert packet.evidence_ids == ("evidence:source",)
+    assert packet.assertion_ids == ("assertion:calibration.recorded",)
+    first = review(packet, "exact-a", Verdict.PASS)
+    second = review(packet, "exact-b", Verdict.PASS)
+    result = adjudicate_reviews(first, second)
+    assert result.verdict is Verdict.PASS
+    assert result.independence_verified
+    assert result.review_anchors_verified
+    assert result.independence_level is IndependenceLevel.SAME_MODEL_CLEAN_CONTEXT
+    assert result.reviews == (first, second)
+    assert [item.review_digest for item in result.reviews] == [
+        first.review_digest,
+        second.review_digest,
+    ]
+    adjudication_schema = json.loads(
+        (ROOT / "qa" / "schemas" / "adjudication.schema.json").read_text(encoding="utf-8")
+    )
+    assert validate_json_schema(result.to_dict(), adjudication_schema) == []
+    invalid_level = result.to_dict()
+    invalid_level["independence_level"] = None
+    assert validate_json_schema(invalid_level, adjudication_schema)
+
+
+def test_metadata_only_bounded_evidence_cannot_support_pass(tmp_path: Path) -> None:
+    packet = generated_packet(
+        tmp_path,
+        bounded_evidence={
+            "transport": "offline",
+            "tags": ["fixture"],
+            "source": {"provider": "fixture-provider", "profile": "fixture-profile"},
+            "note": "fixture metadata only",
+        },
+    )
+    assert packet.bounded_evidence
+    assert packet.evidence_ids == ()
+    with pytest.raises(ValueError, match="requires an evidence citation"):
+        review(packet, "metadata-pass", Verdict.PASS)
+    result = adjudicate_reviews(
+        review(packet, "metadata-a", Verdict.INCONCLUSIVE),
+        review(packet, "metadata-b", Verdict.INCONCLUSIVE),
+    )
+    assert result.verdict is Verdict.INCONCLUSIVE
+
+
+@pytest.mark.parametrize(
+    "bounded_evidence",
+    [
+        {"source": {"kind": "reference", "content": "sanitized fixture"}},
+        {
+            "source": {
+                "kind": "reference",
+                "assertion_ids": ["assertion:format.exact"],
+                "content": {"provider": "fixture-provider"},
+            }
+        },
+    ],
+)
+def test_malformed_or_metadata_only_typed_evidence_is_rejected(
+    tmp_path: Path,
+    bounded_evidence: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match="typed bounded evidence"):
+        generated_packet(tmp_path, bounded_evidence=bounded_evidence)
+
+
+@pytest.mark.parametrize(
+    "forbidden_level",
+    [IndependenceLevel.DETERMINISTIC_ONLY, IndependenceLevel.HUMAN_ADJUDICATED],
+)
+def test_review_schema_rejects_self_asserted_nonsemantic_level(
+    forbidden_level: IndependenceLevel,
+) -> None:
+    document = review(bound_packet(), "typed-context", Verdict.PASS).to_dict()
+    document["independence_level"] = forbidden_level.value
+    body = dict(document)
+    body.pop("review_digest")
+    document["review_digest"] = canonical_digest(body)
+    with pytest.raises(ValueError, match="fields are incomplete or unexpected"):
+        ReviewResult.from_dict(document)
+
+
+def test_stale_review_digest_is_rejected_at_write_and_adjudication(
+    tmp_path: Path,
+) -> None:
+    packet = bound_packet()
+    original = review(packet, "stale-a", Verdict.PASS)
+    stale = replace(original, reviewer_id="stale-changed")
+    with pytest.raises(ValueError, match="review result digest mismatch"):
+        write_review_result(tmp_path / "stale.json", stale)
+    with pytest.raises(ValueError, match="review result digest mismatch"):
+        adjudicate_reviews(stale, review(packet, "stale-b", Verdict.PASS))
+
+
+def test_adjudication_writer_rederives_authoritative_decision(tmp_path: Path) -> None:
+    packet = bound_packet("CAL-FAIL-TOOL-ENVELOPE")
+    result = adjudicate_reviews(
+        review(packet, "writer-a", Verdict.PASS),
+        review(packet, "writer-b", Verdict.PASS),
+    )
+    assert result.verdict is Verdict.FAIL
+    forged = replace(result, verdict=Verdict.PASS, rationale="forged promotion")
+    with pytest.raises(ValueError, match="does not match verified review inputs"):
+        write_adjudication(
+            tmp_path / "forged.json",
+            forged,
+            expected_context_digests=context_anchors(*result.reviews),
+            expected_review_digests=review_anchors(*result.reviews),
+        )
+    assert not (tmp_path / "forged.json").exists()
+
+
+def test_relabelled_copied_review_fails_retained_context_anchors() -> None:
+    packet = bound_packet()
+    original = review(
+        packet,
+        "copy-a",
+        Verdict.PASS,
+        context=review_context("actual-context-a", run_nonce="a" * 32),
+    )
+    retained_second = review(
+        packet,
+        "copy-b",
+        Verdict.PASS,
+        context=review_context(
+            "actual-context-b",
+            run_nonce="b" * 32,
+            model="fixture-model-b",
+        ),
+    )
+    copied_document = original.to_dict()
+    copied_document["review_id"] = "review-copy-b"
+    copied_document["reviewer_id"] = "copy-b"
+    copied_document["context"] = review_context(
+        "self-issued-copy",
+        run_nonce="c" * 32,
+        model="self-issued-model",
+    ).to_dict()
+    body = dict(copied_document)
+    body.pop("review_digest")
+    copied_document["review_digest"] = canonical_digest(body)
+    copied = ReviewResult.from_dict(copied_document)
+    copied.packet.verify_source(CALIBRATION)
+
+    result = adjudicate(
+        original,
+        copied,
+        expected_context_digests=(
+            original.context.context_digest,
+            retained_second.context.context_digest,
+        ),
+        expected_review_digests=review_anchors(original, retained_second),
+    )
+    assert result.verdict is Verdict.INCONCLUSIVE
+    assert result.independence_verified is False
+
+
+def test_recomputed_semantic_review_fails_retained_review_anchors() -> None:
+    packet = bound_packet()
+    first = review(packet, "semantic-a", Verdict.PASS)
+    original_second = review(packet, "semantic-b", Verdict.FAIL)
+    forged_document = original_second.to_dict()
+    forged_document["verdict"] = Verdict.PASS.value
+    forged_document["rationale"] = "recomputed semantic promotion"
+    body = dict(forged_document)
+    body.pop("review_digest")
+    forged_document["review_digest"] = canonical_digest(body)
+    forged_second = ReviewResult.from_dict(forged_document)
+    forged_second.packet.verify_source(CALIBRATION)
+
+    result = adjudicate(
+        first,
+        forged_second,
+        expected_context_digests=context_anchors(first, original_second),
+        expected_review_digests=review_anchors(first, original_second),
+    )
+    assert result.verdict is Verdict.INCONCLUSIVE
+    assert result.independence_verified is False
+    assert result.review_anchors_verified is False
+
+
 def test_adjudicator_preserves_disagreement_and_deterministic_fail() -> None:
     packet = bound_packet()
-    disagreement = adjudicate(review(packet, "a", Verdict.PASS), review(packet, "b", Verdict.FAIL))
+    disagreement = adjudicate_reviews(
+        review(packet, "a", Verdict.PASS),
+        review(packet, "b", Verdict.FAIL),
+    )
     assert disagreement.verdict is Verdict.INCONCLUSIVE
     assert len(disagreement.reviews) == 2
 
     failed_packet = bound_packet("CAL-FAIL-TOOL-ENVELOPE")
-    authoritative = adjudicate(
+    authoritative = adjudicate_reviews(
         review(failed_packet, "a", Verdict.PASS), review(failed_packet, "b", Verdict.PASS)
     )
     assert authoritative.verdict is Verdict.FAIL
@@ -190,6 +620,7 @@ def test_paired_packet_and_review_substitution_cannot_promote_fail() -> None:
             Verdict.PASS,
         ).to_dict()
         document["packet"] = packet_document
+        document["packet_digest"] = packet_document["packet_digest"]
         review_body = dict(document)
         review_body.pop("review_digest")
         document["review_digest"] = canonical_digest(review_body)
@@ -231,12 +662,25 @@ def test_persisted_bounded_evidence_substitution_requires_full_source_rebind(
     review_paths: list[Path] = []
     loaded_reviews: list[ReviewResult] = []
     for reviewer_id in ("forged-content-a", "forged-content-b"):
-        document = review(packet, reviewer_id, Verdict.PASS).to_dict()
+        document = review(packet, reviewer_id, Verdict.INCONCLUSIVE).to_dict()
         packet_document = document["packet"]
-        packet_document["bounded_evidence"] = {"source": "substituted fixture"}
+        packet_document["bounded_evidence"] = {
+            "source": {
+                "kind": "reference",
+                "assertion_ids": ["assertion:format.exact"],
+                "content": "substituted fixture",
+            }
+        }
+        packet_document["evidence_ids"] = ["evidence:source"]
         packet_body = dict(packet_document)
         packet_body.pop("packet_digest")
         packet_document["packet_digest"] = canonical_digest(packet_body)
+        document["packet_digest"] = packet_document["packet_digest"]
+        document["verdict"] = Verdict.PASS.value
+        document["evidence_citations"] = [
+            "evidence:source",
+            "assertion:format.exact",
+        ]
         review_body = dict(document)
         review_body.pop("review_digest")
         document["review_digest"] = canonical_digest(review_body)
@@ -260,13 +704,20 @@ def test_persisted_bounded_evidence_substitution_requires_full_source_rebind(
             review_paths[1],
             replay_path=replay_path,
             evidence_path=evidence_path,
+            expected_context_digests=context_anchors(*loaded_reviews),
+            expected_review_digests=review_anchors(*loaded_reviews),
             expected_manifest_sha256=manifest_sha256,
         )
 
 
 def test_adjudicator_never_passes_without_evidence(tmp_path: Path) -> None:
     packet = generated_packet(tmp_path, bounded_evidence={})
-    result = adjudicate(review(packet, "a", Verdict.PASS), review(packet, "b", Verdict.PASS))
+    with pytest.raises(ValueError, match="requires an evidence citation"):
+        review(packet, "rejected-pass", Verdict.PASS)
+    result = adjudicate_reviews(
+        review(packet, "a", Verdict.INCONCLUSIVE),
+        review(packet, "b", Verdict.INCONCLUSIVE),
+    )
     assert result.verdict is Verdict.INCONCLUSIVE
 
 
@@ -300,18 +751,13 @@ def test_review_packet_binds_fresh_replay_and_rejects_substitution() -> None:
         evidence_path=CALIBRATION,
     )
     assert packet.source_record_sha256 == replay_case.source_record_sha256
-    assert (
-        packet.source_record_canonical_sha256
-        == replay_case.source_record_canonical_sha256
-    )
+    assert packet.source_record_canonical_sha256 == replay_case.source_record_canonical_sha256
     assert packet.source_evidence_sha256 == replay.evidence_sha256
     assert packet.source_manifest_sha256 == replay.manifest_sha256
     assert packet.source_replay_sha256 == replay.replay_digest
     packet.verify_replay(replay)
     packet_schema = json.loads(
-        (ROOT / "qa" / "schemas" / "review-packet.schema.json").read_text(
-            encoding="utf-8"
-        )
+        (ROOT / "qa" / "schemas" / "review-packet.schema.json").read_text(encoding="utf-8")
     )
     assert validate_json_schema(packet.to_dict(), packet_schema) == []
 
@@ -409,8 +855,7 @@ def test_replay_cannot_promote_deterministic_failure_into_review_packet() -> Non
         deterministic_failures=(),
     )
     promoted_cases = tuple(
-        promoted_case if case.case_id == replay_case.case_id else case
-        for case in replay.cases
+        promoted_case if case.case_id == replay_case.case_id else case for case in replay.cases
     )
     promoted = replace(replay, cases=promoted_cases, replay_digest="")
     promoted = replace(promoted, replay_digest=promoted.expected_digest())
@@ -545,26 +990,69 @@ def test_cli_default_adjudication_output_stays_in_review_root(
     packet = bound_packet()
     first_path = tmp_path / "review-a.json"
     second_path = tmp_path / "review-b.json"
-    write_review_result(first_path, review(packet, "context-a", Verdict.PASS))
-    write_review_result(second_path, review(packet, "context-b", Verdict.PASS))
+    first = review(packet, "context-a", Verdict.PASS)
+    second = review(packet, "context-b", Verdict.PASS)
+    write_review_result(first_path, first)
+    write_review_result(second_path, second)
     replay_path = tmp_path / "replay.json"
     write_replay_report(replay_path, replay_file(CALIBRATION))
 
-    assert main(
-        [
-            "adjudicate",
-            str(first_path),
-            str(second_path),
-            "--replay",
-            str(replay_path),
-            "--evidence",
-            str(CALIBRATION),
-        ]
-    ) == 0
+    assert (
+        main(
+            [
+                "adjudicate",
+                str(first_path),
+                str(second_path),
+                "--replay",
+                str(replay_path),
+                "--evidence",
+                str(CALIBRATION),
+                "--context-anchor-1",
+                first.context.context_digest,
+                "--context-anchor-2",
+                second.context.context_digest,
+                "--review-anchor-1",
+                first.review_digest,
+                "--review-anchor-2",
+                second.review_digest,
+            ]
+        )
+        == 0
+    )
     output = json.loads(capsys.readouterr().out)
+    assert output["independence_verified"] is True
+    assert output["review_anchors_verified"] is True
+    assert output["independence_level"] == "SAME_MODEL_CLEAN_CONTEXT"
     adjudication = tmp_path / "CAL-PASS-STREAM.adjudication.json"
     assert Path(output["output"]).resolve() == adjudication.resolve()
     assert adjudication.is_file()
+    persisted = json.loads(adjudication.read_text(encoding="utf-8"))
+    assert persisted["independence_level"] == "SAME_MODEL_CLEAN_CONTEXT"
+
+
+def test_cli_rejects_malformed_review_anchor_before_reading_files() -> None:
+    valid = "0" * 64
+    with pytest.raises(SystemExit) as raised:
+        main(
+            [
+                "adjudicate",
+                "missing-a.json",
+                "missing-b.json",
+                "--replay",
+                "missing-replay.json",
+                "--evidence",
+                "missing-evidence.jsonl",
+                "--context-anchor-1",
+                valid,
+                "--context-anchor-2",
+                "1" * 64,
+                "--review-anchor-1",
+                "malformed",
+                "--review-anchor-2",
+                "2" * 64,
+            ]
+        )
+    assert raised.value.code == 2
 
 
 def test_all_generated_outputs_share_redaction_boundary(
@@ -572,9 +1060,7 @@ def test_all_generated_outputs_share_redaction_boundary(
 ) -> None:
     canary = "canary" + "://credential/output-tree-b05"
     private_material = (
-        "-----BEGIN PRIVATE KEY-----\n"
-        "DISPOSABLEOUTPUTTREEONLY\n"
-        "-----END PRIVATE KEY-----"
+        "-----BEGIN PRIVATE KEY-----\n" "DISPOSABLEOUTPUTTREEONLY\n" "-----END PRIVATE KEY-----"
     )
     disposable_values = (
         canary,
@@ -588,9 +1074,7 @@ def test_all_generated_outputs_share_redaction_boundary(
         "private_key": private_material,
         "refresh_token": disposable_values[2],
         "session_cookie": disposable_values[3],
-        "diagnostic": (
-            f"Cookie: sid={disposable_values[4]}\nmarker={canary}"
-        ),
+        "diagnostic": (f"Cookie: sid={disposable_values[4]}\nmarker={canary}"),
     }
     identity = CampaignIdentity.create("output-boundary")
     scenario = Scenario.from_dict(
@@ -608,7 +1092,13 @@ def test_all_generated_outputs_share_redaction_boundary(
         verdict=Verdict.PASS,
         assertions=(AssertionResult("format.exact", True, "answer", "answer"),),
         observation=observation,
-        bounded_evidence={"source": "sanitized fixture"},
+        bounded_evidence={
+            "source": {
+                "kind": "reference",
+                "assertion_ids": ["assertion:format.exact"],
+                "content": "sanitized fixture",
+            }
+        },
     )
     root = tmp_path / "generated"
     store = EvidenceStore(root, identity, canaries=[canary])
@@ -636,20 +1126,20 @@ def test_all_generated_outputs_share_redaction_boundary(
     first = ReviewResult.create(
         review_id="output-review-a",
         reviewer_id="output-context-a",
-        independence_level=IndependenceLevel.SAME_MODEL_CLEAN_CONTEXT,
+        context=review_context("output-context-a"),
         verdict=Verdict.PASS,
         rationale=f"bounded {canary} {private_material}",
-        evidence_citations=("source",),
+        evidence_citations=("evidence:source", "assertion:format.exact"),
         packet=packet,
         canaries=[canary],
     )
     second = ReviewResult.create(
         review_id="output-review-b",
         reviewer_id="output-context-b",
-        independence_level=IndependenceLevel.DIFFERENT_MODEL,
+        context=review_context("output-context-b", model="fixture-model-b"),
         verdict=Verdict.PASS,
         rationale=f"bounded {canary}",
-        evidence_citations=("source",),
+        evidence_citations=("evidence:source", "assertion:format.exact"),
         packet=packet,
         canaries=[canary],
     )
@@ -657,7 +1147,9 @@ def test_all_generated_outputs_share_redaction_boundary(
     write_review_result(root / "review-b.json", second, canaries=[canary])
     write_adjudication(
         root / "adjudication.json",
-        adjudicate(first, second),
+        adjudicate_reviews(first, second),
+        expected_context_digests=context_anchors(first, second),
+        expected_review_digests=review_anchors(first, second),
         canaries=[canary],
     )
     _emit(
@@ -678,6 +1170,5 @@ def test_all_generated_outputs_share_redaction_boundary(
             else [json.loads(text)]
         )
         assert all(
-            credential_like_paths(document, canaries=[canary]) == ()
-            for document in documents
+            credential_like_paths(document, canaries=[canary]) == () for document in documents
         )

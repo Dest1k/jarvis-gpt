@@ -37,6 +37,30 @@ content is re-derived from anchored evidence. Matching replay fields alone are
 insufficient; request, output, bounded evidence, verdicts, failures, and every
 source binding must match before adjudication.
 
+## Review citations and independence
+
+Review packets expose digest-bound `evidence:<id>` and `assertion:<id>`
+catalogs. A bounded-evidence entry receives an evidence ID only when it is an
+exact typed envelope with a supported `kind`, non-empty exact `assertion_ids`
+links into the packet catalog, and substantive `content`. Transport, tags,
+arbitrary unknown scalar fields, and other context metadata do not become
+substantive evidence IDs; a malformed attempted typed envelope fails packet
+creation. Every review must cite exact existing IDs; substantive `PASS` or
+`FAIL` requires at least one ID from each catalog. Empty, duplicate, wildcard,
+parent, and unknown citations fail validation.
+
+Reviews record a context ID, unique run nonce, provider, model, profile, context
+digest, and top-level packet digest. Adjudication computes independence only
+after each context digest matches the positional anchor retained when that
+context was issued and each review digest matches the positional anchor
+retained after review completion. The latter binds the semantic verdict,
+rationale, citations, context, and complete packet. Anchors derived from the
+review files presented for adjudication are not trusted. A missing, mismatched,
+swapped, or reused anchor, repeated context ID, or repeated nonce cannot count
+as an independent vote and yields `INCONCLUSIVE` unless deterministic replay
+already requires `FAIL`. Context/review hashes detect mutation relative to
+retained anchors; they do not authenticate the named provider or operator.
+
 ## Statuses
 
 | Verdict | Use |

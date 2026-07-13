@@ -13,13 +13,13 @@ from ..output import sanitize_output, write_json_exclusive
 from ..replay import load_replay_report, replay_records
 from ..safe_paths import canonical_directory, create_exclusive_directory, safe_output_path
 from ..validators.context import ValidationContext
-from .independence import IndependenceLevel
+from .independence import ReviewContext
 from .schemas import ReviewPacket, ReviewResult
 
 
 class Reviewer(Protocol):
     reviewer_id: str
-    independence_level: IndependenceLevel
+    context: ReviewContext
 
     def review(self, packet: ReviewPacket) -> ReviewResult: ...
 
@@ -30,13 +30,13 @@ class SyntheticReviewer:
     def __init__(
         self,
         reviewer_id: str,
-        independence_level: IndependenceLevel,
+        context: ReviewContext,
         verdict: Verdict,
         rationale: str,
         canaries: Iterable[str] = (),
     ) -> None:
         self.reviewer_id = reviewer_id
-        self.independence_level = independence_level
+        self.context = context
         self.verdict = verdict
         self.rationale = rationale
         self.canaries = tuple(canaries)
@@ -45,10 +45,10 @@ class SyntheticReviewer:
         return ReviewResult.create(
             review_id=f"{packet.packet_id}-{self.reviewer_id}",
             reviewer_id=self.reviewer_id,
-            independence_level=self.independence_level,
+            context=self.context,
             verdict=self.verdict,
             rationale=self.rationale,
-            evidence_citations=tuple(sorted(packet.bounded_evidence)),
+            evidence_citations=tuple(sorted(packet.evidence_ids + packet.assertion_ids)),
             packet=packet,
             canaries=self.canaries,
         )
@@ -64,17 +64,14 @@ def _exclusive_json(
     root = canonical_directory(path.parent, create=True)
     target = safe_output_path(root, path.name)
     canary_values = tuple(canaries)
-    if require_unchanged and sanitize_output(
-        document, canaries=canary_values
-    ).value != document:
+    if require_unchanged and sanitize_output(document, canaries=canary_values).value != document:
         raise ValueError("digest-bearing output was not sanitized before persistence")
     write_json_exclusive(target, document, canaries=canary_values)
     return target
 
 
-def write_review_result(
-    path: Path, review: ReviewResult, *, canaries: Iterable[str] = ()
-) -> None:
+def write_review_result(path: Path, review: ReviewResult, *, canaries: Iterable[str] = ()) -> None:
+    review.validate_integrity()
     if not review.packet.provenance_verified:
         raise ValueError("review output requires an anchored verified packet")
     _exclusive_json(path, review.to_dict(), canaries=canaries)

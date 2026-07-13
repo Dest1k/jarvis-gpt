@@ -9,6 +9,27 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-14 - Codex (assurance remediation Commit C)
+
+- Closed B07 with immutable review/context/packet digests, typed citable
+  bounded-evidence envelopes linked to exact assertion IDs, canonical factual
+  review contexts, and computed independence levels.
+- Adjudication now requires positional context anchors retained when contexts
+  are issued and positional review-result anchors retained before untrusted
+  storage. Missing/mismatched/reused anchors remain fail-closed; semantic
+  recomputation and context relabeling cannot authorize `PASS`, while an
+  anchored deterministic `FAIL` remains authoritative.
+- Positive/negative regressions cover valid independent reviews, duplicate or
+  malformed contexts, missing/swapped anchors, recomputed semantic verdicts,
+  metadata-only/malformed evidence, exact/unknown citations, schema/runtime
+  consistency, CLI anchor validation, and immutable preserved reviews.
+- Validation before commit: `140 passed, 2 skipped`; Ruff, compileall, diff
+  check, suite/evidence validation, and calibration replay are green. Calibration
+  remains exactly 8/8 with 1 PASS / 6 FAIL / 1 INCONCLUSIVE / 0 mismatches. Two
+  read-only independent reviews returned GO for B07.
+- No `.audit/**`, production source, runtime state, dependency, network, push,
+  merge, or review-attestation operation was used. Next batch is B08-B11 only.
+
 ### 2026-07-14 - Codex (assurance remediation Commit B)
 
 - Closed B03/B05 with append-time evidence byte tracking, exact manifest-byte

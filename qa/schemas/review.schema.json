@@ -5,22 +5,42 @@
   "type": "object",
   "additionalProperties": false,
   "required": [
-    "schema", "review_id", "reviewer_id", "independence_level", "verdict",
-    "rationale", "evidence_citations", "packet", "created_at_utc", "review_digest"
+    "schema", "review_id", "reviewer_id", "context", "packet_digest",
+    "verdict", "rationale", "evidence_citations", "packet", "created_at_utc",
+    "review_digest"
   ],
   "properties": {
-    "schema": {"const": "jarvis.qa.review-result.v1"},
+    "schema": {"const": "jarvis.qa.review-result.v2"},
     "review_id": {"type": "string", "minLength": 1},
     "reviewer_id": {"type": "string", "minLength": 1},
-    "independence_level": {
-      "enum": [
-        "DETERMINISTIC_ONLY", "SAME_MODEL_CLEAN_CONTEXT", "DIFFERENT_PROFILE",
-        "DIFFERENT_MODEL", "DIFFERENT_PROVIDER", "HUMAN_ADJUDICATED"
-      ]
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "context_id", "run_nonce", "provider", "model", "profile",
+        "context_digest"
+      ],
+      "properties": {
+        "context_id": {"type": "string", "pattern": "^[a-z0-9](?:[a-z0-9._:/-]{0,126}[a-z0-9])?$"},
+        "run_nonce": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+        "provider": {"type": "string", "pattern": "^[a-z0-9](?:[a-z0-9._:/-]{0,126}[a-z0-9])?$"},
+        "model": {"type": "string", "pattern": "^[a-z0-9](?:[a-z0-9._:/-]{0,126}[a-z0-9])?$"},
+        "profile": {"type": "string", "pattern": "^[a-z0-9](?:[a-z0-9._:/-]{0,126}[a-z0-9])?$"},
+        "context_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
     },
+    "packet_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "verdict": {"enum": ["PASS", "FAIL", "INCONCLUSIVE"]},
     "rationale": {"type": "string", "minLength": 1},
-    "evidence_citations": {"type": "array", "items": {"type": "string"}},
+    "evidence_citations": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^(?:evidence|assertion):[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,126}[A-Za-z0-9])?$"
+      }
+    },
     "packet": {"type": "object"},
     "created_at_utc": {"type": "string", "minLength": 1},
     "review_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"}

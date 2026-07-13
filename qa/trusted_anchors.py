@@ -7,7 +7,7 @@ from pathlib import Path
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 _TRUSTED_MANIFEST_SHA256 = {
     "qa/tests/fixtures/calibration_evidence.jsonl": (
-        "fc72e8462525a24a19b63ba5fc7c65051cf014491c486878e27a758a338b092d"
+        "6019152e13aaffde7f331b0cab2a347025da3ed72e9e92c696dcca773a2dc6d5"
     ),
 }
 

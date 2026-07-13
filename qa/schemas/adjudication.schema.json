@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jarvis.local/qa/adjudication.schema.json",
+  "title": "JARVIS fail-closed semantic adjudication",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "verdict",
+    "rationale",
+    "independence_verified",
+    "independence_level",
+    "independence_reason",
+    "context_anchor_sha256s",
+    "review_anchors_verified",
+    "review_anchor_sha256s",
+    "deterministic_failures_preserved",
+    "reviews",
+    "created_at_utc"
+  ],
+  "properties": {
+    "schema": {"const": "jarvis.qa.adjudication.v2"},
+    "verdict": {"enum": ["PASS", "FAIL", "INCONCLUSIVE"]},
+    "rationale": {"type": "string", "minLength": 1},
+    "independence_verified": {"type": "boolean"},
+    "independence_level": {
+      "enum": [
+        null,
+        "SAME_MODEL_CLEAN_CONTEXT",
+        "DIFFERENT_PROFILE",
+        "DIFFERENT_MODEL",
+        "DIFFERENT_PROVIDER"
+      ]
+    },
+    "independence_reason": {"type": "string", "minLength": 1},
+    "context_anchor_sha256s": {
+      "type": "array",
+      "oneOf": [
+        {"maxItems": 0},
+        {"minItems": 2, "maxItems": 2}
+      ],
+      "items": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+    },
+    "review_anchors_verified": {"type": "boolean"},
+    "review_anchor_sha256s": {
+      "type": "array",
+      "oneOf": [
+        {"maxItems": 0},
+        {"minItems": 2, "maxItems": 2}
+      ],
+      "items": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+    },
+    "deterministic_failures_preserved": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "reviews": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "items": {"type": "object"}
+    },
+    "created_at_utc": {"type": "string", "minLength": 1}
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"review_anchors_verified": {"const": true}}
+      },
+      "then": {
+        "properties": {
+          "review_anchor_sha256s": {
+            "minItems": 2,
+            "maxItems": 2,
+            "uniqueItems": true
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"independence_verified": {"const": true}}
+      },
+      "then": {
+        "properties": {
+          "context_anchor_sha256s": {
+            "minItems": 2,
+            "maxItems": 2,
+            "uniqueItems": true
+          },
+          "review_anchors_verified": {"const": true},
+          "independence_level": {
+            "enum": [
+              "SAME_MODEL_CLEAN_CONTEXT",
+              "DIFFERENT_PROFILE",
+              "DIFFERENT_MODEL",
+              "DIFFERENT_PROVIDER"
+            ]
+          }
+        }
+      },
+      "else": {
+        "properties": {"independence_level": {"const": null}}
+      }
+    }
+  ]
+}

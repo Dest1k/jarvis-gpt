@@ -39,6 +39,18 @@ The three source identities are intentionally separate:
   replay before it accepts them. Deserialized packets and reviews likewise
   remain unverified until adjudication re-derives the complete immutable packet
   from anchored evidence; a matching replay digest alone grants no provenance.
+- Review packets publish exact substantive evidence and assertion citation IDs.
+  A substantive bounded-evidence item is an exact typed envelope containing
+  `kind`, linked `assertion_ids`, and non-metadata `content`; arbitrary unknown
+  fields remain uncitable metadata. Each review binds a canonical context ID,
+  unique run nonce, provider, model, profile, context digest, and packet digest.
+  Retain each context digest out of band when the context is issued, then retain
+  each completed review digest before its result enters untrusted storage.
+  Adjudication requires both positional anchor pairs and computes pairwise
+  independence from the anchored facts and review outputs;
+  missing/mismatched/reused anchors, repeated contexts/nonces, and metadata-only
+  evidence cannot produce semantic `PASS`. Review/context hashes detect mutation
+  relative to retained anchors but do not authenticate the named provider.
 - One output boundary recursively redacts credential-bearing keys and text,
   private/session/cookie/OAuth/JWT/password/connection material, and explicit
   disposable canaries before bounding and strict serialization. A post-scan
@@ -69,7 +81,7 @@ py -3.11 -m qa.cli replay qa\tests\fixtures\calibration_evidence.jsonl
 py -3.11 -m qa.cli validate-evidence <evidence.jsonl> --expected-manifest-sha256 <retained-sha256>
 py -3.11 -m qa.cli replay <evidence.jsonl> --expected-manifest-sha256 <retained-sha256>
 py -3.11 -m qa.cli build-review-packets <evidence.jsonl> --expected-manifest-sha256 <retained-sha256> --output-dir <new-directory>
-py -3.11 -m qa.cli adjudicate <review-1.json> <review-2.json> --replay <replay.json> --evidence <evidence.jsonl> --expected-manifest-sha256 <retained-sha256> --output <new-file.json>
+py -3.11 -m qa.cli adjudicate <review-1.json> <review-2.json> --replay <replay.json> --evidence <evidence.jsonl> --context-anchor-1 <retained-review-1-context-sha256> --context-anchor-2 <retained-review-2-context-sha256> --review-anchor-1 <retained-review-1-sha256> --review-anchor-2 <retained-review-2-sha256> --expected-manifest-sha256 <retained-manifest-sha256> --output <new-file.json>
 py -3.11 -m qa.cli run-suite <suite-directory> --output-root <new-directory>
 ```
 
@@ -78,11 +90,14 @@ cases return `BLOCKED_BY_ENV`; offline cases remain usable. Review packet,
 review result, adjudication, replay-report, evidence, and manifest writers
 refuse overwrite. `run-suite` emits `manifest_sha256`; retain that value
 separately before the evidence bundle enters untrusted storage or transport.
-Recomputing the anchor from a manifest presented alongside evidence does not
-establish trust and cannot detect paired substitution. `adjudicate` reopens
-that anchored evidence, performs a fresh replay, and requires every persisted
-packet field—including request, output, and bounded evidence—to equal the
-newly derived packet before either review can influence a verdict.
+Retain each context digest when the context is issued and each review digest
+immediately after the review is completed, before the review result enters
+untrusted storage or transport. Pass both pairs in the same positional order as
+the review files. Recomputing any anchor from the objects presented for
+adjudication does not establish trust. `adjudicate` reopens the anchored
+evidence, performs a fresh replay, and requires every persisted packet
+field—including request, output, and bounded evidence—to equal the newly
+derived packet before either review can influence a verdict.
 
 Runner exit codes are:
 
@@ -115,7 +130,7 @@ trusted anchor; it is integrity evidence, not signer authentication.
 - `replay.py`: offline deterministic replay of sanitized JSONL.
 - `upstream/`: offline provenance/adoption gate.
 - `schemas/`: machine-readable scenario, evidence, manifest, replay, review,
-  packet, and verdict contracts.
+  packet, adjudication, and verdict contracts.
 - `suites/`: permanent scenario namespaces. The initial committed suite is
   intentionally small; remediation work adds task-specific scenarios here.
 - `tests/fixtures/calibration_evidence.jsonl`: sanitized, offline calibration
