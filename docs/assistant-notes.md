@@ -23,6 +23,12 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
   namespaces, append-only sanitized JSONL, deterministic response/stream/
   artifact/state/format validators, replay, explicit reviewer independence,
   immutable review outputs, and fail-closed adjudication.
+- Independent acceptance review exposed two fail-closed gaps. The branch tip
+  now ignores recorded artifact existence/hash/source-after claims and hashes
+  only explicit contract-approved paths; it also persists and exactly validates
+  typed replay contracts for `BLOCKED_BY_ENV`, `BLOCKED_BY_SPEC`, optional
+  `SKIP`, and `ERROR`. Focused clean-context re-review passed four regressions
+  with no remaining blocker in that scope.
 - Added the offline upstream candidate/provenance gate under `qa/upstream/` and
   `docs/upstream/`. The donor registry is empty. `web_surfer` and
   `document_surfer` are engineering-provenance records marked
@@ -32,7 +38,7 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
   false `functional/READY` precondition, permits exactly one explicit reviewed
   wave per run, and leaves `SPARK-0013` behind separate `PROFILE-SAFETY` /
   `PROFILE-RESEARCH` product decisions. Do not run protocol `07`.
-- Offline validation at handoff: `41 passed`; Ruff, compileall, suite/evidence
+- Offline validation at handoff: `44 passed`; Ruff, compileall, suite/evidence
   validation, and replay are clean. Calibration replay reproduces 1 PASS,
   6 FAIL, and 1 INCONCLUSIVE with zero mismatches. Separate synthetic reviews
   preserve disagreement, and two semantic PASS votes cannot override a

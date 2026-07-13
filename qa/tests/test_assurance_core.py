@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from qa.evidence import EvidenceStore, load_evidence, validate_evidence_file
+from qa.evidence import (
+    EvidenceStore,
+    load_evidence,
+    validate_evidence_file,
+    validate_evidence_records,
+)
 from qa.models import (
     EXIT_FAIL,
     EXIT_HARNESS_ERROR,
@@ -257,15 +263,18 @@ def test_ndjson_reconstruction_and_terminal_consistency() -> None:
 
 def test_artifact_path_hash_and_source_checks(tmp_path: Path) -> None:
     artifact = tmp_path / "output.txt"
+    source = tmp_path / "source.txt"
     artifact.write_text("ok", encoding="utf-8")
-    digest = __import__("hashlib").sha256(b"ok").hexdigest()
+    source.write_text("source", encoding="utf-8")
+    digest = hashlib.sha256(b"ok").hexdigest()
+    source_digest = hashlib.sha256(b"source").hexdigest()
     results = run_validators(
         {
             "artifact": {
                 "path": str(artifact),
-                "exists": True,
-                "sha256": digest,
-                "source_sha256_after": "source",
+                "exists": False,
+                "sha256": "fabricated-recorded-hash",
+                "source_sha256_after": "fabricated-recorded-source-hash",
             }
         },
         [
@@ -273,11 +282,43 @@ def test_artifact_path_hash_and_source_checks(tmp_path: Path) -> None:
                 "kind": "artifact",
                 "expected_path": str(artifact),
                 "expected_sha256": digest,
-                "source_sha256_before": "source",
+                "source_path": str(source),
+                "source_sha256_before": source_digest,
             }
         ],
     )
     assert all(result.passed for result in results)
+
+
+def test_artifact_validator_rejects_fabricated_recorded_file_claims(tmp_path: Path) -> None:
+    artifact = tmp_path / "missing-output.txt"
+    source = tmp_path / "missing-source.txt"
+    fabricated_hash = hashlib.sha256(b"fabricated").hexdigest()
+    results = run_validators(
+        {
+            "artifact": {
+                "path": str(artifact),
+                "exists": True,
+                "sha256": fabricated_hash,
+                "source_sha256_after": fabricated_hash,
+            }
+        },
+        [
+            {
+                "kind": "artifact",
+                "expected_path": str(artifact),
+                "expected_sha256": fabricated_hash,
+                "source_path": str(source),
+                "source_sha256_before": fabricated_hash,
+            }
+        ],
+    )
+    outcomes = {result.name: result.passed for result in results}
+    assert outcomes["artifact.contract_complete"] is True
+    assert outcomes["artifact.exact_path"] is True
+    assert outcomes["artifact.exists"] is False
+    assert outcomes["artifact.sha256"] is False
+    assert outcomes["artifact.source_unchanged"] is False
 
 
 def test_state_identity_claim_canary_and_exit_mismatch() -> None:
@@ -323,6 +364,101 @@ def test_runner_writes_after_each_case_and_classifies_semantic(tmp_path: Path) -
         Verdict.FAIL,
     ]
     assert len(load_evidence(store.path)) == 3
+
+
+def test_runner_classifications_have_typed_replay_contracts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    identity = CampaignIdentity.create("classification-test")
+    store = EvidenceStore(tmp_path, identity)
+    runner = AssuranceRunner(identity, store)
+
+    def scenario(
+        scenario_id: str,
+        transport: str,
+        request: dict[str, object],
+        **extra: object,
+    ) -> Scenario:
+        return Scenario.from_dict(
+            {
+                "scenario_id": scenario_id,
+                "title": "classification replay",
+                "transport": transport,
+                "request": request,
+                "expected_contract": {},
+                "validators": [{"kind": "response_integrity"}],
+                **extra,
+            }
+        )
+
+    blocked_env = runner.run_case(
+        scenario("CLASS-ENV-001", "http", {"method": "GET", "path": "/health"})
+    )
+    runner.http_executor = LoopbackHttpExecutor(
+        "http://127.0.0.1:1", allowed_routes=set()
+    )
+    blocked_spec = runner.run_case(
+        scenario("CLASS-SPEC-001", "http", {"method": "GET", "path": "/health"})
+    )
+    skipped = runner.run_case(
+        scenario(
+            "CLASS-SKIP-001",
+            "offline",
+            {"observation": {"final": "unused"}},
+            required=False,
+            skip_reason="optional fixture is unavailable",
+        )
+    )
+    monkeypatch.setattr("qa.runner.run_validators", lambda *_args: [])
+    errored = runner.run_case(
+        scenario(
+            "CLASS-ERROR-001",
+            "offline",
+            {"observation": {"final": "no assertions"}},
+        )
+    )
+    runner.close()
+
+    assert [blocked_env.verdict, blocked_spec.verdict, skipped.verdict, errored.verdict] == [
+        Verdict.BLOCKED_BY_ENV,
+        Verdict.BLOCKED_BY_SPEC,
+        Verdict.SKIP,
+        Verdict.ERROR,
+    ]
+    records, errors = validate_evidence_file(store.path)
+    assert errors == []
+    assert {record["replay"]["mode"] for record in records} == {"classification"}
+    replay = replay_file(store.path)
+    assert replay.errors == ()
+    assert replay.mismatches == ()
+    assert replay.counts == {
+        "PASS": 0,
+        "FAIL": 0,
+        "INCONCLUSIVE": 0,
+        "BLOCKED_BY_ENV": 1,
+        "BLOCKED_BY_SPEC": 1,
+        "SKIP": 1,
+        "ERROR": 1,
+    }
+
+    records[0]["replay"]["reason"] = "fabricated classification"
+    assert any("reason must match error" in error for error in validate_evidence_records(records))
+
+
+def test_skip_reason_requires_an_optional_scenario() -> None:
+    base = {
+        "scenario_id": "CLASS-SKIP-INVALID",
+        "title": "invalid skip",
+        "transport": "offline",
+        "request": {"observation": {"final": "unused"}},
+        "expected_contract": {},
+        "validators": [{"kind": "response_integrity"}],
+        "skip_reason": "requested skip",
+    }
+    with pytest.raises(ValueError, match="optional scenario"):
+        Scenario.from_dict(base)
+    with pytest.raises(ValueError, match="non-empty"):
+        Scenario.from_dict({**base, "required": False, "skip_reason": ""})
 
 
 def test_committed_suite_and_schema_files_are_valid_json() -> None:

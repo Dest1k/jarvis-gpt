@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .evidence import validate_evidence_file
+from .evidence import validate_evidence_file, validate_replay_contract
 from .models import EXIT_FAIL, EXIT_HARNESS_ERROR, EXIT_PASS, Verdict
 from .validators import run_validators
 
@@ -51,11 +51,23 @@ class ReplaySummary:
 def replay_record(record: Mapping[str, Any]) -> ReplayCase:
     case_id = str(record.get("case_id", "<missing>"))
     recorded = Verdict(str(record["verdict"]))
+    contract_errors = validate_replay_contract(record, recorded)
+    if contract_errors:
+        raise ValueError("; ".join(contract_errors))
+    replay_mode = record["replay"]["mode"]
     observation = record.get("observation")
     validators = record.get("validators")
     if not isinstance(observation, Mapping) or not isinstance(validators, list):
         replayed = Verdict.ERROR
         failures = ("replay.record_shape",)
+    elif replay_mode == "classification":
+        assertions = record["assertions"]
+        failures = tuple(
+            str(assertion["name"])
+            for assertion in assertions
+            if isinstance(assertion, Mapping) and not bool(assertion["passed"])
+        )
+        replayed = recorded
     else:
         assertions = run_validators(observation, validators)
         failures = tuple(assertion.name for assertion in assertions if not assertion.passed)
@@ -65,13 +77,6 @@ def replay_record(record: Mapping[str, Any]) -> ReplayCase:
             replayed = Verdict.FAIL
         elif bool(record.get("semantic_review_required", False)):
             replayed = Verdict.INCONCLUSIVE
-        elif recorded in {
-            Verdict.BLOCKED_BY_ENV,
-            Verdict.BLOCKED_BY_SPEC,
-            Verdict.SKIP,
-            Verdict.ERROR,
-        } and record.get("non_replayable_reason"):
-            replayed = recorded
         else:
             replayed = Verdict.PASS
     return ReplayCase(case_id, recorded, replayed, failures)

@@ -25,6 +25,10 @@ The three source identities are intentionally separate:
   bounded evidence is serialized.
 - A `PASS` needs at least one factual assertion. A deterministic failure cannot
   be promoted by semantic review.
+- Artifact checks stat and hash only the contract-approved filesystem paths;
+  recorded `exists` and hash fields are treated as untrusted claims.
+- Runner-produced blocked, skipped, and error records carry a typed
+  classification replay contract with an exact runner assertion and reason.
 - This first version never manages JARVIS lifecycle, Docker, models, runtime
   state, or external network resources.
 
@@ -56,8 +60,11 @@ Runner exit codes are:
 
 `replay` returns zero when recomputed verdicts exactly match the immutable
 recorded verdicts, even when the calibrated corpus intentionally includes
-known `FAIL` and `INCONCLUSIVE` cases. `adjudicate` returns `0`, `1`, or `2`
-for `PASS`, `FAIL`, or `INCONCLUSIVE` respectively.
+known `FAIL` and `INCONCLUSIVE` cases. Deterministic records rerun validators;
+typed runner classifications validate and preserve `BLOCKED_BY_ENV`,
+`BLOCKED_BY_SPEC`, optional `SKIP`, and `ERROR` without a free-form bypass.
+`adjudicate` returns `0`, `1`, or `2` for `PASS`, `FAIL`, or `INCONCLUSIVE`
+respectively.
 
 ## Layout
 

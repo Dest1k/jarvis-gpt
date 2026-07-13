@@ -10,6 +10,7 @@ Every JSONL record is `jarvis.qa.evidence.v1` and binds:
 - sanitized observation and bounded evidence;
 - factual assertion objects;
 - authoritative deterministic failure names;
+- a typed deterministic or runner-classification replay contract;
 - case verdict and pre-write redaction count.
 
 Records are append-only. The campaign path and final manifest are
@@ -57,6 +58,15 @@ derived from the completed campaign reports. It exercises:
 Replay recomputes deterministic assertions and compares the new verdict with
 the recorded verdict. The replay command succeeds only when every verdict
 matches. It does not reinterpret a known calibrated `FAIL` as harness failure.
+For runner-produced `BLOCKED_BY_ENV`, `BLOCKED_BY_SPEC`, optional `SKIP`, and
+`ERROR`, replay instead verifies the exact typed runner assertion, its pass/fail
+polarity, the requirement flag, and a reason bound to the recorded error before
+preserving the classification. A free-form non-replayable marker is not
+accepted.
+
+Artifact validators never trust recorded existence or digest claims. They stat
+and SHA-256 hash the exact contract-approved artifact path and, when requested,
+the explicit source path used for the before/after integrity comparison.
 
 ## Evidence limitations
 

@@ -13,6 +13,94 @@ from .models import CampaignIdentity, CampaignSummary, CaseResult, Scenario, Ver
 from .redaction import credential_like_paths, redact_value
 
 EVIDENCE_SCHEMA = "jarvis.qa.evidence.v1"
+DETERMINISTIC_REPLAY_VERDICTS = frozenset(
+    {Verdict.PASS, Verdict.FAIL, Verdict.INCONCLUSIVE}
+)
+CLASSIFICATION_REPLAY_VERDICTS = frozenset(
+    {
+        Verdict.BLOCKED_BY_ENV,
+        Verdict.BLOCKED_BY_SPEC,
+        Verdict.SKIP,
+        Verdict.ERROR,
+    }
+)
+
+
+def _replay_contract(result: CaseResult) -> dict[str, Any]:
+    if result.verdict in DETERMINISTIC_REPLAY_VERDICTS:
+        return {"mode": "deterministic"}
+    if result.verdict in CLASSIFICATION_REPLAY_VERDICTS:
+        if not result.error:
+            raise ValueError(f"{result.verdict.value} requires a replay reason")
+        return {
+            "mode": "classification",
+            "reason": result.error,
+            "assertion_names": [assertion.name for assertion in result.assertions],
+        }
+    raise ValueError(f"unsupported replay verdict {result.verdict.value}")
+
+
+def validate_replay_contract(record: Mapping[str, Any], verdict: Verdict) -> list[str]:
+    """Validate the typed replay mode without trusting a free-form marker."""
+
+    errors: list[str] = []
+    replay = record.get("replay")
+    if not isinstance(replay, Mapping):
+        return ["replay must be an object"]
+    mode = replay.get("mode")
+    if mode == "deterministic":
+        if set(replay) != {"mode"}:
+            errors.append("deterministic replay has unexpected fields")
+        if verdict not in DETERMINISTIC_REPLAY_VERDICTS:
+            errors.append(f"{verdict.value} cannot use deterministic replay mode")
+        return errors
+    if mode != "classification":
+        return ["replay mode must be deterministic or classification"]
+    if set(replay) != {"mode", "reason", "assertion_names"}:
+        errors.append("classification replay fields are incomplete or unexpected")
+    if verdict not in CLASSIFICATION_REPLAY_VERDICTS:
+        errors.append(f"{verdict.value} cannot use classification replay mode")
+
+    reason = replay.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        errors.append("classification replay reason must be non-empty")
+    if record.get("error") != reason:
+        errors.append("classification replay reason must match error")
+
+    assertions = record.get("assertions")
+    assertion_names = replay.get("assertion_names")
+    if not isinstance(assertions, list) or not isinstance(assertion_names, list) or any(
+        not isinstance(name, str) for name in assertion_names
+    ):
+        errors.append("classification replay assertion_names must be a string array")
+        return errors
+    actual_names = [
+        str(assertion.get("name"))
+        for assertion in assertions
+        if isinstance(assertion, Mapping)
+    ]
+    if assertion_names != actual_names:
+        errors.append("classification replay assertion_names mismatch")
+
+    expected_names = {
+        Verdict.BLOCKED_BY_ENV: {"runner.environment_available"},
+        Verdict.BLOCKED_BY_SPEC: {"runner.specification_complete"},
+        Verdict.SKIP: {"runner.optional_skip"},
+        Verdict.ERROR: {"runner.assertions_present", "runner.completed_without_error"},
+    }
+    expected_passed = verdict is Verdict.SKIP
+    matching = [
+        assertion
+        for assertion in assertions
+        if isinstance(assertion, Mapping)
+        and assertion.get("name") in expected_names.get(verdict, set())
+        and assertion.get("passed") is expected_passed
+    ]
+    if len(matching) != 1 or len(assertions) != 1:
+        errors.append(f"{verdict.value} lacks its exact runner classification assertion")
+    if verdict is Verdict.SKIP and record.get("required") is not False:
+        errors.append("SKIP requires required=false")
+    return errors
 
 
 def _bound_sanitized(value: Any, depth: int = 0) -> Any:
@@ -66,6 +154,7 @@ class EvidenceStore:
             "assertions": [assertion.to_dict() for assertion in result.assertions],
             "deterministic_failures": list(result.deterministic_failures),
             "bounded_evidence": dict(result.bounded_evidence),
+            "replay": _replay_contract(result),
             "error": result.error,
             "observed_at_utc": result.observed_at_utc,
         }
@@ -121,12 +210,15 @@ def validate_evidence_records(records: list[Mapping[str, Any]]) -> list[str]:
         "namespace",
         "case_id",
         "verdict",
+        "required",
+        "semantic_review_required",
         "sanitized_request",
         "validators",
         "observation",
         "assertions",
         "deterministic_failures",
         "bounded_evidence",
+        "replay",
     }
     for index, record in enumerate(records, start=1):
         missing = sorted(required - record.keys())
@@ -140,6 +232,10 @@ def validate_evidence_records(records: list[Mapping[str, Any]]) -> list[str]:
         except ValueError:
             errors.append(f"record {index}: invalid verdict")
             continue
+        if not isinstance(record.get("required"), bool):
+            errors.append(f"record {index}: required must be boolean")
+        if not isinstance(record.get("semantic_review_required"), bool):
+            errors.append(f"record {index}: semantic_review_required must be boolean")
         validators = record.get("validators")
         if not isinstance(validators, list) or not validators:
             errors.append(f"record {index}: validators must be a non-empty array")
@@ -183,6 +279,10 @@ def validate_evidence_records(records: list[Mapping[str, Any]]) -> list[str]:
             errors.append(f"record {index}: FAIL has no failed assertion")
         if verdict in {Verdict.PASS, Verdict.INCONCLUSIVE} and failures:
             errors.append(f"record {index}: {verdict.value} has deterministic failures")
+        errors.extend(
+            f"record {index}: {error}"
+            for error in validate_replay_contract(record, verdict)
+        )
         key = (str(record["campaign_id"]), str(record["case_id"]))
         if key in seen:
             errors.append(f"record {index}: duplicate campaign/case key")

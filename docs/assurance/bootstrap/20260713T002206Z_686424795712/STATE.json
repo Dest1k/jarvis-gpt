@@ -1,7 +1,7 @@
 {
   "schema": "jarvis.assurance-foundation-state.v1",
   "run_id": "20260713T002206Z_686424795712",
-  "recorded_at_utc": "2026-07-13T20:19:43Z",
+  "recorded_at_utc": "2026-07-13T20:33:44Z",
   "state": "ASSURANCE_FOUNDATION_CANDIDATE_FOR_REVIEW",
   "git": {
     "main_checkout": "D:\\jarvis-gpt",
@@ -11,11 +11,12 @@
     "foundation_worktree": "D:\\jarvis-gpt-worktrees\\assurance-20260713T002206Z_686424795712",
     "foundation_branch": "foundation/assurance-upstream/20260713T002206Z_686424795712",
     "foundation_base": "b2c481de1a9e68079a67ff49790eb685a09e80e5",
-    "head_before_final_foundation_commit": "924bef7caf9a328a3353f8a7380cc986b744aa01",
+    "head_before_final_foundation_commit": "66633f2d2e7192abd2dd9f9662bea4f76dfef451",
     "final_head_resolution": "git rev-parse HEAD on the foundation branch",
     "substantive_commits": [
       "573bd20b680b6dbc8201e303112e1b4c8e2630a0",
-      "924bef7caf9a328a3353f8a7380cc986b744aa01"
+      "924bef7caf9a328a3353f8a7380cc986b744aa01",
+      "66633f2d2e7192abd2dd9f9662bea4f76dfef451"
     ],
     "push_performed": false,
     "merge_performed": false
@@ -49,9 +50,9 @@
   },
   "validation": {
     "pytest": {
-      "passed": 41,
+      "passed": 44,
       "failed": 0,
-      "core": 23,
+      "core": 26,
       "review_cli": 5,
       "upstream": 13
     },

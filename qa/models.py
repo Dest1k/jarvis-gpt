@@ -49,7 +49,15 @@ class Scenario:
     validators: tuple[Mapping[str, Any], ...]
     required: bool = True
     semantic_review_required: bool = False
+    skip_reason: str | None = None
     tags: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.skip_reason is not None:
+            if self.required:
+                raise ValueError("skip_reason is allowed only for an optional scenario")
+            if not self.skip_reason.strip():
+                raise ValueError("skip_reason must be non-empty")
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> Scenario:
@@ -76,6 +84,10 @@ class Scenario:
         tags = data.get("tags", [])
         if not isinstance(tags, list) or not all(isinstance(tag, str) for tag in tags):
             raise ValueError(f"{scenario_id}: tags must be strings")
+        required = bool(data.get("required", True))
+        skip_reason = data.get("skip_reason")
+        if skip_reason is not None and not isinstance(skip_reason, str):
+            raise ValueError(f"{scenario_id}: skip_reason must be a string")
         return cls(
             scenario_id=scenario_id,
             title=title,
@@ -83,8 +95,9 @@ class Scenario:
             request=dict(request),
             expected_contract=dict(contract),
             validators=tuple(dict(item) for item in validators),
-            required=bool(data.get("required", True)),
+            required=required,
             semantic_review_required=bool(data.get("semantic_review_required", False)),
+            skip_reason=skip_reason,
             tags=tuple(tags),
         )
 

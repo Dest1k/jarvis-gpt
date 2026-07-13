@@ -4,8 +4,9 @@
   "title": "JARVIS sanitized assurance evidence record",
   "type": "object",
   "required": [
-    "schema", "campaign_id", "namespace", "case_id", "verdict", "sanitized_request", "validators",
-    "observation", "assertions", "deterministic_failures", "bounded_evidence"
+    "schema", "campaign_id", "namespace", "case_id", "verdict", "required",
+    "semantic_review_required", "sanitized_request", "validators", "observation", "assertions",
+    "deterministic_failures", "bounded_evidence", "replay"
   ],
   "properties": {
     "schema": {"const": "jarvis.qa.evidence.v1"},
@@ -13,12 +14,35 @@
     "namespace": {"type": "string", "minLength": 8},
     "case_id": {"type": "string", "minLength": 3},
     "verdict": {"$ref": "verdict.schema.json"},
+    "required": {"type": "boolean"},
+    "semantic_review_required": {"type": "boolean"},
     "sanitized_request": {"type": "object"},
     "validators": {"type": "array", "minItems": 1},
     "observation": {"type": "object"},
     "assertions": {"type": "array"},
     "deterministic_failures": {"type": "array", "items": {"type": "string"}},
     "bounded_evidence": {"type": "object"},
+    "replay": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode"],
+          "properties": {"mode": {"const": "deterministic"}}
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "reason", "assertion_names"],
+          "properties": {
+            "mode": {"const": "classification"},
+            "reason": {"type": "string", "minLength": 1},
+            "assertion_names": {"type": "array", "items": {"type": "string"}}
+          }
+        }
+      ]
+    },
+    "error": {"type": ["string", "null"]},
     "redaction_event_count": {"type": "integer"}
   }
 }

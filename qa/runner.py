@@ -201,47 +201,68 @@ class AssuranceRunner:
         raise BlockedBySpecification(f"unsupported transport {scenario.transport}")
 
     def run_case(self, scenario: Scenario) -> CaseResult:
-        try:
-            observation = self._execute(scenario)
-            assertions = tuple(run_validators(observation, scenario.validators))
-            if not assertions:
-                verdict = Verdict.ERROR
-                error = "no assertions were produced"
-            elif any(not assertion.passed for assertion in assertions):
-                verdict = Verdict.FAIL
-                error = None
-            elif scenario.semantic_review_required:
-                verdict = Verdict.INCONCLUSIVE
-                error = None
-            else:
-                verdict = Verdict.PASS
-                error = None
-        except BlockedByEnvironment as exc:
-            observation = {}
-            assertions = (
-                AssertionResult("runner.environment_available", False, "available", str(exc)),
-            )
-            verdict = Verdict.BLOCKED_BY_ENV
-            error = str(exc)
-        except BlockedBySpecification as exc:
-            observation = {}
-            assertions = (
-                AssertionResult("runner.specification_complete", False, "complete", str(exc)),
-            )
-            verdict = Verdict.BLOCKED_BY_SPEC
-            error = str(exc)
-        except Exception as exc:  # harness boundary, never a false PASS
+        if scenario.skip_reason is not None:
             observation = {}
             assertions = (
                 AssertionResult(
-                    "runner.completed_without_error",
-                    False,
-                    "completed",
-                    f"{type(exc).__name__}: {exc}",
+                    "runner.optional_skip",
+                    True,
+                    "explicit optional skip",
+                    scenario.skip_reason,
                 ),
             )
-            verdict = Verdict.ERROR
-            error = f"{type(exc).__name__}: {exc}"
+            verdict = Verdict.SKIP
+            error = scenario.skip_reason
+        else:
+            try:
+                observation = self._execute(scenario)
+                assertions = tuple(run_validators(observation, scenario.validators))
+                if not assertions:
+                    assertions = (
+                        AssertionResult(
+                            "runner.assertions_present",
+                            False,
+                            "at least one assertion",
+                            0,
+                        ),
+                    )
+                    verdict = Verdict.ERROR
+                    error = "no assertions were produced"
+                elif any(not assertion.passed for assertion in assertions):
+                    verdict = Verdict.FAIL
+                    error = None
+                elif scenario.semantic_review_required:
+                    verdict = Verdict.INCONCLUSIVE
+                    error = None
+                else:
+                    verdict = Verdict.PASS
+                    error = None
+            except BlockedByEnvironment as exc:
+                observation = {}
+                assertions = (
+                    AssertionResult("runner.environment_available", False, "available", str(exc)),
+                )
+                verdict = Verdict.BLOCKED_BY_ENV
+                error = str(exc)
+            except BlockedBySpecification as exc:
+                observation = {}
+                assertions = (
+                    AssertionResult("runner.specification_complete", False, "complete", str(exc)),
+                )
+                verdict = Verdict.BLOCKED_BY_SPEC
+                error = str(exc)
+            except Exception as exc:  # harness boundary, never a false PASS
+                observation = {}
+                assertions = (
+                    AssertionResult(
+                        "runner.completed_without_error",
+                        False,
+                        "completed",
+                        f"{type(exc).__name__}: {exc}",
+                    ),
+                )
+                verdict = Verdict.ERROR
+                error = f"{type(exc).__name__}: {exc}"
         result = CaseResult(
             case_id=scenario.scenario_id,
             verdict=verdict,
