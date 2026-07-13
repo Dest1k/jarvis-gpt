@@ -1,0 +1,6 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jarvis.local/qa/verdict.schema.json",
+  "title": "JARVIS assurance verdict",
+  "enum": ["PASS", "FAIL", "INCONCLUSIVE", "BLOCKED_BY_ENV", "BLOCKED_BY_SPEC", "SKIP", "ERROR"]
+}

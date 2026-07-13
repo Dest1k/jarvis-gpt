@@ -1,0 +1,21 @@
+{
+  "scenario_id": "CORE-RESPONSE-001",
+  "title": "Offline response-integrity smoke",
+  "transport": "offline",
+  "request": {
+    "observation": {
+      "final": "Готово",
+      "finals": ["Готово"],
+      "finish_reason": "stop",
+      "stream_terminal": true
+    }
+  },
+  "expected_contract": {"final": "Готово"},
+  "validators": [
+    {"kind": "response_integrity"},
+    {"kind": "format_contract", "field": "final", "exact": "Готово", "language": "ru"}
+  ],
+  "required": true,
+  "semantic_review_required": false,
+  "tags": ["offline", "operator-core"]
+}
