@@ -1,0 +1,7 @@
+{
+  "first": "same.md",
+  "second": "same.20260713010203.md",
+  "third": "same.20260713010203.md",
+  "third_collides_with_existing_second": true,
+  "oracle": "every implicit output path is unique and never overwrites an existing output"
+}

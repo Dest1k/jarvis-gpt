@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "test_id": "TEST-STATIC-017",
+  "evidence_id": "EVID-STATIC-017",
+  "started_utc": "2026-07-13T00:31:30.922756Z",
+  "finished_utc": "2026-07-13T00:31:30.945621Z",
+  "duration_seconds": 0.022861,
+  "command_argv": [
+    "/tmp/jarvis-phase-a-venv/bin/python",
+    ".audit/runs/20260713T002206Z_686424795712/harness/static/build_traceability.py"
+  ],
+  "command_display": "/tmp/jarvis-phase-a-venv/bin/python .audit/runs/20260713T002206Z_686424795712/harness/static/build_traceability.py",
+  "working_directory": "/workspace/scratch/d6949e59ddd4/jarvis-gpt",
+  "exit_code": 0,
+  "timed_out": false,
+  "stdout_path": ".audit/runs/20260713T002206Z_686424795712/evidence/static/EVID-STATIC-017_TEST-STATIC-017.stdout.txt",
+  "stderr_path": ".audit/runs/20260713T002206Z_686424795712/evidence/static/EVID-STATIC-017_TEST-STATIC-017.stderr.txt",
+  "environment": {
+    "python": "3.12.13 (main, Mar  3 2026, 14:59:34) [Clang 21.1.4 ]",
+    "platform": "Linux-6.12.47-x86_64-with-glibc2.39"
+  }
+}

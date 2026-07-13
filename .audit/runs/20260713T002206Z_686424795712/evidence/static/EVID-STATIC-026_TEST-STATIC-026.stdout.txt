@@ -1,0 +1,11 @@
+{
+  "status": "PASS",
+  "features": 254,
+  "requirements": 22,
+  "scenarios": 59,
+  "findings": 25,
+  "candidate_tasks": 25,
+  "manifest_items_verified": 78,
+  "production_diff": [],
+  "production_untracked_or_modified": []
+}

@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "test_id": "TEST-STATIC-008",
+  "evidence_id": "EVID-STATIC-008",
+  "started_utc": "2026-07-13T00:27:06.988390Z",
+  "finished_utc": "2026-07-13T00:27:12.377302Z",
+  "duration_seconds": 5.388905,
+  "command_argv": [
+    "env",
+    "HOME=/tmp/jarvis-npm-home",
+    "NEXT_TELEMETRY_DISABLED=1",
+    "npm_config_cache=/tmp/jarvis-npm-cache",
+    "npm",
+    "run",
+    "build"
+  ],
+  "command_display": "env HOME=/tmp/jarvis-npm-home NEXT_TELEMETRY_DISABLED=1 npm_config_cache=/tmp/jarvis-npm-cache npm run build",
+  "working_directory": "/tmp/jarvis-frontend-audit-20260713T002206Z-2",
+  "exit_code": 0,
+  "timed_out": false,
+  "stdout_path": ".audit/runs/20260713T002206Z_686424795712/evidence/static/EVID-STATIC-008_TEST-STATIC-008.stdout.txt",
+  "stderr_path": ".audit/runs/20260713T002206Z_686424795712/evidence/static/EVID-STATIC-008_TEST-STATIC-008.stderr.txt",
+  "environment": {
+    "python": "3.12.13 (main, Mar  3 2026, 14:59:34) [Clang 21.1.4 ]",
+    "platform": "Linux-6.12.47-x86_64-with-glibc2.39"
+  }
+}

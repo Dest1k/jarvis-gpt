@@ -1,0 +1,7 @@
+{
+  "features": 254,
+  "requirements": 22,
+  "findings": 25,
+  "live_scenarios": 36,
+  "evidence_files": 78
+}

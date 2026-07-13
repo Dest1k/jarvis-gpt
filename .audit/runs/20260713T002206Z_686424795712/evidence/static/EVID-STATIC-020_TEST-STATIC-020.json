@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "test_id": "TEST-STATIC-020",
+  "evidence_id": "EVID-STATIC-020",
+  "started_utc": "2026-07-13T00:33:07.791473Z",
+  "finished_utc": "2026-07-13T00:33:11.055758Z",
+  "duration_seconds": 3.264278,
+  "command_argv": [
+    "env",
+    "PYTHONDONTWRITEBYTECODE=1",
+    "/tmp/jarvis-phase-a-venv/bin/python",
+    "-m",
+    "pytest",
+    "--collect-only",
+    "-q"
+  ],
+  "command_display": "env PYTHONDONTWRITEBYTECODE=1 /tmp/jarvis-phase-a-venv/bin/python -m pytest --collect-only -q",
+  "working_directory": "/workspace/scratch/d6949e59ddd4/jarvis-gpt",
+  "exit_code": 0,
+  "timed_out": false,
+  "stdout_path": ".audit/runs/20260713T002206Z_686424795712/evidence/static/EVID-STATIC-020_TEST-STATIC-020.stdout.txt",
+  "stderr_path": ".audit/runs/20260713T002206Z_686424795712/evidence/static/EVID-STATIC-020_TEST-STATIC-020.stderr.txt",
+  "environment": {
+    "python": "3.12.13 (main, Mar  3 2026, 14:59:34) [Clang 21.1.4 ]",
+    "platform": "Linux-6.12.47-x86_64-with-glibc2.39"
+  }
+}

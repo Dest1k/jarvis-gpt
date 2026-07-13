@@ -1,0 +1,9 @@
+{
+  "features": 254,
+  "requirements": 22,
+  "api_features": 94,
+  "websocket_features": 1,
+  "cli_features": 32,
+  "tool_features": 98,
+  "ui_features": 15
+}

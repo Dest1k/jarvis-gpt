@@ -1,0 +1,23 @@
+{
+  "gemma4-mono": {
+    "title": "Gemma 4 Mono (Offload)",
+    "description": "Experimental Docker/WSL Gemma 4 31B IT NVFP4 stability profile. Partial CPU weight offload + native KV offload, eager mode, single-seq. Measured decode is below 1 tok/s on RTX 5090; use only for long-context quality checks, never interactive chat. Prefer gemma4-turbo.",
+    "model_dir_name": "gemma4-31b-it-nvfp4",
+    "eager_mode": true,
+    "max_steps": 12
+  },
+  "gemma4-mono-perf": {
+    "title": "Gemma 4 Mono Perf",
+    "description": "Experimental Docker/WSL Gemma 4 31B IT NVFP4 quality profile. Minimal CPU weight offload (2.5GB), eager mode, 4k context and text-only execution. Measured around 2.45 tok/s on RTX 5090: much faster than the old mono profile, but still not an interactive runtime. Use gemma4-turbo for Command Center chat.",
+    "model_dir_name": "gemma4-31b-it-nvfp4",
+    "eager_mode": true,
+    "max_steps": 16
+  },
+  "gemma4-turbo": {
+    "title": "Gemma 4 Turbo",
+    "description": "Recommended interactive Gemma 4 26B A4B NVFP4 profile for RTX 5090. It fits GPU memory without CPU weight offload.",
+    "model_dir_name": "gemma4-26b-a4b-nvfp4",
+    "eager_mode": false,
+    "max_steps": 24
+  }
+}

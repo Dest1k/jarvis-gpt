@@ -1,0 +1,37 @@
+{
+  "source_commit": "686424795712cb0a562750b6dade13de18c48792",
+  "tracked_files": 167,
+  "total_bytes": 4859919,
+  "total_lines": 125148,
+  "by_classification": {
+    "config": 18,
+    "documentation": 14,
+    "generated": 3,
+    "production": 64,
+    "schema": 2,
+    "script": 13,
+    "test": 52,
+    "unknown": 1
+  },
+  "by_subsystem": {
+    "autonomy-jobs": 5,
+    "backend-api": 3,
+    "backend-core": 4,
+    "backend-tests": 52,
+    "cli": 1,
+    "configuration": 1,
+    "defensive-design": 1,
+    "deployment": 4,
+    "documentation": 14,
+    "execution": 15,
+    "frontend": 16,
+    "launcher-runtime": 13,
+    "llm-agent": 2,
+    "profiles-models": 3,
+    "quality-gates": 1,
+    "repository": 10,
+    "state-memory": 6,
+    "tools-host-web": 4,
+    "web-document": 12
+  }
+}

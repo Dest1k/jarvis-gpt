@@ -1,0 +1,58 @@
+{
+  "json_files_parsed": [
+    "backend/chromium-seccomp.json",
+    "docs/execution-capabilities.example.json",
+    "frontend/.eslintrc.json",
+    "frontend/package-lock.json",
+    "frontend/package.json",
+    "frontend/tsconfig.json"
+  ],
+  "project_name": "jarvis-gpt",
+  "compose_services": [
+    "backend",
+    "dispatcher",
+    "frontend"
+  ],
+  "env_keys": [
+    "JARVIS_HOME",
+    "JARVIS_PROFILE",
+    "JARVIS_MODEL_ROOT",
+    "JARVIS_LLM_BASE_URL",
+    "JARVIS_LLM_MODEL",
+    "JARVIS_LLM_ENABLED",
+    "JARVIS_VLLM_IMAGE",
+    "CUDA_VISIBLE_DEVICES",
+    "JARVIS_VERIFY_ANSWERS",
+    "JARVIS_EMBEDDINGS_ENABLED",
+    "JARVIS_EMBEDDINGS_BASE_URL",
+    "JARVIS_EMBEDDINGS_MODEL",
+    "JARVIS_BRAVE_SEARCH_API_KEY",
+    "JARVIS_TAVILY_API_KEY",
+    "JARVIS_SERPER_API_KEY",
+    "JARVIS_WEB_SURFER_MODULE",
+    "JARVIS_AUTONOMY_ENABLED",
+    "JARVIS_TELEMETRY_INTERVAL_SEC",
+    "JARVIS_HEALTH_INTERVAL_SEC",
+    "JARVIS_LEARNING_INTERVAL_SEC",
+    "JARVIS_COGNITION_ENABLED",
+    "JARVIS_COGNITION_INTERVAL_SEC",
+    "JARVIS_COGNITION_MAX_TOKENS",
+    "JARVIS_AUTONOMY_MISSION_INTERVAL_SEC",
+    "JARVIS_CORS_ORIGINS",
+    "JARVIS_API_TOKEN",
+    "JARVIS_API_HOST",
+    "JARVIS_API_PORT",
+    "JARVIS_API_REQUIRE_TOKEN_ON_LOOPBACK",
+    "JARVIS_BACKEND_URL"
+  ],
+  "profiles": [
+    "gemma4-mono",
+    "gemma4-mono-perf",
+    "gemma4-turbo"
+  ],
+  "openapi_paths": 81,
+  "app_routes": 95,
+  "compose_frontend_requires_backend_healthy": true,
+  "compose_backend_has_healthcheck": false,
+  "dev_extra_has_unused_httpx2": true
+}

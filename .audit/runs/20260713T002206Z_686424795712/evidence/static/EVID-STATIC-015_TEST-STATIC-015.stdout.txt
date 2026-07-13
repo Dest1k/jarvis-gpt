@@ -1,0 +1,1 @@
+Wrote JSON report to .audit/runs/20260713T002206Z_686424795712/evidence/static/coverage.json

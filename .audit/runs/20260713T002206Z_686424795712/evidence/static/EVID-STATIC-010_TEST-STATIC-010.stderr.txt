@@ -1,0 +1,7 @@
+Traceback (most recent call last):
+  File "/workspace/scratch/d6949e59ddd4/jarvis-gpt/.audit/runs/20260713T002206Z_686424795712/harness/static/static_contracts.py", line 111, in <module>
+    main()
+  File "/workspace/scratch/d6949e59ddd4/jarvis-gpt/.audit/runs/20260713T002206Z_686424795712/harness/static/static_contracts.py", line 80, in main
+    assert launcher_profiles == profile_names
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError

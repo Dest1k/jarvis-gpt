@@ -1,0 +1,11 @@
+{
+  "zip_error": "Archive uncompressed size exceeds limit (8 > 5)",
+  "zip_partial_files_after_failure": {
+    "first.txt": 4
+  },
+  "gzip_error": "Member exceeds size limit (7 > 2)",
+  "gzip_partial_files_after_failure": {
+    "payload.txt": 0
+  },
+  "oracle": "failed extraction leaves no final output files"
+}

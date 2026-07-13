@@ -1,0 +1,46 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.13, pytest-9.0.3, pluggy-1.6.0
+rootdir: /workspace/scratch/d6949e59ddd4/jarvis-gpt
+configfile: pyproject.toml
+plugins: anyio-4.14.1
+collected 394 items
+
+backend/tests/test_agentic_loop.py .................                     [  4%]
+backend/tests/test_approval_executor.py ........................         [ 10%]
+backend/tests/test_browser_cdp.py .....                                  [ 11%]
+backend/tests/test_cognitive_memory.py .........                         [ 13%]
+backend/tests/test_config_storage.py ................                    [ 18%]
+backend/tests/test_deployment_contracts.py .......                       [ 19%]
+backend/tests/test_dispatcher.py ..................                      [ 24%]
+backend/tests/test_document_memory.py .................                  [ 28%]
+backend/tests/test_document_runtime.py ..                                [ 29%]
+backend/tests/test_document_surfer.py ...........                        [ 31%]
+backend/tests/test_embeddings.py .......                                 [ 33%]
+backend/tests/test_event_bus.py .                                        [ 34%]
+backend/tests/test_execution_actions_protocol.py .......                 [ 35%]
+backend/tests/test_execution_replay.py .......                           [ 37%]
+backend/tests/test_execution_transaction_session.py ................     [ 41%]
+backend/tests/test_executive_cognitive.py ...............                [ 45%]
+backend/tests/test_executive_planner.py ..................               [ 50%]
+backend/tests/test_experience.py ....                                    [ 51%]
+backend/tests/test_experience_loop.py .....                              [ 52%]
+backend/tests/test_file_types_and_archives.py ..........                 [ 54%]
+backend/tests/test_ingest.py ............                                [ 57%]
+backend/tests/test_learning_telemetry.py .........                       [ 60%]
+backend/tests/test_llm.py ............                                   [ 63%]
+backend/tests/test_model_catalog.py .......                              [ 64%]
+backend/tests/test_operations.py ...........                             [ 67%]
+backend/tests/test_operator_queue.py ..                                  [ 68%]
+backend/tests/test_persona.py .........                                  [ 70%]
+backend/tests/test_redaction.py .                                        [ 70%]
+backend/tests/test_shop_registry.py ....                                 [ 71%]
+backend/tests/test_shop_routing.py .......................               [ 77%]
+backend/tests/test_shop_search.py ...................................... [ 87%]
+.................                                                        [ 91%]
+backend/tests/test_smoke_script.py .....                                 [ 92%]
+backend/tests/test_verification.py ...........                           [ 95%]
+backend/tests/test_web_coverage.py ..........                            [ 98%]
+backend/tests/test_web_orchestrator.py ....                              [ 99%]
+backend/tests/test_web_surfer_integration.py ...                         [100%]
+
+============================= 394 passed in 13.82s =============================

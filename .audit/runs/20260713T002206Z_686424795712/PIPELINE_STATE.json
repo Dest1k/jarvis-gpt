@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "run_id": "20260713T002206Z_686424795712",
+  "repository": "Dest1k/jarvis-gpt",
+  "source_commit": "686424795712cb0a562750b6dade13de18c48792",
+  "source_branch": "main",
+  "audit_branch": "audit/phase-a-20260713T002206Z_686424795712",
+  "phase_a": {
+    "status": "COMPLETE_WITH_BLOCKERS",
+    "executor": "Codex / Work",
+    "live_machine_access": false,
+    "completed_utc": "2026-07-13T00:34:00Z",
+    "counts": {
+      "features": 254,
+      "requirements": 22,
+      "tests_collected": 830,
+      "static_command_records": 27,
+      "findings": 25,
+      "live_scenarios": 36
+    }
+  },
+  "phase_b": {
+    "status": "NOT_STARTED"
+  },
+  "spark": {
+    "status": "LOCKED_UNTIL_PHASE_B"
+  },
+  "canonical_local_paths": {
+    "repo_root": "D:\\jarvis-gpt",
+    "data_root": "D:\\jarvis"
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "repository": "Dest1k/jarvis-gpt",
+  "git_root_cloud": "/workspace/scratch/d6949e59ddd4/jarvis-gpt",
+  "canonical_repo_root_windows": "D:\\jarvis-gpt",
+  "canonical_data_root_windows": "D:\\jarvis",
+  "remote": "https://github.com/Dest1k/jarvis-gpt.git",
+  "source_branch": "main",
+  "source_commit": "686424795712cb0a562750b6dade13de18c48792",
+  "source_parent": "859d2eb7b2b0093481db0ccfef950b4082cdf1c3",
+  "tags_at_source": [],
+  "submodules": [],
+  "tracked_files": 167,
+  "source_status": "clean",
+  "clone_mode": "single-branch partial clone; all tracked working-tree blobs materialized",
+  "captured_utc": "2026-07-13T00:22:06Z",
+  "audit_exclusions_for_drift": [".audit/**", "docs/audit/**"]
+}

@@ -1,0 +1,48 @@
+usage: jarvis [-h] [--profile {gemma4-mono,gemma4-mono-perf,gemma4-turbo}]
+              {init,profiles,status,backup,models,diag,chat,tools,llm-health,dispatcher-status,dispatcher-compose,dispatcher-up,dispatcher-down,telemetry,learning-tick,host-bridge,host-bridge-action,autonomy,persona,persona-set,ingest,files,file-search,audit,approvals,approval-request,approval-update,approval-execute,tool-run,mission-next,mission-run,serve}
+              ...
+
+Jarvis runtime CLI
+
+positional arguments:
+  {init,profiles,status,backup,models,diag,chat,tools,llm-health,dispatcher-status,dispatcher-compose,dispatcher-up,dispatcher-down,telemetry,learning-tick,host-bridge,host-bridge-action,autonomy,persona,persona-set,ingest,files,file-search,audit,approvals,approval-request,approval-update,approval-execute,tool-run,mission-next,mission-run,serve}
+    init                Create D:\jarvis runtime folders and SQLite state
+    profiles            List available runtime profiles
+    status              Show local runtime status
+    backup              Create a consistent SQLite runtime backup
+    models              Show local model catalog and dispatcher config
+    diag                Run diagnostics
+    chat                Run one local agent turn
+    tools               List registered safe tools
+    llm-health          Check OpenAI-compatible LLM route
+    dispatcher-status   Show dispatcher status
+    dispatcher-compose  Show dispatcher docker compose commands and env
+    dispatcher-up       Start vLLM dispatcher service
+    dispatcher-down     Stop vLLM dispatcher service
+    telemetry           Collect host/GPU/Docker telemetry
+    learning-tick       Mine audit/tool history into memory
+    host-bridge         Show native host bridge status
+    host-bridge-action  Run a typed action.v1 request through the native host
+                        bridge
+    autonomy            Show autonomous supervisor settings
+    persona             Show the durable operator persona
+    persona-set         Update persona fields, e.g. --set location=Kazan --set
+                        tech_stack=Proxmox,Debian
+    ingest              Copy and index a local text file
+    files               List indexed or stored files
+    file-search         Search indexed file chunks
+    audit               Show audit trail
+    approvals           List human approval gates
+    approval-request    Create a HITL gate
+    approval-update     Update a HITL gate
+    approval-execute    Execute an approved HITL gate through the gated
+                        executor
+    tool-run            Run a registered safe tool
+    mission-next        Execute next pending mission task
+    mission-run         Auto-chain mission steps until completion, a blocked
+                        step, or the budget
+    serve               Start FastAPI backend
+
+options:
+  -h, --help            show this help message and exit
+  --profile {gemma4-mono,gemma4-mono-perf,gemma4-turbo}
