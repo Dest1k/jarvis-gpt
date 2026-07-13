@@ -2,7 +2,9 @@
 
 Ты выполняешь PHASE C: контролируемое исправление подтверждённых результатов двухкомпонентного аудита JARVIS.
 
-Этот файл является **единственным каноническим launcher-prompt для Spark**. Он объединяет task-loop с обязательной технической изоляцией, резервными копиями и проверяемым откатом.
+Этот файл является **единственным каноническим launcher-prompt для Spark**. Он объединяет task-loop с обязательной технической изоляцией, резервными копиями, проверяемым откатом и операторским acceptance gate.
+
+Цель PHASE C — не просто сделать tests зелёными, а получить ветку-кандидат, где JARVIS адекватно выполняет обычные пользовательские задачи: понимает цель, соблюдает инструкции, выдаёт полезный законченный результат, честно сообщает блокеры и не показывает внутренний JSON/protocol вместо ответа.
 
 Это работа с принадлежащим пользователю локальным проектом. Не воздействуй на внешние системы, не формируй инструкции по нарушению ограничений и не используй реальные конфиденциальные данные. Для задач ввода, разрешений, URL и файловых границ применяй только harmless synthetic examples, loopback fixtures, temp roots и copied state.
 
@@ -34,17 +36,23 @@ git rev-parse HEAD
 Полностью прочитай и исполняй совместно:
 
 1. `docs/audit/03_JARVIS_SPARK_REMEDIATION_PROMPT.md` — core task-loop;
-2. `docs/audit/04_JARVIS_REMEDIATION_SAFETY_AND_ROLLBACK_PROTOCOL.md` — isolation/backup/rollback;
-3. `.audit/LATEST_COMPLETE_RUN.txt` и указанный run;
-4. `spark/START_HERE_FOR_SPARK.md`;
-5. `spark/SPARK_MASTER_PROMPT.md`;
-6. `spark/SPARK_QUEUE.csv`;
-7. `spark/SPARK_PROGRESS.md`;
-8. `spark/TASK_SCHEMA.md`;
-9. весь `spark/safety/`;
-10. актуальные repository instructions.
+2. `docs/audit/05_JARVIS_OPERATOR_ACCEPTANCE_AND_RESPONSE_QUALITY_PROTOCOL.md` — instruction following, полезность результата и response integrity;
+3. `docs/audit/04_JARVIS_REMEDIATION_SAFETY_AND_ROLLBACK_PROTOCOL.md` — isolation/backup/rollback;
+4. `.audit/LATEST_COMPLETE_RUN.txt` и указанный run;
+5. `spark/START_HERE_FOR_SPARK.md`;
+6. `spark/SPARK_MASTER_PROMPT.md`;
+7. `spark/SPARK_QUEUE.csv`;
+8. `spark/SPARK_PROGRESS.md`;
+9. `spark/TASK_SCHEMA.md`;
+10. весь `spark/safety/`;
+11. operator acceptance baseline/reports текущего run;
+12. актуальные repository instructions.
 
-При конфликте rollback protocol имеет приоритет в Git root/worktree/branch, backups, runtime state, Docker, restore, cleanup и stop conditions.
+При конфликте:
+
+- operator acceptance protocol имеет приоритет в instruction following, ordinary user journeys, response integrity, false-success и post-fix readiness;
+- rollback protocol имеет приоритет в Git root/worktree/branch, backups, runtime state, Docker, restore, cleanup и stop conditions;
+- выбери более безопасный и более строго проверяемый вариант.
 
 Все patch/test/commit действия выполняются только в remediation worktree.
 
@@ -60,6 +68,15 @@ spark/safety/READY
 ```
 
 `SAFETY_STATE.json` должен показывать `state = READY`, а `PIPELINE_STATE.json` — завершённые PHASE A/PHASE B и разрешённые Spark tasks.
+
+Дополнительно должны существовать:
+
+```text
+OPERATOR_ACCEPTANCE_RESULTS.csv
+INSTRUCTION_FOLLOWING_REPORT.md
+RESPONSE_INTEGRITY_REPORT.md
+REAL_WORLD_JOURNEYS_REPORT.md
+```
 
 Если хотя бы одно условие не выполнено:
 
@@ -165,7 +182,8 @@ Set-Location $Worktree
 5. не повторяй committed tasks;
 6. при незавершённом dirty patch восстанови только explicit allowed files из task tag и task snapshot;
 7. обнови `RESUME_NOTE.md`;
-8. продолжи с первой eligible READY task.
+8. продолжи с первой eligible READY task;
+9. проверь, что post-fix operator transcripts незавершённой task не засчитаны как PASS.
 
 Если происхождение dirty diff или runtime mutation неизвестно, установи `ABORTED`/`NEEDS_HUMAN_RESTORE` и остановись.
 
@@ -247,6 +265,21 @@ Reproduction и regression test должны быть функциональны
 
 Task, которую нельзя воспроизвести таким способом, получает `BLOCKED_BY_POLICY` или `BLOCKED_BY_SAFETY`.
 
+### 9.5. Operator behavior task rule
+
+Если task затрагивает user-facing behavior, instruction following, routing, streaming, tools, GUI, missions, documents, memory или final response:
+
+1. сначала воспроизведи exact sanitized ordinary-user case из operator acceptance baseline;
+2. зафиксируй явные constraints и forbidden outcomes;
+3. докажи исходный FAIL transcript/state;
+4. добавь deterministic regression validator для orchestration/output integrity там, где возможно;
+5. не привязывай test к случайной точной формулировке LLM — проверяй intent, format, claimed state, artifacts и semantic contract;
+6. после patch повтори исходный case минимум требуемое число раз;
+7. повтори соседние journeys: strict format, multi-turn context, failure/recovery, streaming reconstruction и internal-protocol scan;
+8. сохрани результат в `spark/OPERATOR_ACCEPTANCE_REGRESSIONS.csv`.
+
+Нельзя закрыть такую task только unit-тестом, если исходный defect проявлялся через real model/GUI. Нельзя считать исправлением hardcoded ответ, скрытие ошибки, ослабление validator или удаление полезной функции.
+
 ---
 
 ## 10. Если task не удалась
@@ -302,6 +335,7 @@ Task, которую нельзя воспроизвести таким спос
 - один локальный commit;
 - stage только explicit paths;
 - fix + regression tests + task report + queue/progress update;
+- для operator task также обновление operator regression artifacts;
 - никаких `git add -A` в dirty tree;
 - никаких push/merge/rebase/squash/force;
 - после commit — status, SHA и task → commit mapping.
@@ -320,13 +354,17 @@ Canonical checkout и default branch не изменяются.
 - runtime known-good;
 - DB/file/volume integrity не ухудшилась;
 - resource leaks отсутствуют или оформлены blocker;
+- затронутые operator journeys повторены;
+- response-integrity scan не выявил новых internal JSON/protocol leaks, duplicate/truncated final или false success;
 - progress/safety state обновлены.
 
-После последнего batch создай:
+После последнего batch выполни финальный representative real-model operator suite по `05_JARVIS_OPERATOR_ACCEPTANCE_AND_RESPONSE_QUALITY_PROTOCOL.md` и создай:
 
 ```text
 spark/REMEDIATION_SUMMARY.md
 spark/POST_FIX_VALIDATION.md
+spark/POST_FIX_OPERATOR_ACCEPTANCE.md
+spark/OPERATOR_ACCEPTANCE_REGRESSIONS.csv
 spark/ROLLBACK_INDEX.md
 ```
 
@@ -335,6 +373,15 @@ spark/ROLLBACK_INDEX.md
 ```text
 CANDIDATE_FOR_REVIEW
 ```
+
+разрешён только если:
+
+- нет нового internal protocol/secret leakage;
+- нет false success или missing claimed artifact;
+- нет cross-session mixing;
+- все P0/P1 operator findings исправлены, заблокированы по точной причине или явно оставлены на human decision;
+- обязательная real-model post-fix validation выполнена;
+- все safety gates сохраняются.
 
 Не merge и не push.
 
@@ -349,9 +396,10 @@ CANDIDATE_FOR_REVIEW
 - current batch/task;
 - current HEAD;
 - runtime known-good status;
+- operator journeys PASS/FAIL и response-integrity status;
 - blockers, если есть.
 
-Не публикуй raw logs, содержимое confidential files, длинные test inputs или operational details по нарушению границ.
+Не публикуй raw logs, длинные transcripts, содержимое confidential files, длинные test inputs или operational details по нарушению границ.
 
 ---
 
@@ -365,10 +413,13 @@ CANDIDATE_FOR_REVIEW
 - task → commit mapping;
 - batch/final validation results;
 - profiles/runtime/GUI checks;
+- количество post-fix operator cases и instruction-following pass rate;
+- response-integrity pass rate;
+- число remaining internal-leak/false-success/vague-handoff defects;
 - bundle/checkpoint/restore status;
 - unresolved findings/residual risks;
 - конечное состояние JARVIS/Docker/LLM;
-- paths к progress/summary/post-fix/rollback documents;
+- paths к progress/summary/post-fix/operator-acceptance/rollback documents;
 - state `CANDIDATE_FOR_REVIEW`.
 
-Не говори «всё исправлено», если остались blockers или непроверенные acceptance checks.
+Не говори «всё исправлено», если остались blockers, непроверенные acceptance checks или не выполнен operator acceptance gate.
