@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import json
 from datetime import UTC, datetime
 from pathlib import Path
 
 from ..models import Verdict
-from .reviewer import load_review_result
+from .reviewer import _exclusive_json, load_review_result
 from .schemas import AdjudicationResult, ReviewResult
 
 
@@ -51,7 +50,4 @@ def adjudicate_files(first_path: Path, second_path: Path) -> AdjudicationResult:
 
 
 def write_adjudication(path: Path, result: AdjudicationResult) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("x", encoding="utf-8", newline="\n") as handle:
-        json.dump(result.to_dict(), handle, ensure_ascii=False, indent=2, sort_keys=True)
-        handle.write("\n")
+    _exclusive_json(path, result.to_dict())

@@ -16,7 +16,10 @@ The three source identities are intentionally separate:
 
 - HTTP base URLs must be loopback. The client uses `trust_env=False`, disables
   redirects, and permits only an explicit `(method, path)` allowlist.
-- CLI commands are exact argument tuples and execute with `shell=False`.
+- CLI requests map through typed fixed specs to the resolved absolute Python
+  interpreter and an absolute repository-owned launcher. The child uses
+  `-I -S`, `shell=False`, repository-root `cwd`, and a minimal environment
+  without `PATH`, `PYTHONPATH`, `PYTHONHOME`, user-site, or startup hooks.
 - Every campaign receives a timestamp-and-random campaign ID and a separate
   namespace.
 - Evidence files and manifests use exclusive-create. JSONL is flushed and
@@ -25,8 +28,14 @@ The three source identities are intentionally separate:
   bounded evidence is serialized.
 - A `PASS` needs at least one factual assertion. A deterministic failure cannot
   be promoted by semantic review.
-- Artifact checks stat and hash only the contract-approved filesystem paths;
-  recorded `exists` and hash fields are treated as untrusted claims.
+- Scenario and validator control objects reject unknown fields and wrong types;
+  JSON contract schemas are themselves validated before any instance result.
+- Artifact checks accept only canonical relative paths plus trusted out-of-band
+  root aliases. Descriptor-based bounded reads reject absolute/traversal,
+  missing, special, oversized, symlink, junction, and reparse targets; recorded
+  `exists` and hash fields remain untrusted claims.
+- Path-derived IDs and generated output leaves are canonical, resolved beneath
+  their exact output root, reparse-safe, and exclusive-create.
 - Runner-produced blocked, skipped, and error records carry a typed
   classification replay contract with an exact runner assertion and reason.
 - This first version never manages JARVIS lifecycle, Docker, models, runtime

@@ -11,6 +11,7 @@ from typing import Any
 from .evidence import validate_evidence_file, validate_replay_contract
 from .models import EXIT_FAIL, EXIT_HARNESS_ERROR, EXIT_PASS, Verdict
 from .validators import run_validators
+from .validators.context import ValidationContext
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,7 +49,9 @@ class ReplaySummary:
         return EXIT_PASS
 
 
-def replay_record(record: Mapping[str, Any]) -> ReplayCase:
+def replay_record(
+    record: Mapping[str, Any], *, context: ValidationContext | None = None
+) -> ReplayCase:
     case_id = str(record.get("case_id", "<missing>"))
     recorded = Verdict(str(record["verdict"]))
     contract_errors = validate_replay_contract(record, recorded)
@@ -69,7 +72,7 @@ def replay_record(record: Mapping[str, Any]) -> ReplayCase:
         )
         replayed = recorded
     else:
-        assertions = run_validators(observation, validators)
+        assertions = run_validators(observation, validators, context=context)
         failures = tuple(assertion.name for assertion in assertions if not assertion.passed)
         if not assertions:
             replayed = Verdict.ERROR
@@ -82,22 +85,24 @@ def replay_record(record: Mapping[str, Any]) -> ReplayCase:
     return ReplayCase(case_id, recorded, replayed, failures)
 
 
-def replay_records(records: list[Mapping[str, Any]]) -> ReplaySummary:
+def replay_records(
+    records: list[Mapping[str, Any]], *, context: ValidationContext | None = None
+) -> ReplaySummary:
     cases: list[ReplayCase] = []
     errors: list[str] = []
     for index, record in enumerate(records, start=1):
         try:
-            cases.append(replay_record(record))
+            cases.append(replay_record(record, context=context))
         except (KeyError, TypeError, ValueError) as exc:
             errors.append(f"record {index}: {type(exc).__name__}: {exc}")
     return ReplaySummary(tuple(cases), tuple(errors))
 
 
-def replay_file(path: Path) -> ReplaySummary:
+def replay_file(path: Path, *, context: ValidationContext | None = None) -> ReplaySummary:
     try:
         records, validation_errors = validate_evidence_file(path)
         if validation_errors:
             return ReplaySummary((), tuple(validation_errors))
-        return replay_records(records)
+        return replay_records(records, context=context)
     except (OSError, ValueError) as exc:
         return ReplaySummary((), (f"{type(exc).__name__}: {exc}",))

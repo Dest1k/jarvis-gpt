@@ -6,13 +6,43 @@ import json
 import os
 from collections.abc import Iterable, Mapping
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from .models import CampaignIdentity, CampaignSummary, CaseResult, Scenario, Verdict
 from .redaction import credential_like_paths, redact_value
+from .safe_paths import (
+    canonical_directory,
+    safe_output_path,
+    validate_campaign_identifier,
+    validate_case_id,
+)
 
 EVIDENCE_SCHEMA = "jarvis.qa.evidence.v1"
+EVIDENCE_REQUIRED_FIELDS = frozenset(
+    {
+        "schema",
+        "campaign_id",
+        "namespace",
+        "case_id",
+        "verdict",
+        "required",
+        "semantic_review_required",
+        "sanitized_request",
+        "expected_contract",
+        "validators",
+        "observation",
+        "assertions",
+        "deterministic_failures",
+        "bounded_evidence",
+        "replay",
+    }
+)
+EVIDENCE_OPTIONAL_FIELDS = frozenset(
+    {"title", "error", "observed_at_utc", "redaction_event_count"}
+)
+EVIDENCE_ALLOWED_FIELDS = EVIDENCE_REQUIRED_FIELDS | EVIDENCE_OPTIONAL_FIELDS
 DETERMINISTIC_REPLAY_VERDICTS = frozenset(
     {Verdict.PASS, Verdict.FAIL, Verdict.INCONCLUSIVE}
 )
@@ -128,12 +158,15 @@ class EvidenceStore:
         *,
         canaries: Iterable[str] = (),
     ) -> None:
-        self.output_root = output_root.resolve()
+        self.output_root = canonical_directory(output_root, create=True)
         self.identity = identity
         self.canaries = tuple(canaries)
-        self.output_root.mkdir(parents=True, exist_ok=True)
-        self.path = self.output_root / f"{identity.campaign_id}.jsonl"
-        self.manifest_path = self.output_root / f"{identity.campaign_id}.manifest.json"
+        self.path = safe_output_path(
+            self.output_root, f"{identity.campaign_id}.jsonl"
+        )
+        self.manifest_path = safe_output_path(
+            self.output_root, f"{identity.campaign_id}.manifest.json"
+        )
         with self.path.open("x", encoding="utf-8", newline="\n"):
             pass
 
@@ -190,9 +223,15 @@ def load_evidence(path: Path) -> list[dict[str, Any]]:
             if not line.strip():
                 raise ValueError(f"{path}:{line_number}: blank JSONL record")
             try:
-                record = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise ValueError(f"{path}:{line_number}: invalid JSON: {exc.msg}") from exc
+                record = json.loads(
+                    line,
+                    parse_constant=lambda value: (_ for _ in ()).throw(
+                        ValueError(f"non-finite JSON constant {value}")
+                    ),
+                )
+            except (json.JSONDecodeError, ValueError) as exc:
+                detail = exc.msg if isinstance(exc, json.JSONDecodeError) else str(exc)
+                raise ValueError(f"{path}:{line_number}: invalid JSON: {detail}") from exc
             if not isinstance(record, dict):
                 raise ValueError(f"{path}:{line_number}: record must be an object")
             records.append(record)
@@ -204,31 +243,62 @@ def load_evidence(path: Path) -> list[dict[str, Any]]:
 def validate_evidence_records(records: list[Mapping[str, Any]]) -> list[str]:
     errors: list[str] = []
     seen: set[tuple[str, str]] = set()
-    required = {
-        "schema",
-        "campaign_id",
-        "namespace",
-        "case_id",
-        "verdict",
-        "required",
-        "semantic_review_required",
-        "sanitized_request",
-        "validators",
-        "observation",
-        "assertions",
-        "deterministic_failures",
-        "bounded_evidence",
-        "replay",
-    }
     for index, record in enumerate(records, start=1):
-        missing = sorted(required - record.keys())
+        missing = sorted(EVIDENCE_REQUIRED_FIELDS - record.keys())
         if missing:
             errors.append(f"record {index}: missing {', '.join(missing)}")
             continue
+        unexpected = sorted(set(record) - EVIDENCE_ALLOWED_FIELDS)
+        if unexpected:
+            errors.append(f"record {index}: unexpected fields {', '.join(unexpected)}")
         if record.get("schema") != EVIDENCE_SCHEMA:
             errors.append(f"record {index}: unsupported schema")
+        if "title" in record and (
+            not isinstance(record["title"], str) or not record["title"]
+        ):
+            errors.append(f"record {index}: title must be a non-empty string")
+        if "error" in record and record["error"] is not None and not isinstance(
+            record["error"], str
+        ):
+            errors.append(f"record {index}: error must be a string or null")
+        if "observed_at_utc" in record:
+            observed_at = record["observed_at_utc"]
+            try:
+                candidate = (
+                    observed_at[:-1] + "+00:00"
+                    if isinstance(observed_at, str) and observed_at.endswith("Z")
+                    else observed_at
+                )
+                parsed_at = datetime.fromisoformat(candidate)
+                if parsed_at.tzinfo is None:
+                    raise ValueError("timezone is required")
+            except (TypeError, ValueError):
+                errors.append(f"record {index}: observed_at_utc must be a date-time")
+        redaction_count = record.get("redaction_event_count")
+        if "redaction_event_count" in record and (
+            not isinstance(redaction_count, int)
+            or isinstance(redaction_count, bool)
+            or redaction_count < 0
+        ):
+            errors.append(
+                f"record {index}: redaction_event_count must be a non-negative integer"
+            )
         try:
-            verdict = Verdict(str(record["verdict"]))
+            campaign_id = validate_campaign_identifier(
+                record.get("campaign_id"), label="campaign_id"
+            )
+            namespace = validate_campaign_identifier(record.get("namespace"), label="namespace")
+            case_id = validate_case_id(record.get("case_id"))
+            if campaign_id == namespace:
+                errors.append(f"record {index}: campaign_id and namespace must differ")
+        except ValueError as exc:
+            errors.append(f"record {index}: {exc}")
+            campaign_id = ""
+            case_id = ""
+        try:
+            if not isinstance(record["verdict"], str):
+                raise ValueError("verdict must be a string")
+            verdict = Verdict(record["verdict"])
         except ValueError:
             errors.append(f"record {index}: invalid verdict")
             continue
@@ -239,20 +309,43 @@ def validate_evidence_records(records: list[Mapping[str, Any]]) -> list[str]:
         validators = record.get("validators")
         if not isinstance(validators, list) or not validators:
             errors.append(f"record {index}: validators must be a non-empty array")
+        else:
+            for validator_index, validator in enumerate(validators, start=1):
+                try:
+                    Scenario.from_dict(
+                        {
+                            "scenario_id": "EVIDENCE-VALIDATOR-001",
+                            "title": "persisted validator contract",
+                            "transport": "offline",
+                            "request": {},
+                            "expected_contract": {},
+                            "validators": [validator],
+                        }
+                    )
+                except (TypeError, ValueError) as exc:
+                    errors.append(
+                        f"record {index}: validator {validator_index} is invalid: {exc}"
+                    )
         if not isinstance(record.get("observation"), Mapping):
             errors.append(f"record {index}: observation must be an object")
         if not isinstance(record.get("bounded_evidence"), Mapping):
             errors.append(f"record {index}: bounded_evidence must be an object")
         if not isinstance(record.get("sanitized_request"), Mapping):
             errors.append(f"record {index}: sanitized_request must be an object")
+        if not isinstance(record.get("expected_contract"), Mapping):
+            errors.append(f"record {index}: expected_contract must be an object")
         assertions = record.get("assertions")
-        if not isinstance(assertions, list):
-            errors.append(f"record {index}: assertions must be an array")
+        if not isinstance(assertions, list) or not assertions:
+            errors.append(f"record {index}: assertions must be a non-empty array")
             continue
+        assertion_fields = {"name", "passed", "expected", "actual", "detail"}
         if any(
             not isinstance(item, Mapping)
+            or set(item) != assertion_fields
             or not isinstance(item.get("name"), str)
+            or not item.get("name")
             or not isinstance(item.get("passed"), bool)
+            or not isinstance(item.get("detail"), str)
             for item in assertions
         ):
             errors.append(f"record {index}: invalid assertion shape")
@@ -269,10 +362,12 @@ def validate_evidence_records(records: list[Mapping[str, Any]]) -> list[str]:
         ]
         declared_failures = record["deterministic_failures"]
         if not isinstance(declared_failures, list) or any(
-            not isinstance(item, str) for item in declared_failures
+            not isinstance(item, str) or not item for item in declared_failures
         ):
             errors.append(f"record {index}: deterministic_failures must be a string array")
             continue
+        if len(declared_failures) != len(set(declared_failures)):
+            errors.append(f"record {index}: deterministic_failures must be unique")
         if sorted(failures) != sorted(declared_failures):
             errors.append(f"record {index}: deterministic_failures mismatch")
         if verdict is Verdict.FAIL and not failures:
@@ -283,7 +378,7 @@ def validate_evidence_records(records: list[Mapping[str, Any]]) -> list[str]:
             f"record {index}: {error}"
             for error in validate_replay_contract(record, verdict)
         )
-        key = (str(record["campaign_id"]), str(record["case_id"]))
+        key = (campaign_id, case_id)
         if key in seen:
             errors.append(f"record {index}: duplicate campaign/case key")
         seen.add(key)

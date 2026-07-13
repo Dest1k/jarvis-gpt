@@ -9,6 +9,25 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-14 - Codex (assurance remediation Commit A)
+
+- Isolated remediation branch
+  `fix/assurance-foundation/20260713T002206Z_686424795712` remains based on
+  foundation candidate `7d4a4757df9aa3264fd16caf439e40588c375fee`.
+- Closed B01/B02/B04/B06 with an isolated absolute CLI launcher and minimal
+  environment, canonical identifier/output boundaries, strict scenario/JSON
+  contracts, and bounded race-resistant artifact reads under trusted roots.
+- Added positive/negative regressions for hostile import/process state,
+  Windows/POSIX path forms, nested reparse ancestors, non-finite JSON, malformed
+  schema keywords, type coercion, unsafe/special/oversized files, and independent
+  source checks. Updated the sanitized calibration artifact contract without
+  changing its 1 PASS / 6 FAIL / 1 INCONCLUSIVE replay result.
+- Validation before commit: `80 passed, 2 skipped`; Ruff, compileall, diff check,
+  suite validation, and calibration replay are green. Skips are host-limited
+  real symlink tests; deterministic simulated-reparse regressions pass.
+- No `.audit/**`, production source, runtime state, dependency, network, push,
+  merge, or review-attestation operation was used. Next batch is B03/B05 only.
+
 ### 2026-07-13 - Codex (PHASE B.5 assurance and upstream foundation)
 
 - Work is isolated on

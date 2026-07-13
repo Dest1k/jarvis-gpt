@@ -10,9 +10,15 @@ from .models import Scenario
 
 def load_scenario_file(path: Path) -> list[Scenario]:
     try:
-        document = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"{path}: invalid JSON: {exc.msg}") from exc
+        document = json.loads(
+            path.read_text(encoding="utf-8"),
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                ValueError(f"non-finite JSON constant {value}")
+            ),
+        )
+    except (json.JSONDecodeError, ValueError) as exc:
+        detail = exc.msg if isinstance(exc, json.JSONDecodeError) else str(exc)
+        raise ValueError(f"{path}: invalid JSON: {detail}") from exc
     items = document if isinstance(document, list) else [document]
     if not items or not all(isinstance(item, dict) for item in items):
         raise ValueError(f"{path}: expected a scenario object or non-empty array")

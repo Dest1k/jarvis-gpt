@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import secrets
 from collections import Counter
@@ -9,7 +10,12 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
+
+from .safe_paths import validate_campaign_identifier, validate_case_id
+from .schema_validation import validate_json_schema
 
 EXIT_PASS = 0
 EXIT_FAIL = 1
@@ -53,6 +59,21 @@ class Scenario:
     tags: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        validate_case_id(self.scenario_id, label="scenario_id")
+        if not isinstance(self.title, str) or not self.title.strip():
+            raise ValueError("scenario title is required")
+        if self.transport not in {"offline", "http", "cli"}:
+            raise ValueError("unsupported scenario transport")
+        if not isinstance(self.request, Mapping) or not isinstance(
+            self.expected_contract, Mapping
+        ):
+            raise ValueError("scenario request and expected contract must be objects")
+        if not self.validators or any(not isinstance(item, Mapping) for item in self.validators):
+            raise ValueError("scenario validators must be non-empty objects")
+        if not isinstance(self.required, bool) or not isinstance(
+            self.semantic_review_required, bool
+        ):
+            raise ValueError("scenario flags must be booleans")
         if self.skip_reason is not None:
             if self.required:
                 raise ValueError("skip_reason is allowed only for an optional scenario")
@@ -61,33 +82,25 @@ class Scenario:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> Scenario:
-        scenario_id = str(data.get("scenario_id", "")).strip()
-        title = str(data.get("title", "")).strip()
-        transport = str(data.get("transport", "")).strip().lower()
-        if not re.fullmatch(r"[A-Z0-9][A-Z0-9_.-]{2,79}", scenario_id):
-            raise ValueError("scenario_id must be a stable uppercase identifier")
-        if not title:
+        if isinstance(data, Mapping) and "skip_reason" in data:
+            if data.get("required", True) is not False:
+                raise ValueError("skip_reason is allowed only for an optional scenario")
+            if isinstance(data.get("skip_reason"), str) and not data["skip_reason"].strip():
+                raise ValueError("skip_reason must be non-empty")
+        errors = validate_json_schema(data, _scenario_schema())
+        if errors:
+            raise ValueError(f"invalid scenario contract: {'; '.join(errors[:5])}")
+        scenario_id = validate_case_id(data["scenario_id"], label="scenario_id")
+        title = data["title"]
+        if not title.strip():
             raise ValueError(f"{scenario_id}: title is required")
-        if transport not in {"offline", "http", "cli"}:
-            raise ValueError(f"{scenario_id}: unsupported transport {transport!r}")
-        request = data.get("request")
-        contract = data.get("expected_contract")
-        validators = data.get("validators")
-        if not isinstance(request, Mapping):
-            raise ValueError(f"{scenario_id}: request must be an object")
-        if not isinstance(contract, Mapping):
-            raise ValueError(f"{scenario_id}: expected_contract must be an object")
-        if not isinstance(validators, list) or not validators:
-            raise ValueError(f"{scenario_id}: at least one validator is required")
-        if not all(isinstance(item, Mapping) and item.get("kind") for item in validators):
-            raise ValueError(f"{scenario_id}: every validator needs a kind")
+        transport = data["transport"]
+        request = data["request"]
+        contract = data["expected_contract"]
+        validators = data["validators"]
         tags = data.get("tags", [])
-        if not isinstance(tags, list) or not all(isinstance(tag, str) for tag in tags):
-            raise ValueError(f"{scenario_id}: tags must be strings")
-        required = bool(data.get("required", True))
+        required = data.get("required", True)
         skip_reason = data.get("skip_reason")
-        if skip_reason is not None and not isinstance(skip_reason, str):
-            raise ValueError(f"{scenario_id}: skip_reason must be a string")
         return cls(
             scenario_id=scenario_id,
             title=title,
@@ -96,7 +109,7 @@ class Scenario:
             expected_contract=dict(contract),
             validators=tuple(dict(item) for item in validators),
             required=required,
-            semantic_review_required=bool(data.get("semantic_review_required", False)),
+            semantic_review_required=data.get("semantic_review_required", False),
             skip_reason=skip_reason,
             tags=tuple(tags),
         )
@@ -108,11 +121,8 @@ class CampaignIdentity:
     namespace: str
 
     def __post_init__(self) -> None:
-        pattern = r"[a-z0-9][a-z0-9_.-]{7,127}"
-        if not re.fullmatch(pattern, self.campaign_id):
-            raise ValueError("invalid campaign_id")
-        if not re.fullmatch(pattern, self.namespace):
-            raise ValueError("invalid namespace")
+        validate_campaign_identifier(self.campaign_id, label="campaign_id")
+        validate_campaign_identifier(self.namespace, label="namespace")
         if self.campaign_id == self.namespace:
             raise ValueError("campaign_id and namespace must be distinct")
 
@@ -142,6 +152,11 @@ class CaseResult:
     observed_at_utc: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
 
     def __post_init__(self) -> None:
+        validate_case_id(self.case_id)
+        if not isinstance(self.required, bool) or not isinstance(
+            self.semantic_review_required, bool
+        ):
+            raise ValueError("case flags must be booleans")
         if self.verdict is Verdict.PASS:
             if not self.assertions:
                 raise ValueError("PASS requires at least one factual assertion")
@@ -182,3 +197,12 @@ class CampaignSummary:
         if any(result.required and result.verdict in incomplete for result in self.results):
             return EXIT_INCOMPLETE
         return EXIT_PASS
+
+
+@lru_cache(maxsize=1)
+def _scenario_schema() -> dict[str, Any]:
+    path = Path(__file__).resolve().parent / "schemas" / "scenario.schema.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(document, dict):
+        raise RuntimeError("scenario schema must be an object")
+    return document

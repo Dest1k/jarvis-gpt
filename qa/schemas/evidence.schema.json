@@ -3,24 +3,57 @@
   "$id": "https://jarvis.local/qa/evidence.schema.json",
   "title": "JARVIS sanitized assurance evidence record",
   "type": "object",
+  "additionalProperties": false,
   "required": [
     "schema", "campaign_id", "namespace", "case_id", "verdict", "required",
-    "semantic_review_required", "sanitized_request", "validators", "observation", "assertions",
-    "deterministic_failures", "bounded_evidence", "replay"
+    "semantic_review_required", "sanitized_request", "expected_contract", "validators",
+    "observation", "assertions", "deterministic_failures", "bounded_evidence", "replay"
   ],
   "properties": {
     "schema": {"const": "jarvis.qa.evidence.v1"},
-    "campaign_id": {"type": "string", "minLength": 8},
-    "namespace": {"type": "string", "minLength": 8},
-    "case_id": {"type": "string", "minLength": 3},
+    "campaign_id": {"type": "string", "pattern": "^[a-z0-9](?:[a-z0-9]|[._-](?=[a-z0-9])){7,127}$"},
+    "namespace": {"type": "string", "pattern": "^[a-z0-9](?:[a-z0-9]|[._-](?=[a-z0-9])){7,127}$"},
+    "case_id": {"type": "string", "pattern": "^[A-Z0-9](?:[A-Z0-9]|[._-](?=[A-Z0-9])){2,79}$"},
+    "title": {"type": "string", "minLength": 1},
     "verdict": {"$ref": "verdict.schema.json"},
     "required": {"type": "boolean"},
     "semantic_review_required": {"type": "boolean"},
     "sanitized_request": {"type": "object"},
-    "validators": {"type": "array", "minItems": 1},
+    "expected_contract": {"type": "object"},
+    "validators": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "oneOf": [
+          {"$ref": "scenario.schema.json#/$defs/artifact"},
+          {"$ref": "scenario.schema.json#/$defs/canary_absence"},
+          {"$ref": "scenario.schema.json#/$defs/claimed_state"},
+          {"$ref": "scenario.schema.json#/$defs/exit_consistency"},
+          {"$ref": "scenario.schema.json#/$defs/format_contract"},
+          {"$ref": "scenario.schema.json#/$defs/identity"},
+          {"$ref": "scenario.schema.json#/$defs/response_integrity"},
+          {"$ref": "scenario.schema.json#/$defs/stream_integrity"}
+        ]
+      }
+    },
     "observation": {"type": "object"},
-    "assertions": {"type": "array"},
-    "deterministic_failures": {"type": "array", "items": {"type": "string"}},
+    "assertions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "passed", "expected", "actual", "detail"],
+        "properties": {
+          "name": {"type": "string", "minLength": 1},
+          "passed": {"type": "boolean"},
+          "expected": {},
+          "actual": {},
+          "detail": {"type": "string"}
+        }
+      }
+    },
+    "deterministic_failures": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
     "bounded_evidence": {"type": "object"},
     "replay": {
       "oneOf": [
@@ -37,12 +70,13 @@
           "properties": {
             "mode": {"const": "classification"},
             "reason": {"type": "string", "minLength": 1},
-            "assertion_names": {"type": "array", "items": {"type": "string"}}
+            "assertion_names": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}
           }
         }
       ]
     },
     "error": {"type": ["string", "null"]},
-    "redaction_event_count": {"type": "integer"}
+    "observed_at_utc": {"type": "string", "format": "date-time"},
+    "redaction_event_count": {"type": "integer", "minimum": 0}
   }
 }

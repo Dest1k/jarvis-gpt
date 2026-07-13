@@ -11,6 +11,7 @@ from typing import Any
 
 from ..models import Verdict
 from ..redaction import redact_value
+from ..safe_paths import validate_case_id
 from .independence import IndependenceLevel
 
 SEMANTIC_VERDICTS = {Verdict.PASS, Verdict.FAIL, Verdict.INCONCLUSIVE}
@@ -36,9 +37,7 @@ class ReviewPacket:
 
     @classmethod
     def create(cls, record: Mapping[str, Any]) -> ReviewPacket:
-        case_id = str(record.get("case_id", "")).strip()
-        if not case_id:
-            raise ValueError("review packet needs a case_id")
+        case_id = validate_case_id(record.get("case_id"))
         observation = record.get("observation", {})
         if not isinstance(observation, Mapping):
             observation = {}
@@ -101,6 +100,7 @@ class ReviewPacket:
             source_evidence_digest=str(data["source_evidence_digest"]),
             packet_digest=str(data["packet_digest"]),
         )
+        validate_case_id(packet.case_id)
         body = packet.to_dict()
         body.pop("packet_digest")
         if canonical_digest(body) != packet.packet_digest:

@@ -11,7 +11,9 @@ import ipaddress
 import json
 import os
 import subprocess
+import sys
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -26,11 +28,37 @@ from .models import (
     Verdict,
 )
 from .validators import run_validators
+from .validators.context import ValidationContext
 
-DEFAULT_CLI_ALLOWLIST = frozenset(
-    ("py", "-3.11", "-m", "jarvis_gpt.cli", command)
+_JARVIS_CLI_ARGUMENTS = frozenset(
+    {(command,) for command in ("profiles", "status", "models", "llm-health")}
+)
+
+
+@dataclass(frozen=True, slots=True)
+class CliCommandSpec:
+    """One logical request mapped to fixed arguments for the trusted launcher."""
+
+    request_args: tuple[str, ...]
+    jarvis_args: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            not self.request_args
+            or any(not isinstance(item, str) or not item for item in self.request_args)
+            or self.jarvis_args not in _JARVIS_CLI_ARGUMENTS
+        ):
+            raise ValueError("CLI command specification is outside the fixed allowlist")
+
+
+DEFAULT_CLI_SPECS = tuple(
+    CliCommandSpec(
+        ("py", "-3.11", "-m", "jarvis_gpt.cli", command),
+        (command,),
+    )
     for command in ("profiles", "status", "models", "llm-health")
 )
+DEFAULT_CLI_ALLOWLIST = frozenset(spec.request_args for spec in DEFAULT_CLI_SPECS)
 DEFAULT_HTTP_ALLOWLIST = frozenset(
     {
         ("GET", "/health"),
@@ -126,30 +154,75 @@ class LoopbackHttpExecutor:
 class AllowlistedCliExecutor:
     def __init__(
         self,
-        allowlist: Iterable[tuple[str, ...]] = DEFAULT_CLI_ALLOWLIST,
+        command_specs: Iterable[CliCommandSpec] = DEFAULT_CLI_SPECS,
         *,
         timeout: float = 60.0,
     ) -> None:
-        self.allowlist = frozenset(tuple(command) for command in allowlist)
+        commands: dict[tuple[str, ...], CliCommandSpec] = {}
+        for spec in command_specs:
+            if not isinstance(spec, CliCommandSpec):
+                raise TypeError("CLI allowlist entries must be typed command specifications")
+            if spec.request_args in commands:
+                raise ValueError("duplicate CLI request specification")
+            commands[spec.request_args] = spec
+        if not commands:
+            raise ValueError("CLI command specification allowlist cannot be empty")
+        self.commands = commands
         self.timeout = timeout
+        self.repository_root = Path(__file__).resolve().parents[1]
+        self.interpreter = Path(sys.executable).resolve(strict=True)
+        self.launcher = (self.repository_root / "qa" / "_trusted_jarvis_cli.py").resolve(
+            strict=True
+        )
+        if (
+            not self.interpreter.is_absolute()
+            or not self.interpreter.is_file()
+            or not self.launcher.is_relative_to(self.repository_root)
+            or not self.launcher.is_file()
+        ):
+            raise RuntimeError("trusted CLI interpreter or launcher is unavailable")
+
+    @staticmethod
+    def _minimal_environment() -> dict[str, str]:
+        inherited = ("SYSTEMROOT", "WINDIR", "TEMP", "TMP")
+        environment = {
+            key: os.environ[key]
+            for key in inherited
+            if key in os.environ and "\x00" not in os.environ[key]
+        }
+        environment["NO_COLOR"] = "1"
+        return environment
 
     def run(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        if set(request) != {"args"}:
+            raise BlockedBySpecification("CLI request accepts only the fixed args field")
         args = request.get("args")
         if not isinstance(args, list) or not all(isinstance(item, str) for item in args):
             raise BlockedBySpecification("CLI args must be an explicit string array")
-        command = tuple(args)
-        if command not in self.allowlist:
+        requested = tuple(args)
+        spec = self.commands.get(requested)
+        if spec is None:
             raise BlockedBySpecification("CLI command is not on the exact allowlist")
-        inherited = ("PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "PYTHONPATH")
-        safe_env = {key: os.environ[key] for key in inherited if key in os.environ}
+        command = [
+            str(self.interpreter),
+            "-I",
+            "-S",
+            "-X",
+            "utf8",
+            str(self.launcher),
+            *spec.jarvis_args,
+        ]
         completed = subprocess.run(  # noqa: S603 - exact tuple allowlist above
-            list(command),
+            command,
             shell=False,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=self.timeout,
             check=False,
-            env=safe_env,
+            env=self._minimal_environment(),
+            cwd=str(self.repository_root),
         )
         machine_result: dict[str, Any] = {}
         try:
@@ -174,6 +247,7 @@ class AssuranceRunner:
         *,
         http_executor: LoopbackHttpExecutor | None = None,
         cli_executor: AllowlistedCliExecutor | None = None,
+        validation_context: ValidationContext | None = None,
     ) -> None:
         if evidence_store.identity != identity:
             raise ValueError("evidence store identity does not match runner identity")
@@ -181,6 +255,7 @@ class AssuranceRunner:
         self.evidence_store = evidence_store
         self.http_executor = http_executor
         self.cli_executor = cli_executor or AllowlistedCliExecutor()
+        self.validation_context = validation_context
 
     def close(self) -> None:
         if self.http_executor is not None:
@@ -216,7 +291,13 @@ class AssuranceRunner:
         else:
             try:
                 observation = self._execute(scenario)
-                assertions = tuple(run_validators(observation, scenario.validators))
+                assertions = tuple(
+                    run_validators(
+                        observation,
+                        scenario.validators,
+                        context=self.validation_context,
+                    )
+                )
                 if not assertions:
                     assertions = (
                         AssertionResult(
@@ -284,11 +365,15 @@ class AssuranceRunner:
 
 
 def run_offline_suite(
-    scenarios: Iterable[Scenario], output_root: Path, *, canaries: Iterable[str] = ()
+    scenarios: Iterable[Scenario],
+    output_root: Path,
+    *,
+    canaries: Iterable[str] = (),
+    validation_context: ValidationContext | None = None,
 ) -> CampaignSummary:
     identity = CampaignIdentity.create()
     store = EvidenceStore(output_root, identity, canaries=canaries)
-    runner = AssuranceRunner(identity, store)
+    runner = AssuranceRunner(identity, store, validation_context=validation_context)
     try:
         return runner.run_suite(scenarios)
     finally:

@@ -8,6 +8,7 @@ from typing import Protocol
 
 from ..evidence import validate_evidence_file
 from ..models import Verdict
+from ..safe_paths import canonical_directory, create_exclusive_directory, safe_output_path
 from .independence import IndependenceLevel
 from .schemas import ReviewPacket, ReviewResult
 
@@ -46,11 +47,13 @@ class SyntheticReviewer:
         )
 
 
-def _exclusive_json(path: Path, document: dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("x", encoding="utf-8", newline="\n") as handle:
+def _exclusive_json(path: Path, document: dict[str, object]) -> Path:
+    root = canonical_directory(path.parent, create=True)
+    target = safe_output_path(root, path.name)
+    with target.open("x", encoding="utf-8", newline="\n") as handle:
         json.dump(document, handle, ensure_ascii=False, indent=2, sort_keys=True)
         handle.write("\n")
+    return target
 
 
 def write_review_result(path: Path, review: ReviewResult) -> None:
@@ -68,11 +71,10 @@ def build_review_packets(evidence_path: Path, output_dir: Path) -> list[Path]:
     records, errors = validate_evidence_file(evidence_path)
     if errors:
         raise ValueError(f"invalid evidence: {'; '.join(errors)}")
-    output_dir.mkdir(parents=True, exist_ok=False)
+    exact_root = create_exclusive_directory(output_dir)
     outputs: list[Path] = []
     for record in records:
         packet = ReviewPacket.create(record)
-        path = output_dir / f"{packet.case_id}.review-packet.json"
-        _exclusive_json(path, packet.to_dict())
-        outputs.append(path)
+        path = exact_root / f"{packet.case_id}.review-packet.json"
+        outputs.append(_exclusive_json(path, packet.to_dict()))
     return outputs

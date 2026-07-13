@@ -33,10 +33,12 @@ candidate + provenance + bounded local evidence
 
 `qa.runner` accepts only loopback HTTP base URLs. `httpx.Client` is constructed
 with `trust_env=False` and redirects disabled. Routes are exact allowlist
-entries. CLI execution uses an exact argument-tuple allowlist,
-`subprocess.run(..., shell=False)`, a bounded timeout, and a small inherited
-environment. The runner has no lifecycle operation and never starts/stops
-JARVIS, Docker, models, or external services.
+entries. CLI requests map through typed immutable specs to the resolved
+absolute interpreter and a repository-owned absolute launcher. The child uses
+isolated/no-site startup, `subprocess.run(..., shell=False)`, repository-root
+`cwd`, a bounded timeout, and a minimal environment that omits process/import
+search paths and Python startup hooks. The runner has no lifecycle operation
+and never starts/stops JARVIS, Docker, models, or external services.
 
 ### Campaign isolation
 
@@ -82,6 +84,14 @@ The initial registry provides:
 
 Unknown validators fail closed. Validator exceptions become failed assertions,
 never `PASS`.
+
+Scenario and validator control objects use strict schemas: unknown fields,
+wrong primitive/container types, malformed schema keywords, and `bool` used as
+an integer all fail deterministically. Artifact validators receive canonical
+allowed roots and byte caps only through a trusted out-of-band validation
+context. Target and optional source paths are independent relative paths;
+bounded descriptor reads reject escapes, reparse points, non-regular files,
+and oversize content before exposing any digest.
 
 ## Provenance
 
