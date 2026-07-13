@@ -1,228 +1,257 @@
-# JARVIS — PHASE C: ИСПРАВЛЕНИЕ РЕЗУЛЬТАТОВ АУДИТА ЧЕРЕЗ CODEX SPARK
+# JARVIS — PHASE C: КОНТРОЛИРУЕМЫЕ ИСПРАВЛЕНИЯ ПО РЕЗУЛЬТАТАМ АУДИТА
 
-Ты работаешь как дисциплинированный исполнитель уже завершённого двухкомпонентного аудита JARVIS. Не проводи новый всеобъемлющий аудит и не пытайся держать весь проект и весь отчёт в контексте. Аудиторы PHASE A и PHASE B должны были превратить подтверждённые проблемы в маленькие, упорядоченные и проверяемые задачи.
+Ты работаешь как дисциплинированный исполнитель завершённого двухкомпонентного аудита JARVIS. Не проводи новый всеобъемлющий аудит и не пытайся держать весь проект в контексте. PHASE A и PHASE B должны были превратить подтверждённые проблемы в маленькие, упорядоченные и проверяемые задачи.
 
-Твоя цель — последовательно обработать всю доступную очередь `READY`: для каждой задачи сначала воспроизвести исходный дефект, добавить regression test, сделать минимальное исправление, выполнить все проверки, обновить журнал и создать отдельный локальный commit. Работай до тех пор, пока не останется выполнимых `READY`-задач либо пока среда не поставит конкретный блокер.
+Твоя цель — последовательно обработать доступную очередь `READY`: для каждой задачи воспроизвести исходный функциональный FAIL на безвредном test case, добавить regression test, сделать минимальный patch, выполнить проверки, обновить журнал и создать отдельный локальный commit.
+
+Это работа с принадлежащим пользователю локальным проектом. Не воздействуй на внешние системы, не генерируй инструкции по нарушению ограничений и не используй реальные конфиденциальные данные. Для задач, связанных с вводом, разрешениями, URL или файловыми границами, применяй только harmless synthetic examples, loopback fixtures, temp roots и copied state. Если task требует более широкого метода, пометь её `BLOCKED_BY_POLICY` или `BLOCKED_BY_SAFETY`, не импровизируй.
+
+Все сообщения пользователю пиши по-русски. Подробные команды, logs и evidence сохраняй в task reports; в чате сообщай только прогресс, counts, paths, blockers и итоговые commit SHA.
 
 ---
 
-## 0. Каталоги
+## 0. Канонический запуск
 
-Рабочий Git-репозиторий находится строго в:
-
-```text
-D:\jarvis-gpt
-```
-
-Тяжёлые runtime-данные, модели, Docker-данные и большие evidence-файлы находятся в:
+Этот core-файл запускается только через:
 
 ```text
-D:\jarvis
+docs/audit/03_SAFE_JARVIS_SPARK_REMEDIATION_PROMPT.md
 ```
 
-`D:\jarvis` не является репозиторием. Не создавай там `.audit`, не редактируй там исходники и не используй его как working tree.
+Safe launcher и `04_JARVIS_REMEDIATION_SAFETY_AND_ROLLBACK_PROTOCOL.md` имеют приоритет в вопросах worktree, branch, backups, runtime checkpoints, restore и stop conditions.
 
-Начни:
+Production patch/test/commit выполняются **только** в:
 
-```powershell
-Set-Location D:\jarvis-gpt
-git rev-parse --show-toplevel
+```text
+D:\jarvis-gpt-worktrees\spark-<RUN_ID>
 ```
 
-Ожидаемый результат — `D:/jarvis-gpt` с допустимой разницей в регистре и разделителях. Если путь недоступен или Git root иной, остановись и сообщи точный blocker; не подменяй корень каталогом `D:\jarvis`.
+на ветке:
+
+```text
+spark-remediation/<RUN_ID>
+```
+
+`D:\jarvis-gpt` используется только для первоначального preflight и чтения audit artifacts.
 
 ---
 
 ## 1. Не начинай по незавершённому аудиту
 
-Проверь наличие:
+Проверь:
 
 ```text
 .audit/LATEST_COMPLETE_RUN.txt
+.audit/runs/<RUN_ID>/spark/READY
+.audit/runs/<RUN_ID>/spark/safety/READY
 ```
 
-Если его нет, допустим fallback на `.audit/LATEST_RUN.txt`, но только если указанный run содержит:
+В run должны существовать:
 
 ```text
 PIPELINE_STATE.json
-spark/READY
 spark/START_HERE_FOR_SPARK.md
 spark/SPARK_MASTER_PROMPT.md
 spark/SPARK_QUEUE.csv
 spark/SPARK_PROGRESS.md
 spark/TASK_SCHEMA.md
+spark/safety/SAFETY_STATE.json
+spark/safety/WORKTREE_IDENTITY.json
+spark/safety/PRE_SPARK_CHECKPOINT.json
 ```
 
-Прочитай `PIPELINE_STATE.json`. Начинать разрешено только если:
+Начинать разрешено только если:
 
-- `phase_a.status` равен `COMPLETE` или `COMPLETE_WITH_BLOCKERS`;
-- `phase_b.status` равен `COMPLETE` или `COMPLETE_WITH_BLOCKERS`;
+- PHASE A и PHASE B имеют конечный завершённый status;
 - `spark.status` равен `READY` или `PARTIALLY_READY`;
-- существует marker `spark/READY`;
-- очередь не содержит скрытых обязательных `NOT_RUN` runtime-проверок для выбранной задачи.
+- существуют оба READY markers;
+- `SAFETY_STATE.json.state = READY`;
+- current worktree/branch/checkpoints соответствуют run;
+- выбранная task не зависит от незавершённых runtime checks.
 
-Если эти условия не выполнены, не пытайся самостоятельно «доделать аудит» и не чини по сырым гипотезам. Запиши точный blocker в ответ и остановись.
+При несовпадении зафиксируй blocker и остановись. Не доделывай аудит самостоятельно.
 
-Открой run-каталог и полностью прочитай только:
+Прочитай только:
 
 1. `spark/START_HERE_FOR_SPARK.md`;
 2. `spark/SPARK_MASTER_PROMPT.md`;
 3. `spark/SPARK_QUEUE.csv`;
 4. `spark/SPARK_PROGRESS.md`;
 5. `spark/TASK_SCHEMA.md`;
-6. repository instructions (`AGENTS.md`, `CODEX.md` и эквиваленты).
+6. весь `spark/safety/`;
+7. repository instructions.
 
-Не загружай сразу все findings, evidence и scenario matrices.
+Не загружай все findings/evidence заранее.
 
 ---
 
-## 2. Проверка версии кода и пользовательских изменений
+## 2. Проверка версии, worktree и пользовательских изменений
 
-Зафиксируй:
+Перед работой зафиксируй:
 
 ```powershell
-git status --short --branch
+git rev-parse --show-toplevel
+git branch --show-current
 git rev-parse HEAD
-git log -1 --oneline
+git status --short --branch
 ```
 
-Сопоставь текущий commit с baseline/current commit, указанным в audit run и текущей task.
+Сопоставь текущий commit с baseline/current commit в audit run и task.
 
 Если production-код изменился после аудита:
 
-- не применяй задачу вслепую;
-- вычисли, затронуты ли её `context_files`, `allowed_files`, symbols, contract или tests;
-- если drift не затрагивает задачу и reproduction всё ещё даёт ожидаемый FAIL, можно продолжить с записью drift в task report;
-- если root cause, reproduction или acceptance больше не соответствуют коду, пометь задачу `BLOCKED_BY_DRIFT` и продолжи следующую независимую READY-задачу;
-- не сбрасывай изменения пользователя.
+- не применяй task вслепую;
+- проверь её `context_files`, `allowed_files`, symbols, contract и reproduction;
+- если drift не затрагивает task и исходный FAIL сохраняется, продолжай с записью drift;
+- если root cause/acceptance изменились, поставь `BLOCKED_BY_DRIFT`.
 
-Если working tree содержит несвязанные пользовательские изменения:
+Если working tree содержит несвязанные изменения:
 
 - не stage их;
 - не форматируй весь репозиторий;
 - не используй `git add -A`;
-- меняй только разрешённые task-файлы;
-- если безопасно отделить изменения невозможно, пометь текущую задачу `BLOCKED_BY_USER_CHANGES`.
+- меняй только task files;
+- при невозможности отделения поставь `BLOCKED_BY_USER_CHANGES`.
 
-Запрещены `git reset --hard`, агрессивный `git clean`, переписывание истории и удаление пользовательских данных.
+Запрещены `reset --hard`, aggressive clean, переписывание истории и удаление пользовательских данных.
 
 ---
 
-## 3. Выбор следующей задачи
+## 3. Выбор следующей task
 
-Из `SPARK_QUEUE.csv` выбирай первую по `order` задачу, которая одновременно:
+Из `SPARK_QUEUE.csv` выбирай первую по `order`, которая:
 
 - имеет status `READY`;
 - все `depends_on` имеют status `DONE`;
-- не конфликтует с незавершённой задачей;
-- принадлежит текущему или следующему допустимому batch;
-- не требует отсутствующего обязательного ресурса.
+- не конфликтует с незавершённой task;
+- принадлежит допустимому batch;
+- имеет доступные обязательные resources;
+- разрешена safety state;
+- имеет определённые `allowed_files`, mutation scope и rollback procedure.
 
-Работай **строго по одной задаче**. Для неё прочитай:
+Работай строго по одной task.
+
+Для неё прочитай:
 
 - `spark/tasks/SPARK-NNNN.md`;
 - только перечисленные `context_files`;
-- только связанные source findings;
-- только релевантные evidence excerpts/paths;
-- repository instructions для затронутых каталогов.
+- source findings;
+- релевантные evidence paths;
+- repository instructions затронутых каталогов.
 
-Не читай весь аудит «на всякий случай»: это уменьшает точность и засоряет контекст.
-
-Если очередь пуста, но есть `BLOCKED_BY_SPEC`/`BLOCKED_BY_ENV`/`BLOCKED_BY_DRIFT`, подготовь итоговый список и не импровизируй продуктовые решения.
+Если очередь содержит только blockers, подготовь итоговый список и не импровизируй решения продукта.
 
 ---
 
-## 4. Обязательный цикл одной задачи
+## 4. Обязательный цикл одной task
 
-### Шаг 1. Baseline
+### Шаг 1. Guard и checkpoints
 
-Запиши в task report:
+Выполни механический guard из safe launcher и rollback protocol.
+
+Создай task Git tag:
+
+```text
+pre-spark-<RUN_ID>-SPARK-NNNN
+```
+
+Если `requires_pre_task_snapshot: true`, создай и проверь snapshot затрагиваемых roots до reproduction.
+
+Зафиксируй:
 
 - UTC timestamp;
-- текущий commit;
-- branch;
-- `git status`;
-- профиль/runtime state;
-- используемые tool versions;
-- связанные finding/scenario IDs.
+- current commit и branch;
+- Git status;
+- profile/runtime state;
+- tool versions;
+- finding/scenario IDs;
+- allowed files/processes/containers/roots;
+- time/disk/resource budgets;
+- rollback commands/oracles.
 
 ### Шаг 2. Воспроизведение до изменения
 
-Выполни точные команды `Reproduction before change`.
+Выполни точные `Reproduction before change`.
 
-Задача может перейти к исправлению только если:
+Разрешено перейти к patch только если:
 
 - получен ожидаемый FAIL;
-- либо task явно имеет type `test`/`investigation` и её собственный oracle выполнен.
+- либо task типа `test`/`investigation` выполнила собственный oracle.
 
-Если дефект не воспроизводится:
+Reproduction должна использовать harmless synthetic input и безопасную изоляцию.
 
-1. повтори из указанного clean/known state;
-2. проверь допустимый source/environment drift;
+Если defect не воспроизводится:
+
+1. повтори из указанного known state;
+2. проверь source/environment drift;
 3. не вноси speculative fix;
-4. пометь `BLOCKED_NOT_REPRODUCED` или `OBSOLETE_REFUTED` с evidence;
-5. продолжи следующую независимую задачу.
+4. поставь `BLOCKED_NOT_REPRODUCED` или `OBSOLETE_REFUTED`;
+5. выполни cleanup и продолжи следующую независимую task.
 
 ### Шаг 3. Test first
 
-Добавь или обнови минимальный regression test, который:
+Добавь минимальный regression test, который:
 
 - падает на исходной реализации;
-- проверяет контракт, а не внутреннюю случайность;
-- не зависит от точного nondeterministic текста LLM;
-- использует fake/mock для orchestration, если реальная модель не нужна;
-- не требует внешней сети без явной необходимости;
-- воспроизводит bug на соответствующем уровне: unit/integration/E2E/runtime.
+- проверяет public contract;
+- не зависит от exact nondeterministic LLM text;
+- использует fake/mock для orchestration, если real model не нужна;
+- не требует внешней сети;
+- использует temp roots/copied state;
+- не содержит operational abuse instructions;
+- воспроизводит bug на подходящем уровне.
 
-Запусти test до production patch и сохрани ожидаемый FAIL. Если task объясняет, почему test-first физически невозможен, следуй указанному альтернативному oracle и зафиксируй это.
+Запусти test до production patch и сохрани ожидаемый FAIL.
 
 ### Шаг 4. Минимальный patch
 
 - меняй только `allowed_files`;
 - не трогай `forbidden_files`;
-- не делай несвязанный refactor, rename, cleanup или dependency upgrade;
-- сохрани публичные contracts, кроме явно требуемого изменения;
-- не расширяй permissions и не ослабляй validation ради зелёного теста;
+- не делай unrelated refactor/rename/cleanup/dependency upgrade;
+- сохраняй public contracts, кроме явно требуемого изменения;
+- не расширяй permissions и не ослабляй validation;
 - не hardcode test input;
-- не скрывай ошибку broad exception handler, sleep или отключением проверки;
-- не меняй tests так, чтобы они подтверждали неправильное поведение;
-- не правь generated/vendor/runtime data без явного указания task.
+- не скрывай ошибки broad exception/sleep/disabled check;
+- не меняй test так, чтобы он подтверждал неверное поведение;
+- не правь generated/vendor/runtime data без task contract.
 
-Если реальная root cause отличается, но остаётся в documented scope, обнови task и примени минимальное доказуемое исправление. Если требуется другая подсистема, более пяти production-файлов, новая архитектура или product decision — `BLOCKED_SCOPE_ESCALATION`.
+Если root cause отличается, но остаётся в scope, обнови task report и сделай минимальное доказуемое исправление. Если требуется другая подсистема, более пяти production-files, новая архитектура или решение пользователя — `BLOCKED_SCOPE_ESCALATION`.
 
-### Шаг 5. Проверка
+### Шаг 5. Validation
 
-Выполни в таком порядке:
+Выполни по порядку:
 
 1. новый regression test;
-2. узкий suite затронутого компонента;
-3. соседний regression suite;
-4. все exact validation commands из task;
-5. profile/runtime/GUI checks, если требуются;
-6. второй профиль и общие пути, если изменён shared code;
-7. cleanup и повторный known-good smoke;
-8. `git diff --check`;
-9. просмотр полного task diff.
+2. narrow component suite;
+3. neighboring regression suite;
+4. exact validation commands;
+5. profile/runtime/GUI checks, если нужны;
+6. второй profile/shared paths, если затронут общий код;
+7. cleanup и known-good smoke;
+8. integrity checks затрагиваемого copied/runtime state;
+9. `git diff --check`;
+10. просмотр полного task diff.
 
-Старые audit evidence не заменяют повторную проверку после patch.
+Старое audit evidence не заменяет повторную проверку после patch.
 
-Нельзя объявлять DONE, если обязательная validation-команда не запущена. Недоступная команда должна дать `BLOCKED_BY_ENV`, а не воображаемый PASS.
+Нельзя объявлять DONE, если обязательная validation не запускалась. Недоступная команда означает blocker, а не PASS.
 
-### Шаг 6. Проверка diff
+### Шаг 6. Diff review
 
 Проверь:
 
-- нет ли секретов, больших логов, моделей, cache/runtime files;
-- нет ли форматирования несвязанных файлов;
-- нет ли случайного изменения lockfiles;
-- не попали ли пользовательские изменения;
-- production diff соответствует одному defect;
+- нет секретов, больших logs, models, caches/runtime files;
+- нет форматирования unrelated files;
+- lockfiles изменены только по task contract;
+- пользовательские изменения не попали в commit;
+- production diff соответствует одной root cause;
 - regression test действительно ловил исходную ошибку;
-- task/audit progress обновлены.
+- task/progress/queue/safety state обновлены;
+- canonical checkout не изменён.
 
-### Шаг 7. Отчёт и статус
+### Шаг 7. Report и status
 
-В `spark/tasks/SPARK-NNNN.md` добавь фактический execution report:
+В `spark/tasks/SPARK-NNNN.md` добавь execution report:
 
 - status;
 - started/finished UTC;
@@ -233,47 +262,47 @@ git log -1 --oneline
 - test-first proof;
 - validation commands, exit codes, durations;
 - profile/GUI/runtime evidence;
-- cleanup state;
+- cleanup/restore state;
 - remaining risks;
-- commit SHA либо blocker.
+- commit SHA или blocker.
 
-Обнови `SPARK_PROGRESS.md` и `SPARK_QUEUE.csv`.
+Обнови `SPARK_PROGRESS.md`, `SPARK_QUEUE.csv` и safety artifacts.
 
-Статус `DONE` допустим только при выполнении всех binary acceptance criteria.
+DONE допустим только при выполнении всех binary acceptance criteria.
 
 ### Шаг 8. Один локальный commit
 
-Stage только файлы текущей задачи явными путями. Никогда не используй `git add -A` в грязном дереве.
+Stage только явные paths текущей task.
 
-Создай **один локальный commit** с предложенным сообщением. Не push, не rebase, не squash чужие commits и не открывай PR.
-
-Commit должен включать:
+Commit включает:
 
 - production fix;
 - regression tests;
 - task execution report;
-- обновление progress/queue, относящееся к задаче.
+- progress/queue updates этой task.
 
-После commit ещё раз проверь `git status` и сохрани SHA.
+Не push, не merge, не rebase, не squash и не открывай PR.
+
+После commit проверь status и сохрани SHA.
 
 ---
 
-## 5. Runtime и safety
-
-Задачи могут требовать Docker, WSL, GPU, моделей, GUI и данных под `D:\jarvis`. Следуй task-specific preconditions/cleanup.
+## 5. Runtime и data rules
 
 Общие запреты:
 
 - не удаляй рабочие volumes/models/user DB;
 - не выполняй broad prune;
-- corrupt/disk-full/permission tests — только на копиях/тестовых roots;
+- readonly/nearly-full/damaged-state tests — только на copies/test roots;
 - не останавливай посторонние workloads;
-- не атакуй внешние системы;
-- используй synthetic secrets;
-- не выполняй опасные model-generated команды на реальном host;
-- после каждого runtime test возвращай систему в документированное состояние.
+- не обращайся к внешним системам для проверки границ;
+- используй synthetic sentinels;
+- не исполняй потенциально опасные model-generated команды на host;
+- после runtime test возвращай documented state.
 
-Если task требует опасное действие без безопасной изоляции, пометь `BLOCKED_BY_SAFETY`.
+Если task требует действие без безопасной изоляции — `BLOCKED_BY_SAFETY`.
+
+Если task требует недопустимую методику или operational details — `BLOCKED_BY_POLICY`.
 
 ---
 
@@ -281,104 +310,109 @@ Commit должен включать:
 
 Не переходи в следующий batch, пока:
 
-- все доступные задачи текущего batch имеют конечный status;
-- выполнена предусмотренная validation task;
+- все доступные tasks текущего batch имеют конечный status;
+- предусмотренная validation task выполнена;
 - общие suites зелёные;
-- runtime возвращён к known-good state;
+- runtime known-good;
+- DB/file/volume integrity не ухудшилась;
 - `SPARK_PROGRESS.md` обновлён.
 
 Если batch validation обнаружила регрессию:
 
-1. не переписывай историю завершённых commits;
-2. найди минимальный responsible task/commit;
-3. если проблема укладывается в его contract, создай следующий свободный `SPARK-NNNN` follow-up task со ссылкой на finding/task/commit;
-4. добавь её непосредственно перед повторной validation в queue;
-5. исправь тем же обязательным циклом;
-6. если root cause/contract неоднозначны — заблокируй batch и не переходи дальше.
-
-Не пропускай validation ради количества DONE-задач.
+1. не переписывай историю;
+2. найди responsible task/commit;
+3. создай отдельный `git revert <SHA>`, если откат доказуем;
+4. либо создай узкую follow-up task;
+5. повтори validation;
+6. при неоднозначном contract заблокируй batch.
 
 ---
 
-## 7. Новые проблемы, найденные при исправлении
+## 7. Новые проблемы
 
-Не расширяй текущую задачу случайно.
+Не расширяй текущую task случайно.
 
-Если обнаружен новый независимый defect:
+Если найден новый независимый defect:
 
 - сохрани минимальное evidence;
-- создай новый finding/task только если контракт однозначен, воспроизведение доказано и проблема мешает текущей validation;
-- иначе внеси его в `SPARK_PROGRESS.md` как `NEW_FINDING_NEEDS_AUDIT`;
-- продолжи текущую задачу, если это безопасно;
-- не превращай один patch в ремонт всей подсистемы.
+- создай task только если contract однозначен, reproduction доказано и проблема мешает validation;
+- иначе запиши `NEW_FINDING_NEEDS_AUDIT`;
+- продолжи текущую task, если безопасно.
 
-Новый security/data-loss defect, способный сделать дальнейшие действия опасными, блокирует соответствующий workstream до документированного решения.
+Новый критичный риск потери данных или нарушения границ доступа блокирует соответствующий workstream до documented decision.
 
 ---
 
-## 8. Устойчивость к длинной работе и compaction
+## 8. Устойчивость длинной работы
 
-После каждой задачи и каждого batch обновляй `SPARK_PROGRESS.md` так, чтобы новая сессия могла продолжить без старого контекста. В нём держи:
+После каждой task и batch обновляй `SPARK_PROGRESS.md`:
 
-- run ID и baseline commits;
-- current branch/HEAD;
+- RUN_ID и baseline commits;
+- worktree/branch/HEAD;
 - DONE/BLOCKED/READY counts;
-- последний завершённый task и commit;
-- текущий runtime state;
-- следующий eligible task;
-- outstanding blockers;
-- точную следующую команду.
+- last task и commit;
+- runtime state;
+- next eligible task;
+- blockers;
+- exact next command.
 
-После compaction или новой сессии сначала перечитай:
+После новой сессии перечитай:
 
 ```text
 PIPELINE_STATE.json
 spark/SPARK_QUEUE.csv
 spark/SPARK_PROGRESS.md
+spark/safety/SAFETY_STATE.json
 ```
 
-Затем загрузись только в следующую task.
+Затем загрузи только следующую task.
+
+Сообщай пользователю прогресс на 50% и 90%, а также после каждого batch. Все сообщения — на русском и без raw logs.
 
 ---
 
-## 9. Когда работа считается завершённой
+## 9. Завершение
 
-Продолжай автономно, пока не выполнено одно из условий:
+Продолжай, пока:
 
-1. нет ни одной eligible `READY`-задачи;
-2. все READY-задачи DONE и все batch/final validation tasks PASS;
-3. оставшиеся задачи имеют только конечные blockers;
-4. безопасное продолжение невозможно из-за environment/user changes/runtime risk.
+1. нет eligible READY tasks;
+2. все READY tasks DONE и batch/final validations PASS;
+3. оставшиеся tasks имеют конечные blockers;
+4. безопасное продолжение невозможно.
 
-После последнего batch выполни финальную validation task из queue. Не изобретай собственный «полный тест», если аудиторы уже дали точные команды; дополнить их можно, заменить — нет.
+После последнего batch выполни финальную validation task.
 
-Обнови `SPARK_PROGRESS.md` итогом:
+Создай:
 
-- DONE/BLOCKED/OBSOLETE counts;
-- commits по task;
-- финальные suites и результаты;
-- проверенные profiles/runtime/GUI;
-- unresolved findings;
-- residual risk;
-- конечный system state;
-- next human action, только если нужен.
+```text
+spark/REMEDIATION_SUMMARY.md
+spark/POST_FIX_VALIDATION.md
+spark/ROLLBACK_INDEX.md
+```
 
-Не меняй исходный `ASSURANCE_STATEMENT.md` так, будто исправления автоматически доказали всю систему. Создай `spark/REMEDIATION_SUMMARY.md` и `spark/POST_FIX_VALIDATION.md`, если это предусмотрено master prompt/queue.
+Финальный state:
+
+```text
+CANDIDATE_FOR_REVIEW
+```
+
+Никакого автоматического merge в main.
 
 ---
 
 ## 10. Финальный ответ
 
-Не вставляй огромные логи. Сообщи:
+Кратко по-русски сообщи:
 
 - run path;
-- branch и final HEAD;
-- количество DONE/BLOCKED/OBSOLETE/remaining READY;
-- список task → commit;
-- какие batch/final validation suites прошли;
-- какие profiles/runtime/GUI реально перепроверены;
-- оставшиеся blockers и residual risks;
-- конечное состояние JARVIS и Docker/LLM;
-- путь к `spark/SPARK_PROGRESS.md` и `spark/POST_FIX_VALIDATION.md`.
+- worktree, branch и final HEAD;
+- DONE/BLOCKED/OBSOLETE/remaining READY counts;
+- task → commit mapping;
+- batch/final validation results;
+- проверенные profiles/runtime/GUI;
+- rollback assets/checkpoint status;
+- unresolved findings и residual risks;
+- конечное состояние JARVIS/Docker/LLM;
+- paths к `SPARK_PROGRESS.md`, `REMEDIATION_SUMMARY.md`, `POST_FIX_VALIDATION.md`, `ROLLBACK_INDEX.md`.
 
-Не говори «всё исправлено», если остались blockers, неисполненные acceptance checks или непроверенные high-risk области.
+Не утверждай, что всё исправлено, если остались blockers или непроверенные acceptance checks. Не публикуй raw logs, конфиденциальные значения или длинные тестовые inputs.
