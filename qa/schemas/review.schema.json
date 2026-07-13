@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jarvis.local/qa/review.schema.json",
+  "title": "JARVIS immutable semantic review result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "review_id", "reviewer_id", "independence_level", "verdict",
+    "rationale", "evidence_citations", "packet", "created_at_utc", "review_digest"
+  ],
+  "properties": {
+    "schema": {"const": "jarvis.qa.review-result.v1"},
+    "review_id": {"type": "string", "minLength": 1},
+    "reviewer_id": {"type": "string", "minLength": 1},
+    "independence_level": {
+      "enum": [
+        "DETERMINISTIC_ONLY", "SAME_MODEL_CLEAN_CONTEXT", "DIFFERENT_PROFILE",
+        "DIFFERENT_MODEL", "DIFFERENT_PROVIDER", "HUMAN_ADJUDICATED"
+      ]
+    },
+    "verdict": {"enum": ["PASS", "FAIL", "INCONCLUSIVE"]},
+    "rationale": {"type": "string", "minLength": 1},
+    "evidence_citations": {"type": "array", "items": {"type": "string"}},
+    "packet": {"type": "object"},
+    "created_at_utc": {"type": "string", "minLength": 1},
+    "review_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+  }
+}
