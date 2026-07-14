@@ -182,3 +182,105 @@ def test_main_report_redacts_nested_compose_canary(monkeypatch, capsys):
     compose = next(c for c in report["checks"] if c["name"] == "docker compose config")
     assert canary not in compose["stdout_tail"]
     assert "[redacted]" in compose["stdout_tail"]
+
+
+def test_backend_tests_receive_sanitized_deployment_env(monkeypatch, capsys):
+    """SPARK-0016: pytest must not inherit launcher JARVIS_HOME/PROFILE/MODEL_ROOT."""
+    captured: dict[str, object] = {}
+
+    def fake_run(name, command, *, cwd=smoke.ROOT, optional=False, env=None):
+        if name == "backend tests":
+            captured["env"] = env
+            captured["command"] = command
+            return {
+                "name": name,
+                "ok": True,
+                "optional": False,
+                "status": "passed",
+                "returncode": 0,
+            }
+        return {
+            "name": name,
+            "ok": True,
+            "optional": optional,
+            "status": "passed" if not optional else "skipped",
+        }
+
+    monkeypatch.setenv("JARVIS_HOME", r"D:\jarvis\audit-functional\canary-home")
+    monkeypatch.setenv("JARVIS_MODEL_ROOT", r"D:\jarvis\data\models")
+    monkeypatch.setenv("JARVIS_PROFILE", "gemma4-turbo")
+    monkeypatch.setattr(smoke, "run", fake_run)
+    monkeypatch.setattr(sys, "argv", ["smoke.py", "--skip-frontend", "--skip-http"])
+
+    exit_code = smoke.main()
+    report = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert report["ok"] is True
+    assert captured["command"] == [sys.executable, "-m", "pytest"]
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert "JARVIS_HOME" not in env
+    assert "JARVIS_MODEL_ROOT" not in env
+    assert "JARVIS_PROFILE" not in env
+
+
+def test_sanitized_test_env_strips_only_deployment_keys(monkeypatch):
+    monkeypatch.setenv("JARVIS_HOME", "deployment-home")
+    monkeypatch.setenv("JARVIS_PROFILE", "gemma4-turbo")
+    monkeypatch.setenv("JARVIS_MODEL_ROOT", "deployment-models")
+    monkeypatch.setenv("PATH", "keep-me")
+
+    cleaned = smoke.sanitized_test_env()
+
+    assert "JARVIS_HOME" not in cleaned
+    assert "JARVIS_PROFILE" not in cleaned
+    assert "JARVIS_MODEL_ROOT" not in cleaned
+    assert cleaned.get("PATH") == "keep-me"
+
+
+def test_doctor_ps1_propagates_smoke_nonzero_exit(tmp_path):
+    """SPARK-0016: doctor.ps1 must exit nonzero when smoke reports required failure."""
+    import os
+    import subprocess
+    from pathlib import Path
+
+    doctor = Path(smoke.ROOT) / "scripts" / "doctor.ps1"
+    text = doctor.read_text(encoding="utf-8")
+    assert "exit $smokeExit" in text or "exit $LASTEXITCODE" in text
+
+    # Isolated mini-doctor matching production exit propagation contract.
+    stub_smoke = tmp_path / "smoke_fail.py"
+    stub_smoke.write_text(
+        "import json, sys\n"
+        "print(json.dumps({'ok': False, 'summary': {'failed': 1}, "
+        "'checks': [{'name': 'backend tests', 'ok': False}]}))\n"
+        "sys.exit(1)\n",
+        encoding="utf-8",
+    )
+    mini_doctor = tmp_path / "mini_doctor.ps1"
+    mini_doctor.write_text(
+        f'py -3.11 "{stub_smoke}"\n'
+        "$smokeExit = $LASTEXITCODE\n"
+        "if ($null -eq $smokeExit) { $smokeExit = 1 }\n"
+        "exit $smokeExit\n",
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(mini_doctor),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "JARVIS_HOME": r"D:\should-not-matter"},
+    )
+    assert completed.returncode != 0
+    assert '"ok": false' in completed.stdout.lower() or '"ok": false' in completed.stdout

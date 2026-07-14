@@ -1760,7 +1760,29 @@ function Show-Logs {
 
 function Invoke-Doctor {
   Set-JarvisEnvironment -SelectedProfile $Profile
-  & (Join-Path $RepoRoot "scripts\doctor.ps1")
+  # Run doctor in a nested -File process so its explicit exit code is captured
+  # without relying on in-process call-operator exit semantics.
+  $doctorScript = Join-Path $RepoRoot "scripts\doctor.ps1"
+  $doctorArgs = @(
+    "-NoProfile",
+    "-ExecutionPolicy", "Bypass",
+    "-File", $doctorScript
+  )
+  $proc = Start-Process -FilePath "powershell.exe" `
+    -ArgumentList $doctorArgs `
+    -WorkingDirectory $RepoRoot `
+    -Wait -PassThru -NoNewWindow
+  $code = 1
+  if ($null -ne $proc -and $null -ne $proc.ExitCode) {
+    $code = [int]$proc.ExitCode
+  }
+  if ($Action -eq "doctor") {
+    exit $code
+  }
+  if ($code -ne 0) {
+    Write-Host "Doctor failed with exit code $code" -ForegroundColor Red
+  }
+  return $code
 }
 
 function Open-CommandCenter {

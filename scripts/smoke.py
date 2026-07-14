@@ -25,7 +25,11 @@ def main() -> int:
     args = parser.parse_args()
 
     checks = [
-        run("backend tests", [sys.executable, "-m", "pytest"]),
+        run(
+            "backend tests",
+            [sys.executable, "-m", "pytest"],
+            env=sanitized_test_env(),
+        ),
         run(
             "backend lint",
             [sys.executable, "-m", "ruff", "check", "backend/src", "backend/tests"],
@@ -184,6 +188,24 @@ def executable(name: str) -> str:
         if found:
             return found
     return name
+
+
+# Deployment identity injected by jarvis-launcher must not leak into pytest.
+_TEST_ENV_BLOCKLIST = (
+    "JARVIS_HOME",
+    "JARVIS_MODEL_ROOT",
+    "JARVIS_PROFILE",
+)
+
+
+def sanitized_test_env(
+    base: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Return env for test subprocesses without deployment home/profile vars."""
+    env = dict(os.environ if base is None else base)
+    for key in _TEST_ENV_BLOCKLIST:
+        env.pop(key, None)
+    return env
 
 
 if __name__ == "__main__":
