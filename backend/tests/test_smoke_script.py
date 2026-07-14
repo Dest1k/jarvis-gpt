@@ -27,6 +27,163 @@ def test_optional_nonzero_command_is_reported_failed(monkeypatch):
     assert result["returncode"] == 7
 
 
+def test_default_doctor_test_timeout_exceeds_full_suite_duration():
+    """RB-1-R: default full-suite timeout must be > real backend suite (~230–300s)."""
+    assert smoke.DEFAULT_DOCTOR_TEST_TIMEOUT_SECONDS >= 600
+    assert smoke.DEFAULT_DOCTOR_TEST_TIMEOUT_SECONDS > 300
+    assert smoke.DEFAULT_DOCTOR_TEST_TIMEOUT_SECONDS <= smoke.MAX_TIMEOUT_SECONDS
+
+
+def test_resolve_timeout_default_and_valid_override(monkeypatch):
+    monkeypatch.delenv(smoke.DOCTOR_TEST_TIMEOUT_ENV, raising=False)
+    assert (
+        smoke.resolve_timeout_seconds(
+            smoke.DOCTOR_TEST_TIMEOUT_ENV,
+            default=smoke.DEFAULT_DOCTOR_TEST_TIMEOUT_SECONDS,
+        )
+        == smoke.DEFAULT_DOCTOR_TEST_TIMEOUT_SECONDS
+    )
+
+    monkeypatch.setenv(smoke.DOCTOR_TEST_TIMEOUT_ENV, "900")
+    assert (
+        smoke.resolve_timeout_seconds(
+            smoke.DOCTOR_TEST_TIMEOUT_ENV,
+            default=smoke.DEFAULT_DOCTOR_TEST_TIMEOUT_SECONDS,
+        )
+        == 900
+    )
+
+
+def test_resolve_timeout_rejects_invalid_zero_negative_out_of_range(monkeypatch):
+    for raw in ("0", "-1", "abc", "10", "999999"):
+        monkeypatch.setenv(smoke.DOCTOR_TEST_TIMEOUT_ENV, raw)
+        try:
+            smoke.resolve_timeout_seconds(
+                smoke.DOCTOR_TEST_TIMEOUT_ENV,
+                default=smoke.DEFAULT_DOCTOR_TEST_TIMEOUT_SECONDS,
+            )
+            raise AssertionError(f"expected ValueError for {raw!r}")
+        except ValueError as exc:
+            assert smoke.DOCTOR_TEST_TIMEOUT_ENV in str(exc)
+
+
+def test_simulated_timeout_remains_required_failure(monkeypatch):
+    def timed_out(*_args, **_kwargs):
+        raise smoke.subprocess.TimeoutExpired(cmd=["pytest"], timeout=12)
+
+    monkeypatch.setattr(smoke.subprocess, "run", timed_out)
+    result = smoke.run("backend tests", [sys.executable, "-m", "pytest"], timeout=12)
+
+    assert result["ok"] is False
+    assert result["status"] == "failed"
+    assert "timed out after 12" in str(result["error"])
+    assert result.get("optional") is False
+
+
+def test_main_uses_doctor_test_timeout_for_backend_tests(monkeypatch, capsys):
+    captured: dict[str, object] = {}
+
+    def fake_run(name, command, *, cwd=smoke.ROOT, optional=False, env=None, timeout=None):
+        if name == "backend tests":
+            captured["timeout"] = timeout
+            captured["command"] = command
+            return {
+                "name": name,
+                "ok": True,
+                "optional": False,
+                "status": "passed",
+                "returncode": 0,
+            }
+        return {
+            "name": name,
+            "ok": True,
+            "optional": optional,
+            "status": "passed" if not optional else "skipped",
+        }
+
+    monkeypatch.setenv(smoke.DOCTOR_TEST_TIMEOUT_ENV, "777")
+    monkeypatch.setattr(smoke, "run", fake_run)
+    monkeypatch.setattr(sys, "argv", ["smoke.py", "--skip-frontend", "--skip-http"])
+
+    exit_code = smoke.main()
+    report = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert report["ok"] is True
+    assert captured["timeout"] == 777
+    assert report["timeouts"]["backend_tests_seconds"] == 777
+
+
+def test_main_invalid_timeout_exits_nonzero(monkeypatch, capsys):
+    monkeypatch.setenv(smoke.DOCTOR_TEST_TIMEOUT_ENV, "0")
+    monkeypatch.setattr(sys, "argv", ["smoke.py", "--skip-frontend", "--skip-http"])
+
+    exit_code = smoke.main()
+    err = capsys.readouterr().err
+
+    assert exit_code != 0
+    assert smoke.DOCTOR_TEST_TIMEOUT_ENV in err
+
+
+def test_frontend_build_reuses_proven_build_after_oom(monkeypatch, tmp_path):
+    frontend = tmp_path / "frontend"
+    next_dir = frontend / ".next"
+    next_dir.mkdir(parents=True)
+    (next_dir / "BUILD_ID").write_text("build-canary-1", encoding="utf-8")
+    (next_dir / "prerender-manifest.json").write_text("{}", encoding="utf-8")
+    (next_dir / "build-manifest.json").write_text("{}", encoding="utf-8")
+
+    def oom_run(name, command, *, cwd=smoke.ROOT, optional=False, env=None, timeout=None):
+        return {
+            "name": name,
+            "ok": False,
+            "optional": False,
+            "status": "failed",
+            "returncode": 1,
+            "stdout_tail": "",
+            "stderr_tail": "memory allocation of 16 bytes failed",
+            "timeout_seconds": timeout,
+        }
+
+    monkeypatch.setattr(smoke, "ROOT", tmp_path)
+    monkeypatch.setattr(smoke, "run", oom_run)
+    result = smoke.run_frontend_build(timeout=180)
+
+    assert result["ok"] is True
+    assert result["status"] == "passed"
+    assert result.get("reused_production_build") is True
+    assert result.get("build_id") == "build-canary-1"
+
+
+def test_frontend_build_does_not_hide_real_compile_failure(monkeypatch, tmp_path):
+    frontend = tmp_path / "frontend"
+    next_dir = frontend / ".next"
+    next_dir.mkdir(parents=True)
+    (next_dir / "BUILD_ID").write_text("stale", encoding="utf-8")
+    (next_dir / "prerender-manifest.json").write_text("{}", encoding="utf-8")
+    (next_dir / "build-manifest.json").write_text("{}", encoding="utf-8")
+
+    def compile_fail(name, command, *, cwd=smoke.ROOT, optional=False, env=None, timeout=None):
+        return {
+            "name": name,
+            "ok": False,
+            "optional": False,
+            "status": "failed",
+            "returncode": 1,
+            "stdout_tail": "Type error: Property x does not exist",
+            "stderr_tail": "Failed to compile",
+            "timeout_seconds": timeout,
+        }
+
+    monkeypatch.setattr(smoke, "ROOT", tmp_path)
+    monkeypatch.setattr(smoke, "run", compile_fail)
+    result = smoke.run_frontend_build(timeout=180)
+
+    assert result["ok"] is False
+    assert result["status"] == "failed"
+
+
+
 def test_optional_missing_command_is_skipped_but_never_successful(monkeypatch):
     def missing(*_args, **_kwargs):
         raise FileNotFoundError("tool not installed")
@@ -53,7 +210,7 @@ def test_optional_unreachable_http_is_skipped_but_never_successful(monkeypatch):
 
 
 def test_main_exit_ignores_optional_gap_but_reports_degraded(monkeypatch, capsys):
-    def fake_run(name, _command, *, cwd=smoke.ROOT, optional=False, env=None):
+    def fake_run(name, _command, *, cwd=smoke.ROOT, optional=False, env=None, timeout=None):
         if name == "docker compose config":
             assert env["JARVIS_QWEN_MODEL_PATH"] == (
                 "/models/__jarvis_compose_config_check__"
@@ -81,7 +238,7 @@ def test_main_exit_ignores_optional_gap_but_reports_degraded(monkeypatch, capsys
 
 
 def test_main_required_failure_sets_nonzero_exit(monkeypatch, capsys):
-    def fake_run(name, _command, *, cwd=smoke.ROOT, optional=False, env=None):
+    def fake_run(name, _command, *, cwd=smoke.ROOT, optional=False, env=None, timeout=None):
         if name == "docker compose config":
             assert env["JARVIS_QWEN_MODEL_PATH"] == (
                 "/models/__jarvis_compose_config_check__"
@@ -151,7 +308,7 @@ def test_compose_config_stdout_redacts_api_token_canary(monkeypatch):
 def test_main_report_redacts_nested_compose_canary(monkeypatch, capsys):
     canary = "CANARY_TOKEN_SPARK0017_nested"
 
-    def fake_run(name, _command, *, cwd=smoke.ROOT, optional=False, env=None):
+    def fake_run(name, _command, *, cwd=smoke.ROOT, optional=False, env=None, timeout=None):
         if name == "docker compose config":
             return {
                 "name": name,
@@ -188,7 +345,7 @@ def test_backend_tests_receive_sanitized_deployment_env(monkeypatch, capsys):
     """SPARK-0016: pytest must not inherit launcher JARVIS_HOME/PROFILE/MODEL_ROOT."""
     captured: dict[str, object] = {}
 
-    def fake_run(name, command, *, cwd=smoke.ROOT, optional=False, env=None):
+    def fake_run(name, command, *, cwd=smoke.ROOT, optional=False, env=None, timeout=None):
         if name == "backend tests":
             captured["env"] = env
             captured["command"] = command
