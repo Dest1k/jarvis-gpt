@@ -62,7 +62,7 @@ from .shop_registry import (
     shop_search_url,
 )
 from .storage import JarvisStorage, utc_now
-from .tools import OperatorTurnAuthorization, ToolRegistry
+from .tools import OperatorTurnAuthorization, ToolRegistry, _canonicalize_tool_invocation
 from .verification import (
     Verdict,
     build_mission_report_messages,
@@ -2725,6 +2725,23 @@ class AgentRuntime:
         context: AgentContext | None,
         description: str,
     ) -> DirectAction:
+        tool_name, arguments = _canonicalize_tool_invocation(tool_name, arguments)
+        # Reject non-canonical bare aliases before a pending approval exists.
+        if self.tools.get(tool_name) is None:
+            return DirectAction(
+                answer=(
+                    f"Action `{tool_name}` was rejected before approval: "
+                    "unknown or non-canonical tool alias."
+                ),
+                events=[
+                    ChatEvent(
+                        type="thought",
+                        title="Non-canonical tool rejected",
+                        content=f"Rejected tool alias before approval: {tool_name}",
+                        payload={"tool": tool_name},
+                    )
+                ],
+            )
         spec = self.tools.get(tool_name)
         risk = (
             spec.danger_level
@@ -5069,6 +5086,7 @@ class AgentRuntime:
         context: AgentContext,
         resume: dict[str, Any] | None = None,
     ) -> tuple[str, ChatEvent, _ExecutedToolResult | None]:
+        name, args = _canonicalize_tool_invocation(name, args)
         mission_id = context.mission_id
         conversation_id = str(context.conversation_id or "")
         if mission_id is None and conversation_id.startswith("mission:"):

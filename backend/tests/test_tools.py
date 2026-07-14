@@ -4599,3 +4599,65 @@ def test_public_observability_helper_does_not_record_itself(monkeypatch, tmp_pat
     assert first["summary"] == second["summary"]
     assert len(storage.list_tool_runs(limit=100)) == before
     storage.close()
+
+def test_canonicalize_tool_invocation_maps_filesystem_mkdir_alias():
+    """SPARK-0009: model-facing filesystem.mkdir becomes execution.apply/fs.mkdir."""
+    from jarvis_gpt.tools import _canonicalize_tool_invocation
+
+    name, args = _canonicalize_tool_invocation(
+        "filesystem.mkdir",
+        {"path": r"D:\tmp\jarvis-mkdir-canary", "parents": True},
+    )
+    assert name == "execution.apply"
+    assert args["payload"]["action"]["kind"] == "fs.mkdir"
+    assert args["payload"]["action"]["path"] == r"D:\tmp\jarvis-mkdir-canary"
+
+    name2, args2 = _canonicalize_tool_invocation(
+        "execution.apply",
+        {
+            "payload": {
+                "protocol": "jarvis.execution.v1",
+                "action": {"kind": "filesystem.mkdir", "path": r"D:\tmp\x"},
+            }
+        },
+    )
+    assert name2 == "execution.apply"
+    assert args2["payload"]["action"]["kind"] == "fs.mkdir"
+
+
+def test_canonicalize_tool_invocation_does_not_rewrite_mutation_aliases():
+    """SPARK-0009 negative: write/move/delete aliases must not canonicalize."""
+    from jarvis_gpt.tools import (
+        _canonicalize_mkdir_kind_in_payload,
+        _canonicalize_tool_invocation,
+    )
+
+    for alias in (
+        "filesystem.write",
+        "filesystem.overwrite",
+        "filesystem.append",
+        "filesystem.move",
+        "filesystem.rename",
+        "filesystem.copy",
+        "filesystem.delete",
+        "filesystem.remove",
+    ):
+        name, args = _canonicalize_tool_invocation(alias, {"path": r"D:\tmp\x"})
+        assert name == alias
+        assert "payload" not in args
+
+    for kind in (
+        "filesystem.write",
+        "filesystem.move",
+        "filesystem.delete",
+        "filesystem.copy",
+        "filesystem.rename",
+        "filesystem.append",
+    ):
+        payload = {
+            "protocol": "jarvis.execution.v1",
+            "action": {"kind": kind, "path": r"D:\tmp\x"},
+        }
+        rewritten = _canonicalize_mkdir_kind_in_payload(payload)
+        assert rewritten["action"]["kind"] == kind
+

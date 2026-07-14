@@ -4361,6 +4361,90 @@ def test_agent_filters_thinking_blocks_from_stream(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_request_direct_tool_approval_rejects_unknown_alias(monkeypatch, tmp_path):
+    """SPARK-0009: unknown tool aliases never create a pending approval."""
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    agent = AgentRuntime(
+        settings=settings,
+        storage=storage,
+        llm=LLMRouter(settings),
+        bus=EventBus(),
+    )
+    before = len(storage.list_approvals(limit=50))
+    action = agent._request_direct_tool_approval(
+        "filesystem.not_a_real_kind",
+        {"path": str(tmp_path / "nope")},
+        context=None,
+        description="should reject",
+    )
+    after = len(storage.list_approvals(limit=50))
+    assert after == before
+    assert "rejected" in action.answer.lower() or "unknown" in action.answer.lower()
+
+    # Mutation aliases also must not create pending approvals.
+    for alias in ("filesystem.write", "filesystem.move", "filesystem.delete"):
+        before_m = len(storage.list_approvals(limit=50))
+        action_m = agent._request_direct_tool_approval(
+            alias,
+            {"path": str(tmp_path / "mutation-nope")},
+            context=None,
+            description="should reject mutation alias",
+        )
+        after_m = len(storage.list_approvals(limit=50))
+        assert after_m == before_m
+        assert "rejected" in action_m.answer.lower() or "unknown" in action_m.answer.lower()
+    storage.close()
+
+
+def test_request_direct_tool_approval_canonicalizes_mkdir_alias(monkeypatch, tmp_path):
+    """SPARK-0009: filesystem.mkdir approval stores canonical execution.apply/fs.mkdir."""
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    agent = AgentRuntime(
+        settings=settings,
+        storage=storage,
+        llm=LLMRouter(settings),
+        bus=EventBus(),
+    )
+    target = tmp_path / "approved-mkdir-once"
+    neighbor = tmp_path / "neighbor-not-touched"
+    action = agent._request_direct_tool_approval(
+        "filesystem.mkdir",
+        {"path": str(target), "parents": True},
+        context=None,
+        description="create exact approved directory",
+    )
+    approvals = storage.list_approvals(limit=20)
+    assert approvals, action.answer
+    latest = approvals[0]
+    payload = latest.get("payload") or {}
+    assert payload.get("tool") == "execution.apply"
+    kind = (
+        ((payload.get("arguments") or {}).get("payload") or {})
+        .get("action", {})
+        .get("kind")
+    )
+    assert kind == "fs.mkdir"
+    path = (
+        ((payload.get("arguments") or {}).get("payload") or {})
+        .get("action", {})
+        .get("path")
+    )
+    assert path == str(target)
+    assert not target.exists()
+    assert not neighbor.exists()
+    storage.close()
+
+
 def test_classify_rejects_raw_call_markers_and_tool_envelopes():
     """SPARK-0006 / FUNC-FIND-006: bare call: markers must never be answers."""
     from jarvis_gpt.agent import (

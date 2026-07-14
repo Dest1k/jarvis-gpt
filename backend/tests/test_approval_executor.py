@@ -1147,6 +1147,157 @@ def test_executive_approval_is_bound_to_persisted_and_current_environment(monkey
     storage.close()
 
 
+
+def test_filesystem_mkdir_alias_canonicalizes_to_fs_mkdir_on_approval(monkeypatch, tmp_path):
+    """SPARK-0009 / OP-0037: alias filesystem.mkdir binds and creates fs.mkdir once."""
+    from jarvis_gpt.tools import (
+        _canonicalize_mkdir_kind_in_payload,
+        _canonicalize_tool_invocation,
+    )
+
+    alias_payload = {
+        "protocol": "jarvis.execution.v1",
+        "action": {
+            "kind": "filesystem.mkdir",
+            "path": str(tmp_path / "from-alias"),
+            "parents": True,
+        },
+    }
+    canonical = _canonicalize_mkdir_kind_in_payload(alias_payload)
+    assert canonical["action"]["kind"] == "fs.mkdir"
+
+    name, args = _canonicalize_tool_invocation(
+        "filesystem.mkdir",
+        {"path": str(tmp_path / "from-tool-name"), "parents": True},
+    )
+    assert name == "execution.apply"
+    assert args["payload"]["action"]["kind"] == "fs.mkdir"
+
+    # Mutation aliases must remain non-canonical.
+    for alias in ("filesystem.write", "filesystem.move", "filesystem.delete"):
+        bad_name, bad_args = _canonicalize_tool_invocation(alias, {"path": "x"})
+        assert bad_name == alias
+        assert "payload" not in bad_args
+
+    bad_name, bad_args = _canonicalize_tool_invocation(
+        "filesystem.not_a_real_kind", {"path": "x"}
+    )
+    assert bad_name == "filesystem.not_a_real_kind"
+
+    executor, storage = _runtime(monkeypatch, tmp_path)
+    neighbor = tmp_path / "neighbor-must-not-exist"
+    assert not neighbor.exists()
+
+    for repeat in range(3):
+        path = tmp_path / f"approved-dir-alias-{repeat}"
+        approval = storage.create_approval(
+            title=f"Mkdir alias {repeat}",
+            description="Create controlled directory via non-canonical kind alias.",
+            requested_action="tool.run",
+            risk="danger",
+            payload={
+                "tool": "execution.apply",
+                "arguments": {
+                    "payload": {
+                        "protocol": "jarvis.execution.v1",
+                        "action": {
+                            "kind": "filesystem.mkdir",
+                            "path": str(path),
+                            "parents": True,
+                        },
+                    }
+                },
+            },
+        )
+        storage.update_approval(approval["id"], status="approved", result={"operator": "test"})
+        result = asyncio.run(executor.execute(approval["id"]))
+        assert result.ok is True, result.summary
+        assert result.data["tool_run"]["tool"] == "execution.apply"
+        assert result.data["tool_run"]["ok"] is True
+        assert path.is_dir()
+        # Replay must not create neighboring paths or double-claim success as new work.
+        second = asyncio.run(executor.execute(approval["id"]))
+        assert second.ok is False or second.approval["status"] == "executed"
+        assert path.is_dir()
+
+    assert not neighbor.exists()
+
+    # Bare unknown alias is rejected before any path is created.
+    ghost = tmp_path / "should-not-exist-unknown-alias"
+    approval = storage.create_approval(
+        title="Unknown alias",
+        description="Must fail closed.",
+        requested_action="tool.run",
+        risk="danger",
+        payload={"tool": "filesystem.not_a_real_kind", "arguments": {"path": str(ghost)}},
+    )
+    storage.update_approval(approval["id"], status="approved", result={"operator": "test"})
+    result = asyncio.run(executor.execute(approval["id"]))
+    assert result.ok is False
+    assert not ghost.exists()
+
+    # write/move/delete aliases do not become executable via canonicalize.
+    for alias, path_name in (
+        ("filesystem.write", "no-write"),
+        ("filesystem.move", "no-move"),
+        ("filesystem.delete", "no-delete"),
+    ):
+        target = tmp_path / path_name
+        approval = storage.create_approval(
+            title=f"Reject {alias}",
+            description="Must not canonicalize mutation alias.",
+            requested_action="tool.run",
+            risk="danger",
+            payload={"tool": alias, "arguments": {"path": str(target)}},
+        )
+        storage.update_approval(approval["id"], status="approved", result={"operator": "test"})
+        result = asyncio.run(executor.execute(approval["id"]))
+        assert result.ok is False
+        assert not target.exists()
+    storage.close()
+
+
+def test_tools_run_rewrites_filesystem_mkdir_alias(monkeypatch, tmp_path):
+    """SPARK-0009: tools.run packages filesystem.mkdir as execution.apply/fs.mkdir."""
+    executor, storage = _runtime(monkeypatch, tmp_path)
+    target = tmp_path / "tools-run-mkdir"
+    neighbor = tmp_path / "tools-run-neighbor"
+    response = asyncio.run(
+        executor.tools.run("filesystem.mkdir", {"path": str(target), "parents": True})
+    )
+    assert response.ok is False
+    assert response.data.get("approval_action") == "tool.run"
+    payload = response.data.get("approval_payload") or {}
+    assert payload.get("tool") == "execution.apply"
+    assert payload["arguments"]["payload"]["action"]["kind"] == "fs.mkdir"
+    assert payload["arguments"]["payload"]["action"]["path"] == str(target)
+    assert not target.exists()
+    assert not neighbor.exists()
+
+    approved = asyncio.run(
+        executor.tools.run(
+            "filesystem.mkdir",
+            {"path": str(target), "parents": True},
+            allow_danger=True,
+        )
+    )
+    assert approved.ok is True
+    assert approved.tool == "execution.apply"
+    assert target.is_dir()
+    assert not neighbor.exists()
+
+    # Negative: write alias is rejected without creating approval-shaped success.
+    write_target = tmp_path / "should-not-write"
+    write_resp = asyncio.run(
+        executor.tools.run("filesystem.write", {"path": str(write_target), "content": "x"})
+    )
+    assert write_resp.ok is False
+    assert write_resp.data.get("rejected_alias") is True
+    assert write_resp.data.get("approval_action") is None
+    assert not write_target.exists()
+    storage.close()
+
+
 def _runtime(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")

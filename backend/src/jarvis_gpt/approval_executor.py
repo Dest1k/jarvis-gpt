@@ -501,10 +501,13 @@ class ApprovalExecutor:
                 data={"memory": memory},
             )
         if action == "tool.run":
+            from .tools import _canonicalize_tool_invocation
+
             tool_name = str(payload.get("tool") or "").strip()
             arguments = payload.get("arguments") or {}
             if not isinstance(arguments, dict):
                 arguments = {}
+            tool_name, arguments = _canonicalize_tool_invocation(tool_name, arguments)
             spec = self.tools.get(tool_name)
             if spec is None:
                 return ApprovalExecution(

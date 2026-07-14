@@ -547,8 +547,9 @@ class ToolRegistry:
         user_message_id: str | None = None,
         authorization: OperatorTurnAuthorization | None = None,
     ) -> ToolRunResponse:
+        # SPARK-0009: canonicalize only filesystem.mkdir → fs.mkdir before lookup/approval.
+        name, args = _canonicalize_tool_invocation(name, arguments or {})
         spec = self.get(name)
-        args = arguments or {}
         operator_authorized = False
         authorization_error: str | None = None
         if authorization is not None:
@@ -566,7 +567,17 @@ class ToolRegistry:
             else:
                 operator_authorized = True
         approved = allow_danger or operator_authorized
-        if spec is None:
+        if name in _REJECTED_NON_CANONICAL_ALIASES:
+            response = ToolRunResponse(
+                tool=name,
+                ok=False,
+                summary=(
+                    f"Tool alias {name!r} is not a canonical action; "
+                    "use execution.apply with kind 'fs.mkdir' (or another protocol kind)."
+                ),
+                data={"rejected_alias": True, "tool": name},
+            )
+        elif spec is None:
             response = ToolRunResponse(
                 tool=name,
                 ok=False,
@@ -2732,6 +2743,99 @@ async def _execution_verify(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRe
     )
 
 
+
+# SPARK-0009 / FUNC-FIND-009: only the mkdir model-facing alias is rewritten.
+# Do not expand this set to write/move/delete or other mutation kinds.
+_MKDIR_ALIAS_TOOL_NAMES = frozenset({"filesystem.mkdir"})
+_REJECTED_NON_CANONICAL_ALIASES = frozenset(
+    {
+        "filesystem.write",
+        "filesystem.overwrite",
+        "filesystem.append",
+        "filesystem.move",
+        "filesystem.rename",
+        "filesystem.copy",
+        "filesystem.delete",
+        "filesystem.remove",
+        "mkdir",
+    }
+)
+
+
+def _canonicalize_mkdir_kind_in_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Rewrite only action.kind filesystem.mkdir → fs.mkdir inside a typed payload."""
+
+    data = dict(payload)
+    action = data.get("action")
+    if isinstance(action, dict):
+        action = dict(action)
+        kind = str(action.get("kind") or "").strip()
+        if kind == "filesystem.mkdir":
+            action["kind"] = "fs.mkdir"
+        data["action"] = action
+    return data
+
+
+def _canonicalize_tool_invocation(
+    name: str,
+    arguments: dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    """Map only the filesystem.mkdir alias onto execution.apply / fs.mkdir.
+
+    Other model-facing mutation aliases are intentionally not rewritten so they
+    fail closed without creating a broader capability surface.
+    """
+
+    raw_name = str(name or "").strip()
+    args = dict(arguments or {})
+
+    if raw_name in _MKDIR_ALIAS_TOOL_NAMES:
+        path = str(args.get("path") or args.get("directory") or "").strip()
+        if not path:
+            # Leave as rejected bare alias; run() reports non-canonical.
+            return raw_name, args
+        payload = {
+            "protocol": "jarvis.execution.v1",
+            "action": {
+                "kind": "fs.mkdir",
+                "path": path,
+                "parents": bool(args.get("parents", True)),
+            },
+        }
+        preserved = {
+            key: value
+            for key, value in args.items()
+            if key
+            in {
+                "session_id",
+                "finalize_session",
+                "safe_gate_token",
+                "verification",
+            }
+        }
+        return "execution.apply", {"payload": payload, **preserved}
+
+    if raw_name in {
+        "execution.apply",
+        "execution.inspect",
+        "execution.preflight",
+    }:
+        payload = args.get("payload")
+        if isinstance(payload, dict):
+            args = {**args, "payload": _canonicalize_mkdir_kind_in_payload(payload)}
+    elif raw_name == "execution.transaction":
+        actions = args.get("actions")
+        if isinstance(actions, list):
+            rewritten: list[Any] = []
+            for item in actions:
+                if isinstance(item, dict):
+                    rewritten.append(_canonicalize_mkdir_kind_in_payload(item))
+                else:
+                    rewritten.append(item)
+            args = {**args, "actions": rewritten}
+    return raw_name, args
+
+
 async def _execution_apply(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     return await _execution_action(ctx, args, expected=None, tool="execution.apply")
 
@@ -2747,6 +2851,9 @@ async def _execution_action(
     if not isinstance(payload, dict):
         return ToolRunResponse(tool=tool, ok=False, summary="A typed payload object is required.")
     try:
+        # SPARK-0009: mkdir alias only — never broaden to write/move/delete here.
+        payload = _canonicalize_mkdir_kind_in_payload(payload)
+        args = {**args, "payload": payload}
         action_class = classify_payload(payload)
         action = parse_action(payload)
         expectation = _execution_expectation(args.get("verification"))
