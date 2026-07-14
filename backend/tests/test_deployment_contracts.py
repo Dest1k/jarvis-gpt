@@ -108,6 +108,18 @@ def test_launcher_is_local_only_and_preserves_foreign_listeners() -> None:
     assert "started_by_launcher = $true" in launcher
     assert "function Test-LauncherOwnsDispatcher" in launcher
     assert "function Test-ReusedDispatcherOwnership" in launcher
+    assert "function Test-ManagedJarvisPort" in launcher
+    assert "function Get-AlreadyRunningStackServices" in launcher
+    assert "function Test-BridgeActionReady" in launcher
+    assert "already-running status without" in launcher
+    assert "mutating CLI verification" in launcher
+    assert "skipping mutating init" in launcher
+    assert "Stopping managed backend before mutating init" in launcher
+    assert "Cannot start/replace dispatcher while the managed API owns executive" in launcher
+    assert launcher.index("Get-AlreadyRunningStackServices") < launcher.index(
+        'Arguments @("-3.11", ".\\jarvis.py", "--profile", $Profile, "init")'
+    )
+    assert launcher.count('Arguments @("-3.11", ".\\jarvis.py", "--profile", $Profile, "init")') == 1
     assert 'container_id = [string]$llmReadiness.container.id' in launcher
     assert '$phase = "external-ready"' in launcher
     assert "Preserving LLM runtime" in launcher
@@ -139,6 +151,34 @@ def test_launcher_is_local_only_and_preserves_foreign_listeners() -> None:
     assert "-ArgumentList $Arguments" not in launcher
     assert 'Join-Path $RepoRoot "jarvis.py"' in launcher
     assert '"jarvis-gpt-command-center"' not in launcher
+
+
+def test_launcher_repeat_start_is_idempotent_contract() -> None:
+    """SPARK-0014: warm start must not contest the API primary lease."""
+
+    launcher = _read("scripts/jarvis-launcher.ps1")
+
+    # Already-running path must short-circuit before mutating init.
+    already_fn = launcher.index("function Get-AlreadyRunningStackServices")
+    start_fn = launcher.index("function Start-JarvisStack")
+    init_call = launcher.index(
+        'Arguments @("-3.11", ".\\jarvis.py", "--profile", $Profile, "init")',
+        start_fn,
+    )
+    already_call = launcher.index("Get-AlreadyRunningStackServices", start_fn)
+    assert already_fn < start_fn
+    assert already_call < init_call
+    assert "reporting already-running status without" in launcher
+    assert "mutating CLI verification" in launcher
+    # Mutating init is gated on live managed backend / lease ownership.
+    assert "skipping mutating init" in launcher
+    assert "Live managed backend already owns executive state" in launcher
+    # Env-change restart releases the lease before init.
+    assert "Stopping managed backend before mutating init" in launcher
+    # No second init call after lease-sensitive paths.
+    assert launcher.count(
+        'Arguments @("-3.11", ".\\jarvis.py", "--profile", $Profile, "init")'
+    ) == 1
 
 
 def test_frontend_runtime_uses_unprivileged_node_user() -> None:

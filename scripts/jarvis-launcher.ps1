@@ -1393,6 +1393,116 @@ function Ensure-FrontendReady {
   return $rebuilt
 }
 
+function Test-ManagedJarvisPort {
+  param(
+    [int]$Port,
+    [string]$Service
+  )
+
+  return (Test-PortOpen -Port $Port) -and (Test-ManagedPortOwner -Port $Port -Service $Service)
+}
+
+function Test-BridgeActionReady {
+  if (-not (Test-ManagedJarvisPort -Port 8765 -Service "bridge")) {
+    return $false
+  }
+  $bridgeHealth = Invoke-HttpProbe -Uri "http://127.0.0.1:8765/health" -TimeoutSec 2 -Json
+  if (-not ($bridgeHealth.ok -and [string]$bridgeHealth.data.contract -eq "action.v1")) {
+    return $false
+  }
+  $bridgeCapabilities = Invoke-BridgeCapabilitiesProbe -TimeoutSec 3
+  return [bool]$bridgeCapabilities.ok
+}
+
+function Get-AlreadyRunningStackServices {
+  param(
+    $PreviousState,
+    [bool]$BackendEnvironmentChanged,
+    [bool]$FrontendEnvironmentChanged,
+    [string]$BackendBindHost,
+    [string]$FrontendBindHost
+  )
+
+  # Idempotent start: when every required managed service is already healthy and
+  # launch environments are unchanged, skip all mutating CLI (init/dispatcher-up)
+  # so the live API lease is never contested.
+  if ($BackendEnvironmentChanged -or $FrontendEnvironmentChanged) {
+    return $null
+  }
+  if ($script:LanMode -and -not (Test-PortExposedForLan -Port 3000)) {
+    return $null
+  }
+
+  $services = @{}
+
+  if (-not $NoBackend) {
+    if (-not (Test-ManagedJarvisPort -Port 8000 -Service "backend")) {
+      return $null
+    }
+    $services.backend = @{
+      port = 8000
+      pid = Get-PortOwner -Port 8000
+      reused = $true
+      host = $BackendBindHost
+    }
+  }
+
+  if (-not $NoFrontend) {
+    if (-not (Test-ManagedJarvisPort -Port 3000 -Service "frontend")) {
+      return $null
+    }
+    $services.frontend = @{
+      port = 3000
+      pid = Get-PortOwner -Port 3000
+      reused = $true
+      host = $FrontendBindHost
+    }
+  }
+
+  if (-not $NoBridge) {
+    if (-not (Test-BridgeActionReady)) {
+      return $null
+    }
+    $services.bridge = @{
+      port = 8765
+      pid = Get-PortOwner -Port 8765
+      reused = $true
+      contract = "action.v1"
+      policy_revision = $BridgePolicyRevision
+    }
+  }
+
+  if (-not $NoDispatcher) {
+    $llmReadiness = Get-LlmReadiness
+    $dispatcherStatus = Get-DispatcherDesiredStatus
+    $llmStartDecision = Get-LlmStartDecision `
+      -Readiness $llmReadiness `
+      -DispatcherStatus $dispatcherStatus
+    if ($llmStartDecision -ne "reuse") {
+      return $null
+    }
+    $dispatcherOwnershipContinues = Test-ReusedDispatcherOwnership `
+      -State $PreviousState `
+      -Readiness $llmReadiness
+    $services.dispatcher = @{
+      profile = $Profile
+      docker = [bool]$llmReadiness.container.running
+      reused = $true
+      started_by_launcher = $dispatcherOwnershipContinues
+      container_id = [string]$llmReadiness.container.id
+      phase = [string]$llmReadiness.phase
+    }
+  } else {
+    $services.dispatcher = @{
+      profile = $Profile
+      skipped = "app-without-llm-launch"
+      started_by_launcher = $false
+    }
+  }
+
+  return $services
+}
+
 function Start-JarvisStack {
   Ensure-LauncherFolders
   Set-JarvisEnvironment -SelectedProfile $Profile
@@ -1412,8 +1522,44 @@ function Start-JarvisStack {
   $frontendBindHost = Get-FrontendBindHost
 
   Write-Banner
-  Write-Host "Preparing runtime folders..." -ForegroundColor Yellow
-  Invoke-JarvisCommand -FilePath "py.exe" -Arguments @("-3.11", ".\jarvis.py", "--profile", $Profile, "init")
+
+  $alreadyRunningServices = Get-AlreadyRunningStackServices `
+    -PreviousState $previousState `
+    -BackendEnvironmentChanged $backendEnvironmentChanged `
+    -FrontendEnvironmentChanged $frontendEnvironmentChanged `
+    -BackendBindHost $backendBindHost `
+    -FrontendBindHost $frontendBindHost
+  if ($null -ne $alreadyRunningServices) {
+    Write-Host (
+      "Jarvis stack is already running; reporting already-running status without " +
+      "mutating CLI verification (avoids API executive-state lease failure)."
+    ) -ForegroundColor Green
+    Save-LauncherState -Services $alreadyRunningServices
+    Show-JarvisStatus
+    return
+  }
+
+  # API owns primary-runtime.lock while backend is live. Stop a managed backend
+  # whose environment changed before any mutating CLI (init/dispatcher-up).
+  if (
+    -not $NoBackend -and
+    $backendEnvironmentChanged -and
+    (Test-ManagedJarvisPort -Port 8000 -Service "backend")
+  ) {
+    Write-Host "Stopping managed backend before mutating init (environment changed)..." -ForegroundColor Yellow
+    Stop-PortOwner -Port 8000 -ManagedOnly -Service "backend"
+    [void](Wait-PortClosed -Port 8000)
+  }
+
+  $backendHoldsLease = (-not $NoBackend) -and (Test-ManagedJarvisPort -Port 8000 -Service "backend")
+  if ($backendHoldsLease) {
+    Write-Host (
+      "Live managed backend already owns executive state; skipping mutating init."
+    ) -ForegroundColor DarkYellow
+  } else {
+    Write-Host "Preparing runtime folders..." -ForegroundColor Yellow
+    Invoke-JarvisCommand -FilePath "py.exe" -Arguments @("-3.11", ".\jarvis.py", "--profile", $Profile, "init")
+  }
 
   $services = @{}
 
@@ -1452,6 +1598,12 @@ function Start-JarvisStack {
       $llmStartDecision -in @("start", "replace") -and
       (Ensure-DockerReady -TimeoutSec $DockerWaitSec)
     ) {
+      if ($backendHoldsLease) {
+        throw (
+          "Cannot start/replace dispatcher while the managed API owns executive " +
+          "state. Stop the stack or use a cold start path before dispatcher-up."
+        )
+      }
       if ($llmStartDecision -eq "replace") {
         $actualModel = [string]$dispatcherStatus.runtime.model_id
         $desiredModel = [string]$dispatcherStatus.desired_runtime.model_id
