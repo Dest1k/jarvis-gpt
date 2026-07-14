@@ -30,7 +30,7 @@ Batch A focused validation: 155 passed, 2 skipped.
 |------|--------|
 | SPARK-0002 response constraints | PASS — deterministic sentence/bullet/JSON contracts + one repair |
 | SPARK-0004 multi-turn refs | PASS — deictic/follow-up markers; conversation-local binding |
-| SPARK-0005 clarification | PASS — no mission before one precise question |
+| SPARK-0005 clarification | PARTIAL on original campaign (offline FailLLM only); **live fixed in release-blocker remediation** (see release-blocker-remediation/) |
 | SPARK-0012 memory namespace | PASS — exact namespace write/recall; operator/core uncontaminated |
 | SPARK-0001 DNS vs shopping | PASS — educational/network DNS not shopping; shop catalog preserved |
 | SPARK-0010 web synthesis | PASS — reject link dumps; provenance URLs; one network-unavailable result |
@@ -88,3 +88,4 @@ See RESIDUAL_GAPS.md (non-blocking P2/live-stack items).
 ```
 1421f0e SPARK-0013: product-decision profile safety for certified host b812b75 fix: preserve DNS-record research and shop-catalog domain pins 2fb92f9 SPARK-0010: require cited usable web synthesis d9ae273 SPARK-0001: keep DNS/network questions out of shopping 82f287d SPARK-0012: honor exact memory namespace on write/recall 7a3074f SPARK-0005: clarify before mission creation 5aa0f19 SPARK-0004: preserve multi-turn document and option references 6c715bb SPARK-0002: enforce exact response constraints deterministically c9337ee SPARK-0008: normalize corrupt document recovery 3602af1 SPARK-0003: bind exact artifact paths and verify writes 92dc133 SPARK-0007: stabilize uploaded-document identity and recall 56ce5a6 SPARK-0014: make repeated start idempotent without lease contest
 ```
+

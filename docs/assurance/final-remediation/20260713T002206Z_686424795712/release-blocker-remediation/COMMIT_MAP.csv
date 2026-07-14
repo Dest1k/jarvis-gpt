@@ -1,0 +1,4 @@
+﻿commit,role,message
+8aa2823ce40a8ed41555a8b1f9ec89de59deaad3,BASE_FINAL_CANDIDATE,docs: pin FINAL_STATE final_head to candidate tip
+534cf2e57dc47ad779f18e03045eba978c0f3b35,RB-1,fix: restore pinned lint and doctor gate
+10787388c2ceddce9c219e1181b7ba82ecd4e316,RB-2,fix: require clarification before artifact side effects

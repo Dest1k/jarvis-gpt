@@ -1,0 +1,29 @@
+﻿{
+  "run_id": "20260713T002206Z_686424795712",
+  "status": "FINAL_RELEASE_BLOCKER_REMEDIATION_CANDIDATE_FOR_REVIEW",
+  "base_final_candidate": "8aa2823ce40a8ed41555a8b1f9ec89de59deaad3",
+  "branch": "fix/final-release-blockers/20260713T002206Z_686424795712",
+  "worktree": "D:\\\\jarvis-gpt-worktrees\\\\final-release-blockers-20260713T002206Z_686424795712",
+  "head": "61c00e92d875d4d471c725cebf8e5e463fd2747b",
+  "rb1_commit": "534cf2e57dc47ad779f18e03045eba978c0f3b35",
+  "rb2_commit": "10787388c2ceddce9c219e1181b7ba82ecd4e316",
+  "main_untouched": true,
+  "no_push_no_merge": true,
+  "independent_attestation_claimed": false,
+  "product_ready_claimed": false,
+  "blockers": {
+    "RB-1": "RESOLVED_PINNED_RUFF_0",
+    "RB-2": "RESOLVED_CLARIFICATION_GATE_AND_RESUME"
+  },
+  "tests": {
+    "ruff_pinned": "0 errors",
+    "backend_pytest": "862 passed, 13 skipped",
+    "qa_pytest": "218 passed, 3 skipped",
+    "frontend_typecheck_build": "PASS",
+    "live_clarify_claude_scenario": "6/6",
+    "live_followup_artifact": "3/3 deterministic resume (unique names); live API 2/3+overwrite then stack drop, offline 3/3"
+  },
+  "claude_review_source": "D:\\\\jarvis\\\\audit-backups\\\\20260713T002206Z_686424795712\\\\final-review-claude\\\\FINAL_REVIEW_BLOCKED.md",
+  "updated_utc": "2026-07-14T19:19:58Z"
+}
+
