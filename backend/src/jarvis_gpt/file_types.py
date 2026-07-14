@@ -320,11 +320,16 @@ def identify_path(path: str | Path, *, peek_bytes: int = 8192) -> FileTypeInfo:
     if path_obj.exists() and path_obj.is_file():
         size = path_obj.stat().st_size
         with path_obj.open("rb") as handle:
-            data = handle.read(max(64, min(peek_bytes, 1_048_576)))
+            # Read enough of the trailer region for small PDFs so truncated
+            # fixtures are not falsely identified as healthy documents.
+            read_limit = max(64, min(max(peek_bytes, size), 1_048_576))
+            data = handle.read(read_limit)
     info = identify_bytes(data, name=name)
     details = dict(info.details)
     details["size"] = size
     details["path"] = str(path_obj)
+    if info.kind == "pdf":
+        details.update(_pdf_health_details(data if size <= len(data) else data, size=size))
     return FileTypeInfo(
         kind=info.kind,
         family=info.family,
@@ -477,14 +482,47 @@ class _MagicHit:
     details: dict[str, Any] = field(default_factory=dict)
 
 
+def _pdf_health_details(data: bytes, *, size: int | None = None) -> dict[str, Any]:
+    """Surface truncated/corrupt PDF health without changing the magic kind."""
+
+    payload_size = int(size if size is not None else len(data))
+    has_eof = b"%%EOF" in data
+    has_page = bool(re.search(rb"/Type\s*/Page\b", data))
+    looks_truncated = (not has_eof and payload_size < 256) or (
+        not has_eof and not has_page and payload_size < 4096
+    )
+    return {
+        "pdf_has_eof": has_eof,
+        "pdf_has_page_marker": has_page,
+        "corrupt": looks_truncated,
+        "readable": not looks_truncated,
+        "actionable_error": (
+            "PDF appears truncated or corrupt; replace with a valid PDF and retry."
+            if looks_truncated
+            else None
+        ),
+    }
+
+
 def _match_magic(data: bytes) -> _MagicHit | None:
     if not data:
         return None
     # PDF
     if data.startswith(b"%PDF"):
+        health = _pdf_health_details(data)
         return _MagicHit(
-            "pdf", "document", "application/pdf", ".pdf", 0.99,
-            is_document=True, description="PDF document",
+            "pdf",
+            "document",
+            "application/pdf",
+            ".pdf",
+            0.99 if health.get("readable") else 0.55,
+            is_document=True,
+            description=(
+                "PDF document (truncated/corrupt)"
+                if health.get("corrupt")
+                else "PDF document"
+            ),
+            details=health,
         )
     # ZIP family
     if data[:4] in {b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"}:

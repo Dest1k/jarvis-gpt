@@ -114,6 +114,50 @@ def test_copy_document_preserves_source_hash(tmp_path: Path) -> None:
     assert Path(copied["path"]).read_bytes() == source.read_bytes()
 
 
+def test_corrupt_pdf_fails_actionably_then_valid_retry_is_clean(tmp_path: Path) -> None:
+    """SPARK-0008: corrupt-to-valid retry has no false success or stale content."""
+
+    from jarvis_gpt.document_runtime import extract_document_safe
+
+    corrupt = tmp_path / "corrupt-1.pdf"
+    corrupt.write_bytes(
+        b"%PDF-1.7\n% intentionally truncated functional fixture\n1 0 obj\n"
+    )
+    failed = extract_document_safe(corrupt)
+    assert failed["ok"] is False
+    assert failed["status"] == "failed"
+    assert failed["actionable"] is True
+    assert failed["partial_result"] is None
+    assert failed["stale_content"] is False
+    assert "retry" in str(failed["error"]).casefold()
+
+    valid = tmp_path / "valid-replacement.pdf"
+    # Minimal complete-looking PDF with EOF and a page marker + extractable text.
+    valid.write_bytes(
+        b"%PDF-1.7\n"
+        b"1 0 obj<< /Type /Catalog /Pages 2 0 R >>endobj\n"
+        b"2 0 obj<< /Type /Pages /Kids [3 0 R] /Count 1 >>endobj\n"
+        b"3 0 obj<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>endobj\n"
+        b"4 0 obj<< /Length 44 >>stream\n"
+        b"BT /F1 12 Tf 100 100 Td (AUDIT_OK_MARKER) Tj ET\n"
+        b"endstream\nendobj\n"
+        b"xref\n0 5\n"
+        b"trailer<< /Root 1 0 R >>\n"
+        b"startxref\n0\n"
+        b"%%EOF\n"
+    )
+    # Parser may use basic extraction for synthetic content; ensure no raise/false fail.
+    recovered = extract_document_safe(valid)
+    assert recovered["ok"] is True
+    assert recovered["partial_result"] is None
+    assert recovered["stale_content"] is False
+    assert recovered["document"]["kind"] == "pdf"
+    # No stale content from previous corrupt attempt.
+    assert recovered["document"]["name"] == "valid-replacement.pdf"
+    text = str(recovered["document"].get("text") or "")
+    assert "intentionally truncated" not in text
+
+
 def test_documents_generate_exact_path_and_collision_tools(monkeypatch, tmp_path: Path) -> None:
     """SPARK-0003 user contract via documents.generate / convert tools."""
 

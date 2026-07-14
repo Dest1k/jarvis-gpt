@@ -672,24 +672,115 @@ def _extract_xlsx(path: Path) -> dict[str, Any]:
 
 def _extract_pdf(path: Path) -> dict[str, Any]:
     data = path.read_bytes()
+    _assert_pdf_not_corrupt(path, data)
     warnings: list[str] = []
     text = ""
     pages = len(re.findall(rb"/Type\s*/Page\b", data))
+    parser_error: str | None = None
     try:
         from pypdf import PdfReader  # type: ignore[import-not-found]
 
         reader = PdfReader(str(path))
+        if getattr(reader, "is_encrypted", False):
+            raise DocumentRuntimeError(
+                "PDF is encrypted and cannot be read. Provide an unlocked PDF and retry."
+            )
         pages = len(reader.pages)
         text = "\n\n".join(page.extract_text() or "" for page in reader.pages)
-    except Exception:  # noqa: BLE001
+    except DocumentRuntimeError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        parser_error = str(exc)
         text = _extract_pdf_text_basic(data)
         warnings.append("Used basic PDF extraction; scanned/compressed PDFs may need OCR.")
+    text = text.strip()
+    if not text and (
+        parser_error is not None or not _pdf_structure_looks_complete(data)
+    ):
+        detail = parser_error or "truncated or incomplete PDF structure"
+        raise DocumentRuntimeError(
+            "PDF is corrupt or unreadable "
+            f"({detail}). Replace the file with a valid PDF and retry; "
+            "do not treat empty extraction as success."
+        )
     return {
         "kind": "pdf",
-        "text": text.strip(),
+        "text": text,
         "structure": {"page_count": pages},
         "warnings": warnings,
     }
+
+
+def _assert_pdf_not_corrupt(path: Path, data: bytes) -> None:
+    if not data:
+        raise DocumentRuntimeError(
+            f"PDF is empty and unreadable: {path.name}. Upload a valid PDF and retry."
+        )
+    if not data.lstrip().startswith(b"%PDF"):
+        raise DocumentRuntimeError(
+            f"PDF is corrupt or not a PDF (missing %PDF header): {path.name}. "
+            "Replace the file with a valid PDF and retry."
+        )
+    # Intentionally truncated fixtures and broken partial downloads end without a trailer.
+    if not _pdf_structure_looks_complete(data):
+        raise DocumentRuntimeError(
+            f"PDF is corrupt or truncated (incomplete trailer/objects): {path.name}. "
+            "Replace the file with a complete valid PDF and retry."
+        )
+
+
+def _pdf_structure_looks_complete(data: bytes) -> bool:
+    if b"%%EOF" in data:
+        return True
+    # Very small payloads without EOF are treated as truncated by contract.
+    if len(data) < 256:
+        return False
+    # Larger files without EOF may still be valid linearized PDFs; require page markers.
+    return bool(re.search(rb"/Type\s*/Page\b", data)) and bool(
+        re.search(rb"/Root\b", data) or re.search(rb"startxref", data)
+    )
+
+
+def normalize_document_parse_error(exc: BaseException, *, path: Path | None = None) -> dict[str, Any]:
+    """Normalize parser failure into one actionable, non-success recovery payload."""
+
+    name = path.name if path is not None else None
+    message = str(exc).strip() or exc.__class__.__name__
+    actionable = (
+        message
+        if "retry" in message.casefold()
+        else f"{message.rstrip('.')} Replace the document with a valid file and retry."
+    )
+    return {
+        "ok": False,
+        "status": "failed",
+        "error": actionable[:2000],
+        "error_code": "document_parse_failed",
+        "actionable": True,
+        "retryable": True,
+        "partial_result": None,
+        "stale_content": False,
+        "name": name,
+        "path": str(path) if path is not None else None,
+    }
+
+
+def extract_document_safe(path: Path, *, max_chars: int = 60_000) -> dict[str, Any]:
+    """Extract a document or return a normalized failed recovery result (never false success)."""
+
+    target = Path(path)
+    try:
+        payload = extract_document(target, max_chars=max_chars)
+        return {
+            "ok": True,
+            "status": "readable",
+            "document": payload,
+            "error": None,
+            "partial_result": None,
+            "stale_content": False,
+        }
+    except DocumentRuntimeError as exc:
+        return normalize_document_parse_error(exc, path=target)
 
 
 def _extract_textual(path: Path) -> dict[str, Any]:

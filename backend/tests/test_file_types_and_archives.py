@@ -19,11 +19,21 @@ from jarvis_gpt.file_types import identify_bytes, identify_path
 
 def test_identify_magic_pdf_and_zip(tmp_path: Path) -> None:
     pdf = tmp_path / "a.pdf"
-    pdf.write_bytes(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n")
+    pdf.write_bytes(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n%%EOF\n")
     info = identify_path(pdf)
     assert info.kind == "pdf"
     assert info.is_document is True
     assert info.source == "magic"
+
+
+def test_identify_flags_truncated_corrupt_pdf(tmp_path: Path) -> None:
+    corrupt = tmp_path / "corrupt-1.pdf"
+    corrupt.write_bytes(b"%PDF-1.7\n% intentionally truncated functional fixture\n1 0 obj\n")
+    info = identify_path(corrupt)
+    assert info.kind == "pdf"
+    assert info.details.get("corrupt") is True
+    assert info.details.get("readable") is False
+    assert "retry" in str(info.details.get("actionable_error") or "").casefold()
 
     zpath = tmp_path / "pack.zip"
     with zipfile.ZipFile(zpath, "w") as archive:
