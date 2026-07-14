@@ -1,0 +1,44 @@
+{
+  "run_id": "20260713T002206Z_686424795712",
+  "blocker": "RB-5",
+  "status": "FINAL_TRANSFORM_ROUTE_CANDIDATE_FOR_REVIEW",
+  "base_candidate": "41c22de07c095c6a595589a57614cfbf55d33e48",
+  "branch": "fix/final-transform-route/20260713T002206Z_686424795712",
+  "worktree": "D:\\jarvis-gpt-worktrees\\final-transform-route-fix-20260713T002206Z_686424795712",
+  "rollback": "D:\\jarvis\\audit-backups\\20260713T002206Z_686424795712\\final-transform-route-fix",
+  "rb4_preserved": true,
+  "production_commit": "91b557f95c2ec6b8fc97aae62be7fbaf3fb602fe",
+  "production_commit_subject": "fix: route complete document transforms deterministically",
+  "assurance_commit_subject": "assurance: record deterministic transform routing",
+  "note": "assurance_commit is the branch HEAD of this evidence commit; resolve via git rev-parse HEAD on the branch",
+  "live_acceptance": {
+    "exact_transform_12": "12/12",
+    "claude_scenario_6": "6/6",
+    "incomplete_6": "6/6",
+    "clarification_followup_3": "3/3",
+    "recall_3": "3/3",
+    "new_artifact_3": "3/3",
+    "payload_guard_3": "3/3",
+    "source_hash_unchanged": true
+  },
+  "validation": {
+    "focused_agent_document_tool": "380 passed",
+    "backend_suite": "904 passed, 13 skipped",
+    "qa_suite": "218 passed, 3 skipped",
+    "qa_calibration": "1 PASS / 6 FAIL / 1 INCONCLUSIVE, 0 mismatches",
+    "ruff_0_8_4": "All checks passed",
+    "compileall": "exit 0",
+    "git_diff_check": "clean",
+    "secret_scan": 0
+  },
+  "tree_equality_vs_base": {
+    "frontend": "bf6cb7cefff8ccea7edab7952e7c476980647567",
+    "scripts": "ee73f39eed42e0be10c3fe5815b58718ff050233",
+    "github": "597938ac2b2b46d7f780a7c349566cc69ab99bb8",
+    "qa": "d556d27a753f6aa06c8d617237ac4ced0b826147"
+  },
+  "push": false,
+  "merge": false,
+  "attestation": false,
+  "ready": false
+}

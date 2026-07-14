@@ -1,0 +1,3 @@
+order,role,sha,subject,paths
+1,production+tests,91b557f95c2ec6b8fc97aae62be7fbaf3fb602fe,fix: route complete document transforms deterministically,backend/src/jarvis_gpt/agent.py;backend/tests/test_rb5_transform_route.py
+2,evidence+docs,(branch HEAD after this commit),assurance: record deterministic transform routing,docs/assurance/final-remediation/20260713T002206Z_686424795712/transform-route-fix/*
