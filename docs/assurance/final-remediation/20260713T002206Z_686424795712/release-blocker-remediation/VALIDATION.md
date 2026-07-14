@@ -1,4 +1,4 @@
-﻿# VALIDATION — release blocker remediation
+# VALIDATION — release blocker remediation
 
 ## 1. Pinned Ruff
 
@@ -57,4 +57,3 @@ Covered by existing suites retained green: redaction/smoke, internal output inte
 
 - Live API: clarify **6/6**; follow created artifacts (2 distinct new files in one run; third was same-path overwrite).
 - Deterministic resume offline with FailLLM: **3/3** unique `report-followN.md` files, zero missions.
-

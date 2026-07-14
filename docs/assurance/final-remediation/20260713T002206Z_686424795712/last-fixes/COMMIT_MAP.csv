@@ -1,0 +1,5 @@
+order,sha,subject,blocker
+0,27e364c88f657cd4205360186a926d57e9b21c5c,assurance: record final release blocker remediation,BASE
+1,751b2e4c4d14044ca936ba7e4604eb1e0caff08a,fix: make doctor full-suite timeout resource-safe,RB-1-R
+2,bd922cbd7d1eb156f4531efee19fa32e87d7e43c,fix: bind direct artifact requests to verified exact paths,RB-3
+3,SEE_GIT_LOG_TIP,assurance: record final doctor and artifact fixes,DOCS

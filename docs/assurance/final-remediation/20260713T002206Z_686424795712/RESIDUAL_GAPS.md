@@ -1,4 +1,4 @@
-﻿# RESIDUAL_GAPS
+# RESIDUAL_GAPS
 
 Non-blocking residual gaps after one good-faith remediation campaign.
 
@@ -13,4 +13,3 @@ Non-blocking residual gaps after one good-faith remediation campaign.
 No residual secret leak, internal protocol leak, false success, cross-session mix, missing claimed artifact, or certified-turbo startup P0/P1 remains unaddressed at the contract/unit level.
 | RG-SPARK-0005-OFFLINE-GAP | closed | Original SPARK-0005 was test-only FailLLM; live gate landed in release-blocker remediation | Closed by RB-2 fix commits |
 | RG-DOCKER-DESKTOP-FLAKE | P2 | Docker Desktop engine intermittently disconnects on host during long LLM load | Residual host env; not product logic |
-

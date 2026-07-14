@@ -1,4 +1,4 @@
-﻿# FINAL_REMEDIATION_SUMMARY
+# FINAL_REMEDIATION_SUMMARY
 
 - RUN_ID: `20260713T002206Z_686424795712`
 - Status: **FINAL_REMEDIATION_CANDIDATE_FOR_REVIEW**
@@ -88,4 +88,3 @@ See RESIDUAL_GAPS.md (non-blocking P2/live-stack items).
 ```
 1421f0e SPARK-0013: product-decision profile safety for certified host b812b75 fix: preserve DNS-record research and shop-catalog domain pins 2fb92f9 SPARK-0010: require cited usable web synthesis d9ae273 SPARK-0001: keep DNS/network questions out of shopping 82f287d SPARK-0012: honor exact memory namespace on write/recall 7a3074f SPARK-0005: clarify before mission creation 5aa0f19 SPARK-0004: preserve multi-turn document and option references 6c715bb SPARK-0002: enforce exact response constraints deterministically c9337ee SPARK-0008: normalize corrupt document recovery 3602af1 SPARK-0003: bind exact artifact paths and verify writes 92dc133 SPARK-0007: stabilize uploaded-document identity and recall 56ce5a6 SPARK-0014: make repeated start idempotent without lease contest
 ```
-

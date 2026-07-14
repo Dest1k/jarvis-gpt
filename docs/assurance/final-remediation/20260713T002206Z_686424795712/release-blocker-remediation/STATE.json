@@ -1,4 +1,4 @@
-﻿{
+{
   "run_id": "20260713T002206Z_686424795712",
   "status": "FINAL_RELEASE_BLOCKER_REMEDIATION_CANDIDATE_FOR_REVIEW",
   "base_final_candidate": "8aa2823ce40a8ed41555a8b1f9ec89de59deaad3",
@@ -26,4 +26,3 @@
   "claude_review_source": "D:\\\\jarvis\\\\audit-backups\\\\20260713T002206Z_686424795712\\\\final-review-claude\\\\FINAL_REVIEW_BLOCKED.md",
   "updated_utc": "2026-07-14T19:19:58Z"
 }
-

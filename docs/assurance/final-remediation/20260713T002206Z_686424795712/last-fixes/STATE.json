@@ -1,0 +1,39 @@
+{
+  "run_id": "20260713T002206Z_686424795712",
+  "status": "FINAL_RELEASE_LAST_FIXES_CANDIDATE_FOR_REVIEW",
+  "base_candidate": "27e364c88f657cd4205360186a926d57e9b21c5c",
+  "branch": "fix/final-release-last-fixes/20260713T002206Z_686424795712",
+  "worktree": "D:\\jarvis-gpt-worktrees\\final-release-last-fixes-20260713T002206Z_686424795712",
+  "commits": {
+    "rb1_r": "751b2e4c4d14044ca936ba7e4604eb1e0caff08a",
+    "rb3": "bd922cbd7d1eb156f4531efee19fa32e87d7e43c",
+    "assurance_subject": "assurance: record final doctor and artifact fixes"
+  },
+  "blockers": {
+    "RB-1-R": {
+      "status": "FIXED",
+      "commit": "751b2e4c4d14044ca936ba7e4604eb1e0caff08a",
+      "doctor_clean": {
+        "exit": 0,
+        "ok": true,
+        "required_failures": 0,
+        "backend_tests_timeout_seconds": 600
+      }
+    },
+    "RB-3": {
+      "status": "FIXED",
+      "commit": "bd922cbd7d1eb156f4531efee19fa32e87d7e43c",
+      "live": {
+        "exact_artifact": "3/3",
+        "ambiguous_clarification": "6/6",
+        "follow_up_artifact": "3/3",
+        "document_search_misroute": 0,
+        "timestamp_fallback": 0,
+        "missing_claimed_artifact": 0
+      }
+    }
+  },
+  "independent_attestation": false,
+  "product_ready": false,
+  "push_merge": false
+}
