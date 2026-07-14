@@ -56,6 +56,17 @@ def test_user_visible_answer_helper_blocks_tool_envelopes():
         assert visible == TOOL_PROTOCOL_FAILURE_ANSWER
 
 
+def test_empty_home_reports_zero_conversations(client):
+    """SPARK-0015: fresh runtime home exposes empty conversation history."""
+    status = client.get("/api/status")
+    assert status.status_code == 200
+    body = status.json()
+    assert body["settings"]["home"]
+    conversations = client.get("/api/conversations?limit=20")
+    assert conversations.status_code == 200
+    assert conversations.json() == []
+
+
 def test_lifespan_cleanup_survives_repeated_cancellation(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")

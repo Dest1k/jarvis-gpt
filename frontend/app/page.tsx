@@ -43,8 +43,8 @@ import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "re
 import type { CSSProperties, KeyboardEvent, PointerEvent as ReactPointerEvent, ReactNode } from "react";
 
 const API_PROXY_URL = "/jarvis-api";
-const CHAT_WINDOWS_KEY = "jarvis.chatWindows.v1";
-const CHAT_SETTINGS_KEY = "jarvis.chatSettings.v1";
+const CHAT_WINDOWS_KEY_BASE = "jarvis.chatWindows.v1";
+const CHAT_SETTINGS_KEY_BASE = "jarvis.chatSettings.v1";
 const LEGACY_STORAGE_SUFFIX = ["g", "pt"].join("");
 const LEGACY_CHAT_WINDOWS_KEY = `jarvis-${LEGACY_STORAGE_SUFFIX}.chatWindows.v1`;
 const LEGACY_CHAT_SETTINGS_KEY = `jarvis-${LEGACY_STORAGE_SUFFIX}.chatSettings.v1`;
@@ -55,6 +55,19 @@ const BOOT_MESSAGE = "Jarvis готов к подключению.";
 const LIVE_TELEMETRY_INTERVAL_MS = 1000;
 const BACKGROUND_TELEMETRY_INTERVAL_MS = 3000;
 const VITAL_STATUS_INTERVAL_MS = 3000;
+
+/** Stable client identity for browser storage (FUNC-FIND-015 / SPARK-0015). */
+function runtimeClientIdentity(home: string, profileName: string): string {
+  return `${String(home || "").trim().toLowerCase()}::${String(profileName || "").trim().toLowerCase()}`;
+}
+
+function scopedChatWindowsKey(identity: string): string {
+  return `${CHAT_WINDOWS_KEY_BASE}::${encodeURIComponent(identity)}`;
+}
+
+function scopedChatSettingsKey(identity: string): string {
+  return `${CHAT_SETTINGS_KEY_BASE}::${encodeURIComponent(identity)}`;
+}
 
 type RuntimeStatus = {
   settings: {
@@ -1178,13 +1191,15 @@ function assistantDuration(line: ChatLine, now: number) {
   return null;
 }
 
-function readStoredChatWindows(): { windows: ChatWindow[]; activeId: string } {
+function readStoredChatWindows(identity: string | null): { windows: ChatWindow[]; activeId: string } {
   const fallback = createInitialChatWindow();
-  if (typeof window === "undefined") {
+  if (typeof window === "undefined" || !identity) {
     return { windows: [fallback], activeId: fallback.id };
   }
   try {
-    const raw = localStorage.getItem(CHAT_WINDOWS_KEY) ?? localStorage.getItem(LEGACY_CHAT_WINDOWS_KEY);
+    // Only identity-scoped keys are authoritative. Unscoped legacy keys are not
+    // read after a runtime home/profile is known — that mix caused FUNC-FIND-015.
+    const raw = localStorage.getItem(scopedChatWindowsKey(identity));
     const parsed = JSON.parse(raw || "{}") as StoredChatWindows;
     const windows = (parsed.windows ?? [])
       .filter((item) => item && typeof item.id === "string")
@@ -1214,10 +1229,10 @@ function readStoredChatWindows(): { windows: ChatWindow[]; activeId: string } {
   return { windows: [fallback], activeId: fallback.id };
 }
 
-function readStoredChatSettings(): StoredChatSettings {
-  if (typeof window === "undefined") return {};
+function readStoredChatSettings(identity: string | null): StoredChatSettings {
+  if (typeof window === "undefined" || !identity) return {};
   try {
-    const raw = localStorage.getItem(CHAT_SETTINGS_KEY) ?? localStorage.getItem(LEGACY_CHAT_SETTINGS_KEY);
+    const raw = localStorage.getItem(scopedChatSettingsKey(identity));
     return JSON.parse(raw || "{}") as StoredChatSettings;
   } catch {
     return {};
@@ -1708,6 +1723,8 @@ export default function CommandCenter() {
     createInitialChatWindow()
   ]);
   const [activeChatWindowId, setActiveChatWindowId] = useState(DEFAULT_CHAT_WINDOW_ID);
+  const [runtimeIdentity, setRuntimeIdentity] = useState<string | null>(null);
+  const runtimeIdentityRef = useRef<string | null>(null);
   const [operatorQueue, setOperatorQueue] = useState<OperatorQueue | null>(null);
   const [approvals, setApprovals] = useState<ApprovalItem[]>([]);
   const [voiceAvailable, setVoiceAvailable] = useState(false);
@@ -1829,6 +1846,26 @@ export default function CommandCenter() {
     transcriptShouldStickRef.current = false;
   }, []);
 
+  const applyRuntimeIdentity = useCallback((data: RuntimeStatus) => {
+    const nextIdentity = runtimeClientIdentity(
+      data.settings.home,
+      data.settings.profile?.name ?? ""
+    );
+    if (runtimeIdentityRef.current === nextIdentity) return;
+    runtimeIdentityRef.current = nextIdentity;
+    setRuntimeIdentity(nextIdentity);
+    const storedWindows = readStoredChatWindows(nextIdentity);
+    setChatWindows(storedWindows.windows);
+    setActiveChatWindowId(storedWindows.activeId);
+    const settings = readStoredChatSettings(nextIdentity);
+    setActiveTab(settings.activeTab ?? "chat");
+    setChatSideTab(normalizeChatSideTab(settings.chatSideTab));
+    setChatHeight(clampChatHeight(settings.chatHeight ?? DEFAULT_CHAT_HEIGHT));
+    setMaxTokens(storedMaxTokens(settings.maxTokens));
+    setThinkingEnabled(settings.thinkingEnabled ?? true);
+    setStorageReady(true);
+  }, []);
+
   const refresh = useCallback(async () => {
     try {
       setError(null);
@@ -1836,6 +1873,7 @@ export default function CommandCenter() {
         api<RuntimeStatus>("/api/status").then((data) => {
           setStatus(data);
           if (data.health.length) setDiagnostics(data.health);
+          applyRuntimeIdentity(data);
         }),
         api<ConversationItem[]>("/api/conversations?limit=8").then(setConversations),
         api<Mission[]>("/api/missions").then(setMissions),
@@ -1891,7 +1929,7 @@ export default function CommandCenter() {
     } catch (err) {
       setError(err instanceof Error ? err.message : "Backend недоступен");
     }
-  }, []);
+  }, [applyRuntimeIdentity]);
 
   const refreshVitals = useCallback(async () => {
     if (vitalsRequestInFlightRef.current) return;
@@ -1901,18 +1939,20 @@ export default function CommandCenter() {
         api<RuntimeStatus>("/api/status").then((data) => {
           setStatus(data);
           if (data.health.length) setDiagnostics(data.health);
+          applyRuntimeIdentity(data);
         }),
         api<DispatcherStatus>("/api/dispatcher").then(setDispatcher),
         api<ModelDownloadJob[]>("/api/model-hub/downloads").then(setModelDownloads),
         api<Mission[]>("/api/missions").then(setMissions),
-        api<ApprovalItem[]>("/api/approvals?limit=8").then(setApprovals)
+        api<ApprovalItem[]>("/api/approvals?limit=8").then(setApprovals),
+        api<ConversationItem[]>("/api/conversations?limit=8").then(setConversations)
       ]);
     } catch {
       // The full refresh path owns the visible error state; vitals polling stays quiet.
     } finally {
       vitalsRequestInFlightRef.current = false;
     }
-  }, []);
+  }, [applyRuntimeIdentity]);
 
   const refreshLiveTelemetry = useCallback(async () => {
     if (telemetryRequestInFlightRef.current) return;
@@ -1930,19 +1970,8 @@ export default function CommandCenter() {
     refresh();
   }, [refresh]);
 
-  useEffect(() => {
-    const settings = readStoredChatSettings();
-    setActiveTab(settings.activeTab ?? "chat");
-    setChatSideTab(normalizeChatSideTab(settings.chatSideTab));
-    setChatHeight(clampChatHeight(settings.chatHeight ?? DEFAULT_CHAT_HEIGHT));
-    setMaxTokens(storedMaxTokens(settings.maxTokens));
-    setThinkingEnabled(settings.thinkingEnabled ?? true);
-    const storedWindows = readStoredChatWindows();
-    setChatWindows(storedWindows.windows);
-    setActiveChatWindowId(storedWindows.activeId);
-    setStorageReady(true);
-  }, []);
-
+  // Chat persistence is gated on runtime identity from /api/status so a home
+  // switch cannot revive an unscoped transcript (FUNC-FIND-015).
   useEffect(() => {
     missionsRef.current = missions;
   }, [missions]);
@@ -2062,12 +2091,12 @@ export default function CommandCenter() {
   }, [refreshLiveTelemetry]);
 
   useEffect(() => {
-    if (!storageReady) return;
+    if (!storageReady || !runtimeIdentity) return;
     localStorage.setItem(
-      CHAT_SETTINGS_KEY,
+      scopedChatSettingsKey(runtimeIdentity),
       JSON.stringify({ activeTab, chatSideTab, chatHeight, maxTokens, thinkingEnabled })
     );
-  }, [activeTab, chatSideTab, chatHeight, maxTokens, thinkingEnabled, storageReady]);
+  }, [activeTab, chatSideTab, chatHeight, maxTokens, thinkingEnabled, storageReady, runtimeIdentity]);
 
   useEffect(() => {
     const node = transcriptRef.current;
@@ -2093,16 +2122,16 @@ export default function CommandCenter() {
   }, [chatBusy]);
 
   useEffect(() => {
-    if (!storageReady) return;
+    if (!storageReady || !runtimeIdentity) return;
     const compactWindows = chatWindows.slice(0, 8).map((window) => ({
       ...window,
       lines: window.lines.slice(-120)
     }));
     localStorage.setItem(
-      CHAT_WINDOWS_KEY,
+      scopedChatWindowsKey(runtimeIdentity),
       JSON.stringify({ activeId: activeChatWindowId, windows: compactWindows })
     );
-  }, [activeChatWindowId, chatWindows, storageReady]);
+  }, [activeChatWindowId, chatWindows, storageReady, runtimeIdentity]);
 
   useEffect(() => {
     setVoiceAvailable(Boolean(speechRecognitionConstructor()));
