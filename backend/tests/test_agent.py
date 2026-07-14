@@ -4537,3 +4537,56 @@ def test_stream_chat_suppresses_tool_envelope_payloads(monkeypatch, tmp_path):
 
 async def _collect(stream):
     return [item async for item in stream]
+
+def test_ambiguity_blocks_mission_until_one_clarification(monkeypatch, tmp_path):
+    """SPARK-0005: no mission/artifact before one precise clarification."""
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+
+    class FailLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None):
+            raise AssertionError("LLM should not run before clarification")
+
+    agent = AgentRuntime(settings=settings, storage=storage, llm=FailLLM(), bus=EventBus())
+    prompt = (
+        "Подготовь файл отчёта в выбранном мной формате. "
+        "Сначала задай один вопрос, который сразу уточняет формат, имя и каталог."
+    )
+    response = asyncio.run(agent.chat(prompt))
+    missions = storage.list_missions(limit=10) if hasattr(storage, "list_missions") else []
+    assert response.answer
+    assert "?" in response.answer or "Уточните" in response.answer
+    assert "mission plan" not in response.answer.casefold()
+    assert not any(event.type == "mission" for event in response.events)
+    # No mission persisted.
+    if missions is not None:
+        assert len(missions) == 0
+    storage.close()
+
+
+def test_dns_definition_does_not_create_shop_direct_action(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    captured = {}
+
+    class CapturingLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None):
+            captured["messages"] = messages
+            return type("Result", (), {"ok": True, "content": "DNS переводит имена в IP-адреса.", "error": None})()
+
+    agent = AgentRuntime(settings=settings, storage=storage, llm=CapturingLLM(), bus=EventBus())
+    response = asyncio.run(agent.chat("Одним предложением объясни назначение DNS."))
+    assert "dns-shop" not in response.answer.casefold()
+    assert "магазин" not in response.answer.casefold()
+    # Shopping tool path should not dominate events.
+    tool_titles = " ".join(str(event.title or "") for event in response.events).casefold()
+    assert "shop" not in tool_titles
+    storage.close()
