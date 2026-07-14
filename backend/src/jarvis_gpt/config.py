@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import platform
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -70,18 +71,31 @@ class RuntimeProfile:
     cpu_offload_gb: float
     kv_offloading_gb: int
     vllm_extra_args: VllmExtraArgs = field(default_factory=VllmExtraArgs)
+    # Product certification on the current certified host (not a performance claim).
+    certification: str = "unsupported"  # certified | experimental | unsupported
+    interactive_certified: bool = False
+    default_recommended: bool = False
+    research_only: bool = True
+    readiness_deadline_sec: float = 300.0
+    certification_reason: str = ""
+    menu_visible: bool = False
+    requires_experimental_opt_in: bool = True
 
 
+# Product decision RESOLVED_BY_PRODUCT_DECISION (SPARK-0013):
+# 31B profiles are not made "fast"; they are labeled experimental/unsupported
+# interactive on the current certified host. gemma4-turbo remains the only
+# certified interactive default.
 PROFILES: dict[str, RuntimeProfile] = {
-    # Experimental Docker/WSL 31B stability path. CPU weight streaming is very slow.
+    # Unsupported interactive / research-only on the current certified host.
     "gemma4-mono": RuntimeProfile(
         name="gemma4-mono",
         title="Gemma 4 Mono (Offload)",
         description=(
-            "Experimental Docker/WSL Gemma 4 31B IT NVFP4 stability profile. "
-            "Partial CPU weight offload + native KV offload, eager mode, single-seq. "
-            "Measured decode is below 1 tok/s on RTX 5090; use only for long-context "
-            "quality checks, never interactive chat. Prefer gemma4-turbo."
+            "UNSUPPORTED interactive on the current certified host. "
+            "Research-only Docker/WSL Gemma 4 31B IT NVFP4 path with heavy offload. "
+            "Measured decode is below 1 tok/s; never present as ready interactive chat. "
+            "Prefer gemma4-turbo. RESOLVED_BY_PRODUCT_DECISION for SPARK-0013."
         ),
         model_dir_name="gemma4-31b-it-nvfp4",
         eager_mode=True,
@@ -95,18 +109,26 @@ PROFILES: dict[str, RuntimeProfile] = {
         max_num_seqs=1,
         cpu_offload_gb=24,
         kv_offloading_gb=16,
+        certification="unsupported",
+        interactive_certified=False,
+        default_recommended=False,
+        research_only=True,
+        readiness_deadline_sec=1200.0,
+        certification_reason=(
+            "31B offload path is research-only on this host; cyclic/slow decode "
+            "makes interactive use unsupported (RESOLVED_BY_PRODUCT_DECISION)."
+        ),
+        menu_visible=False,
+        requires_experimental_opt_in=True,
     ),
-    # Live-certified text-only 31B quality path. A small CPU spill leaves room for
-    # activations and KV while keeping almost all of the checkpoint GPU-resident.
+    # Experimental / research-only on the current certified host.
     "gemma4-mono-perf": RuntimeProfile(
         name="gemma4-mono-perf",
         title="Gemma 4 Mono Perf",
         description=(
-            "Experimental Docker/WSL Gemma 4 31B IT NVFP4 quality profile. "
-            "Minimal CPU weight offload (2.5GB), eager mode, 4k context and "
-            "text-only execution. Measured around 2.45 tok/s on RTX 5090: much "
-            "faster than the old mono profile, but still not an interactive runtime. "
-            "Use gemma4-turbo for Command Center chat."
+            "EXPERIMENTAL / research-only on the current certified host. "
+            "Gemma 4 31B IT NVFP4 quality path (~2.45 tok/s measured) is not certified "
+            "interactive. Prefer gemma4-turbo. RESOLVED_BY_PRODUCT_DECISION for SPARK-0013."
         ),
         model_dir_name="gemma4-31b-it-nvfp4",
         eager_mode=True,
@@ -126,13 +148,24 @@ PROFILES: dict[str, RuntimeProfile] = {
             mm_processor_cache_gb=0,
             max_num_batched_tokens=512,
         ),
+        certification="experimental",
+        interactive_certified=False,
+        default_recommended=False,
+        research_only=True,
+        readiness_deadline_sec=900.0,
+        certification_reason=(
+            "31B mono-perf is experimental/research-only on this host; not certified "
+            "for interactive Command Center use (RESOLVED_BY_PRODUCT_DECISION)."
+        ),
+        menu_visible=False,
+        requires_experimental_opt_in=True,
     ),
     "gemma4-turbo": RuntimeProfile(
         name="gemma4-turbo",
         title="Gemma 4 Turbo",
         description=(
-            "Recommended interactive Gemma 4 26B A4B NVFP4 profile for RTX 5090. "
-            "It fits GPU memory without CPU weight offload."
+            "Certified interactive / default recommended Gemma 4 26B A4B NVFP4 profile "
+            "for the current certified host. Fits GPU memory without CPU weight offload."
         ),
         model_dir_name="gemma4-26b-a4b-nvfp4",
         eager_mode=False,
@@ -144,8 +177,81 @@ PROFILES: dict[str, RuntimeProfile] = {
         max_num_seqs=16,
         cpu_offload_gb=0,
         kv_offloading_gb=0,
+        certification="certified",
+        interactive_certified=True,
+        default_recommended=True,
+        research_only=False,
+        readiness_deadline_sec=180.0,
+        certification_reason=(
+            "Certified interactive default on the current host (gemma4-turbo)."
+        ),
+        menu_visible=True,
+        requires_experimental_opt_in=False,
     ),
 }
+
+
+def profile_public_dict(profile: RuntimeProfile) -> dict[str, object]:
+    return {
+        "name": profile.name,
+        "title": profile.title,
+        "description": profile.description,
+        "eager_mode": profile.eager_mode,
+        "max_steps": profile.max_steps,
+        "temperature": profile.temperature,
+        "max_model_len": profile.max_model_len,
+        "gpu_memory_utilization": profile.gpu_memory_utilization,
+        "kv_cache_dtype": profile.kv_cache_dtype,
+        "max_num_seqs": profile.max_num_seqs,
+        "cpu_offload_gb": profile.cpu_offload_gb,
+        "kv_offloading_gb": profile.kv_offloading_gb,
+        "certification": profile.certification,
+        "interactive_certified": profile.interactive_certified,
+        "default_recommended": profile.default_recommended,
+        "research_only": profile.research_only,
+        "readiness_deadline_sec": profile.readiness_deadline_sec,
+        "certification_reason": profile.certification_reason,
+        "menu_visible": profile.menu_visible,
+        "requires_experimental_opt_in": profile.requires_experimental_opt_in,
+        "vllm_extra_args": {
+            "language_model_only": profile.vllm_extra_args.language_model_only,
+            "skip_mm_profiling": profile.vllm_extra_args.skip_mm_profiling,
+            "mm_processor_cache_gb": profile.vllm_extra_args.mm_processor_cache_gb,
+            "max_num_batched_tokens": profile.vllm_extra_args.max_num_batched_tokens,
+        },
+    }
+
+
+def certified_interactive_profiles() -> list[str]:
+    return [
+        name
+        for name, profile in PROFILES.items()
+        if profile.interactive_certified and profile.certification == "certified"
+    ]
+
+
+def detect_repeated_token_degeneration(text: str, *, min_repeats: int = 12) -> bool:
+    """True when output collapses into cyclic/repeated-token degeneration."""
+
+    cleaned = " ".join(str(text or "").split()).strip()
+    if len(cleaned) < max(24, min_repeats):
+        return False
+    # Character-run collapse: aaaaa...
+    if re.search(r"(.)\1{" + str(max(8, min_repeats - 1)) + r",}", cleaned):
+        return True
+    tokens = cleaned.split()
+    if len(tokens) >= min_repeats and len(set(tokens[-min_repeats:])) == 1:
+        return True
+    # Short cycle: ab ab ab ab ...
+    if len(tokens) >= min_repeats:
+        window = tokens[-min_repeats:]
+        for cycle in (1, 2, 3, 4):
+            if min_repeats % cycle != 0:
+                continue
+            unit = window[:cycle]
+            if unit * (min_repeats // cycle) == window:
+                return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -184,30 +290,7 @@ class JarvisSettings:
     def public_dict(self) -> dict[str, object]:
         return {
             "home": str(self.home),
-            "profile": {
-                "name": self.profile.name,
-                "title": self.profile.title,
-                "description": self.profile.description,
-                "eager_mode": self.profile.eager_mode,
-                "max_steps": self.profile.max_steps,
-                "temperature": self.profile.temperature,
-                "max_model_len": self.profile.max_model_len,
-                "gpu_memory_utilization": self.profile.gpu_memory_utilization,
-                "kv_cache_dtype": self.profile.kv_cache_dtype,
-                "max_num_seqs": self.profile.max_num_seqs,
-                "cpu_offload_gb": self.profile.cpu_offload_gb,
-                "kv_offloading_gb": self.profile.kv_offloading_gb,
-                "vllm_extra_args": {
-                    "language_model_only": self.profile.vllm_extra_args.language_model_only,
-                    "skip_mm_profiling": self.profile.vllm_extra_args.skip_mm_profiling,
-                    "mm_processor_cache_gb": (
-                        self.profile.vllm_extra_args.mm_processor_cache_gb
-                    ),
-                    "max_num_batched_tokens": (
-                        self.profile.vllm_extra_args.max_num_batched_tokens
-                    ),
-                },
-            },
+            "profile": profile_public_dict(self.profile),
             "paths": {
                 "data": str(self.data_dir),
                 "files": str(self.data_dir / "files"),

@@ -363,3 +363,40 @@ def test_storage_persists_runtime_values(tmp_path):
     assert rows[0]["value"] == {"operator_name": "Tony"}
     assert storage.counters()["runtime_kv"] == 1
     storage.close()
+
+def test_profile_product_decision_certification_matrix():
+    from jarvis_gpt.config import (
+        PROFILES,
+        certified_interactive_profiles,
+        detect_repeated_token_degeneration,
+        profile_public_dict,
+    )
+
+    turbo = PROFILES["gemma4-turbo"]
+    mono = PROFILES["gemma4-mono"]
+    perf = PROFILES["gemma4-mono-perf"]
+
+    assert turbo.certification == "certified"
+    assert turbo.interactive_certified is True
+    assert turbo.default_recommended is True
+    assert turbo.menu_visible is True
+    assert turbo.readiness_deadline_sec > 0
+
+    assert perf.certification == "experimental"
+    assert perf.research_only is True
+    assert perf.interactive_certified is False
+    assert perf.requires_experimental_opt_in is True
+    assert perf.readiness_deadline_sec > 0
+
+    assert mono.certification == "unsupported"
+    assert mono.research_only is True
+    assert mono.interactive_certified is False
+    assert mono.requires_experimental_opt_in is True
+    assert mono.readiness_deadline_sec > 0
+
+    assert certified_interactive_profiles() == ["gemma4-turbo"]
+    public = profile_public_dict(turbo)
+    assert public["certification"] == "certified"
+    assert "RESOLVED_BY_PRODUCT_DECISION" in mono.certification_reason or "unsupported" in mono.certification_reason.casefold()
+    assert detect_repeated_token_degeneration("4") is False
+    assert detect_repeated_token_degeneration(" ".join(["token"] * 20)) is True

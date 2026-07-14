@@ -242,12 +242,22 @@ class ModelProfilePlan(BaseModel):
     status: Literal["active", "available", "future"]
     model_hint: str
     notes: list[str] = Field(default_factory=list)
+    certification: str | None = None
+    interactive_certified: bool | None = None
+    default_recommended: bool | None = None
+    research_only: bool | None = None
+    readiness_deadline_sec: float | None = None
+    certification_reason: str | None = None
+    menu_visible: bool | None = None
+    requires_experimental_opt_in: bool | None = None
 
 
 class ModelProfilesResponse(BaseModel):
     active_profile: str
     active_model: str
     profiles: list[ModelProfilePlan] = Field(default_factory=list)
+    default_recommended_profile: str | None = None
+    certified_interactive_profiles: list[str] = Field(default_factory=list)
 
 
 class ModelDownloadRequest(BaseModel):

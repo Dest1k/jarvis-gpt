@@ -14,7 +14,7 @@ from typing import Any, Literal, TypeVar
 
 import httpx
 
-from .config import JarvisSettings
+from .config import JarvisSettings, detect_repeated_token_degeneration
 from .model_catalog import ModelCatalog
 
 
@@ -344,7 +344,19 @@ class LLMRouter:
         if not choices:
             return LLMResult(ok=False, content="", error="LLM response has no choices", raw=data)
         content = (choices[0].get("message") or {}).get("content") or ""
-        return LLMResult(ok=True, content=content.strip(), raw=data)
+        content = content.strip()
+        if detect_repeated_token_degeneration(content):
+            return LLMResult(
+                ok=False,
+                content="",
+                error=(
+                    "Profile health probe failed: repeated-token/cyclic degeneration "
+                    f"on profile {self.settings.profile.name}. Profile is unhealthy "
+                    "and must not be reported as ready."
+                ),
+                raw=data,
+            )
+        return LLMResult(ok=True, content=content, raw=data)
 
     async def stream_complete(
         self,

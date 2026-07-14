@@ -181,6 +181,24 @@ def test_launcher_repeat_start_is_idempotent_contract() -> None:
     ) == 1
 
 
+def test_launcher_profile_safety_menu_and_opt_in_contract() -> None:
+    """SPARK-0013: normal menu is turbo-only; experimental needs explicit opt-in."""
+
+    launcher = _read("scripts/jarvis-launcher.ps1")
+    assert "function Get-ProfileCertification" in launcher
+    assert "function Assert-ProfileAllowed" in launcher
+    assert "function Invoke-ProfileHealthProbe" in launcher
+    assert "AllowExperimentalProfiles" in launcher
+    assert "IUnderstandExperimentalProfile" in launcher
+    assert "certified interactive (recommended)" in launcher
+    assert "readiness_deadline_sec" in launcher or "readiness_deadline" in launcher
+    assert "RESOLVED_BY_PRODUCT_DECISION" in launcher
+    # Certified turbo remains visible; mono profiles require advanced opt-in.
+    assert launcher.count('Value = "gemma4-turbo"') >= 1
+    assert "EXPERIMENTAL research-only" in launcher
+    assert "UNSUPPORTED interactive" in launcher
+
+
 def test_frontend_runtime_uses_unprivileged_node_user() -> None:
     dockerfile = _read("frontend/Dockerfile")
     dockerignore = _read("frontend/.dockerignore")

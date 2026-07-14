@@ -336,23 +336,70 @@ def memory_hygiene_report(storage: JarvisStorage, *, limit: int = 1000) -> dict[
 
 
 def model_profile_plan(settings: JarvisSettings) -> dict[str, Any]:
-    profiles = [
-        {
-            "id": name,
-            "title": profile.title,
-            "role": "current-runtime" if name == settings.profile.name else "local-alternative",
-            "status": "active" if name == settings.profile.name else "available",
-            "model_hint": profile.model_dir_name,
-            "notes": [
-                profile.description,
-                f"context={profile.max_model_len}",
-                f"temperature={profile.temperature}",
-            ],
-        }
-        for name, profile in sorted(PROFILES.items())
-    ]
+    profiles = []
+    for name, profile in sorted(PROFILES.items()):
+        if name == settings.profile.name:
+            status = "active"
+            role = "current-runtime"
+        elif profile.interactive_certified:
+            status = "available"
+            role = "certified-interactive"
+        elif profile.certification == "experimental":
+            status = "available"
+            role = "experimental-research-only"
+        else:
+            status = "available"
+            role = "unsupported-interactive-research-only"
+        profiles.append(
+            {
+                "id": name,
+                "title": profile.title,
+                "role": role,
+                "status": status,
+                "model_hint": profile.model_dir_name,
+                "certification": profile.certification,
+                "interactive_certified": profile.interactive_certified,
+                "default_recommended": profile.default_recommended,
+                "research_only": profile.research_only,
+                "readiness_deadline_sec": profile.readiness_deadline_sec,
+                "certification_reason": profile.certification_reason,
+                "menu_visible": profile.menu_visible,
+                "requires_experimental_opt_in": profile.requires_experimental_opt_in,
+                "notes": [
+                    profile.description,
+                    f"certification={profile.certification}",
+                    f"readiness_deadline_sec={profile.readiness_deadline_sec}",
+                    f"context={profile.max_model_len}",
+                    f"temperature={profile.temperature}",
+                    profile.certification_reason,
+                ],
+            }
+        )
+    # PROFILE-RESEARCH backlog (not a release blocker).
     profiles.extend(
         [
+            {
+                "id": "PROFILE-RESEARCH",
+                "title": "Profile research backlog",
+                "role": "research-backlog",
+                "status": "future",
+                "model_hint": "future multi-profile quality work",
+                "certification": "research",
+                "interactive_certified": False,
+                "default_recommended": False,
+                "research_only": True,
+                "readiness_deadline_sec": None,
+                "certification_reason": (
+                    "Backlog only: do not block release on multi-day 31B tuning."
+                ),
+                "menu_visible": False,
+                "requires_experimental_opt_in": True,
+                "notes": [
+                    "PROFILE-RESEARCH backlog is not a release blocker.",
+                    "Do not download alternate models or engines in remediation.",
+                    "Keep gemma4-turbo as certified interactive default.",
+                ],
+            },
             {
                 "id": "planner-70b-80b",
                 "title": "Future Planner",
@@ -379,6 +426,15 @@ def model_profile_plan(settings: JarvisSettings) -> dict[str, Any]:
     return {
         "active_profile": settings.profile.name,
         "active_model": settings.profile.model_dir_name,
+        "default_recommended_profile": next(
+            (name for name, item in PROFILES.items() if item.default_recommended),
+            "gemma4-turbo",
+        ),
+        "certified_interactive_profiles": [
+            name
+            for name, item in PROFILES.items()
+            if item.interactive_certified and item.certification == "certified"
+        ],
         "profiles": profiles,
     }
 

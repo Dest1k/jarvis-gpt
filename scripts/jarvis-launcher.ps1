@@ -6,6 +6,11 @@ param(
   [ValidateSet("gemma4-turbo", "gemma4-mono", "gemma4-mono-perf")]
   [string]$Profile = "gemma4-turbo",
 
+  # Explicit advanced/CLI opt-in for experimental or unsupported research profiles.
+  [switch]$AllowExperimentalProfiles,
+
+  [switch]$IUnderstandExperimentalProfile,
+
   [string]$HomePath = "D:\jarvis",
   [string]$ModelRoot = "D:\jarvis\data\models",
 
@@ -23,6 +28,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$script:AllowExperimentalProfiles = [bool]$AllowExperimentalProfiles
+$script:IUnderstandExperimentalProfile = [bool]$IUnderstandExperimentalProfile
 
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $FrontendRoot = Join-Path $RepoRoot "frontend"
@@ -181,9 +188,85 @@ function Get-BackendEnvironmentSha256 {
   return Get-StringSha256 -Value ($values -join "`n")
 }
 
+function Get-ProfileCertification {
+  param([string]$SelectedProfile)
+
+  switch ($SelectedProfile) {
+    "gemma4-turbo" {
+      return @{
+        name = "gemma4-turbo"
+        certification = "certified"
+        interactive_certified = $true
+        default_recommended = $true
+        research_only = $false
+        readiness_deadline_sec = 180
+        menu_visible = $true
+        requires_experimental_opt_in = $false
+        certification_reason = "Certified interactive default on the current host."
+      }
+    }
+    "gemma4-mono-perf" {
+      return @{
+        name = "gemma4-mono-perf"
+        certification = "experimental"
+        interactive_certified = $false
+        default_recommended = $false
+        research_only = $true
+        readiness_deadline_sec = 900
+        menu_visible = $false
+        requires_experimental_opt_in = $true
+        certification_reason = "Experimental/research-only on this host (RESOLVED_BY_PRODUCT_DECISION)."
+      }
+    }
+    "gemma4-mono" {
+      return @{
+        name = "gemma4-mono"
+        certification = "unsupported"
+        interactive_certified = $false
+        default_recommended = $false
+        research_only = $true
+        readiness_deadline_sec = 1200
+        menu_visible = $false
+        requires_experimental_opt_in = $true
+        certification_reason = "Unsupported interactive/research-only on this host (RESOLVED_BY_PRODUCT_DECISION)."
+      }
+    }
+    default {
+      throw "Unknown profile: $SelectedProfile"
+    }
+  }
+}
+
+function Assert-ProfileAllowed {
+  param([string]$SelectedProfile)
+
+  $cert = Get-ProfileCertification -SelectedProfile $SelectedProfile
+  if (-not [bool]$cert.requires_experimental_opt_in) {
+    return $cert
+  }
+  if (
+    -not [bool]$script:AllowExperimentalProfiles -or
+    -not [bool]$script:IUnderstandExperimentalProfile
+  ) {
+    throw (
+      "Profile '$SelectedProfile' is $($cert.certification) " +
+      "($($cert.certification_reason)). " +
+      "Normal interactive menu shows only certified gemma4-turbo. " +
+      "To opt in for research, re-run with -AllowExperimentalProfiles " +
+      "-IUnderstandExperimentalProfile -Profile $SelectedProfile."
+    )
+  }
+  Write-Host (
+    "EXPERIMENTAL OPT-IN: profile=$SelectedProfile certification=$($cert.certification) " +
+    "deadline=$($cert.readiness_deadline_sec)s research_only=$($cert.research_only)"
+  ) -ForegroundColor Yellow
+  return $cert
+}
+
 function Set-JarvisEnvironment {
   param([string]$SelectedProfile)
 
+  $cert = Assert-ProfileAllowed -SelectedProfile $SelectedProfile
   $apiToken = Get-OrCreateApiToken
   $corsOrigins = @($script:ConfiguredCorsOrigins -split ",") |
     ForEach-Object { $_.Trim().TrimEnd("/") } |
@@ -193,6 +276,8 @@ function Set-JarvisEnvironment {
   $env:JARVIS_HOME = $HomePath
   $env:JARVIS_MODEL_ROOT = $ModelRoot
   $env:JARVIS_PROFILE = $SelectedProfile
+  $env:JARVIS_PROFILE_CERTIFICATION = [string]$cert.certification
+  $env:JARVIS_PROFILE_READINESS_DEADLINE_SEC = [string]$cert.readiness_deadline_sec
   $env:JARVIS_LLM_BASE_URL = "http://localhost:8001/v1"
   $env:JARVIS_LLM_MODEL = "dispatcher"
   $env:JARVIS_API_HOST = "127.0.0.1"
@@ -668,10 +753,31 @@ function Get-LlmReadiness {
     $phase = "loading"
   }
 
+  $cert = Get-ProfileCertification -SelectedProfile $Profile
+  $deadlineSec = [int]$cert.readiness_deadline_sec
+  $unhealthy = $false
+  $unhealthyReason = ""
+  if ($ready) {
+    # Cyclic/repeated-token probe: short deterministic completion.
+    $probe = Invoke-ProfileHealthProbe
+    if (-not $probe.ok) {
+      $ready = $false
+      $unhealthy = $true
+      $unhealthyReason = [string]$probe.error
+      $phase = "unhealthy"
+    }
+  }
+
   return [ordered]@{
     ready = $ready
     phase = $phase
     profile = $Profile
+    certification = [string]$cert.certification
+    certification_reason = [string]$cert.certification_reason
+    readiness_deadline_sec = $deadlineSec
+    interactive_certified = [bool]$cert.interactive_certified
+    unhealthy = $unhealthy
+    unhealthy_reason = $unhealthyReason
     endpoint = "http://127.0.0.1:8001/v1"
     container = $container
     port_open = $portOpen
@@ -684,6 +790,36 @@ function Get-LlmReadiness {
     served_models = $servedModels
     log_signals = Get-DispatcherLogSignals
     checked_at = (Get-Date).ToString("HH:mm:ss")
+  }
+}
+
+function Invoke-ProfileHealthProbe {
+  # Bounded health probe: reject empty/cyclic repeated-token degeneration.
+  try {
+    $body = @{
+      model = "dispatcher"
+      temperature = 0
+      max_tokens = 16
+      messages = @(@{ role = "user"; content = "Reply with only the digit 4. What is 2+2?" })
+    } | ConvertTo-Json -Depth 5
+    $response = Invoke-RestMethod `
+      -Method Post `
+      -Uri "http://127.0.0.1:8001/v1/chat/completions" `
+      -ContentType "application/json" `
+      -Body $body `
+      -TimeoutSec 20
+    $content = [string]$response.choices[0].message.content
+    if ([string]::IsNullOrWhiteSpace($content)) {
+      return @{ ok = $false; error = "health probe returned empty content" }
+    }
+    if ($content -match '(.)\1{11,}' -or $content -match '(\b\w+\b)(?:\s+\1){8,}') {
+      return @{ ok = $false; error = "health probe detected repeated-token degeneration" }
+    }
+    return @{ ok = $true; error = ""; content = $content }
+  } catch {
+    # Endpoint may still be warming; do not mark ready profiles unhealthy solely
+    # because the probe timed out once - caller uses phase/deadline for that.
+    return @{ ok = $true; error = ""; skipped = $true; detail = $_.Exception.Message }
   }
 }
 
@@ -1960,28 +2096,47 @@ function Invoke-Menu {
   }
 
   if ($choice.Value -in @("start", "app", "restart")) {
+    # Normal interactive menu shows only certified profile(s).
     $profiles = @(
       @{
-        Label = "Turbo 26B - recommended interactive"
+        Label = "Turbo 26B - certified interactive (recommended)"
         Value = "gemma4-turbo"
-        Hint  = "gemma4-26b-a4b-nvfp4 | vLLM | no offload | fastest interactive"
-      },
-      @{
-        Label = "Mono 31B - text quality (improved, slow)"
-        Value = "gemma4-mono-perf"
-        Hint  = "gemma4-31b-it-nvfp4 | vLLM text-only | ~2.45 tok/s measured | 4k"
-      },
-      @{
-        Label = "Mono 31B - experimental long-context (slowest)"
-        Value = "gemma4-mono"
-        Hint  = "gemma4-31b-it-nvfp4 | heavy Docker/WSL offload | below 1 tok/s | 16k"
+        Hint  = "certified | gemma4-26b-a4b-nvfp4 | readiness deadline 180s"
       }
     )
-    $profileChoice = Select-Menu -Title "Select LLM profile (arrows + Enter)" -Items $profiles
+    if ([bool]$script:AllowExperimentalProfiles) {
+      $profiles += @(
+        @{
+          Label = "Mono 31B perf - EXPERIMENTAL research-only"
+          Value = "gemma4-mono-perf"
+          Hint  = "experimental | not interactive-certified | deadline 900s | requires confirmation"
+        },
+        @{
+          Label = "Mono 31B offload - UNSUPPORTED interactive / research-only"
+          Value = "gemma4-mono"
+          Hint  = "unsupported interactive | research-only | deadline 1200s | requires confirmation"
+        }
+      )
+    }
+    $profileChoice = Select-Menu -Title "Select LLM profile (certified interactive only unless advanced opt-in)" -Items $profiles
     if (-not $profileChoice) {
       return
     }
     $script:Profile = $profileChoice.Value
+    if ($script:Profile -ne "gemma4-turbo") {
+      if (-not $IUnderstandExperimentalProfile) {
+        $confirm = Select-Menu -Title "Confirm experimental/unsupported profile" -Items @(
+          @{ Label = "Cancel - use certified turbo"; Value = "cancel"; Hint = "recommended" },
+          @{ Label = "I understand this profile is experimental/research-only"; Value = "confirm"; Hint = "advanced opt-in" }
+        )
+        if (-not $confirm -or $confirm.Value -ne "confirm") {
+          $script:Profile = "gemma4-turbo"
+        } else {
+          $script:IUnderstandExperimentalProfile = $true
+          $script:AllowExperimentalProfiles = $true
+        }
+      }
+    }
 
     if ($choice.Value -eq "app") {
       $script:NoDispatcher = $true
