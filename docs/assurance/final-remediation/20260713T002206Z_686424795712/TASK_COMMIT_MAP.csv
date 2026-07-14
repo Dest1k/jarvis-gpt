@@ -1,0 +1,13 @@
+﻿task_id,commit,subject
+SPARK-0014,56ce5a6693655e8af7ff3594a23459dd32760802,SPARK-0014: make repeated start idempotent without lease contest
+SPARK-0007,92dc13366a8b22c557d11704fcedd3cf5817521f,SPARK-0007: stabilize uploaded-document identity and recall
+SPARK-0003,3602af1887d7e915c9b174a94cee2ac9c9c765f4,SPARK-0003: bind exact artifact paths and verify writes
+SPARK-0008,c9337ee1be646fea2059cccad2305da29c528ee1,SPARK-0008: normalize corrupt document recovery
+SPARK-0002,6c715bbb7307e623863434567c56bf61770514cc,SPARK-0002: enforce exact response constraints deterministically
+SPARK-0004,5aa0f194a1222df5cef877122cf7273ba014c743,SPARK-0004: preserve multi-turn document and option references
+SPARK-0005,7a3074faaf2223cbe0ff7c704ac070537f20994b,SPARK-0005: clarify before mission creation
+SPARK-0012,82f287d4bf4d658bfbd2b8ea2405f0c5168099a8,SPARK-0012: honor exact memory namespace on write/recall
+SPARK-0001,d9ae273b7799a3bdd4a980ac027bef32dfd370f8,SPARK-0001: keep DNS/network questions out of shopping
+SPARK-0010,2fb92f9e71c4dc84aaee33fdde695b46e810cad2,SPARK-0010: require cited usable web synthesis
+SPARK-0013,1421f0e56fe6519c51e7f5cd52ab36ec777a7967,SPARK-0013: product-decision profile safety for certified host
+FOLLOWUP-DNS,b812b75,fix: preserve DNS-record research and shop-catalog domain pins

@@ -1,0 +1,33 @@
+﻿{
+    "final_head":  "1421f0e56fe6519c51e7f5cd52ab36ec777a7967",
+    "profile_product_decision":  {
+                                     "profile_research":  "backlog non-blocker",
+                                     "gemma4_turbo":  "certified interactive default",
+                                     "gemma4_mono":  "unsupported interactive research-only",
+                                     "spark_0013":  "RESOLVED_BY_PRODUCT_DECISION",
+                                     "gemma4_mono_perf":  "experimental research-only"
+                                 },
+    "run_id":  "20260713T002206Z_686424795712",
+    "product_ready_claimed":  false,
+    "base_attestation":  "fc19886576aeafe36c2ca18396a4a27da231fb57",
+    "worktree":  "D:\\jarvis-gpt-worktrees\\final-remediation-20260713T002206Z_686424795712",
+    "wave0_candidate":  "3385dbc5de4e86bd413a9bd6a53d21f83deae8ff",
+    "no_push_no_merge":  true,
+    "branch":  "final-remediation/20260713T002206Z_686424795712",
+    "status":  "FINAL_REMEDIATION_CANDIDATE_FOR_REVIEW",
+    "main_untouched":  true,
+    "tests":  {
+                  "batch_a":  "155 passed, 2 skipped",
+                  "batch_c":  "56 passed, 2 skipped",
+                  "full_backend":  "856 passed, 13 skipped",
+                  "batch_b":  "254 passed",
+                  "frontend_build":  "PASS"
+              },
+    "updated_utc":  "2026-07-14T16:51:48.3016727Z",
+    "batches":  {
+                    "C":  "PASS",
+                    "B":  "PASS",
+                    "A":  "PASS"
+                },
+    "independent_attestation_claimed":  false
+}
