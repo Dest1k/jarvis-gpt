@@ -1529,9 +1529,15 @@ class ToolRegistry:
                     "file_id": "Source uploaded/indexed file id",
                     "path": "Source local path",
                     "output_format": "Target format",
-                    "output_name": "Optional output filename or root-relative path",
+                    "output_name": "Exact output filename or root-relative path (destination)",
                     "output_path": "Optional absolute/relative destination under document-outputs",
-                    "destination": "Alias of output_path",
+                    "destination": "Alias of output_path; never interchangeable with source path",
+                    "require_exact_path": (
+                        "When true (default for named destinations), refuse timestamp "
+                        "fallback and require actual_path == requested destination"
+                    ),
+                    "overwrite": "Explicit overwrite of an existing destination file",
+                    "source_identity": "Optional bound source identity contract",
                     "max_chars": "Maximum extracted characters from source",
                 },
                 handler=_documents_convert,
@@ -5124,8 +5130,17 @@ def _documents_generate(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
             require_exact=require_exact,
         )
         result["path_verification"] = path_gate
+        result["validation_result"] = {
+            **path_gate,
+            "source_unchanged": True,
+            "exact_destination": require_exact,
+        }
+        result["requested_destination"] = str(bound_destination)
         result["requested_path"] = str(bound_destination)
         result["requested_name"] = requested_name or bound_destination.name
+        result["actual_path"] = str(output_path)
+        result["output_hash"] = file_sha256(output_path)
+        result["output_size"] = output_path.stat().st_size
         # Source files must remain byte-identical after generate.
         for source_key, before in source_hashes_before.items():
             after = file_sha256(Path(source_key))
@@ -5133,7 +5148,20 @@ def _documents_generate(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
                 raise DocumentRuntimeError(
                     f"source file was modified during generate: {source_key}"
                 )
+            # Output must not silently be the source path.
+            if Path(source_key).resolve(strict=False) == output_path.resolve(strict=False):
+                raise DocumentRuntimeError(
+                    f"generate output path is a source path: {source_key}"
+                )
         result["source_hashes_unchanged"] = bool(source_hashes_before)
+        if source_hashes_before:
+            first_src = next(iter(source_hashes_before))
+            result["source_identity"] = {
+                "path": first_src,
+                "sha256": source_hashes_before[first_src],
+            }
+            result["source_hash_before"] = source_hashes_before[first_src]
+            result["source_hash_after"] = file_sha256(Path(first_src))
         file_record = _record_generated_document(ctx, output_path) if output_path.exists() else None
     except (
         ValueError,
@@ -5161,16 +5189,113 @@ def _documents_convert(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespons
         output_format = "md"
     if output_format == "text":
         output_format = "txt"
+    require_exact = _truthy_arg(
+        args.get("require_exact_path")
+        if args.get("require_exact_path") is not None
+        else args.get("exact_destination")
+    )
+    requested_name = str(args.get("output_name") or "").strip() or None
+    requested_path = args.get("output_path") or args.get("destination")
+    # Named destinations default to exact binding (no silent timestamp rename).
+    if (
+        not require_exact
+        and (requested_name or requested_path)
+        and not _truthy_arg(args.get("collision_safe"))
+        and args.get("require_exact_path") is None
+        and args.get("exact_destination") is None
+    ):
+        require_exact = True
+        args = {**args, "require_exact_path": True}
+    # Reject directory-like destinations without a filename (RB-4).
+    for raw in (requested_name, requested_path):
+        token = str(raw or "").strip().replace("\\", "/").rstrip("/")
+        if not token:
+            continue
+        base = Path(token).name
+        if not base or base in {".", "..", "document-outputs"}:
+            return ToolRunResponse(
+                tool="documents.convert",
+                ok=False,
+                summary=(
+                    "destination is directory-like without a filename; "
+                    "refusing convert without exact file destination"
+                ),
+            )
+        stem = Path(base).stem.casefold()
+        if stem in {
+            "md",
+            "markdown",
+            "docx",
+            "pdf",
+            "txt",
+            "html",
+            "csv",
+            "json",
+            "xlsx",
+            "document-outputs",
+        }:
+            return ToolRunResponse(
+                tool="documents.convert",
+                ok=False,
+                summary=(
+                    f"destination filename looks like a format/directory label "
+                    f"({base!r}); refusing inventing a path"
+                ),
+            )
     try:
         target = _document_target(ctx, args, max_chars=max_chars)
         source_path = Path(target["path"])
         source_hash_before = file_sha256(source_path)
+        source_identity = args.get("source_identity")
+        if not isinstance(source_identity, dict):
+            source_identity = {
+                "path": str(source_path),
+                "name": source_path.name,
+                "sha256": source_hash_before,
+                "file_id": args.get("file_id"),
+            }
         destination = _resolve_document_destination(
             ctx,
             args,
             default_name=f"{source_path.stem}.{output_format}",
             default_suffix=f".{output_format}",
         )
+        bound_destination = Path(destination)
+        # Source == destination is forbidden unless explicit in-place overwrite.
+        allow_in_place = _truthy_arg(
+            args.get("allow_in_place") or args.get("in_place")
+        )
+        if (
+            bound_destination.resolve(strict=False) == source_path.resolve(strict=False)
+            and not allow_in_place
+        ):
+            raise DocumentRuntimeError(
+                "source and destination are the same path; "
+                "in-place transform requires explicit allow_in_place"
+            )
+        # Never invent format-label subdirectories under document-outputs.
+        try:
+            rel = bound_destination.resolve(strict=False).relative_to(
+                (ctx.settings.data_dir / DOCUMENT_OUTPUT_DIRNAME).resolve(strict=False)
+            )
+            for part in rel.parts[:-1]:
+                stem = part.casefold().strip("-_")
+                if stem in {
+                    "md",
+                    "markdown",
+                    "docx",
+                    "pdf",
+                    "txt",
+                    "html",
+                    "csv",
+                    "json",
+                    "xlsx",
+                } or stem.startswith("markdown"):
+                    raise DocumentRuntimeError(
+                        f"refusing invented format subdirectory in destination: {part}"
+                    )
+        except ValueError:
+            pass
         source_kind = str(
             (target.get("document") or {}).get("kind") or source_path.suffix.lstrip(".")
         )
@@ -5205,9 +5330,27 @@ def _documents_convert(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespons
                 },
                 "structure": written.get("structure") or {},
                 "verification": written["verification"],
-                "source_sha256_before": source_hash_before,
-                "source_sha256_after": file_sha256(source_path),
-                "source_unchanged": file_sha256(source_path) == source_hash_before,
+            }
+            output_path = Path(written["path"])
+        elif output_format in {"md", "txt"} and source_text.strip():
+            # Deterministic text/markdown transform: write extracted source body
+            # to the exact bound destination (copy-on-write, never touch source).
+            body_text = source_text
+            if output_format == "md" and not body_text.lstrip().startswith("#"):
+                body_text = f"# {source_path.stem}\n\n{body_text}"
+            written = write_exact_text_artifact(destination, body_text)
+            result = {
+                "ok": True,
+                "mode": "convert",
+                "output": {
+                    "path": written["path"],
+                    "name": written["name"],
+                    "format": output_format,
+                    "size": written["size"],
+                    "sha256": written["sha256"],
+                },
+                "verification": written["verification"],
+                "structure": {},
             }
             output_path = Path(written["path"])
         elif output_format == source_path.suffix.lstrip(".").lower() or (
@@ -5229,9 +5372,6 @@ def _documents_convert(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespons
                     "sha256": file_sha256(Path(copied["path"])),
                 },
                 "verification": verification,
-                "source_sha256_before": source_hash_before,
-                "source_sha256_after": file_sha256(source_path),
-                "source_unchanged": file_sha256(source_path) == source_hash_before,
             }
             output_path = Path(copied["path"])
         else:
@@ -5249,9 +5389,52 @@ def _documents_convert(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespons
                     output_path,
                     expected_format=output_format,
                 )
-            result["source_sha256_before"] = source_hash_before
-            result["source_sha256_after"] = file_sha256(source_path)
-            result["source_unchanged"] = file_sha256(source_path) == source_hash_before
+        if not output_path or not str(output_path):
+            raise DocumentRuntimeError("documents.convert produced no output path")
+        # Exact binding: refuse timestamp/other-path success when destination was named.
+        if require_exact and output_path.resolve(strict=False) != bound_destination.resolve(
+            strict=False
+        ):
+            raise DocumentRuntimeError(
+                f"exact path mismatch: requested {bound_destination}, tool wrote {output_path}"
+            )
+        source_hash_after = file_sha256(source_path)
+        if source_hash_after != source_hash_before:
+            raise DocumentRuntimeError(
+                f"source file was modified during convert: {source_path}"
+            )
+        path_gate = _verify_exact_artifact_path(
+            written_path=output_path,
+            requested_name=requested_name,
+            requested_path=requested_path,
+            require_exact=require_exact,
+        )
+        # Output must not be the source file.
+        if output_path.resolve(strict=False) == source_path.resolve(strict=False):
+            raise DocumentRuntimeError(
+                "convert output path is the source path; success forbidden"
+            )
+        output_hash = file_sha256(output_path)
+        output_size = output_path.stat().st_size
+        result["path_verification"] = path_gate
+        result["validation_result"] = {
+            **path_gate,
+            "source_unchanged": True,
+            "not_source": True,
+            "exact_destination": require_exact,
+        }
+        result["requested_destination"] = str(bound_destination)
+        result["requested_path"] = str(bound_destination)
+        result["requested_name"] = requested_name or bound_destination.name
+        result["actual_path"] = str(output_path)
+        result["source_identity"] = source_identity
+        result["source_hash_before"] = source_hash_before
+        result["source_hash_after"] = source_hash_after
+        result["source_sha256_before"] = source_hash_before
+        result["source_sha256_after"] = source_hash_after
+        result["source_unchanged"] = True
+        result["output_hash"] = output_hash
+        result["output_size"] = output_size
         file_record = _record_generated_document(ctx, output_path) if output_path.exists() else None
     except (
         ValueError,
@@ -10581,6 +10764,20 @@ def _resolve_document_destination(
     output_root = ctx.settings.data_dir / DOCUMENT_OUTPUT_DIRNAME
     raw_path = args.get("output_path") or args.get("destination")
     raw_name = args.get("output_name")
+    # Strip a leading document-outputs/ segment so relative destinations are not
+    # double-nested under the output root (RB-4).
+    if raw_path is not None and not Path(str(raw_path)).is_absolute():
+        token = str(raw_path).replace("\\", "/").lstrip("./")
+        prefix = f"{DOCUMENT_OUTPUT_DIRNAME}/"
+        if token.casefold().startswith(prefix):
+            raw_path = token[len(prefix) :]
+        elif token.casefold() == DOCUMENT_OUTPUT_DIRNAME.casefold():
+            raw_path = None
+    if raw_name is not None:
+        name_token = str(raw_name).replace("\\", "/").lstrip("./")
+        prefix = f"{DOCUMENT_OUTPUT_DIRNAME}/"
+        if name_token.casefold().startswith(prefix):
+            raw_name = name_token[len(prefix) :]
     if raw_name and not Path(str(raw_name)).suffix and default_suffix:
         raw_name = f"{raw_name}{default_suffix}"
     if not raw_path and not raw_name:

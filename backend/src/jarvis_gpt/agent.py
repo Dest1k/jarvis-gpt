@@ -4734,7 +4734,14 @@ class AgentRuntime:
             conversation_id=context.conversation_id,
             user_message_id=context.operator_message_id,
         )
-        ok, path, verified_answer = _verified_artifact_answer(result=result, intent=spec)
+        allowed_root = (self.settings.data_dir / _DOCUMENT_OUTPUT_DIR).resolve(
+            strict=False
+        )
+        ok, path, verified_answer = _verified_artifact_answer(
+            result=result,
+            intent=spec,
+            allowed_root=allowed_root,
+        )
         if ok:
             answer = (
                 f"Отчёт подготовлен после уточнения.\n\n"
@@ -4772,13 +4779,87 @@ class AgentRuntime:
             ],
         )
 
+    def _resolve_transform_source_identity(
+        self,
+        intent: dict[str, Any],
+        context: AgentContext,
+    ) -> dict[str, Any] | None:
+        """Bind exact source identity for TRANSFORM_EXISTING_DOCUMENT (pre-tool)."""
+
+        source_name = str(intent.get("source_filename") or "").strip()
+        source_name_cf = source_name.casefold()
+        candidates: list[dict[str, Any]] = []
+
+        for hit in context.file_hits:
+            file_id = str(hit.get("file_id") or hit.get("id") or "")
+            hit_name = str(hit.get("name") or hit.get("filename") or "")
+            hit_path = str(hit.get("path") or hit.get("stored_path") or "")
+            if source_name_cf and hit_name and hit_name.casefold() != source_name_cf:
+                # Keep unmatched hits only when no explicit source name was given.
+                continue
+            if file_id or hit_path:
+                candidates.append(
+                    {
+                        "file_id": file_id,
+                        "name": hit_name or source_name,
+                        "path": hit_path,
+                    }
+                )
+        if not candidates and source_name:
+            for record in self.storage.list_files(limit=50):
+                rec_name = str(record.get("name") or "")
+                if rec_name.casefold() == source_name_cf:
+                    candidates.append(
+                        {
+                            "file_id": str(record.get("id") or ""),
+                            "name": rec_name,
+                            "path": str(record.get("stored_path") or ""),
+                        }
+                    )
+                    break
+        if not candidates:
+            # Fall back to most recent file_hit when operator said "uploaded" without name.
+            for hit in context.file_hits:
+                file_id = str(hit.get("file_id") or hit.get("id") or "")
+                if file_id:
+                    candidates.append(
+                        {
+                            "file_id": file_id,
+                            "name": str(hit.get("name") or hit.get("filename") or ""),
+                            "path": str(hit.get("path") or hit.get("stored_path") or ""),
+                        }
+                    )
+                    break
+        if not candidates:
+            return None
+        chosen = candidates[0]
+        path_obj: Path | None = None
+        raw_path = str(chosen.get("path") or "").strip()
+        if raw_path:
+            path_obj = Path(raw_path)
+        elif chosen.get("file_id"):
+            record = self.storage.get_file(str(chosen["file_id"]))
+            if record and record.get("stored_path"):
+                path_obj = Path(str(record["stored_path"]))
+                chosen["name"] = str(record.get("name") or chosen.get("name") or "")
+                chosen["path"] = str(record["stored_path"])
+        if path_obj is None or not path_obj.is_file():
+            return None
+        digest = hashlib.sha256(path_obj.read_bytes()).hexdigest()
+        return {
+            "file_id": str(chosen.get("file_id") or ""),
+            "name": str(chosen.get("name") or path_obj.name),
+            "path": str(path_obj),
+            "sha256": digest,
+        }
+
     async def _try_direct_new_artifact_action(
         self, message: str, context: AgentContext
     ) -> DirectAction | None:
-        """Deterministic NEW_ARTIFACT_REQUEST path with exact destination binding.
+        """Deterministic NEW_ARTIFACT / TRANSFORM path with exact destination binding.
 
-        Bypasses shopping/web/document-recall misroutes for complete create
-        requests that already specify format + filename/path + content.
+        Binds requested destination before tool execution. Transform uses a typed
+        contract with separate source identity and destination (RB-3/RB-4).
         """
 
         if not context.side_effects_admitted:
@@ -4794,63 +4875,156 @@ class AgentRuntime:
         }:
             return None
 
-        source_file_ids: list[str] = []
-        if intent.get("kind") == TRANSFORM_EXISTING_DOCUMENT:
-            for hit in context.file_hits:
-                file_id = str(hit.get("file_id") or "")
-                if file_id and file_id not in source_file_ids:
-                    source_file_ids.append(file_id)
-            source_file_ids = source_file_ids[:4]
+        allowed_root = (self.settings.data_dir / _DOCUMENT_OUTPUT_DIR).resolve(
+            strict=False
+        )
+        source_paths: list[Path] = []
+        source_identity: dict[str, Any] | None = None
+        tool_name = "documents.generate"
+        args: dict[str, Any]
 
-        args: dict[str, Any] = {
-            "title": intent["title"],
-            "body": intent["body"],
-            "output_format": intent["output_format"],
-            "output_name": intent["output_name"],
-            "exact_body": True,
-            "require_exact_path": True,
-            "overwrite": bool(intent.get("overwrite")),
-        }
-        if source_file_ids:
-            args["source_file_ids"] = source_file_ids
-            # Transform may synthesize from sources when body is only a stub.
-            if intent.get("source_reference") and len(str(intent.get("body") or "")) < 40:
-                args["exact_body"] = False
+        if intent.get("kind") == TRANSFORM_EXISTING_DOCUMENT:
+            source_identity = self._resolve_transform_source_identity(intent, context)
+            if source_identity is None:
+                return DirectAction(
+                    answer=(
+                        "Не удалось однозначно определить исходный документ для "
+                        "трансформации. Укажите точный source file (имя или file_id) "
+                        f"и destination `{intent.get('filename')}`."
+                    ),
+                    events=[
+                        ChatEvent(
+                            type="thought",
+                            title="Transform source unresolved",
+                            content="TRANSFORM_EXISTING_DOCUMENT missing source identity.",
+                            payload={
+                                "source": "direct_transform",
+                                "intent": TRANSFORM_EXISTING_DOCUMENT,
+                                "requested_destination": intent.get(
+                                    "requested_destination"
+                                ),
+                            },
+                        )
+                    ],
+                )
+            source_paths = [Path(str(source_identity["path"]))]
+            # Source and destination are separate fields — never swap.
+            dest_name = str(intent["output_name"])
+            if Path(dest_name).name.casefold() == Path(
+                str(source_identity["name"])
+            ).name.casefold() and not intent.get("allow_in_place"):
+                return DirectAction(
+                    answer=(
+                        "Source и destination совпадают; in-place transform по умолчанию "
+                        "запрещён (copy-on-write). Укажите другое имя выходного файла."
+                    ),
+                    events=[],
+                )
+            # Prefer convert: binds exact destination before execution.
+            # Destination is absolute under allowed_root (never re-prefix document-outputs).
+            bound_dest = allowed_root / dest_name
+            tool_name = "documents.convert"
+            args = {
+                "file_id": source_identity.get("file_id") or None,
+                "path": source_identity.get("path"),
+                "output_format": intent["output_format"],
+                "output_name": dest_name,
+                "destination": str(bound_dest),
+                "require_exact_path": True,
+                "overwrite": bool(intent.get("overwrite")),
+                "collision_policy": intent.get("collision_policy") or "fail",
+                "transformation_instruction": intent.get(
+                    "transformation_instruction"
+                )
+                or "",
+                "source_identity": {
+                    "file_id": source_identity.get("file_id"),
+                    "name": source_identity.get("name"),
+                    "path": source_identity.get("path"),
+                    "sha256": source_identity.get("sha256"),
+                },
+            }
+            # Drop empty file_id so path-based resolution wins cleanly.
+            if not args.get("file_id"):
+                args.pop("file_id", None)
+        else:
+            bound_dest = allowed_root / str(intent["output_name"])
+            args = {
+                "title": intent["title"],
+                "body": intent["body"],
+                "output_format": intent["output_format"],
+                "output_name": intent["output_name"],
+                "destination": str(bound_dest),
+                "exact_body": True,
+                "require_exact_path": True,
+                "overwrite": bool(intent.get("overwrite")),
+            }
 
         result = await self.tools.run(
-            "documents.generate",
+            tool_name,
             args,
             conversation_id=context.conversation_id,
             user_message_id=context.operator_message_id,
         )
-        ok, path, answer = _verified_artifact_answer(result=result, intent=intent)
+        ok, path, answer = _verified_artifact_answer(
+            result=result,
+            intent=intent,
+            allowed_root=allowed_root,
+            source_paths=source_paths,
+        )
+        # Model/final answer path may only come from verified tool result.
+        if ok and path:
+            verified_name = Path(path).name
+            if verified_name.casefold() != str(intent.get("filename") or "").casefold():
+                ok = False
+                answer = (
+                    f"Ошибка точного пути: verified result `{verified_name}` "
+                    f"не совпадает с запросом `{intent.get('filename')}`. "
+                    "Success запрещён."
+                )
+                path = ""
         return DirectAction(
             answer=answer,
             events=[
                 ChatEvent(
                     type="thought",
-                    title="Прямое создание артефакта",
+                    title=(
+                        "Прямая трансформация документа"
+                        if intent.get("kind") == TRANSFORM_EXISTING_DOCUMENT
+                        else "Прямое создание артефакта"
+                    ),
                     content=(
-                        f"Intent {intent.get('kind')}: exact path "
-                        f"{intent.get('output_name')} bound before tool execution."
+                        f"Intent {intent.get('kind')}: exact destination "
+                        f"{intent.get('requested_destination')} bound before tool execution."
                     ),
                     payload={
-                        "source": "direct_new_artifact",
+                        "source": (
+                            "direct_transform"
+                            if intent.get("kind") == TRANSFORM_EXISTING_DOCUMENT
+                            else "direct_new_artifact"
+                        ),
                         "intent": intent.get("kind"),
                         "filename": intent.get("filename"),
+                        "requested_destination": intent.get("requested_destination"),
+                        "source_identity": source_identity,
                         "require_exact_path": True,
                     },
                 ),
                 ChatEvent(
                     type="tool_call",
-                    title="documents.generate",
+                    title=tool_name,
                     content=result.summary,
                     payload={
-                        "tool": "documents.generate",
+                        "tool": tool_name,
                         "ok": ok and result.ok,
                         "path": path if ok else "",
                         "requested_name": intent.get("output_name"),
-                        "source": "direct_new_artifact",
+                        "requested_destination": intent.get("requested_destination"),
+                        "source": (
+                            "direct_transform"
+                            if intent.get("kind") == TRANSFORM_EXISTING_DOCUMENT
+                            else "direct_new_artifact"
+                        ),
                         "path_verified": ok,
                         "intent": intent.get("kind"),
                     },
@@ -9289,6 +9463,7 @@ def _create_artifact_verbs() -> tuple[str, ...]:
         "write the report",
         "write a markdown",
         "write markdown",
+        "write ",
         "save the file",
         "save as",
         "сохрани файл",
@@ -9302,11 +9477,57 @@ def _create_artifact_verbs() -> tuple[str, ...]:
         "make a file",
         "make the file",
         "make a report",
+        "make a markdown",
+        "сделай markdown",
+        "сделай файл",
+        "сделай md",
         "новый файл",
         "новый документ",
         "new file",
         "new document",
         "new markdown",
+        # Transform / convert verbs (RB-4): durable write of a derived artifact.
+        "transform",
+        "convert",
+        "преобразуй",
+        "конвертируй",
+        "конверт",
+        "to markdown",
+        "into markdown",
+        "to md",
+        "into md",
+        "в markdown",
+        "в md",
+        "в docx",
+        "to docx",
+        "into docx",
+    )
+
+
+def _has_transform_verb(message: str) -> bool:
+    """True when the operator asks to convert/transform an existing document."""
+
+    normalized = str(message or "").casefold()
+    return _contains_any(
+        normalized,
+        (
+            "transform",
+            "convert",
+            "преобразуй",
+            "конвертируй",
+            "конверт",
+            "to markdown",
+            "into markdown",
+            "to md",
+            "into md",
+            "в markdown",
+            "в md",
+            "to docx",
+            "into docx",
+            "в docx",
+            "переведи в",
+            "переформат",
+        ),
     )
 
 
@@ -9728,10 +9949,41 @@ def _artifact_spec_from_clarification_resume(
     }
 
 
-# RB-3: typed document/artifact intents — never treat a future filename as recall.
+# RB-3/RB-4: typed document/artifact intents — never treat a future filename as recall.
 EXISTING_DOCUMENT_REFERENCE = "EXISTING_DOCUMENT_REFERENCE"
 NEW_ARTIFACT_REQUEST = "NEW_ARTIFACT_REQUEST"
 TRANSFORM_EXISTING_DOCUMENT = "TRANSFORM_EXISTING_DOCUMENT"
+
+_ARTIFACT_FILENAME_RE = re.compile(
+    r"(?i)\b([a-z0-9._-]+\.(?:md|docx|pdf|txt|html|csv|json|xlsx))\b"
+)
+_FORMAT_LABEL_TOKENS = frozenset(
+    {
+        "md",
+        "markdown",
+        "markdown-",
+        "docx",
+        "pdf",
+        "txt",
+        "text",
+        "html",
+        "csv",
+        "json",
+        "xlsx",
+        "word",
+        "format",
+        "формат",
+        "document",
+        "documents",
+        "file",
+        "files",
+        "документ",
+        "документа",
+        "файл",
+        "файла",
+    }
+)
+_DOCUMENT_OUTPUT_DIR = "document-outputs"
 
 
 def _has_existing_source_reference(message: str) -> bool:
@@ -9745,10 +9997,14 @@ def _has_existing_source_reference(message: str) -> bool:
             "сохранённ",
             "saved document",
             "source document",
+            "source file",
+            "source-doc",
             "исходн",
             "на основе",
             "based on",
             "from the document",
+            "from the file",
+            "from the uploaded",
             "из документа",
             "из файла",
             "приложенн",
@@ -9764,11 +10020,15 @@ def _classify_document_artifact_intent(message: str) -> str | None:
     normalized = str(message or "").casefold()
     if not normalized.strip():
         return None
-    creating = _looks_like_artifact_or_mission_side_effect(message) or _contains_any(
-        normalized, _create_artifact_verbs()
+    has_source = _has_existing_source_reference(message)
+    creating = (
+        _looks_like_artifact_or_mission_side_effect(message)
+        or _contains_any(normalized, _create_artifact_verbs())
+        or (_has_transform_verb(message) and has_source)
     )
     if creating:
-        if _has_existing_source_reference(message):
+        # Transform when an existing source document is referenced; else new artifact.
+        if has_source:
             return TRANSFORM_EXISTING_DOCUMENT
         return NEW_ARTIFACT_REQUEST
     if _looks_like_document_read_or_recall(message):
@@ -9776,19 +10036,134 @@ def _classify_document_artifact_intent(message: str) -> str | None:
     return None
 
 
-def _artifact_filename_from_message(message: str) -> str | None:
+def _all_artifact_filenames(message: str) -> list[str]:
+    return [m.group(1) for m in _ARTIFACT_FILENAME_RE.finditer(str(message or ""))]
+
+
+def _source_filename_from_message(message: str) -> str | None:
+    """Extract the existing source document name (never the destination)."""
+
     text = str(message or "")
-    name_match = re.search(
-        r"(?i)(?:имя|name|файл|file|filename|as|named)\s*[:=]?\s*"
-        r"([^\s\\/]+\.(?:md|docx|pdf|txt))",
+    patterns = (
+        r"(?i)(?:uploaded|загруженн\w*|source(?:\s+document|\s+file)?|исходн\w*|"
+        r"from\s+(?:the\s+)?(?:file|document)|из\s+(?:файла|документа))\s+"
+        r"([a-z0-9._-]+\.(?:md|docx|pdf|txt|html|csv|json|xlsx))",
+        r"(?i)([a-z0-9._-]+\.(?:md|docx|pdf|txt|html|csv|json|xlsx))\s+"
+        r"(?:to|into|в)\s+(?:markdown|md|docx|pdf|txt|html)",
+        r"(?i)(?:document|file|файл|документ)\s+"
+        r"([a-z0-9._-]+\.(?:md|docx|pdf|txt))\s+"
+        r"(?:to|into|в|и)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1)
+    # Bare source-doc style name when transform verb is present.
+    if _has_transform_verb(text) or _has_existing_source_reference(text):
+        names = _all_artifact_filenames(text)
+        for name in names:
+            if name.casefold().startswith("source") or name.casefold().endswith(".txt"):
+                # Prefer obvious source tokens; destination usually has a different stem.
+                dest_markers = re.search(
+                    r"(?i)(?:save\s+as|сохрани\s+как|named|as|имя|filename)\s+"
+                    + re.escape(name),
+                    text,
+                )
+                if not dest_markers:
+                    return name
+    return None
+
+
+def _destination_filename_from_message(
+    message: str,
+    *,
+    source_filename: str | None = None,
+) -> str | None:
+    """Extract the requested output filename — never the source identity."""
+
+    text = str(message or "")
+    source_cf = (source_filename or "").casefold()
+    source_set = {source_cf} if source_cf else set()
+    # Explicit destination markers (Russian "как" included for "сохрани как").
+    explicit_patterns = (
+        r"(?i)(?:save\s+as|сохрани\s+как|под\s+именем|named|filename|file\s*name|"
+        r"output(?:_name)?|имя(?:\s+файла)?)\s*[:=]?\s*"
+        r"([^\s\\/\"']+\.(?:md|docx|pdf|txt|html|csv|json|xlsx))",
+        r"(?i)(?:as|как)\s+([a-z0-9._-]+\.(?:md|docx|pdf|txt|html|csv|json|xlsx))",
+        r"(?i)(?:write|создай|create|generate|сохрани|save|make|сделай)\s+"
+        r"(?:a\s+|the\s+|новый\s+|новый\s+)?"
+        r"(?:markdown\s+|md\s+|docx\s+)?"
+        r"(?:file\s+|файл\s+)?"
+        r"(?:named\s+|called\s+)?"
+        r"([a-z0-9._-]+\.(?:md|docx|pdf|txt|html|csv|json|xlsx))",
+        r"(?i)(?:файл|file)\s+([a-z0-9._-]+\.(?:md|docx|pdf|txt|html|csv|json|xlsx))",
+    )
+    for pattern in explicit_patterns:
+        for match in re.finditer(pattern, text):
+            name = match.group(1)
+            if name.casefold() not in source_set:
+                return name
+    names = _all_artifact_filenames(text)
+    non_source = [name for name in names if name.casefold() not in source_set]
+    if non_source:
+        # When several non-source names appear, the last is typically the target.
+        return non_source[-1]
+    if len(names) >= 2:
+        return names[-1]
+    # Single name is destination only for NEW_ARTIFACT (no source).
+    if names and not source_set:
+        return names[0]
+    return None
+
+
+def _artifact_filename_from_message(message: str) -> str | None:
+    """Backward-compatible: destination filename when present, else first name."""
+
+    source = _source_filename_from_message(message)
+    dest = _destination_filename_from_message(message, source_filename=source)
+    if dest:
+        return dest
+    names = _all_artifact_filenames(message)
+    return names[0] if names else None
+
+
+def _artifact_relative_dir_from_message(message: str) -> str:
+    """Optional subdirectory under document-outputs — never a format label."""
+
+    text = str(message or "")
+    # Explicit folder keywords only (bare "in"/"в" are too broad: "в markdown").
+    dir_match = re.search(
+        r"(?i)(?:каталог|directory|folder|папк[аеуи]?)\s+"
+        r"([a-z0-9._\-\\/]+)",
         text,
     )
-    if name_match:
-        return name_match.group(1)
-    name_match = re.search(r"(?i)\b([a-z0-9._-]+\.(?:md|docx|pdf|txt))\b", text)
-    if name_match:
-        return name_match.group(1)
-    return None
+    if not dir_match:
+        # Allow "in document-outputs/<subdir>" or "in <subdir>" when subdir is path-like.
+        dir_match = re.search(
+            r"(?i)(?:\bin\b|\bв\b)\s+"
+            r"((?:document-outputs[\\/])?[a-z0-9._\-]+(?:[\\/][a-z0-9._\-]+)+)",
+            text,
+        )
+    if not dir_match:
+        # "in document-outputs" alone → root of outputs (no extra subdir).
+        return ""
+    token = dir_match.group(1).strip().replace("\\", "/").strip(" .,:;")
+    token_norm = token.strip("/")
+    if token_norm in {"", ".", "..", _DOCUMENT_OUTPUT_DIR}:
+        return ""
+    if token_norm.startswith(f"{_DOCUMENT_OUTPUT_DIR}/"):
+        token_norm = token_norm.split(f"{_DOCUMENT_OUTPUT_DIR}/", 1)[-1].strip("/")
+    # Reject format labels and invented format-derived directories (RB-4).
+    parts = [part for part in token_norm.split("/") if part and part not in {".", ".."}]
+    safe: list[str] = []
+    for part in parts:
+        stem = part.casefold().strip("-_")
+        if stem in _FORMAT_LABEL_TOKENS or stem.startswith("markdown"):
+            continue
+        if part.casefold() == _DOCUMENT_OUTPUT_DIR:
+            continue
+        safe.append(part)
+    return "/".join(safe)
 
 
 def _artifact_format_from_message(message: str, *, filename: str | None = None) -> str:
@@ -9801,10 +10176,11 @@ def _artifact_format_from_message(message: str, *, filename: str | None = None) 
         return "docx"
     if re.search(r"(?i)\bpdf\b", normalized) or ".pdf" in normalized:
         return "pdf"
-    if re.search(r"(?i)\b(txt|text)\b", normalized) or ".txt" in normalized:
-        return "txt"
+    # Prefer markdown when transform "to markdown" is present over source .txt.
     if re.search(r"(?i)\b(md|markdown)\b", normalized) or ".md" in normalized:
         return "md"
+    if re.search(r"(?i)\b(txt|text)\b", normalized) or ".txt" in normalized:
+        return "txt"
     return "md"
 
 
@@ -9875,9 +10251,10 @@ def _new_artifact_intent_from_message(
     *,
     original_goal: str = "",
 ) -> dict[str, Any] | None:
-    """Build a typed NEW_ARTIFACT_REQUEST intent with exact destination binding.
+    """Build a typed NEW_ARTIFACT / TRANSFORM intent with exact destination binding.
 
-    Returns None when the message is not a concrete new-artifact request.
+    Source identity and requested destination are separate fields and must never
+    substitute for each other (RB-4).
     """
 
     if _looks_like_host_filesystem_write(message):
@@ -9887,49 +10264,88 @@ def _new_artifact_intent_from_message(
         return None
     if _requires_side_effect_clarification(message) and not original_goal:
         return None
-    filename = _artifact_filename_from_message(message)
+
+    combined = f"{original_goal}\n{message}".strip() if original_goal else message
+    source_filename = _source_filename_from_message(combined)
+    filename = _destination_filename_from_message(
+        message, source_filename=source_filename
+    )
     if not filename and original_goal:
-        filename = _artifact_filename_from_message(original_goal)
+        filename = _destination_filename_from_message(
+            original_goal, source_filename=source_filename
+        )
     if not filename:
+        # Directory-like destination without a filename → incomplete (clarify).
         return None
-    fmt = _artifact_format_from_message(message, filename=filename)
+
+    # Destination must not silently become the source basename.
     if (
-        not filename.lower().endswith(f".{fmt}")
-        and "." not in filename
+        kind == TRANSFORM_EXISTING_DOCUMENT
+        and source_filename
+        and filename.casefold() == source_filename.casefold()
     ):
+        # In-place only when the operator explicitly requested overwrite/in-place.
+        allow_in_place = _contains_any(
+            str(message or "").casefold(),
+            (
+                "in-place",
+                "inplace",
+                "overwrite source",
+                "перезапиши исходн",
+                "на месте",
+                "in place",
+            ),
+        )
+        if not allow_in_place:
+            return None
+
+    fmt = _artifact_format_from_message(combined, filename=filename)
+    if not filename.lower().endswith(f".{fmt}") and "." not in filename:
         filename = f"{filename}.{fmt}"
+    # Reject pure directory / root labels used as filenames.
+    stem = Path(filename).stem.casefold()
+    if stem in _FORMAT_LABEL_TOKENS or stem == _DOCUMENT_OUTPUT_DIR:
+        return None
+
     body = _artifact_body_from_message(message, original_goal=original_goal)
     title = Path(filename).stem.replace("_", " ").replace("-", " ").strip() or "Report"
-    destination = f"document-outputs/{filename}"
-    # Preserve relative directory if the operator embedded one (not bare document-outputs).
-    dir_match = re.search(
-        r"(?i)(?:каталог|directory|folder|папк[аеуи]?|in|в)\s+"
-        r"([a-z0-9._\-\\/]+)",
-        message,
-    )
-    rel_dir = ""
-    if dir_match:
-        token = dir_match.group(1).strip().replace("\\", "/").strip(" .,:;")
-        token_norm = token.strip("/")
-        if token_norm in {"", ".", "..", "document-outputs"}:
-            rel_dir = ""
-        elif token_norm.startswith("document-outputs/"):
-            rel_dir = token_norm.split("document-outputs/", 1)[-1].strip("/")
-        elif "document-outputs" not in token_norm:
-            rel_dir = token_norm
-        if rel_dir in {".", ".."}:
-            rel_dir = ""
+    rel_dir = _artifact_relative_dir_from_message(combined)
     output_name = f"{rel_dir}/{filename}" if rel_dir else filename
+    requested_destination = f"{_DOCUMENT_OUTPUT_DIR}/{output_name}".replace("\\", "/")
+    # Collapse accidental double document-outputs prefixes.
+    while f"{_DOCUMENT_OUTPUT_DIR}/{_DOCUMENT_OUTPUT_DIR}/" in requested_destination:
+        requested_destination = requested_destination.replace(
+            f"{_DOCUMENT_OUTPUT_DIR}/{_DOCUMENT_OUTPUT_DIR}/",
+            f"{_DOCUMENT_OUTPUT_DIR}/",
+            1,
+        )
+
     gaps = _side_effect_completeness_gaps(message)
+    has_dest = bool(filename) and _destination_is_concrete(message.casefold())
+    has_fmt = _format_is_concrete(message.casefold())
     complete = not gaps or (
         bool(filename)
-        and _format_is_concrete(message.casefold())
-        and _destination_is_concrete(message.casefold())
-        and len(body.strip()) >= 4
+        and has_fmt
+        and has_dest
+        and (len(body.strip()) >= 4 or kind == TRANSFORM_EXISTING_DOCUMENT)
     )
+    # Transform additionally requires a resolvable source identity when complete.
+    if kind == TRANSFORM_EXISTING_DOCUMENT and complete and not (
+        source_filename or _has_existing_source_reference(message)
+    ):
+        complete = False
+
+    transformation_instruction = ""
+    if kind == TRANSFORM_EXISTING_DOCUMENT:
+        transformation_instruction = (
+            f"Transform existing document {source_filename or '(uploaded/source)'} "
+            f"into {fmt} at exact destination {requested_destination}."
+        )
+
     return {
         "kind": kind,
-        "destination": destination,
+        "destination": requested_destination,
+        "requested_destination": requested_destination,
         "filename": filename[:180],
         "output_name": output_name[:180],
         "format": fmt,
@@ -9940,27 +10356,90 @@ def _new_artifact_intent_from_message(
         "overwrite": False,
         "collision_policy": "fail",
         "require_exact_path": True,
+        "allow_in_place": False,
         "complete": complete,
         "source_reference": _has_existing_source_reference(message),
+        "source_filename": (source_filename or "")[:180],
+        "source_identity": {
+            "filename": (source_filename or "")[:180],
+            "reference": _has_existing_source_reference(message),
+        },
+        "transformation_instruction": transformation_instruction,
+        "allowed_root": _DOCUMENT_OUTPUT_DIR,
     }
+
+
+def _path_is_under_allowed_root(path: Path, allowed_root: Path) -> bool:
+    try:
+        path.resolve(strict=False).relative_to(allowed_root.resolve(strict=False))
+        return True
+    except (ValueError, OSError):
+        return False
 
 
 def _verified_artifact_answer(
     *,
     result: ToolRunResponse,
     intent: dict[str, Any],
+    allowed_root: Path | None = None,
+    source_paths: list[Path] | None = None,
 ) -> tuple[bool, str, str]:
-    """Build operator answer only from verified tool result paths (no invented paths)."""
+    """Build operator answer only from verified tool result paths (no invented paths).
 
-    requested = str(intent.get("filename") or intent.get("output_name") or "")
+    Success requires the canonical resolved actual_path to equal the requested
+    destination (basename at minimum; full path when bound), under the allowed
+    root, as a regular non-source file created by this operation (RB-3/RB-4).
+    """
+
+    requested = str(
+        intent.get("requested_destination")
+        or intent.get("destination")
+        or intent.get("filename")
+        or intent.get("output_name")
+        or ""
+    )
+    requested_name = Path(
+        str(intent.get("filename") or intent.get("output_name") or requested)
+        .replace("\\", "/")
+    ).name
     path = ""
-    if isinstance(result.data, dict):
-        raw_output = result.data.get("output")
-        output = raw_output if isinstance(raw_output, dict) else {}
-        path = str(output.get("path") or "")
-        verification = result.data.get("path_verification")
+    data = result.data if isinstance(result.data, dict) else {}
+    if data:
+        # Prefer explicit contract fields; never invent a path.
+        path = str(data.get("actual_path") or "").strip()
+        if not path:
+            raw_output = data.get("output")
+            output = raw_output if isinstance(raw_output, dict) else {}
+            path = str(output.get("path") or "").strip()
+        verification = data.get("path_verification") or data.get("validation_result")
         if isinstance(verification, dict) and verification.get("path"):
-            path = str(verification["path"])
+            # Validation path must still match claimed output; do not override a
+            # mismatched actual with a different verification path.
+            verified_path = str(verification["path"])
+            if not path:
+                path = verified_path
+            elif Path(path).resolve(strict=False) != Path(verified_path).resolve(
+                strict=False
+            ):
+                return (
+                    False,
+                    path,
+                    (
+                        f"Ошибка проверки: actual_path `{path}` не совпадает с "
+                        f"validation path `{verified_path}`. False success запрещён."
+                    ),
+                )
+        # Tool-side validation_result may already mark failure.
+        if isinstance(verification, dict) and verification.get("ok") is False:
+            return (
+                False,
+                path,
+                (
+                    "Не удалось создать артефакт по запрошенному пути: "
+                    f"{verification.get('reason') or result.summary}. "
+                    f"Запрошено: `{requested}`."
+                ),
+            )
     if not result.ok or not path:
         return (
             False,
@@ -9980,20 +10459,94 @@ def _verified_artifact_answer(
                 f"Запрошено: `{requested}`. False success запрещён."
             ),
         )
-    if requested and actual.name.casefold() != Path(requested).name.casefold():
+    if requested_name and actual.name.casefold() != requested_name.casefold():
         return (
             False,
             path,
             (
-                f"Ошибка точного пути: запрошено `{Path(requested).name}`, "
+                f"Ошибка точного пути: запрошено `{requested_name}`, "
                 f"инструмент записал `{actual.name}`. Артефакт не считается созданным."
             ),
         )
+    # Full destination equality when intent carries a bound relative path.
+    requested_rel = str(
+        intent.get("output_name") or intent.get("filename") or ""
+    ).replace("\\", "/")
+    if requested_rel and allowed_root is not None:
+        expected = (allowed_root / requested_rel).resolve(strict=False)
+        if actual.resolve(strict=False) != expected:
+            return (
+                False,
+                path,
+                (
+                    f"Ошибка точного пути: запрошено `{expected}`, "
+                    f"инструмент записал `{actual}`. Success запрещён."
+                ),
+            )
+    if allowed_root is not None and not _path_is_under_allowed_root(
+        actual, allowed_root
+    ):
+        return (
+            False,
+            path,
+            (
+                f"Ошибка: путь `{path}` вне allowed root `{allowed_root}`. "
+                "Success запрещён."
+            ),
+        )
+    # Output must not be the source file (copy-on-write default).
+    for source in source_paths or []:
+        try:
+            if actual.resolve(strict=False) == Path(source).resolve(strict=False):
+                return (
+                    False,
+                    path,
+                    (
+                        f"Ошибка: output path совпадает с source `{source}`. "
+                        "In-place transform без явного запроса запрещён."
+                    ),
+                )
+        except OSError:
+            continue
+    # Timestamp-fallback names are never success for exact-path intents.
+    if re.search(r"\.\d{14}(\.|$)", actual.name):
+        return (
+            False,
+            path,
+            (
+                f"Ошибка: timestamp fallback `{actual.name}` вместо "
+                f"`{requested_name}`. Success запрещён."
+            ),
+        )
+    # Invented format subdirectories (markdown/, markdown-/) are forbidden.
+    try:
+        rel_parts = (
+            actual.resolve(strict=False)
+            .relative_to((allowed_root or actual.parent).resolve(strict=False))
+            .parts
+            if allowed_root is not None
+            else actual.parts
+        )
+        for part in rel_parts[:-1]:
+            stem = part.casefold().strip("-_")
+            if stem in _FORMAT_LABEL_TOKENS or stem.startswith("markdown"):
+                return (
+                    False,
+                    path,
+                    (
+                        f"Ошибка: invented subdirectory `{part}` from format label. "
+                        "Success запрещён."
+                    ),
+                )
+    except ValueError:
+        pass
+
     fmt = (
         intent.get("output_format")
         or intent.get("format")
         or actual.suffix.lstrip(".")
     )
+    # Final response path comes only from the verified tool result.
     answer = (
         f"Артефакт создан.\n\n"
         f"**Файл:** `{actual.name}`\n"
