@@ -1,0 +1,77 @@
+﻿{
+  "schema_version": "1.0",
+  "run_id": "20260713T002206Z_686424795712",
+  "review_run_id": "assurance-rereview-grok-20260713T002206Z_686424795712-fd1a548e9362c0b7",
+  "context_id": "rereview-grok-fd1a548e9362c0b7",
+  "run_nonce": "fd1a548e9362c0b7",
+  "started_at_utc": "2026-07-14T10:30:53Z",
+  "finished_at_utc": "2026-07-14T10:39:25Z",
+  "state": "REVIEWED_FOUNDATION_COMMIT",
+  "reviewer": {
+    "provider": "xAI",
+    "model": "Grok 4.5",
+    "independence_level": "DIFFERENT_PROVIDER",
+    "note": "Independent re-review by Grok 4.5 (xAI); remediation performed by different provider (Codex/OpenAI lineage)."
+  },
+  "candidate": {
+    "original_foundation": "7d4a4757df9aa3264fd16caf439e40588c375fee",
+    "remediated_foundation": "b4ae74f740b4751e30941102fafe0455f885760d",
+    "main_origin_main": "b2c481de1a9e68079a67ff49790eb685a09e80e5",
+    "remediation_branch": "fix/assurance-foundation/20260713T002206Z_686424795712",
+    "review_branch": "review/assurance-remediation-grok/20260713T002206Z_686424795712",
+    "review_worktree": "D:/jarvis-gpt-worktrees/assurance-rereview-grok-20260713T002206Z_686424795712"
+  },
+  "remediation_commits": [
+    {"sha": "e9a316de16f6c7d4ea1f595417846d30b2041e33", "blockers": ["B01","B02","B04","B06"]},
+    {"sha": "ddf282aee94b6af27aeab2e0fc117303ba1a203a", "blockers": ["B03","B05"]},
+    {"sha": "593f5805de7a2c71a85fa282a360876532cacf68", "blockers": ["B07"]},
+    {"sha": "7aa54c9097dacfa01909d0f5a43c745f27e43a1e", "blockers": ["B08","B09","B10","B11"]},
+    {"sha": "b4ae74f740b4751e30941102fafe0455f885760d", "blockers": ["B12","B13","B14"]}
+  ],
+  "blockers": {"total": 14, "pass": 14, "fail": 0, "blocked": 0},
+  "validation": {
+    "pytest_passed": 218,
+    "pytest_skipped": 3,
+    "remediation_integrity_passed": 33,
+    "matrix_named_regression_passed": 86,
+    "focused_upstream_passed": 59,
+    "focused_upstream_skipped": 1,
+    "ruff": "PASS",
+    "compileall": "PASS",
+    "diff_check": "PASS",
+    "calibration": {"replayed": 8, "pass": 1, "fail": 6, "inconclusive": 1, "mismatches": 0},
+    "overlay_source_pins": "4/4",
+    "overlay_task_mappings": "17/17",
+    "main_untracked_baseline": 269,
+    "main_untracked_baseline_diffs": 0,
+    "main_audit_manifest_entries": 544,
+    "main_audit_manifest_differences": 0,
+    "independent_probes_pass": 16
+  },
+  "scope": {
+    "changed_paths": 55,
+    "forbidden_paths": 0,
+    "out_of_scope_paths": 0,
+    "allowed_roots": ["qa/**", "docs/assurance/**", "docs/upstream/**", "docs/audit/10_JARVIS_FUNCTIONAL_REMEDIATION_WAVES_PROMPT.md", "docs/assistant-notes.md"]
+  },
+  "protected_state": {
+    "main_unchanged": true,
+    "origin_main_unchanged": true,
+    "remediation_branch_unchanged": true,
+    "original_candidate_unchanged": true,
+    "previous_review_unchanged": true,
+    "audit_tree_not_modified_by_review": true,
+    "production_runtime_not_started": true,
+    "dependencies_not_installed": true,
+    "external_network_not_used": true,
+    "push_performed": false,
+    "merge_performed": false
+  },
+  "attestation": {
+    "status": "REVIEWED_FOUNDATION_COMMIT",
+    "reviewed_candidate_sha": "b4ae74f740b4751e30941102fafe0455f885760d",
+    "product_ready_marker_created": false,
+    "wave0_started": false
+  }
+}
+

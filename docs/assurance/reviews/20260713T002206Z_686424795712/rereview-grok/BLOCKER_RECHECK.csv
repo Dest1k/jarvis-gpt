@@ -1,0 +1,15 @@
+﻿blocker_id,status,fix_commit,independent_evidence,acceptance_result,residual_risk
+B01,PASS,e9a316de16f6c7d4ea1f595417846d30b2041e33,"code review qa/runner.py+qa/_trusted_jarvis_cli.py; matrix 3 tests; adversarial PYTHONPATH/PYTHONHOME hijack ignored; non-allowlist blocked; env=NO_COLOR/SYSTEMROOT/TEMP/TMP/WINDIR only; shell=False; absolute interpreter; -I -S launcher",PASS,Host may still lack backend CLI binary; execution remains allowlisted read-only
+B02,PASS,e9a316de16f6c7d4ea1f595417846d30b2041e33,"safe_paths validate_case_id/safe_output_path; 10/10 unsafe IDs rejected; relative escape denied; matrix path/reparse tests",PASS,Real Windows junction fixtures host-skipped; simulated reparse coverage present
+B03,PASS,ddf282aee94b6af27aeab2e0fc117303ba1a203a,"calibration anchor 6019152e... validates 8 records; forged verdict blocked; wrong anchor blocked; replay 1P/6F/1I 0 mismatches; CLI packets 8",PASS,Hash binding is integrity not authentication
+B04,PASS,e9a316de16f6c7d4ea1f595417846d30b2041e33,"unknown scenario field rejected; matrix schema/coercion/nonfinite tests; JSON schemas additionalProperties false",PASS,None material
+B05,PASS,ddf282aee94b6af27aeab2e0fc117303ba1a203a,"nested canaries redacted at output boundary; matrix redaction/output_boundary tests; CLI outputs scan clean",PASS,Future novel secret shapes may need pattern updates
+B06,PASS,e9a316de16f6c7d4ea1f595417846d30b2041e33,"bounded_file_digest inside ok; abs/rel escape denied; matrix artifact/bounded digest tests",PASS,None material
+B07,PASS,593f5805de7a2c71a85fa282a360876532cacf68,"independence recomputes context/nonce/provider/model; matrix duplicate context/citation/anchor tests",PASS,Semantic disagreement remains INCONCLUSIVE by design
+B08,PASS,7aa54c9097dacfa01909d0f5a43c745f27e43a1e,"upstream suite + imported source mapping rehash matrix",PASS,None material
+B09,PASS,7aa54c9097dacfa01909d0f5a43c745f27e43a1e,"license snapshot digest binding and tamper matrix; permissive does not waive notice",PASS,Validator does not grant legal approval
+B10,PASS,7aa54c9097dacfa01909d0f5a43c745f27e43a1e,"prefix reparse and source/destination escape matrix",PASS,Host real-symlink skip remains
+B11,PASS,7aa54c9097dacfa01909d0f5a43c745f27e43a1e,"_validate_repo_url rejects noncanonical forms; internal/external field matrix; no network lookup",PASS,None material
+B12,PASS,b4ae74f740b4751e30941102fafe0455f885760d,"independent Git ODB rehash 4/4 pins MATCH; CLI validate-overlay-sources 4/4 pins 17/17 mappings; integrity suite 33",PASS,Pins bound to historical functional commit 5aae9855...
+B13,PASS,b4ae74f740b4751e30941102fafe0455f885760d,"exact HEAD ok when ignored-clean; ancestor/main rejected; protocol requires HEAD==REVIEWED_INPUT_COMMIT; integrity tests",PASS,Ignored caches (__pycache__) fail closed until cleaned
+B14,PASS,b4ae74f740b4751e30941102fafe0455f885760d,"synthetic tree mutation detected diffs=2; matrix audit-manifest tests; external main manifests 544/544 identical retained SHA",PASS,Manifests metadata-only no content copy
