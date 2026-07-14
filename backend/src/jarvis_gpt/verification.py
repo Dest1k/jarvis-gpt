@@ -214,3 +214,194 @@ def valid_mission_report(text: str) -> bool:
         return False
     lowered = cleaned.lower()
     return not ('"tool"' in lowered or '"route"' in lowered or '"verdict"' in lowered)
+
+
+# --------------------------------------------------------------------------- #
+# Deterministic response-constraint contracts (SPARK-0002)
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class ResponseConstraints:
+    """Exact operator-facing format contracts extracted from the task text."""
+
+    bullet_count: int | None = None
+    one_sentence: bool = False
+    require_json: bool = False
+    language: str | None = None
+    format_hint: str | None = None
+    path_hint: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "bullet_count": self.bullet_count,
+            "one_sentence": self.one_sentence,
+            "require_json": self.require_json,
+            "language": self.language,
+            "format_hint": self.format_hint,
+            "path_hint": self.path_hint,
+        }
+
+
+def extract_response_constraints(task: str) -> ResponseConstraints:
+    text = str(task or "")
+    lowered = text.casefold()
+    bullet_count: int | None = None
+    for pattern in (
+        r"(?:ровно|exactly)\s+(\d+)\s*(?:пункт|points?|bullet|items?|строк|lines?)",
+        r"(\d+)\s*(?:пункт(?:а|ов)?|bullet(?:s)?|points?)",
+        r"(?:список|list)\s+из\s+(\d+)",
+    ):
+        match = re.search(pattern, lowered, flags=re.IGNORECASE)
+        if match:
+            bullet_count = max(1, min(50, int(match.group(1))))
+            break
+    one_sentence = bool(
+        re.search(
+            r"(одн(?:о|им)\s+предложен|one\s+sentence|exactly\s+one\s+sentence|ровно\s+одно\s+предложен)",
+            lowered,
+        )
+    )
+    require_json = bool(
+        re.search(
+            r"(?:\bjson\b|в\s+формате\s+json|return\s+json|только\s+json|valid\s+json)",
+            lowered,
+        )
+    )
+    language = None
+    if re.search(r"(по-русски|на\s+русском|russian)", lowered):
+        language = "ru"
+    elif re.search(r"(in\s+english|на\s+английском|english)", lowered):
+        language = "en"
+    format_hint = None
+    for fmt in ("markdown", "md", "docx", "csv", "html"):
+        if re.search(rf"\b{fmt}\b", lowered):
+            format_hint = fmt
+            break
+    path_hint = None
+    path_match = re.search(
+        r"((?:[A-Za-z]:)?(?:[\\/][\w .\-\[\]]+)+\.\w{1,12})",
+        text,
+    )
+    if path_match:
+        path_hint = path_match.group(1)
+    return ResponseConstraints(
+        bullet_count=bullet_count,
+        one_sentence=one_sentence,
+        require_json=require_json,
+        language=language,
+        format_hint=format_hint,
+        path_hint=path_hint,
+    )
+
+
+def count_sentences(text: str) -> int:
+    cleaned = " ".join(str(text or "").split()).strip()
+    if not cleaned:
+        return 0
+    parts = re.split(r"(?<=[.!?…])\s+", cleaned)
+    return len([part for part in parts if part.strip()])
+
+
+def count_bullets(text: str) -> int:
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    bullets = [
+        line
+        for line in lines
+        if re.match(r"^(?:[-*•]|\d+[.)])\s+\S", line)
+    ]
+    return len(bullets)
+
+
+def validate_response_constraints(
+    task: str,
+    answer: str,
+    *,
+    constraints: ResponseConstraints | None = None,
+) -> dict[str, Any]:
+    """Deterministically check ordinary non-tool format contracts."""
+
+    contract = constraints or extract_response_constraints(task)
+    violations: list[str] = []
+    text = str(answer or "").strip()
+    if contract.one_sentence:
+        sentences = count_sentences(text)
+        if sentences != 1:
+            violations.append(f"expected exactly 1 sentence, got {sentences}")
+    if contract.bullet_count is not None:
+        bullets = count_bullets(text)
+        if bullets != contract.bullet_count:
+            violations.append(
+                f"expected exactly {contract.bullet_count} bullets/items, got {bullets}"
+            )
+    if contract.require_json:
+        candidate = text
+        if candidate.startswith("```"):
+            candidate = re.sub(r"^```(?:json)?\s*", "", candidate)
+            candidate = re.sub(r"\s*```$", "", candidate)
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            violations.append("expected valid JSON only")
+            parsed = None
+        if parsed is not None and not isinstance(parsed, (dict, list)):
+            violations.append("JSON root must be object or array")
+        # No surrounding prose when JSON was requested.
+        if not text.lstrip().startswith(("{", "[", "`")):
+            violations.append("JSON response must not include surrounding prose")
+    elif text.lstrip().startswith(("{", "[")) and not contract.require_json:
+        # Soft signal only when the operator did not ask for JSON.
+        pass
+    if contract.language == "ru":
+        cyr = sum(1 for ch in text if "а" <= ch.casefold() <= "я" or ch in "ё")
+        lat = sum(1 for ch in text if "a" <= ch.casefold() <= "z")
+        if cyr == 0 and lat > 8:
+            violations.append("expected Russian-language answer")
+    if contract.path_hint and contract.path_hint not in text:
+        # Path constraints are checked when the operator asked for an exact path.
+        if re.search(r"(путь|path|файл|file)", str(task or "").casefold()):
+            violations.append(f"expected path {contract.path_hint}")
+    return {
+        "ok": not violations,
+        "violations": violations,
+        "constraints": contract.as_dict(),
+        "sentence_count": count_sentences(text),
+        "bullet_count": count_bullets(text),
+    }
+
+
+def repair_response_for_constraints(
+    answer: str,
+    constraints: ResponseConstraints,
+) -> str | None:
+    """Best-effort deterministic repair that never duplicates a final answer."""
+
+    text = str(answer or "").strip()
+    if not text:
+        return None
+    if constraints.one_sentence:
+        # Keep the first sentence only; do not invent content.
+        parts = re.split(r"(?<=[.!?…])\s+", " ".join(text.split()))
+        if parts:
+            return parts[0].strip()
+    if constraints.bullet_count is not None:
+        lines = [line.rstrip() for line in text.splitlines()]
+        bullets = [
+            line
+            for line in lines
+            if re.match(r"^(?:[-*•]|\d+[.)])\s+\S", line.strip())
+        ]
+        if len(bullets) > constraints.bullet_count:
+            return "\n".join(bullets[: constraints.bullet_count])
+        if len(bullets) == constraints.bullet_count:
+            return "\n".join(bullets)
+    if constraints.require_json:
+        match = re.search(r"(\{.*\}|\[.*\])", text, flags=re.DOTALL)
+        if match:
+            candidate = match.group(1)
+            try:
+                json.loads(candidate)
+                return candidate
+            except json.JSONDecodeError:
+                return None
+    return None
