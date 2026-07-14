@@ -224,6 +224,7 @@ def resolve_artifact_output_path(
     output_name: str | None = None,
     default_name: str = "artifact.md",
     collision_safe: bool = True,
+    allow_overwrite: bool = False,
 ) -> Path:
     """Bind an operator-requested destination under the document-outputs root.
 
@@ -231,6 +232,12 @@ def resolve_artifact_output_path(
     subdirectories (for example ``functional-20260713/report.md``), or a
     simple basename. Never rewrites sources; only allocates under
     ``output_root``.
+
+    When ``collision_safe`` is True (default), an existing file is not
+    overwritten — a timestamp suffix is allocated instead. When the operator
+    requires an *exact* destination (``collision_safe=False``), a collision
+    raises unless ``allow_overwrite`` is explicitly True. Timestamp fallback
+    must never silently replace an exact requested path.
     """
 
     root = Path(output_root).resolve(strict=False)
@@ -269,10 +276,15 @@ def resolve_artifact_output_path(
     if destination.exists() and destination.is_dir():
         raise DocumentRuntimeError(f"output_path is a directory: {destination}")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    if destination.exists() and collision_safe:
+    if destination.exists() and collision_safe and not allow_overwrite:
         stamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
         destination = destination.with_name(
             f"{destination.stem}.{stamp}{destination.suffix}"
+        )
+    elif destination.exists() and not allow_overwrite:
+        raise DocumentRuntimeError(
+            f"refusing to overwrite existing artifact without explicit permission: "
+            f"{destination}"
         )
     return destination
 

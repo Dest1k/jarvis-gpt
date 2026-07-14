@@ -61,6 +61,20 @@ def test_resolve_artifact_output_path_collision_is_unique(tmp_path: Path) -> Non
     assert first != second
 
 
+def test_resolve_artifact_exact_path_refuses_collision_without_overwrite(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "document-outputs"
+    first = resolve_artifact_output_path(
+        root, output_name="exact.md", collision_safe=False
+    )
+    first.write_text("A\n", encoding="utf-8")
+    with pytest.raises(DocumentRuntimeError, match="overwrite"):
+        resolve_artifact_output_path(
+            root, output_name="exact.md", collision_safe=False, allow_overwrite=False
+        )
+
+
 def test_write_exact_text_artifact_has_no_generator_wrapper(tmp_path: Path) -> None:
     path = tmp_path / "document-outputs" / "functional-20260713" / "OP-0013-1.md"
     body = "# Итог\n\nmarker OP-0013-1\n"
@@ -188,7 +202,7 @@ def test_documents_generate_exact_path_and_collision_tools(monkeypatch, tmp_path
     assert path.read_text(encoding="utf-8") == body
     assert "generator" not in path.read_text(encoding="utf-8")
 
-    # Concurrent same-name request must not overwrite.
+    # Exact-name collision must not overwrite and must not claim false success.
     second = asyncio.run(
         tools.run(
             "documents.generate",
@@ -199,11 +213,29 @@ def test_documents_generate_exact_path_and_collision_tools(monkeypatch, tmp_path
             },
         )
     )
-    assert second.ok is True
-    second_path = Path(second.data["output"]["path"])
-    assert second_path != path
+    assert second.ok is False
+    assert "overwrite" in second.summary.casefold() or "exist" in second.summary.casefold()
     assert path.read_text(encoding="utf-8") == body
-    assert "OP-0034-B-1" in second_path.read_text(encoding="utf-8")
+    assert path.exists()
+
+    # Explicit collision_safe opt-in may allocate a unique non-overwriting path.
+    third = asyncio.run(
+        tools.run(
+            "documents.generate",
+            {
+                "body": "# Итог\n\nmarker OP-0034-B-1\n",
+                "output_format": "md",
+                "output_name": "functional-20260713/OP-0013-1.md",
+                "collision_safe": True,
+                "require_exact_path": False,
+            },
+        )
+    )
+    assert third.ok is True
+    third_path = Path(third.data["output"]["path"])
+    assert third_path != path
+    assert path.read_text(encoding="utf-8") == body
+    assert "OP-0034-B-1" in third_path.read_text(encoding="utf-8")
 
     md = tmp_path / "convert-source.md"
     md.write_text(
@@ -232,4 +264,70 @@ def test_documents_generate_exact_path_and_collision_tools(monkeypatch, tmp_path
         assert 'w:val="Heading1"' in archive.read("word/document.xml").decode("utf-8")
         assert "<w:tbl>" in archive.read("word/document.xml").decode("utf-8")
 
+    storage.close()
+
+
+def test_documents_generate_exact_path_mismatch_is_failure(monkeypatch, tmp_path: Path) -> None:
+    """RB-3 C: if the tool would bind a different path, success is forbidden."""
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    # Occupy the exact name so require_exact path resolution refuses silently rewriting.
+    occupied = settings.data_dir / "document-outputs" / "must-be-exact.md"
+    occupied.parent.mkdir(parents=True, exist_ok=True)
+    occupied.write_text("occupied\n", encoding="utf-8")
+
+    result = asyncio.run(
+        tools.run(
+            "documents.generate",
+            {
+                "body": "# Should fail\n",
+                "output_format": "md",
+                "output_name": "must-be-exact.md",
+                "require_exact_path": True,
+                "exact_body": True,
+            },
+        )
+    )
+    assert result.ok is False
+    assert "overwrite" in result.summary.casefold() or "exist" in result.summary.casefold()
+    assert occupied.read_text(encoding="utf-8") == "occupied\n"
+    storage.close()
+
+
+def test_documents_generate_preserves_source_hash(monkeypatch, tmp_path: Path) -> None:
+    """RB-3 H: source files remain unchanged after generate-from-source."""
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    source = tmp_path / "source-transform.md"
+    source.write_text("# Source\n\noriginal body\n", encoding="utf-8")
+    before = hashlib.sha256(source.read_bytes()).hexdigest()
+    generated = asyncio.run(
+        tools.run(
+            "documents.generate",
+            {
+                "title": "Transform out",
+                "output_format": "md",
+                "output_name": "transform-out.md",
+                "source_paths": [str(source)],
+                "require_exact_path": True,
+            },
+        )
+    )
+    assert generated.ok is True
+    assert hashlib.sha256(source.read_bytes()).hexdigest() == before
+    out = Path(generated.data["output"]["path"])
+    assert out.name == "transform-out.md"
+    assert out.is_file()
     storage.close()

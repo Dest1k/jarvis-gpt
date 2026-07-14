@@ -843,6 +843,31 @@ class AgentRuntime:
                     duration_ms=duration_ms,
                 )
 
+        # RB-3: complete NEW_ARTIFACT_REQUEST binds exact path before shopping/recall.
+        direct_artifact = await self._try_direct_new_artifact_action(message, context)
+        if direct_artifact is not None:
+            for event in direct_artifact.events:
+                events.append(event)
+                await self._emit(event)
+            duration_ms = _elapsed_ms(started_at)
+            message_id = self.storage.add_message(
+                conversation_id=context.conversation_id,
+                role="assistant",
+                content=direct_artifact.answer,
+                metadata={
+                    "duration_ms": duration_ms,
+                    "source": "direct_new_artifact",
+                    "events": [event.model_dump() for event in events],
+                },
+            )
+            return ChatResponse(
+                conversation_id=context.conversation_id,
+                message_id=message_id,
+                answer=direct_artifact.answer,
+                events=events,
+                duration_ms=duration_ms,
+            )
+
         shop_start = self._named_shop_start_event(message, task_plan)
         if shop_start is not None and not context.resumed_from_clarification:
             events.append(shop_start)
@@ -1280,6 +1305,35 @@ class AgentRuntime:
                     "message_id": message_id,
                 }
                 return
+
+        # RB-3: complete NEW_ARTIFACT_REQUEST binds exact path before shopping/recall.
+        direct_artifact = await self._try_direct_new_artifact_action(message, context)
+        if direct_artifact is not None:
+            for event in direct_artifact.events:
+                events.append(event)
+                await self._emit(event)
+                yield {"type": "event", "event": event.model_dump()}
+            yield {"type": "delta", "content": direct_artifact.answer}
+            duration_ms = _elapsed_ms(started_at)
+            message_id = self.storage.add_message(
+                conversation_id=context.conversation_id,
+                role="assistant",
+                content=direct_artifact.answer,
+                metadata={
+                    "duration_ms": duration_ms,
+                    "source": "direct_new_artifact",
+                    "events": [event.model_dump() for event in events],
+                },
+            )
+            yield {
+                "type": "done",
+                "answer": direct_artifact.answer,
+                "conversation_id": context.conversation_id,
+                "duration_ms": duration_ms,
+                "events": [event.model_dump() for event in events],
+                "message_id": message_id,
+            }
+            return
 
         shop_start = self._named_shop_start_event(message, task_plan)
         if shop_start is not None and not context.resumed_from_clarification:
@@ -4671,6 +4725,8 @@ class AgentRuntime:
             "output_format": spec["output_format"],
             "output_name": spec["output_name"],
             "exact_body": True,
+            "require_exact_path": True,
+            "overwrite": False,
         }
         result = await self.tools.run(
             "documents.generate",
@@ -4678,27 +4734,16 @@ class AgentRuntime:
             conversation_id=context.conversation_id,
             user_message_id=context.operator_message_id,
         )
-        path = ""
-        if isinstance(result.data, dict):
-            raw_output = result.data.get("output")
-            output = raw_output if isinstance(raw_output, dict) else {}
-            path = str(output.get("path") or "")
-        if result.ok and path:
+        ok, path, verified_answer = _verified_artifact_answer(result=result, intent=spec)
+        if ok:
             answer = (
                 f"Отчёт подготовлен после уточнения.\n\n"
-                f"**Файл:** `{spec['output_name']}`\n"
-                f"**Путь:** `{path}`\n"
-                f"**Формат:** {spec['output_format']}\n\n"
+                f"{verified_answer}\n"
                 f"Содержание отражает исходную задачу и ваш ответ "
                 f"(безопасный default, если тема была общей)."
             )
-        elif result.ok:
-            answer = f"Отчёт подготовлен: {result.summary}"
         else:
-            answer = (
-                "Не удалось создать файл после уточнения: "
-                f"{result.summary}. Повторите формат, имя и каталог."
-            )
+            answer = verified_answer
         return DirectAction(
             answer=answer,
             events=[
@@ -4717,9 +4762,97 @@ class AgentRuntime:
                     content=result.summary,
                     payload={
                         "tool": "documents.generate",
-                        "ok": result.ok,
-                        "path": path,
+                        "ok": ok and result.ok,
+                        "path": path if ok else "",
+                        "requested_name": spec.get("output_name"),
                         "source": "clarification_resume",
+                        "path_verified": ok,
+                    },
+                ),
+            ],
+        )
+
+    async def _try_direct_new_artifact_action(
+        self, message: str, context: AgentContext
+    ) -> DirectAction | None:
+        """Deterministic NEW_ARTIFACT_REQUEST path with exact destination binding.
+
+        Bypasses shopping/web/document-recall misroutes for complete create
+        requests that already specify format + filename/path + content.
+        """
+
+        if not context.side_effects_admitted:
+            return None
+        if context.resumed_from_clarification:
+            return None
+        intent = _new_artifact_intent_from_message(message)
+        if intent is None or not intent.get("complete"):
+            return None
+        if intent.get("kind") not in {
+            NEW_ARTIFACT_REQUEST,
+            TRANSFORM_EXISTING_DOCUMENT,
+        }:
+            return None
+
+        source_file_ids: list[str] = []
+        if intent.get("kind") == TRANSFORM_EXISTING_DOCUMENT:
+            for hit in context.file_hits:
+                file_id = str(hit.get("file_id") or "")
+                if file_id and file_id not in source_file_ids:
+                    source_file_ids.append(file_id)
+            source_file_ids = source_file_ids[:4]
+
+        args: dict[str, Any] = {
+            "title": intent["title"],
+            "body": intent["body"],
+            "output_format": intent["output_format"],
+            "output_name": intent["output_name"],
+            "exact_body": True,
+            "require_exact_path": True,
+            "overwrite": bool(intent.get("overwrite")),
+        }
+        if source_file_ids:
+            args["source_file_ids"] = source_file_ids
+            # Transform may synthesize from sources when body is only a stub.
+            if intent.get("source_reference") and len(str(intent.get("body") or "")) < 40:
+                args["exact_body"] = False
+
+        result = await self.tools.run(
+            "documents.generate",
+            args,
+            conversation_id=context.conversation_id,
+            user_message_id=context.operator_message_id,
+        )
+        ok, path, answer = _verified_artifact_answer(result=result, intent=intent)
+        return DirectAction(
+            answer=answer,
+            events=[
+                ChatEvent(
+                    type="thought",
+                    title="Прямое создание артефакта",
+                    content=(
+                        f"Intent {intent.get('kind')}: exact path "
+                        f"{intent.get('output_name')} bound before tool execution."
+                    ),
+                    payload={
+                        "source": "direct_new_artifact",
+                        "intent": intent.get("kind"),
+                        "filename": intent.get("filename"),
+                        "require_exact_path": True,
+                    },
+                ),
+                ChatEvent(
+                    type="tool_call",
+                    title="documents.generate",
+                    content=result.summary,
+                    payload={
+                        "tool": "documents.generate",
+                        "ok": ok and result.ok,
+                        "path": path if ok else "",
+                        "requested_name": intent.get("output_name"),
+                        "source": "direct_new_artifact",
+                        "path_verified": ok,
+                        "intent": intent.get("kind"),
                     },
                 ),
             ],
@@ -4850,9 +4983,44 @@ class AgentRuntime:
             preferences=self.storage.get_runtime_value("experience.preferences", {}),
         )
 
+        # RB-3: complete new-artifact / transform requests must not fall through to
+        # document recall, shopping (e.g. DNS in report content), or general chat.
+        artifact_intent = _new_artifact_intent_from_message(message)
+        if artifact_intent and artifact_intent.get("complete"):
+            kind = str(artifact_intent.get("kind") or NEW_ARTIFACT_REQUEST)
+            tools: tuple[str, ...]
+            if kind == TRANSFORM_EXISTING_DOCUMENT:
+                tools = (
+                    "documents.generate",
+                    "documents.recall",
+                    "documents.read",
+                    "documents.convert",
+                )
+            else:
+                tools = ("documents.generate",)
+            return TaskKernelPlan(
+                route="reasoning",
+                mode=task_mode,
+                intent="new_artifact" if kind == NEW_ARTIFACT_REQUEST else "transform_document",
+                confidence=0.94,
+                query=message,
+                tools=tools,
+                completion_criteria=(
+                    "create the artifact at the exact requested path",
+                    "verify the written path before reporting success",
+                    "do not route to document search or shopping",
+                ),
+                rationale=(
+                    f"Typed {kind} with exact destination "
+                    f"{artifact_intent.get('output_name')}."
+                ),
+            )
+
         if (
             mode != "mission"
             and not attachments
+            and _classify_document_artifact_intent(message)
+            != NEW_ARTIFACT_REQUEST
             and _looks_like_archive_memory_query(
                 message,
                 has_file_context=bool(context.file_hits),
@@ -4885,6 +5053,8 @@ class AgentRuntime:
         if (
             mode != "mission"
             and not attachments
+            and _classify_document_artifact_intent(message)
+            not in {NEW_ARTIFACT_REQUEST, TRANSFORM_EXISTING_DOCUMENT}
             and _looks_like_document_memory_query(
                 message,
                 has_file_context=bool(context.file_hits),
@@ -9076,10 +9246,78 @@ def _looks_like_clarification_before_action(message: str) -> bool:
     )
 
 
+def _create_artifact_verbs() -> tuple[str, ...]:
+    """Explicit creation/write verbs for NEW_ARTIFACT / TRANSFORM intents."""
+
+    return (
+        "подготовь файл",
+        "подготовь отч",
+        "подготовь документ",
+        "prepare the report",
+        "prepare a report",
+        "prepare the file",
+        "prepare a file",
+        "prepare report",
+        "создай файл",
+        "создай отч",
+        "создай документ",
+        "создай markdown",
+        "create report",
+        "create a report",
+        "create the report",
+        "create a document",
+        "create the document",
+        "create file",
+        "create a file",
+        "create the file",
+        "create a new",
+        "create new",
+        "create markdown",
+        "create a markdown",
+        "сгенерируй",
+        "generate report",
+        "generate a report",
+        "generate the report",
+        "generate a document",
+        "generate the document",
+        "generate a file",
+        "generate markdown",
+        "generate a markdown",
+        "write a file",
+        "write the file",
+        "write a report",
+        "write the report",
+        "write a markdown",
+        "write markdown",
+        "save the file",
+        "save as",
+        "сохрани файл",
+        "сохрани отч",
+        "сохрани документ",
+        "сохрани как",
+        "положи",
+        "put it where",
+        "put the file",
+        "put it in",
+        "make a file",
+        "make the file",
+        "make a report",
+        "новый файл",
+        "новый документ",
+        "new file",
+        "new document",
+        "new markdown",
+    )
+
+
 def _looks_like_document_read_or_recall(message: str) -> bool:
     """True for recall/summarize/compare of existing documents (not artifact creation)."""
 
     normalized = str(message or "").casefold()
+    # Creation / transform verbs win over bare "document/file" memory cues so that
+    # "create X.md from the uploaded document" is not misrouted to documents.recall.
+    if _contains_any(normalized, _create_artifact_verbs()):
+        return False
     return _contains_any(
         normalized,
         (
@@ -9105,6 +9343,9 @@ def _looks_like_document_read_or_recall(message: str) -> bool:
             "сравни",
             "compare the",
             "documents.recall",
+            "найди документ",
+            "find the document",
+            "find document",
         ),
     )
 
@@ -9119,43 +9360,7 @@ def _looks_like_artifact_or_mission_side_effect(message: str) -> bool:
     if _looks_like_document_read_or_recall(normalized):
         return False
     # Require an explicit creation/write verb — bare "document/report" is not enough.
-    create_verbs = (
-        "подготовь файл",
-        "подготовь отч",
-        "подготовь документ",
-        "prepare the report",
-        "prepare a report",
-        "prepare the file",
-        "prepare a file",
-        "создай файл",
-        "создай отч",
-        "создай документ",
-        "create report",
-        "create a report",
-        "create the report",
-        "create a document",
-        "create the document",
-        "create file",
-        "сгенерируй",
-        "generate report",
-        "generate a report",
-        "generate the report",
-        "generate a document",
-        "generate the document",
-        "generate a file",
-        "write a file",
-        "write the file",
-        "write a report",
-        "write the report",
-        "save the file",
-        "сохрани файл",
-        "сохрани отч",
-        "сохрани документ",
-        "положи",
-        "put it where",
-        "put the file",
-        "put it in",
-    )
+    create_verbs = _create_artifact_verbs()
     mission_markers = (
         "mission plan",
         "создай mission",
@@ -9166,7 +9371,26 @@ def _looks_like_artifact_or_mission_side_effect(message: str) -> bool:
         "разбей на задачи",
         "разложи на шаги",
     )
-    return _contains_any(normalized, create_verbs + mission_markers)
+    if _contains_any(normalized, create_verbs + mission_markers):
+        return True
+    # Filename + explicit destination is also a durable-write request when a
+    # concrete create/write shape is present (e.g. "report.md in document-outputs").
+    has_filename = bool(re.search(r"(?i)\b[\w.-]+\.(md|docx|pdf|txt)\b", normalized))
+    has_dest_marker = _contains_any(
+        normalized,
+        (
+            "document-outputs",
+            "output_path",
+            "output_name",
+            "save as",
+            "сохрани как",
+            "под именем",
+            "имя файла",
+            "filename",
+            "file name",
+        ),
+    )
+    return has_filename and has_dest_marker
 
 
 def _format_is_concrete(normalized: str) -> bool:
@@ -9502,6 +9726,281 @@ def _artifact_spec_from_clarification_resume(
         "output_format": fmt,
         "output_name": output_name[:180],
     }
+
+
+# RB-3: typed document/artifact intents — never treat a future filename as recall.
+EXISTING_DOCUMENT_REFERENCE = "EXISTING_DOCUMENT_REFERENCE"
+NEW_ARTIFACT_REQUEST = "NEW_ARTIFACT_REQUEST"
+TRANSFORM_EXISTING_DOCUMENT = "TRANSFORM_EXISTING_DOCUMENT"
+
+
+def _has_existing_source_reference(message: str) -> bool:
+    normalized = str(message or "").casefold()
+    return _contains_any(
+        normalized,
+        (
+            "загруженн",
+            "uploaded",
+            "сохраненн",
+            "сохранённ",
+            "saved document",
+            "source document",
+            "исходн",
+            "на основе",
+            "based on",
+            "from the document",
+            "из документа",
+            "из файла",
+            "приложенн",
+            "attached",
+            "file_id",
+        ),
+    )
+
+
+def _classify_document_artifact_intent(message: str) -> str | None:
+    """Classify EXISTING_DOCUMENT_REFERENCE / NEW_ARTIFACT_REQUEST / TRANSFORM."""
+
+    normalized = str(message or "").casefold()
+    if not normalized.strip():
+        return None
+    creating = _looks_like_artifact_or_mission_side_effect(message) or _contains_any(
+        normalized, _create_artifact_verbs()
+    )
+    if creating:
+        if _has_existing_source_reference(message):
+            return TRANSFORM_EXISTING_DOCUMENT
+        return NEW_ARTIFACT_REQUEST
+    if _looks_like_document_read_or_recall(message):
+        return EXISTING_DOCUMENT_REFERENCE
+    return None
+
+
+def _artifact_filename_from_message(message: str) -> str | None:
+    text = str(message or "")
+    name_match = re.search(
+        r"(?i)(?:имя|name|файл|file|filename|as|named)\s*[:=]?\s*"
+        r"([^\s\\/]+\.(?:md|docx|pdf|txt))",
+        text,
+    )
+    if name_match:
+        return name_match.group(1)
+    name_match = re.search(r"(?i)\b([a-z0-9._-]+\.(?:md|docx|pdf|txt))\b", text)
+    if name_match:
+        return name_match.group(1)
+    return None
+
+
+def _artifact_format_from_message(message: str, *, filename: str | None = None) -> str:
+    normalized = str(message or "").casefold()
+    if filename and "." in filename:
+        ext = Path(filename).suffix.lstrip(".").lower()
+        if ext in {"md", "docx", "pdf", "txt", "html", "csv", "json"}:
+            return "md" if ext == "markdown" else ext
+    if re.search(r"(?i)\b(docx|word)\b", normalized) or ".docx" in normalized:
+        return "docx"
+    if re.search(r"(?i)\bpdf\b", normalized) or ".pdf" in normalized:
+        return "pdf"
+    if re.search(r"(?i)\b(txt|text)\b", normalized) or ".txt" in normalized:
+        return "txt"
+    if re.search(r"(?i)\b(md|markdown)\b", normalized) or ".md" in normalized:
+        return "md"
+    return "md"
+
+
+def _artifact_body_from_message(message: str, *, original_goal: str = "") -> str:
+    content_match = re.search(
+        r"(?is)(?:content|содержание|тема|body|текстом|text)\s*[:=]\s*(.+)$",
+        message,
+    )
+    if content_match:
+        body = content_match.group(1).strip()
+        if body:
+            return body if body.lstrip().startswith("#") else f"# Report\n\n{body}\n"
+    # Bullet / about-topic patterns common in acceptance prompts.
+    about = re.search(
+        r"(?is)(?:about|про|по теме|with(?: three)? bullets?(?: about)?)\s+(.+)$",
+        message,
+    )
+    if about:
+        topic = about.group(1).strip(" .,:;")
+        if len(topic) >= 3:
+            return (
+                f"# Report\n\n"
+                f"- {topic}\n"
+                f"- Key considerations for operators\n"
+                f"- Follow-up checks\n"
+            )
+    residual = re.sub(
+        r"(?i)\b(md|markdown|docx|pdf|txt|format|формат|имя|name|exact|"
+        r"directory|каталог|document-outputs|file|файл|report\.md|"
+        r"create|создай|generate|сгенерируй|write|prepare|подготовь|"
+        r"new|новый|named|filename)\b",
+        " ",
+        message,
+    )
+    residual = re.sub(r"\s+", " ", residual).strip(" ,.;:-")
+    # Drop known filename tokens from residual.
+    residual = re.sub(r"(?i)\b[\w.-]+\.(?:md|docx|pdf|txt)\b", " ", residual)
+    residual = re.sub(r"\s+", " ", residual).strip(" ,.;:-")
+    if residual and len(residual) >= 4:
+        return f"# Report\n\n{residual}\n"
+    goal = original_goal or message
+    return (
+        f"# Report\n\nPrepared for the original request.\n\n"
+        f"Goal: {goal[:500]}\n"
+    )
+
+
+def _looks_like_host_filesystem_write(message: str) -> bool:
+    """True for absolute host paths that are not document-outputs artifacts.
+
+    Operator turns like ``Создай файл C:\\temp\\x.txt`` must stay on the
+    execution/filesystem path, not documents.generate under document-outputs.
+    """
+
+    text = str(message or "")
+    normalized = text.casefold()
+    if "document-outputs" in normalized:
+        return False
+    if re.search(r"(?i)\b[a-z]:[\\/]", text):
+        return True
+    if re.search(r"(?i)(^|[\s\"'])/(?:home|users|tmp|var|opt|mnt)/", text):
+        return True
+    return "\\\\" in text  # UNC path
+
+
+def _new_artifact_intent_from_message(
+    message: str,
+    *,
+    original_goal: str = "",
+) -> dict[str, Any] | None:
+    """Build a typed NEW_ARTIFACT_REQUEST intent with exact destination binding.
+
+    Returns None when the message is not a concrete new-artifact request.
+    """
+
+    if _looks_like_host_filesystem_write(message):
+        return None
+    kind = _classify_document_artifact_intent(message)
+    if kind not in {NEW_ARTIFACT_REQUEST, TRANSFORM_EXISTING_DOCUMENT}:
+        return None
+    if _requires_side_effect_clarification(message) and not original_goal:
+        return None
+    filename = _artifact_filename_from_message(message)
+    if not filename and original_goal:
+        filename = _artifact_filename_from_message(original_goal)
+    if not filename:
+        return None
+    fmt = _artifact_format_from_message(message, filename=filename)
+    if (
+        not filename.lower().endswith(f".{fmt}")
+        and "." not in filename
+    ):
+        filename = f"{filename}.{fmt}"
+    body = _artifact_body_from_message(message, original_goal=original_goal)
+    title = Path(filename).stem.replace("_", " ").replace("-", " ").strip() or "Report"
+    destination = f"document-outputs/{filename}"
+    # Preserve relative directory if the operator embedded one (not bare document-outputs).
+    dir_match = re.search(
+        r"(?i)(?:каталог|directory|folder|папк[аеуи]?|in|в)\s+"
+        r"([a-z0-9._\-\\/]+)",
+        message,
+    )
+    rel_dir = ""
+    if dir_match:
+        token = dir_match.group(1).strip().replace("\\", "/").strip(" .,:;")
+        token_norm = token.strip("/")
+        if token_norm in {"", ".", "..", "document-outputs"}:
+            rel_dir = ""
+        elif token_norm.startswith("document-outputs/"):
+            rel_dir = token_norm.split("document-outputs/", 1)[-1].strip("/")
+        elif "document-outputs" not in token_norm:
+            rel_dir = token_norm
+        if rel_dir in {".", ".."}:
+            rel_dir = ""
+    output_name = f"{rel_dir}/{filename}" if rel_dir else filename
+    gaps = _side_effect_completeness_gaps(message)
+    complete = not gaps or (
+        bool(filename)
+        and _format_is_concrete(message.casefold())
+        and _destination_is_concrete(message.casefold())
+        and len(body.strip()) >= 4
+    )
+    return {
+        "kind": kind,
+        "destination": destination,
+        "filename": filename[:180],
+        "output_name": output_name[:180],
+        "format": fmt,
+        "output_format": fmt,
+        "content": body[:12000],
+        "body": body[:12000],
+        "title": title[:120],
+        "overwrite": False,
+        "collision_policy": "fail",
+        "require_exact_path": True,
+        "complete": complete,
+        "source_reference": _has_existing_source_reference(message),
+    }
+
+
+def _verified_artifact_answer(
+    *,
+    result: ToolRunResponse,
+    intent: dict[str, Any],
+) -> tuple[bool, str, str]:
+    """Build operator answer only from verified tool result paths (no invented paths)."""
+
+    requested = str(intent.get("filename") or intent.get("output_name") or "")
+    path = ""
+    if isinstance(result.data, dict):
+        raw_output = result.data.get("output")
+        output = raw_output if isinstance(raw_output, dict) else {}
+        path = str(output.get("path") or "")
+        verification = result.data.get("path_verification")
+        if isinstance(verification, dict) and verification.get("path"):
+            path = str(verification["path"])
+    if not result.ok or not path:
+        return (
+            False,
+            path,
+            (
+                "Не удалось создать артефакт по запрошенному пути: "
+                f"{result.summary}. Запрошено: `{requested}`."
+            ),
+        )
+    actual = Path(path)
+    if not actual.exists() or not actual.is_file():
+        return (
+            False,
+            path,
+            (
+                f"Ошибка проверки: заявленный файл не существует: `{path}`. "
+                f"Запрошено: `{requested}`. False success запрещён."
+            ),
+        )
+    if requested and actual.name.casefold() != Path(requested).name.casefold():
+        return (
+            False,
+            path,
+            (
+                f"Ошибка точного пути: запрошено `{Path(requested).name}`, "
+                f"инструмент записал `{actual.name}`. Артефакт не считается созданным."
+            ),
+        )
+    fmt = (
+        intent.get("output_format")
+        or intent.get("format")
+        or actual.suffix.lstrip(".")
+    )
+    answer = (
+        f"Артефакт создан.\n\n"
+        f"**Файл:** `{actual.name}`\n"
+        f"**Путь:** `{path}`\n"
+        f"**Формат:** {fmt}\n"
+    )
+    return True, path, answer
 
 
 def _looks_like_osint_dns_context(normalized: str) -> bool:

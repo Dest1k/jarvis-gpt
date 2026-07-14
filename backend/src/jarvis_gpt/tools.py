@@ -5005,6 +5005,27 @@ def _documents_generate(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
     exact_body = args.get("exact_body")
     if exact_body is None:
         exact_body = True
+    require_exact = _truthy_arg(
+        args.get("require_exact_path")
+        if args.get("require_exact_path") is not None
+        else args.get("exact_destination")
+    )
+    requested_name = str(args.get("output_name") or "").strip() or None
+    requested_path = args.get("output_path") or args.get("destination")
+    # When the operator/agent binds an explicit name without opting into collision
+    # rewrite, treat it as an exact destination (no silent timestamp rename).
+    if (
+        not require_exact
+        and (requested_name or requested_path)
+        and not _truthy_arg(args.get("collision_safe"))
+        and args.get("require_exact_path") is None
+        and args.get("exact_destination") is None
+    ):
+        # Default for named destinations: exact path. Callers that want the
+        # historical collision-timestamp behaviour must pass collision_safe=true.
+        require_exact = True
+        args = {**args, "require_exact_path": True}
+    source_hashes_before: dict[str, str] = {}
     try:
         source_paths: list[Path] = []
         if args.get("source_paths") or args.get("source_file_ids"):
@@ -5015,6 +5036,9 @@ def _documents_generate(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
                     "file_ids": args.get("source_file_ids"),
                 },
             )
+            for source in source_paths:
+                if source.is_file():
+                    source_hashes_before[str(source)] = file_sha256(source)
         surfer = _document_surfer_for(ctx)
         if source_paths and (not body or (isinstance(body, str) and not body.strip())):
             corpus = surfer.summarize_corpus(source_paths)
@@ -5027,6 +5051,7 @@ def _documents_generate(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
             default_name=default_name,
             default_suffix=f".{output_format}",
         )
+        bound_destination = Path(destination)
         body_text = body if isinstance(body, str) else str(body or "")
         if output_format in {"md", "txt"} and exact_body and body_text.strip():
             written = write_exact_text_artifact(destination, body_text)
@@ -5083,6 +5108,32 @@ def _documents_generate(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
                     output_path,
                     expected_format=output_format,
                 )
+        if not output_path or not str(output_path):
+            raise DocumentRuntimeError("documents.generate produced no output path")
+        # Exact binding: refuse timestamp/other-path success when operator asked for a name.
+        if require_exact and output_path.resolve(strict=False) != bound_destination.resolve(
+            strict=False
+        ):
+            raise DocumentRuntimeError(
+                f"exact path mismatch: requested {bound_destination}, tool wrote {output_path}"
+            )
+        path_gate = _verify_exact_artifact_path(
+            written_path=output_path,
+            requested_name=requested_name,
+            requested_path=requested_path,
+            require_exact=require_exact,
+        )
+        result["path_verification"] = path_gate
+        result["requested_path"] = str(bound_destination)
+        result["requested_name"] = requested_name or bound_destination.name
+        # Source files must remain byte-identical after generate.
+        for source_key, before in source_hashes_before.items():
+            after = file_sha256(Path(source_key))
+            if after != before:
+                raise DocumentRuntimeError(
+                    f"source file was modified during generate: {source_key}"
+                )
+        result["source_hashes_unchanged"] = bool(source_hashes_before)
         file_record = _record_generated_document(ctx, output_path) if output_path.exists() else None
     except (
         ValueError,
@@ -10511,6 +10562,15 @@ def _safe_output_stem(value: str) -> str:
     return (cleaned or "document")[:120]
 
 
+def _truthy_arg(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    text = str(value).strip().casefold()
+    return text in {"1", "true", "yes", "on", "y"}
+
+
 def _resolve_document_destination(
     ctx: ToolContext,
     args: dict[str, Any],
@@ -10525,13 +10585,63 @@ def _resolve_document_destination(
         raw_name = f"{raw_name}{default_suffix}"
     if not raw_path and not raw_name:
         raw_name = default_name
+    require_exact = _truthy_arg(
+        args.get("require_exact_path")
+        if args.get("require_exact_path") is not None
+        else args.get("exact_destination")
+    )
+    allow_overwrite = _truthy_arg(args.get("overwrite") or args.get("allow_overwrite"))
+    if args.get("collision_safe") is not None:
+        collision_safe = _truthy_arg(args.get("collision_safe"))
+    else:
+        # Exact destination requests must not silently fall back to timestamp names.
+        collision_safe = not require_exact
     return resolve_artifact_output_path(
         output_root,
         output_path=raw_path,
         output_name=raw_name,
         default_name=default_name,
-        collision_safe=True,
+        collision_safe=collision_safe,
+        allow_overwrite=allow_overwrite,
     )
+
+
+def _verify_exact_artifact_path(
+    *,
+    written_path: Path,
+    requested_name: str | None,
+    requested_path: str | Path | None,
+    require_exact: bool,
+) -> dict[str, Any]:
+    """Post-write gate: claimed success requires the verified regular file path."""
+
+    target = Path(written_path)
+    if not target.exists() or not target.is_file():
+        raise DocumentRuntimeError(f"claimed artifact missing after write: {target}")
+    size = target.stat().st_size
+    if size <= 0:
+        raise DocumentRuntimeError(f"claimed artifact is empty: {target}")
+    digest = file_sha256(target)
+    if require_exact:
+        requested_basename = ""
+        if requested_name:
+            requested_basename = Path(str(requested_name).replace("\\", "/")).name
+        elif requested_path:
+            requested_basename = Path(str(requested_path).replace("\\", "/")).name
+        if requested_basename and target.name.casefold() != requested_basename.casefold():
+            raise DocumentRuntimeError(
+                f"exact path mismatch: requested {requested_basename!r}, "
+                f"tool wrote {target.name!r}"
+            )
+    return {
+        "ok": True,
+        "path": str(target),
+        "name": target.name,
+        "size": size,
+        "sha256": digest,
+        "is_file": True,
+        "require_exact": require_exact,
+    }
 
 
 def _record_generated_document(ctx: ToolContext, path: Path) -> dict[str, Any]:

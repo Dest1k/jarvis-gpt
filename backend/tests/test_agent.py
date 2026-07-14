@@ -4745,6 +4745,179 @@ def test_unambiguous_artifact_request_skips_clarification(monkeypatch, tmp_path)
     storage.close()
 
 
+def test_rb3_unambiguous_exact_path_markdown_routes_to_generate(monkeypatch, tmp_path):
+    """RB-3 A/B: exact-path artifact routes to generation, not search; path preserved."""
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tool_calls: list[str] = []
+
+    class FailLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None):
+            raise AssertionError("LLM must not run for complete NEW_ARTIFACT_REQUEST")
+
+    agent = AgentRuntime(settings=settings, storage=storage, llm=FailLLM(), bus=EventBus())
+    real_run = agent.tools.run
+
+    async def tracking_run(name, arguments=None, **kwargs):
+        tool_calls.append(name)
+        return await real_run(name, arguments, **kwargs)
+
+    monkeypatch.setattr(agent.tools, "run", tracking_run)
+
+    prompt = (
+        "Create a new markdown file named exact-path-1.md in document-outputs "
+        "with content: hello acceptance RB3"
+    )
+    ctx = agent._prepare_context(prompt, None)
+    plan = agent._plan_task(prompt, ctx, mode="auto", attachments=[])
+    assert plan.intent in {"new_artifact", "transform_document"}
+    assert "documents.generate" in plan.tools
+    assert "documents.recall" not in plan.tools or plan.intent == "transform_document"
+
+    response = asyncio.run(agent.chat(prompt))
+    assert "documents.generate" in tool_calls
+    assert "documents.recall" not in tool_calls
+    assert "documents.search" not in tool_calls
+    assert "Уточните" not in response.answer
+    expected = Path(settings.data_dir) / "document-outputs" / "exact-path-1.md"
+    assert expected.is_file()
+    assert "hello acceptance RB3" in expected.read_text(encoding="utf-8")
+    assert "exact-path-1.md" in response.answer
+    assert str(expected) in response.answer or expected.name in response.answer
+    storage.close()
+
+
+def test_rb3_timestamp_path_mismatch_forbids_success(monkeypatch, tmp_path):
+    """RB-3 C/D: tool returning a different path cannot claim requested success."""
+    from jarvis_gpt.models import ToolRunResponse
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+
+    class FailLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None):
+            raise AssertionError("LLM must not run")
+
+    agent = AgentRuntime(settings=settings, storage=storage, llm=FailLLM(), bus=EventBus())
+    wrong = Path(settings.data_dir) / "document-outputs" / "document-outputs.20260714194853"
+    wrong.parent.mkdir(parents=True, exist_ok=True)
+    wrong.write_text("stale\n", encoding="utf-8")
+
+    async def fake_generate(name, arguments=None, **kwargs):
+        assert name == "documents.generate"
+        return ToolRunResponse(
+            tool="documents.generate",
+            ok=True,
+            summary="Generated md document: document-outputs.20260714194853.",
+            data={
+                "ok": True,
+                "output": {
+                    "path": str(wrong),
+                    "name": wrong.name,
+                    "format": "md",
+                    "size": wrong.stat().st_size,
+                    "sha256": "deadbeef",
+                },
+            },
+        )
+
+    monkeypatch.setattr(agent.tools, "run", fake_generate)
+    response = asyncio.run(
+        agent.chat(
+            "Create report-claimed.md in document-outputs with content: should not claim"
+        )
+    )
+    claimed = Path(settings.data_dir) / "document-outputs" / "report-claimed.md"
+    assert not claimed.exists()
+    lower = response.answer.casefold()
+    assert "report-claimed.md" not in response.answer or "ошиб" in lower or "не" in lower
+    # Must not present a successful exact-path claim for a missing file.
+    assert "Артефакт создан" not in response.answer
+    storage.close()
+
+
+def test_rb3_existing_document_reference_still_uses_recall(monkeypatch, tmp_path):
+    """RB-3 E: existing document reference still routes to recall/search."""
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    # Seed a remembered file so document_memory routing can engage.
+    storage.create_file_record(
+        name="phoenix-plan.md",
+        source_path=None,
+        stored_path=tmp_path / "phoenix-plan.md",
+        sha256="abc",
+        size=12,
+        mime_type="text/markdown",
+        status="ready",
+        error=None,
+        chunk_count=1,
+    )
+    (tmp_path / "phoenix-plan.md").write_text("phoenix body\n", encoding="utf-8")
+
+    class FailLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None):
+            return type(
+                "R",
+                (),
+                {"ok": True, "content": "Краткое резюме phoenix.", "error": None},
+            )()
+
+    agent = AgentRuntime(settings=settings, storage=storage, llm=FailLLM(), bus=EventBus())
+    prompt = "Дай резюме сохранённого документа phoenix"
+    from jarvis_gpt.agent import (
+        EXISTING_DOCUMENT_REFERENCE,
+        _classify_document_artifact_intent,
+    )
+
+    assert _classify_document_artifact_intent(prompt) == EXISTING_DOCUMENT_REFERENCE
+    ctx = agent._prepare_context(prompt, None)
+    plan = agent._plan_task(prompt, ctx, mode="auto", attachments=[])
+    assert plan.intent == "document_memory"
+    assert "documents.recall" in plan.tools
+    storage.close()
+
+
+def test_rb3_dns_content_does_not_hijack_to_shopping(monkeypatch, tmp_path):
+    """RB-3: DNS in report content must not route complete artifact to shop_search."""
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+
+    class FailLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None):
+            raise AssertionError("direct artifact path should not need LLM")
+
+    agent = AgentRuntime(settings=settings, storage=storage, llm=FailLLM(), bus=EventBus())
+    prompt = (
+        "Create report.md in document-outputs with three bullets about DNS security"
+    )
+    ctx = agent._prepare_context(prompt, None)
+    plan = agent._plan_task(prompt, ctx, mode="auto", attachments=[])
+    assert plan.intent == "new_artifact"
+    assert "web.shop_search" not in plan.tools
+    response = asyncio.run(agent.chat(prompt))
+    expected = Path(settings.data_dir) / "document-outputs" / "report.md"
+    assert expected.is_file()
+    assert "DNS" in expected.read_text(encoding="utf-8") or expected.stat().st_size > 0
+    assert expected.name in response.answer
+    storage.close()
+
+
 def test_pending_clarification_is_conversation_isolated(monkeypatch, tmp_path):
     """RB-2 E: two conversations do not share pending clarification state."""
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
