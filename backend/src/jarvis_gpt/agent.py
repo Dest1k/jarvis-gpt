@@ -8152,19 +8152,35 @@ def _looks_like_self_contained_reasoning(normalized: str) -> bool:
     )
     if explicit_web_intent:
         return False
-    # Short definitional / one-sentence knowledge questions are local reasoning.
-    if _looks_like_network_dns_question(normalized) and not _looks_like_shopping_query(
-        normalized
-    ):
-        return True
+    # Definitional DNS/protocol questions are local reasoning. Live DNS record
+    # lookups (whois/записи/resolve host) still need public sources.
     if _contains_any(
+        normalized,
+        (
+            "whois",
+            "dns запись",
+            "dns-зап",
+            "dns record",
+            "записи домена",
+            "nslookup",
+            "resolve ",
+            "проверь dns",
+            "проверь dns",
+        ),
+    ):
+        pass
+    elif _contains_any(
         normalized,
         (
             "одним предложением",
             "one sentence",
             "что такое",
             "объясни назначение",
-            "назначение",
+            "назначение dns",
+            "назначение dns",
+            "dns это",
+            "domain name system",
+            "система доменных",
         ),
     ) and not _looks_like_shopping_query(normalized):
         return True

@@ -12887,8 +12887,9 @@ def _web_answer_preferred_domains(texts: list[str]) -> list[str]:
         if host:
             _append_unique_domain(domains, host)
     shop_source = find_shop_source(normalized)
-    # Only pin marketplace domains when the question is actually shopping.
-    if shop_source is not None and _web_answer_looks_like_shopping(normalized):
+    # Pin marketplace domains for catalog queries. Educational DNS-protocol
+    # questions that only mention the word DNS must not pin dns-shop.ru.
+    if shop_source is not None and not _web_answer_is_dns_protocol_question(normalized):
         _append_unique_domain(domains, shop_source.domain)
     known_sites = (
         ("avito.ru", (r"\bavito\b", r"\bавито\b")),
@@ -13080,15 +13081,16 @@ def _looks_like_place_lookup_text(normalized: str) -> bool:
     )
 
 
-def _web_answer_looks_like_shopping(normalized: str) -> bool:
-    # Educational / network protocol questions that merely mention DNS must not
-    # be treated as DNS-shop catalog shopping.
-    if any(
+def _web_answer_is_dns_protocol_question(normalized: str) -> bool:
+    """True when DNS means the protocol, not the DNS marketplace."""
+
+    return any(
         marker in normalized
         for marker in (
             "назначение dns",
             "что такое dns",
             "объясни dns",
+            "объясни назначение dns",
             "dns protocol",
             "domain name system",
             "система доменных",
@@ -13096,8 +13098,28 @@ def _web_answer_looks_like_shopping(normalized: str) -> bool:
             "dns over",
             "nslookup",
             "hostname",
+            "dns это",
+            "одним предложением",
+            "one sentence",
         )
-    ):
+    ) and not any(
+        marker in normalized
+        for marker in (
+            "купить",
+            "цена",
+            "rtx",
+            "5090",
+            "товар",
+            "найди",
+            "наличие",
+        )
+    )
+
+
+def _web_answer_looks_like_shopping(normalized: str) -> bool:
+    # Educational / network protocol questions that merely mention DNS must not
+    # be treated as DNS-shop catalog shopping.
+    if _web_answer_is_dns_protocol_question(normalized):
         return False
     return any(
         marker in normalized
@@ -13111,6 +13133,7 @@ def _web_answer_looks_like_shopping(normalized: str) -> bool:
             "магазин",
             "заказать",
             "buy",
+            "найди",
             "\u0446\u0435\u043d",
             "\u0434\u0435\u0448\u0435\u0432",
             "\u0434\u0435\u0448\u0451\u0432",
