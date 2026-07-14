@@ -1,0 +1,8 @@
+blocker_id,description,prior_status,recheck_method,result,evidence
+RB-1,candidate introduced 16 new ruff violations breaking CI lint gate,BLOCKED_then_FIXED,pinned ruff 0.8.4 CI-scope,PASS,ruff.txt (All checks passed exit 0)
+RB-2,SPARK-0005 claimed PASS but clarification failed live,BLOCKED_then_FIXED,live clarification gate,PASS,carried by RB-5/RB-6 gates (ambiguous 6/6 zero side effects)
+RB-1-R,clean jarvis.cmd doctor exited nonzero on healthy stack (internal 180s timeout),BLOCKED_then_FIXED,tree equality on scripts/ (identical to prior accepted candidate),PASS_REUSED,scripts tree identical; prior doctor PASS reused
+RB-3,direct artifact ignored exact filename / false success,BLOCKED_then_FIXED,tree equality + RB-4/RB-5 live gates,PASS,LIVE-2 direct 12/12 exact paths
+RB-4,transform wrote source name / invented dirs / false success,FIXED_prior,live transform gates,PASS,LIVE-2 12/12 zero source-substitution zero invented dirs
+RB-5,transform route non-deterministic (mission/guard misroute),FIXED_prior,deterministic 100/100 + live direct 12/12,PASS,deterministic.txt; LIVE-2 12/12 zero mission zero guard
+RB-6,clarified transform follow-up wrote source name and falsely claimed success (0/3),BLOCKED,typed pending-draft code contract + deterministic + live,PASS,LIVE-1 clarified transform 6/6 exact filename zero source-substitution zero false-success; LIVE-5 no duplicate; LIVE-6 no second convert
