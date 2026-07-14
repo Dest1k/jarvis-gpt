@@ -131,6 +131,12 @@ _MULTI_MARKERS = (
     "all files",
     "documents",
     "files",
+    "сравни",
+    "compare",
+    "оба",
+    "both",
+    " and ",
+    " и ",
 )
 _GENERIC_DOCUMENT_TERMS = {
     "agreement",
@@ -160,6 +166,68 @@ _GENERIC_DOCUMENT_STEMS = (
     "презентац",
     "таблиц",
     "файл",
+)
+# Instruction / filler tokens that must not defeat an exact filename/ID match.
+_IDENTITY_NOISE_TERMS = {
+    "attached",
+    "attachment",
+    "content",
+    "field",
+    "find",
+    "give",
+    "its",
+    "key",
+    "marker",
+    "name",
+    "named",
+    "only",
+    "please",
+    "return",
+    "say",
+    "show",
+    "tell",
+    "that",
+    "this",
+    "value",
+    "which",
+    "значение",
+    "значения",
+    "ключ",
+    "ключа",
+    "маркер",
+    "найди",
+    "назови",
+    "поле",
+    "поля",
+    "приложенном",
+    "приложенный",
+    "приложенная",
+    "приложенные",
+    "скажи",
+    "только",
+    "указано",
+    "указан",
+    "верни",
+    "его",
+    "её",
+    "ее",
+    "ранее",
+    "загружен",
+    "загружена",
+    "загружено",
+    "загружены",
+    "загруженный",
+    "загруженная",
+    "загруженное",
+    "загруженные",
+    "загруженном",
+    "загруженную",
+    "загруженных",
+}
+_FILE_ID_RE = re.compile(r"\bfile_[0-9a-fA-F]{8,}\b")
+_FILENAME_MENTION_RE = re.compile(
+    r"(?<![\w./\\])([\w.-]+\.[A-Za-z0-9]{1,12})(?![\w./\\])",
+    flags=re.UNICODE,
 )
 
 
@@ -358,10 +426,14 @@ class DocumentMemory:
         limit: int,
     ) -> tuple[list[dict[str, Any]], str, list[dict[str, Any]]]:
         errors: list[dict[str, Any]] = []
-        if file_ids:
+        explicit_ids = list(file_ids or [])
+        for mentioned_id in _file_ids_mentioned(query):
+            if mentioned_id not in explicit_ids:
+                explicit_ids.append(mentioned_id)
+        if explicit_ids:
             candidates: list[dict[str, Any]] = []
             seen: set[str] = set()
-            for raw_file_id in file_ids[:limit]:
+            for raw_file_id in explicit_ids[:limit]:
                 file_id = str(raw_file_id or "").strip()
                 if not file_id or file_id in seen:
                     continue
@@ -382,9 +454,38 @@ class DocumentMemory:
             return candidates, "explicit", errors
 
         ranked: dict[str, dict[str, Any]] = {}
+        # Exact basename mentions (including Unicode) are first-class identity.
+        for mention in _filenames_mentioned(query):
+            for record in self.storage.search_files(mention, limit=limit * 3):
+                name = str(record.get("name") or "")
+                if not _names_match_exactly(name, mention):
+                    continue
+                ranked[str(record["id"])] = {
+                    **record,
+                    "match_sources": sorted(
+                        {
+                            *list(record.get("match_sources") or []),
+                            "name",
+                            "exact_filename",
+                        }
+                    ),
+                    "matched_terms": sorted(
+                        {
+                            *list(record.get("matched_terms") or []),
+                            mention,
+                        },
+                        key=str.casefold,
+                    ),
+                    "match_score": max(float(record.get("match_score") or 0.0), 50.0),
+                }
+
         if retrieval_query:
             for record in self.storage.search_files(retrieval_query, limit=limit * 3):
-                ranked[str(record["id"])] = record
+                existing = ranked.get(str(record["id"]))
+                if existing is None or float(record.get("match_score") or 0.0) > float(
+                    existing.get("match_score") or 0.0
+                ):
+                    ranked[str(record["id"])] = record
 
         # A remembered filename may consist only of otherwise generic words
         # (for example "summary.docx").  Use the original request only for
@@ -398,7 +499,7 @@ class DocumentMemory:
             ):
                 ranked[str(record["id"])] = record
 
-        identity_terms = _identity_terms(retrieval_query)
+        identity_terms = _identity_terms(retrieval_query or query)
         candidates = [
             _with_identity_match(item, identity_terms)
             for item in sorted(
@@ -406,10 +507,16 @@ class DocumentMemory:
                 key=lambda item: -float(item.get("match_score") or 0.0),
             )
             if _record_is_supported_document(item)
-            and _passes_identity_threshold(item, identity_terms)
+            and _passes_identity_threshold(item, identity_terms, query=query)
         ][: max(limit + 1, 2)]
         if candidates:
-            if _requests_recent(query) and not _requests_multiple(query):
+            exact_name_count = len(_filenames_mentioned(query))
+            # "earlier/last" collapses only when the operator did not name multiple files.
+            if (
+                _requests_recent(query)
+                and not _requests_multiple(query)
+                and exact_name_count <= 1
+            ):
                 candidates = [max(candidates, key=_document_recency_key)]
             return candidates, "search", errors
 
@@ -488,7 +595,12 @@ def _identity_terms(query: str) -> list[str]:
     terms: list[str] = []
     for token in re.findall(r"[\w-]+", query, flags=re.UNICODE):
         normalized = token.casefold().strip("._-")
-        if not normalized or _is_generic_document_term(normalized):
+        if (
+            not normalized
+            or _is_generic_document_term(normalized)
+            or normalized in _IDENTITY_NOISE_TERMS
+            or any(normalized.startswith(stem) for stem in _RECALL_NOISE_STEMS)
+        ):
             continue
         if normalized not in terms:
             terms.append(normalized)
@@ -501,15 +613,63 @@ def _is_generic_document_term(term: str) -> bool:
     )
 
 
+def _file_ids_mentioned(query: str) -> list[str]:
+    return list(dict.fromkeys(_FILE_ID_RE.findall(str(query or ""))))
+
+
+def _filenames_mentioned(query: str) -> list[str]:
+    mentions: list[str] = []
+    for match in _FILENAME_MENTION_RE.findall(str(query or "")):
+        cleaned = match.strip().strip("\"'`")
+        if cleaned and cleaned not in mentions:
+            mentions.append(cleaned)
+    return mentions
+
+
+def _names_match_exactly(left: str, right: str) -> bool:
+    left_name = Path(str(left or "")).name.casefold()
+    right_name = Path(str(right or "")).name.casefold()
+    return bool(left_name and right_name and left_name == right_name)
+
+
+def _record_has_exact_identity(record: dict[str, Any], query: str) -> bool:
+    """True when the operator named this file or its stable source id exactly."""
+
+    query_cf = str(query or "").casefold()
+    if not query_cf:
+        return False
+    file_id = str(record.get("id") or "").casefold()
+    if file_id and file_id in query_cf:
+        return True
+    name = str(record.get("name") or "")
+    if name and name.casefold() in query_cf:
+        return True
+    for mention in _filenames_mentioned(query):
+        if _names_match_exactly(name, mention):
+            return True
+    if "exact_filename" in set(record.get("match_sources") or []):
+        return True
+    return False
+
+
 def _identity_matches(record: dict[str, Any], identity_terms: list[str]) -> list[str]:
     matched = {str(term).casefold() for term in record.get("matched_terms") or []}
+    name_cf = str(record.get("name") or "").casefold()
+    for token in re.findall(r"[\w.-]+", name_cf, flags=re.UNICODE):
+        cleaned = token.strip("._-")
+        if cleaned:
+            matched.add(cleaned)
     return [term for term in identity_terms if term in matched]
 
 
 def _passes_identity_threshold(
     record: dict[str, Any],
     identity_terms: list[str],
+    *,
+    query: str = "",
 ) -> bool:
+    if _record_has_exact_identity(record, query):
+        return True
     if not identity_terms:
         return True
     matched = _identity_matches(record, identity_terms)
@@ -547,6 +707,15 @@ def _selection_is_ambiguous(
         or _requests_multiple(query)
     ):
         return False
+    exact_mentions = _filenames_mentioned(query)
+    if len(exact_mentions) >= 2:
+        exact_hits = [
+            item for item in candidates if _record_has_exact_identity(item, query)
+        ]
+        # Operator named multiple concrete files: return all exact hits, do not
+        # ask for clarification as if they were competing alternatives.
+        if len(exact_hits) >= 2:
+            return False
     first, second = candidates[:2]
     coverage_gap = float(first.get("identity_coverage") or 0.0) - float(
         second.get("identity_coverage") or 0.0

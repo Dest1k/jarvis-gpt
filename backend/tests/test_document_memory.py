@@ -418,3 +418,88 @@ def test_archive_extracted_pptx_is_indexed_and_recallable(monkeypatch, tmp_path)
     assert recalled.data["sources"][0]["file_id"] == indexed["id"]
     assert "launch checklist" in recalled.data["passages"][0]["content"]
     storage.close()
+
+
+def test_document_memory_exact_filename_survives_instruction_noise(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """SPARK-0007: OP-0026-style prompts must resolve the named uploaded file."""
+
+    settings, storage, surfer = _runtime(monkeypatch, tmp_path)
+    path = tmp_path / "synthetic-fact-1.txt"
+    path.write_text("audit_marker=AM-CONTROL-1\nowner=fixture\n", encoding="utf-8")
+    record = FileIngestor(settings, storage).ingest_path(path)["file"]
+    # Distractor with overlapping tokens must not win or block exact name.
+    distractor = tmp_path / "synthetic-fact-2.txt"
+    distractor.write_text("audit_marker=AM-OTHER\n", encoding="utf-8")
+    FileIngestor(settings, storage).ingest_path(distractor)
+
+    result = DocumentMemory(storage=storage, surfer=surfer).recall(
+        "В приложенном файле synthetic-fact-1.txt найди значение поля "
+        "audit_marker и верни только его."
+    )
+
+    assert result["ok"] is True
+    assert result["sources"][0]["file_id"] == record["id"]
+    assert result["sources"][0]["name"] == "synthetic-fact-1.txt"
+    assert "AM-CONTROL-1" in result["passages"][0]["content"]
+    storage.close()
+
+
+def test_document_memory_prior_upload_resolves_by_exact_id_and_unicode_name(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """SPARK-0007: prior-upload recall by stable ID and Unicode basename."""
+
+    settings, storage, surfer = _runtime(monkeypatch, tmp_path)
+    path = tmp_path / "кампания-recall-1.txt"
+    path.write_text("retention_code=RC-UNIC-1\nowner=prior\n", encoding="utf-8")
+    record = FileIngestor(settings, storage).ingest_path(path)["file"]
+
+    by_id = DocumentMemory(storage=storage, surfer=surfer).recall(
+        f"В ранее загруженном файле {record['id']} назови retention_code"
+    )
+    by_name = DocumentMemory(storage=storage, surfer=surfer).recall(
+        "В новом диалоге найди ранее загруженный кампания-recall-1.txt и "
+        "скажи, какое значение указано у ключа retention_code."
+    )
+
+    assert by_id["ok"] is True
+    assert by_id["sources"][0]["file_id"] == record["id"]
+    assert by_id["selection"]["mode"] == "explicit"
+    assert "RC-UNIC-1" in by_id["passages"][0]["content"]
+
+    assert by_name["ok"] is True
+    assert by_name["sources"][0]["file_id"] == record["id"]
+    assert by_name["sources"][0]["name"] == "кампания-recall-1.txt"
+    assert "RC-UNIC-1" in by_name["passages"][0]["content"]
+    storage.close()
+
+
+def test_document_memory_mission_pair_resolves_both_exact_names(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """SPARK-0007: mission compare inputs bind to exact prior-upload IDs."""
+
+    settings, storage, surfer = _runtime(monkeypatch, tmp_path)
+    alpha = tmp_path / "mission-alpha.txt"
+    beta = tmp_path / "mission-beta.txt"
+    alpha.write_text("side=alpha\nmarker=A1\n", encoding="utf-8")
+    beta.write_text("side=beta\nmarker=B1\n", encoding="utf-8")
+    alpha_id = FileIngestor(settings, storage).ingest_path(alpha)["file"]["id"]
+    beta_id = FileIngestor(settings, storage).ingest_path(beta)["file"]["id"]
+
+    result = DocumentMemory(storage=storage, surfer=surfer).recall(
+        "сравни содержимое ранее загруженных mission-alpha.txt и mission-beta.txt",
+        max_files=3,
+    )
+
+    assert result["ok"] is True
+    source_ids = {item["file_id"] for item in result["sources"]}
+    source_names = {item["name"] for item in result["sources"]}
+    assert source_ids == {alpha_id, beta_id}
+    assert source_names == {"mission-alpha.txt", "mission-beta.txt"}
+    storage.close()
