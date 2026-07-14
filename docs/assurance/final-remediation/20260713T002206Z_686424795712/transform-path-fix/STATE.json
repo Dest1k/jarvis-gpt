@@ -1,0 +1,47 @@
+{
+  "run_id": "20260713T002206Z_686424795712",
+  "blocker": "RB-4",
+  "status": "FINAL_TRANSFORM_PATH_CANDIDATE_FOR_REVIEW",
+  "base_candidate": "38f606fcef9e7947c14b62a9a815da6445f4196e",
+  "branch": "fix/final-transform-path/20260713T002206Z_686424795712",
+  "worktree": "D:\\jarvis-gpt-worktrees\\final-transform-fix-20260713T002206Z_686424795712",
+  "production_commit": "18f15c0dcb96d096a0e484d0d5a22f78e424c6ff",
+  "production_subject": "fix: bind document transforms to verified exact destinations",
+  "assurance_commit_subject": "assurance: record final transform-path remediation",
+  "scope_files": [
+    "backend/src/jarvis_gpt/agent.py",
+    "backend/src/jarvis_gpt/tools.py",
+    "backend/tests/test_rb4_transform_path.py"
+  ],
+  "frontend_tree": "bf6cb7cefff8ccea7edab7952e7c476980647567",
+  "frontend_tree_equal_to_accepted": true,
+  "live_acceptance": {
+    "transform": "6/6",
+    "negative_mismatched_path": "3/3",
+    "existing_document_recall": "3/3",
+    "direct_new_artifact": "3/3",
+    "ambiguous_clarification": "3/3",
+    "follow_up_artifact": "3/3",
+    "source_unchanged": true,
+    "runtime_home": "D:\\jarvis\\audit-backups\\20260713T002206Z_686424795712\\final-transform-fix\\runtime-home",
+    "evidence": "D:\\jarvis\\audit-backups\\20260713T002206Z_686424795712\\final-transform-fix\\live-results\\live-acceptance.json"
+  },
+  "validation": {
+    "backend_pytest": "891 passed, 13 skipped",
+    "qa_pytest": "218 passed, 3 skipped",
+    "ruff": "0.8.4 all checks passed",
+    "compileall": "exit 0",
+    "git_diff_check": "clean",
+    "secret_scan_hits": 0
+  },
+  "constraints": {
+    "no_push": true,
+    "no_merge": true,
+    "no_attestation": true,
+    "no_ready": true,
+    "no_subagents": true,
+    "no_31b": true,
+    "main_untouched": true
+  },
+  "assurance_commit": "BRANCH_TIP (git log -1 on fix/final-transform-path/20260713T002206Z_686424795712)"
+}

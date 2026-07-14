@@ -1,0 +1,4 @@
+sha,subject,role,blocker,files
+38f606fcef9e7947c14b62a9a815da6445f4196e,assurance: record final doctor and artifact fixes,base_candidate,RB-1-R+RB-3,docs
+18f15c0dcb96d096a0e484d0d5a22f78e424c6ff,fix: bind document transforms to verified exact destinations,production_fix,RB-4,"backend/src/jarvis_gpt/agent.py;backend/src/jarvis_gpt/tools.py;backend/tests/test_rb4_transform_path.py"
+BRANCH_TIP,assurance: record final transform-path remediation,documentation_evidence,RB-4,docs/assurance/final-remediation/20260713T002206Z_686424795712/transform-path-fix/*
