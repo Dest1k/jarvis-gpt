@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import difflib
+import hashlib
 import html
 import mimetypes
 import re
 import shutil
 import zipfile
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
@@ -57,6 +59,8 @@ _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _A_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 _R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 _REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+_CP_NS = "http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
+_DC_NS = "http://purl.org/dc/elements/1.1/"
 _UNSAFE_XML_DECLARATION = re.compile(r"<!\s*(?:DOCTYPE|ENTITY)\b", re.IGNORECASE)
 
 
@@ -207,6 +211,383 @@ def copy_document(path: Path, output_path: Path) -> dict[str, Any]:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(path, output_path)
     return {"path": str(output_path), "size": output_path.stat().st_size}
+
+
+def file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def resolve_artifact_output_path(
+    output_root: Path,
+    *,
+    output_path: str | Path | None = None,
+    output_name: str | None = None,
+    default_name: str = "artifact.md",
+    collision_safe: bool = True,
+) -> Path:
+    """Bind an operator-requested destination under the document-outputs root.
+
+    Accepts absolute paths inside the root, root-relative paths with
+    subdirectories (for example ``functional-20260713/report.md``), or a
+    simple basename. Never rewrites sources; only allocates under
+    ``output_root``.
+    """
+
+    root = Path(output_root).resolve(strict=False)
+    root.mkdir(parents=True, exist_ok=True)
+    destination: Path | None = None
+    raw_path = str(output_path or "").strip()
+    raw_name = str(output_name or "").strip()
+    if raw_path:
+        candidate = Path(raw_path)
+        if candidate.is_absolute():
+            destination = candidate.resolve(strict=False)
+        else:
+            destination = (root / candidate).resolve(strict=False)
+    elif raw_name:
+        # Preserve relative subdirectories from output_name when present.
+        name_path = Path(raw_name.replace("\\", "/"))
+        safe_parts = [
+            re.sub(r"[^\w.\- ()\[\]]+", "_", part).strip(" .")
+            for part in name_path.parts
+            if part not in {"", ".", ".."}
+        ]
+        if not safe_parts:
+            safe_parts = [_safe_artifact_filename(default_name)]
+        else:
+            safe_parts[-1] = _safe_artifact_filename(safe_parts[-1]) or safe_parts[-1]
+        destination = (root.joinpath(*safe_parts)).resolve(strict=False)
+    else:
+        destination = (root / _safe_artifact_filename(default_name)).resolve(strict=False)
+
+    try:
+        destination.relative_to(root)
+    except ValueError as exc:
+        raise DocumentRuntimeError(
+            f"output path escapes document-outputs root: {destination}"
+        ) from exc
+    if destination.exists() and destination.is_dir():
+        raise DocumentRuntimeError(f"output_path is a directory: {destination}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists() and collision_safe:
+        stamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
+        destination = destination.with_name(
+            f"{destination.stem}.{stamp}{destination.suffix}"
+        )
+    return destination
+
+
+def write_exact_text_artifact(
+    output_path: Path,
+    body: str,
+    *,
+    encoding: str = "utf-8",
+) -> dict[str, Any]:
+    """Write operator body bytes-for-bytes (UTF-8 text) without generator wrappers."""
+
+    destination = Path(output_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    text = str(body if body is not None else "")
+    if not text.endswith("\n"):
+        text = text + "\n"
+    destination.write_text(text, encoding=encoding, newline="\n")
+    verification = verify_document_artifact(destination, expected_format="text")
+    return {
+        "path": str(destination),
+        "name": destination.name,
+        "size": destination.stat().st_size,
+        "sha256": file_sha256(destination),
+        "exact_body": True,
+        "verification": verification,
+    }
+
+
+def write_markdown_docx(
+    output_path: Path,
+    markdown_text: str,
+    *,
+    title: str | None = None,
+) -> dict[str, Any]:
+    """Convert Markdown text into a structurally valid DOCX with headings/tables."""
+
+    destination = Path(output_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    blocks = _parse_markdown_blocks(markdown_text)
+    if title and not any(block.get("type") == "heading" for block in blocks[:1]):
+        blocks.insert(0, {"type": "heading", "level": 1, "text": title})
+    _write_structured_docx(destination, blocks, title=title or "Document")
+    verification = verify_document_artifact(destination, expected_format="docx")
+    extracted = extract_document(destination)
+    structure = dict(extracted.get("structure") or {})
+    return {
+        "path": str(destination),
+        "name": destination.name,
+        "size": destination.stat().st_size,
+        "sha256": file_sha256(destination),
+        "format": "docx",
+        "structure": structure,
+        "verification": verification,
+        "heading_count": len(
+            [block for block in blocks if block.get("type") == "heading"]
+        ),
+        "table_count": len([block for block in blocks if block.get("type") == "table"]),
+    }
+
+
+def verify_document_artifact(
+    path: Path,
+    *,
+    expected_format: str | None = None,
+) -> dict[str, Any]:
+    """Post-write verification: existence, non-empty, and structural validity."""
+
+    target = Path(path)
+    if not target.exists() or not target.is_file():
+        raise DocumentRuntimeError(f"claimed artifact missing: {target}")
+    size = target.stat().st_size
+    if size <= 0:
+        raise DocumentRuntimeError(f"claimed artifact is empty: {target}")
+    fmt = (expected_format or target.suffix.lstrip(".") or "bin").lower()
+    if fmt == "markdown":
+        fmt = "md"
+    result: dict[str, Any] = {
+        "path": str(target),
+        "exists": True,
+        "size": size,
+        "sha256": file_sha256(target),
+        "format": fmt,
+        "ok": True,
+    }
+    if fmt == "docx":
+        if not zipfile.is_zipfile(target):
+            raise DocumentRuntimeError(f"DOCX is not a valid ZIP package: {target}")
+        with zipfile.ZipFile(target) as archive:
+            names = archive.namelist()
+            if len(names) != len(set(names)):
+                raise DocumentRuntimeError(f"DOCX has duplicate ZIP members: {target}")
+            required = {
+                "[Content_Types].xml",
+                "_rels/.rels",
+                "word/document.xml",
+            }
+            missing = sorted(required - set(names))
+            if missing:
+                raise DocumentRuntimeError(
+                    f"DOCX missing required members {missing}: {target}"
+                )
+            document_xml = archive.read("word/document.xml")
+            try:
+                ET.fromstring(document_xml)
+            except ET.ParseError as exc:
+                raise DocumentRuntimeError(
+                    f"DOCX word/document.xml is not well-formed: {exc}"
+                ) from exc
+            result["zip_members"] = len(names)
+            result["has_document_xml"] = True
+    elif fmt in {"md", "txt", "text", "csv", "json", "html", "htm"}:
+        # Strict UTF-8 decode proves text artifacts are not binary garbage.
+        target.read_text(encoding="utf-8")
+        result["utf8"] = True
+    return result
+
+
+def _safe_artifact_filename(value: str) -> str:
+    cleaned = re.sub(r"[^\w.\- ()\[\]]+", "_", Path(str(value or "")).name).strip(" .")
+    return cleaned[:180] or "artifact.bin"
+
+
+def _parse_markdown_blocks(markdown_text: str) -> list[dict[str, Any]]:
+    lines = str(markdown_text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    blocks: list[dict[str, Any]] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        heading = re.match(r"^(#{1,6})\s+(.*)$", line)
+        if heading:
+            blocks.append(
+                {
+                    "type": "heading",
+                    "level": len(heading.group(1)),
+                    "text": heading.group(2).strip(),
+                }
+            )
+            index += 1
+            continue
+        if "|" in line and index + 1 < len(lines) and re.match(
+            r"^\s*\|?\s*:?-{3,}",
+            lines[index + 1],
+        ):
+            table_lines = [line]
+            index += 1
+            while index < len(lines) and "|" in lines[index]:
+                table_lines.append(lines[index])
+                index += 1
+            rows = _markdown_table_rows(table_lines)
+            if rows:
+                blocks.append({"type": "table", "rows": rows})
+            continue
+        if not line.strip():
+            blocks.append({"type": "empty"})
+            index += 1
+            continue
+        # Paragraph: accumulate until blank/heading/table.
+        paragraph_lines = [line.rstrip()]
+        index += 1
+        while index < len(lines):
+            nxt = lines[index]
+            if (
+                not nxt.strip()
+                or re.match(r"^(#{1,6})\s+", nxt)
+                or (
+                    "|" in nxt
+                    and index + 1 < len(lines)
+                    and re.match(r"^\s*\|?\s*:?-{3,}", lines[index + 1])
+                )
+            ):
+                break
+            paragraph_lines.append(nxt.rstrip())
+            index += 1
+        blocks.append({"type": "paragraph", "text": " ".join(paragraph_lines).strip()})
+    return blocks
+
+
+def _markdown_table_rows(table_lines: list[str]) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for line_index, line in enumerate(table_lines):
+        stripped = line.strip().strip("|")
+        cells = [cell.strip() for cell in stripped.split("|")]
+        if line_index == 1 and cells and all(re.match(r"^:?-{3,}:?$", cell) for cell in cells):
+            continue
+        if any(cells):
+            rows.append(cells)
+    return rows
+
+
+def _write_structured_docx(
+    path: Path,
+    blocks: list[dict[str, Any]],
+    *,
+    title: str,
+) -> None:
+    body_xml: list[str] = []
+    for block in blocks:
+        kind = str(block.get("type") or "")
+        if kind == "heading":
+            level = max(1, min(6, int(block.get("level") or 1)))
+            text = html.escape(str(block.get("text") or ""), quote=False)
+            style = f"Heading{level}"
+            body_xml.append(
+                f'<w:p><w:pPr><w:pStyle w:val="{style}"/></w:pPr>'
+                f'<w:r><w:t xml:space="preserve">{text}</w:t></w:r></w:p>'
+            )
+        elif kind == "table":
+            rows = list(block.get("rows") or [])
+            if not rows:
+                continue
+            row_xml: list[str] = []
+            for row in rows:
+                cells = list(row)
+                cell_xml = []
+                for cell in cells:
+                    cell_text = html.escape(str(cell), quote=False)
+                    cell_xml.append(
+                        "<w:tc><w:tcPr><w:tcW w:w=\"2400\" w:type=\"dxa\"/></w:tcPr>"
+                        f'<w:p><w:r><w:t xml:space="preserve">{cell_text}</w:t></w:r></w:p>'
+                        "</w:tc>"
+                    )
+                row_xml.append(f"<w:tr>{''.join(cell_xml)}</w:tr>")
+            col_count = max(len(row) for row in rows)
+            grid = "".join('<w:gridCol w:w="2400"/>' for _ in range(col_count))
+            body_xml.append(
+                f'<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/></w:tblPr>'
+                f"<w:tblGrid>{grid}</w:tblGrid>{''.join(row_xml)}</w:tbl>"
+            )
+        elif kind == "empty":
+            body_xml.append("<w:p/>")
+        else:
+            text = html.escape(str(block.get("text") or ""), quote=False)
+            if not text:
+                body_xml.append("<w:p/>")
+            else:
+                body_xml.append(
+                    f'<w:p><w:r><w:t xml:space="preserve">{text}</w:t></w:r></w:p>'
+                )
+    if not body_xml:
+        body_xml.append(
+            f'<w:p><w:r><w:t xml:space="preserve">{html.escape(title)}</w:t></w:r></w:p>'
+        )
+    document_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<w:document xmlns:w="{_W_NS}"><w:body>'
+        + "".join(body_xml)
+        + '<w:sectPr><w:pgSz w:w="12240" w:h="15840"/>'
+        '<w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440"/>'
+        "</w:sectPr></w:body></w:document>"
+    )
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" '
+        'ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/word/document.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+        '<Override PartName="/word/styles.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>'
+        '<Override PartName="/docProps/core.xml" '
+        'ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>'
+        "</Types>"
+    )
+    rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<Relationships xmlns="{_REL_NS}">'
+        '<Relationship Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+        'Target="word/document.xml"/>'
+        '<Relationship Id="rId2" '
+        'Type="http://schemas.openxmlformats.org/package/2006/'
+        'relationships/metadata/core-properties" '
+        'Target="docProps/core.xml"/>'
+        "</Relationships>"
+    )
+    styles = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<w:styles xmlns:w="{_W_NS}">'
+        '<w:style w:type="paragraph" w:styleId="Normal">'
+        '<w:name w:val="Normal"/></w:style>'
+        + "".join(
+            f'<w:style w:type="paragraph" w:styleId="Heading{level}">'
+            f'<w:name w:val="heading {level}"/>'
+            f'<w:basedOn w:val="Normal"/>'
+            f'<w:uiPriority w:val="{level}"/>'
+            f"</w:style>"
+            for level in range(1, 7)
+        )
+        + "</w:styles>"
+    )
+    word_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<Relationships xmlns="{_REL_NS}">'
+        '<Relationship Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" '
+        'Target="styles.xml"/>'
+        "</Relationships>"
+    )
+    core = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<cp:coreProperties xmlns:cp="{_CP_NS}" xmlns:dc="{_DC_NS}">'
+        f"<dc:title>{html.escape(title)}</dc:title>"
+        "<dc:creator>jarvis</dc:creator>"
+        "<cp:lastModifiedBy>jarvis</cp:lastModifiedBy>"
+        "</cp:coreProperties>"
+    )
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", content_types)
+        archive.writestr("_rels/.rels", rels)
+        archive.writestr("word/document.xml", document_xml)
+        archive.writestr("word/styles.xml", styles)
+        archive.writestr("word/_rels/document.xml.rels", word_rels)
+        archive.writestr("docProps/core.xml", core)
 
 
 def _extract_docx(path: Path) -> dict[str, Any]:

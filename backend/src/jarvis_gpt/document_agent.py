@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .document_runtime import resolve_artifact_output_path, write_exact_text_artifact, write_markdown_docx
 from .document_surfer import (
     DocumentGenerationError,
     DocumentSurferConfig,
@@ -29,6 +30,9 @@ class DocumentGenerationRequest:
     body: str | None = None
     title: str | None = None
     output_dir: str | Path | None = None
+    output_path: str | Path | None = None
+    output_name: str | None = None
+    exact_body: bool = True
     sections: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -112,11 +116,55 @@ class DocumentAgent:
         if output_dir is not None:
             self.surfer.config.output_dir = Path(output_dir)
 
+        body_text = "\n\n".join(part for part in body_parts if part).strip() or title
+        fmt = str(request.output_format or "md").strip().lower()
+        if fmt == "markdown":
+            fmt = "md"
+        base_dir = Path(output_dir) if output_dir is not None else (
+            self.surfer.config.output_dir or Path.cwd() / "document-outputs"
+        )
+        destination = resolve_artifact_output_path(
+            base_dir,
+            output_path=request.output_path,
+            output_name=request.output_name,
+            default_name=f"document.{fmt}",
+            collision_safe=True,
+        )
+
         try:
+            if fmt in {"md", "txt"} and request.exact_body and request.body:
+                written = write_exact_text_artifact(destination, str(request.body))
+                return GeneratedDocument(
+                    output_path=str(written["path"]),
+                    format=fmt,
+                    summary=f"Generated exact {fmt} for: {request.task}. Path: {written['path']}"[
+                        :850
+                    ],
+                    key_sections=[title],
+                    citations=list(request.web_research_ids),
+                    size=int(written["size"]),
+                    sha256=written.get("sha256"),
+                    warnings=[],
+                )
+            if fmt == "docx" and ("#" in body_text or "|" in body_text):
+                written = write_markdown_docx(destination, body_text, title=title)
+                structure = written.get("structure") or {}
+                headings = list(structure.get("headings") or []) or [title]
+                return GeneratedDocument(
+                    output_path=str(written["path"]),
+                    format="docx",
+                    summary=f"Generated docx for: {request.task}. Path: {written['path']}"[:850],
+                    key_sections=headings[:12],
+                    citations=list(request.web_research_ids),
+                    size=int(written["size"]),
+                    sha256=written.get("sha256"),
+                    warnings=[],
+                )
             result = self.surfer.generate(
                 title=title,
-                body="\n\n".join(part for part in body_parts if part).strip() or title,
-                output_format=request.output_format,
+                body=body_text,
+                output_format=fmt,
+                output_path=destination,
                 sections=request.sections or None,
                 metadata={
                     "task": request.task,

@@ -51,9 +51,15 @@ from .document_runtime import (
     DocumentRuntimeError,
     apply_document_replacements,
     compare_documents,
+    copy_document,
     document_mime_type,
     extract_document,
+    file_sha256,
     is_supported_document,
+    resolve_artifact_output_path,
+    verify_document_artifact,
+    write_exact_text_artifact,
+    write_markdown_docx,
 )
 from .document_surfer import (
     DocumentGenerationError,
@@ -1488,17 +1494,21 @@ class ToolRegistry:
                 name="documents.generate",
                 description=(
                     "Generate a new document artifact (md/txt/csv/json/html/docx/xlsx) under "
-                    "document-outputs. Never overwrites source files."
+                    "document-outputs. Honors exact output_path/output_name including "
+                    "subdirectories. Never overwrites source files."
                 ),
                 category="documents",
                 input_schema={
                     "title": "Document title",
-                    "body": "Main body text or list of sections",
+                    "body": "Main body text or list of sections (written exactly for md/txt)",
                     "output_format": "md|txt|csv|json|html|docx|xlsx",
-                    "output_name": "Optional output filename",
+                    "output_name": "Optional output filename or root-relative path",
+                    "output_path": "Optional absolute/relative destination under document-outputs",
+                    "destination": "Alias of output_path",
                     "sections": "Optional list of {heading,body}",
                     "source_paths": "Optional source paths to include in context outline",
                     "source_file_ids": "Optional source file ids for context outline",
+                    "exact_body": "When true (default for md/txt body), write body without generator wrappers",
                 },
                 handler=_documents_generate,
             )
@@ -1508,14 +1518,17 @@ class ToolRegistry:
                 name="documents.convert",
                 description=(
                     "Convert a document by extracting text and regenerating in another "
-                    "supported format (md/txt/csv/json/html/docx/xlsx)."
+                    "supported format (md/txt/csv/json/html/docx/xlsx). Markdown-to-DOCX "
+                    "preserves headings and tables as native structure."
                 ),
                 category="documents",
                 input_schema={
                     "file_id": "Source uploaded/indexed file id",
                     "path": "Source local path",
                     "output_format": "Target format",
-                    "output_name": "Optional output filename",
+                    "output_name": "Optional output filename or root-relative path",
+                    "output_path": "Optional absolute/relative destination under document-outputs",
+                    "destination": "Alias of output_path",
                     "max_chars": "Maximum extracted characters from source",
                 },
                 handler=_documents_convert,
@@ -4958,7 +4971,14 @@ def _documents_generate(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
     if body is None:
         body = str(args.get("text") or args.get("content") or "")
     output_format = str(args.get("output_format") or args.get("format") or "md").strip().lower()
+    if output_format == "markdown":
+        output_format = "md"
+    if output_format == "text":
+        output_format = "txt"
     sections = args.get("sections") if isinstance(args.get("sections"), list) else None
+    exact_body = args.get("exact_body")
+    if exact_body is None:
+        exact_body = True
     try:
         source_paths: list[Path] = []
         if args.get("source_paths") or args.get("source_file_ids"):
@@ -4973,17 +4993,78 @@ def _documents_generate(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
         if source_paths and (not body or (isinstance(body, str) and not body.strip())):
             corpus = surfer.summarize_corpus(source_paths)
             body = corpus.get("combined_outline") or corpus.get("markdown") or title
-        result = surfer.generate(
-            title=title,
-            body=body if body is not None else title,
-            output_format=output_format,
-            output_name=args.get("output_name"),
-            sections=sections,
-            metadata={"source_paths": [str(path) for path in source_paths]},
+            exact_body = False
+        default_name = f"{_safe_output_stem(title)}.{output_format}"
+        destination = _resolve_document_destination(
+            ctx,
+            args,
+            default_name=default_name,
+            default_suffix=f".{output_format}",
         )
-        output_path = Path(str((result.get("output") or {}).get("path") or ""))
+        body_text = body if isinstance(body, str) else str(body or "")
+        if output_format in {"md", "txt"} and exact_body and body_text.strip():
+            written = write_exact_text_artifact(destination, body_text)
+            result = {
+                "ok": True,
+                "mode": "generate",
+                "output": {
+                    "path": written["path"],
+                    "name": written["name"],
+                    "format": output_format,
+                    "size": written["size"],
+                    "sha256": written["sha256"],
+                },
+                "title": title,
+                "exact_body": True,
+                "verification": written["verification"],
+                "structure": {},
+                "warnings": [],
+            }
+            output_path = Path(written["path"])
+        elif output_format == "docx" and body_text.strip() and (
+            "#" in body_text or "|" in body_text
+        ):
+            written = write_markdown_docx(destination, body_text, title=title)
+            result = {
+                "ok": True,
+                "mode": "generate",
+                "output": {
+                    "path": written["path"],
+                    "name": written["name"],
+                    "format": "docx",
+                    "size": written["size"],
+                    "sha256": written["sha256"],
+                },
+                "title": title,
+                "structure": written.get("structure") or {},
+                "verification": written["verification"],
+                "warnings": [],
+            }
+            output_path = Path(written["path"])
+        else:
+            result = surfer.generate(
+                title=title,
+                body=body if body is not None else title,
+                output_format=output_format,
+                output_path=destination,
+                output_name=None,
+                sections=sections,
+                metadata={"source_paths": [str(path) for path in source_paths]},
+            )
+            output_path = Path(str((result.get("output") or {}).get("path") or ""))
+            if output_path.exists():
+                result["verification"] = verify_document_artifact(
+                    output_path,
+                    expected_format=output_format,
+                )
         file_record = _record_generated_document(ctx, output_path) if output_path.exists() else None
-    except (ValueError, DocumentSurferError, DocumentGenerationError, OSError) as exc:
+    except (
+        ValueError,
+        DocumentRuntimeError,
+        DocumentSurferError,
+        DocumentGenerationError,
+        OSError,
+    ) as exc:
         return ToolRunResponse(tool="documents.generate", ok=False, summary=str(exc))
     return ToolRunResponse(
         tool="documents.generate",
@@ -4999,18 +5080,107 @@ def _documents_generate(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
 def _documents_convert(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     max_chars = _int_arg(args.get("max_chars"), default=80000, minimum=500, maximum=200000)
     output_format = str(args.get("output_format") or args.get("format") or "md").strip().lower()
+    if output_format == "markdown":
+        output_format = "md"
+    if output_format == "text":
+        output_format = "txt"
     try:
         target = _document_target(ctx, args, max_chars=max_chars)
-        surfer = _document_surfer_for(ctx)
-        result = surfer.convert(
-            target["path"],
-            output_format=output_format,
-            output_name=args.get("output_name"),
-            max_chars=max_chars,
+        source_path = Path(target["path"])
+        source_hash_before = file_sha256(source_path)
+        destination = _resolve_document_destination(
+            ctx,
+            args,
+            default_name=f"{source_path.stem}.{output_format}",
+            default_suffix=f".{output_format}",
         )
-        output_path = Path(str((result.get("output") or {}).get("path") or ""))
+        source_kind = str((target.get("document") or {}).get("kind") or source_path.suffix.lstrip("."))
+        source_text = str(target.get("text") or "")
+        if not source_text.strip() and source_path.suffix.lower() in {".md", ".txt", ".markdown"}:
+            source_text = source_path.read_text(encoding="utf-8", errors="replace")
+        if output_format == "docx" and (
+            source_kind in {"md", "markdown", "txt", "text"}
+            or source_path.suffix.lower() in {".md", ".markdown", ".txt"}
+            or source_text.lstrip().startswith("#")
+            or "|" in source_text
+        ):
+            # Prefer raw markdown source so headings/tables are not flattened.
+            if source_path.suffix.lower() in {".md", ".markdown"}:
+                markdown_body = source_path.read_text(encoding="utf-8", errors="replace")
+            else:
+                markdown_body = source_text
+            written = write_markdown_docx(
+                destination,
+                markdown_body,
+                title=source_path.stem,
+            )
+            result = {
+                "ok": True,
+                "mode": "convert",
+                "output": {
+                    "path": written["path"],
+                    "name": written["name"],
+                    "format": "docx",
+                    "size": written["size"],
+                    "sha256": written["sha256"],
+                },
+                "structure": written.get("structure") or {},
+                "verification": written["verification"],
+                "source_sha256_before": source_hash_before,
+                "source_sha256_after": file_sha256(source_path),
+                "source_unchanged": file_sha256(source_path) == source_hash_before,
+            }
+            output_path = Path(written["path"])
+        elif output_format == source_path.suffix.lstrip(".").lower() or (
+            args.get("copy_only") is True
+        ):
+            copied = copy_document(source_path, destination)
+            verification = verify_document_artifact(
+                Path(copied["path"]),
+                expected_format=output_format or source_path.suffix.lstrip("."),
+            )
+            result = {
+                "ok": True,
+                "mode": "copy",
+                "output": {
+                    "path": copied["path"],
+                    "name": Path(copied["path"]).name,
+                    "format": output_format,
+                    "size": copied["size"],
+                    "sha256": file_sha256(Path(copied["path"])),
+                },
+                "verification": verification,
+                "source_sha256_before": source_hash_before,
+                "source_sha256_after": file_sha256(source_path),
+                "source_unchanged": file_sha256(source_path) == source_hash_before,
+            }
+            output_path = Path(copied["path"])
+        else:
+            surfer = _document_surfer_for(ctx)
+            result = surfer.convert(
+                source_path,
+                output_format=output_format,
+                output_path=destination,
+                output_name=None,
+                max_chars=max_chars,
+            )
+            output_path = Path(str((result.get("output") or {}).get("path") or ""))
+            if output_path.exists():
+                result["verification"] = verify_document_artifact(
+                    output_path,
+                    expected_format=output_format,
+                )
+            result["source_sha256_before"] = source_hash_before
+            result["source_sha256_after"] = file_sha256(source_path)
+            result["source_unchanged"] = file_sha256(source_path) == source_hash_before
         file_record = _record_generated_document(ctx, output_path) if output_path.exists() else None
-    except (ValueError, DocumentSurferError, DocumentGenerationError, OSError) as exc:
+    except (
+        ValueError,
+        DocumentRuntimeError,
+        DocumentSurferError,
+        DocumentGenerationError,
+        OSError,
+    ) as exc:
         return ToolRunResponse(tool="documents.convert", ok=False, summary=str(exc))
     return ToolRunResponse(
         tool="documents.convert",
@@ -10297,17 +10467,43 @@ def _document_output_path(settings: JarvisSettings, source: Path, output_name: A
     output_dir = settings.data_dir / DOCUMENT_OUTPUT_DIRNAME
     suffix = source.suffix or ".txt"
     raw_name = str(output_name or "").strip()
-    if raw_name:
-        safe_name = re.sub(r"[^\w.\- ()\[\]]+", "_", Path(raw_name).name).strip(" .")
-        if not Path(safe_name).suffix:
-            safe_name = f"{safe_name}{suffix}"
-    else:
-        safe_name = f"{source.stem}.edited{suffix}"
-    safe_name = safe_name[:180] or f"edited{suffix}"
-    candidate = output_dir / safe_name
-    if not candidate.exists():
-        return candidate
-    return output_dir / f"{candidate.stem}.{new_id('doc')}{candidate.suffix}"
+    default_name = f"{source.stem}.edited{suffix}"
+    if raw_name and not Path(raw_name).suffix:
+        raw_name = f"{raw_name}{suffix}"
+    return resolve_artifact_output_path(
+        output_dir,
+        output_name=raw_name or default_name,
+        default_name=default_name,
+        collision_safe=True,
+    )
+
+
+def _safe_output_stem(value: str) -> str:
+    cleaned = re.sub(r"[^\w.\- ()\[\]]+", "_", str(value or "").strip()).strip(" .")
+    return (cleaned or "document")[:120]
+
+
+def _resolve_document_destination(
+    ctx: ToolContext,
+    args: dict[str, Any],
+    *,
+    default_name: str,
+    default_suffix: str,
+) -> Path:
+    output_root = ctx.settings.data_dir / DOCUMENT_OUTPUT_DIRNAME
+    raw_path = args.get("output_path") or args.get("destination")
+    raw_name = args.get("output_name")
+    if raw_name and not Path(str(raw_name)).suffix and default_suffix:
+        raw_name = f"{raw_name}{default_suffix}"
+    if not raw_path and not raw_name:
+        raw_name = default_name
+    return resolve_artifact_output_path(
+        output_root,
+        output_path=raw_path,
+        output_name=raw_name,
+        default_name=default_name,
+        collision_safe=True,
+    )
 
 
 def _record_generated_document(ctx: ToolContext, path: Path) -> dict[str, Any]:
