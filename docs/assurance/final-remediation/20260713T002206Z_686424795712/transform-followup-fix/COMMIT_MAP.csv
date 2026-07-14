@@ -1,0 +1,4 @@
+sha,role,subject,parent
+d2372de0e7c3c5e6d3c3314f3ec489e618474946,base,assurance: record deterministic transform routing,91b557f95c2ec6b8fc97aae62be7fbaf3fb602fe
+956411609f04977ce2625942415b383095f98aa8,fix,fix: resume clarified transforms through typed pending state,d2372de0e7c3c5e6d3c3314f3ec489e618474946
+a67e9dab6688a24441d87eb692c21ecdb8d65b91,assurance,assurance: record clarified transform continuation,956411609f04977ce2625942415b383095f98aa8
