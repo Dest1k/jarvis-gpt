@@ -1,0 +1,79 @@
+{
+  "schema_version": "1.0",
+  "run_id": "20260713T002206Z_686424795712",
+  "state": "ASSURANCE_FOUNDATION_REMEDIATION_CANDIDATE_FOR_REVIEW",
+  "base_commit": "7d4a4757df9aa3264fd16caf439e40588c375fee",
+  "branch": "fix/assurance-foundation/20260713T002206Z_686424795712",
+  "final_head": {
+    "resolution": "git rev-parse HEAD",
+    "scope": "the commit containing this document",
+    "literal_self_hash_embedded": false
+  },
+  "commits": [
+    {
+      "batch": "A",
+      "commit": "e9a316de16f6c7d4ea1f595417846d30b2041e33",
+      "blockers": ["B01", "B02", "B04", "B06"]
+    },
+    {
+      "batch": "B",
+      "commit": "ddf282aee94b6af27aeab2e0fc117303ba1a203a",
+      "blockers": ["B03", "B05"]
+    },
+    {
+      "batch": "C",
+      "commit": "593f5805de7a2c71a85fa282a360876532cacf68",
+      "blockers": ["B07"]
+    },
+    {
+      "batch": "D",
+      "commit": "7aa54c9097dacfa01909d0f5a43c745f27e43a1e",
+      "blockers": ["B08", "B09", "B10", "B11"]
+    },
+    {
+      "batch": "E",
+      "commit": "THIS_COMMIT",
+      "message": "assurance: bind remediation sources and reviewed wave inputs",
+      "blockers": ["B12", "B13", "B14"]
+    }
+  ],
+  "blockers": {
+    "total": 14,
+    "pass": 14,
+    "blocked": 0,
+    "fail_open": 0
+  },
+  "validation": {
+    "pytest_passed": 218,
+    "pytest_skipped": 3,
+    "remediation_integrity_passed": 33,
+    "ruff": "PASS",
+    "compileall": "PASS",
+    "diff_check": "PASS",
+    "calibration": {
+      "replayed": 8,
+      "pass": 1,
+      "fail": 6,
+      "inconclusive": 1,
+      "mismatches": 0
+    },
+    "overlay_source_pins": "4/4",
+    "overlay_task_mappings": "17/17",
+    "main_audit_manifest_entries": 544,
+    "main_audit_manifest_differences": 0
+  },
+  "protected_state": {
+    "main_unchanged": true,
+    "candidate_unchanged": true,
+    "review_unchanged": true,
+    "audit_tree_unchanged": true,
+    "production_paths_unchanged": true,
+    "runtime_state_unchanged": true,
+    "push_performed": false,
+    "merge_performed": false
+  },
+  "attestation": {
+    "reviewed_foundation_commit_issued": false,
+    "independent_re_review_required": true
+  }
+}

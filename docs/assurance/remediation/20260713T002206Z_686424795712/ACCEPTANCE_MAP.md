@@ -22,7 +22,7 @@ Task получает `PASS` только если одновременно:
    false success;
 7. cleanup/rollback checks PASS;
 8. diff ограничен task allowed files, `git diff --check` PASS, `.audit/**`
-   неизменён;
+   неизменён по anchored external content manifests;
 9. task report и patch находятся в одном локальном task commit.
 
 Невоспроизведённый FAIL, отсутствующее evidence, deterministic FAIL,
@@ -33,16 +33,16 @@ Task получает `PASS` только если одновременно:
 
 ```powershell
 py -3.11 -m qa.cli validate-suite qa\suites\operator_core
-py -3.11 -m qa.cli validate-evidence <new-sanitized-task-evidence.jsonl>
-py -3.11 -m qa.cli replay <new-sanitized-task-evidence.jsonl>
+py -3.11 -m qa.cli validate-evidence <new-sanitized-task-evidence.jsonl> --expected-manifest-sha256 <retained-sha256>
+py -3.11 -m qa.cli replay <new-sanitized-task-evidence.jsonl> --expected-manifest-sha256 <retained-sha256> --output <replay.json>
 ```
 
 Для semantic contracts создаются два раздельных review packet/output и
 adjudication:
 
 ```powershell
-py -3.11 -m qa.cli build-review-packets <new-sanitized-task-evidence.jsonl>
-py -3.11 -m qa.cli adjudicate <review-1.json> <review-2.json>
+py -3.11 -m qa.cli build-review-packets <new-sanitized-task-evidence.jsonl> --expected-manifest-sha256 <retained-sha256> --output-dir <packets>
+py -3.11 -m qa.cli adjudicate <review-1.json> <review-2.json> --replay <replay.json> --evidence <new-sanitized-task-evidence.jsonl> --context-anchor-1 <sha256> --context-anchor-2 <sha256> --review-anchor-1 <sha256> --review-anchor-2 <sha256> --expected-manifest-sha256 <retained-sha256>
 ```
 
 ## Wave 0
@@ -236,7 +236,9 @@ Wave становится `WAVE_N_CANDIDATE_FOR_REVIEW` только если в
 точном порядке, task-to-commit mapping полный, batch deterministic suites и
 bounded replay PASS, два semantic outputs сохранены раздельно где нужны,
 adjudication не скрывает disagreement, cleanup/rollback PASS, worktree clean,
-`.audit/**` неизменён и push/merge не выполнялись.
+exact `REVIEWED_INPUT_COMMIT` совпадает со start HEAD, а anchored external
+before/after manifests подтверждают неизменность всего `.audit/**` tree,
+включая untracked files; push/merge не выполнялись.
 
 Даже `WAVE_2_CANDIDATE_FOR_REVIEW` не является product READY. Только отдельная
 post-fix acceptance campaign может решить вопрос о создании

@@ -5,30 +5,45 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from dataclasses import field as dataclass_field
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .models import CampaignIdentity, CampaignSummary, CaseResult, Scenario, Verdict
-from .output import safe_json_bytes, sanitize_output, write_json_exclusive
+from .output import OutputLimits, safe_json_bytes, sanitize_output, write_json_exclusive
+from .overlay import verified_git_repository_root
 from .redaction import credential_like_paths
 from .safe_paths import (
     MAX_CONFIGURABLE_FILE_BYTES,
     SafePathError,
     bounded_file_bytes,
+    bounded_file_digest,
     canonical_directory,
     safe_output_path,
     validate_campaign_identifier,
     validate_case_id,
+    validate_relative_path,
 )
 from .trusted_anchors import trusted_manifest_sha256
 
 EVIDENCE_SCHEMA = "jarvis.qa.evidence.v1"
 MANIFEST_SCHEMA = "jarvis.qa.campaign-manifest.v2"
+AUDIT_CONTENT_MANIFEST_SCHEMA = "jarvis.qa.audit-content-manifest.v1"
+AUDIT_CONTENT_COMPARISON_SCHEMA = "jarvis.qa.audit-content-comparison.v1"
+AUDIT_FILE_HASH_CONVENTION = "sha256_raw_file_bytes_v1"
+AUDIT_LINK_HASH_CONVENTION = "sha256_utf8_readlink_metadata_v1"
+AUDIT_MANIFEST_LIMITS = OutputLimits(
+    max_depth=8,
+    max_items=20_000,
+    max_string_length=4096,
+)
+MAX_AUDIT_MANIFEST_ENTRIES = 10_000
+MAX_AUDIT_MANIFEST_BYTES = 16 * 1024 * 1024
 _ZERO_DIGEST = "0" * 64
 _SHA256_LENGTH = 64
 _EVIDENCE_VERIFICATION_TOKEN = object()
@@ -720,3 +735,446 @@ def result_record(result: CaseResult) -> dict[str, Any]:
     document = asdict(result)
     document["verdict"] = result.verdict.value
     return document
+
+
+@dataclass(frozen=True, slots=True)
+class AuditManifestArtifact:
+    path: Path
+    sha256: str
+    entry_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class AuditManifestComparison:
+    before_sha256: str
+    after_sha256: str
+    differences: tuple[dict[str, Any], ...]
+    result: AuditManifestArtifact
+
+    @property
+    def ok(self) -> bool:
+        return not self.differences
+
+
+def _audit_reparse(stat_result: os.stat_result) -> bool:
+    return stat.S_ISLNK(stat_result.st_mode) or bool(
+        int(getattr(stat_result, "st_file_attributes", 0)) & 0x0400
+    )
+
+
+def _audit_entry_digest(
+    audit_root: Path,
+    relative_path: str,
+    entry_path: Path,
+    entry_stat: os.stat_result,
+) -> tuple[str, int, str | None]:
+    if _audit_reparse(entry_stat):
+        try:
+            metadata = os.readlink(entry_path)
+        except OSError as exc:
+            raise SafePathError(
+                "LINK_METADATA_UNAVAILABLE", "link metadata is inaccessible"
+            ) from exc
+        payload = str(metadata).encode("utf-8", errors="surrogatepass")
+        file_type = "symlink" if stat.S_ISLNK(entry_stat.st_mode) else "reparse"
+        return file_type, int(entry_stat.st_size), hashlib.sha256(payload).hexdigest()
+    if stat.S_ISDIR(entry_stat.st_mode):
+        return "directory", int(entry_stat.st_size), None
+    if stat.S_ISREG(entry_stat.st_mode):
+        first_digest = bounded_file_digest(
+            audit_root,
+            relative_path,
+            max_bytes=MAX_CONFIGURABLE_FILE_BYTES,
+        )
+        second_digest = bounded_file_digest(
+            audit_root,
+            relative_path,
+            max_bytes=MAX_CONFIGURABLE_FILE_BYTES,
+        )
+        if first_digest != second_digest:
+            raise SafePathError("ENTRY_RACE", "audit entry changed during scan")
+        return "regular_file", first_digest.size, first_digest.sha256
+    raise SafePathError("SPECIAL_FILE", "special audit entries are unsupported")
+
+
+def _audit_stat_identity(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        int(value.st_dev),
+        int(value.st_ino),
+        int(value.st_mode),
+        int(value.st_size),
+        int(value.st_mtime_ns),
+        int(value.st_ctime_ns),
+        int(getattr(value, "st_file_attributes", 0)),
+    )
+
+
+def _audit_scan(repository_root: str | os.PathLike[str]) -> list[dict[str, Any]]:
+    repository = canonical_directory(repository_root)
+    audit_root = canonical_directory(repository / ".audit")
+    if audit_root.parent != repository:
+        raise SafePathError("AUDIT_ROOT_ESCAPE", "audit root must be a direct repository child")
+    entries: list[dict[str, Any]] = []
+
+    def scan(directory: Path, relative_parent: str) -> None:
+        try:
+            before = os.lstat(directory)
+        except OSError as exc:
+            raise SafePathError(
+                "DIRECTORY_INACCESSIBLE", "audit directory is inaccessible"
+            ) from exc
+        if _audit_reparse(before) or not stat.S_ISDIR(before.st_mode):
+            raise SafePathError("UNSAFE_DIRECTORY", "audit directory is unsafe")
+        try:
+            with os.scandir(directory) as iterator:
+                children = sorted(iterator, key=lambda entry: (entry.name.casefold(), entry.name))
+        except OSError as exc:
+            raise SafePathError(
+                "DIRECTORY_INACCESSIBLE", "audit directory is inaccessible"
+            ) from exc
+        for child in children:
+            relative = f"{relative_parent}/{child.name}" if relative_parent else child.name
+            relative = validate_relative_path(relative, label="audit manifest path")
+            try:
+                child_stat = os.lstat(child.path)
+            except OSError as exc:
+                raise SafePathError("ENTRY_INACCESSIBLE", "audit entry is inaccessible") from exc
+            file_type, size, digest = _audit_entry_digest(
+                audit_root,
+                relative,
+                Path(child.path),
+                child_stat,
+            )
+            entries.append(
+                {
+                    "relative_path": relative,
+                    "file_type": file_type,
+                    "size": size,
+                    "sha256": digest,
+                }
+            )
+            if len(entries) > MAX_AUDIT_MANIFEST_ENTRIES:
+                raise SafePathError("ENTRY_LIMIT", "audit manifest entry limit exceeded")
+            if file_type == "directory":
+                scan(Path(child.path), relative)
+            try:
+                child_after = os.lstat(child.path)
+            except OSError as exc:
+                raise SafePathError("ENTRY_RACE", "audit entry changed during scan") from exc
+            if (
+                _audit_stat_identity(child_stat) != _audit_stat_identity(child_after)
+                or _audit_reparse(child_stat) != _audit_reparse(child_after)
+            ):
+                raise SafePathError("ENTRY_RACE", "audit entry changed during scan")
+            if file_type in {"symlink", "reparse"}:
+                after_type, after_size, after_digest = _audit_entry_digest(
+                    audit_root,
+                    relative,
+                    Path(child.path),
+                    child_after,
+                )
+                if (file_type, size, digest) != (after_type, after_size, after_digest):
+                    raise SafePathError("ENTRY_RACE", "audit link changed during scan")
+        try:
+            after = os.lstat(directory)
+        except OSError as exc:
+            raise SafePathError("DIRECTORY_RACE", "audit directory changed during scan") from exc
+        if _audit_stat_identity(before) != _audit_stat_identity(after) or _audit_reparse(
+            after
+        ):
+            raise SafePathError("DIRECTORY_RACE", "audit directory changed during scan")
+
+    scan(audit_root, "")
+    entries.sort(key=lambda entry: (entry["relative_path"].casefold(), entry["relative_path"]))
+    return entries
+
+
+def _canonical_entries_bytes(entries: list[dict[str, Any]]) -> bytes:
+    return json.dumps(
+        entries,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _repository_identity(repository: Path) -> str:
+    return hashlib.sha256(
+        os.path.normcase(str(repository)).replace("\\", "/").encode("utf-8")
+    ).hexdigest()
+
+
+def _build_audit_content_manifest(repository: Path) -> dict[str, Any]:
+    entries = _audit_scan(repository)
+    document: dict[str, Any] = {
+        "schema": AUDIT_CONTENT_MANIFEST_SCHEMA,
+        "scope": ".audit",
+        "repository_root_sha256": _repository_identity(repository),
+        "file_hash_convention": AUDIT_FILE_HASH_CONVENTION,
+        "link_hash_convention": AUDIT_LINK_HASH_CONVENTION,
+        "entry_count": len(entries),
+        "entries_sha256": hashlib.sha256(_canonical_entries_bytes(entries)).hexdigest(),
+        "entries": entries,
+    }
+    sanitized = sanitize_output(document, limits=AUDIT_MANIFEST_LIMITS)
+    if sanitized.events or sanitized.value != document:
+        raise ValueError("audit manifest metadata requires redaction")
+    return document
+
+
+def build_audit_content_manifest(
+    repository_root: str | os.PathLike[str],
+    git_executable: str | os.PathLike[str],
+) -> dict[str, Any]:
+    """Hash the complete .audit tree without copying or returning file content."""
+
+    _, repository = verified_git_repository_root(repository_root, git_executable)
+    return _build_audit_content_manifest(repository)
+
+
+def _direct_manifest_name(value: object, *, label: str) -> str:
+    relative = validate_relative_path(value, label=label)
+    if len(PurePosixPath(relative).parts) != 1:
+        raise SafePathError("UNSAFE_MANIFEST_NAME", f"{label} must be a direct child")
+    return relative
+
+
+def _external_manifest_root(repository: Path, output_root: str | os.PathLike[str]) -> Path:
+    external = canonical_directory(output_root)
+    if (
+        external == repository
+        or external.is_relative_to(repository)
+        or repository.is_relative_to(external)
+    ):
+        raise SafePathError(
+            "OUTPUT_NOT_EXTERNAL", "manifest output root must be disjoint from repository"
+        )
+    return external
+
+
+def _external_output_path(
+    repository: Path,
+    output_root: str | os.PathLike[str],
+    output_name: object,
+) -> Path:
+    external = _external_manifest_root(repository, output_root)
+    name = _direct_manifest_name(output_name, label="audit manifest output name")
+    return safe_output_path(external, name)
+
+
+def write_audit_content_manifest(
+    repository_root: str | os.PathLike[str],
+    output_root: str | os.PathLike[str],
+    output_name: object,
+    git_executable: str | os.PathLike[str],
+    *,
+    canaries: Iterable[str] = (),
+) -> AuditManifestArtifact:
+    _, repository = verified_git_repository_root(repository_root, git_executable)
+    target = _external_output_path(repository, output_root, output_name)
+    document = _build_audit_content_manifest(repository)
+    sanitized = sanitize_output(
+        document,
+        canaries=canaries,
+        limits=AUDIT_MANIFEST_LIMITS,
+    )
+    if sanitized.events or sanitized.value != document:
+        raise ValueError("audit manifest metadata requires redaction")
+    payload = write_json_exclusive(
+        target,
+        document,
+        canaries=canaries,
+        limits=AUDIT_MANIFEST_LIMITS,
+    )
+    return AuditManifestArtifact(
+        path=target,
+        sha256=hashlib.sha256(payload).hexdigest(),
+        entry_count=len(document["entries"]),
+    )
+
+
+def _validate_audit_manifest(document: Any) -> dict[str, Any]:
+    if not isinstance(document, dict):
+        raise ValueError("audit manifest must be an object")
+    expected_fields = {
+        "schema",
+        "scope",
+        "repository_root_sha256",
+        "file_hash_convention",
+        "link_hash_convention",
+        "entry_count",
+        "entries_sha256",
+        "entries",
+    }
+    if set(document) != expected_fields:
+        raise ValueError("audit manifest fields are incomplete or unexpected")
+    if document["schema"] != AUDIT_CONTENT_MANIFEST_SCHEMA or document["scope"] != ".audit":
+        raise ValueError("audit manifest identity is invalid")
+    repository_identity = document["repository_root_sha256"]
+    if (
+        not isinstance(repository_identity, str)
+        or len(repository_identity) != _SHA256_LENGTH
+        or any(character not in "0123456789abcdef" for character in repository_identity)
+    ):
+        raise ValueError("audit manifest repository identity is invalid")
+    if (
+        document["file_hash_convention"] != AUDIT_FILE_HASH_CONVENTION
+        or document["link_hash_convention"] != AUDIT_LINK_HASH_CONVENTION
+    ):
+        raise ValueError("audit manifest hash convention is invalid")
+    entries = document["entries"]
+    if not isinstance(entries, list) or len(entries) > MAX_AUDIT_MANIFEST_ENTRIES:
+        raise ValueError("audit manifest entries are invalid")
+    if (
+        not isinstance(document["entry_count"], int)
+        or isinstance(document["entry_count"], bool)
+        or document["entry_count"] != len(entries)
+    ):
+        raise ValueError("audit manifest entry count is invalid")
+    paths: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {
+            "relative_path",
+            "file_type",
+            "size",
+            "sha256",
+        }:
+            raise ValueError("audit manifest entry shape is invalid")
+        relative = validate_relative_path(entry["relative_path"], label="audit manifest path")
+        file_type = entry["file_type"]
+        size = entry["size"]
+        digest = entry["sha256"]
+        if file_type not in {"regular_file", "directory", "symlink", "reparse"}:
+            raise ValueError("audit manifest file type is invalid")
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            raise ValueError("audit manifest size is invalid")
+        if file_type == "directory":
+            if digest is not None:
+                raise ValueError("directory audit entry cannot carry a byte digest")
+        elif not isinstance(digest, str) or len(digest) != _SHA256_LENGTH or any(
+            character not in "0123456789abcdef" for character in digest
+        ):
+            raise ValueError("audit manifest digest is invalid")
+        paths.append(relative)
+    expected_order = sorted(paths, key=lambda value: (value.casefold(), value))
+    if paths != expected_order or len({path.casefold() for path in paths}) != len(paths):
+        raise ValueError("audit manifest paths are not sorted and unique")
+    entries_digest = hashlib.sha256(_canonical_entries_bytes(entries)).hexdigest()
+    if document["entries_sha256"] != entries_digest:
+        raise ValueError("audit manifest entries digest mismatch")
+    sanitized = sanitize_output(document, limits=AUDIT_MANIFEST_LIMITS)
+    if sanitized.events or sanitized.value != document:
+        raise ValueError("audit manifest metadata requires redaction")
+    return document
+
+
+def _load_audit_manifest(
+    manifest_root: str | os.PathLike[str],
+    manifest_name: object,
+    expected_sha256: str,
+) -> tuple[dict[str, Any], str]:
+    if len(expected_sha256) != _SHA256_LENGTH or any(
+        character not in "0123456789abcdef" for character in expected_sha256
+    ):
+        raise ValueError("expected audit manifest SHA-256 is invalid")
+    root = canonical_directory(manifest_root)
+    relative = _direct_manifest_name(manifest_name, label="audit manifest name")
+    payload = bounded_file_bytes(root, relative, max_bytes=MAX_AUDIT_MANIFEST_BYTES)
+    actual_sha256 = hashlib.sha256(payload).hexdigest()
+    if actual_sha256 != expected_sha256:
+        raise ValueError("audit manifest trusted SHA-256 mismatch")
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("audit manifest is not UTF-8") from exc
+    document = _strict_json_loads(text, label="audit manifest")
+    return _validate_audit_manifest(document), actual_sha256
+
+
+def compare_audit_content_manifests(
+    repository_root: str | os.PathLike[str],
+    manifest_root: str | os.PathLike[str],
+    before_name: object,
+    after_name: object,
+    git_executable: str | os.PathLike[str],
+    *,
+    expected_before_sha256: str,
+    expected_after_sha256: str,
+    result_name: object,
+) -> AuditManifestComparison:
+    _, repository = verified_git_repository_root(repository_root, git_executable)
+    external = _external_manifest_root(repository, manifest_root)
+    result_path = _external_output_path(repository, external, result_name)
+    before_relative = _direct_manifest_name(before_name, label="before manifest name")
+    after_relative = _direct_manifest_name(after_name, label="after manifest name")
+    if before_relative.casefold() == after_relative.casefold():
+        raise ValueError("before and after manifests must be distinct")
+    before, before_sha256 = _load_audit_manifest(
+        external,
+        before_relative,
+        expected_before_sha256,
+    )
+    after, after_sha256 = _load_audit_manifest(
+        external,
+        after_relative,
+        expected_after_sha256,
+    )
+    repository_identity = _repository_identity(repository)
+    if (
+        before["repository_root_sha256"] != repository_identity
+        or after["repository_root_sha256"] != repository_identity
+    ):
+        raise ValueError("audit manifests do not match the requested repository")
+    live = _build_audit_content_manifest(repository)
+    before_by_path = {entry["relative_path"]: entry for entry in before["entries"]}
+    after_by_path = {entry["relative_path"]: entry for entry in after["entries"]}
+    differences: list[dict[str, Any]] = []
+    for relative in sorted(before_by_path.keys() - after_by_path.keys()):
+        differences.append({"code": "PATH_REMOVED", "relative_path": relative})
+    for relative in sorted(after_by_path.keys() - before_by_path.keys()):
+        differences.append({"code": "PATH_ADDED", "relative_path": relative})
+    for relative in sorted(before_by_path.keys() & after_by_path.keys()):
+        before_entry = before_by_path[relative]
+        after_entry = after_by_path[relative]
+        for field, code in (
+            ("file_type", "FILE_TYPE_CHANGED"),
+            ("size", "FILE_SIZE_CHANGED"),
+            ("sha256", "FILE_HASH_CHANGED"),
+        ):
+            if before_entry[field] != after_entry[field]:
+                differences.append(
+                    {"code": code, "relative_path": relative, "field": field}
+                )
+    if after != live:
+        differences.append({"code": "AFTER_MANIFEST_STALE"})
+    comparison_document: dict[str, Any] = {
+        "schema": AUDIT_CONTENT_COMPARISON_SCHEMA,
+        "scope": ".audit",
+        "status": "PASS" if not differences else "FAIL",
+        "before_manifest": before_relative,
+        "before_sha256": before_sha256,
+        "after_manifest": after_relative,
+        "after_sha256": after_sha256,
+        "difference_count": len(differences),
+        "differences": differences,
+    }
+    sanitized = sanitize_output(comparison_document, limits=AUDIT_MANIFEST_LIMITS)
+    if sanitized.events or sanitized.value != comparison_document:
+        raise ValueError("audit manifest comparison metadata requires redaction")
+    result_payload = write_json_exclusive(
+        result_path,
+        comparison_document,
+        limits=AUDIT_MANIFEST_LIMITS,
+    )
+    result = AuditManifestArtifact(
+        path=result_path,
+        sha256=hashlib.sha256(result_payload).hexdigest(),
+        entry_count=len(differences),
+    )
+    return AuditManifestComparison(
+        before_sha256=before_sha256,
+        after_sha256=after_sha256,
+        differences=tuple(differences),
+        result=result,
+    )

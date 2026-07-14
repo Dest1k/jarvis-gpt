@@ -10,18 +10,27 @@ git_context:
   remediation_base: "REVIEWED_FOUNDATION_COMMIT_REQUIRED_AT_EXECUTION"
 
 immutable_sources:
+  hash_convention: "sha256_git_blob_raw_bytes_v1"
   functional_run: ".audit/runs/20260713T002206Z_686424795712/functional"
   state:
+    source_commit: "5aae9855f0779c746ec9287c2ec8917637fedb36"
     path: ".audit/runs/20260713T002206Z_686424795712/functional/FUNCTIONAL_STATE.json"
+    git_blob_oid: "d579beba2a7f4761247ac6f74fc7605cab6ba0b5"
     sha256: "f4ef88248fd2d09933799ea217e484f8361fb3fa2690714d2825a9853aeb6aa2"
   findings_index:
+    source_commit: "5aae9855f0779c746ec9287c2ec8917637fedb36"
     path: ".audit/runs/20260713T002206Z_686424795712/functional/FUNCTIONAL_FINDINGS_INDEX.md"
+    git_blob_oid: "4a312bda8cc9b079edcd171e29bbcffe0fde729b"
     sha256: "0eba14a00dc56e9da85f9719df6b048db41523a8b06e9bbc184a4b0a348940dd"
   queue:
+    source_commit: "5aae9855f0779c746ec9287c2ec8917637fedb36"
     path: ".audit/runs/20260713T002206Z_686424795712/functional/spark/QUEUE.csv"
+    git_blob_oid: "36282aa80d93a694439b71b9fcf47799f20a7057"
     sha256: "3e923271c433de160431f35a11c8c1a743cf4bdef9fbc53fea46537da66ae138"
   task_schema:
+    source_commit: "5aae9855f0779c746ec9287c2ec8917637fedb36"
     path: ".audit/runs/20260713T002206Z_686424795712/functional/spark/TASK_SCHEMA.md"
+    git_blob_oid: "f2a50c828b562abb51ba4c3c662a4e7c84f2df93"
     sha256: "1afbfc0d47313790a91065944925bee61be12c9aac947bd322094296ca4f45d7"
 
 preconditions:
@@ -252,6 +261,7 @@ waves:
 product_decision_gate:
   task_id: "SPARK-0013"
   finding_id: "FUNC-FIND-013"
+  task_path: ".audit/runs/20260713T002206Z_686424795712/functional/spark/tasks/SPARK-0013.md"
   included_in_numbered_waves: false
   automatic_execution_allowed: false
   decision_status: "PENDING_HUMAN_DECISION"

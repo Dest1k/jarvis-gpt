@@ -2,7 +2,8 @@
   "schema": "jarvis.assurance-foundation-state.v1",
   "run_id": "20260713T002206Z_686424795712",
   "recorded_at_utc": "2026-07-13T20:33:44Z",
-  "state": "ASSURANCE_FOUNDATION_CANDIDATE_FOR_REVIEW",
+  "state": "FOUNDATION_REVIEW_BLOCKED",
+  "bootstrap_candidate_state": "ASSURANCE_FOUNDATION_CANDIDATE_FOR_REVIEW",
   "git": {
     "main_checkout": "D:\\jarvis-gpt",
     "main_branch": "main",
@@ -37,7 +38,10 @@
     "bundle_verified": true,
     "bundle_sha256": "ab31161a3aee6372a2432c0531c6c3ce48c9a8a25dd027c7270f7595e572dcb2",
     "untracked_baseline_count": 269,
-    "untracked_baseline_sha256": "443722c67fed1727728d3a0242d4bf4573549784a58536328a99c191e1f87fbc"
+    "untracked_baseline_sha256": "443722c67fed1727728d3a0242d4bf4573549784a58536328a99c191e1f87fbc",
+    "untracked_baseline_kind": "PATH_LIST_ONLY",
+    "untracked_content_manifest": null,
+    "sufficient_for_wave_execution": false
   },
   "immutable_tree_oids": {
     ".audit": "ec672e1a1fbd966ae86c76ad59b1f5f7a1738742",
@@ -73,8 +77,17 @@
     "semantic_disagreement_result": "INCONCLUSIVE",
     "deterministic_fail_override_attempt_result": "FAIL",
     "upstream_gate_fixtures": "PASS",
-    "overlay_source_hashes": "4/4 MATCH",
-    "overlay_task_coverage": "17/17"
+    "overlay_source_hashes": {
+      "status": "4/4 MATCH",
+      "convention": "sha256_git_blob_raw_bytes_v1",
+      "source_commit": "5aae9855f0779c746ec9287c2ec8917637fedb36",
+      "git_object_database_verified": true
+    },
+    "overlay_task_coverage": {
+      "status": "17/17 MATCH",
+      "source_commit": "5aae9855f0779c746ec9287c2ec8917637fedb36",
+      "queue_index_task_blobs_verified": true
+    }
   },
   "scope": {
     "audit_modified": false,
@@ -89,10 +102,25 @@
   },
   "wave_0": {
     "protocol_path": "docs/audit/10_JARVIS_FUNCTIONAL_REMEDIATION_WAVES_PROMPT.md",
-    "protocol_structurally_ready": true,
+    "protocol_structurally_ready": false,
     "execution_allowed_before_review": false,
-    "required_precondition": "explicit independently reviewed local foundation commit"
+    "required_precondition": "independently reviewed remediation commit plus exact reviewed input HEAD"
   },
-  "residual_blockers": [],
-  "review_status": "PENDING_INDEPENDENT_REVIEW"
+  "residual_blockers": [
+    "B01",
+    "B02",
+    "B03",
+    "B04",
+    "B05",
+    "B06",
+    "B07",
+    "B08",
+    "B09",
+    "B10",
+    "B11",
+    "B12",
+    "B13",
+    "B14"
+  ],
+  "review_status": "FOUNDATION_REVIEW_BLOCKED"
 }

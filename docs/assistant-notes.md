@@ -9,6 +9,31 @@ and decisions. Do not paste secrets, tokens, private logs, or long command outpu
 
 ## Notes
 
+### 2026-07-14 - Codex (assurance remediation Commit E)
+
+- Closed B12-B14 with exact raw Git-blob source pins, a strict canonical
+  dependency-free overlay parser bound to the actual wave/product structure,
+  exact reviewed HEAD/index/double-hashed worktree equality, and complete
+  external `.audit` content manifests with retained anchors and live rescans.
+- Trusted Git calls require an explicit absolute non-reparse executable, a
+  minimal environment, disabled repository fsmonitor/hooks, no replace refs or
+  alternates, no external content filters, and no hidden index/ignored state.
+  Regular audit files require two matching bounded digests; links/reparse
+  metadata is recorded without following.
+- Positive/negative regressions cover commit/path/OID/hash/mapping substitution,
+  YAML shadow and alternate structures, hostile Git state, ancestor/dirty or
+  hidden starts, complete path/type/size/hash changes, stale manifests,
+  timestamp-restored races, output containment, large path sets, and redaction.
+- Final validation: `218 passed, 3 skipped`; dedicated remediation integrity
+  `33 passed`; Ruff, compileall, and diff check PASS. Calibration remains 8/8
+  with 1 PASS / 6 FAIL / 1 INCONCLUSIVE / 0 mismatches. Source verification is
+  4/4 pins and 17/17 mappings/files; anchored adjudication and upstream gate
+  PASS; main audit comparison is 544 entries with zero differences.
+- Independent scoped reviews returned GO for B12-B14, including a final
+  19-case parser review. No `.audit/**`, production source, runtime state,
+  dependency, network, push, merge, readiness marker, or self-attestation was
+  used. The resulting commit is only a candidate for independent re-review.
+
 ### 2026-07-14 - Codex (assurance remediation Commit D)
 
 - Closed B08-B11 with exact source-to-destination manifests, independent

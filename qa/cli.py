@@ -8,7 +8,12 @@ from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any
 
-from .evidence import EvidenceStore, validate_evidence_file
+from .evidence import (
+    EvidenceStore,
+    compare_audit_content_manifests,
+    validate_evidence_file,
+    write_audit_content_manifest,
+)
 from .models import (
     EXIT_FAIL,
     EXIT_HARNESS_ERROR,
@@ -18,6 +23,7 @@ from .models import (
     Verdict,
 )
 from .output import safe_json_text
+from .overlay import verify_overlay_source_pins, verify_reviewed_input_head
 from .redaction import redact_text
 from .replay import replay_file, write_replay_report
 from .review.adjudicator import adjudicate_files, write_adjudication
@@ -33,6 +39,12 @@ def _emit(document: dict[str, Any], *, canaries: Iterable[str] = ()) -> None:
 def _sha256_anchor(value: str) -> str:
     if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
         raise argparse.ArgumentTypeError("anchor must be a lowercase SHA-256 digest")
+    return value
+
+
+def _commit_sha(value: str) -> str:
+    if len(value) != 40 or any(character not in "0123456789abcdef" for character in value):
+        raise argparse.ArgumentTypeError("commit must be a full lowercase SHA")
     return value
 
 
@@ -171,6 +183,92 @@ def _cmd_run_suite(args: argparse.Namespace) -> int:
     return summary.exit_code
 
 
+def _cmd_validate_overlay_sources(args: argparse.Namespace) -> int:
+    result = verify_overlay_source_pins(
+        args.repository_root,
+        args.overlay,
+        args.expected_source_commit,
+        args.git_executable,
+    )
+    _emit(
+        {
+            "command": "validate-overlay-sources",
+            "ok": result.ok,
+            "source_pins": len(result.pins),
+            "source_pins_matched": result.matched,
+            "task_mappings": result.task_mappings,
+            "task_files_matched": result.task_files_matched,
+            "errors": list(result.errors),
+        }
+    )
+    return EXIT_PASS if result.ok else EXIT_FAIL
+
+
+def _cmd_verify_reviewed_input(args: argparse.Namespace) -> int:
+    result = verify_reviewed_input_head(
+        args.repository_root,
+        args.reviewed_input_commit,
+        args.git_executable,
+    )
+    _emit(
+        {
+            "command": "verify-reviewed-input",
+            "ok": result.ok,
+            "expected": result.expected,
+            "actual": result.actual,
+            "errors": list(result.errors),
+        }
+    )
+    return EXIT_PASS if result.ok else EXIT_FAIL
+
+
+def _cmd_audit_manifest_create(args: argparse.Namespace) -> int:
+    artifact = write_audit_content_manifest(
+        args.repository_root,
+        args.backup_root,
+        args.output_name,
+        args.git_executable,
+    )
+    _emit(
+        {
+            "command": "audit-manifest-create",
+            "ok": True,
+            "manifest": artifact.path.name,
+            "manifest_sha256": artifact.sha256,
+            "entries": artifact.entry_count,
+        }
+    )
+    return EXIT_PASS
+
+
+def _cmd_audit_manifest_compare(args: argparse.Namespace) -> int:
+    comparison = compare_audit_content_manifests(
+        args.repository_root,
+        args.backup_root,
+        args.before_name,
+        args.after_name,
+        args.git_executable,
+        expected_before_sha256=args.expected_before_sha256,
+        expected_after_sha256=args.expected_after_sha256,
+        result_name=args.result_name,
+    )
+    _emit(
+        {
+            "command": "audit-manifest-compare",
+            "ok": comparison.ok,
+            "before_sha256": comparison.before_sha256,
+            "after_sha256": comparison.after_sha256,
+            "difference_count": len(comparison.differences),
+            "difference_codes": sorted(
+                {str(item["code"]) for item in comparison.differences}
+            ),
+            "result": comparison.result.path.name,
+            "result_sha256": comparison.result.sha256,
+        }
+    )
+    return EXIT_PASS if comparison.ok else EXIT_FAIL
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -215,6 +313,53 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--base-url")
     run_parser.add_argument("--campaign-prefix", default="jarvis-assurance")
     run_parser.set_defaults(handler=_cmd_run_suite)
+
+    overlay_parser = subparsers.add_parser("validate-overlay-sources")
+    overlay_parser.add_argument("--repository-root", type=Path, required=True)
+    overlay_parser.add_argument("--overlay", required=True)
+    overlay_parser.add_argument(
+        "--expected-source-commit",
+        required=True,
+        type=_commit_sha,
+    )
+    overlay_parser.add_argument("--git-executable", type=Path, required=True)
+    overlay_parser.set_defaults(handler=_cmd_validate_overlay_sources)
+
+    reviewed_input_parser = subparsers.add_parser("verify-reviewed-input")
+    reviewed_input_parser.add_argument("--repository-root", type=Path, required=True)
+    reviewed_input_parser.add_argument(
+        "--reviewed-input-commit",
+        required=True,
+        type=_commit_sha,
+    )
+    reviewed_input_parser.add_argument("--git-executable", type=Path, required=True)
+    reviewed_input_parser.set_defaults(handler=_cmd_verify_reviewed_input)
+
+    audit_create_parser = subparsers.add_parser("audit-manifest-create")
+    audit_create_parser.add_argument("--repository-root", type=Path, required=True)
+    audit_create_parser.add_argument("--backup-root", type=Path, required=True)
+    audit_create_parser.add_argument("--output-name", required=True)
+    audit_create_parser.add_argument("--git-executable", type=Path, required=True)
+    audit_create_parser.set_defaults(handler=_cmd_audit_manifest_create)
+
+    audit_compare_parser = subparsers.add_parser("audit-manifest-compare")
+    audit_compare_parser.add_argument("--repository-root", type=Path, required=True)
+    audit_compare_parser.add_argument("--backup-root", type=Path, required=True)
+    audit_compare_parser.add_argument("--before-name", required=True)
+    audit_compare_parser.add_argument("--after-name", required=True)
+    audit_compare_parser.add_argument(
+        "--expected-before-sha256",
+        required=True,
+        type=_sha256_anchor,
+    )
+    audit_compare_parser.add_argument(
+        "--expected-after-sha256",
+        required=True,
+        type=_sha256_anchor,
+    )
+    audit_compare_parser.add_argument("--result-name", required=True)
+    audit_compare_parser.add_argument("--git-executable", type=Path, required=True)
+    audit_compare_parser.set_defaults(handler=_cmd_audit_manifest_compare)
     return parser
 
 

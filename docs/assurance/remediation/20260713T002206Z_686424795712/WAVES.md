@@ -24,6 +24,33 @@ scenarios, 30 scenario FAIL, 49 operator-repeat FAIL, 17 findings и 17 READY
 Spark tasks. `functional/spark/READY` существует; `functional/READY` намеренно
 отсутствует и для remediation не требуется.
 
+## Неизменяемые source pins
+
+Четыре записи `immutable_sources` используют единственную конвенцию
+`sha256_git_blob_raw_bytes_v1`: SHA-256 вычисляется по точным bytes Git blob из
+точного `source_commit`, полученного через local Git object database. Checkout
+bytes не являются источником, поэтому EOL-конверсия, text mode и нормализация
+не участвуют. Каждая запись фиксирует commit, repository-relative path, Git
+blob OID и SHA-256 raw blob bytes.
+
+До wave verifier обязан получить `4/4` source pins и `17/17` однозначных
+task/finding/path mappings из того же commit. Он сравнивает overlay с exact
+QUEUE/index/task blobs, не читает mutable checkout sources и не обращается к
+сети. Весь overlay разбирается только как canonical dependency-free YAML
+subset; mappings берутся из фактических `waves` и `product_decision_gate`.
+Block scalar, shadow/duplicate section или alternate noncanonical structure
+отклоняются до проверки mappings:
+
+```powershell
+py -3.11 -m qa.cli validate-overlay-sources `
+  --repository-root <repository-root> `
+  --overlay docs/assurance/remediation/20260713T002206Z_686424795712/WAVES.yml `
+  --expected-source-commit 5aae9855f0779c746ec9287c2ec8917637fedb36 `
+  --git-executable <trusted-absolute-git-executable>
+```
+
+Любой missing/stale commit, path, blob OID, digest или task mapping — blocker.
+
 ## Неизменяемые правила
 
 - Один запуск получает ровно один explicit `TARGET_WAVE`.
@@ -93,7 +120,7 @@ Precondition: committed review `WAVE-1` со статусом `APPROVED` и то
 `WAVE_2_CANDIDATE_FOR_REVIEW`. Это не создаёт product READY: отдельная
 post-fix acceptance campaign остаётся обязательной.
 
-## Product decision gate — SPARK-0013
+## Product decision gate — SPARK-0013 / FUNC-FIND-013
 
 `SPARK-0013` исключён из numbered waves. Его исходный acceptance текст нельзя
 трактовать как обещание «сделать 31B быстрым». Решение разделено на:
