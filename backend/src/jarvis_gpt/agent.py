@@ -412,6 +412,11 @@ class AgentContext:
     operator_message_id: str | None = None
     operator_scopes: frozenset[str] = dataclass_field(default_factory=frozenset)
     operator_used_effects: set[str] = dataclass_field(default_factory=set)
+    # RB-2: side-effect admission is decided before mission/artifact/tool mutation.
+    side_effects_admitted: bool = True
+    pending_clarification_goal: str | None = None
+    resumed_from_clarification: bool = False
+    clarification_original_goal: str | None = None
 
 
 @dataclass(frozen=True)
@@ -702,12 +707,35 @@ class AgentRuntime:
             )
         await self._augment_semantic_memory(context, context_message)
         await self._augment_semantic_files(context, context_message)
+        # RB-2: resolve pending clarification before planning so a follow-up answer
+        # cannot be hijacked by shopping/web routes (e.g. "DNS" in report content).
+        admitted, effective_message, clarification = self._admit_side_effects(
+            message, context
+        )
+        plan_message = effective_message if admitted else message
         task_plan = self._plan_task(
-            context_message,
+            plan_message if not context.resumed_from_clarification else (
+                context.clarification_original_goal or plan_message
+            ),
             context,
             mode=mode,
             attachments=attachments,
         )
+        if context.resumed_from_clarification:
+            # Keep kernel on the original deliverable, not the shopping false-positive.
+            task_plan = TaskKernelPlan(
+                route="reasoning",
+                mode=task_plan.mode,
+                intent="artifact_after_clarification",
+                confidence=0.95,
+                tools=("documents.generate",),
+                completion_criteria=(
+                    "create exactly one artifact from the clarified operands",
+                    "do not open shopping or unrelated web research",
+                ),
+                rationale="Resuming original artifact goal after operator clarification.",
+                needs_clarification=False,
+            )
         context.task_plan = task_plan
         events: list[ChatEvent] = [
             ChatEvent(
@@ -739,8 +767,84 @@ class AgentRuntime:
             events.append(event)
             await self._emit(event)
 
+        if not admitted and clarification:
+            events.append(
+                ChatEvent(
+                    type="thought",
+                    title="Нужно уточнение",
+                    content=clarification,
+                    payload={
+                        "route": "clarify",
+                        "blocked_mission": True,
+                        "blocked_artifact": True,
+                        "source": "side_effect_admission",
+                    },
+                )
+            )
+            await self._emit(events[-1])
+            duration_ms = _elapsed_ms(started_at)
+            message_id = self.storage.add_message(
+                conversation_id=context.conversation_id,
+                role="assistant",
+                content=clarification,
+                metadata={
+                    "source": "clarification",
+                    "task_kernel": task_plan.payload(),
+                    "mission_created": False,
+                    "artifact_created": False,
+                    "pending_goal": context.pending_clarification_goal,
+                },
+            )
+            events.append(
+                ChatEvent(
+                    type="assistant_done",
+                    title="Уточнение",
+                    payload={
+                        "source": "clarification",
+                        "mission_created": False,
+                        "artifact_created": False,
+                    },
+                )
+            )
+            await self._emit(events[-1])
+            return ChatResponse(
+                conversation_id=context.conversation_id,
+                message_id=message_id,
+                answer=clarification,
+                events=events,
+                duration_ms=duration_ms,
+            )
+        if effective_message != message:
+            message = effective_message
+            context.operator_message = effective_message
+
+        if context.resumed_from_clarification:
+            resumed = await self._try_clarified_artifact_action(message, context)
+            if resumed is not None:
+                for event in resumed.events:
+                    events.append(event)
+                    await self._emit(event)
+                duration_ms = _elapsed_ms(started_at)
+                message_id = self.storage.add_message(
+                    conversation_id=context.conversation_id,
+                    role="assistant",
+                    content=resumed.answer,
+                    metadata={
+                        "duration_ms": duration_ms,
+                        "source": "clarification_resume",
+                        "events": [event.model_dump() for event in events],
+                    },
+                )
+                return ChatResponse(
+                    conversation_id=context.conversation_id,
+                    message_id=message_id,
+                    answer=resumed.answer,
+                    events=events,
+                    duration_ms=duration_ms,
+                )
+
         shop_start = self._named_shop_start_event(message, task_plan)
-        if shop_start is not None:
+        if shop_start is not None and not context.resumed_from_clarification:
             events.append(shop_start)
             await self._emit(shop_start)
 
@@ -783,6 +887,16 @@ class AgentRuntime:
                 or _clarification_question_from_message(message)
             )
             answer = question
+            if context.side_effects_admitted:
+                # Persist pending so follow-up can resume without re-guessing.
+                self._set_pending_clarification(
+                    context.conversation_id,
+                    goal=message,
+                    question=question,
+                    gaps=_side_effect_completeness_gaps(message)
+                    or ["operator_requested_clarification"],
+                )
+                context.side_effects_admitted = False
             events.append(
                 ChatEvent(
                     type="thought",
@@ -819,6 +933,25 @@ class AgentRuntime:
                 duration_ms=duration_ms,
             )
         if forced_mission or task_plan.route == "mission":
+            if not context.side_effects_admitted:
+                question = _clarification_question_from_message(message)
+                duration_ms = _elapsed_ms(started_at)
+                message_id = self.storage.add_message(
+                    conversation_id=context.conversation_id,
+                    role="assistant",
+                    content=question,
+                    metadata={
+                        "source": "clarification",
+                        "mission_created": False,
+                    },
+                )
+                return ChatResponse(
+                    conversation_id=context.conversation_id,
+                    message_id=message_id,
+                    answer=question,
+                    events=events,
+                    duration_ms=duration_ms,
+                )
             mission = await self.create_mission_planned(message)
             answer = self._mission_answer(mission)
             events.append(
@@ -1013,12 +1146,33 @@ class AgentRuntime:
             )
         await self._augment_semantic_memory(context, context_message)
         await self._augment_semantic_files(context, context_message)
+        # RB-2: resolve pending clarification before planning (parity with chat()).
+        admitted, effective_message, clarification = self._admit_side_effects(
+            message, context
+        )
+        plan_message = effective_message if admitted else message
         task_plan = self._plan_task(
-            context_message,
+            plan_message
+            if not context.resumed_from_clarification
+            else (context.clarification_original_goal or plan_message),
             context,
             mode=mode,
             attachments=attachments,
         )
+        if context.resumed_from_clarification:
+            task_plan = TaskKernelPlan(
+                route="reasoning",
+                mode=task_plan.mode,
+                intent="artifact_after_clarification",
+                confidence=0.95,
+                tools=("documents.generate",),
+                completion_criteria=(
+                    "create exactly one artifact from the clarified operands",
+                    "do not open shopping or unrelated web research",
+                ),
+                rationale="Resuming original artifact goal after operator clarification.",
+                needs_clarification=False,
+            )
         context.task_plan = task_plan
         events: list[ChatEvent] = [
             ChatEvent(
@@ -1054,8 +1208,81 @@ class AgentRuntime:
             await self._emit(event)
             yield {"type": "event", "event": event.model_dump()}
 
+        if not admitted and clarification:
+            events.append(
+                ChatEvent(
+                    type="thought",
+                    title="Clarification required",
+                    content=clarification,
+                    payload={
+                        "route": "clarify",
+                        "blocked_mission": True,
+                        "blocked_artifact": True,
+                        "source": "side_effect_admission",
+                    },
+                )
+            )
+            await self._emit(events[-1])
+            yield {"type": "event", "event": events[-1].model_dump()}
+            yield {"type": "delta", "content": clarification}
+            duration_ms = _elapsed_ms(started_at)
+            message_id = self.storage.add_message(
+                conversation_id=context.conversation_id,
+                role="assistant",
+                content=clarification,
+                metadata={
+                    "source": "clarification",
+                    "task_kernel": task_plan.payload(),
+                    "mission_created": False,
+                    "artifact_created": False,
+                    "pending_goal": context.pending_clarification_goal,
+                },
+            )
+            yield {
+                "type": "done",
+                "answer": clarification,
+                "conversation_id": context.conversation_id,
+                "duration_ms": duration_ms,
+                "events": [event.model_dump() for event in events],
+                "message_id": message_id,
+                "mission_created": False,
+            }
+            return
+        if effective_message != message:
+            message = effective_message
+            context.operator_message = effective_message
+
+        if context.resumed_from_clarification:
+            resumed = await self._try_clarified_artifact_action(message, context)
+            if resumed is not None:
+                for event in resumed.events:
+                    events.append(event)
+                    await self._emit(event)
+                    yield {"type": "event", "event": event.model_dump()}
+                yield {"type": "delta", "content": resumed.answer}
+                duration_ms = _elapsed_ms(started_at)
+                message_id = self.storage.add_message(
+                    conversation_id=context.conversation_id,
+                    role="assistant",
+                    content=resumed.answer,
+                    metadata={
+                        "duration_ms": duration_ms,
+                        "source": "clarification_resume",
+                        "events": [event.model_dump() for event in events],
+                    },
+                )
+                yield {
+                    "type": "done",
+                    "answer": resumed.answer,
+                    "conversation_id": context.conversation_id,
+                    "duration_ms": duration_ms,
+                    "events": [event.model_dump() for event in events],
+                    "message_id": message_id,
+                }
+                return
+
         shop_start = self._named_shop_start_event(message, task_plan)
-        if shop_start is not None:
+        if shop_start is not None and not context.resumed_from_clarification:
             events.append(shop_start)
             await self._emit(shop_start)
             yield {"type": "event", "event": shop_start.model_dump()}
@@ -1103,6 +1330,15 @@ class AgentRuntime:
                 or _clarification_question_from_message(message)
             )
             answer = question
+            if context.side_effects_admitted:
+                self._set_pending_clarification(
+                    context.conversation_id,
+                    goal=message,
+                    question=question,
+                    gaps=_side_effect_completeness_gaps(message)
+                    or ["operator_requested_clarification"],
+                )
+                context.side_effects_admitted = False
             events.append(
                 ChatEvent(
                     type="thought",
@@ -1136,6 +1372,29 @@ class AgentRuntime:
             }
             return
         if forced_mission or task_plan.route == "mission":
+            if not context.side_effects_admitted:
+                question = _clarification_question_from_message(message)
+                yield {"type": "delta", "content": question}
+                duration_ms = _elapsed_ms(started_at)
+                message_id = self.storage.add_message(
+                    conversation_id=context.conversation_id,
+                    role="assistant",
+                    content=question,
+                    metadata={
+                        "source": "clarification",
+                        "mission_created": False,
+                    },
+                )
+                yield {
+                    "type": "done",
+                    "answer": question,
+                    "conversation_id": context.conversation_id,
+                    "duration_ms": duration_ms,
+                    "events": [event.model_dump() for event in events],
+                    "message_id": message_id,
+                    "mission_created": False,
+                }
+                return
             mission = await self.create_mission_planned(message)
             answer = self._mission_answer(mission)
             events.append(
@@ -1507,6 +1766,12 @@ class AgentRuntime:
         *,
         decomposition: MissionDecomposition | None = None,
     ) -> dict[str, Any]:
+        # RB-2: never persist a mission while the deliverable still needs clarification.
+        if _requires_side_effect_clarification(goal):
+            raise ValueError(
+                "mission creation blocked until clarification is answered: "
+                + _clarification_question_from_message(goal)
+            )
         selected = (
             validate_mission_decomposition(decomposition)
             if decomposition is not None
@@ -4214,6 +4479,252 @@ class AgentRuntime:
             self.storage.recent_messages(conversation_id, limit=10)
         )
 
+    def _pending_clarification_state(
+        self, conversation_id: str
+    ) -> dict[str, Any] | None:
+        value = self.storage.get_runtime_value(
+            _pending_clarification_key(conversation_id), None
+        )
+        return value if isinstance(value, dict) and value.get("goal") else None
+
+    def _set_pending_clarification(
+        self,
+        conversation_id: str,
+        *,
+        goal: str,
+        question: str,
+        gaps: list[str],
+    ) -> None:
+        self.storage.set_runtime_value(
+            _pending_clarification_key(conversation_id),
+            {
+                "goal": goal,
+                "question": question,
+                "gaps": list(gaps),
+                "ts": time.time(),
+            },
+        )
+
+    def _clear_pending_clarification(self, conversation_id: str) -> None:
+        self.storage.set_runtime_value(
+            _pending_clarification_key(conversation_id),
+            {},
+        )
+
+    def _admit_side_effects(
+        self, message: str, context: AgentContext
+    ) -> tuple[bool, str, str | None]:
+        """Decide whether mission/artifact/mutating tools may run for this turn.
+
+        Returns ``(admitted, effective_message, clarification_question)``.
+        When not admitted, ``clarification_question`` is exactly one precise question
+        and no side effects may run until the operator answers.
+        """
+
+        conversation_id = context.conversation_id
+        pending = self._pending_clarification_state(conversation_id)
+        if pending is not None:
+            goal = str(pending.get("goal") or "").strip()
+            combined = f"{goal}\n\nУточнение оператора: {message}".strip()
+            gaps = _side_effect_completeness_gaps(combined)
+            # After the operator answered the one clarifying question, format+destination
+            # are enough to resume; remaining topical body may use a disclosed default.
+            original_gaps = {
+                str(item) for item in (pending.get("gaps") or []) if str(item)
+            }
+            if original_gaps and not (set(gaps) & {"format", "destination"}):
+                gaps = [g for g in gaps if g not in {"content", "operator_requested_clarification"}]
+            if not gaps and not _looks_like_clarification_before_action(combined):
+                self._clear_pending_clarification(conversation_id)
+                context.pending_clarification_goal = None
+                context.side_effects_admitted = True
+                context.resumed_from_clarification = True
+                context.clarification_original_goal = goal
+                return True, combined, None
+            message_complete = (
+                not _side_effect_completeness_gaps(message)
+                and _looks_like_artifact_or_mission_side_effect(message)
+            )
+            if message_complete:
+                self._clear_pending_clarification(conversation_id)
+                context.pending_clarification_goal = None
+                context.side_effects_admitted = True
+                context.resumed_from_clarification = True
+                context.clarification_original_goal = goal
+                return True, message, None
+            question = _clarification_question_from_message(combined)
+            self._set_pending_clarification(
+                conversation_id,
+                goal=goal,
+                question=question,
+                gaps=gaps or _side_effect_completeness_gaps(combined),
+            )
+            context.pending_clarification_goal = goal
+            context.side_effects_admitted = False
+            return False, message, question
+
+        if not _requires_side_effect_clarification(message):
+            context.side_effects_admitted = True
+            context.pending_clarification_goal = None
+            return True, message, None
+
+        question = _clarification_question_from_message(message)
+        gaps = _side_effect_completeness_gaps(message)
+        if not gaps and _looks_like_clarification_before_action(message):
+            gaps = ["operator_requested_clarification"]
+        self._set_pending_clarification(
+            conversation_id,
+            goal=message,
+            question=question,
+            gaps=gaps,
+        )
+        context.pending_clarification_goal = message
+        context.side_effects_admitted = False
+        return False, message, question
+
+    def _side_effect_tool_blocked(
+        self, tool_name: str, context: AgentContext
+    ) -> str | None:
+        """Hard second-line gate immediately before mutating tool execution."""
+
+        if tool_name not in SIDE_EFFECT_MUTATING_TOOLS:
+            return None
+        if not context.side_effects_admitted:
+            question = _clarification_question_from_message(
+                context.operator_message or context.pending_clarification_goal or ""
+            )
+            return (
+                f"Side-effect tool {tool_name!r} blocked until clarification is answered. "
+                f"{question}"
+            )
+        # After an admitted clarification resume, allow the bound generate path even
+        # when the combined operator text still contains the original vague goal.
+        if context.resumed_from_clarification:
+            return None
+        # Re-check completeness of the admitted operator message so an LLM cannot
+        # invent format/path defaults for an incomplete goal.
+        message = context.operator_message or ""
+        if _requires_side_effect_clarification(message):
+            question = _clarification_question_from_message(message)
+            # Persist pending state so the next operator turn can resume.
+            if context.conversation_id:
+                self._set_pending_clarification(
+                    context.conversation_id,
+                    goal=message,
+                    question=question,
+                    gaps=_side_effect_completeness_gaps(message),
+                )
+            context.side_effects_admitted = False
+            return (
+                f"Side-effect tool {tool_name!r} blocked: deliverable is incomplete. "
+                f"{question}"
+            )
+        return None
+
+    async def _try_clarified_artifact_action(
+        self, message: str, context: AgentContext
+    ) -> DirectAction | None:
+        """Deterministically finish an artifact after the operator answered clarification.
+
+        Avoids planner/shopping hijacks (e.g. the word DNS in report content) and
+        guarantees exactly one generate attempt for the resumed goal.
+        """
+
+        if not context.resumed_from_clarification or not context.side_effects_admitted:
+            return None
+        original = context.clarification_original_goal or ""
+        if not (
+            _looks_like_artifact_or_mission_side_effect(original)
+            or _looks_like_artifact_or_mission_side_effect(message)
+        ):
+            return None
+        # Mission-only resumes still go through normal mission planning.
+        mission_markers = (
+            "mission plan",
+            "создай mission",
+            "создай миссию",
+            "plan a mission",
+            "многошагов",
+            "multi-step",
+            "разбей на задачи",
+            "разложи на шаги",
+        )
+        if _contains_any(original.casefold(), mission_markers) and not _contains_any(
+            original.casefold(),
+            (
+                "подготовь файл",
+                "prepare the report",
+                "prepare the file",
+                "создай файл",
+                "create report",
+                "generate report",
+            ),
+        ):
+            return None
+
+        spec = _artifact_spec_from_clarification_resume(message, original_goal=original)
+        if spec is None:
+            return None
+        args = {
+            "title": spec["title"],
+            "body": spec["body"],
+            "output_format": spec["output_format"],
+            "output_name": spec["output_name"],
+            "exact_body": True,
+        }
+        result = await self.tools.run(
+            "documents.generate",
+            args,
+            conversation_id=context.conversation_id,
+            user_message_id=context.operator_message_id,
+        )
+        path = ""
+        if isinstance(result.data, dict):
+            raw_output = result.data.get("output")
+            output = raw_output if isinstance(raw_output, dict) else {}
+            path = str(output.get("path") or "")
+        if result.ok and path:
+            answer = (
+                f"Отчёт подготовлен после уточнения.\n\n"
+                f"**Файл:** `{spec['output_name']}`\n"
+                f"**Путь:** `{path}`\n"
+                f"**Формат:** {spec['output_format']}\n\n"
+                f"Содержание отражает исходную задачу и ваш ответ "
+                f"(безопасный default, если тема была общей)."
+            )
+        elif result.ok:
+            answer = f"Отчёт подготовлен: {result.summary}"
+        else:
+            answer = (
+                "Не удалось создать файл после уточнения: "
+                f"{result.summary}. Повторите формат, имя и каталог."
+            )
+        return DirectAction(
+            answer=answer,
+            events=[
+                ChatEvent(
+                    type="thought",
+                    title="Продолжаю после уточнения",
+                    content="Создаю артефакт по исходной цели с заполненными параметрами.",
+                    payload={
+                        "source": "clarification_resume",
+                        "original_goal": original[:400],
+                    },
+                ),
+                ChatEvent(
+                    type="tool_call",
+                    title="documents.generate",
+                    content=result.summary,
+                    payload={
+                        "tool": "documents.generate",
+                        "ok": result.ok,
+                        "path": path,
+                        "source": "clarification_resume",
+                    },
+                ),
+            ],
+        )
+
     async def _open_shopping_candidate(
         self,
         candidates: list[dict[str, Any]],
@@ -4403,8 +4914,8 @@ class AgentRuntime:
                 rationale="The request targets previously persisted document knowledge.",
             )
 
-        if _looks_like_clarification_before_action(message):
-            # Ambiguous deliverable: ask exactly one question before mission/artifact.
+        if _requires_side_effect_clarification(message):
+            # Incomplete artifact/mission deliverable: one precise question first.
             question = _clarification_question_from_message(message)
             return TaskKernelPlan(
                 route="reasoning",
@@ -4417,7 +4928,10 @@ class AgentRuntime:
                     "do not create a mission or artifact before the answer",
                     "resume the original goal after the operator replies",
                 ),
-                rationale="Operator asked for clarification before execution.",
+                rationale=(
+                    "Deliverable is incomplete or operator requested clarification "
+                    "before side effects."
+                ),
                 needs_clarification=True,
                 clarification=question,
             )
@@ -5280,6 +5794,26 @@ class AgentRuntime:
         resume: dict[str, Any] | None = None,
     ) -> tuple[str, ChatEvent, _ExecutedToolResult | None]:
         name, args = _canonicalize_tool_invocation(name, args)
+        # RB-2 second-line gate: block mission/artifact mutation even if the model
+        # selected a side-effect tool route after admission was denied or incomplete.
+        block_reason = self._side_effect_tool_blocked(name, context)
+        if block_reason is not None:
+            observation = f"observation[{name} · blocked]: {block_reason}"
+            return (
+                observation,
+                ChatEvent(
+                    type="thought",
+                    title="Нужно уточнение",
+                    content=block_reason,
+                    payload={
+                        "route": "clarify",
+                        "blocked_tool": name,
+                        "blocked_artifact": name.startswith("documents."),
+                        "source": "side_effect_tool_gate",
+                    },
+                ),
+                None,
+            )
         mission_id = context.mission_id
         conversation_id = str(context.conversation_id or "")
         if mission_id is None and conversation_id.startswith("mission:"):
@@ -8500,6 +9034,21 @@ def _looks_like_network_dns_question(normalized: str) -> bool:
     )
 
 
+# Tools that create durable missions/artifacts or other mutating deliverables.
+# LLM route selection cannot bypass the RB-2 admission gate by calling these.
+SIDE_EFFECT_MUTATING_TOOLS = frozenset(
+    {
+        "documents.generate",
+        "documents.convert",
+        "documents.archive.create",
+        "documents.apply_replacements",
+        "filesystem.write_text",
+        "filesystem.mkdir",
+        "mission.brief",
+    }
+)
+
+
 def _looks_like_clarification_before_action(message: str) -> bool:
     """True when the operator requires one clarifying question before any mission/artifact."""
 
@@ -8527,19 +9076,432 @@ def _looks_like_clarification_before_action(message: str) -> bool:
     )
 
 
-def _clarification_question_from_message(message: str) -> str:
-    """Return one precise clarification question for an ambiguous deliverable."""
+def _looks_like_document_read_or_recall(message: str) -> bool:
+    """True for recall/summarize/compare of existing documents (not artifact creation)."""
 
     normalized = str(message or "").casefold()
-    if any(token in normalized for token in ("формат", "format", "имя", "каталог", "path", "файл")):
+    return _contains_any(
+        normalized,
+        (
+            "дай резюме",
+            "резюме сохран",
+            "summarize",
+            "summary of",
+            "что написано",
+            "что говорит",
+            "what does the document",
+            "what is in the document",
+            "recall",
+            "сохраненн",
+            "сохранённ",
+            "saved document",
+            "saved phoenix",
+            "saved stream",
+            "загруженн",
+            "uploaded document",
+            "прочитай",
+            "read the document",
+            "read the file",
+            "сравни",
+            "compare the",
+            "documents.recall",
+        ),
+    )
+
+
+def _looks_like_artifact_or_mission_side_effect(message: str) -> bool:
+    """True when the operator is requesting a durable artifact or mission plan."""
+
+    normalized = str(message or "").casefold()
+    if not normalized.strip():
+        return False
+    # Document memory / summarize must never be treated as create-artifact.
+    if _looks_like_document_read_or_recall(normalized):
+        return False
+    # Require an explicit creation/write verb — bare "document/report" is not enough.
+    create_verbs = (
+        "подготовь файл",
+        "подготовь отч",
+        "подготовь документ",
+        "prepare the report",
+        "prepare a report",
+        "prepare the file",
+        "prepare a file",
+        "создай файл",
+        "создай отч",
+        "создай документ",
+        "create report",
+        "create a report",
+        "create the report",
+        "create a document",
+        "create the document",
+        "create file",
+        "сгенерируй",
+        "generate report",
+        "generate a report",
+        "generate the report",
+        "generate a document",
+        "generate the document",
+        "generate a file",
+        "write a file",
+        "write the file",
+        "write a report",
+        "write the report",
+        "save the file",
+        "сохрани файл",
+        "сохрани отч",
+        "сохрани документ",
+        "положи",
+        "put it where",
+        "put the file",
+        "put it in",
+    )
+    mission_markers = (
+        "mission plan",
+        "создай mission",
+        "создай миссию",
+        "plan a mission",
+        "многошагов",
+        "multi-step",
+        "разбей на задачи",
+        "разложи на шаги",
+    )
+    return _contains_any(normalized, create_verbs + mission_markers)
+
+
+def _format_is_concrete(normalized: str) -> bool:
+    if re.search(
+        r"(?i)(\.md\b|\.docx\b|\.pdf\b|\.txt\b|\.html\b|\.csv\b|\.json\b|\.xlsx\b)",
+        normalized,
+    ):
+        return True
+    concrete = (
+        "формат md",
+        "формат markdown",
+        "формат docx",
+        "формат pdf",
+        "формат txt",
+        "format md",
+        "format markdown",
+        "format docx",
+        "format pdf",
+        "format txt",
+        "as markdown",
+        "as md",
+        "as docx",
+        "as pdf",
+        "в markdown",
+        "в md",
+        "в docx",
+        "в pdf",
+        "в txt",
+        "markdown",
+        "docx",
+        " pdf",
+        "pdf ",
+    )
+    if not _contains_any(normalized, concrete):
+        # bare tokens at word boundaries
+        format_token = re.search(
+            r"(?i)\b(md|markdown|docx|pdf|txt|html|csv|json|xlsx)\b",
+            normalized,
+        )
+        if not format_token:
+            return False
+        # Reject purely vague phrases that mention the word "format" only.
+        vague = (
+            "нужном формате",
+            "нужный формат",
+            "подходящем формате",
+            "right format",
+            "correct format",
+            "выбранном мной формате",
+            "нужном формат",
+            "where it belongs",
+        )
+        stripped = re.sub(
+            r"(?i)(нужном формате|нужный формат|подходящем формате|right format|"
+            r"correct format|выбранном мной формате)",
+            " ",
+            normalized,
+        )
+        vague_without_token = _contains_any(normalized, vague) and not re.search(
+            r"(?i)\b(md|markdown|docx|pdf|txt)\b",
+            stripped,
+        )
+        return not vague_without_token
+    vague_only = _contains_any(
+        normalized,
+        (
+            "нужном формате",
+            "нужный формат",
+            "подходящем формате",
+            "right format",
+            "correct format",
+            "выбранном мной формате",
+        ),
+    )
+    has_format_token = bool(
+        re.search(
+            r"(?i)\b(md|markdown|docx|pdf|txt|html|csv|json|xlsx)\b",
+            normalized,
+        )
+    )
+    return not (vague_only and not has_format_token)
+
+
+def _destination_is_concrete(normalized: str) -> bool:
+    if "document-outputs" in normalized:
+        return True
+    if re.search(r"(?i)[a-z]:\\[^\s]+|/[^\s]+", normalized):
+        return True
+    if re.search(
+        r"(?i)(\.md|\.docx|\.pdf|\.txt|\.html|\.csv|\.json|\.xlsx)\b",
+        normalized,
+    ):
+        return True
+    if re.search(
+        r"(?i)(файл|file|name|имя)\s*[:=]?\s*[\w.-]+\.(md|docx|pdf|txt|html|csv|json|xlsx)",
+        normalized,
+    ):
+        return True
+    if not _contains_any(
+        normalized,
+        (
+            "в каталог",
+            "в папк",
+            "into folder",
+            "in folder",
+            "output_path",
+            "output_name",
+            "сохрани как",
+            "save as",
+            "под именем",
+        ),
+    ):
+        return False
+    # Still require some concrete token after the marker when only vague dest phrases exist.
+    vague_dest = _contains_any(
+        normalized,
+        (
+            "where it belongs",
+            "куда надо",
+            "куда следует",
+            "нужном месте",
+            "в нужное место",
+            "куда нужно",
+            "куда принадлежит",
+        ),
+    )
+    has_filename = bool(re.search(r"(?i)[\w.-]+\.(md|docx|pdf|txt)", normalized))
+    return not (vague_dest and not has_filename)
+
+
+def _content_topic_is_present(normalized: str) -> bool:
+    """True when there is enough topical substance to generate a deliverable."""
+
+    # Strip meta-instructions about format/destination; remaining text should carry a topic.
+    stripped = normalized
+    for pattern in (
+        r"в нужном формате",
+        r"right format",
+        r"correct format",
+        r"where it belongs",
+        r"куда надо",
+        r"куда следует",
+        r"нужном месте",
+        r"в нужное место",
+        r"выбранном мной формате",
+        r"подготовь файл отч[её]та",
+        r"prepare the report file",
+        r"put it where it belongs",
+        r"сначала задай[^.]*",
+        r"ask one question[^.]*",
+    ):
+        stripped = re.sub(pattern, " ", stripped, flags=re.IGNORECASE)
+    stripped = re.sub(r"\s+", " ", stripped).strip()
+    # Need more than generic "report/file" words.
+    residual = re.sub(
+        r"(?i)\b(отч[её]т|отчет|report|файл|file|документ|document|подготовь|prepare|"
+        r"создай|create|generate|сохрани|save|положи|put|формат|format|каталог|"
+        r"папк|folder|directory|имя|name)\b",
+        " ",
+        stripped,
+    )
+    residual = re.sub(r"\s+", " ", residual).strip(" .,:;!?-")
+    return len(residual) >= 8
+
+
+def _side_effect_completeness_gaps(message: str) -> list[str]:
+    """Return missing operands required for a finished artifact/mission deliverable."""
+
+    normalized = str(message or "").casefold()
+    if not _looks_like_artifact_or_mission_side_effect(normalized):
+        return []
+    gaps: list[str] = []
+    mission_only = _contains_any(
+        normalized,
+        (
+            "mission plan",
+            "создай mission",
+            "создай миссию",
+            "plan a mission",
+            "многошагов",
+            "multi-step",
+            "разбей на задачи",
+            "разложи на шаги",
+        ),
+    ) and not _contains_any(
+        normalized,
+        (
+            "подготовь файл",
+            "подготовь отч",
+            "prepare the report",
+            "prepare a report",
+            "prepare the file",
+            "создай файл",
+            "создай отч",
+            "создай документ",
+            "create report",
+            "create a report",
+            "create a document",
+            "generate report",
+            "generate a",
+            "write a file",
+            "write the file",
+            "write a report",
+            "save the file",
+            "сохрани файл",
+            "положи",
+            "put it where",
+            "put the file",
+        ),
+    )
+    if not mission_only:
+        if not _format_is_concrete(normalized):
+            gaps.append("format")
+        if not _destination_is_concrete(normalized):
+            gaps.append("destination")
+        if not _content_topic_is_present(normalized):
+            gaps.append("content")
+    # Operator explicitly demanded a question first — treat as incomplete until answered.
+    if _looks_like_clarification_before_action(message) and not gaps:
+        gaps.append("operator_requested_clarification")
+    return gaps
+
+
+def _requires_side_effect_clarification(message: str) -> bool:
+    if _looks_like_clarification_before_action(message):
+        return True
+    return bool(_side_effect_completeness_gaps(message))
+
+
+def _clarification_question_from_message(message: str) -> str:
+    """Return exactly one precise clarification question for an incomplete deliverable."""
+
+    gaps = _side_effect_completeness_gaps(message)
+    normalized = str(message or "").casefold()
+    if not gaps and _looks_like_clarification_before_action(message):
+        gaps = ["format", "destination"]
+    if set(gaps) >= {"format", "destination"} or (
+        "формат" in normalized and ("имя" in normalized or "каталог" in normalized)
+    ):
         return (
             "Уточните, пожалуйста, одним ответом: в каком формате нужен отчёт "
             "(например md/docx/pdf), какое точное имя файла и в какой каталог его сохранить?"
+        )
+    if gaps == ["format"]:
+        return (
+            "Уточните, пожалуйста, в каком формате сохранить результат "
+            "(md, docx или pdf)?"
+        )
+    if gaps == ["destination"]:
+        return (
+            "Уточните, пожалуйста, точное имя файла и каталог назначения "
+            "(например report.md в document-outputs)?"
+        )
+    if gaps == ["content"]:
+        return (
+            "Уточните, пожалуйста, какую тему/содержание должен содержать "
+            "итоговый файл, чтобы результат был законченным?"
+        )
+    if gaps:
+        return (
+            "Уточните, пожалуйста, одним ответом недостающие параметры результата: "
+            f"{', '.join(gaps)} (формат, имя/путь и содержание)."
         )
     return (
         "Уточните, пожалуйста, один недостающий параметр, без которого нельзя "
         "безопасно выполнить задачу (формат, путь, объём или критерий успеха)."
     )
+
+
+def _pending_clarification_key(conversation_id: str) -> str:
+    return f"clarification.pending.{conversation_id}"
+
+
+def _artifact_spec_from_clarification_resume(
+    message: str, *, original_goal: str = ""
+) -> dict[str, str] | None:
+    """Build a concrete documents.generate spec from goal + operator answer."""
+
+    text = f"{original_goal}\n{message}".strip()
+    normalized = text.casefold()
+    fmt = "md"
+    if re.search(r"(?i)\b(docx|word)\b", normalized) or ".docx" in normalized:
+        fmt = "docx"
+    elif re.search(r"(?i)\bpdf\b", normalized) or ".pdf" in normalized:
+        fmt = "pdf"
+    elif re.search(r"(?i)\b(txt|text)\b", normalized) or ".txt" in normalized:
+        fmt = "txt"
+    elif re.search(r"(?i)\b(md|markdown)\b", normalized) or ".md" in normalized:
+        fmt = "md"
+
+    name_match = re.search(
+        r"(?i)(?:имя|name|файл|file|as)\s*[:=]?\s*([^\s\\/]+\.(?:md|docx|pdf|txt))",
+        text,
+    )
+    if not name_match:
+        name_match = re.search(r"(?i)\b([a-z0-9._-]+\.(?:md|docx|pdf|txt))\b", text)
+    output_name = name_match.group(1) if name_match else f"report.{fmt}"
+    if (
+        not output_name.lower().endswith(f".{fmt}")
+        and "." not in output_name
+    ):
+        output_name = f"{output_name}.{fmt}"
+
+    body = ""
+    content_match = re.search(
+        r"(?is)(?:content|содержание|тема|body)\s*[:=]\s*(.+)$",
+        message,
+    )
+    if content_match:
+        body = content_match.group(1).strip()
+    if not body:
+        # Pull residual topical tokens from the operator answer.
+        residual = re.sub(
+            r"(?i)\b(md|markdown|docx|pdf|txt|format|формат|имя|name|exact|"
+            r"directory|каталог|document-outputs|file|файл|report\.md)\b",
+            " ",
+            message,
+        )
+        residual = re.sub(r"\s+", " ", residual).strip(" ,.;:-")
+        body = residual
+    if not body or len(body) < 4:
+        body = (
+            f"# Report\n\nPrepared for the original request.\n\n"
+            f"Goal: {original_goal or 'operator report'}\n"
+        )
+    elif not body.lstrip().startswith("#"):
+        body = f"# Report\n\n{body}\n"
+
+    title = Path(output_name).stem.replace("_", " ").replace("-", " ").strip() or "Report"
+    return {
+        "title": title[:120],
+        "body": body[:12000],
+        "output_format": fmt,
+        "output_name": output_name[:180],
+    }
 
 
 def _looks_like_osint_dns_context(normalized: str) -> bool:
@@ -10399,6 +11361,10 @@ def _shopping_research_key(conversation_id: str) -> str:
 
 def _web_research_state_key(conversation_id: str) -> str:
     return f"research.last_web.{conversation_id}"
+
+
+def _clarification_pending_state_key(conversation_id: str) -> str:
+    return _pending_clarification_key(conversation_id)
 
 
 def _shopping_state_from_recent_messages(messages: list[dict[str, Any]]) -> dict[str, Any] | None:

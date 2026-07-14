@@ -4565,6 +4565,239 @@ def test_ambiguity_blocks_mission_until_one_clarification(monkeypatch, tmp_path)
     # No mission persisted.
     if missions is not None:
         assert len(missions) == 0
+    # Pending clarification must be conversation-local.
+    pending = storage.get_runtime_value(
+        f"clarification.pending.{response.conversation_id}", None
+    )
+    assert isinstance(pending, dict)
+    assert pending.get("goal")
+    storage.close()
+
+
+def _artifact_files(root: Path) -> list[Path]:
+    if not root.exists():
+        return []
+    return [path for path in root.rglob("*") if path.is_file()]
+
+
+def test_underspecified_artifact_blocks_even_when_model_requests_generate(
+    monkeypatch, tmp_path
+):
+    """RB-2 A/B: model-shaped documents.generate is blocked; clarification returned."""
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "1")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tool_calls: list[str] = []
+
+    class ArtifactHungryLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None):
+            # Model tries to create an artifact without asking.
+            return type(
+                "Result",
+                (),
+                {
+                    "ok": True,
+                    "content": (
+                        '{"tool":"documents.generate","arguments":{'
+                        '"title":"Report","body":"Invented body",'
+                        '"output_format":"md","output_name":"report.md"}}'
+                    ),
+                    "error": None,
+                },
+            )()
+
+    agent = AgentRuntime(
+        settings=settings, storage=storage, llm=ArtifactHungryLLM(), bus=EventBus()
+    )
+    real_run = agent.tools.run
+
+    async def tracking_run(name, arguments=None, **kwargs):
+        tool_calls.append(name)
+        return await real_run(name, arguments, **kwargs)
+
+    monkeypatch.setattr(agent.tools, "run", tracking_run)
+
+    prompt = "prepare the report file in the right format and put it where it belongs"
+    before = _artifact_files(Path(settings.data_dir))
+    response = asyncio.run(agent.chat(prompt))
+    after = _artifact_files(Path(settings.data_dir))
+
+    assert "?" in response.answer or "Уточните" in response.answer
+    assert response.answer.count("?") >= 1
+    assert "documents.generate" not in tool_calls
+    assert len(after) == len(before)
+    assert storage.list_missions(limit=10) == []
+    assert not any(event.type == "mission" for event in response.events)
+    pending = storage.get_runtime_value(
+        f"clarification.pending.{response.conversation_id}", None
+    )
+    assert isinstance(pending, dict) and pending.get("goal")
+    storage.close()
+
+
+def test_clarification_followup_resumes_original_goal(monkeypatch, tmp_path):
+    """RB-2 C: operator answer fills gaps and continues the original goal."""
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "1")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    calls = {"n": 0}
+
+    class ResumeLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None):
+            calls["n"] += 1
+            # After admission, model may generate the artifact.
+            return type(
+                "Result",
+                (),
+                {
+                    "ok": True,
+                    "content": (
+                        '{"tool":"documents.generate","arguments":{'
+                        '"title":"DNS report","body":"# DNS\\n\\nThree bullets.",'
+                        '"output_format":"md","output_name":"report.md",'
+                        '"output_path":"document-outputs/report.md"}}'
+                    )
+                    if calls["n"] == 1
+                    else "Создан файл report.md в document-outputs.",
+                    "error": None,
+                },
+            )()
+
+    agent = AgentRuntime(
+        settings=settings, storage=storage, llm=ResumeLLM(), bus=EventBus()
+    )
+    first = asyncio.run(
+        agent.chat(
+            "prepare the report file in the right format and put it where it belongs"
+        )
+    )
+    assert "?" in first.answer or "Уточните" in first.answer
+    assert storage.list_missions(limit=5) == []
+
+    second = asyncio.run(
+        agent.chat(
+            "md, имя report.md, каталог document-outputs, содержание: краткий отчёт DNS",
+            conversation_id=first.conversation_id,
+        )
+    )
+    pending = storage.get_runtime_value(
+        f"clarification.pending.{first.conversation_id}", None
+    )
+    assert not pending or not pending.get("goal")
+    # Either artifact tool ran or answer resumed without re-asking the same gate.
+    assert "?" not in second.answer or "report" in second.answer.casefold()
+    storage.close()
+
+
+def test_unambiguous_artifact_request_skips_clarification(monkeypatch, tmp_path):
+    """RB-2 D: concrete artifact request is not blocked by the gate."""
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "1")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tool_calls: list[str] = []
+
+    class GenerateLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None):
+            return type(
+                "Result",
+                (),
+                {
+                    "ok": True,
+                    "content": (
+                        '{"tool":"documents.generate","arguments":{'
+                        '"title":"DNS","body":"- a\\n- b\\n- c",'
+                        '"output_format":"md","output_name":"report.md"}}'
+                    ),
+                    "error": None,
+                },
+            )()
+
+    agent = AgentRuntime(
+        settings=settings, storage=storage, llm=GenerateLLM(), bus=EventBus()
+    )
+    real_run = agent.tools.run
+
+    async def tracking_run(name, arguments=None, **kwargs):
+        tool_calls.append(name)
+        return await real_run(name, arguments, **kwargs)
+
+    monkeypatch.setattr(agent.tools, "run", tracking_run)
+
+    prompt = (
+        "Create report.md in document-outputs with three bullets about DNS security"
+    )
+    response = asyncio.run(agent.chat(prompt))
+    assert "Уточните" not in response.answer
+    # Tool path may run; gate must not force clarification for complete request.
+    pending = storage.get_runtime_value(
+        f"clarification.pending.{response.conversation_id}", None
+    )
+    assert not pending or not pending.get("goal")
+    storage.close()
+
+
+def test_pending_clarification_is_conversation_isolated(monkeypatch, tmp_path):
+    """RB-2 E: two conversations do not share pending clarification state."""
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+
+    class FailLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None):
+            raise AssertionError("LLM must not run for clarification gate")
+
+    agent = AgentRuntime(settings=settings, storage=storage, llm=FailLLM(), bus=EventBus())
+    a = asyncio.run(
+        agent.chat("prepare the report file in the right format and put it where it belongs")
+    )
+    b = asyncio.run(
+        agent.chat("Подготовь файл отчёта в нужном формате и положи его куда надо")
+    )
+    assert a.conversation_id != b.conversation_id
+    pa = storage.get_runtime_value(f"clarification.pending.{a.conversation_id}", None)
+    pb = storage.get_runtime_value(f"clarification.pending.{b.conversation_id}", None)
+    assert isinstance(pa, dict) and pa.get("goal")
+    assert isinstance(pb, dict) and pb.get("goal")
+    assert pa.get("goal") != pb.get("goal")
+    storage.close()
+
+
+def test_retry_does_not_create_duplicate_mission_or_artifact(monkeypatch, tmp_path):
+    """RB-2 F: repeating the ambiguous request does not create side effects."""
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+
+    class FailLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None):
+            raise AssertionError("LLM must not run before clarification")
+
+    agent = AgentRuntime(settings=settings, storage=storage, llm=FailLLM(), bus=EventBus())
+    prompt = "prepare the report file in the right format and put it where it belongs"
+    first = asyncio.run(agent.chat(prompt))
+    second = asyncio.run(agent.chat(prompt, conversation_id=first.conversation_id))
+    assert "?" in first.answer or "Уточните" in first.answer
+    assert "?" in second.answer or "Уточните" in second.answer
+    assert storage.list_missions(limit=10) == []
+    outputs = Path(settings.data_dir) / "document-outputs"
+    assert not outputs.exists() or _artifact_files(outputs) == []
+    # Still no missions and no generate side effects on retry.
+    assert len(storage.list_missions(limit=10)) == 0
     storage.close()
 
 
