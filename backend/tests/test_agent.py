@@ -4590,3 +4590,15 @@ def test_dns_definition_does_not_create_shop_direct_action(monkeypatch, tmp_path
     tool_titles = " ".join(str(event.title or "") for event in response.events).casefold()
     assert "shop" not in tool_titles
     storage.close()
+
+def test_network_unavailable_result_is_single_actionable_message():
+    from jarvis_gpt.agent import _network_unavailable_result, _valid_web_synthesis_answer
+
+    msg = _network_unavailable_result("connection refused")
+    assert "недоступ" in msg.casefold() or "unavailable" in msg.casefold()
+    assert "повтор" in msg.casefold() or "offline" in msg.casefold()
+    # Link dump without prose is not usable synthesis.
+    assert _valid_web_synthesis_answer("1. https://a.example\n2. https://b.example") is False
+    assert _valid_web_synthesis_answer(
+        "Краткий вывод по теме с опорой на источники.\n\nИсточники:\n1. Example: https://a.example"
+    ) is True
