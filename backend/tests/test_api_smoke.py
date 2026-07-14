@@ -563,6 +563,29 @@ def test_interrupted_stream_partial_answer_is_recoverable(client):
     assert messages[-1]["metadata"]["interrupted"] is True
 
 
+def test_interrupted_stream_empty_partial_is_not_persisted_as_final(client):
+    """SPARK-0011: empty stream interruption must not create a blank assistant final."""
+    conversation_id = app.state.storage.create_conversation("empty interrupted stream")
+    before = client.get(f"/api/conversations/{conversation_id}/messages").json()
+    saved = _persist_interrupted_stream(
+        app.state.storage,
+        conversation_id=conversation_id,
+        partial=["", "  ", ""],
+        events=[{"type": "assistant_done", "payload": {"source": "test", "interrupted": True}}],
+    )
+    after = client.get(f"/api/conversations/{conversation_id}/messages").json()
+    interrupted = client.get(f"/api/chat/stream/interrupted/{conversation_id}")
+    assistant_bodies = [
+        str(item.get("content") or "").strip()
+        for item in after
+        if item.get("role") == "assistant"
+    ]
+    assert saved is None
+    assert len(after) == len(before)
+    assert all(body for body in assistant_bodies)
+    assert interrupted.status_code in {200, 404}
+
+
 def test_mission_lifecycle_and_report(client):
     created = client.post(
         "/api/missions",

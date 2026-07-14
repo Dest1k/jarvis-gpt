@@ -1169,6 +1169,21 @@ function normalizeStoredLine(line: ChatLine): ChatLine {
   };
 }
 
+/** Empty pending assistant bubbles must not survive stream teardown (FUNC-FIND-011). */
+function isEmptyAssistantPlaceholder(line: ChatLine | null | undefined): boolean {
+  if (!line || line.role !== "assistant") return false;
+  const content = String(line.content ?? "").trim();
+  if (content) return false;
+  // Pending stream placeholder, or a finalized empty 0 ms bubble.
+  if (line.pending) return true;
+  const duration = coerceDurationMs(line.durationMs);
+  return duration === null || duration === 0;
+}
+
+function withoutEmptyAssistantPlaceholders(lines: ChatLine[]): ChatLine[] {
+  return lines.filter((line) => !isEmptyAssistantPlaceholder(line));
+}
+
 function coerceDurationMs(value: unknown): number | null {
   const numeric = typeof value === "number" ? value : Number(value);
   if (!Number.isFinite(numeric) || numeric < 0) return null;
@@ -1211,7 +1226,7 @@ function readStoredChatWindows(identity: string | null): { windows: ChatWindow[]
         conversationId: item.conversationId ?? null,
         lines:
           Array.isArray(item.lines) && item.lines.length
-            ? item.lines.map(normalizeStoredLine)
+            ? withoutEmptyAssistantPlaceholders(item.lines.map(normalizeStoredLine))
             : bootLines(),
         createdAt: Number(item.createdAt) || Date.now()
       }));
@@ -2511,22 +2526,56 @@ export default function CommandCenter() {
         }
       );
       await refresh();
+      // Stream ended without a terminal done/error: drop empty placeholder so a
+      // retry cannot leave a stale 0 ms assistant bubble (FUNC-FIND-011).
+      updateChatWindow(chatWindowId, (window) => ({
+        ...window,
+        lines: withoutEmptyAssistantPlaceholders(
+          window.lines.map((line) =>
+            line.id === assistantId && line.pending
+              ? {
+                  ...line,
+                  pending: false,
+                  startedAt: null,
+                  durationMs:
+                    coerceDurationMs(line.durationMs) ??
+                    Math.max(0, Date.now() - assistantStartedAt)
+                }
+              : line
+          )
+        )
+      }));
     } catch (err) {
       updateChatWindow(chatWindowId, (window) => ({
         ...window,
-        lines: window.lines.map((line) =>
-          line.id === assistantId
-            ? {
-                ...line,
-                content: err instanceof Error ? `Ошибка backend: ${err.message}` : "Ошибка backend",
-                durationMs: Math.max(0, Date.now() - assistantStartedAt),
-                pending: false,
-                startedAt: null
-              }
-            : line
-        )
+        lines: window.lines.flatMap((line) => {
+          if (line.id !== assistantId) return [line];
+          const content = String(line.content ?? "").trim();
+          if (!content) {
+            // Remove empty stream placeholder instead of committing a 0 ms bubble.
+            return [];
+          }
+          return [
+            {
+              ...line,
+              content:
+                err instanceof Error
+                  ? `${content}\n\n[stream interrupted: ${err.message}]`
+                  : content,
+              durationMs: Math.max(0, Date.now() - assistantStartedAt),
+              pending: false,
+              startedAt: null
+            }
+          ];
+        })
       }));
     } finally {
+      if (assistantId) {
+        updateChatWindow(chatWindowId, (window) => ({
+          ...window,
+          lines: withoutEmptyAssistantPlaceholders(window.lines)
+        }));
+      }
       setChatBusy(false);
       setActiveOperation(null);
     }

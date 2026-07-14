@@ -7,7 +7,8 @@
     "build": "next build",
     "start": "next start",
     "typecheck": "tsc --noEmit",
-    "test:runtime-identity": "node -e \"const id=(h,p)=>String(h||'').trim().toLowerCase()+'::'+String(p||'').trim().toLowerCase(); const key=i=>'jarvis.chatWindows.v1::'+encodeURIComponent(i); const a=id('D:\\\\jarvis\\\\old','gemma4-turbo'); const b=id('D:\\\\jarvis\\\\new','gemma4-turbo'); if(a===b) process.exit(1); if(key(a)===key(b)) process.exit(2); if(key(a).includes(encodeURIComponent(a))===false) process.exit(3); console.log('runtime-identity-ok');\""
+    "test:runtime-identity": "node -e \"const id=(h,p)=>String(h||'').trim().toLowerCase()+'::'+String(p||'').trim().toLowerCase(); const key=i=>'jarvis.chatWindows.v1::'+encodeURIComponent(i); const a=id('D:\\\\jarvis\\\\old','gemma4-turbo'); const b=id('D:\\\\jarvis\\\\new','gemma4-turbo'); if(a===b) process.exit(1); if(key(a)===key(b)) process.exit(2); if(key(a).includes(encodeURIComponent(a))===false) process.exit(3); console.log('runtime-identity-ok');\"",
+    "test:stream-placeholder": "node -e \"const empty=(l)=>l.role==='assistant'&&!String(l.content||'').trim()&&(!!l.pending||l.durationMs===0||l.durationMs==null); const drop=ls=>ls.filter(l=>!empty(l)); const before=[{role:'user',content:'hi'},{role:'assistant',content:'',pending:true,durationMs:0},{role:'assistant',content:'ok',pending:false,durationMs:12}]; const after=drop(before); if(after.length!==2) process.exit(1); if(after.some(empty)) process.exit(2); if(drop([{role:'assistant',content:'x',pending:true}]).length!==1) process.exit(3); console.log('stream-placeholder-ok');\""
   },
   "dependencies": {
     "clsx": "2.1.1",
