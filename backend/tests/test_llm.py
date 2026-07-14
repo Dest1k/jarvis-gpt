@@ -1,9 +1,42 @@
 from __future__ import annotations
 
 import asyncio
+import re
 
 from jarvis_gpt.config import load_settings
 from jarvis_gpt.llm import LLMRouter, LLMStreamChunk, _stream_chunk_from_line
+
+# Shared marker scan for SPARK-0006 / FUNC-FIND-006 (mirrors qa response_integrity).
+_TOOL_ENVELOPE_MARKERS = (
+    re.compile(r"(?i)(?:^|\s)call\s*:\s*\S+"),
+    re.compile(
+        r"(?is)[{[][^}\]]*(?:"
+        r"\"(?:tool|function|tool_calls|function_call)\"\s*:|"
+        r"\"name\"\s*:\s*\"[^\"]+\"[^}\]]*\"arguments\"\s*:"
+        r")"
+    ),
+)
+
+
+def _has_tool_envelope_marker(text: str) -> bool:
+    return any(pattern.search(text) for pattern in _TOOL_ENVELOPE_MARKERS)
+
+
+def test_tool_shaped_output_fixtures_are_detected_by_marker_scan():
+    """SPARK-0006: known bad finals must fail the envelope marker scan."""
+    bad_finals = [
+        "call:documents.read",
+        "call:llm.health",
+        "call:dispatcher.status",
+        'call:documents.read\n{"tool":"documents.read","arguments":{}}',
+        '{"tool":"web.search","arguments":{"query":"x"}}',
+        '{"tool_calls":[{"id":"1","function":{"name":"x","arguments":"{}"}}]}',
+    ]
+    for final in bad_finals:
+        assert _has_tool_envelope_marker(final) is True, final
+
+    assert _has_tool_envelope_marker("Документ сохранён, замечаний нет.") is False
+    assert _has_tool_envelope_marker("Use the tools available in the UI.") is False
 
 
 def test_stream_chunk_parser_reads_openai_sse_delta():

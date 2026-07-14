@@ -41,6 +41,21 @@ def client(monkeypatch, tmp_path):
         yield test_client
 
 
+def test_user_visible_answer_helper_blocks_tool_envelopes():
+    """SPARK-0006: API-facing helper must scrub call:/tool envelopes from finals."""
+    from jarvis_gpt.agent import TOOL_PROTOCOL_FAILURE_ANSWER, _user_visible_answer
+
+    for payload in (
+        "call:documents.read",
+        "call:llm.health",
+        'call:dispatcher.status\n{"tool":"dispatcher.status","arguments":{}}',
+    ):
+        visible = _user_visible_answer(payload)
+        assert "call:" not in visible.lower()
+        assert '"tool"' not in visible
+        assert visible == TOOL_PROTOCOL_FAILURE_ANSWER
+
+
 def test_lifespan_cleanup_survives_repeated_cancellation(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")

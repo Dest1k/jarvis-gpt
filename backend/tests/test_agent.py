@@ -4361,5 +4361,95 @@ def test_agent_filters_thinking_blocks_from_stream(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_classify_rejects_raw_call_markers_and_tool_envelopes():
+    """SPARK-0006 / FUNC-FIND-006: bare call: markers must never be answers."""
+    from jarvis_gpt.agent import (
+        TOOL_PROTOCOL_FAILURE_ANSWER,
+        _classify_tool_turn,
+        _contains_internal_tool_output,
+        _user_visible_answer,
+    )
+
+    leak_samples = [
+        "call:documents.read",
+        "call:llm.health",
+        "call:dispatcher.status",
+        'call:documents.read\n{"tool":"documents.read","arguments":{}}',
+        '{"tool":"documents.read","arguments":{"path":"x.pdf"}}',
+        '{"tool_calls":[{"name":"web.search","arguments":{}}]}',
+    ]
+    for sample in leak_samples:
+        turn = _classify_tool_turn(sample)
+        assert turn.kind in {"protocol_error", "tool"}, sample
+        if turn.kind == "protocol_error":
+            assert turn.text == ""
+        assert _contains_internal_tool_output(sample) is True
+        visible = _user_visible_answer(sample)
+        assert "call:" not in visible.lower()
+        assert '"tool"' not in visible
+        assert visible == TOOL_PROTOCOL_FAILURE_ANSWER
+
+    normal = "Документ обработан, ключевых находок нет."
+    assert _classify_tool_turn(normal).kind == "answer"
+    assert _contains_internal_tool_output(normal) is False
+    assert _user_visible_answer(normal) == normal
+
+
+class FakeToolEnvelopeStreamingLLM:
+    def __init__(self, payload: str) -> None:
+        self.payload = payload
+
+    async def complete(self, messages, *, temperature=None, max_tokens=None):
+        return type(
+            "Result",
+            (),
+            {"ok": True, "content": self.payload, "error": None, "raw": {}},
+        )()
+
+    async def stream_complete(self, messages, *, temperature=None, max_tokens=None):
+        yield LLMStreamChunk(kind="delta", content=self.payload)
+        yield LLMStreamChunk(kind="done", finish_reason="stop")
+
+
+def test_stream_chat_suppresses_tool_envelope_payloads(monkeypatch, tmp_path):
+    """SPARK-0006: NDJSON deltas and terminal answer must not expose call: envelopes."""
+    from jarvis_gpt.agent import TOOL_PROTOCOL_FAILURE_ANSWER
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "1")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+
+    forbidden = (
+        "call:documents.read",
+        "call:llm.health",
+        "call:dispatcher.status",
+        '{"tool":',
+        "tool_calls",
+    )
+    for payload in (
+        "call:documents.read",
+        "call:llm.health",
+        'call:documents.read\n{"tool":"documents.read","arguments":{}}',
+    ):
+        agent = AgentRuntime(
+            settings=settings,
+            storage=storage,
+            llm=FakeToolEnvelopeStreamingLLM(payload),
+            bus=EventBus(),
+        )
+        items = asyncio.run(_collect(agent.stream_chat("проверка", mode="chat")))
+        deltas = "".join(item.get("content", "") for item in items if item["type"] == "delta")
+        done = next(item for item in items if item["type"] == "done")
+        combined = f"{deltas}\n{done['answer']}"
+        for marker in forbidden:
+            assert marker not in combined, (payload, marker, combined)
+        assert done["answer"]
+        assert done["answer"] == TOOL_PROTOCOL_FAILURE_ANSWER or "call:" not in done["answer"]
+    storage.close()
+
+
 async def _collect(stream):
     return [item async for item in stream]

@@ -1294,7 +1294,7 @@ class AgentRuntime:
 
         continuation_count = 0
         if answer_parts:
-            answer = _clean_assistant_answer("".join(answer_parts).strip())
+            answer = _user_visible_answer("".join(answer_parts).strip())
             if stream_error:
                 interruption = f"\n\n[stream interrupted: {stream_error}]"
                 answer = f"{answer}{interruption}"
@@ -5285,7 +5285,7 @@ class AgentRuntime:
             )
             if not result.ok or not result.content:
                 return _AgenticResult(ok=False, answer="", events=events, error=result.error)
-            answer = _clean_assistant_answer(result.content)
+            answer = _user_visible_answer(result.content)
             finish_reason = _finish_reason_from_llm_result(result)
             continuation_count = 0
             if finish_reason == "length":
@@ -7019,7 +7019,18 @@ def _schema_hint(schema: dict[str, Any]) -> str:
     return ", ".join(parts)
 
 
-_TOOL_JSON_KEY_RE = re.compile(r"""[\"'](?:tool|name|arguments|args)[\"']\s*:""")
+_TOOL_JSON_KEY_RE = re.compile(
+    r"""[\"'](?:tool|name|arguments|args|tool_calls|function_call|function)[\"']\s*:"""
+)
+# Matches raw control-plane markers that models emit instead of a final answer
+# (FUNC-FIND-006 / OP-0025..): "call:documents.read", "call:llm.health", etc.
+_CALL_MARKER_RE = re.compile(r"(?im)(?:^|\s)call\s*:\s*\S+")
+_TOOL_ENVELOPE_TEXT_RE = re.compile(
+    r"(?is)[{[][^}\]]*(?:"
+    r"\"(?:tool|function|tool_calls|function_call)\"\s*:|"
+    r"\"name\"\s*:\s*\"[^\"]+\"[^}\]]*\"arguments\"\s*:"
+    r")"
+)
 
 
 def _looks_like_broken_tool_payload(content: str) -> bool:
@@ -7036,13 +7047,39 @@ def _looks_like_broken_tool_payload(content: str) -> bool:
     return bool(_TOOL_JSON_KEY_RE.search(candidate[brace_at:]))
 
 
+def _contains_internal_tool_output(content: str) -> bool:
+    """True when user-visible text still carries tool/control envelopes."""
+
+    text = _clean_assistant_answer(content).strip()
+    if not text:
+        return False
+    if _CALL_MARKER_RE.search(text):
+        return True
+    if _TOOL_ENVELOPE_TEXT_RE.search(text):
+        return True
+    if _looks_like_broken_tool_payload(text):
+        return True
+    return False
+
+
+def _user_visible_answer(content: str) -> str:
+    """Return a safe operator-facing answer, never raw tool/control envelopes."""
+
+    cleaned = _clean_assistant_answer(content).strip()
+    if not cleaned:
+        return cleaned
+    if _contains_internal_tool_output(cleaned):
+        return TOOL_PROTOCOL_FAILURE_ANSWER
+    return cleaned
+
+
 def _classify_tool_turn(content: str) -> _ToolTurn:
     """Classify a complete model turn without exposing control-plane payloads.
 
     Tool-enabled rounds are buffered before this function is called. A valid tool
     turn is one standalone JSON object (an optional full JSON fence is accepted).
-    Any prose/JSON mixture or malformed tool-shaped value is a protocol error,
-    never a user-visible answer.
+    Any prose/JSON mixture, bare call: marker, or malformed tool-shaped value is a
+    protocol error, never a user-visible answer.
     """
 
     text = _clean_assistant_answer(content).strip()
@@ -7053,6 +7090,8 @@ def _classify_tool_turn(content: str) -> _ToolTurn:
     except json.JSONDecodeError:
         data = None
     if isinstance(data, dict):
+        if "tool_calls" in data or "function_call" in data:
+            return _ToolTurn(kind="protocol_error", text="")
         has_tool_name = "tool" in data or "name" in data
         if has_tool_name:
             name = data.get("tool") if "tool" in data else data.get("name")
@@ -7071,7 +7110,7 @@ def _classify_tool_turn(content: str) -> _ToolTurn:
                 text="",
                 action=(name.strip(), args),
             )
-    if _looks_like_broken_tool_payload(candidate):
+    if _contains_internal_tool_output(text):
         return _ToolTurn(kind="protocol_error", text="")
     return _ToolTurn(kind="answer", text=text)
 

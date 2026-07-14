@@ -14,11 +14,11 @@ tasks:
   - task_id: "SPARK-0016"
     order: 2
     status: "PASS"
-    commit: "PENDING"
+    commit: "e276df67deb9cf77b4b42a84a17c6ea51bcb66a1"
   - task_id: "SPARK-0006"
     order: 3
-    status: "PENDING"
-    commit: null
+    status: "PASS"
+    commit: "PENDING"
   - task_id: "SPARK-0009"
     order: 4
     status: "PENDING"
