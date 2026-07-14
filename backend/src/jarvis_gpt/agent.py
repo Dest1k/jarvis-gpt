@@ -417,6 +417,9 @@ class AgentContext:
     pending_clarification_goal: str | None = None
     resumed_from_clarification: bool = False
     clarification_original_goal: str | None = None
+    # RB-6: typed pending TRANSFORM draft restored on clarification follow-up.
+    pending_transform_draft: dict[str, Any] | None = None
+    transform_resume_already_completed: bool = False
 
 
 @dataclass(frozen=True)
@@ -723,15 +726,26 @@ class AgentRuntime:
         )
         if context.resumed_from_clarification:
             # Keep kernel on the original deliverable, not the shopping false-positive.
+            # RB-6: clarified transforms resume on the sealed documents.convert path.
+            resume_tools: tuple[str, ...] = ("documents.generate",)
+            resume_intent = "artifact_after_clarification"
+            if (
+                context.pending_transform_draft
+                and context.pending_transform_draft.get("intent_kind")
+                == TRANSFORM_EXISTING_DOCUMENT
+            ):
+                resume_tools = ("documents.convert",)
+                resume_intent = "transform_document"
             task_plan = TaskKernelPlan(
                 route="reasoning",
                 mode=task_plan.mode,
-                intent="artifact_after_clarification",
-                confidence=0.95,
-                tools=("documents.generate",),
+                intent=resume_intent,
+                confidence=0.99 if resume_intent == "transform_document" else 0.95,
+                tools=resume_tools,
                 completion_criteria=(
                     "create exactly one artifact from the clarified operands",
                     "do not open shopping or unrelated web research",
+                    "do not use mission or free tool-loop for sealed transform",
                 ),
                 rationale="Resuming original artifact goal after operator clarification.",
                 needs_clarification=False,
@@ -946,13 +960,23 @@ class AgentRuntime:
             answer = question
             if context.side_effects_admitted:
                 # Persist pending so follow-up can resume without re-guessing.
+                gaps = _side_effect_completeness_gaps(message) or [
+                    "operator_requested_clarification"
+                ]
+                draft = context.pending_transform_draft or _build_pending_transform_draft(
+                    message,
+                    conversation_id=context.conversation_id,
+                    originating_message_id=context.operator_message_id,
+                    gaps=gaps,
+                )
                 self._set_pending_clarification(
                     context.conversation_id,
                     goal=message,
                     question=question,
-                    gaps=_side_effect_completeness_gaps(message)
-                    or ["operator_requested_clarification"],
+                    gaps=gaps,
+                    draft=draft,
                 )
+                context.pending_transform_draft = draft
                 context.side_effects_admitted = False
             events.append(
                 ChatEvent(
@@ -1217,15 +1241,25 @@ class AgentRuntime:
             attachments=attachments,
         )
         if context.resumed_from_clarification:
+            resume_tools: tuple[str, ...] = ("documents.generate",)
+            resume_intent = "artifact_after_clarification"
+            if (
+                context.pending_transform_draft
+                and context.pending_transform_draft.get("intent_kind")
+                == TRANSFORM_EXISTING_DOCUMENT
+            ):
+                resume_tools = ("documents.convert",)
+                resume_intent = "transform_document"
             task_plan = TaskKernelPlan(
                 route="reasoning",
                 mode=task_plan.mode,
-                intent="artifact_after_clarification",
-                confidence=0.95,
-                tools=("documents.generate",),
+                intent=resume_intent,
+                confidence=0.99 if resume_intent == "transform_document" else 0.95,
+                tools=resume_tools,
                 completion_criteria=(
                     "create exactly one artifact from the clarified operands",
                     "do not open shopping or unrelated web research",
+                    "do not use mission or free tool-loop for sealed transform",
                 ),
                 rationale="Resuming original artifact goal after operator clarification.",
                 needs_clarification=False,
@@ -1450,13 +1484,23 @@ class AgentRuntime:
             )
             answer = question
             if context.side_effects_admitted:
+                gaps = _side_effect_completeness_gaps(message) or [
+                    "operator_requested_clarification"
+                ]
+                draft = context.pending_transform_draft or _build_pending_transform_draft(
+                    message,
+                    conversation_id=context.conversation_id,
+                    originating_message_id=context.operator_message_id,
+                    gaps=gaps,
+                )
                 self._set_pending_clarification(
                     context.conversation_id,
                     goal=message,
                     question=question,
-                    gaps=_side_effect_completeness_gaps(message)
-                    or ["operator_requested_clarification"],
+                    gaps=gaps,
+                    draft=draft,
                 )
+                context.pending_transform_draft = draft
                 context.side_effects_admitted = False
             events.append(
                 ChatEvent(
@@ -4627,21 +4671,58 @@ class AgentRuntime:
         goal: str,
         question: str,
         gaps: list[str],
+        draft: dict[str, Any] | None = None,
     ) -> None:
+        payload: dict[str, Any] = {
+            "goal": goal,
+            "question": question,
+            "gaps": list(gaps),
+            "ts": time.time(),
+        }
+        if draft is not None:
+            # Conversation-scoped typed draft (RB-6); never share across conversations.
+            bound = dict(draft)
+            bound["conversation_id"] = conversation_id
+            payload["draft"] = bound
         self.storage.set_runtime_value(
             _pending_clarification_key(conversation_id),
-            {
-                "goal": goal,
-                "question": question,
-                "gaps": list(gaps),
-                "ts": time.time(),
-            },
+            payload,
         )
 
     def _clear_pending_clarification(self, conversation_id: str) -> None:
         self.storage.set_runtime_value(
             _pending_clarification_key(conversation_id),
             {},
+        )
+
+    def _mark_transform_draft_completed(
+        self,
+        conversation_id: str,
+        draft: dict[str, Any],
+        *,
+        completed_path: str,
+        goal: str | None = None,
+    ) -> None:
+        """Atomically close a clarified transform after verified success (RB-6)."""
+
+        completed = dict(draft)
+        completed["status"] = "completed"
+        completed["completed_path"] = completed_path
+        completed["missing_fields"] = []
+        bound_goal = (
+            goal
+            or str(draft.get("transformation_instruction") or "")
+            or str(draft.get("goal") or "")
+        )
+        self.storage.set_runtime_value(
+            _pending_clarification_key(conversation_id),
+            {
+                "goal": bound_goal,
+                "question": "",
+                "gaps": [],
+                "ts": time.time(),
+                "draft": completed,
+            },
         )
 
     def _admit_side_effects(
@@ -4658,43 +4739,123 @@ class AgentRuntime:
         pending = self._pending_clarification_state(conversation_id)
         if pending is not None:
             goal = str(pending.get("goal") or "").strip()
-            combined = f"{goal}\n\nУточнение оператора: {message}".strip()
-            gaps = _side_effect_completeness_gaps(combined)
-            # After the operator answered the one clarifying question, format+destination
-            # are enough to resume; remaining topical body may use a disclosed default.
-            original_gaps = {
-                str(item) for item in (pending.get("gaps") or []) if str(item)
-            }
-            if original_gaps and not (set(gaps) & {"format", "destination"}):
-                gaps = [g for g in gaps if g not in {"content", "operator_requested_clarification"}]
-            if not gaps and not _looks_like_clarification_before_action(combined):
-                self._clear_pending_clarification(conversation_id)
-                context.pending_clarification_goal = None
-                context.side_effects_admitted = True
-                context.resumed_from_clarification = True
-                context.clarification_original_goal = goal
-                return True, combined, None
-            message_complete = (
-                not _side_effect_completeness_gaps(message)
-                and _looks_like_artifact_or_mission_side_effect(message)
-            )
-            if message_complete:
-                self._clear_pending_clarification(conversation_id)
-                context.pending_clarification_goal = None
-                context.side_effects_admitted = True
-                context.resumed_from_clarification = True
-                context.clarification_original_goal = goal
-                return True, message, None
-            question = _clarification_question_from_message(combined)
-            self._set_pending_clarification(
-                conversation_id,
-                goal=goal,
-                question=question,
-                gaps=gaps or _side_effect_completeness_gaps(combined),
-            )
-            context.pending_clarification_goal = goal
-            context.side_effects_admitted = False
-            return False, message, question
+            raw_draft = pending.get("draft")
+            draft = raw_draft if isinstance(raw_draft, dict) else None
+            # Conversation isolation: reject drafts bound to another conversation.
+            if draft is not None:
+                draft_cid = str(draft.get("conversation_id") or "").strip()
+                if draft_cid and draft_cid != conversation_id:
+                    draft = None
+
+            handled_pending = True
+            # RB-6: typed TRANSFORM pending draft — merge follow-up into draft only.
+            if (
+                draft is not None
+                and draft.get("intent_kind") == TRANSFORM_EXISTING_DOCUMENT
+            ):
+                if draft.get("status") == "completed":
+                    # New fully-specified or fresh incomplete transform replaces completed.
+                    if _is_fully_specified_transform(message) or (
+                        _requires_side_effect_clarification(message)
+                        and _is_transform_shaped_request(message)
+                    ):
+                        self._clear_pending_clarification(conversation_id)
+                        handled_pending = False
+                    else:
+                        # Re-follow-up after completed: no second transform execution.
+                        context.pending_clarification_goal = goal or None
+                        context.side_effects_admitted = True
+                        context.resumed_from_clarification = True
+                        context.clarification_original_goal = goal
+                        context.pending_transform_draft = draft
+                        context.transform_resume_already_completed = True
+                        combined_done = (
+                            f"{goal}\n\nУточнение оператора: {message}".strip()
+                        )
+                        return True, combined_done, None
+                else:
+                    merged = _merge_transform_draft_followup(draft, message)
+                    missing = [
+                        str(item)
+                        for item in (merged.get("missing_fields") or [])
+                        if str(item)
+                    ]
+                    if missing:
+                        question = _clarification_question_from_gaps(missing)
+                        self._set_pending_clarification(
+                            conversation_id,
+                            goal=goal,
+                            question=question,
+                            gaps=missing,
+                            draft=merged,
+                        )
+                        context.pending_clarification_goal = goal
+                        context.pending_transform_draft = merged
+                        context.side_effects_admitted = False
+                        return False, message, question
+                    # Draft complete — admit and route to sealed convert path.
+                    # Keep pending as ready until verified success closes it.
+                    ready = dict(merged)
+                    ready["status"] = "ready"
+                    self._set_pending_clarification(
+                        conversation_id,
+                        goal=goal,
+                        question="",
+                        gaps=[],
+                        draft=ready,
+                    )
+                    context.pending_clarification_goal = None
+                    context.side_effects_admitted = True
+                    context.resumed_from_clarification = True
+                    context.clarification_original_goal = goal
+                    context.pending_transform_draft = ready
+                    combined = f"{goal}\n\nУточнение оператора: {message}".strip()
+                    return True, combined, None
+
+            # Non-transform pending clarification (plain NEW_ARTIFACT resume).
+            if handled_pending:
+                combined = f"{goal}\n\nУточнение оператора: {message}".strip()
+                gaps = _side_effect_completeness_gaps(combined)
+                # After the operator answered the one clarifying question, format+destination
+                # are enough to resume; remaining topical body may use a disclosed default.
+                original_gaps = {
+                    str(item) for item in (pending.get("gaps") or []) if str(item)
+                }
+                if original_gaps and not (set(gaps) & {"format", "destination"}):
+                    gaps = [
+                        g
+                        for g in gaps
+                        if g not in {"content", "operator_requested_clarification"}
+                    ]
+                if not gaps and not _looks_like_clarification_before_action(combined):
+                    self._clear_pending_clarification(conversation_id)
+                    context.pending_clarification_goal = None
+                    context.side_effects_admitted = True
+                    context.resumed_from_clarification = True
+                    context.clarification_original_goal = goal
+                    return True, combined, None
+                message_complete = (
+                    not _side_effect_completeness_gaps(message)
+                    and _looks_like_artifact_or_mission_side_effect(message)
+                )
+                if message_complete:
+                    self._clear_pending_clarification(conversation_id)
+                    context.pending_clarification_goal = None
+                    context.side_effects_admitted = True
+                    context.resumed_from_clarification = True
+                    context.clarification_original_goal = goal
+                    return True, message, None
+                question = _clarification_question_from_message(combined)
+                self._set_pending_clarification(
+                    conversation_id,
+                    goal=goal,
+                    question=question,
+                    gaps=gaps or _side_effect_completeness_gaps(combined),
+                    draft=draft if isinstance(draft, dict) else None,
+                )
+                context.pending_clarification_goal = goal
+                context.side_effects_admitted = False
+                return False, message, question
 
         if not _requires_side_effect_clarification(message):
             context.side_effects_admitted = True
@@ -4705,13 +4866,21 @@ class AgentRuntime:
         gaps = _side_effect_completeness_gaps(message)
         if not gaps and _looks_like_clarification_before_action(message):
             gaps = ["operator_requested_clarification"]
+        draft = _build_pending_transform_draft(
+            message,
+            conversation_id=conversation_id,
+            originating_message_id=context.operator_message_id,
+            gaps=gaps,
+        )
         self._set_pending_clarification(
             conversation_id,
             goal=message,
             question=question,
             gaps=gaps,
+            draft=draft,
         )
         context.pending_clarification_goal = message
+        context.pending_transform_draft = draft
         context.side_effects_admitted = False
         return False, message, question
 
@@ -4741,12 +4910,21 @@ class AgentRuntime:
             question = _clarification_question_from_message(message)
             # Persist pending state so the next operator turn can resume.
             if context.conversation_id:
+                gaps = _side_effect_completeness_gaps(message)
+                draft = context.pending_transform_draft or _build_pending_transform_draft(
+                    message,
+                    conversation_id=context.conversation_id,
+                    originating_message_id=context.operator_message_id,
+                    gaps=gaps,
+                )
                 self._set_pending_clarification(
                     context.conversation_id,
                     goal=message,
                     question=question,
-                    gaps=_side_effect_completeness_gaps(message),
+                    gaps=gaps,
+                    draft=draft,
                 )
+                context.pending_transform_draft = draft
             context.side_effects_admitted = False
             return (
                 f"Side-effect tool {tool_name!r} blocked: deliverable is incomplete. "
@@ -4760,12 +4938,98 @@ class AgentRuntime:
         """Deterministically finish an artifact after the operator answered clarification.
 
         Avoids planner/shopping hijacks (e.g. the word DNS in report content) and
-        guarantees exactly one generate attempt for the resumed goal.
+        guarantees exactly one generate/convert attempt for the resumed goal.
+
+        RB-6: clarified TRANSFORM resumes through the same sealed documents.convert
+        path as fully specified transforms (RB-5), using the typed pending draft.
         """
 
         if not context.resumed_from_clarification or not context.side_effects_admitted:
             return None
         original = context.clarification_original_goal or ""
+        draft = context.pending_transform_draft
+
+        # RB-6: completed clarified transform — zero second execution.
+        if context.transform_resume_already_completed and isinstance(draft, dict):
+            completed_path = str(draft.get("completed_path") or "").strip()
+            dest_name = str(draft.get("destination_filename") or "").strip()
+            if completed_path and Path(completed_path).is_file():
+                answer = (
+                    f"Артефакт создан. Файл: `{Path(completed_path).name}` "
+                    f"(повторный follow-up не создаёт второй artifact).\n"
+                    f"Путь: `{completed_path}`"
+                )
+            else:
+                answer = (
+                    "Трансформация после уточнения уже была выполнена; "
+                    "повторный запуск отключён (zero duplicate artifact)."
+                )
+                if dest_name:
+                    answer += f" Запрошенный файл: `{dest_name}`."
+            return DirectAction(
+                answer=answer,
+                events=[
+                    ChatEvent(
+                        type="thought",
+                        title="Clarified transform already completed",
+                        content="Pending draft status=completed; no second convert.",
+                        payload={
+                            "source": "clarification_resume_transform",
+                            "status": "completed",
+                            "completed_path": completed_path,
+                            "requested_destination": draft.get("requested_destination"),
+                        },
+                    )
+                ],
+            )
+
+        # RB-6: typed TRANSFORM draft → sealed convert (same contract as RB-5).
+        if (
+            isinstance(draft, dict)
+            and draft.get("intent_kind") == TRANSFORM_EXISTING_DOCUMENT
+        ):
+            intent = _intent_from_transform_draft(draft)
+            if intent is None or not intent.get("complete"):
+                return None
+            action = await self._run_typed_artifact_intent(
+                intent, context, source_label="clarification_resume_transform"
+            )
+            if action is not None:
+                # Atomically close pending only after verified exact-path success.
+                verified_ok = any(
+                    e.type == "tool_call"
+                    and bool((e.payload or {}).get("path_verified"))
+                    and bool((e.payload or {}).get("ok"))
+                    for e in action.events
+                )
+                verified_path = ""
+                for event in action.events:
+                    if event.type == "tool_call" and (event.payload or {}).get(
+                        "path_verified"
+                    ):
+                        verified_path = str((event.payload or {}).get("path") or "")
+                        break
+                if verified_ok and verified_path:
+                    self._mark_transform_draft_completed(
+                        context.conversation_id,
+                        draft,
+                        completed_path=verified_path,
+                        goal=original
+                        or str(draft.get("transformation_instruction") or ""),
+                    )
+                elif not verified_ok:
+                    # Keep ready draft for retry/reload without duplicate success claim.
+                    ready = dict(draft)
+                    ready["status"] = "ready"
+                    self._set_pending_clarification(
+                        context.conversation_id,
+                        goal=original or str(draft.get("transformation_instruction") or ""),
+                        question="",
+                        gaps=[],
+                        draft=ready,
+                    )
+            return action
+
         if not (
             _looks_like_artifact_or_mission_side_effect(original)
             or _looks_like_artifact_or_mission_side_effect(message)
@@ -4794,6 +5058,21 @@ class AgentRuntime:
             ),
         ):
             return None
+
+        # Fallback: if original goal was transform-shaped but draft was missing,
+        # reconstruct typed transform intent (never generate with source name).
+        if _is_transform_shaped_request(original):
+            intent = _new_artifact_intent_from_message(
+                message, original_goal=original
+            )
+            if (
+                intent is not None
+                and intent.get("kind") == TRANSFORM_EXISTING_DOCUMENT
+                and intent.get("complete")
+            ):
+                return await self._run_typed_artifact_intent(
+                    intent, context, source_label="clarification_resume_transform"
+                )
 
         spec = _artifact_spec_from_clarification_resume(message, original_goal=original)
         if spec is None:
@@ -4939,6 +5218,7 @@ class AgentRuntime:
 
         Binds requested destination before tool execution. Transform uses a typed
         contract with separate source identity and destination (RB-3/RB-4).
+        Clarified transforms use ``_try_clarified_artifact_action`` (RB-6).
         """
 
         if not context.side_effects_admitted:
@@ -4948,6 +5228,33 @@ class AgentRuntime:
         intent = _new_artifact_intent_from_message(message)
         if intent is None or not intent.get("complete"):
             return None
+        if intent.get("kind") not in {
+            NEW_ARTIFACT_REQUEST,
+            TRANSFORM_EXISTING_DOCUMENT,
+        }:
+            return None
+        source_label = (
+            "direct_transform"
+            if intent.get("kind") == TRANSFORM_EXISTING_DOCUMENT
+            else "direct_new_artifact"
+        )
+        return await self._run_typed_artifact_intent(
+            intent, context, source_label=source_label
+        )
+
+    async def _run_typed_artifact_intent(
+        self,
+        intent: dict[str, Any],
+        context: AgentContext,
+        *,
+        source_label: str,
+    ) -> DirectAction | None:
+        """Execute a complete typed NEW_ARTIFACT / TRANSFORM intent (RB-4/RB-5/RB-6).
+
+        Shared by the direct fully specified path and clarified-transform resume so
+        both bind exact destination before tool execution and verify the result.
+        """
+
         if intent.get("kind") not in {
             NEW_ARTIFACT_REQUEST,
             TRANSFORM_EXISTING_DOCUMENT,
@@ -4977,7 +5284,7 @@ class AgentRuntime:
                             title="Transform source unresolved",
                             content="TRANSFORM_EXISTING_DOCUMENT missing source identity.",
                             payload={
-                                "source": "direct_transform",
+                                "source": source_label,
                                 "intent": TRANSFORM_EXISTING_DOCUMENT,
                                 "requested_destination": intent.get(
                                     "requested_destination"
@@ -5062,6 +5369,11 @@ class AgentRuntime:
                     "Success запрещён."
                 )
                 path = ""
+        # Clarified-transform success wording (still only verified path).
+        if ok and source_label == "clarification_resume_transform" and path:
+            answer = (
+                f"Артефакт создан после уточнения.\n\n{answer}"
+            )
         return DirectAction(
             answer=answer,
             events=[
@@ -5077,11 +5389,7 @@ class AgentRuntime:
                         f"{intent.get('requested_destination')} bound before tool execution."
                     ),
                     payload={
-                        "source": (
-                            "direct_transform"
-                            if intent.get("kind") == TRANSFORM_EXISTING_DOCUMENT
-                            else "direct_new_artifact"
-                        ),
+                        "source": source_label,
                         "intent": intent.get("kind"),
                         "filename": intent.get("filename"),
                         "requested_destination": intent.get("requested_destination"),
@@ -5099,11 +5407,7 @@ class AgentRuntime:
                         "path": path if ok else "",
                         "requested_name": intent.get("output_name"),
                         "requested_destination": intent.get("requested_destination"),
-                        "source": (
-                            "direct_transform"
-                            if intent.get("kind") == TRANSFORM_EXISTING_DOCUMENT
-                            else "direct_new_artifact"
-                        ),
+                        "source": source_label,
                         "path_verified": ok,
                         "intent": intent.get("kind"),
                     },
@@ -10053,30 +10357,352 @@ def _pending_clarification_key(conversation_id: str) -> str:
     return f"clarification.pending.{conversation_id}"
 
 
+def _is_transform_shaped_request(message: str) -> bool:
+    """True when the operator request is a transform of an existing document."""
+
+    text = str(message or "")
+    if not text.strip():
+        return False
+    if not _has_existing_source_reference(text):
+        return False
+    if _looks_like_pure_document_analysis(text):
+        return False
+    normalized = text.casefold()
+    return bool(
+        _has_transform_verb(text)
+        or _is_fully_specified_transform(text)
+        or _contains_any(normalized, _create_artifact_verbs())
+        or _looks_like_artifact_or_mission_side_effect(text)
+        or _destination_filename_from_message(
+            text, source_filename=_source_filename_from_message(text)
+        )
+        is not None
+    )
+
+
+def _clarification_question_from_gaps(gaps: list[str]) -> str:
+    """One precise question from a typed missing-field list."""
+
+    missing = [str(item) for item in gaps if str(item)]
+    if set(missing) >= {"format", "destination"} or set(missing) == {
+        "format",
+        "destination",
+    }:
+        return (
+            "Уточните, пожалуйста, одним ответом: в каком формате нужен отчёт "
+            "(например md/docx/pdf), какое точное имя файла и в какой каталог его сохранить?"
+        )
+    if missing == ["format"]:
+        return (
+            "Уточните, пожалуйста, в каком формате сохранить результат "
+            "(md, docx или pdf)?"
+        )
+    if missing == ["destination"]:
+        return (
+            "Уточните, пожалуйста, точное имя файла и каталог назначения "
+            "(например report.md в document-outputs)?"
+        )
+    if missing == ["content"]:
+        return (
+            "Уточните, пожалуйста, какую тему/содержание должен содержать "
+            "итоговый файл, чтобы результат был законченным?"
+        )
+    if missing:
+        return (
+            "Уточните, пожалуйста, одним ответом недостающие параметры результата: "
+            f"{', '.join(missing)} (формат, имя/путь и содержание)."
+        )
+    return _clarification_question_from_message("")
+
+
+def _format_from_followup_only(
+    message: str, *, filename: str | None = None
+) -> str | None:
+    """Extract format from the operator follow-up only (never from source .txt)."""
+
+    text = str(message or "")
+    normalized = text.casefold()
+    if filename and "." in filename:
+        ext = Path(filename).suffix.lstrip(".").lower()
+        if ext in {"md", "docx", "pdf", "txt", "html", "csv", "json"}:
+            return "md" if ext == "markdown" else ext
+    if re.search(r"(?i)\b(docx|word)\b", normalized) or ".docx" in normalized:
+        return "docx"
+    if re.search(r"(?i)\bpdf\b", normalized) or ".pdf" in normalized:
+        return "pdf"
+    if re.search(r"(?i)\b(md|markdown)\b", normalized) or ".md" in normalized:
+        return "md"
+    # Only accept bare txt when follow-up explicitly names text format — not source.
+    source_cf = (_source_filename_from_message(text) or "").casefold()
+    explicit_txt = bool(re.search(r"(?i)\b(txt|text|plain\s*text)\b", normalized))
+    if (
+        explicit_txt
+        and ".txt" not in source_cf
+        and (
+            not re.search(r"(?i)\b[\w.-]+\.txt\b", text)
+            or re.search(r"(?i)\b(format|формат)\b", normalized)
+        )
+    ):
+        return "txt"
+    return None
+
+
+def _build_pending_transform_draft(
+    message: str,
+    *,
+    conversation_id: str,
+    originating_message_id: str | None = None,
+    gaps: list[str] | None = None,
+) -> dict[str, Any] | None:
+    """Build a typed pending TRANSFORM draft for clarification (RB-6).
+
+    Stores structured operands instead of free text only. Source identity is never
+    used as a default destination.
+    """
+
+    if not _is_transform_shaped_request(message):
+        return None
+    source_filename = _source_filename_from_message(message) or ""
+    # Known destination only when explicit and not equal to source.
+    dest = _destination_filename_from_message(
+        message, source_filename=source_filename or None
+    )
+    if dest and source_filename and dest.casefold() == source_filename.casefold():
+        dest = None
+    fmt = _format_from_followup_only(message, filename=dest)
+    # Vague "нужном формате" is not a concrete format even if source ends with .txt.
+    vague_format = bool(
+        re.search(
+            r"(?i)(нужном формате|нужный формат|подходящем формате|right format|"
+            r"correct format|выбранном мной формате)",
+            message,
+        )
+    )
+    dest_has_ext = bool(
+        dest and re.search(r"(?i)\.(md|docx|pdf|txt|html|csv|json|xlsx)$", dest)
+    )
+    if (
+        fmt
+        and not _format_is_concrete(message.casefold())
+        and not dest_has_ext
+        and vague_format
+    ):
+        # Source extension must not satisfy format completeness.
+        fmt = None
+    missing = list(gaps) if gaps is not None else _side_effect_completeness_gaps(message)
+    # Typed missing list always reflects format/destination for transforms.
+    typed_missing: list[str] = []
+    if not fmt:
+        typed_missing.append("format")
+    if not dest:
+        typed_missing.append("destination")
+    # Preserve non-format/destination gaps (e.g. operator_requested_clarification).
+    for item in missing:
+        key = str(item)
+        if key not in typed_missing and key not in {"content"}:
+            typed_missing.append(key)
+    rel_dir = _artifact_relative_dir_from_message(message)
+    requested_destination = ""
+    if dest:
+        output_name = f"{rel_dir}/{dest}" if rel_dir else dest
+        requested_destination = f"{_DOCUMENT_OUTPUT_DIR}/{output_name}".replace(
+            "\\", "/"
+        )
+    return {
+        "intent_kind": TRANSFORM_EXISTING_DOCUMENT,
+        "source_filename": source_filename[:180],
+        "source_file_id": "",
+        "source_path": "",
+        "transformation_instruction": str(message or "")[:2000],
+        "allowed_root": _DOCUMENT_OUTPUT_DIR,
+        "collision_policy": "fail",
+        "overwrite": False,
+        "format": fmt,
+        "destination_filename": (dest or "")[:180] if dest else None,
+        "requested_destination": requested_destination[:240] if requested_destination else None,
+        "missing_fields": typed_missing,
+        "conversation_id": conversation_id,
+        "originating_message_id": str(originating_message_id or ""),
+        "status": "pending",
+        "completed_path": None,
+    }
+
+
+def _merge_transform_draft_followup(
+    draft: dict[str, Any], followup: str
+) -> dict[str, Any]:
+    """Fill only missing fields of a typed transform draft from the follow-up (RB-6).
+
+    Source identity is never used as destination. Destination must come from the
+    operator answer or an already-saved exact destination on the draft.
+    """
+
+    merged = dict(draft)
+    source = str(merged.get("source_filename") or "").strip()
+    source_cf = source.casefold()
+
+    # Destination: follow-up first, never fall back to source filename.
+    dest = _destination_filename_from_message(
+        followup, source_filename=source or None
+    )
+    if dest and source_cf and dest.casefold() == source_cf:
+        dest = None
+    if dest:
+        merged["destination_filename"] = dest[:180]
+    elif merged.get("destination_filename"):
+        dest = str(merged.get("destination_filename") or "") or None
+        if dest and source_cf and dest.casefold() == source_cf:
+            dest = None
+            merged["destination_filename"] = None
+
+    # Format: follow-up only (ignore source .txt in original goal).
+    fmt = _format_from_followup_only(
+        followup, filename=str(merged.get("destination_filename") or "") or None
+    )
+    if fmt:
+        merged["format"] = fmt
+    elif not merged.get("format"):
+        # Extension on requested destination is enough.
+        dest_name = str(merged.get("destination_filename") or "")
+        if dest_name and "." in dest_name:
+            ext = Path(dest_name).suffix.lstrip(".").lower()
+            if ext in {"md", "docx", "pdf", "txt", "html", "csv", "json"}:
+                merged["format"] = "md" if ext == "markdown" else ext
+
+    dest_name = str(merged.get("destination_filename") or "").strip() or None
+    fmt_final = str(merged.get("format") or "").strip() or None
+    if (
+        dest_name
+        and fmt_final
+        and not dest_name.lower().endswith(f".{fmt_final}")
+        and "." not in dest_name
+    ):
+        dest_name = f"{dest_name}.{fmt_final}"
+        merged["destination_filename"] = dest_name[:180]
+
+    rel_dir = _artifact_relative_dir_from_message(followup)
+    if not rel_dir and merged.get("requested_destination"):
+        # Keep previously known relative dir if any.
+        prev = str(merged.get("requested_destination") or "")
+        if prev.startswith(f"{_DOCUMENT_OUTPUT_DIR}/"):
+            rest = prev[len(_DOCUMENT_OUTPUT_DIR) + 1 :]
+            if "/" in rest:
+                rel_dir = rest.rsplit("/", 1)[0]
+
+    missing: list[str] = []
+    if not fmt_final:
+        missing.append("format")
+    if not dest_name:
+        missing.append("destination")
+    merged["missing_fields"] = missing
+
+    if dest_name:
+        output_name = f"{rel_dir}/{dest_name}" if rel_dir else dest_name
+        requested = f"{_DOCUMENT_OUTPUT_DIR}/{output_name}".replace("\\", "/")
+        while f"{_DOCUMENT_OUTPUT_DIR}/{_DOCUMENT_OUTPUT_DIR}/" in requested:
+            requested = requested.replace(
+                f"{_DOCUMENT_OUTPUT_DIR}/{_DOCUMENT_OUTPUT_DIR}/",
+                f"{_DOCUMENT_OUTPUT_DIR}/",
+                1,
+            )
+        merged["requested_destination"] = requested[:240]
+        merged["output_name"] = output_name[:180]
+    else:
+        merged["requested_destination"] = None
+        merged["output_name"] = None
+
+    if not missing:
+        merged["status"] = "ready"
+    else:
+        merged["status"] = "pending"
+    return merged
+
+
+def _intent_from_transform_draft(draft: dict[str, Any]) -> dict[str, Any] | None:
+    """Convert a complete typed transform draft into the RB-5 intent contract."""
+
+    if not isinstance(draft, dict):
+        return None
+    if draft.get("intent_kind") != TRANSFORM_EXISTING_DOCUMENT:
+        return None
+    dest_name = str(draft.get("destination_filename") or "").strip()
+    fmt = str(draft.get("format") or "").strip()
+    source = str(draft.get("source_filename") or "").strip()
+    if not dest_name or not fmt:
+        return None
+    if source and dest_name.casefold() == source.casefold():
+        return None
+    output_name = str(draft.get("output_name") or dest_name).strip() or dest_name
+    requested = str(
+        draft.get("requested_destination")
+        or f"{_DOCUMENT_OUTPUT_DIR}/{output_name}"
+    ).replace("\\", "/")
+    title = Path(dest_name).stem.replace("_", " ").replace("-", " ").strip() or "Report"
+    instruction = str(draft.get("transformation_instruction") or "").strip()
+    if not instruction:
+        instruction = (
+            f"Transform existing document {source or '(uploaded/source)'} "
+            f"into {fmt} at exact destination {requested}."
+        )
+    return {
+        "kind": TRANSFORM_EXISTING_DOCUMENT,
+        "destination": requested,
+        "requested_destination": requested,
+        "filename": dest_name[:180],
+        "output_name": output_name[:180],
+        "format": fmt,
+        "output_format": fmt,
+        "content": "",
+        "body": "",
+        "title": title[:120],
+        "overwrite": bool(draft.get("overwrite")),
+        "collision_policy": str(draft.get("collision_policy") or "fail"),
+        "require_exact_path": True,
+        "allow_in_place": False,
+        "complete": True,
+        "source_reference": True,
+        "source_filename": source[:180],
+        "source_identity": {
+            "filename": source[:180],
+            "file_id": str(draft.get("source_file_id") or ""),
+            "path": str(draft.get("source_path") or ""),
+            "reference": True,
+        },
+        "transformation_instruction": instruction[:2000],
+        "allowed_root": str(draft.get("allowed_root") or _DOCUMENT_OUTPUT_DIR),
+    }
+
+
 def _artifact_spec_from_clarification_resume(
     message: str, *, original_goal: str = ""
 ) -> dict[str, str] | None:
-    """Build a concrete documents.generate spec from goal + operator answer."""
+    """Build a concrete documents.generate spec from goal + operator answer.
 
-    text = f"{original_goal}\n{message}".strip()
-    normalized = text.casefold()
-    fmt = "md"
-    if re.search(r"(?i)\b(docx|word)\b", normalized) or ".docx" in normalized:
-        fmt = "docx"
-    elif re.search(r"(?i)\bpdf\b", normalized) or ".pdf" in normalized:
-        fmt = "pdf"
-    elif re.search(r"(?i)\b(txt|text)\b", normalized) or ".txt" in normalized:
-        fmt = "txt"
-    elif re.search(r"(?i)\b(md|markdown)\b", normalized) or ".md" in normalized:
-        fmt = "md"
+    RB-6 safety: never treat the source filename as the destination. Prefer
+    destination and format from the follow-up message first.
+    """
 
-    name_match = re.search(
-        r"(?i)(?:имя|name|файл|file|as)\s*[:=]?\s*([^\s\\/]+\.(?:md|docx|pdf|txt))",
-        text,
+    source = _source_filename_from_message(original_goal) or _source_filename_from_message(
+        message
     )
-    if not name_match:
-        name_match = re.search(r"(?i)\b([a-z0-9._-]+\.(?:md|docx|pdf|txt))\b", text)
-    output_name = name_match.group(1) if name_match else f"report.{fmt}"
+    # Prefer destination from the follow-up alone (operator answer).
+    dest = _destination_filename_from_message(message, source_filename=source)
+    if not dest:
+        combined = f"{original_goal}\n{message}".strip()
+        dest = _destination_filename_from_message(combined, source_filename=source)
+    if dest and source and dest.casefold() == source.casefold():
+        dest = None
+    if not dest:
+        return None
+
+    fmt = _format_from_followup_only(message, filename=dest)
+    if not fmt:
+        fmt = _format_from_followup_only(
+            f"{original_goal}\n{message}", filename=dest
+        )
+    if not fmt:
+        fmt = "md"
+    output_name = dest
     if (
         not output_name.lower().endswith(f".{fmt}")
         and "." not in output_name
@@ -10099,6 +10725,9 @@ def _artifact_spec_from_clarification_resume(
             message,
         )
         residual = re.sub(r"\s+", " ", residual).strip(" ,.;:-")
+        # Drop any residual filename tokens (including source).
+        residual = re.sub(r"(?i)\b[\w.-]+\.(?:md|docx|pdf|txt)\b", " ", residual)
+        residual = re.sub(r"\s+", " ", residual).strip(" ,.;:-")
         body = residual
     if not body or len(body) < 4:
         body = (
@@ -10114,6 +10743,9 @@ def _artifact_spec_from_clarification_resume(
         "body": body[:12000],
         "output_format": fmt,
         "output_name": output_name[:180],
+        "filename": output_name[:180],
+        "requested_destination": f"{_DOCUMENT_OUTPUT_DIR}/{output_name}"[:240],
+        "destination": f"{_DOCUMENT_OUTPUT_DIR}/{output_name}"[:240],
     }
 
 
@@ -10558,7 +11190,25 @@ def _new_artifact_intent_from_message(
 
     if _looks_like_host_filesystem_write(message):
         return None
+    # RB-6: when resuming after clarification, classify from original goal + follow-up
+    # so TRANSFORM is not reclassified as NEW_ARTIFACT from the answer alone.
     kind = _classify_document_artifact_intent(message)
+    if original_goal:
+        kind_orig = _classify_document_artifact_intent(original_goal)
+        kind_combined = _classify_document_artifact_intent(
+            f"{original_goal}\n{message}".strip()
+        )
+        if kind_orig == TRANSFORM_EXISTING_DOCUMENT or kind_combined == (
+            TRANSFORM_EXISTING_DOCUMENT
+        ):
+            kind = TRANSFORM_EXISTING_DOCUMENT
+        elif kind is None:
+            kind = kind_combined or kind_orig
+        elif (
+            kind_orig == NEW_ARTIFACT_REQUEST
+            and kind != TRANSFORM_EXISTING_DOCUMENT
+        ):
+            kind = kind_orig
     if kind not in {NEW_ARTIFACT_REQUEST, TRANSFORM_EXISTING_DOCUMENT}:
         return None
     # Fully specified structural transform/new-artifact contracts skip the
@@ -10575,6 +11225,7 @@ def _new_artifact_intent_from_message(
 
     combined = f"{original_goal}\n{message}".strip() if original_goal else message
     source_filename = _source_filename_from_message(combined)
+    # Destination: follow-up first; never substitute source basename.
     filename = _destination_filename_from_message(
         message, source_filename=source_filename
     )
@@ -10607,7 +11258,10 @@ def _new_artifact_intent_from_message(
         if not allow_in_place:
             return None
 
-    fmt = _artifact_format_from_message(combined, filename=filename)
+    # Prefer format from the follow-up message so source .txt does not win.
+    fmt = _format_from_followup_only(message, filename=filename)
+    if not fmt:
+        fmt = _artifact_format_from_message(combined, filename=filename)
     if not filename.lower().endswith(f".{fmt}") and "." not in filename:
         filename = f"{filename}.{fmt}"
     # Reject pure directory / root labels used as filenames.
@@ -10628,10 +11282,15 @@ def _new_artifact_intent_from_message(
             1,
         )
 
-    gaps = _side_effect_completeness_gaps(message)
-    has_dest = bool(filename) and _destination_is_concrete(message.casefold())
-    has_fmt = _format_is_concrete(message.casefold()) or bool(
-        re.search(r"(?i)\.(md|docx|pdf|txt|html|csv|json|xlsx)$", filename)
+    gaps = _side_effect_completeness_gaps(message if not original_goal else combined)
+    has_dest = bool(filename) and (
+        _destination_is_concrete(message.casefold())
+        or (bool(original_goal) and bool(filename))
+    )
+    has_fmt = (
+        _format_is_concrete(message.casefold())
+        or bool(re.search(r"(?i)\.(md|docx|pdf|txt|html|csv|json|xlsx)$", filename))
+        or bool(fmt)
     )
     complete = not gaps or (
         bool(filename)
@@ -10639,16 +11298,26 @@ def _new_artifact_intent_from_message(
         and has_dest
         and (len(body.strip()) >= 4 or kind == TRANSFORM_EXISTING_DOCUMENT)
     )
-    # Structural complete transform contract forces complete=True (RB-5).
-    if kind == TRANSFORM_EXISTING_DOCUMENT and _is_fully_specified_transform(
-        combined if original_goal else message
+    # Structural complete transform contract forces complete=True (RB-5/RB-6).
+    if kind == TRANSFORM_EXISTING_DOCUMENT and (
+        _is_fully_specified_transform(combined if original_goal else message)
+        or (
+            bool(original_goal)
+            and bool(source_filename)
+            and bool(filename)
+            and has_fmt
+            and has_dest
+            and filename.casefold() != source_filename.casefold()
+        )
     ):
         complete = True
     if kind == NEW_ARTIFACT_REQUEST and _is_fully_specified_new_artifact(message):
         complete = True
     # Transform additionally requires a resolvable source identity when complete.
     if kind == TRANSFORM_EXISTING_DOCUMENT and complete and not (
-        source_filename or _has_existing_source_reference(message)
+        source_filename
+        or _has_existing_source_reference(message)
+        or _has_existing_source_reference(original_goal)
     ):
         complete = False
 
