@@ -344,7 +344,7 @@ def validate_response_constraints(
         except json.JSONDecodeError:
             violations.append("expected valid JSON only")
             parsed = None
-        if parsed is not None and not isinstance(parsed, (dict, list)):
+        if parsed is not None and not isinstance(parsed, dict | list):
             violations.append("JSON root must be object or array")
         # No surrounding prose when JSON was requested.
         if not text.lstrip().startswith(("{", "[", "`")):
@@ -357,10 +357,13 @@ def validate_response_constraints(
         lat = sum(1 for ch in text if "a" <= ch.casefold() <= "z")
         if cyr == 0 and lat > 8:
             violations.append("expected Russian-language answer")
-    if contract.path_hint and contract.path_hint not in text:
+    if (
+        contract.path_hint
+        and contract.path_hint not in text
+        and re.search(r"(путь|path|файл|file)", str(task or "").casefold())
+    ):
         # Path constraints are checked when the operator asked for an exact path.
-        if re.search(r"(путь|path|файл|file)", str(task or "").casefold()):
-            violations.append(f"expected path {contract.path_hint}")
+        violations.append(f"expected path {contract.path_hint}")
     return {
         "ok": not violations,
         "violations": violations,

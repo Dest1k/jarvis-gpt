@@ -441,8 +441,8 @@ def test_arbiter_asks_clarifying_question_instead_of_guessing(monkeypatch, tmp_p
 def test_response_constraints_one_sentence_and_bullets() -> None:
     from jarvis_gpt.verification import (
         extract_response_constraints,
-        validate_response_constraints,
         repair_response_for_constraints,
+        validate_response_constraints,
     )
 
     task = "Одним предложением объясни назначение DNS."
@@ -463,5 +463,9 @@ def test_response_constraints_one_sentence_and_bullets() -> None:
     json_task = "Верни только valid JSON объект с ключом status."
     jc = extract_response_constraints(json_task)
     assert jc.require_json is True
-    assert validate_response_constraints(json_task, '{"status":"ok"}', constraints=jc)["ok"] is True
-    assert validate_response_constraints(json_task, "готово {\"status\":\"ok\"}", constraints=jc)["ok"] is False
+    assert validate_response_constraints(
+        json_task, '{"status":"ok"}', constraints=jc
+    )["ok"] is True
+    assert validate_response_constraints(
+        json_task, 'готово {"status":"ok"}', constraints=jc
+    )["ok"] is False

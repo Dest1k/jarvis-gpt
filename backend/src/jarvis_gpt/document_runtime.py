@@ -526,7 +526,7 @@ def _write_structured_docx(
     )
     content_types = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        f'<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
         '<Default Extension="rels" '
         'ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
         '<Default Extension="xml" ContentType="application/xml"/>'
@@ -741,7 +741,9 @@ def _pdf_structure_looks_complete(data: bytes) -> bool:
     )
 
 
-def normalize_document_parse_error(exc: BaseException, *, path: Path | None = None) -> dict[str, Any]:
+def normalize_document_parse_error(
+    exc: BaseException, *, path: Path | None = None
+) -> dict[str, Any]:
     """Normalize parser failure into one actionable, non-success recovery payload."""
 
     name = path.name if path is not None else None

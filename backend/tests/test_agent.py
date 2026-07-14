@@ -4580,7 +4580,15 @@ def test_dns_definition_does_not_create_shop_direct_action(monkeypatch, tmp_path
     class CapturingLLM:
         async def complete(self, messages, *, temperature=None, max_tokens=None):
             captured["messages"] = messages
-            return type("Result", (), {"ok": True, "content": "DNS переводит имена в IP-адреса.", "error": None})()
+            return type(
+                "Result",
+                (),
+                {
+                    "ok": True,
+                    "content": "DNS переводит имена в IP-адреса.",
+                    "error": None,
+                },
+            )()
 
     agent = AgentRuntime(settings=settings, storage=storage, llm=CapturingLLM(), bus=EventBus())
     response = asyncio.run(agent.chat("Одним предложением объясни назначение DNS."))

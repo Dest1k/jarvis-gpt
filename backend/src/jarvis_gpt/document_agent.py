@@ -11,7 +11,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .document_runtime import resolve_artifact_output_path, write_exact_text_artifact, write_markdown_docx
+from .document_runtime import (
+    resolve_artifact_output_path,
+    write_exact_text_artifact,
+    write_markdown_docx,
+)
 from .document_surfer import (
     DocumentGenerationError,
     DocumentSurferConfig,

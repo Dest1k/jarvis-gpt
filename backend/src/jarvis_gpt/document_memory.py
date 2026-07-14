@@ -647,9 +647,7 @@ def _record_has_exact_identity(record: dict[str, Any], query: str) -> bool:
     for mention in _filenames_mentioned(query):
         if _names_match_exactly(name, mention):
             return True
-    if "exact_filename" in set(record.get("match_sources") or []):
-        return True
-    return False
+    return "exact_filename" in set(record.get("match_sources") or [])
 
 
 def _identity_matches(record: dict[str, Any], identity_terms: list[str]) -> list[str]:

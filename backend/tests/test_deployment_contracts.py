@@ -119,7 +119,8 @@ def test_launcher_is_local_only_and_preserves_foreign_listeners() -> None:
     assert launcher.index("Get-AlreadyRunningStackServices") < launcher.index(
         'Arguments @("-3.11", ".\\jarvis.py", "--profile", $Profile, "init")'
     )
-    assert launcher.count('Arguments @("-3.11", ".\\jarvis.py", "--profile", $Profile, "init")') == 1
+    init_args = 'Arguments @("-3.11", ".\\jarvis.py", "--profile", $Profile, "init")'
+    assert launcher.count(init_args) == 1
     assert 'container_id = [string]$llmReadiness.container.id' in launcher
     assert '$phase = "external-ready"' in launcher
     assert "Preserving LLM runtime" in launcher

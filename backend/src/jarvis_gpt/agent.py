@@ -7270,9 +7270,8 @@ def _contains_internal_tool_output(content: str) -> bool:
         return True
     if _TOOL_ENVELOPE_TEXT_RE.search(text):
         return True
-    if _looks_like_broken_tool_payload(text):
-        return True
-    return False
+    # Pre-existing release hygiene (SIM103): present on base fc19886/main.
+    return bool(_looks_like_broken_tool_payload(text))
 
 
 def _user_visible_answer(content: str) -> str:
@@ -9909,9 +9908,7 @@ def _valid_web_synthesis_answer(answer: str) -> bool:
     lines = [line.strip() for line in answer.splitlines() if line.strip()]
     url_only = sum(1 for line in lines if re.search(r"https?://", line))
     prose = sum(1 for line in lines if not re.search(r"https?://", line) and len(line) > 20)
-    if url_only >= 2 and prose == 0:
-        return False
-    return True
+    return not (url_only >= 2 and prose == 0)
 
 
 def _ensure_synthesis_sources(answer: str, evidence: list[dict[str, str]]) -> str:

@@ -4665,6 +4665,7 @@ def test_canonicalize_tool_invocation_does_not_rewrite_mutation_aliases():
 def test_memory_save_honors_explicit_namespace(monkeypatch, tmp_path):
     """SPARK-0012: requested namespace is not rewritten to operator/core defaults."""
     import asyncio
+
     from jarvis_gpt.config import ensure_runtime_dirs, load_settings
     from jarvis_gpt.llm import LLMRouter
     from jarvis_gpt.storage import JarvisStorage

@@ -1508,7 +1508,10 @@ class ToolRegistry:
                     "sections": "Optional list of {heading,body}",
                     "source_paths": "Optional source paths to include in context outline",
                     "source_file_ids": "Optional source file ids for context outline",
-                    "exact_body": "When true (default for md/txt body), write body without generator wrappers",
+                    "exact_body": (
+                        "When true (default for md/txt body), "
+                        "write body without generator wrappers"
+                    ),
                 },
                 handler=_documents_generate,
             )
@@ -5117,7 +5120,9 @@ def _documents_convert(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespons
             default_name=f"{source_path.stem}.{output_format}",
             default_suffix=f".{output_format}",
         )
-        source_kind = str((target.get("document") or {}).get("kind") or source_path.suffix.lstrip("."))
+        source_kind = str(
+            (target.get("document") or {}).get("kind") or source_path.suffix.lstrip(".")
+        )
         source_text = str(target.get("text") or "")
         if not source_text.strip() and source_path.suffix.lower() in {".md", ".txt", ".markdown"}:
             source_text = source_path.read_text(encoding="utf-8", errors="replace")

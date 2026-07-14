@@ -397,6 +397,10 @@ def test_profile_product_decision_certification_matrix():
     assert certified_interactive_profiles() == ["gemma4-turbo"]
     public = profile_public_dict(turbo)
     assert public["certification"] == "certified"
-    assert "RESOLVED_BY_PRODUCT_DECISION" in mono.certification_reason or "unsupported" in mono.certification_reason.casefold()
+    reason = mono.certification_reason
+    assert (
+        "RESOLVED_BY_PRODUCT_DECISION" in reason
+        or "unsupported" in reason.casefold()
+    )
     assert detect_repeated_token_degeneration("4") is False
     assert detect_repeated_token_degeneration(" ".join(["token"] * 20)) is True

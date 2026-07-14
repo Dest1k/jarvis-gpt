@@ -239,6 +239,29 @@ def test_sanitized_test_env_strips_only_deployment_keys(monkeypatch):
     assert cleaned.get("PATH") == "keep-me"
 
 
+def test_doctor_and_ci_share_pinned_ruff_lint_contract():
+    """RB-1: doctor/smoke backend lint must match CI pinned ruff==0.8.4 contract."""
+    from pathlib import Path
+
+    root = Path(smoke.ROOT)
+    req_dev = (root / "backend" / "requirements-dev.txt").read_text(encoding="utf-8")
+    assert "ruff==0.8.4" in req_dev
+
+    smoke_src = (root / "scripts" / "smoke.py").read_text(encoding="utf-8")
+    assert '"backend lint"' in smoke_src or "'backend lint'" in smoke_src
+    assert '"-m", "ruff", "check", "backend/src", "backend/tests"' in smoke_src or (
+        "'-m', 'ruff', 'check', 'backend/src', 'backend/tests'" in smoke_src
+    )
+
+    ci = (root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    assert "Lint backend" in ci
+    assert "python -m ruff check backend/src backend/tests" in ci
+
+    doctor = (root / "scripts" / "doctor.ps1").read_text(encoding="utf-8")
+    assert "scripts\\smoke.py" in doctor or "scripts/smoke.py" in doctor
+    assert "exit $smokeExit" in doctor
+
+
 def test_doctor_ps1_propagates_smoke_nonzero_exit(tmp_path):
     """SPARK-0016: doctor.ps1 must exit nonzero when smoke reports required failure."""
     import os
