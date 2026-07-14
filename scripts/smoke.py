@@ -11,6 +11,11 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+_BACKEND_SRC = ROOT / "backend" / "src"
+if str(_BACKEND_SRC) not in sys.path:
+    sys.path.insert(0, str(_BACKEND_SRC))
+
+from jarvis_gpt.redaction import redact_text, redact_value  # noqa: E402
 
 
 def main() -> int:
@@ -83,7 +88,7 @@ def main() -> int:
         },
         "checks": checks,
     }
-    print(json.dumps(report, indent=2))
+    print(json.dumps(redact_value(report), indent=2))
     return 0 if required_ok else 1
 
 
@@ -120,8 +125,8 @@ def run(
         "optional": optional,
         "status": "passed" if ok else "failed",
         "returncode": result.returncode,
-        "stdout_tail": tail(result.stdout),
-        "stderr_tail": tail(result.stderr),
+        "stdout_tail": safe_tail(result.stdout),
+        "stderr_tail": safe_tail(result.stderr),
     }
 
 
@@ -156,13 +161,18 @@ def _failed_check(
         "ok": False,
         "optional": optional,
         "status": "skipped" if optional and unavailable else "failed",
-        "error": error,
+        "error": redact_text(error),
     }
 
 
 def tail(text: str, limit: int = 800) -> str:
     text = text.strip()
     return text[-limit:] if len(text) > limit else text
+
+
+def safe_tail(text: str, limit: int = 800) -> str:
+    """Return a length-limited command tail with secrets redacted."""
+    return tail(redact_text(text), limit=limit)
 
 
 def executable(name: str) -> str:
