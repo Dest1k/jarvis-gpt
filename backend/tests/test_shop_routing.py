@@ -890,3 +890,19 @@ def test_shop_failure_never_relabels_generic_or_lookalike_results_as_verified(
     )
     assert agent._cached_shop_failure_answer(**arguments) is None
     storage.close()
+
+def test_dns_question_does_not_route_to_shop() -> None:
+    """SPARK-0001: educational DNS must not enter shopping/catalog route."""
+    messages = [
+        "Одним предложением объясни назначение DNS.",
+        "Что такое DNS?",
+        "Как настроить DNS на роутере?",
+        "resolve example.com DNS lookup",
+    ]
+    for message in messages:
+        normalized = message.casefold()
+        assert _looks_like_shopping_query(normalized) is False, message
+        assert _shop_key_from_message(normalized) in {None, "dns"}
+    # Named shop catalog still routes to shopping.
+    assert _looks_like_shopping_query("найди rtx 5090 на dns".casefold()) is True
+    assert _shop_key_from_message("найди rtx 5090 на dns".casefold()) == "dns"
