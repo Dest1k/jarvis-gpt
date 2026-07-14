@@ -1,0 +1,97 @@
+{
+  "schema": "jarvis.assurance.wave0.re_review_state.v1",
+  "status": "REVIEWED_WAVE_0_COMMIT",
+  "verdict": "PASS",
+  "run_id": "20260713T002206Z_686424795712",
+  "review_run_id": "20260713T002206Z_686424795712-wave0-grok-rereview",
+  "context_id": "f889e850-a328-4804-85d4-1f573fdcd43b",
+  "run_nonce": "e4f64a14-fb4c-4250-b696-5a504c6f0f7e",
+  "reviewer_provider": "xAI",
+  "reviewer_model": "Grok 4.5",
+  "independence_level": "SAME_MODEL_CLEAN_CONTEXT",
+  "independence_note": "Implementer also used Grok 4.5; clean-context re-review with independent evidence collection. Not DIFFERENT_PROVIDER.",
+  "started_at_utc": "2026-07-14T15:35:00Z",
+  "completed_at_utc": "2026-07-14T15:59:30Z",
+  "reviewed_foundation": "2fc7c7df15561ac3f8659f7c8c7ec529f87b2de8",
+  "old_blocked_candidate": "3a6c030a89543c9ec319723b3b6730fb22ca27d8",
+  "old_bad_spark0009": "8648c4096f618f675e7c992df20d0e5bac8135eb",
+  "reviewed_wave_0_commit": "3385dbc5de4e86bd413a9bd6a53d21f83deae8ff",
+  "candidate_branch": "fix/functional-wave0-scope/20260713T002206Z_686424795712",
+  "candidate_worktree": "D:\\jarvis-gpt-worktrees\\functional-wave0-scope-remediation-20260713T002206Z_686424795712",
+  "review_branch": "review/functional-wave0-scope-grok/20260713T002206Z_686424795712",
+  "review_worktree": "D:\\jarvis-gpt-worktrees\\functional-wave0-rereview-grok-20260713T002206Z_686424795712",
+  "exact_six_commit_chain": [
+    "14e42f252ced2381c8f8b905a2609612398981e5",
+    "e276df67deb9cf77b4b42a84a17c6ea51bcb66a1",
+    "cd5e05549613aea95c49f8cae6c2d9111f467e85",
+    "7a014ac9c5894ac3a72954d6c8858ef0f25c51d3",
+    "138b48bb64934bc8af911fc0958d7d61fd258fb1",
+    "3385dbc5de4e86bd413a9bd6a53d21f83deae8ff"
+  ],
+  "scope_gate": {
+    "commit_count": 6,
+    "first_three_retained": true,
+    "linear_direct_parents": true,
+    "bad_commit_absent_from_ancestry": true,
+    "hidden_extra_commits": false,
+    "one_task_one_commit": true,
+    "audit_paths_unchanged": true,
+    "execution_protocol_diff_empty": true,
+    "spark0009_allowed_files_only": true,
+    "verdict": "PASS"
+  },
+  "patch_equivalence": {
+    "spark0015_prodtest_identical": true,
+    "spark0015_prodtest_sha256": "b6fab9fee9229cee4b1cd717c865fbe98fa0a719cf8eefc7f6a0e31c5f9a3d1b",
+    "spark0011_prodtest_identical": true,
+    "spark0011_prodtest_sha256": "b1659d8caff31107951f8d199ca87438b58fdb4dec62eb85a1447fb34cc6e4f2",
+    "verdict": "PASS"
+  },
+  "spark0009": {
+    "canonicalize_only": "filesystem.mkdir->fs.mkdir",
+    "live_matrix_passed": 38,
+    "live_matrix_failed": 0,
+    "verdict": "PASS"
+  },
+  "validation": {
+    "approval_executor_passed": 26,
+    "tools_passed": 102,
+    "agent_passed": 105,
+    "agent_failed_preexisting": 7,
+    "api_smoke_passed": 24,
+    "redaction_passed": 3,
+    "smoke_script_passed": 10,
+    "response_integrity_passed": 3,
+    "frontend_runtime_identity": "runtime-identity-ok",
+    "frontend_stream_placeholder": "stream-placeholder-ok",
+    "frontend_typecheck": "PASS",
+    "frontend_build": "PASS",
+    "qa_operator_core_ok": true,
+    "qa_calibration_records": 8,
+    "qa_replay": {
+      "cases": 8,
+      "PASS": 1,
+      "FAIL": 6,
+      "INCONCLUSIVE": 1,
+      "mismatches": 0,
+      "ok": true
+    }
+  },
+  "baseline": {
+    "main_head": "b2c481de1a9e68079a67ff49790eb685a09e80e5",
+    "origin_main_head": "b2c481de1a9e68079a67ff49790eb685a09e80e5",
+    "main_untracked": "269/269",
+    "main_audit_entries": 544,
+    "main_audit_files_content_equal_prior": true,
+    "candidate_head_unchanged": true,
+    "wave1_started": false,
+    "push_merge": false
+  },
+  "prior_blocker_resolved": {
+    "id": "W0-REC-SCOPE-001",
+    "resolved": true,
+    "note": "SPARK-0009 rebuilt without execution_protocol.py; mkdir-only canonicalization"
+  },
+  "subagents_used": false,
+  "code_fixed_by_reviewer": false
+}

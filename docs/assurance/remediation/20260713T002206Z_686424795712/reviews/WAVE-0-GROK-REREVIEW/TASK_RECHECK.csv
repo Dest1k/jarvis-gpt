@@ -1,0 +1,7 @@
+order,task_id,commit,scope_verdict,functional_verdict,overall,notes
+1,SPARK-0017,14e42f252ced2381c8f8b905a2609612398981e5,PASS,PASS,PASS,retained; redaction+smoke_script focused suites green
+2,SPARK-0016,e276df67deb9cf77b4b42a84a17c6ea51bcb66a1,PASS,PASS,PASS,retained; doctor exit propagation + smoke_script green
+3,SPARK-0006,cd5e05549613aea95c49f8cae6c2d9111f467e85,PASS,PASS,PASS,retained; tool-envelope integrity pytest PASS
+4,SPARK-0009,7a014ac9c5894ac3a72954d6c8858ef0f25c51d3,PASS,PASS,PASS,rebuilt mkdir-only; no execution_protocol.py; live matrix 38/38
+5,SPARK-0015,138b48bb64934bc8af911fc0958d7d61fd258fb1,PASS,PASS,PASS,prod/test patch-eq with 6cc0041...; runtime-identity-ok
+6,SPARK-0011,3385dbc5de4e86bd413a9bd6a53d21f83deae8ff,PASS,PASS,PASS,prod/test patch-eq with 3a6c030a...; stream-placeholder-ok; closes candidate
