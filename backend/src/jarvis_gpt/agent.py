@@ -69,8 +69,11 @@ from .verification import (
     build_repair_messages,
     build_verification_messages,
     deterministic_mission_report,
+    extract_response_constraints,
     parse_verdict,
+    repair_response_for_constraints,
     valid_mission_report,
+    validate_response_constraints,
 )
 
 
@@ -768,6 +771,53 @@ class AgentRuntime:
         # _try_direct_action (for example web_research -> mission), so re-read it.
         task_plan = context.task_plan or task_plan
         forced_mission = mode == "mission"
+        if (
+            not forced_mission
+            and (
+                task_plan.needs_clarification
+                or _looks_like_clarification_before_action(message)
+            )
+        ):
+            question = (
+                task_plan.clarification
+                or _clarification_question_from_message(message)
+            )
+            answer = question
+            events.append(
+                ChatEvent(
+                    type="thought",
+                    title="Нужно уточнение",
+                    content=question,
+                    payload={"route": "clarify", "blocked_mission": True},
+                )
+            )
+            await self._emit(events[-1])
+            duration_ms = _elapsed_ms(started_at)
+            message_id = self.storage.add_message(
+                conversation_id=context.conversation_id,
+                role="assistant",
+                content=answer,
+                metadata={
+                    "source": "clarification",
+                    "task_kernel": task_plan.payload(),
+                    "mission_created": False,
+                },
+            )
+            events.append(
+                ChatEvent(
+                    type="assistant_done",
+                    title="Уточнение",
+                    payload={"source": "clarification", "mission_created": False},
+                )
+            )
+            await self._emit(events[-1])
+            return ChatResponse(
+                conversation_id=context.conversation_id,
+                message_id=message_id,
+                answer=answer,
+                events=events,
+                duration_ms=duration_ms,
+            )
         if forced_mission or task_plan.route == "mission":
             mission = await self.create_mission_planned(message)
             answer = self._mission_answer(mission)
@@ -1041,6 +1091,50 @@ class AgentRuntime:
         # _try_direct_action (for example web_research -> mission), so re-read it.
         task_plan = context.task_plan or task_plan
         forced_mission = mode == "mission"
+        if (
+            not forced_mission
+            and (
+                task_plan.needs_clarification
+                or _looks_like_clarification_before_action(message)
+            )
+        ):
+            question = (
+                task_plan.clarification
+                or _clarification_question_from_message(message)
+            )
+            answer = question
+            events.append(
+                ChatEvent(
+                    type="thought",
+                    title="Clarification required",
+                    content=question,
+                    payload={"route": "clarify", "blocked_mission": True},
+                )
+            )
+            await self._emit(events[-1])
+            yield {"type": "event", "event": events[-1].model_dump()}
+            yield {"type": "delta", "content": answer}
+            duration_ms = _elapsed_ms(started_at)
+            message_id = self.storage.add_message(
+                conversation_id=context.conversation_id,
+                role="assistant",
+                content=answer,
+                metadata={
+                    "source": "clarification",
+                    "task_kernel": task_plan.payload(),
+                    "mission_created": False,
+                },
+            )
+            yield {
+                "type": "done",
+                "answer": answer,
+                "conversation_id": context.conversation_id,
+                "duration_ms": duration_ms,
+                "events": [event.model_dump() for event in events],
+                "message_id": message_id,
+                "mission_created": False,
+            }
+            return
         if forced_mission or task_plan.route == "mission":
             mission = await self.create_mission_planned(message)
             answer = self._mission_answer(mission)
@@ -3094,10 +3188,7 @@ class AgentRuntime:
         ]
         if not search.ok:
             return DirectAction(
-                answer=(
-                    "Не смог выполнить веб-поиск, поэтому не буду выдумывать результат.\n\n"
-                    f"Запрос: `{query}`\nПричина: {search.summary}"
-                ),
+                answer=_network_unavailable_result(search.summary),
                 events=events,
             )
 
@@ -4312,6 +4403,25 @@ class AgentRuntime:
                 rationale="The request targets previously persisted document knowledge.",
             )
 
+        if _looks_like_clarification_before_action(message):
+            # Ambiguous deliverable: ask exactly one question before mission/artifact.
+            question = _clarification_question_from_message(message)
+            return TaskKernelPlan(
+                route="reasoning",
+                mode=task_mode,
+                intent="clarification",
+                confidence=0.93,
+                tools=(),
+                completion_criteria=(
+                    "ask exactly one precise clarifying question",
+                    "do not create a mission or artifact before the answer",
+                    "resume the original goal after the operator replies",
+                ),
+                rationale="Operator asked for clarification before execution.",
+                needs_clarification=True,
+                clarification=question,
+            )
+
         if mode == "mission" or (mode == "auto" and self._looks_like_mission(message)):
             return TaskKernelPlan(
                 route="mission",
@@ -4970,68 +5080,151 @@ class AgentRuntime:
             criteria=criteria,
             observations=observation_list,
         )
+        events: list[ChatEvent] = []
+        payload: dict[str, Any] | None = None
+        repaired = False
         if verdict is None:
+            answer, constraint_payload = self._enforce_response_constraints(
+                task,
+                answer,
+                repair_mode=repair_mode,
+            )
+            if constraint_payload is not None:
+                return answer, [], {"constraints": constraint_payload}
             return answer, [], None
         if verdict.verdict == "pass":
             event = self._verification_event(verdict)
-            return answer, [event], event.payload
-        # Failed self-checks are learning signals: the journal survives chat
-        # deletion, and the learning tick turns repeated gaps into lessons.
-        # Journaling must never break a turn, hence the suppress.
-        with suppress(Exception):
-            self.storage.record_learning_observation(
-                kind="verification.revise",
-                conversation_id=str(context.conversation_id or "") or None,
-                role="verifier",
-                content=task[:1200],
-                summary=(
-                    "Self-check found gaps: "
-                    + ("; ".join(verdict.missing) or verdict.fix_hint or "unspecified")
-                ),
-                payload=verdict.payload(),
-            )
-        repaired_text = ""
-        try:
-            repair_messages = base_messages
-            if observation_list and not any(
-                isinstance(item, dict)
-                and str(item.get("content") or "").startswith("observation[")
-                for item in base_messages
-            ):
-                # Non-stream chat passes pre-tool messages; inject tool facts so
-                # rewrite repair cannot invent work that tools already produced.
-                repair_messages = [
-                    *base_messages,
-                    {
-                        "role": "user",
-                        "content": "Факты из инструментов:\n"
-                        + "\n".join(f"- {item}" for item in observation_list[:6]),
-                    },
-                ]
-            result = await asyncio.wait_for(
-                self._complete_llm(
-                    build_repair_messages(repair_messages, answer, verdict, mode=repair_mode),
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    thinking_enabled=thinking_enabled,
-                ),
-                timeout=self._verify_timeout(),
-            )
-            if result.ok and result.content:
-                turn = _classify_tool_turn(result.content)
-                if turn.kind == "answer":
-                    repaired_text = turn.text.strip()
-            if repaired_text.startswith(("{", "[")):
-                # A repair that came back as router/data JSON is broken output;
-                # the draft answer must survive it.
-                repaired_text = ""
-        except Exception:  # noqa: BLE001 - timeout or error must keep the draft
+            events.append(event)
+            payload = dict(event.payload or {})
+        else:
+            # Failed self-checks are learning signals: the journal survives chat
+            # deletion, and the learning tick turns repeated gaps into lessons.
+            # Journaling must never break a turn, hence the suppress.
+            with suppress(Exception):
+                self.storage.record_learning_observation(
+                    kind="verification.revise",
+                    conversation_id=str(context.conversation_id or "") or None,
+                    role="verifier",
+                    content=task[:1200],
+                    summary=(
+                        "Self-check found gaps: "
+                        + ("; ".join(verdict.missing) or verdict.fix_hint or "unspecified")
+                    ),
+                    payload=verdict.payload(),
+                )
             repaired_text = ""
-        repaired = bool(repaired_text)
-        if repaired:
-            answer = f"{answer}\n\n{repaired_text}" if repair_mode == "addendum" else repaired_text
-        event = self._verification_event(verdict, repaired=repaired)
-        return answer, [event], event.payload
+            try:
+                repair_messages = base_messages
+                if observation_list and not any(
+                    isinstance(item, dict)
+                    and str(item.get("content") or "").startswith("observation[")
+                    for item in base_messages
+                ):
+                    # Non-stream chat passes pre-tool messages; inject tool facts so
+                    # rewrite repair cannot invent work that tools already produced.
+                    repair_messages = [
+                        *base_messages,
+                        {
+                            "role": "user",
+                            "content": "Факты из инструментов:\n"
+                            + "\n".join(f"- {item}" for item in observation_list[:6]),
+                        },
+                    ]
+                result = await asyncio.wait_for(
+                    self._complete_llm(
+                        build_repair_messages(
+                            repair_messages, answer, verdict, mode=repair_mode
+                        ),
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        thinking_enabled=thinking_enabled,
+                    ),
+                    timeout=self._verify_timeout(),
+                )
+                if result.ok and result.content:
+                    turn = _classify_tool_turn(result.content)
+                    if turn.kind == "answer":
+                        repaired_text = turn.text.strip()
+                if repaired_text.startswith(("{", "[")):
+                    # A repair that came back as router/data JSON is broken output;
+                    # the draft answer must survive it.
+                    repaired_text = ""
+            except Exception:  # noqa: BLE001 - timeout or error must keep the draft
+                repaired_text = ""
+            repaired = bool(repaired_text)
+            if repaired:
+                answer = (
+                    f"{answer}\n\n{repaired_text}"
+                    if repair_mode == "addendum"
+                    else repaired_text
+                )
+            event = self._verification_event(verdict, repaired=repaired)
+            events.append(event)
+            payload = dict(event.payload or {})
+        # Deterministic ordinary-format contracts (bullet count / one sentence / JSON).
+        # One repair at most; never emit a duplicate final block.
+        answer, constraint_payload = self._enforce_response_constraints(
+            task,
+            answer,
+            repair_mode=repair_mode,
+        )
+        if constraint_payload is not None:
+            payload = dict(payload or {})
+            payload["constraints"] = constraint_payload
+        return answer, events, payload
+
+    def _enforce_response_constraints(
+        self,
+        task: str,
+        answer: str,
+        *,
+        repair_mode: str = "rewrite",
+    ) -> tuple[str, dict[str, Any] | None]:
+        constraints = extract_response_constraints(task)
+        if not any(
+            (
+                constraints.bullet_count is not None,
+                constraints.one_sentence,
+                constraints.require_json,
+                constraints.language,
+                constraints.path_hint,
+            )
+        ):
+            return answer, None
+        report = validate_response_constraints(task, answer, constraints=constraints)
+        if report["ok"]:
+            return answer, {"ok": True, "constraints": constraints.as_dict()}
+        repaired = repair_response_for_constraints(answer, constraints)
+        if not repaired or repaired.strip() == answer.strip():
+            return answer, {
+                "ok": False,
+                "violations": report["violations"],
+                "constraints": constraints.as_dict(),
+                "repaired": False,
+            }
+        recheck = validate_response_constraints(task, repaired, constraints=constraints)
+        if repair_mode == "addendum" and not recheck["ok"]:
+            # Streamed answers cannot be fully rewritten safely.
+            return answer, {
+                "ok": False,
+                "violations": report["violations"],
+                "constraints": constraints.as_dict(),
+                "repaired": False,
+            }
+        if repair_mode == "addendum":
+            # Do not duplicate: only return addendum when rewrite is impossible.
+            return answer, {
+                "ok": False,
+                "violations": report["violations"],
+                "constraints": constraints.as_dict(),
+                "repaired": False,
+            }
+        return repaired, {
+            "ok": recheck["ok"],
+            "violations": recheck["violations"],
+            "constraints": constraints.as_dict(),
+            "repaired": True,
+        }
 
     def _stream_llm(
         self,
@@ -6001,6 +6194,8 @@ class AgentRuntime:
     @staticmethod
     def _looks_like_mission(message: str) -> bool:
         normalized = message.lower()
+        if _looks_like_clarification_before_action(message):
+            return False
         if _looks_like_reasoning_scenario(normalized) or _looks_like_self_contained_reasoning(
             normalized
         ):
@@ -7677,6 +7872,9 @@ _DOCUMENT_ACTION_MARKERS = (
     "итоги",
     "кратко",
     "найди",
+    "назови",
+    "скажи",
+    "верни",
     "прочитай",
     "разбер",
     "резюм",
@@ -7737,9 +7935,24 @@ _DOCUMENT_DEICTIC_MARKERS = (
     "из нее",
     "тот",
     "этот",
+    "это",
+    "том файл",
+    "тот файл",
+    "этот файл",
+    "тот документ",
+    "этот документ",
+    "второй вариант",
+    "первый вариант",
+    "второй",
+    "первый",
+    "вариант",
     "that one",
+    "the second",
+    "the first",
     "it",
     "this one",
+    "that file",
+    "this file",
 )
 _DOCUMENT_TEMPORAL_MARKERS = (
     "недавн",
@@ -7939,6 +8152,22 @@ def _looks_like_self_contained_reasoning(normalized: str) -> bool:
     )
     if explicit_web_intent:
         return False
+    # Short definitional / one-sentence knowledge questions are local reasoning.
+    if _looks_like_network_dns_question(normalized) and not _looks_like_shopping_query(
+        normalized
+    ):
+        return True
+    if _contains_any(
+        normalized,
+        (
+            "одним предложением",
+            "one sentence",
+            "что такое",
+            "объясни назначение",
+            "назначение",
+        ),
+    ) and not _looks_like_shopping_query(normalized):
+        return True
     scenario_score = sum(
         1
         for marker in (
@@ -8151,6 +8380,15 @@ def _looks_like_shopping_query(normalized: str) -> bool:
     if _looks_like_travel_query(normalized):
         return False
     if shop_source and not _looks_like_osint_dns_context(normalized):
+        # DNS-shop alias alone must not capture network/protocol questions.
+        if (
+            getattr(shop_source, "key", None) == "dns"
+            and not purchase_context
+            and not product_context
+            and not _ranking_criterion_from_message(normalized)
+            and _looks_like_network_dns_question(normalized)
+        ):
+            return False
         non_catalog_question = _contains_any(
             normalized,
             (
@@ -8182,6 +8420,11 @@ def _looks_like_shopping_query(normalized: str) -> bool:
                 "скорость доставки",
                 "срок доставки",
                 "работает",
+                "назначение",
+                "объясни",
+                "что такое",
+                "зачем нужен",
+                "как работает",
             ),
         ) or bool(re.search(r"\bкак\s+\w+\s+доставл", normalized))
         source_count = len(find_shop_sources(normalized))
@@ -8217,6 +8460,73 @@ def _looks_like_shopping_query(normalized: str) -> bool:
     return product_context and purchase_context
 
 
+def _looks_like_network_dns_question(normalized: str) -> bool:
+    """True for DNS-as-protocol / network questions, not DNS-shop catalog requests."""
+
+    if _looks_like_osint_dns_context(normalized):
+        return True
+    return _contains_any(
+        normalized,
+        (
+            "назначение",
+            "объясни",
+            "что такое",
+            "зачем",
+            "как работает",
+            "протокол",
+            "предложени",
+            "sentence",
+            "resolve",
+            "lookup",
+            "hostname",
+            "example.com",
+            "ip",
+        ),
+    )
+
+
+def _looks_like_clarification_before_action(message: str) -> bool:
+    """True when the operator requires one clarifying question before any mission/artifact."""
+
+    normalized = str(message or "").casefold()
+    return _contains_any(
+        normalized,
+        (
+            "сначала задай",
+            "сначала спроси",
+            "сначала уточни",
+            "один вопрос",
+            "ровно один вопрос",
+            "ask one question",
+            "ask a single question",
+            "before creating",
+            "before you start",
+            "before starting",
+            "не создавай",
+            "не начинай",
+            "уточняет формат",
+            "уточни формат",
+            "уточни имя",
+            "уточни каталог",
+        ),
+    )
+
+
+def _clarification_question_from_message(message: str) -> str:
+    """Return one precise clarification question for an ambiguous deliverable."""
+
+    normalized = str(message or "").casefold()
+    if any(token in normalized for token in ("формат", "format", "имя", "каталог", "path", "файл")):
+        return (
+            "Уточните, пожалуйста, одним ответом: в каком формате нужен отчёт "
+            "(например md/docx/pdf), какое точное имя файла и в какой каталог его сохранить?"
+        )
+    return (
+        "Уточните, пожалуйста, один недостающий параметр, без которого нельзя "
+        "безопасно выполнить задачу (формат, путь, объём или критерий успеха)."
+    )
+
+
 def _looks_like_osint_dns_context(normalized: str) -> bool:
     return _contains_any(
         normalized,
@@ -8234,6 +8544,25 @@ def _looks_like_osint_dns_context(normalized: str) -> bool:
             "dns на роутер",
             "dns кэш",
             "dns-кэш",
+            # Educational / network protocol questions must not route to DNS-shop.
+            "назначение dns",
+            "что такое dns",
+            "что такое dns",
+            "dns это",
+            "dns protocol",
+            "domain name system",
+            "система доменных",
+            "объясни dns",
+            "объясни назначение dns",
+            "nslookup",
+            "hostname",
+            "resolve ",
+            "резолв",
+            "ip адрес",
+            "ip-адрес",
+            "a-запис",
+            "mx запис",
+            "mx-запис",
         ),
     )
 
@@ -9558,12 +9887,22 @@ def _valid_web_synthesis_answer(answer: str) -> bool:
         "route" in parsed or "confidence" in parsed or "rationale" in parsed
     ):
         return False
-    return not re.fullmatch(r"\s*\{.*\}\s*", answer, flags=re.DOTALL)
+    if re.fullmatch(r"\s*\{.*\}\s*", answer, flags=re.DOTALL):
+        return False
+    # Reject link dumps without synthesis: useful answer must have prose claims.
+    lines = [line.strip() for line in answer.splitlines() if line.strip()]
+    url_only = sum(1 for line in lines if re.search(r"https?://", line))
+    prose = sum(1 for line in lines if not re.search(r"https?://", line) and len(line) > 20)
+    if url_only >= 2 and prose == 0:
+        return False
+    return True
 
 
 def _ensure_synthesis_sources(answer: str, evidence: list[dict[str, str]]) -> str:
     urls = [str(item.get("url") or "") for item in evidence[:6] if item.get("url")]
     if any(url and url in answer for url in urls):
+        return answer
+    if not evidence:
         return answer
     lines = ["", "Источники:"]
     for index, item in enumerate(evidence[:6], start=1):
@@ -9571,8 +9910,24 @@ def _ensure_synthesis_sources(answer: str, evidence: list[dict[str, str]]) -> st
         if not url:
             continue
         title = _short_value(item.get("title") or url, 140)
-        lines.append(f"{index}. {title}: {url}")
+        freshness = str(item.get("freshness") or item.get("source_mode") or "").strip()
+        suffix = f" [{freshness}]" if freshness else ""
+        lines.append(f"{index}. {title}: {url}{suffix}")
     return answer.rstrip() + "\n" + "\n".join(lines)
+
+
+def _network_unavailable_result(reason: str | None = None) -> str:
+    detail = " ".join(str(reason or "").split())
+    if detail:
+        return (
+            "Сеть/веб-источники сейчас недоступны "
+            f"({detail[:240]}). Повторите запрос при доступной сети "
+            "или укажите offline-источник."
+        )
+    return (
+        "Сеть/веб-источники сейчас недоступны. Повторите запрос при доступной "
+        "сети или укажите offline-источник."
+    )
 
 
 def _web_research_followup_intent(message: str) -> bool:
