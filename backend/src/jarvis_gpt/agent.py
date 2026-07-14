@@ -899,6 +899,38 @@ class AgentRuntime:
         # The reasoning-first arbiter may have rewritten the kernel plan inside
         # _try_direct_action (for example web_research -> mission), so re-read it.
         task_plan = context.task_plan or task_plan
+        # RB-5: never escalate a complete single-step transform to mission.
+        if (
+            _is_fully_specified_transform(message)
+            or task_plan.intent == "transform_document"
+        ):
+            # Fail closed: if the direct transform path missed, do not invent a
+            # mission or free-tool fallback. Ask for a precise restate or report
+            # the blocked failure without side effects.
+            fail_answer = (
+                "Не удалось выполнить полностью определённый transform по "
+                "детерминированному пути. Повторите запрос с точным source, "
+                "destination и форматом — mission/search fallback отключён."
+            )
+            duration_ms = _elapsed_ms(started_at)
+            message_id = self.storage.add_message(
+                conversation_id=context.conversation_id,
+                role="assistant",
+                content=fail_answer,
+                metadata={
+                    "duration_ms": duration_ms,
+                    "source": "transform_sealed_no_fallback",
+                    "mission_created": False,
+                    "events": [event.model_dump() for event in events],
+                },
+            )
+            return ChatResponse(
+                conversation_id=context.conversation_id,
+                message_id=message_id,
+                answer=fail_answer,
+                events=events,
+                duration_ms=duration_ms,
+            )
         forced_mission = mode == "mission"
         if (
             not forced_mission
@@ -1371,6 +1403,39 @@ class AgentRuntime:
         # The reasoning-first arbiter may have rewritten the kernel plan inside
         # _try_direct_action (for example web_research -> mission), so re-read it.
         task_plan = context.task_plan or task_plan
+        # RB-5: never escalate a complete single-step transform to mission.
+        if (
+            _is_fully_specified_transform(message)
+            or task_plan.intent == "transform_document"
+        ):
+            fail_answer = (
+                "Не удалось выполнить полностью определённый transform по "
+                "детерминированному пути. Повторите запрос с точным source, "
+                "destination и форматом — mission/search fallback отключён."
+            )
+            yield {"type": "delta", "content": fail_answer}
+            duration_ms = _elapsed_ms(started_at)
+            message_id = self.storage.add_message(
+                conversation_id=context.conversation_id,
+                role="assistant",
+                content=fail_answer,
+                metadata={
+                    "duration_ms": duration_ms,
+                    "source": "transform_sealed_no_fallback",
+                    "mission_created": False,
+                    "events": [event.model_dump() for event in events],
+                },
+            )
+            yield {
+                "type": "done",
+                "answer": fail_answer,
+                "conversation_id": context.conversation_id,
+                "duration_ms": duration_ms,
+                "events": [event.model_dump() for event in events],
+                "message_id": message_id,
+                "mission_created": False,
+            }
+            return
         forced_mission = mode == "mission"
         if (
             not forced_mission
@@ -2911,6 +2976,20 @@ class AgentRuntime:
                 conversation_id=context.conversation_id if context is not None else None,
                 context=context,
             )
+
+        # RB-5: fully specified document transforms/new artifacts are sealed
+        # before the generic LLM arbiter. The arbiter must not reclassify them
+        # into mission/recall/search or free-form tool JSON.
+        sealed_document_intent = (
+            context is not None
+            and context.task_plan is not None
+            and context.task_plan.intent
+            in {"transform_document", "new_artifact", "artifact_after_clarification"}
+        ) or _is_fully_specified_transform(message) or _is_fully_specified_new_artifact(
+            message
+        )
+        if sealed_document_intent:
+            return None
 
         # Reasoning-first arbiter: before any fuzzy web-ish branch (shopping,
         # weather, generic research) fires on keyword matches, let the model judge
@@ -5157,32 +5236,35 @@ class AgentRuntime:
             preferences=self.storage.get_runtime_value("experience.preferences", {}),
         )
 
-        # RB-3: complete new-artifact / transform requests must not fall through to
-        # document recall, shopping (e.g. DNS in report content), or general chat.
+        # RB-3/RB-5: complete new-artifact / transform requests must not fall
+        # through to document recall, mission, shopping, or free tool JSON.
+        # Prefer structural complete-transform detection even when intent body
+        # gaps would otherwise leave the typed intent incomplete.
         artifact_intent = _new_artifact_intent_from_message(message)
+        if artifact_intent is None and _is_fully_specified_transform(message):
+            artifact_intent = _new_artifact_intent_from_message(
+                message, original_goal=message
+            )
         if artifact_intent and artifact_intent.get("complete"):
             kind = str(artifact_intent.get("kind") or NEW_ARTIFACT_REQUEST)
             tools: tuple[str, ...]
             if kind == TRANSFORM_EXISTING_DOCUMENT:
-                tools = (
-                    "documents.generate",
-                    "documents.recall",
-                    "documents.read",
-                    "documents.convert",
-                )
+                # Single-step transform: only the bound convert executor.
+                tools = ("documents.convert",)
             else:
                 tools = ("documents.generate",)
             return TaskKernelPlan(
                 route="reasoning",
                 mode=task_mode,
                 intent="new_artifact" if kind == NEW_ARTIFACT_REQUEST else "transform_document",
-                confidence=0.94,
+                confidence=0.99,
                 query=message,
                 tools=tools,
                 completion_criteria=(
                     "create the artifact at the exact requested path",
                     "verify the written path before reporting success",
-                    "do not route to document search or shopping",
+                    "do not route to document search, mission, or shopping",
+                    "do not invoke the generic intent arbiter",
                 ),
                 rationale=(
                     f"Typed {kind} with exact destination "
@@ -5278,6 +5360,27 @@ class AgentRuntime:
                 ),
                 needs_clarification=True,
                 clarification=question,
+            )
+
+        # RB-5: single-step fully specified transform is never a mission.
+        if _is_fully_specified_transform(message) or (
+            artifact_intent
+            and artifact_intent.get("complete")
+            and artifact_intent.get("kind") == TRANSFORM_EXISTING_DOCUMENT
+        ):
+            return TaskKernelPlan(
+                route="reasoning",
+                mode=task_mode,
+                intent="transform_document",
+                confidence=0.99,
+                query=message,
+                tools=("documents.convert",),
+                completion_criteria=(
+                    "create the artifact at the exact requested path",
+                    "verify the written path before reporting success",
+                    "do not create a mission for a single-step transform",
+                ),
+                rationale="Fully specified TRANSFORM_EXISTING_DOCUMENT (sealed).",
             )
 
         if mode == "mission" or (mode == "auto" and self._looks_like_mission(message)):
@@ -9534,10 +9637,25 @@ def _has_transform_verb(message: str) -> bool:
 def _looks_like_document_read_or_recall(message: str) -> bool:
     """True for recall/summarize/compare of existing documents (not artifact creation)."""
 
+    # Fully specified durable writes never route as recall (RB-5).
+    if _is_fully_specified_transform(message) or _is_fully_specified_new_artifact(message):
+        return False
     normalized = str(message or "").casefold()
     # Creation / transform verbs win over bare "document/file" memory cues so that
     # "create X.md from the uploaded document" is not misrouted to documents.recall.
     if _contains_any(normalized, _create_artifact_verbs()):
+        return False
+    if _has_transform_verb(message):
+        return False
+    # Source + exact destination is a transform contract, not recall.
+    if (
+        _has_existing_source_reference(message)
+        and _destination_filename_from_message(
+            message, source_filename=_source_filename_from_message(message)
+        )
+        and _destination_is_concrete(normalized)
+        and not _looks_like_pure_document_analysis(message)
+    ):
         return False
     return _contains_any(
         normalized,
@@ -9577,8 +9695,11 @@ def _looks_like_artifact_or_mission_side_effect(message: str) -> bool:
     normalized = str(message or "").casefold()
     if not normalized.strip():
         return False
+    # Structural complete durable writes always admit side effects (RB-5).
+    if _is_fully_specified_transform(message) or _is_fully_specified_new_artifact(message):
+        return True
     # Document memory / summarize must never be treated as create-artifact.
-    if _looks_like_document_read_or_recall(normalized):
+    if _looks_like_document_read_or_recall(message):
         return False
     # Require an explicit creation/write verb — bare "document/report" is not enough.
     create_verbs = _create_artifact_verbs()
@@ -9822,13 +9943,60 @@ def _side_effect_completeness_gaps(message: str) -> list[str]:
             "put the file",
         ),
     )
+    source_name = _source_filename_from_message(message)
+    dest_name = _destination_filename_from_message(
+        message, source_filename=source_name
+    )
+    transform_shaped = _has_existing_source_reference(message) and (
+        _has_transform_verb(message)
+        or _is_fully_specified_transform(message)
+        or dest_name is not None
+        or _contains_any(normalized, _create_artifact_verbs())
+    )
     if not mission_only:
         if not _format_is_concrete(normalized):
             gaps.append("format")
         if not _destination_is_concrete(normalized):
             gaps.append("destination")
-        if not _content_topic_is_present(normalized):
+        # Transform content is the existing source document; topical body is not
+        # required when the structural transform contract is otherwise complete.
+        if not transform_shaped and not _content_topic_is_present(normalized):
             gaps.append("content")
+        # Source extensions (e.g. src-doc.txt) must not satisfy transform
+        # destination/format completeness. Require an explicit non-source dest.
+        if transform_shaped and _has_existing_source_reference(message):
+            if not dest_name and "destination" not in gaps:
+                gaps.append("destination")
+            # Vague format phrases with only a source extension remain incomplete.
+            vague_format = _contains_any(
+                normalized,
+                (
+                    "нужном формате",
+                    "нужный формат",
+                    "подходящем формате",
+                    "right format",
+                    "correct format",
+                    "выбранном мной формате",
+                ),
+            )
+            explicit_out_fmt = bool(
+                re.search(
+                    r"(?i)\b(md|markdown|docx|pdf)\b|\.(?:md|docx|pdf)\b",
+                    normalized,
+                )
+            )
+            if dest_name:
+                explicit_out_fmt = explicit_out_fmt or bool(
+                    re.search(r"(?i)\.(md|docx|pdf|txt|html|csv|json|xlsx)$", dest_name)
+                )
+            if (
+                (vague_format or not dest_name)
+                and not explicit_out_fmt
+                and "format" not in gaps
+            ):
+                gaps.append("format")
+            # Content gap never blocks transform once source is referenced.
+            gaps = [g for g in gaps if g != "content"]
     # Operator explicitly demanded a question first — treat as incomplete until answered.
     if _looks_like_clarification_before_action(message) and not gaps:
         gaps.append("operator_requested_clarification")
@@ -10014,17 +10182,148 @@ def _has_existing_source_reference(message: str) -> bool:
     )
 
 
+def _is_fully_specified_transform(message: str) -> bool:
+    """True when TRANSFORM_EXISTING_DOCUMENT has a complete structural contract.
+
+    RB-5: a fully specified transform is defined by operands (source + exact
+    destination + format + allowed root), not by a particular verb phrase.
+    Complete contracts must never fall through to recall, mission, or free tool
+    JSON — even when the operator uses "подготовь markdown-файл …" rather than
+    an English convert/transform verb.
+    """
+
+    text = str(message or "")
+    if not text.strip():
+        return False
+    if not _has_existing_source_reference(text):
+        return False
+    if _looks_like_pure_document_analysis(text):
+        return False
+    source = _source_filename_from_message(text)
+    dest = _destination_filename_from_message(text, source_filename=source)
+    if not dest:
+        return False
+    if source and dest.casefold() == source.casefold():
+        allow_in_place = _contains_any(
+            text.casefold(),
+            (
+                "in-place",
+                "inplace",
+                "overwrite source",
+                "перезапиши исходн",
+                "на месте",
+                "in place",
+            ),
+        )
+        if not allow_in_place:
+            return False
+    normalized = text.casefold()
+    has_fmt = _format_is_concrete(normalized) or bool(
+        re.search(r"(?i)\.(md|docx|pdf|txt|html|csv|json|xlsx)$", dest)
+    )
+    if not has_fmt:
+        return False
+    return _destination_is_concrete(normalized)
+
+
+def _is_fully_specified_new_artifact(message: str) -> bool:
+    """True when NEW_ARTIFACT_REQUEST has exact destination + format, no source."""
+
+    text = str(message or "")
+    if not text.strip() or _has_existing_source_reference(text):
+        return False
+    if _looks_like_host_filesystem_write(text):
+        return False
+    dest = _destination_filename_from_message(text)
+    if not dest:
+        return False
+    normalized = text.casefold()
+    has_fmt = _format_is_concrete(normalized) or bool(
+        re.search(r"(?i)\.(md|docx|pdf|txt|html|csv|json|xlsx)$", dest)
+    )
+    if not has_fmt or not _destination_is_concrete(normalized):
+        return False
+    # Durable write signal: create/write verb or filename + dest markers.
+    # Do not call _looks_like_artifact_or_mission_side_effect (would recurse).
+    if _contains_any(normalized, _create_artifact_verbs()):
+        return True
+    has_filename = bool(re.search(r"(?i)\b[\w.-]+\.(md|docx|pdf|txt)\b", normalized))
+    has_dest_marker = _contains_any(
+        normalized,
+        (
+            "document-outputs",
+            "output_path",
+            "output_name",
+            "save as",
+            "сохрани как",
+            "под именем",
+            "имя файла",
+            "filename",
+            "file name",
+        ),
+    )
+    return bool(has_filename and has_dest_marker)
+
+
+def _looks_like_pure_document_analysis(message: str) -> bool:
+    """True for read/summarize/compare with no durable write destination."""
+
+    text = str(message or "")
+    dest = _destination_filename_from_message(
+        text, source_filename=_source_filename_from_message(text)
+    )
+    if dest and _destination_is_concrete(text.casefold()):
+        return False
+    normalized = text.casefold()
+    return _contains_any(
+        normalized,
+        (
+            "дай резюме",
+            "резюме сохран",
+            "summarize",
+            "summary of",
+            "что написано",
+            "что говорит",
+            "what does the document",
+            "what is in the document",
+            "recall",
+            "прочитай",
+            "read the document",
+            "read the file",
+            "сравни",
+            "compare the",
+            "найди документ",
+            "find the document",
+            "find document",
+        ),
+    )
+
+
 def _classify_document_artifact_intent(message: str) -> str | None:
     """Classify EXISTING_DOCUMENT_REFERENCE / NEW_ARTIFACT_REQUEST / TRANSFORM."""
 
     normalized = str(message or "").casefold()
     if not normalized.strip():
         return None
+    # Structural complete transform/new-artifact contracts beat recall heuristics.
+    if _is_fully_specified_transform(message):
+        return TRANSFORM_EXISTING_DOCUMENT
+    if _is_fully_specified_new_artifact(message):
+        return NEW_ARTIFACT_REQUEST
     has_source = _has_existing_source_reference(message)
     creating = (
         _looks_like_artifact_or_mission_side_effect(message)
         or _contains_any(normalized, _create_artifact_verbs())
         or (_has_transform_verb(message) and has_source)
+        or (
+            has_source
+            and _destination_filename_from_message(
+                message, source_filename=_source_filename_from_message(message)
+            )
+            is not None
+            and _destination_is_concrete(normalized)
+            and not _looks_like_pure_document_analysis(message)
+        )
     )
     if creating:
         # Transform when an existing source document is referenced; else new artifact.
@@ -10262,7 +10561,16 @@ def _new_artifact_intent_from_message(
     kind = _classify_document_artifact_intent(message)
     if kind not in {NEW_ARTIFACT_REQUEST, TRANSFORM_EXISTING_DOCUMENT}:
         return None
-    if _requires_side_effect_clarification(message) and not original_goal:
+    # Fully specified structural transform/new-artifact contracts skip the
+    # clarification gate — operands are already bound (RB-5).
+    if (
+        _requires_side_effect_clarification(message)
+        and not original_goal
+        and not _is_fully_specified_transform(message)
+        and not (
+            kind == NEW_ARTIFACT_REQUEST and _is_fully_specified_new_artifact(message)
+        )
+    ):
         return None
 
     combined = f"{original_goal}\n{message}".strip() if original_goal else message
@@ -10322,13 +10630,22 @@ def _new_artifact_intent_from_message(
 
     gaps = _side_effect_completeness_gaps(message)
     has_dest = bool(filename) and _destination_is_concrete(message.casefold())
-    has_fmt = _format_is_concrete(message.casefold())
+    has_fmt = _format_is_concrete(message.casefold()) or bool(
+        re.search(r"(?i)\.(md|docx|pdf|txt|html|csv|json|xlsx)$", filename)
+    )
     complete = not gaps or (
         bool(filename)
         and has_fmt
         and has_dest
         and (len(body.strip()) >= 4 or kind == TRANSFORM_EXISTING_DOCUMENT)
     )
+    # Structural complete transform contract forces complete=True (RB-5).
+    if kind == TRANSFORM_EXISTING_DOCUMENT and _is_fully_specified_transform(
+        combined if original_goal else message
+    ):
+        complete = True
+    if kind == NEW_ARTIFACT_REQUEST and _is_fully_specified_new_artifact(message):
+        complete = True
     # Transform additionally requires a resolvable source identity when complete.
     if kind == TRANSFORM_EXISTING_DOCUMENT and complete and not (
         source_filename or _has_existing_source_reference(message)
