@@ -6,6 +6,7 @@ import binascii
 import ipaddress
 import json
 import os
+import re
 import secrets
 import socket
 from contextlib import asynccontextmanager, suppress
@@ -1412,9 +1413,19 @@ async def search_memory(
 
 @app.post("/api/memory", response_model=MemoryItem)
 async def add_memory(request: MemoryCreateRequest) -> MemoryItem:
+    namespace = str(request.namespace or "").strip() or "core"
+    # When content names an explicit campaign namespace, honor it over defaults.
+    if namespace.casefold() in {"core", "operator", "default", "persona"}:
+        match = re.search(
+            r"(?:namespace\s*[:=]\s*|namespace\s+|в\s+namespace\s+)([A-Za-z0-9._\-]+)",
+            request.content,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            namespace = match.group(1).strip()[:80]
     return app.state.storage.add_memory(
         content=request.content,
-        namespace=request.namespace,
+        namespace=namespace,
         tags=request.tags,
         importance=request.importance,
     )

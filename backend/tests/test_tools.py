@@ -4661,3 +4661,40 @@ def test_canonicalize_tool_invocation_does_not_rewrite_mutation_aliases():
         rewritten = _canonicalize_mkdir_kind_in_payload(payload)
         assert rewritten["action"]["kind"] == kind
 
+
+def test_memory_save_honors_explicit_namespace(monkeypatch, tmp_path):
+    """SPARK-0012: requested namespace is not rewritten to operator/core defaults."""
+    import asyncio
+    from jarvis_gpt.config import ensure_runtime_dirs, load_settings
+    from jarvis_gpt.llm import LLMRouter
+    from jarvis_gpt.storage import JarvisStorage
+    from jarvis_gpt.tools import ToolRegistry
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+    ns = "audit.functional.20260713"
+    result = asyncio.run(
+        tools.run(
+            "memory.save",
+            {
+                "content": f"marker MEMORY-1 любимый тестовый цвет — ультрамарин (namespace {ns})",
+                "namespace": ns,
+            },
+        )
+    )
+    assert result.ok is True
+    assert result.data["namespace"] == ns
+    assert result.data["item"]["namespace"] == ns
+    # Default/operator namespaces must stay empty for this marker.
+    operator_hits = storage.search_memory("MEMORY-1", limit=10, namespaces=["operator"])
+    core_hits = storage.search_memory("MEMORY-1", limit=10, namespaces=["core"])
+    ns_hits = storage.search_memory("MEMORY-1", limit=10, namespaces=[ns])
+    assert ns_hits and ns_hits[0]["namespace"] == ns
+    assert not operator_hits
+    assert not core_hits
+    storage.close()

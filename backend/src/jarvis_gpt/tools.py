@@ -4593,7 +4593,7 @@ def _memory_save(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
             ok=False,
             summary="Memory content is required.",
         )
-    namespace = str(args.get("namespace") or "core")[:80]
+    namespace = _resolve_memory_namespace(args, content)
     tags = args.get("tags") or []
     if isinstance(tags, str):
         tags = [item.strip() for item in tags.split(",") if item.strip()]
@@ -4609,9 +4609,32 @@ def _memory_save(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     return ToolRunResponse(
         tool="memory.save",
         ok=True,
-        summary="Memory item saved.",
-        data={"item": item},
+        summary=f"Memory item saved in namespace {namespace}.",
+        data={"item": item, "namespace": namespace},
     )
+
+
+def _resolve_memory_namespace(args: dict[str, Any], content: str) -> str:
+    """Honor exact requested namespace; never silently rewrite to operator/default."""
+
+    explicit = str(args.get("namespace") or "").strip()
+    mentioned = None
+    for pattern in (
+        r"namespace\s*[:=]\s*([A-Za-z0-9._\-]+)",
+        r"namespace\s+([A-Za-z0-9._\-]+)",
+        r"в\s+namespace\s+([A-Za-z0-9._\-]+)",
+    ):
+        match = re.search(pattern, content, flags=re.IGNORECASE)
+        if match:
+            mentioned = match.group(1).strip()
+            break
+    if explicit and explicit.casefold() not in {"operator", "core", "default", "persona"}:
+        return explicit[:80]
+    if mentioned:
+        return mentioned[:80]
+    if explicit:
+        return explicit[:80]
+    return "core"
 
 
 def _files_list(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
@@ -12864,7 +12887,8 @@ def _web_answer_preferred_domains(texts: list[str]) -> list[str]:
         if host:
             _append_unique_domain(domains, host)
     shop_source = find_shop_source(normalized)
-    if shop_source is not None:
+    # Only pin marketplace domains when the question is actually shopping.
+    if shop_source is not None and _web_answer_looks_like_shopping(normalized):
         _append_unique_domain(domains, shop_source.domain)
     known_sites = (
         ("avito.ru", (r"\bavito\b", r"\bавито\b")),
@@ -13057,6 +13081,24 @@ def _looks_like_place_lookup_text(normalized: str) -> bool:
 
 
 def _web_answer_looks_like_shopping(normalized: str) -> bool:
+    # Educational / network protocol questions that merely mention DNS must not
+    # be treated as DNS-shop catalog shopping.
+    if any(
+        marker in normalized
+        for marker in (
+            "назначение dns",
+            "что такое dns",
+            "объясни dns",
+            "dns protocol",
+            "domain name system",
+            "система доменных",
+            "настроить dns",
+            "dns over",
+            "nslookup",
+            "hostname",
+        )
+    ):
+        return False
     return any(
         marker in normalized
         for marker in (
@@ -13801,6 +13843,7 @@ def _format_web_answer_report(
     direct_links: list[dict[str, str]] | None = None,
 ) -> str:
     _ = queries
+    shopping = _web_answer_looks_like_shopping(_repair_mojibake(question).lower())
     links = direct_links or _web_answer_direct_links(
         question,
         preferred_domains=preferred_domains or [],
@@ -13808,9 +13851,13 @@ def _format_web_answer_report(
     )
     lines: list[str] = []
     if not sources:
-        if links:
+        if links and shopping:
             lines.append("Сайт не отдал достаточно данных для честного сравнения цены.")
             lines.append("Вот прямая ссылка для проверки:")
+            lines.extend(_web_answer_markdown_link_lines(links[:3]))
+        elif links:
+            lines.append("Недостаточно подтверждённых данных из открытой выдачи.")
+            lines.append("Проверь источники напрямую:")
             lines.extend(_web_answer_markdown_link_lines(links[:3]))
         else:
             lines.append("Не нашёл надёжную страницу в открытой выдаче.")
