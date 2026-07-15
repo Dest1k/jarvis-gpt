@@ -115,6 +115,27 @@ NATIVE_APP_NAMES = frozenset(
 )
 MMC_CONSOLES = frozenset({"devmgmt.msc", "services.msc"})
 CALCULATOR_APP_URI = r"shell:AppsFolder\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"
+# Locale-invariant runtime process-name fragments for launcher-style apps whose
+# visible window is NOT owned by the launched PID (UWP stubs like the modern
+# Calculator, Office shells, MMC consoles). app.open_and_type focuses by this
+# fragment when the caller supplied no explicit process_name/window_title, so the
+# keystrokes reach the right window regardless of the Windows display language.
+NATIVE_APP_FOCUS_HINTS = {
+    "calc.exe": "Calculator",
+    "winword.exe": "WINWORD",
+    "excel.exe": "EXCEL",
+    "powerpnt.exe": "POWERPNT",
+    "notepad.exe": "Notepad",
+    "mspaint.exe": "mspaint",
+    "taskmgr.exe": "Taskmgr",
+    "code.exe": "Code",
+    "telegram.exe": "Telegram",
+    "chrome.exe": "chrome",
+    "msedge.exe": "msedge",
+    "firefox.exe": "firefox",
+    "devmgmt.msc": "mmc",
+    "services.msc": "mmc",
+}
 BRIDGE_POLICY_REVISION = "native-app-v2"
 APP_PATHS_ENV = "JARVIS_BRIDGE_APP_PATHS_JSON"
 SENSITIVE_ARGUMENT_RE = re.compile(
@@ -233,6 +254,19 @@ class BridgeServer(ThreadingHTTPServer):
         self.started_at = time.monotonic()
 
 
+def _focus_hint_process_name(executable: str, arguments: list[str]) -> str:
+    """Locale-invariant window process-name fragment for a launcher-style app.
+
+    Returns '' when the launched executable already owns its own window (so the
+    launch PID is a fine focus target) or the app is unknown.
+    """
+
+    name = PureWindowsPath(str(executable)).name.casefold()
+    if name == "explorer.exe" and list(arguments) == [CALCULATOR_APP_URI]:
+        return "Calculator"
+    return NATIVE_APP_FOCUS_HINTS.get(name, "")
+
+
 def execute_action(request: dict[str, Any]) -> tuple[dict[str, Any], int]:
     started = time.monotonic()
     try:
@@ -259,9 +293,29 @@ def execute_action(request: dict[str, Any]) -> tuple[dict[str, Any], int]:
                 if key not in {"executable", "arguments", "cwd"}
             }
             native_payload["process_id"] = process_result["pid"]
+            # Launcher-style apps hand their window to a differently-named process,
+            # so the launch PID cannot be focused. When the caller gave no focus
+            # target, steer the bridge at the real window by its locale-invariant
+            # process name instead of failing with "window was not focused".
+            if not native_payload.get("process_name") and not native_payload.get("window_title"):
+                hint = _focus_hint_process_name(
+                    payload.get("executable", ""), payload.get("arguments") or []
+                )
+                if hint:
+                    native_payload["process_name"] = hint
             result = _run_fixed_native_action(action, native_payload, timeout_sec)
-            result.setdefault("pid", process_result["pid"])
             result.setdefault("argv", process_result["argv"])
+            result["launch_pid"] = process_result["pid"]
+            # Prefer the actually-focused window's PID for downstream state
+            # verification; fall back to the launch PID for classic Win32 apps.
+            native_data = result.get("data")
+            focus_pid = (
+                native_data.get("focus_pid") if isinstance(native_data, dict) else None
+            )
+            if isinstance(focus_pid, int) and not isinstance(focus_pid, bool) and focus_pid > 0:
+                result["pid"] = focus_pid
+            else:
+                result.setdefault("pid", process_result["pid"])
         else:
             result = _run_fixed_native_action(action, payload, timeout_sec)
     except subprocess.TimeoutExpired as exc:
@@ -667,17 +721,35 @@ using System.Runtime.InteropServices;
 public static class JarvisBridgeWinApi {
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
   [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int command);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int command);
+  [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+  [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+  [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+  [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
 }
 '@
+
+  $script:LastFocusPid = 0
+  $script:LastFocusName = ''
+  $script:LastForegroundConfirmed = $false
 
   function FindWindowProcess($ProcessId, $ProcessName, $WindowTitle) {
     if ([int64]$ProcessId -gt 0) {
       $candidate = Get-Process -Id ([int]$ProcessId) -ErrorAction SilentlyContinue
       if ($candidate -and $candidate.MainWindowHandle -ne 0) { return $candidate }
     }
+    # Launcher-style apps (UWP calculator, Office) rename the visible-window
+    # process, so match the requested name as a locale-invariant substring rather
+    # than requiring an exact, still-alive image name. Prefer the newest window.
     if ($ProcessName) {
-      $candidate = Get-Process -Name ([string]$ProcessName) -ErrorAction SilentlyContinue |
-        Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+      $needle = ([string]$ProcessName) -replace '\.exe$', ''
+      $candidate = Get-Process -ErrorAction SilentlyContinue |
+        Where-Object { $_.MainWindowHandle -ne 0 -and $_.ProcessName -like ('*' + $needle + '*') } |
+        Sort-Object { try { $_.StartTime.Ticks } catch { 0 } } -Descending |
+        Select-Object -First 1
       if ($candidate) { return $candidate }
     }
     if ($WindowTitle) {
@@ -685,21 +757,63 @@ public static class JarvisBridgeWinApi {
         Where-Object {
           $_.MainWindowHandle -ne 0 -and
           $_.MainWindowTitle -like ('*' + [string]$WindowTitle + '*')
-        } | Select-Object -First 1
+        } |
+        Sort-Object { try { $_.StartTime.Ticks } catch { 0 } } -Descending |
+        Select-Object -First 1
     }
     return $null
   }
 
+  function ForceForeground($Handle) {
+    if ([JarvisBridgeWinApi]::IsIconic($Handle)) {
+      [void][JarvisBridgeWinApi]::ShowWindow($Handle, 9)
+    } else {
+      [void][JarvisBridgeWinApi]::ShowWindow($Handle, 5)
+    }
+    $foreground = [JarvisBridgeWinApi]::GetForegroundWindow()
+    $targetPid = [uint32]0
+    $targetThread = [JarvisBridgeWinApi]::GetWindowThreadProcessId($Handle, [ref]$targetPid)
+    $foregroundPid = [uint32]0
+    $foregroundThread = [JarvisBridgeWinApi]::GetWindowThreadProcessId($foreground, [ref]$foregroundPid)
+    $current = [JarvisBridgeWinApi]::GetCurrentThreadId()
+    $attachedForeground = $false
+    $attachedTarget = $false
+    if ($foregroundThread -ne 0 -and $foregroundThread -ne $current) {
+      $attachedForeground = [JarvisBridgeWinApi]::AttachThreadInput($current, $foregroundThread, $true)
+    }
+    if ($targetThread -ne 0 -and $targetThread -ne $current -and $targetThread -ne $foregroundThread) {
+      $attachedTarget = [JarvisBridgeWinApi]::AttachThreadInput($current, $targetThread, $true)
+    }
+    # A synthetic Alt tap clears the OS foreground lock that otherwise makes
+    # SetForegroundWindow a silent no-op for a background service.
+    [JarvisBridgeWinApi]::keybd_event(0xA4, 0, 0, [UIntPtr]::Zero)
+    [JarvisBridgeWinApi]::keybd_event(0xA4, 0, 2, [UIntPtr]::Zero)
+    [void][JarvisBridgeWinApi]::BringWindowToTop($Handle)
+    [void][JarvisBridgeWinApi]::ShowWindowAsync($Handle, 9)
+    [void][JarvisBridgeWinApi]::SetForegroundWindow($Handle)
+    if ($attachedTarget) { [void][JarvisBridgeWinApi]::AttachThreadInput($current, $targetThread, $false) }
+    if ($attachedForeground) { [void][JarvisBridgeWinApi]::AttachThreadInput($current, $foregroundThread, $false) }
+  }
+
   function FocusWindow($ProcessId, $ProcessName, $WindowTitle) {
-    for ($attempt = 0; $attempt -lt 12; $attempt++) {
+    $script:LastFocusPid = 0
+    $script:LastFocusName = ''
+    $script:LastForegroundConfirmed = $false
+    for ($attempt = 0; $attempt -lt 16; $attempt++) {
       $process = FindWindowProcess $ProcessId $ProcessName $WindowTitle
       if ($process) {
-        [void][JarvisBridgeWinApi]::ShowWindowAsync($process.MainWindowHandle, 9)
-        [void][JarvisBridgeWinApi]::SetForegroundWindow($process.MainWindowHandle)
-        Start-Sleep -Milliseconds 180
-        return $true
+        $handle = $process.MainWindowHandle
+        $script:LastFocusPid = [int]$process.Id
+        $script:LastFocusName = [string]$process.ProcessName
+        ForceForeground $handle
+        Start-Sleep -Milliseconds 140
+        $confirmed = ([JarvisBridgeWinApi]::GetForegroundWindow() -eq $handle)
+        $script:LastForegroundConfirmed = $confirmed
+        # Return as soon as the window is verifiably in front; after a few
+        # attempts accept the located+raised window so input still lands.
+        if ($confirmed -or $attempt -ge 3) { return $true }
       }
-      Start-Sleep -Milliseconds 250
+      Start-Sleep -Milliseconds 220
     }
     return $false
   }
@@ -754,6 +868,9 @@ public static class JarvisBridgeWinApi {
       $focused = FocusWindow $Payload.process_id $Payload.process_name $Payload.window_title
       Out $focused $(if ($focused) { 'Window focused.' } else { 'Window was not found.' }) @{
         focused = $focused
+        focus_pid = $script:LastFocusPid
+        focus_process = $script:LastFocusName
+        foreground_confirmed = $script:LastForegroundConfirmed
       }
     }
     'keyboard.send' {
@@ -767,7 +884,12 @@ public static class JarvisBridgeWinApi {
         }
       }
       SendInput $Payload.keys $Payload.text
-      Out $true 'Native keyboard input sent.' @{ focused = $focused }
+      Out $true 'Native keyboard input sent.' @{
+        focused = $focused
+        focus_pid = $script:LastFocusPid
+        focus_process = $script:LastFocusName
+        foreground_confirmed = $script:LastForegroundConfirmed
+      }
     }
     'app.open_and_type' {
       Start-Sleep -Milliseconds ([int]$Payload.wait_ms)
@@ -780,7 +902,11 @@ public static class JarvisBridgeWinApi {
       }
       SendInput $Payload.keys $Payload.text
       Out $true 'Application focused and native input sent.' @{
-        focused = $true; pid = $Payload.process_id
+        focused = $true
+        pid = $Payload.process_id
+        focus_pid = $script:LastFocusPid
+        focus_process = $script:LastFocusName
+        foreground_confirmed = $script:LastForegroundConfirmed
       }
     }
     'screen.capture' {

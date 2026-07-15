@@ -3694,17 +3694,31 @@ async def _verify_native_action_state(
         }
     items = _nested_native_items(inspected)
     expected_names: set[str]
+    name_required = True
     if action == "chrome.launch":
         expected_names = {"chrome.exe"}
     elif action == "console.show_processes":
         expected_names = {"powershell.exe"}
+    elif action == "app.open_and_type":
+        # For app.open_and_type, native["pid"] is the *focused* window's process,
+        # which for launcher-style apps (UWP calculator, Office shells) differs from
+        # the launched image name. A live process at that PID is the independent
+        # postcondition that input reached a real window; the name is advisory.
+        native_data = native.get("data") if isinstance(native.get("data"), dict) else {}
+        focus_name = str(native_data.get("focus_process") or "").casefold()
+        requested = PureWindowsPath(str(payload.get("executable") or "")).name.casefold()
+        expected_names = {name for name in {focus_name, f"{focus_name}.exe", requested} if name}
+        name_required = False
     else:
         requested = PureWindowsPath(str(payload.get("executable") or "")).name.casefold()
         expected_names = {"mmc.exe"} if requested.endswith(".msc") else {requested}
     matching = any(
         isinstance(item, dict)
         and str(item.get("ProcessId", item.get("process_id", ""))) == str(raw_pid)
-        and str(item.get("Name", item.get("name", ""))).casefold() in expected_names
+        and (
+            not name_required
+            or str(item.get("Name", item.get("name", ""))).casefold() in expected_names
+        )
         for item in items
     )
     verified = inspect_ok and matching

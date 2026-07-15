@@ -8572,12 +8572,105 @@ def _user_visible_answer(content: str) -> str:
     return cleaned
 
 
+# Tool-call envelope vocabulary. Models trained on different providers emit the
+# same intent under different keys (OpenAI `tool_calls`/`function_call`/stringified
+# `arguments`, Anthropic `input`, generic `parameters`). We normalise all of them to
+# one executable (name, args) action instead of dead-ending the operator's request.
+_TOOL_NAME_KEYS = ("tool", "name", "function", "action")
+_TOOL_ARG_KEYS = ("arguments", "args", "parameters", "input")
+_TOOL_ENVELOPE_KEYS = frozenset(
+    {*_TOOL_NAME_KEYS, *_TOOL_ARG_KEYS, "tool_calls", "function_call", "type", "id"}
+)
+
+
+def _coerce_tool_arguments(value: Any) -> dict[str, Any] | None:
+    """Normalise a tool arguments value; return None only when clearly malformed.
+
+    Accepts a JSON object, an already-decoded ``None``/absent (→ ``{}``), or a
+    JSON-encoded object *string* (models frequently stringify arguments).
+    """
+
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return {}
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def _coerce_tool_call(data: Any) -> tuple[str, dict[str, Any]] | None:
+    """Extract one executable (name, arguments) action from any tool-call dialect.
+
+    Returns None when the object is not a tool-call envelope at all. Callers treat
+    a None result on a tool-shaped object (see ``_dict_is_tool_call_envelope``) as a
+    protocol error so genuinely malformed control payloads never reach the operator.
+    """
+
+    if not isinstance(data, dict):
+        return None
+    # OpenAI array form: {"tool_calls": [{...}]} — execute the first requested call.
+    calls = data.get("tool_calls")
+    if isinstance(calls, list) and calls:
+        return _coerce_tool_call(calls[0])
+    # Wrapped forms: {"function_call": {...}} or {"type":"function","function": {...}}.
+    for wrapper in ("function_call", "function"):
+        inner = data.get(wrapper)
+        if isinstance(inner, dict):
+            coerced = _coerce_tool_call(inner)
+            if coerced is not None:
+                return coerced
+    name: str | None = None
+    for key in _TOOL_NAME_KEYS:
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            name = value.strip()
+            break
+    if name is None:
+        return None
+    args: dict[str, Any] | None = None
+    for key in _TOOL_ARG_KEYS:
+        if key in data:
+            args = _coerce_tool_arguments(data.get(key))
+            if args is None:
+                return None
+            break
+    if args is None:
+        # A bare name with only envelope-shaped keys is still a valid no-arg call
+        # (e.g. {"tool":"runtime.status"}); a name mixed with unrelated payload keys
+        # is ordinary data, not a control envelope, so leave it for the answer path.
+        if data.get("tool") is None and set(data) - _TOOL_ENVELOPE_KEYS:
+            return None
+        args = {}
+    return (name, args)
+
+
+def _dict_is_tool_call_envelope(data: dict[str, Any]) -> bool:
+    """True when a JSON object was *meant* to be a tool call (so failure is a
+    protocol error, not a normal answer)."""
+
+    return (
+        "tool_calls" in data
+        or "function_call" in data
+        or isinstance(data.get("function"), dict)
+        or isinstance(data.get("tool"), str)
+    )
+
+
 def _classify_tool_turn(content: str) -> _ToolTurn:
     """Classify a complete model turn without exposing control-plane payloads.
 
-    Tool-enabled rounds are buffered before this function is called. A valid tool
-    turn is one standalone JSON object (an optional full JSON fence is accepted).
-    Any prose/JSON mixture, bare call: marker, or malformed tool-shaped value is a
+    Tool-enabled rounds are buffered before this function is called. A standalone
+    JSON object in any common tool-call dialect (an optional full JSON fence is
+    accepted) is normalised to one executable action. A tool-shaped object that
+    cannot be normalised, a prose/JSON mixture, or a bare call: marker is a
     protocol error, never a user-visible answer.
     """
 
@@ -8589,26 +8682,11 @@ def _classify_tool_turn(content: str) -> _ToolTurn:
     except json.JSONDecodeError:
         data = None
     if isinstance(data, dict):
-        if "tool_calls" in data or "function_call" in data:
+        action = _coerce_tool_call(data)
+        if action is not None:
+            return _ToolTurn(kind="tool", text="", action=action)
+        if _dict_is_tool_call_envelope(data):
             return _ToolTurn(kind="protocol_error", text="")
-        has_tool_name = "tool" in data or "name" in data
-        if has_tool_name:
-            name = data.get("tool") if "tool" in data else data.get("name")
-            if not isinstance(name, str) or not name.strip():
-                return _ToolTurn(kind="protocol_error", text="")
-            if "arguments" in data:
-                args = data.get("arguments")
-            elif "args" in data:
-                args = data.get("args")
-            else:
-                args = {}
-            if not isinstance(args, dict):
-                return _ToolTurn(kind="protocol_error", text="")
-            return _ToolTurn(
-                kind="tool",
-                text="",
-                action=(name.strip(), args),
-            )
     if _contains_internal_tool_output(text):
         return _ToolTurn(kind="protocol_error", text="")
     return _ToolTurn(kind="answer", text=text)

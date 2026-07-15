@@ -513,3 +513,106 @@ def test_windows_token_acl_commands_succeed_on_a_real_file(tmp_path):
     bridge._protect_token_file(token_path)
 
     assert token_path.read_text(encoding="utf-8") == "test-token\n"
+
+
+def test_focus_hint_process_name_maps_launcher_style_apps():
+    bridge = _load_bridge_module()
+
+    assert bridge._focus_hint_process_name("calc.exe", []) == "Calculator"
+    assert bridge._focus_hint_process_name(r"C:\Windows\System32\notepad.exe", []) == "Notepad"
+    assert bridge._focus_hint_process_name("winword.exe", []) == "WINWORD"
+    assert (
+        bridge._focus_hint_process_name("explorer.exe", [bridge.CALCULATOR_APP_URI])
+        == "Calculator"
+    )
+    # explorer without the calculator URI, and unknown apps, own their own window.
+    assert bridge._focus_hint_process_name("explorer.exe", []) == ""
+    assert bridge._focus_hint_process_name("someapp.exe", []) == ""
+
+
+def test_app_open_and_type_injects_focus_hint_and_prefers_focused_pid(monkeypatch):
+    bridge = _load_bridge_module()
+    captured = {}
+
+    def fake_start(action, payload):
+        return {"ok": True, "pid": 4242, "argv": [r"C:\Windows\System32\calc.exe"]}
+
+    def fake_native(action, native_payload, timeout_sec):
+        captured["action"] = action
+        captured["native_payload"] = native_payload
+        return {
+            "ok": True,
+            "action": action,
+            "summary": "Application focused and native input sent.",
+            "data": {
+                "focused": True,
+                "pid": 4242,
+                "focus_pid": 9999,
+                "focus_process": "Calculator",
+                "foreground_confirmed": True,
+            },
+        }
+
+    monkeypatch.setattr(bridge, "_start_process", fake_start)
+    monkeypatch.setattr(bridge, "_run_fixed_native_action", fake_native)
+
+    result, status = bridge.execute_action(
+        {"action": "app.open_and_type", "payload": {"executable": "calc.exe", "text": "2+2="}}
+    )
+
+    assert status == 200
+    assert result["ok"] is True
+    # The calculator window belongs to a different, locale-invariant process, so the
+    # bridge steers focus by name rather than the dead launcher PID.
+    assert captured["native_payload"]["process_name"] == "Calculator"
+    assert result["launch_pid"] == 4242
+    assert result["pid"] == 9999  # the actually-focused window, not the launch stub
+
+
+def test_app_open_and_type_respects_explicit_focus_target(monkeypatch):
+    bridge = _load_bridge_module()
+    captured = {}
+
+    monkeypatch.setattr(
+        bridge, "_start_process", lambda action, payload: {"pid": 10, "argv": ["notepad"]}
+    )
+
+    def fake_native(action, native_payload, timeout_sec):
+        captured["native_payload"] = native_payload
+        return {"ok": True, "action": action, "summary": "done", "data": {"focused": True}}
+
+    monkeypatch.setattr(bridge, "_run_fixed_native_action", fake_native)
+
+    bridge.execute_action(
+        {
+            "action": "app.open_and_type",
+            "payload": {
+                "executable": "notepad.exe",
+                "text": "hi",
+                "window_title": "Untitled",
+            },
+        }
+    )
+
+    # An explicit caller-supplied target is never overridden by the derived hint.
+    assert captured["native_payload"].get("process_name", "") == ""
+    assert captured["native_payload"]["window_title"] == "Untitled"
+
+
+def test_focus_script_uses_robust_foreground_and_reports_focus():
+    bridge = _load_bridge_module()
+    script = bridge.FIXED_NATIVE_POWERSHELL
+
+    # Robust foreground handling that defeats the OS foreground lock.
+    for marker in (
+        "AttachThreadInput",
+        "BringWindowToTop",
+        "GetForegroundWindow",
+        "keybd_event",
+    ):
+        assert marker in script, marker
+    # Locale-invariant window matching by process-name substring.
+    assert "$_.ProcessName -like ('*' + $needle + '*')" in script
+    # The focused window's identity is reported for downstream verification.
+    for field in ("focus_pid", "focus_process", "foreground_confirmed"):
+        assert field in script, field

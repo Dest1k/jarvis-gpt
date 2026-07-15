@@ -554,6 +554,63 @@ def test_agentic_stream_corrects_mixed_tool_payload_without_leaking(monkeypatch,
     storage.close()
 
 
+def test_agentic_stream_executes_alternative_dialect_tool_call(monkeypatch, tmp_path):
+    """An operator command must run even when the model emits its tool call in an
+    OpenAI dialect (tool_calls array + stringified arguments) rather than the
+    canonical {"tool":...,"arguments":...} shape — no protocol dead-end."""
+
+    class OpenAIDialectToolThenAnswerLLM:
+        def __init__(self) -> None:
+            self.rounds = 0
+
+        async def stream_complete(self, messages, *, temperature=None, max_tokens=None, **kwargs):
+            self.rounds += 1
+            if self.rounds == 1:
+                yield LLMStreamChunk(
+                    kind="delta",
+                    content=(
+                        '{"tool_calls":[{"type":"function","function":'
+                        '{"name":"runtime.status","arguments":"{}"}}]}'
+                    ),
+                )
+            else:
+                yield LLMStreamChunk(kind="delta", content="Система в норме.")
+            yield LLMStreamChunk(kind="done", finish_reason="stop")
+
+    llm = OpenAIDialectToolThenAnswerLLM()
+    agent, storage = _agent(monkeypatch, tmp_path, llm)
+    storage.set_runtime_value("experience.autonomy_policy", {"verify_answers": False})
+    runs = []
+
+    async def fake_run(name, arguments=None, **kwargs):
+        runs.append((name, arguments))
+        return type(
+            "R", (), {"tool": name, "ok": True, "summary": "runtime ok", "data": {}}
+        )()
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+
+    async def collect():
+        deltas = []
+        done = None
+        async for item in agent.stream_chat("собери данные и ответь"):
+            if item["type"] == "delta":
+                deltas.append(item["content"])
+            elif item["type"] == "done":
+                done = item
+        return deltas, done
+
+    deltas, done = asyncio.run(collect())
+    visible = "".join(deltas)
+
+    assert runs == [("runtime.status", {})]  # the requested tool actually executed
+    assert visible == "Система в норме."
+    assert done["answer"] == "Система в норме."
+    assert "Не удалось безопасно завершить" not in visible  # no protocol dead-end
+    assert "tool_calls" not in visible and '"tool"' not in visible
+    storage.close()
+
+
 def test_agentic_stream_forced_final_tool_payload_is_safe_error(monkeypatch, tmp_path):
     class ToolEvenWhenForcedFinalLLM:
         def __init__(self) -> None:

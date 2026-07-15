@@ -4646,6 +4646,49 @@ def test_classify_rejects_raw_call_markers_and_tool_envelopes():
     assert _user_visible_answer(normal) == normal
 
 
+def test_classify_executes_alternative_tool_call_dialects():
+    """A tool the operator asked for must run even when the model speaks a
+    different tool-call dialect, instead of dead-ending as a protocol failure."""
+    from jarvis_gpt.agent import _classify_tool_turn
+
+    executable = {
+        "canonical": ('{"tool":"windows.native","arguments":{"action":"x"}}',
+                      ("windows.native", {"action": "x"})),
+        "name_key": ('{"name":"web.search","arguments":{"q":"hi"}}',
+                     ("web.search", {"q": "hi"})),
+        "openai_tool_calls": (
+            '{"tool_calls":[{"type":"function","function":'
+            '{"name":"web.search","arguments":"{\\"q\\":\\"hi\\"}"}}]}',
+            ("web.search", {"q": "hi"}),
+        ),
+        "legacy_function_call": (
+            '{"function_call":{"name":"runtime.status","arguments":"{}"}}',
+            ("runtime.status", {}),
+        ),
+        "parameters_key": ('{"tool":"cmd","parameters":{"a":1}}', ("cmd", {"a": 1})),
+        "input_key": ('{"tool":"cmd","input":{"b":2}}', ("cmd", {"b": 2})),
+        "stringified_arguments": ('{"tool":"cmd","arguments":"{\\"c\\":3}"}', ("cmd", {"c": 3})),
+        "bare_tool": ('{"tool":"runtime.status"}', ("runtime.status", {})),
+        "fenced": ('```json\n{"tool":"cmd","arguments":{}}\n```', ("cmd", {})),
+    }
+    for label, (payload, expected) in executable.items():
+        turn = _classify_tool_turn(payload)
+        assert turn.kind == "tool", (label, turn)
+        assert turn.action == expected, (label, turn.action)
+
+    # Ordinary prose, JSON data answers, and ambiguous/broken control text must
+    # never be misfired as a tool call.
+    assert _classify_tool_turn("Готово: 2+2=4.").kind == "answer"
+    assert _classify_tool_turn('{"result": 42, "note": "ok"}').kind == "answer"
+    for non_tool in (
+        "call:documents.read",
+        'call:documents.read\n{"tool":"documents.read","arguments":{}}',
+        '{"tool_calls": "not-a-list"}',
+        '{"tool":"","arguments":{}}',
+    ):
+        assert _classify_tool_turn(non_tool).kind != "tool", non_tool
+
+
 class FakeToolEnvelopeStreamingLLM:
     def __init__(self, payload: str) -> None:
         self.payload = payload

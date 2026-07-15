@@ -768,6 +768,72 @@ def test_windows_native_process_launch_requires_independent_pid_verification(
     storage.close()
 
 
+def test_windows_native_app_open_and_type_verifies_focused_window_pid(monkeypatch, tmp_path):
+    """app.open_and_type must verify the *focused* window process, whose name may
+    differ from the launched image (UWP calculator: calc.exe -> Calculator.exe)."""
+    calls = []
+
+    class FakeBridgeClient:
+        def __init__(self, _settings):
+            return None
+
+        async def action(self, *, action, payload=None, timeout_sec=30):
+            calls.append((action, payload, timeout_sec))
+            if action == "app.open_and_type":
+                return {
+                    "ok": True,
+                    "summary": "Application focused and native input sent.",
+                    "data": {
+                        "ok": True,
+                        "summary": "Application focused and native input sent.",
+                        "pid": 9999,
+                        "launch_pid": 4242,
+                        "data": {
+                            "focused": True,
+                            "focus_pid": 9999,
+                            "focus_process": "Calculator",
+                            "foreground_confirmed": True,
+                        },
+                    },
+                }
+            assert action == "wmi.query"
+            assert payload["filter"] == "ProcessId = 9999"
+            return {
+                "ok": True,
+                "summary": "WMI/CIM query returned 1 item(s).",
+                "data": {
+                    "ok": True,
+                    "summary": "WMI/CIM query returned 1 item(s).",
+                    "result": {
+                        "ok": True,
+                        "data": {"items": [{"ProcessId": 9999, "Name": "Calculator.exe"}]},
+                    },
+                },
+            }
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr("jarvis_gpt.tools.HostBridgeClient", FakeBridgeClient)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    typed = asyncio.run(
+        tools.run(
+            "windows.native",
+            {"action": "app.open_and_type", "payload": {"executable": "calc.exe", "text": "2+2="}},
+            allow_danger=True,
+        )
+    )
+
+    assert typed.ok is True
+    assert typed.data["verification"]["verified"] is True
+    assert [call[0] for call in calls] == ["app.open_and_type", "wmi.query"]
+    storage.close()
+
+
 def test_windows_native_process_start_uses_typed_empty_argv():
     payload = _validate_native_payload("process.start", {"executable": "calc.exe"})
 
