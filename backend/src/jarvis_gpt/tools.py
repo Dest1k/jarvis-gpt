@@ -3704,7 +3704,11 @@ async def _verify_native_action_state(
         # which for launcher-style apps (UWP calculator, Office shells) differs from
         # the launched image name. A live process at that PID is the independent
         # postcondition that input reached a real window; the name is advisory.
-        native_data = native.get("data") if isinstance(native.get("data"), dict) else {}
+        # The PowerShell payload is nested under native["result"]["data"].
+        native_result = native.get("result") if isinstance(native.get("result"), dict) else {}
+        native_data = (
+            native_result.get("data") if isinstance(native_result.get("data"), dict) else {}
+        )
         focus_name = str(native_data.get("focus_process") or "").casefold()
         requested = PureWindowsPath(str(payload.get("executable") or "")).name.casefold()
         expected_names = {name for name in {focus_name, f"{focus_name}.exe", requested} if name}

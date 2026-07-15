@@ -365,7 +365,7 @@ def test_process_argv_redaction_covers_split_inline_and_url_secrets():
     ]
 
 
-def test_native_actions_execute_only_the_fixed_encoded_script(monkeypatch):
+def test_native_actions_execute_only_the_fixed_script_file(monkeypatch):
     bridge = _load_bridge_module()
     captured = {}
     marker = "'; Write-Output NEVER_EXECUTE; #"
@@ -373,6 +373,11 @@ def test_native_actions_execute_only_the_fixed_encoded_script(monkeypatch):
     def fake_run(argv, **kwargs):
         captured["argv"] = argv
         captured["kwargs"] = kwargs
+        # The fixed script runs from a temp -File; read it while it still exists
+        # (cleanup happens after subprocess.run returns).
+        script_path = argv[argv.index("-File") + 1]
+        captured["script_path"] = script_path
+        captured["script"] = Path(script_path).read_text(encoding="utf-8-sig")
         native = {
             "ok": True,
             "summary": "WMI complete.",
@@ -397,27 +402,33 @@ def test_native_actions_execute_only_the_fixed_encoded_script(monkeypatch):
 
     assert status == 200
     assert result["ok"] is True
-    encoded = captured["argv"][captured["argv"].index("-EncodedCommand") + 1]
-    decoded_script = base64.b64decode(encoded).decode("utf-16-le")
-    assert decoded_script == bridge.FIXED_NATIVE_POWERSHELL
-    assert marker not in decoded_script
+    # The executed script is the fixed constant; the request marker is confined to
+    # the env payload and never appears in the script or on the command line.
+    assert "-EncodedCommand" not in captured["argv"]
+    assert captured["script"] == bridge.FIXED_NATIVE_POWERSHELL
+    assert marker not in captured["script"]
     assert marker not in " ".join(captured["argv"])
     envelope = json.loads(captured["kwargs"]["env"]["JARVIS_BRIDGE_ACTION_JSON"])
     assert envelope["payload"]["filter"] == marker
     assert captured["kwargs"].get("shell", False) is False
+    # The temp script is removed once the action completes.
+    assert not Path(captured["script_path"]).exists()
 
 
 def test_windows_powershell_fixed_invocation_uses_sta_and_no_bypass():
     bridge = _load_bridge_module()
 
     command = bridge.powershell_command(
-        r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+        r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+        r"C:\Users\Admin\AppData\Local\Temp\jarvis-native-xyz.ps1",
     )
 
     assert "-STA" in command
     assert "-NonInteractive" in command
     assert "Bypass" not in command
-    assert "-EncodedCommand" in command
+    assert "-File" in command
+    assert command[-1].endswith(".ps1")
+    assert "-EncodedCommand" not in command
     assert "-Command" not in command
 
 
@@ -540,16 +551,23 @@ def test_app_open_and_type_injects_focus_hint_and_prefers_focused_pid(monkeypatc
     def fake_native(action, native_payload, timeout_sec):
         captured["action"] = action
         captured["native_payload"] = native_payload
+        # Mirror _run_fixed_native_action, which nests the PowerShell output under
+        # "result".
         return {
             "ok": True,
             "action": action,
             "summary": "Application focused and native input sent.",
-            "data": {
-                "focused": True,
-                "pid": 4242,
-                "focus_pid": 9999,
-                "focus_process": "Calculator",
-                "foreground_confirmed": True,
+            "result": {
+                "ok": True,
+                "action": action,
+                "summary": "Application focused and native input sent.",
+                "data": {
+                    "focused": True,
+                    "pid": 4242,
+                    "focus_pid": 9999,
+                    "focus_process": "Calculator",
+                    "foreground_confirmed": True,
+                },
             },
         }
 
@@ -613,6 +631,10 @@ def test_focus_script_uses_robust_foreground_and_reports_focus():
         assert marker in script, marker
     # Locale-invariant window matching by process-name substring.
     assert "$_.ProcessName -like ('*' + $needle + '*')" in script
+    # UWP apps host their window in ApplicationFrameHost; the frame is resolved by
+    # PID through the child CoreWindow rather than the app's own (zero) handle.
+    for marker in ("FindTopWindowForPid", "Windows.UI.Core.CoreWindow", "EnumWindows"):
+        assert marker in script, marker
     # The focused window's identity is reported for downstream verification.
     for field in ("focus_pid", "focus_process", "foreground_confirmed"):
         assert field in script, field

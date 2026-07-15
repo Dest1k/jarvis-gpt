@@ -785,14 +785,22 @@ def test_windows_native_app_open_and_type_verifies_focused_window_pid(monkeypatc
                     "summary": "Application focused and native input sent.",
                     "data": {
                         "ok": True,
+                        "action": "app.open_and_type",
                         "summary": "Application focused and native input sent.",
                         "pid": 9999,
                         "launch_pid": 4242,
-                        "data": {
-                            "focused": True,
-                            "focus_pid": 9999,
-                            "focus_process": "Calculator",
-                            "foreground_confirmed": True,
+                        # Real bridge nests the PowerShell payload under "result".
+                        "result": {
+                            "ok": True,
+                            "summary": "Application focused and native input sent.",
+                            "action": "app.open_and_type",
+                            "data": {
+                                "focused": True,
+                                "pid": 4242,
+                                "focus_pid": 9999,
+                                "focus_process": "Calculator",
+                                "foreground_confirmed": True,
+                            },
                         },
                     },
                 }

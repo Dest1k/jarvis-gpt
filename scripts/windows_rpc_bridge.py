@@ -308,7 +308,9 @@ def execute_action(request: dict[str, Any]) -> tuple[dict[str, Any], int]:
             result["launch_pid"] = process_result["pid"]
             # Prefer the actually-focused window's PID for downstream state
             # verification; fall back to the launch PID for classic Win32 apps.
-            native_data = result.get("data")
+            # The PowerShell output is nested under result["result"]["data"].
+            native = result.get("result")
+            native_data = native.get("data") if isinstance(native, dict) else None
             focus_pid = (
                 native_data.get("focus_pid") if isinstance(native_data, dict) else None
             )
@@ -717,6 +719,7 @@ try {
   Add-Type -AssemblyName System.Drawing
   Add-Type @'
 using System;
+using System.Text;
 using System.Runtime.InteropServices;
 public static class JarvisBridgeWinApi {
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
@@ -724,11 +727,53 @@ public static class JarvisBridgeWinApi {
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int command);
   [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);
   [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
   [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
   [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
   [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindowEx(IntPtr parent, IntPtr child, string cls, string title);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder buffer, int max);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowTextLength(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
+  public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+  // Resolve the visible top-level window for a process. Handles UWP apps whose
+  // frame is hosted by ApplicationFrameHost.exe: the real app PID lives on a child
+  // "Windows.UI.Core.CoreWindow", so a plain PID/MainWindowHandle lookup misses it.
+  public static IntPtr FindTopWindowForPid(uint targetPid) {
+    IntPtr result = IntPtr.Zero;
+    EnumWindows((h, l) => {
+      if (!IsWindowVisible(h)) return true;
+      uint wpid; GetWindowThreadProcessId(h, out wpid);
+      if (wpid == targetPid) { result = h; return false; }
+      IntPtr core = FindWindowEx(h, IntPtr.Zero, "Windows.UI.Core.CoreWindow", null);
+      if (core != IntPtr.Zero) {
+        uint cpid; GetWindowThreadProcessId(core, out cpid);
+        if (cpid == targetPid) { result = h; return false; }
+      }
+      return true;
+    }, IntPtr.Zero);
+    return result;
+  }
+
+  // Find a visible top-level window whose title contains the needle (case-insensitive).
+  public static IntPtr FindTopWindowByTitle(string needle) {
+    IntPtr result = IntPtr.Zero;
+    string lowered = (needle ?? "").ToLowerInvariant();
+    if (lowered.Length == 0) return result;
+    EnumWindows((h, l) => {
+      if (!IsWindowVisible(h)) return true;
+      int length = GetWindowTextLength(h);
+      if (length <= 0) return true;
+      StringBuilder buffer = new StringBuilder(length + 1);
+      GetWindowText(h, buffer, buffer.Capacity);
+      if (buffer.ToString().ToLowerInvariant().Contains(lowered)) { result = h; return false; }
+      return true;
+    }, IntPtr.Zero);
+    return result;
+  }
 }
 '@
 
@@ -736,30 +781,36 @@ public static class JarvisBridgeWinApi {
   $script:LastFocusName = ''
   $script:LastForegroundConfirmed = $false
 
-  function FindWindowProcess($ProcessId, $ProcessName, $WindowTitle) {
+  function ResolveTargetWindow($ProcessId, $ProcessName, $WindowTitle) {
+    # Returns @{ Handle; Pid; Name } for a focusable top-level window, or $null.
+    # Candidate processes are matched even when their own MainWindowHandle is 0
+    # (UWP apps host their window in ApplicationFrameHost), then the real frame
+    # window is resolved by PID via WinAPI.
+    $candidates = @()
     if ([int64]$ProcessId -gt 0) {
-      $candidate = Get-Process -Id ([int]$ProcessId) -ErrorAction SilentlyContinue
-      if ($candidate -and $candidate.MainWindowHandle -ne 0) { return $candidate }
+      $byId = Get-Process -Id ([int]$ProcessId) -ErrorAction SilentlyContinue
+      if ($byId) { $candidates += $byId }
     }
-    # Launcher-style apps (UWP calculator, Office) rename the visible-window
-    # process, so match the requested name as a locale-invariant substring rather
-    # than requiring an exact, still-alive image name. Prefer the newest window.
     if ($ProcessName) {
       $needle = ([string]$ProcessName) -replace '\.exe$', ''
-      $candidate = Get-Process -ErrorAction SilentlyContinue |
-        Where-Object { $_.MainWindowHandle -ne 0 -and $_.ProcessName -like ('*' + $needle + '*') } |
-        Sort-Object { try { $_.StartTime.Ticks } catch { 0 } } -Descending |
-        Select-Object -First 1
-      if ($candidate) { return $candidate }
+      $candidates += Get-Process -ErrorAction SilentlyContinue |
+        Where-Object { $_.ProcessName -like ('*' + $needle + '*') } |
+        Sort-Object { try { $_.StartTime.Ticks } catch { 0 } } -Descending
+    }
+    foreach ($proc in $candidates) {
+      $handle = [JarvisBridgeWinApi]::FindTopWindowForPid([uint32]$proc.Id)
+      if ($handle -ne [IntPtr]::Zero) {
+        return @{ Handle = $handle; Pid = [int]$proc.Id; Name = [string]$proc.ProcessName }
+      }
     }
     if ($WindowTitle) {
-      return Get-Process -ErrorAction SilentlyContinue |
-        Where-Object {
-          $_.MainWindowHandle -ne 0 -and
-          $_.MainWindowTitle -like ('*' + [string]$WindowTitle + '*')
-        } |
-        Sort-Object { try { $_.StartTime.Ticks } catch { 0 } } -Descending |
-        Select-Object -First 1
+      $handle = [JarvisBridgeWinApi]::FindTopWindowByTitle([string]$WindowTitle)
+      if ($handle -ne [IntPtr]::Zero) {
+        $wpid = [uint32]0
+        [void][JarvisBridgeWinApi]::GetWindowThreadProcessId($handle, [ref]$wpid)
+        $name = (Get-Process -Id ([int]$wpid) -ErrorAction SilentlyContinue).ProcessName
+        return @{ Handle = $handle; Pid = [int]$wpid; Name = [string]$name }
+      }
     }
     return $null
   }
@@ -799,19 +850,21 @@ public static class JarvisBridgeWinApi {
     $script:LastFocusPid = 0
     $script:LastFocusName = ''
     $script:LastForegroundConfirmed = $false
-    for ($attempt = 0; $attempt -lt 16; $attempt++) {
-      $process = FindWindowProcess $ProcessId $ProcessName $WindowTitle
-      if ($process) {
-        $handle = $process.MainWindowHandle
-        $script:LastFocusPid = [int]$process.Id
-        $script:LastFocusName = [string]$process.ProcessName
+    # Retry generously: a freshly launched UWP app can take a couple of seconds to
+    # register its ApplicationFrameHost window.
+    for ($attempt = 0; $attempt -lt 20; $attempt++) {
+      $target = ResolveTargetWindow $ProcessId $ProcessName $WindowTitle
+      if ($target) {
+        $handle = $target.Handle
+        $script:LastFocusPid = $target.Pid
+        $script:LastFocusName = $target.Name
         ForceForeground $handle
         Start-Sleep -Milliseconds 140
         $confirmed = ([JarvisBridgeWinApi]::GetForegroundWindow() -eq $handle)
         $script:LastForegroundConfirmed = $confirmed
         # Return as soon as the window is verifiably in front; after a few
         # attempts accept the located+raised window so input still lands.
-        if ($confirmed -or $attempt -ge 3) { return $true }
+        if ($confirmed -or $attempt -ge 4) { return $true }
       }
       Start-Sleep -Milliseconds 220
     }
@@ -1057,17 +1110,26 @@ def _run_fixed_native_action(
         separators=(",", ":"),
     )
     creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-    completed = subprocess.run(  # noqa: S603 - the fixed script contains no request text
-        powershell_command(powershell),
-        capture_output=True,
-        encoding="utf-8",
-        errors="replace",
-        text=True,
-        timeout=timeout_sec,
-        check=False,
-        env=env,
-        creationflags=creationflags,
-    )
+    # The fixed script outgrew -EncodedCommand's command-line length limit, so it
+    # runs from a temp file whose content is the constant FIXED_NATIVE_POWERSHELL.
+    # The per-request payload still travels only in JARVIS_BRIDGE_ACTION_JSON, so no
+    # request text ever reaches the command line or the executed script.
+    script_path = _materialize_fixed_native_script()
+    try:
+        completed = subprocess.run(  # noqa: S603 - the fixed script contains no request text
+            powershell_command(powershell, script_path),
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            text=True,
+            timeout=timeout_sec,
+            check=False,
+            env=env,
+            creationflags=creationflags,
+        )
+    finally:
+        with suppress(OSError):
+            os.unlink(script_path)
     native = _parse_native_result(completed.stdout)
     stdout, stdout_truncated = trim_output(completed.stdout)
     stderr, stderr_truncated = trim_output(completed.stderr)
@@ -1093,15 +1155,32 @@ def powershell_path() -> str | None:
     return shutil.which("powershell.exe") or shutil.which("pwsh")
 
 
-def powershell_command(powershell: str) -> list[str]:
-    encoded = base64.b64encode(FIXED_NATIVE_POWERSHELL.encode("utf-16-le")).decode("ascii")
+def _materialize_fixed_native_script() -> str:
+    """Write the constant fixed native script to a fresh temp .ps1 and return its path.
+
+    Content is always FIXED_NATIVE_POWERSHELL — never request text — so running it
+    with -File carries the same guarantee as the former -EncodedCommand path.
+    """
+
+    handle, path = tempfile.mkstemp(prefix="jarvis-native-", suffix=".ps1")
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8-sig") as stream:
+            stream.write(FIXED_NATIVE_POWERSHELL)
+    except OSError:
+        with suppress(OSError):
+            os.unlink(path)
+        raise
+    return path
+
+
+def powershell_command(powershell: str, script_path: str) -> list[str]:
     executable = PureWindowsPath(powershell).name.lower() or Path(powershell).name.lower()
     args = [powershell, "-NoLogo", "-NoProfile"]
     if executable == "powershell.exe":
         args.extend(["-STA", "-NonInteractive", "-ExecutionPolicy", "RemoteSigned"])
     else:
         args.append("-NonInteractive")
-    args.extend(["-EncodedCommand", encoded])
+    args.extend(["-File", script_path])
     return args
 
 
