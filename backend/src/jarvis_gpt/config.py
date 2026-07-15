@@ -275,6 +275,7 @@ class JarvisSettings:
     embeddings_enabled: bool
     embeddings_base_url: str
     embeddings_model: str
+    operator_full_autonomy: bool
     autonomy_enabled: bool
     telemetry_interval_sec: int
     health_interval_sec: int
@@ -317,6 +318,9 @@ class JarvisSettings:
                 "enabled": self.embeddings_enabled,
                 "base_url": self.embeddings_base_url,
                 "model": self.embeddings_model,
+            },
+            "permissions": {
+                "operator_full_autonomy": self.operator_full_autonomy,
             },
             "autonomy": {
                 "enabled": self.autonomy_enabled,
@@ -375,6 +379,12 @@ def load_settings(profile_name: str | None = None) -> JarvisSettings:
             os.environ.get("JARVIS_LLM_BASE_URL", "http://localhost:8001/v1"),
         ).rstrip("/"),
         embeddings_model=os.environ.get("JARVIS_EMBEDDINGS_MODEL", ""),
+        # When enabled (default), any tool whose capability scope the operator
+        # explicitly named in the current turn runs immediately under an
+        # operator-turn authorization instead of raising an approval gate.
+        # Set JARVIS_OPERATOR_FULL_AUTONOMY=0 to restore strict exact-operand
+        # matching where only narrowly recognized argument shapes auto-run.
+        operator_full_autonomy=_bool_env("JARVIS_OPERATOR_FULL_AUTONOMY", True),
         autonomy_enabled=_bool_env("JARVIS_AUTONOMY_ENABLED", True),
         telemetry_interval_sec=_int_env("JARVIS_TELEMETRY_INTERVAL_SEC", 120),
         health_interval_sec=_int_env("JARVIS_HEALTH_INTERVAL_SEC", 300),

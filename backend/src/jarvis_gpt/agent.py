@@ -3220,6 +3220,7 @@ class AgentRuntime:
             arguments,
             message=context.operator_message or "",
             scopes=context.operator_scopes,
+            full_autonomy=self.settings.operator_full_autonomy,
         ):
             return None
         effect_key = _operator_effect_key(tool_name, arguments)
@@ -6585,6 +6586,7 @@ class AgentRuntime:
                 args,
                 message=context.operator_message or "",
                 scopes=context.operator_scopes,
+                full_autonomy=self.settings.operator_full_autonomy,
             )
         ):
             effect_key = _operator_effect_key(name, args)
@@ -13657,8 +13659,15 @@ def _wiki_article_url(title: str) -> str:
     return "https://ru.wikipedia.org/wiki/" + title.replace(" ", "_")
 
 
-_OPERATOR_COMMAND_RE = re.compile(
-    r"^\s*(?:(?:jarvis|джарвис|please|пожалуйста|прошу|теперь|а\s+теперь)\s*[,,:-]?\s*)*"
+# Leading conversational fillers/interjections the operator may prepend to a
+# command ("а открой…", "ну давай запусти…", "ok, open…").  They carry no
+# intent of their own and must not defeat command recognition.
+_OPERATOR_COMMAND_FILLER = (
+    r"(?:jarvis|джарвис|please|пожалуйста|прошу|слушай|слушай-ка|давай|давай-ка|"
+    r"ну|ну-ка|ок|окей|окей-ка|hey|hi|so|well|yo|ладно|так|короче|вот|эй|э|о|"
+    r"а|и|же|теперь|а\s+теперь|а\s+ну|а\s+давай)"
+)
+_OPERATOR_COMMAND_VERB = (
     r"(?:открой|перейди|зайди|создай|сделай|запиши|сохрани|добавь|измени|исправь|"
     r"обнови|замени|отредактируй|удали|сотри|очисти|скопируй|перемести|перенеси|"
     r"переименуй|запусти|выполни|установи|включи|перезапусти|останови|закрой|"
@@ -13667,7 +13676,18 @@ _OPERATOR_COMMAND_RE = re.compile(
     r"open|navigate|go\s+to|create|make|write|save|append|add|modify|change|edit|"
     r"update|set|replace|delete|remove|erase|clear|copy|move|rename|run|execute|"
     r"launch|start|install|enable|restart|stop|close|disable|terminate|kill|focus|"
-    r"click|press|type|enter|fill|select|choose|scroll|capture|take|show|check)\b",
+    r"click|press|type|enter|fill|select|choose|scroll|capture|take|show|check)"
+)
+# A command verb no longer has to be the very first token: the operator can lead
+# with fillers and/or the object ("консоль открой…", "а калькулятор запусти…").
+# We still anchor near the start (a small non-verb lead-in) so narrative prose
+# with a verb buried deep in the sentence is not misread as an imperative, and
+# the meta/retraction guards in _operator_action_scopes still take precedence.
+_OPERATOR_COMMAND_RE = re.compile(
+    r"^\s*"
+    rf"(?:{_OPERATOR_COMMAND_FILLER}\b[\s,;:.\-]*)*"
+    r"(?:\S+\s+){0,3}?"
+    rf"{_OPERATOR_COMMAND_VERB}\b",
     re.IGNORECASE,
 )
 _OPERATOR_POLITE_COMMAND_RE = re.compile(
@@ -13838,9 +13858,18 @@ def _operator_tool_arguments_match(
     *,
     message: str,
     scopes: frozenset[str],
+    full_autonomy: bool = False,
 ) -> bool:
     if not isinstance(args, dict) or "explicit" not in scopes:
         return False
+    # Full operator autonomy: an explicit command authorizes any tool whose
+    # capability scope the operator actually named this turn, without demanding
+    # that the model reproduce an exact pre-registered argument shape.  The
+    # scope check is the safety boundary — a tool outside the requested scopes
+    # (e.g. a filesystem write during a read-only "look at…" turn) is still not
+    # authorized here and falls through to the approval gate.
+    if full_autonomy and name in _operator_requested_tool_names(scopes):
+        return True
     if name == "browser.open":
         if set(args) != {"url"}:
             return False

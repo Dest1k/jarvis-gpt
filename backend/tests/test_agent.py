@@ -257,6 +257,117 @@ def test_operator_gui_and_browser_authority_rejects_extra_operands():
     )
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        "а открой калькулятор и посчитай там что-нибудь",
+        "а консоль открой с топ 10 процессов",
+        "консоль открой с топ 10 процессов",
+        "ну давай запусти блокнот",
+        "ok, open the calculator",
+    ],
+)
+def test_operator_command_survives_leading_filler_and_word_order(message):
+    """Conversational lead-ins and object-verb inversion still read as commands."""
+    scopes = _operator_action_scopes(message)
+    assert "explicit" in scopes
+    assert "native" in scopes
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "how do I open the calculator?",
+        "объясни как открыть калькулятор",
+        "не открывай калькулятор",
+        "расскажи про блокнот",
+    ],
+)
+def test_questions_and_retractions_are_not_operator_commands(message):
+    assert _operator_action_scopes(message) == frozenset()
+
+
+def test_full_autonomy_authorizes_scope_matched_tool_without_exact_operands():
+    """Full autonomy runs any tool whose scope the operator named, loose args ok."""
+    message = "а консоль открой с топ 10 процессов"
+    scopes = _operator_action_scopes(message)
+    # A process view the strict operand matcher would reject (extra sort field,
+    # non-canonical shape) is authorized once full autonomy is on.
+    loose_args = {
+        "action": "console.show_processes",
+        "payload": {"limit": 10, "sort": "cpu", "extra": "whatever"},
+        "timeout_sec": 30,
+    }
+    assert not _operator_tool_arguments_match(
+        "windows.native", loose_args, message=message, scopes=scopes
+    )
+    assert _operator_tool_arguments_match(
+        "windows.native",
+        loose_args,
+        message=message,
+        scopes=scopes,
+        full_autonomy=True,
+    )
+
+
+def test_full_autonomy_still_rejects_tool_outside_requested_scope():
+    """Full autonomy never authorizes a tool whose scope was not requested."""
+    message = "посмотри топ 3 процессов по памяти"
+    scopes = _operator_action_scopes(message)
+    # A read-only inspection turn must not authorize a filesystem mutation tool
+    # even under full autonomy — that scope was never named.
+    write_args = {
+        "payload": {
+            "protocol": "jarvis.execution.v1",
+            "action": {
+                "kind": "fs.write",
+                "path": "C:/tmp/should-not-run.txt",
+                "content_base64": "aGk=",
+            },
+        }
+    }
+    assert not _operator_tool_arguments_match(
+        "execution.apply",
+        write_args,
+        message=message,
+        scopes=scopes,
+        full_autonomy=True,
+    )
+
+
+def test_full_autonomy_runs_explicit_native_command_without_approval(monkeypatch, tmp_path):
+    """The screenshot scenario: filler-led explicit commands execute, no approval."""
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        "jarvis_gpt.host_bridge.HostBridgeClient.action",
+        _verified_host_action(calls),
+    )
+
+    for message in ("а открой калькулятор", "консоль открой с топ 10 процессов"):
+        response = asyncio.run(agent.chat(message))
+        assert all(event.type != "approval" for event in response.events), message
+
+    # No approval was ever raised, and both explicit commands reached the host
+    # tool directly instead of being parked behind an apr_ gate.
+    assert storage.list_approvals(limit=10) == []
+    native_runs = [run for run in storage.list_tool_runs() if run["tool"] == "windows.native"]
+    assert len(native_runs) == 2
+    dispatched = {call["action"] for call in calls}
+    assert "process.start" in dispatched
+    assert "console.show_processes" in dispatched
+    storage.close()
+
+
+def test_full_autonomy_can_be_disabled_by_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_OPERATOR_FULL_AUTONOMY", "0")
+    settings = load_settings()
+    assert settings.operator_full_autonomy is False
+    monkeypatch.setenv("JARVIS_OPERATOR_FULL_AUTONOMY", "1")
+    assert load_settings().operator_full_autonomy is True
+
+
 def test_agent_creates_mission_from_large_goal(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
