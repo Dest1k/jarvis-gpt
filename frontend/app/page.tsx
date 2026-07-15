@@ -1761,6 +1761,7 @@ export default function CommandCenter() {
   const [chatBusy, setChatBusy] = useState(false);
   const [chatTicker, setChatTicker] = useState(Date.now());
   const [chatFiles, setChatFiles] = useState<File[]>([]);
+  const [chatDragActive, setChatDragActive] = useState(false);
   const [thinkingEnabled, setThinkingEnabled] = useState(true);
   const [dispatcherBusy, setDispatcherBusy] = useState(false);
   const [cleanupBusy, setCleanupBusy] = useState(false);
@@ -1770,6 +1771,8 @@ export default function CommandCenter() {
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const voiceBaseInputRef = useRef("");
   const chatFileInputRef = useRef<HTMLInputElement | null>(null);
+  const chatDropRef = useRef<HTMLFormElement | null>(null);
+  const addChatFilesRef = useRef<(files: FileList | null) => void>(() => {});
   const chatPanelRef = useRef<HTMLElement | null>(null);
   const transcriptRef = useRef<HTMLDivElement | null>(null);
   const transcriptShouldStickRef = useRef(true);
@@ -1803,6 +1806,53 @@ export default function CommandCenter() {
 
   const updateChatWindow = useCallback((id: string, updater: (window: ChatWindow) => ChatWindow) => {
     setChatWindows((current) => current.map((window) => (window.id === id ? updater(window) : window)));
+  }, []);
+
+  // Native drag-and-drop of files into the chat. Without an explicit
+  // preventDefault on dragover/drop, the browser handles the drop itself and
+  // "downloads"/navigates to the file instead of attaching it. We stop that
+  // globally (so a near-miss drop never navigates the app away) and, when the
+  // drop lands on the composer, attach the files through the same path as the
+  // paperclip button.
+  useEffect(() => {
+    function dragHasFiles(event: DragEvent) {
+      const types = event.dataTransfer?.types;
+      return types ? Array.from(types).includes("Files") : false;
+    }
+    function inDropZone(target: EventTarget | null) {
+      // Accept a drop anywhere over the chat panel (transcript or composer); the
+      // composer highlights to show where the files will be attached.
+      const zone = chatPanelRef.current ?? chatDropRef.current;
+      return Boolean(zone && target instanceof Node && zone.contains(target));
+    }
+    function handleDragOver(event: DragEvent) {
+      if (!dragHasFiles(event)) return;
+      event.preventDefault();
+      const inside = inDropZone(event.target);
+      if (event.dataTransfer) event.dataTransfer.dropEffect = inside ? "copy" : "none";
+      setChatDragActive(inside);
+    }
+    function handleDrop(event: DragEvent) {
+      if (!dragHasFiles(event)) return;
+      event.preventDefault();
+      setChatDragActive(false);
+      if (inDropZone(event.target) && event.dataTransfer?.files?.length) {
+        addChatFilesRef.current(event.dataTransfer.files);
+      }
+    }
+    function handleDragEnd() {
+      setChatDragActive(false);
+    }
+    window.addEventListener("dragover", handleDragOver);
+    window.addEventListener("drop", handleDrop);
+    window.addEventListener("dragend", handleDragEnd);
+    window.addEventListener("dragleave", handleDragEnd);
+    return () => {
+      window.removeEventListener("dragover", handleDragOver);
+      window.removeEventListener("drop", handleDrop);
+      window.removeEventListener("dragend", handleDragEnd);
+      window.removeEventListener("dragleave", handleDragEnd);
+    };
   }, []);
 
   const updateActiveChatWindow = useCallback(
@@ -2367,6 +2417,9 @@ export default function CommandCenter() {
       return merged.slice(0, 8);
     });
   }
+
+  // Keep the window drag-and-drop handler pointed at the latest addChatFiles.
+  addChatFilesRef.current = addChatFiles;
 
   function removeChatFile(index: number) {
     setChatFiles((current) => current.filter((_, itemIndex) => itemIndex !== index));
@@ -4689,7 +4742,17 @@ export default function CommandCenter() {
                 );
               })}
             </div>
-            <form className="composer" onSubmit={sendChat}>
+            <form
+              className={`composer${chatDragActive ? " dragActive" : ""}`}
+              ref={chatDropRef}
+              onSubmit={sendChat}
+            >
+              {chatDragActive && (
+                <div className="composerDropHint" aria-hidden="true">
+                  <Upload size={18} />
+                  <span>Отпустите файлы, чтобы прикрепить к сообщению</span>
+                </div>
+              )}
               <div className="composerMain">
                 {chatFiles.length > 0 && (
                   <div className="composerAttachments">

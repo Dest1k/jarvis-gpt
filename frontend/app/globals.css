@@ -1577,6 +1577,34 @@ h3 {
   box-shadow: 0 0 0 3px rgba(64, 215, 196, 0.16);
 }
 
+.composer {
+  position: relative;
+}
+
+.composer.dragActive {
+  outline: 2px dashed var(--chat-accent, #40d7c4);
+  outline-offset: -6px;
+  background: rgba(64, 215, 196, 0.06);
+}
+
+.composerDropHint {
+  position: absolute;
+  inset: 6px;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  border-radius: var(--radius, 10px);
+  background: rgba(10, 20, 18, 0.86);
+  color: var(--chat-text, #e7f2ef);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  pointer-events: none;
+  backdrop-filter: blur(2px);
+}
+
 .attachButton,
 .thinkingButton {
   display: grid;
