@@ -368,6 +368,62 @@ def test_full_autonomy_can_be_disabled_by_env(monkeypatch, tmp_path):
     assert load_settings().operator_full_autonomy is True
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        "посчитай 2+2 в калькуляторе",
+        "в калькуляторе посчитай 2+2",
+        "вычисли 15*3 в калькуляторе",
+        "а в калькуляторе то посчитаешь?",
+        "можешь посчитать 2+2 в калькуляторе",
+        "откроешь блокнот?",
+        "запустишь калькулятор?",
+    ],
+)
+def test_calculation_and_question_forms_grant_native_authority(message):
+    """Compute verbs and 2nd-person request forms authorize the native app tool."""
+    from jarvis_gpt.agent import _operator_requested_tool_names
+
+    scopes = _operator_action_scopes(message)
+    assert "explicit" in scopes
+    assert "windows.native" in _operator_requested_tool_names(scopes)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "не открывай калькулятор",
+        "не запускай блокнот",
+        "не посчитаешь ли ты мои убытки сам",
+        "don't open the calculator",
+    ],
+)
+def test_negated_requests_are_not_operator_commands(message):
+    assert _operator_action_scopes(message) == frozenset()
+
+
+def test_calculator_followup_computes_without_approval(monkeypatch, tmp_path):
+    """Screenshot regression: the calculator follow-up must not fabricate an approval."""
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        "jarvis_gpt.host_bridge.HostBridgeClient.action",
+        _verified_host_action(calls),
+    )
+
+    for message in (
+        "открой калькулятор",
+        "а в калькуляторе то посчитаешь 2+2?",
+    ):
+        response = asyncio.run(agent.chat(message))
+        assert all(event.type != "approval" for event in response.events), message
+
+    assert storage.list_approvals(limit=10) == []
+    native_runs = [run for run in storage.list_tool_runs() if run["tool"] == "windows.native"]
+    assert len(native_runs) == 2
+    storage.close()
+
+
 def test_agent_creates_mission_from_large_goal(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")

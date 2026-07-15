@@ -13673,6 +13673,14 @@ _OPERATOR_COMMAND_VERB = (
     r"переименуй|запусти|выполни|установи|включи|перезапусти|останови|закрой|"
     r"выключи|заверши|активируй|сфокусируй|нажми|кликни|введи|набери|напечатай|"
     r"напиши|заполни|выбери|прокрути|сними|посмотри|покажи|проверь|"
+    # Calculation/math verbs (imperative, infinitive and 2nd-person forms).
+    r"посчита\w*|подсчита\w*|сосчита\w*|вычисл\w*|высчита\w*|сложи|сложить|"
+    r"прибав\w*|вычт\w*|отними|отнять|умнож\w*|помнож\w*|раздели|разделить|"
+    r"подели|поделить|возвед\w*|calculate|compute|evaluate|"
+    # 2nd-person future request forms ("откроешь?", "запустишь?", "посчитаешь?").
+    r"откроешь|перейдёшь|перейдешь|запустишь|выполнишь|покажешь|посмотришь|"
+    r"сделаешь|создашь|напишешь|наберёшь|наберешь|введёшь|введешь|включишь|"
+    r"выключишь|закроешь|переключишь\w*|проверишь|"
     r"open|navigate|go\s+to|create|make|write|save|append|add|modify|change|edit|"
     r"update|set|replace|delete|remove|erase|clear|copy|move|rename|run|execute|"
     r"launch|start|install|enable|restart|stop|close|disable|terminate|kill|focus|"
@@ -13695,7 +13703,18 @@ _OPERATOR_POLITE_COMMAND_RE = re.compile(
     r"(?:please\s+|пожалуйста\s+)?"
     r"(?:открыть|создать|записать|сохранить|изменить|удалить|скопировать|"
     r"переместить|запустить|выполнить|остановить|нажать|ввести|выбрать|"
-    r"open|create|write|save|change|delete|copy|move|run|start|stop|click|type|select)\b",
+    r"посчитать|подсчитать|сосчитать|вычислить|сложить|умножить|разделить|"
+    r"open|create|write|save|change|delete|copy|move|run|start|stop|click|type|"
+    r"select|calculate|compute)\b",
+    re.IGNORECASE,
+)
+# A leading negation turns an otherwise-imperative sentence into a refusal
+# request ("не открывай…", "don't open…").  The command grammar allows a short
+# lead-in before the verb, so negation must be rejected explicitly instead of
+# relying on the verb simply not being the first token.
+_OPERATOR_NEGATION_RE = re.compile(
+    r"^\s*(?:jarvis|джарвис|please|пожалуйста|прошу)?[\s,;:.\-]*"
+    r"(?:не|ни|don't|do\s+not|never)\b",
     re.IGNORECASE,
 )
 _OPERATOR_META_RE = re.compile(
@@ -13737,6 +13756,7 @@ def _operator_action_scopes(message: str) -> frozenset[str]:
         not structural
         or _OPERATOR_META_RE.search(structural)
         or _OPERATOR_RETRACTION_RE.search(structural)
+        or _OPERATOR_NEGATION_RE.search(structural)
         or not (
             _OPERATOR_COMMAND_RE.search(structural)
             or _OPERATOR_POLITE_COMMAND_RE.search(structural)
@@ -13746,9 +13766,10 @@ def _operator_action_scopes(message: str) -> frozenset[str]:
         return frozenset()
     scopes: set[str] = {"explicit"}
     groups = {
-        "open": r"\b(?:открой|открыть|перейди|зайди|open|navigate|go\s+to)\b",
-        "create": r"\b(?:создай|создать|сделай|create|make)\b",
-        "write": r"\b(?:запиши|сохрани|добавь|напиши|write|save|append|add)\b",
+        "open": r"\b(?:открой|открыть|откроешь|перейди|перейдёшь|перейдешь|зайди|"
+        r"зайдёшь|зайдешь|open|navigate|go\s+to)\b",
+        "create": r"\b(?:создай|создать|создашь|сделай|сделаешь|create|make)\b",
+        "write": r"\b(?:запиши|сохрани|добавь|напиши|напишешь|write|save|append|add)\b",
         "modify": (
             r"\b(?:измени|исправь|обнови|замени|отредактируй|modify|change|edit|"
             r"update|set|replace)\b"
@@ -13757,16 +13778,27 @@ def _operator_action_scopes(message: str) -> frozenset[str]:
         "copy": r"\b(?:скопируй|copy)\b",
         "move": r"\b(?:перемести|перенеси|переименуй|move|rename)\b",
         "execute": (
-            r"\b(?:запусти|выполни|установи|включи|перезапусти|run|execute|launch|"
+            r"\b(?:запусти|запустишь|выполни|выполнишь|установи|включи|включишь|"
+            r"перезапусти|переключишь\w*|run|execute|launch|"
             r"start|install|enable|restart)\b"
         ),
-        "stop": r"\b(?:останови|закрой|выключи|заверши|stop|close|disable|terminate|kill)\b",
+        "stop": r"\b(?:останови|закрой|закроешь|выключи|выключишь|заверши|stop|close|"
+        r"disable|terminate|kill)\b",
         "focus": r"\b(?:активируй|сфокусируй|focus)\b",
         "click": r"\b(?:нажми|кликни|click|press)\b",
-        "type": r"\b(?:введи|набери|напечатай|напиши|заполни|type|enter|fill|write)\b",
+        "type": (
+            r"\b(?:введи|введёшь|введешь|набери|наберёшь|наберешь|напечатай|напиши|"
+            r"напишешь|заполни|type|enter|fill|write|"
+            # Calculator/compute input is delivered as keystrokes, so math verbs
+            # authorize the same native typing capability.
+            r"посчита\w*|подсчита\w*|сосчита\w*|вычисл\w*|высчита\w*|сложи|сложить|"
+            r"прибав\w*|вычт\w*|отними|отнять|умнож\w*|помнож\w*|раздели|разделить|"
+            r"подели|поделить|возвед\w*|calculate|compute|evaluate)\b"
+        ),
         "select": r"\b(?:выбери|select|choose)\b",
         "scroll": r"\b(?:прокрути|scroll)\b",
-        "capture": r"\b(?:сними|посмотри|скриншот|снимок\s+экрана|capture|screenshot|take)\b",
+        "capture": r"\b(?:сними|посмотри|посмотришь|покажешь|скриншот|снимок\s+экрана|"
+        r"capture|screenshot|take)\b",
     }
     for scope, pattern in groups.items():
         if re.search(pattern, structural, re.IGNORECASE):
@@ -14545,12 +14577,15 @@ def _native_action_from_message(
         (
             "открой",
             "открыть",
+            "откроешь",
             "запусти",
             "запустить",
+            "запустишь",
             "перейди",
             "open",
             "start",
-            "посчитай",
+            "посчита",
+            "вычисл",
         ),
     )
     if typed_text and app is None and _has_explicit_typing_target(normalized):
@@ -14576,7 +14611,18 @@ def _native_action_from_message(
         return None
     wants_typing = typed_text or _contains_any(
         normalized,
-        ("набери", "введи", "напечат", "посчитай", "посчитать", "type", "write"),
+        (
+            "набери",
+            "введи",
+            "напечат",
+            "посчита",
+            "подсчита",
+            "сосчита",
+            "вычисл",
+            "высчита",
+            "type",
+            "write",
+        ),
     )
     typing_is_targeted = wants_open or _has_explicit_app_typing_target(normalized, markers)
     if not wants_open and not (wants_typing and typing_is_targeted):
