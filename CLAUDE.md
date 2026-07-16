@@ -30,16 +30,25 @@ and after a change rather than assuming a red test is a new regression.
 
 ## Operator permissions / autonomy
 
-- An explicit "do X / open X" command in the operator's current turn is treated
-  as authorization only when the tool-specific matcher proves the exact operands;
-  that exact deterministic action may then run without another approval.
-  The deprecated `JARVIS_OPERATOR_FULL_AUTONOMY` setting is a no-op retained for
-  configuration compatibility. See `backend/src/jarvis_gpt/config.py` and the
-  operator-authority logic in
-  `backend/src/jarvis_gpt/agent.py` (`_operator_action_scopes`,
-  `_operator_tool_arguments_match`, `_operator_requested_tool_names`).
-- Scope only selects candidate tools; it never authorizes model-selected paths,
-  URLs, payloads, or arguments. `allow_review_tools` / `allow_danger_tools` expose
-  tools for proposal but do not execute them, and `approval_required_for` remains
-  gated inside the model-driven agentic loop. The loop budget is bounded to
-  1..24 steps.
+- The runtime ships in **owner full-autonomy** mode: `JARVIS_OPERATOR_FULL_AUTONOMY`
+  defaults on (`backend/src/jarvis_gpt/config.py`). The single operator is the system
+  administrator, so their own chat turn authorizes the work it asks for. In this mode
+  the runtime never stops to ask a clarifying question and never mints an approval
+  gate before acting; the model sees the complete toolset and its chosen tools run
+  through the verified operator-authorization path. The chat is kept to
+  request → analysis → action → result: internal reasoning, memory bookkeeping,
+  approval prompts and clarify/blocked routes stay in the audit event log but do not
+  stream to the UI. See `agent.py` `_owner_autonomy_active`, `_admit_side_effects`,
+  `_tools_for_context`, `_run_agentic_tool` (autonomy grant), and `_suppress_from_chat`.
+- Set `JARVIS_OPERATOR_FULL_AUTONOMY=0` for the **gated** posture: clarify-first for
+  under-specified deliverables, approval gates for review/danger and
+  `approval_required_for` tools, and per-tool exact-operand matching
+  (`_operator_action_scopes`, `_operator_tool_arguments_match`,
+  `_operator_requested_tool_names`). The test suite pins this posture via
+  `backend/tests/conftest.py`; `test_owner_autonomy.py` covers the autonomous default.
+- Reliability guarantees hold in **both** modes and are correctness, not gates: atomic
+  operator-effect keys and duplicate suppression, executive action contracts, and
+  verified writes. The agentic loop budget is bounded to 1..24 steps.
+- Incoming requests are folded through `_fold_operator_confusables` before intent
+  detection (zero-width/non-breaking spaces, `ё`→`е`, NFC) so copy-paste and phrasing
+  quirks do not defeat command recognition.

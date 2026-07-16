@@ -379,9 +379,13 @@ def load_settings(profile_name: str | None = None) -> JarvisSettings:
             os.environ.get("JARVIS_LLM_BASE_URL", "http://localhost:8001/v1"),
         ).rstrip("/"),
         embeddings_model=os.environ.get("JARVIS_EMBEDDINGS_MODEL", ""),
-        # Compatibility switch retained for existing deployments. Current-turn
-        # authorization always requires the exact tool-specific operand matcher;
-        # this flag never turns a broad lexical scope into execution authority.
+        # Owner full-autonomy posture (default on). When enabled, the single
+        # operator is the system administrator: their own chat turn authorizes the
+        # work it asks for, so the runtime acts without clarification round-trips or
+        # approval gates and keeps the chat to request/analysis/action/result. Set to
+        # 0 to fall back to the gated posture (clarify-first, approval-gated tools).
+        # Reliability guarantees (atomic effect keys, verified writes, executive
+        # contracts) hold in both modes. See agent.py `_owner_autonomy_active`.
         operator_full_autonomy=_bool_env("JARVIS_OPERATOR_FULL_AUTONOMY", True),
         autonomy_enabled=_bool_env("JARVIS_AUTONOMY_ENABLED", True),
         telemetry_interval_sec=_int_env("JARVIS_TELEMETRY_INTERVAL_SEC", 120),

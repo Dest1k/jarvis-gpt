@@ -10,6 +10,7 @@ import ntpath
 import os
 import re
 import time
+import unicodedata
 import uuid
 from collections.abc import AsyncIterator, Sequence
 from contextlib import suppress
@@ -295,6 +296,12 @@ AGENTIC_DURABLE_MUTATORS = frozenset(
 SAFE_DIRECT_NATIVE_ACTIONS = frozenset(
     {"capabilities", "process.top", "screen.capture", "window.list", "wmi.query"}
 )
+# Under owner full autonomy the live chat is kept to request → analysis → action →
+# result. These event types are internal bookkeeping (reasoning notes, memory saves,
+# approval prompts, routing kernels): still written to the audit event log, but not
+# streamed as chat noise. Action (tool_call), result (assistant_done), mission
+# progress and verification always stream.
+_NON_CHAT_EVENT_TYPES = frozenset({"thought", "memory", "approval", "task_kernel"})
 
 # When lexical file search finds nothing, recent chunks are only allowed into
 # the prompt if their fuzzy-vector similarity to the query clears this bar.
@@ -1106,6 +1113,7 @@ class AgentRuntime:
         forced_mission = mode == "mission"
         if (
             not forced_mission
+            and not self._owner_autonomy_active()
             and (
                 task_plan.needs_clarification
                 or _looks_like_clarification_before_action(message)
@@ -1747,6 +1755,7 @@ class AgentRuntime:
         forced_mission = mode == "mission"
         if (
             not forced_mission
+            and not self._owner_autonomy_active()
             and (
                 task_plan.needs_clarification
                 or _looks_like_clarification_before_action(message)
@@ -3624,7 +3633,8 @@ class AgentRuntime:
             # Genuinely ambiguous task: ask the operator one targeted question
             # instead of guessing and delivering a confidently wrong result.
             if (
-                arbiter is not None
+                not self._owner_autonomy_active()
+                and arbiter is not None
                 and arbiter.route == "clarify"
                 and arbiter.confidence >= 0.65
                 and arbiter.clarification
@@ -3765,7 +3775,10 @@ class AgentRuntime:
         assert context is not None
         if tool_name not in _operator_requested_tool_names(context.operator_scopes):
             return None
-        if not _operator_tool_arguments_match(
+        # Owner full autonomy honors the operator's requested tool even when the
+        # derived operands don't exactly echo the literal message; the effect
+        # ledger below still binds and de-duplicates the exact effect.
+        if not self._owner_autonomy_active() and not _operator_tool_arguments_match(
             tool_name,
             arguments,
             message=context.operator_message or "",
@@ -5314,6 +5327,18 @@ class AgentRuntime:
             },
         )
 
+    def _owner_autonomy_active(self) -> bool:
+        """Owner full-autonomy posture (JARVIS_OPERATOR_FULL_AUTONOMY, default on).
+
+        When active the single operator is treated as the system administrator: the
+        operator's own turn authorizes the work it asked for, so the runtime never
+        stops to ask a clarifying question or mint an approval gate before acting.
+        Reliability guarantees (atomic effect keys, duplicate suppression, executive
+        contracts, verified writes) still apply — those are correctness, not gates.
+        """
+
+        return bool(self.settings.operator_full_autonomy)
+
     def _admit_side_effects(
         self, message: str, context: AgentContext
     ) -> tuple[bool, str, str | None]:
@@ -5325,6 +5350,16 @@ class AgentRuntime:
         """
 
         conversation_id = context.conversation_id
+        # Owner full autonomy never blocks the operator's own turn on a clarifying
+        # question: understand the request and act. Any stale pending question is
+        # cleared so a fresh command is honored immediately, first time.
+        if self._owner_autonomy_active():
+            if self._pending_clarification_state(conversation_id) is not None:
+                self._clear_pending_clarification(conversation_id)
+            context.pending_clarification_goal = None
+            context.pending_transform_draft = None
+            context.side_effects_admitted = True
+            return True, message, None
         pending = self._pending_clarification_state(conversation_id)
         if pending is not None:
             goal = str(pending.get("goal") or "").strip()
@@ -5478,6 +5513,10 @@ class AgentRuntime:
     ) -> str | None:
         """Hard second-line gate immediately before mutating tool execution."""
 
+        # Owner full autonomy admits the operator's turn; the second-line gate
+        # never blocks the mutation the operator asked for.
+        if self._owner_autonomy_active():
+            return None
         if tool_name not in SIDE_EFFECT_MUTATING_TOOLS:
             return None
         if not context.side_effects_admitted:
@@ -7518,6 +7557,11 @@ class AgentRuntime:
         ]
 
     def _tools_for_context(self, context: AgentContext) -> list[ToolInfo]:
+        # Owner full autonomy exposes the operator's complete toolset (including
+        # review/danger tools) so the model can finish the request in one turn
+        # rather than proposing an approval and stopping.
+        if self._owner_autonomy_active():
+            return self.tools.list()
         tools = {tool.name: tool for tool in self._autonomous_tools()}
         if not _has_current_operator_authority(context):
             return list(tools.values())
@@ -7599,7 +7643,7 @@ class AgentRuntime:
         effect_key: str | None = None
         duplicate_effect = False
         durable_duplicate = False
-        if (
+        operator_match = (
             operator_binding_required
             and not policy_approval_required
             and name in allowed
@@ -7609,7 +7653,23 @@ class AgentRuntime:
                 message=context.operator_message or "",
                 scopes=context.operator_scopes,
             )
-        ):
+        )
+        # Owner full autonomy: the operator's own turn authorizes the model's chosen
+        # tool without a separate approval gate — including review/danger and
+        # policy-approval tools. Scoped to the operator's chat turn (no mission/task
+        # binding, which the capability forbids); the atomic effect ledger below still
+        # binds and de-duplicates the exact effect, so nothing runs twice.
+        autonomy_grant = (
+            not operator_match
+            and operator_binding_required
+            and self._owner_autonomy_active()
+            and name in allowed
+            and spec is not None
+            and bool(context.operator_message_id)
+            and mission_id is None
+            and task_id is None
+        )
+        if operator_match or autonomy_grant:
             effect_key = _operator_effect_key(name, args)
             durable_duplicate = effect_key in context.operator_retry_effects
             duplicate_effect = effect_key in context.operator_used_effects or durable_duplicate
@@ -8847,9 +8907,22 @@ class AgentRuntime:
             "запуска OpenAI-compatible endpoint на `JARVIS_LLM_BASE_URL`."
         )
 
+    def _suppress_from_chat(self, event: ChatEvent) -> bool:
+        """Under owner full autonomy, keep the live chat to request → analysis →
+        action → result. Internal reasoning, memory bookkeeping, approval prompts and
+        clarify/blocked routes stay in the audit event log but do not stream as chat
+        noise. Action, result, mission progress and verification always stream."""
+
+        if not self._owner_autonomy_active():
+            return False
+        if event.type in _NON_CHAT_EVENT_TYPES:
+            return True
+        route = str(event.payload.get("route") or "")
+        return route in {"clarify", "blocked"}
+
     async def _emit(self, event: ChatEvent) -> None:
         self.storage.add_event(kind=f"agent.{event.type}", title=event.title, payload=event.payload)
-        if self.bus is not None:
+        if self.bus is not None and not self._suppress_from_chat(event):
             await self.bus.publish({"channel": "agent", **event.model_dump()})
 
 
@@ -15055,8 +15128,32 @@ _OPERATOR_RETRACTION_RE = re.compile(
 )
 
 
+# Same-meaning character variants operators commonly type: zero-width joiners,
+# non-breaking / typographic spaces, and interchangeable ё/е. Folded to the plain
+# forms the matchers are written against. Keys are code points so the source stays
+# plain ASCII; a None value deletes the character.
+_OPERATOR_CONFUSABLE_TRANSLATION: dict[int, str | None] = {
+    0x00A0: " ", 0x2000: " ", 0x2001: " ", 0x2002: " ", 0x2003: " ",
+    0x2004: " ", 0x2005: " ", 0x2006: " ", 0x2007: " ", 0x2008: " ",
+    0x2009: " ", 0x200A: " ", 0x202F: " ", 0x205F: " ", 0x3000: " ",
+    0x200B: None, 0x200C: None, 0x200D: None, 0x2060: None, 0xFEFF: None,
+    0x0451: "е", 0x0401: "Е",
+}
+
+
+def _fold_operator_confusables(text: str) -> str:
+    """Fold same-meaning character variants so phrasing quirks don't defeat command
+    recognition. Copy-pasted requests routinely carry non-breaking or zero-width
+    spaces, and ``ё``/``е`` are used interchangeably. This only changes the byte
+    shape of characters — never which words are present — so intent detection sees
+    the plain forms the matchers are written against."""
+
+    folded = unicodedata.normalize("NFC", str(text or ""))
+    return folded.translate(_OPERATOR_CONFUSABLE_TRANSLATION)
+
+
 def _operator_structural_text(message: str) -> str:
-    text = str(message or "")
+    text = _fold_operator_confusables(message)
     text = re.sub(
         r"\x60\x60\x60.*?\x60\x60\x60|\x60[^\x60]*\x60|"
         r"«[^»]*»|“[^”]*”|\"[^\"]*\"|'[^']*'",
@@ -16504,7 +16601,7 @@ def _native_action_from_message(
     message: str,
     settings: JarvisSettings | None = None,
 ) -> NativeAction | None:
-    normalized = message.lower()
+    normalized = _fold_operator_confusables(message).lower()
     screen_capture = _screen_capture_action(normalized)
     if screen_capture is not None:
         return screen_capture
