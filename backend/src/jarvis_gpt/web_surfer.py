@@ -957,8 +957,14 @@ class JarvisWebSurfer:
 
     async def _deep_research_impl(self, query: str, depth: int) -> str:
         seed = await self.fast_fact(query)
+        seed_snippets = list(seed.get("snippets", []))
+        if not seed_snippets:
+            # DuckDuckGo returned nothing (rate-limit/outage): fall back to the
+            # independent provider so research does not dead-end on one search engine.
+            with suppress(Exception):
+                seed_snippets = await self.mojeek_search(query, limit=max(depth, 8))
         links: list[str] = []
-        for snippet in seed.get("snippets", []):
+        for snippet in seed_snippets:
             url = str(snippet.get("url") or "")
             if url.startswith("http") and url not in links:
                 links.append(url)
@@ -980,7 +986,7 @@ class JarvisWebSurfer:
             item for item in gathered if isinstance(item, dict) and item.get("markdown")
         ]
         return _compose_research_report(
-            query, seed.get("answer", ""), sections, seed.get("snippets", [])
+            query, seed.get("answer", ""), sections, seed_snippets
         )
 
     async def _research_one(self, url: str) -> dict[str, str] | None:
@@ -1003,6 +1009,35 @@ class JarvisWebSurfer:
             return {"url": url, "title": title or url, "markdown": markdown}
         except NavigationError:
             return None
+        finally:
+            with suppress(Exception):
+                await asyncio.wait_for(context.close(), timeout=_CLEANUP_TIMEOUT_SEC)
+
+    async def mojeek_search(self, query: str, *, limit: int = 8) -> list[dict[str, str]]:
+        """Independent keyless fallback search via Mojeek, in a real browser page.
+
+        Mojeek serves a captcha to lightweight HTTP clients (its API-context path is
+        blocked) but returns a full result page to a genuine browser, so this reuses
+        the surfer's anti-bot navigation. Used when DuckDuckGo is rate-limited or
+        empty, so a single provider outage no longer blanks out web search.
+        """
+
+        query = " ".join(str(query or "").split())
+        if not query:
+            return []
+        url = f"https://www.mojeek.com/search?q={quote_plus(query)}"
+        context = await self._new_context()
+        try:
+            page = await self._new_page(context)
+            await self._goto(page, url)
+            with suppress(AntiBotError):
+                await self._guard_antibot(page)
+            html = ""
+            with suppress(PlaywrightError):
+                html = await page.content()
+            return _parse_mojeek_html(html)[: max(1, limit)] if html else []
+        except NavigationError:
+            return []
         finally:
             with suppress(Exception):
                 await asyncio.wait_for(context.close(), timeout=_CLEANUP_TIMEOUT_SEC)
@@ -2232,6 +2267,36 @@ def _parse_ddg_html(html: str) -> list[dict[str, str]]:
         snippet = ""
         if index < len(snippets):
             snippet = _collapse(_strip_tags(snippets[index]))
+        results.append({"title": title, "url": url, "snippet": snippet})
+        if len(results) >= 12:
+            break
+    return results
+
+
+# Mojeek is a keyless, JS-free, bot-tolerant HTML search engine used as an
+# independent fallback so a DuckDuckGo rate-limit no longer blanks out search.
+# Result shape:  <a class="title" ... href="URL">TITLE</a> ... <p class="s">SNIPPET</p>
+_MOJEEK_TITLE_RE = re.compile(
+    r'<a\s+class="title"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+    re.IGNORECASE | re.DOTALL,
+)
+_MOJEEK_SNIPPET_RE = re.compile(
+    r'<p\s+class="s">(.*?)</p>',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _parse_mojeek_html(html: str) -> list[dict[str, str]]:
+    results: list[dict[str, str]] = []
+    snippets = _MOJEEK_SNIPPET_RE.findall(html)
+    for index, match in enumerate(_MOJEEK_TITLE_RE.finditer(html)):
+        url = unescape(match.group(1))
+        title = _collapse(unescape(_strip_tags(match.group(2))))
+        if not url.startswith("http") or not title:
+            continue
+        snippet = ""
+        if index < len(snippets):
+            snippet = _collapse(unescape(_strip_tags(snippets[index])))
         results.append({"title": title, "url": url, "snippet": snippet})
         if len(results) >= 12:
             break
