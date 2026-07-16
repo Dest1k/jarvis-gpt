@@ -103,13 +103,17 @@ def _local_diagnostic_checks(
 
 
 def _persist_checks(storage: JarvisStorage, checks: list[DiagnosticCheck]) -> None:
-    for check in checks:
-        storage.record_health(
-            component=check.name,
-            status=check.status,
-            message=check.message,
-            details=check.details,
-        )
+    storage.record_health_snapshot(
+        [
+            {
+                "component": check.name,
+                "status": check.status,
+                "message": check.message,
+                "details": check.details,
+            }
+            for check in checks
+        ]
+    )
 
 
 async def run_diagnostics(

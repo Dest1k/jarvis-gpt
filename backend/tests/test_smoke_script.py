@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import sys
 import urllib.error
 from types import SimpleNamespace
+
+import pytest
 
 from scripts import smoke
 
@@ -155,6 +159,47 @@ def test_frontend_build_reuses_proven_build_after_oom(monkeypatch, tmp_path):
     assert result.get("build_id") == "build-canary-1"
 
 
+def test_frontend_build_never_reuses_tree_mutated_by_failed_rebuild(
+    monkeypatch,
+    tmp_path,
+):
+    frontend = tmp_path / "frontend"
+    next_dir = frontend / ".next"
+    next_dir.mkdir(parents=True)
+    (next_dir / "BUILD_ID").write_text("build-canary-1", encoding="utf-8")
+    (next_dir / "prerender-manifest.json").write_text("{}", encoding="utf-8")
+    (next_dir / "build-manifest.json").write_text("{}", encoding="utf-8")
+
+    def corrupting_oom(
+        name,
+        command,
+        *,
+        cwd=smoke.ROOT,
+        optional=False,
+        env=None,
+        timeout=None,
+    ):
+        (next_dir / "partial-chunk.js").write_text("truncated", encoding="utf-8")
+        return {
+            "name": name,
+            "ok": False,
+            "optional": False,
+            "status": "failed",
+            "returncode": 1,
+            "stdout_tail": "",
+            "stderr_tail": "memory allocation failed",
+            "timeout_seconds": timeout,
+        }
+
+    monkeypatch.setattr(smoke, "ROOT", tmp_path)
+    monkeypatch.setattr(smoke, "run", corrupting_oom)
+
+    result = smoke.run_frontend_build(timeout=180)
+
+    assert result["ok"] is False
+    assert result.get("reused_production_build") is not True
+
+
 def test_frontend_build_does_not_hide_real_compile_failure(monkeypatch, tmp_path):
     frontend = tmp_path / "frontend"
     next_dir = frontend / ".next"
@@ -183,6 +228,54 @@ def test_frontend_build_does_not_hide_real_compile_failure(monkeypatch, tmp_path
     assert result["status"] == "failed"
 
 
+def test_existing_frontend_build_rejects_sources_newer_than_build(tmp_path):
+    frontend = tmp_path / "frontend"
+    next_dir = frontend / ".next"
+    app_dir = frontend / "app"
+    next_dir.mkdir(parents=True)
+    app_dir.mkdir()
+    build_files = [
+        next_dir / "BUILD_ID",
+        next_dir / "prerender-manifest.json",
+        next_dir / "build-manifest.json",
+    ]
+    for path in build_files:
+        path.write_text("build" if path.name == "BUILD_ID" else "{}", encoding="utf-8")
+    source = app_dir / "page.tsx"
+    source.write_text("export default function Page() {}", encoding="utf-8")
+    build_time = 1_700_000_000_000_000_000
+    for path in build_files:
+        os.utime(path, ns=(build_time, build_time))
+    os.utime(source, ns=(build_time + 1_000_000_000, build_time + 1_000_000_000))
+
+    assert smoke.existing_production_frontend_build(frontend) is None
+
+
+def test_existing_frontend_build_rejects_newer_public_asset_or_next_config(tmp_path):
+    frontend = tmp_path / "frontend"
+    next_dir = frontend / ".next"
+    public_dir = frontend / "public"
+    next_dir.mkdir(parents=True)
+    public_dir.mkdir()
+    build_files = [
+        next_dir / "BUILD_ID",
+        next_dir / "prerender-manifest.json",
+        next_dir / "build-manifest.json",
+    ]
+    for path in build_files:
+        path.write_text("build" if path.name == "BUILD_ID" else "{}", encoding="utf-8")
+    config = frontend / "next.config.mjs"
+    config.write_text("export default {}", encoding="utf-8")
+    asset = public_dir / "sw.js"
+    asset.write_text("self.skipWaiting()", encoding="utf-8")
+    build_time = 1_700_000_000_000_000_000
+    for path in [*build_files, config]:
+        os.utime(path, ns=(build_time, build_time))
+    os.utime(asset, ns=(build_time + 1_000_000_000, build_time + 1_000_000_000))
+
+    assert smoke.existing_production_frontend_build(frontend) is None
+
+
 
 def test_optional_missing_command_is_skipped_but_never_successful(monkeypatch):
     def missing(*_args, **_kwargs):
@@ -207,6 +300,119 @@ def test_optional_unreachable_http_is_skipped_but_never_successful(monkeypatch):
 
     assert result["ok"] is False
     assert result["status"] == "skipped"
+
+
+def test_health_http_rejects_false_or_invalid_success_body(monkeypatch):
+    class Response:
+        status = 200
+
+        def __init__(self, payload: bytes) -> None:
+            self.payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self, _limit: int) -> bytes:
+            return self.payload
+
+    for payload in (b'{"ok": false}', b'{"status": "starting"}', b'not-json'):
+        monkeypatch.setattr(
+            smoke.urllib.request,
+            "urlopen",
+            lambda *_args, payload=payload, **_kwargs: Response(payload),
+        )
+        result = smoke.http(
+            "backend health",
+            "http://127.0.0.1:8000/health",
+            expect_json_ok=True,
+        )
+        assert result["ok"] is False
+        assert result["body_ok"] is False
+
+    monkeypatch.setattr(
+        smoke.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: Response(b'{"ok": true}'),
+    )
+    healthy = smoke.http(
+        "backend health",
+        "http://127.0.0.1:8000/health",
+        expect_json_ok=True,
+    )
+    assert healthy["ok"] is True
+    assert healthy["body_ok"] is True
+
+
+def test_autonomy_probe_uses_runtime_api_token_without_exposing_it(monkeypatch):
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    observed = {}
+
+    def fake_urlopen(request, timeout=8):
+        observed["authorization"] = request.get_header("Authorization")
+        observed["timeout"] = timeout
+        return Response()
+
+    monkeypatch.setenv("JARVIS_API_TOKEN", "doctor-secret-token")
+    monkeypatch.setattr(smoke.urllib.request, "urlopen", fake_urlopen)
+
+    result = smoke.http(
+        "backend autonomy",
+        "http://127.0.0.1:8000/api/autonomy",
+        headers=smoke.api_auth_headers(),
+    )
+
+    assert result["ok"] is True
+    assert observed == {
+        "authorization": "Bearer doctor-secret-token",
+        "timeout": 8,
+    }
+    assert "doctor-secret-token" not in json.dumps(result)
+
+
+def test_require_runtime_makes_http_checks_release_blocking(monkeypatch, capsys):
+    def fake_run(name, _command, *, cwd=smoke.ROOT, optional=False, env=None, timeout=None):
+        return {"name": name, "ok": True, "optional": optional, "status": "passed"}
+
+    observed: list[tuple[str, bool, bool]] = []
+
+    def fake_http(
+        name,
+        _url,
+        *,
+        optional=False,
+        expect_json_ok=False,
+        headers=None,
+    ):
+        observed.append((name, optional, expect_json_ok))
+        return {"name": name, "ok": False, "optional": optional, "status": "failed"}
+
+    monkeypatch.setattr(smoke, "run", fake_run)
+    monkeypatch.setattr(smoke, "http", fake_http)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["smoke.py", "--skip-frontend", "--require-runtime"],
+    )
+
+    exit_code = smoke.main()
+    report = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 1
+    assert report["ok"] is False
+    assert all(optional is False for _name, optional, _body in observed)
+    assert observed[0] == ("backend health", False, True)
+    assert all(name != "frontend" for name, _optional, _body in observed)
 
 
 def test_main_exit_ignores_optional_gap_but_reports_degraded(monkeypatch, capsys):
@@ -406,9 +612,9 @@ def test_doctor_and_ci_share_pinned_ruff_lint_contract():
 
     smoke_src = (root / "scripts" / "smoke.py").read_text(encoding="utf-8")
     assert '"backend lint"' in smoke_src or "'backend lint'" in smoke_src
-    assert '"-m", "ruff", "check", "backend/src", "backend/tests"' in smoke_src or (
-        "'-m', 'ruff', 'check', 'backend/src', 'backend/tests'" in smoke_src
-    )
+    assert '"backend/src",' in smoke_src
+    assert '"backend/tests",' in smoke_src
+    assert '"qa",' in smoke_src
 
     ci = (root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     assert "Lint backend" in ci
@@ -416,6 +622,7 @@ def test_doctor_and_ci_share_pinned_ruff_lint_contract():
 
     doctor = (root / "scripts" / "doctor.ps1").read_text(encoding="utf-8")
     assert "scripts\\smoke.py" in doctor or "scripts/smoke.py" in doctor
+    assert '"--require-runtime"' in doctor
     assert "exit $smokeExit" in doctor
 
 
@@ -439,17 +646,23 @@ def test_doctor_ps1_propagates_smoke_nonzero_exit(tmp_path):
         encoding="utf-8",
     )
     mini_doctor = tmp_path / "mini_doctor.ps1"
+    python_executable = sys.executable.replace("'", "''")
+    stub_path = str(stub_smoke).replace("'", "''")
     mini_doctor.write_text(
-        f'py -3.11 "{stub_smoke}"\n'
+        f"& '{python_executable}' '{stub_path}'\n"
         "$smokeExit = $LASTEXITCODE\n"
         "if ($null -eq $smokeExit) { $smokeExit = 1 }\n"
         "exit $smokeExit\n",
         encoding="utf-8",
     )
 
+    powershell = shutil.which("powershell.exe") or shutil.which("pwsh")
+    if powershell is None:
+        pytest.skip("PowerShell is unavailable on this test host")
+
     completed = subprocess.run(
         [
-            "powershell.exe",
+            powershell,
             "-NoProfile",
             "-ExecutionPolicy",
             "Bypass",

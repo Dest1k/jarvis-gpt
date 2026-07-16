@@ -70,6 +70,72 @@ def test_storage_persists_mission(tmp_path):
     storage.close()
 
 
+def test_storage_reserved_mission_id_is_idempotent(tmp_path):
+    storage = JarvisStorage(tmp_path / "state" / "jarvis.sqlite3")
+    storage.initialize()
+
+    first = storage.create_mission(
+        mission_id="mis_reserved123456",
+        title="Reserved mission",
+        goal="Create exactly one durable mission",
+        tasks=["Plan", "Verify"],
+    )
+    repeated = storage.create_mission(
+        mission_id="mis_reserved123456",
+        title="Reserved mission",
+        goal="Create exactly one durable mission",
+        tasks=["Plan", "Verify"],
+    )
+
+    assert repeated == first
+    assert len(storage.list_missions()) == 1
+    assert len(first["tasks"]) == 2
+    assert len(storage.list_audit(target_type="mission", target_id=first["id"])) == 1
+    with pytest.raises(ValueError, match="different goal"):
+        storage.create_mission(
+            mission_id="mis_reserved123456",
+            title="Collision",
+            goal="Different goal",
+            tasks=["Never"],
+        )
+    storage.close()
+
+
+def test_mission_creation_rolls_back_every_row_after_task_insert_failure(tmp_path):
+    storage = JarvisStorage(tmp_path / "state" / "jarvis.sqlite3")
+    storage.initialize()
+    conn = storage.connect()
+    conn.execute(
+        """
+        CREATE TRIGGER fail_second_mission_task
+        BEFORE INSERT ON mission_tasks
+        WHEN NEW.position = 2
+        BEGIN
+            SELECT RAISE(ABORT, 'injected task failure');
+        END
+        """
+    )
+    conn.commit()
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected task failure"):
+        storage.create_mission(
+            mission_id="mis_atomicfailure1",
+            title="Must be atomic",
+            goal="Persist all mission rows or none",
+            tasks=["one", "two", "three"],
+        )
+
+    assert conn.in_transaction is False
+    assert storage.get_mission("mis_atomicfailure1") is None
+    storage.set_runtime_value("unrelated.write", {"ok": True})
+    assert storage.get_mission("mis_atomicfailure1") is None
+    assert conn.execute(
+        "SELECT COUNT(*) FROM mission_tasks WHERE mission_id = ?",
+        ("mis_atomicfailure1",),
+    ).fetchone()[0] == 0
+    storage.close()
+
+
 def test_storage_creates_consistent_database_backup(tmp_path):
     storage = JarvisStorage(tmp_path / "state" / "jarvis.sqlite3")
     storage.initialize()
@@ -363,6 +429,74 @@ def test_storage_persists_runtime_values(tmp_path):
     assert rows[0]["value"] == {"operator_name": "Tony"}
     assert storage.counters()["runtime_kv"] == 1
     storage.close()
+
+
+def test_latest_health_uses_one_newest_row_when_timestamps_tie(monkeypatch, tmp_path):
+    storage = JarvisStorage(tmp_path / "state" / "jarvis.sqlite3")
+    storage.initialize()
+    monkeypatch.setattr("jarvis_gpt.storage.utc_now", lambda: "2026-07-16T12:00:00+00:00")
+
+    storage.record_health(component="llm", status="error", message="temporarily down")
+    storage.record_health(component="llm", status="ok", message="recovered")
+
+    rows = storage.latest_health(limit=20)
+    assert len(rows) == 1
+    assert rows[0]["component"] == "llm"
+    assert rows[0]["status"] == "ok"
+    assert rows[0]["message"] == "recovered"
+    storage.close()
+
+
+def test_complete_health_snapshot_is_atomic_when_one_component_insert_fails(tmp_path):
+    storage = JarvisStorage(tmp_path / "state" / "jarvis.sqlite3")
+    storage.initialize()
+    good = [
+        {
+            "component": "runtime.home",
+            "status": "ok",
+            "message": "available",
+        },
+        {
+            "component": "llm.router",
+            "status": "ok",
+            "message": "responding",
+        },
+    ]
+    first_marker = storage.record_health_snapshot(good)
+    conn = storage.connect()
+    conn.execute(
+        """
+        CREATE TRIGGER fail_health_router_insert
+        BEFORE INSERT ON health_snapshots
+        WHEN NEW.component = 'llm.router' AND NEW.status = 'warn'
+        BEGIN
+            SELECT RAISE(ABORT, 'injected health failure');
+        END
+        """
+    )
+    conn.commit()
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected health failure"):
+        storage.record_health_snapshot(
+            [
+                {**good[0], "message": "new local result"},
+                {
+                    "component": "llm.router",
+                    "status": "warn",
+                    "message": "unavailable",
+                },
+            ]
+        )
+
+    assert conn.in_transaction is False
+    rows = storage.latest_complete_health(limit=20)
+    assert {row["status"] for row in rows} == {"ok"}
+    assert {row["id"] for row in rows} == set(first_marker["row_ids"])
+    assert conn.execute(
+        "SELECT COUNT(*) FROM health_snapshots"
+    ).fetchone()[0] == len(good)
+    storage.close()
+
 
 def test_profile_product_decision_certification_matrix():
     from jarvis_gpt.config import (

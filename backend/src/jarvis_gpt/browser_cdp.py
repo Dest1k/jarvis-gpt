@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import ntpath
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -86,6 +88,75 @@ async def chrome_debugger_status(debug_url: str = DEFAULT_CHROME_DEBUG_URL) -> d
         "debug_url": base_url,
         "version": version,
     }
+
+
+async def attest_chrome_debugger(
+    *,
+    debug_url: str,
+    launch_nonce: str,
+    profile_dir: str,
+    proxy: str,
+) -> dict[str, Any]:
+    """Bind a local CDP endpoint to the guarded Chrome command line we launched."""
+
+    base_url = normalize_debug_url(debug_url)
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0), trust_env=False) as client:
+            response = await client.get(f"{base_url}/json/version")
+            response.raise_for_status()
+            version = response.json()
+        websocket_url = str(version.get("webSocketDebuggerUrl") or "")
+        _validate_websocket_debugger_url(websocket_url)
+        async with websockets.connect(
+            websocket_url,
+            max_size=1_000_000,
+            open_timeout=5,
+            close_timeout=2,
+        ) as websocket:
+            result = await _CdpConnection(websocket).send("Browser.getBrowserCommandLine")
+    except (httpx.HTTPError, ValueError, OSError, WebSocketException, TimeoutError) as exc:
+        raise BrowserCdpError(f"Chrome launch attestation failed: {exc}") from exc
+    arguments = result.get("arguments")
+    if not isinstance(arguments, list) or not all(isinstance(item, str) for item in arguments):
+        return {"ok": False, "summary": "Chrome did not expose an attestable command line."}
+    required = {
+        f"--jarvis-guard-nonce={launch_nonce}",
+        f"--proxy-server={proxy}",
+        "--proxy-bypass-list=<-loopback>",
+        "--host-resolver-rules=MAP * ~NOTFOUND",
+        "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+        "--disable-quic",
+        "--enable-automation",
+    }
+    present = set(arguments)
+    missing = required - present
+    profile_arguments = [
+        item.removeprefix("--user-data-dir=")
+        for item in arguments
+        if item.startswith("--user-data-dir=")
+    ]
+    expected_profile = _normalized_profile_path(profile_dir)
+    profile_matches = any(
+        _normalized_profile_path(item) == expected_profile for item in profile_arguments
+    )
+    ok = not missing and profile_matches
+    return {
+        "ok": ok,
+        "summary": (
+            "Chrome command line matches the guarded launch nonce, profile, and network policy."
+            if ok
+            else "Chrome command line does not match the guarded launch attestation."
+        ),
+        "argument_count": len(arguments),
+        "profile_matches": profile_matches,
+        "required_switches_present": not missing,
+    }
+
+
+def _normalized_profile_path(value: str) -> str:
+    if "\\" in value or (len(value) >= 2 and value[1] == ":"):
+        return ntpath.normcase(ntpath.normpath(value.replace("/", "\\")))
+    return os.path.normcase(os.path.normpath(value))
 
 
 async def read_chrome_page(

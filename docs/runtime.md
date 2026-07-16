@@ -868,10 +868,10 @@ to retry from scratch.
 
 - Было: путь ответа LLM в `chat()`/`stream_chat()` — один forward-pass без доступа к инструментам; всё tool-использование решалось эвристиками ДО модели. Теперь модель сама вызывает инструменты в цикле, видит результат и продолжает.
 - Протокол — **JSON-act поверх обычных completions** (деградирует на любой модели, не требует нативного OpenAI tool-calling): модель возвращает `{"tool": "<имя>", "arguments": {...}}` одной строкой → выполняем → возвращаем observation → повтор, пока не хватит, затем финальный текст.
-- Безопасность: автономно предлагаются только `danger_level == "safe"` инструменты МИНУС мутирующие (`AGENTIC_TOOL_DENYLIST = memory.save, learning.tick, mission.brief`). Если модель просит review/danger инструмент — создаётся HITL-approval gate (`storage.create_approval`) и в observation уходит «нужно подтверждение», инструмент НЕ выполняется. Бюджет шагов — из `experience.autonomy_policy.max_autonomous_steps` (bounded 1..8, дефолт 4); при исчерпании форсируется финальный ответ (`FINAL_ANSWER_PROMPT`).
+- Безопасность: `allow_safe_tools` / `allow_review_tools` / `allow_danger_tools` определяют, какие классы инструментов модель может предложить, но сами не дают права исполнения. Review/danger создают HITL-approval gate без точного допустимого current-turn capability; в model-driven agentic loop инструменты из `approval_required_for` остаются gated даже при таком capability. Широкий lexical scope никогда не разрешает выбранные моделью operands: matcher сверяет точные пути, URL, payload и аргументы. `AGENTIC_TOOL_DENYLIST` удерживает durable safe-writes (`memory.save`, `learning.tick`, `mission.brief`) вне фонового proposal-loop. Бюджет шагов — из `experience.autonomy_policy.max_autonomous_steps` (bounded 1..24, дефолт политики 3); при исчерпании форсируется финальный ответ (`FINAL_ANSWER_PROMPT`).
 - Ключевые части в `agent.py`: `_autonomous_tools()`, `_max_tool_steps()`, `_run_agentic_tool()`, `_agentic_answer()` (non-stream), стрим-версия внутри `stream_chat` через `_ToolActionSniffer` (классифицирует поток как tool-JSON или обычный ответ, чтобы обычные ответы стримились токен-за-токеном без лишнего вызова, а tool-JSON не утекал оператору). Хелперы: `_tool_protocol_prompt`, `_schema_hint`, `_parse_tool_action` (требует, чтобы сообщение НАЧИНАЛОСЬ с JSON — иначе это обычный ответ), `_tool_observation_excerpt`.
 - Офлайн/деградация: `_autonomous_tools()` возвращает `[]` при `llm_enabled == False` → путь идентичен прежнему одиночному completion → все офлайн-тесты неизменны. Арбитр интентов (reasoning-first) вызывается только для web_research-планов и кэшируется, так что двойных вызовов роутера нет.
-- Тесты: `backend/tests/test_agentic_loop.py` (5): safe-tool→observation→ответ; danger-tool→approval без выполнения; step-budget→форс-финал; стрим подавляет tool-JSON и стримит ответ; обычный стрим без регресса. Полный прогон — 138 pass, ruff clean.
+- Регрессии model-driven loop находятся в `backend/tests/test_agentic_loop.py` и покрывают safe-tool→observation→ответ, approval без выполнения, step-budget, interrupted stream, protocol/synthesis recovery, unknown-outcome reconciliation и deduplication эквивалентных эффектов. Актуальные команды проверки перечислены в корневом `CLAUDE.md` и CI; фиксированные исторические счётчики здесь намеренно не приводятся.
 - На будущее по треку: при thinking_enabled модель, обернувшая tool-JSON в `<think>`, классифицируется как ответ (JSON может утечь) — сознательный компромисс v1. Ещё не сделано: трек 2 (семантическая память) и трек 3 (реальный mission-executor поверх этого loop).
 
 ## 2026-07-08 handoff — operator persona layer
@@ -1057,7 +1057,15 @@ py -3.11 .\jarvis.py tool-run browser.chrome.launch --allow-danger
 py -3.11 .\jarvis.py tool-run browser.read --set url=https://example.com --allow-danger
 ```
 
-Chrome is launched with a dedicated profile under `D:\jarvis\cache\jarvis-gpt\chrome-profile` and local DevTools on `127.0.0.1:9222`. If a site asks for login or human verification, complete it in that Chrome window and retry `browser.read`.
+Chrome is launched with a versioned dedicated profile under `D:\jarvis\cache\jarvis-gpt\chrome-profile` and local DevTools on `127.0.0.1:9222`. If a site asks for login or human verification, complete it in that Chrome window and retry `browser.read`.
+
+The CDP endpoint is usable only while its bridge launch attestation still matches the
+nonce, listening Chrome PID/start time, profile, debug URL, proxy and full command
+line. All browser traffic goes through the bridge's fail-closed loopback proxy, which
+validates every redirect/CONNECT and connects to the checked numeric IP. Public-only
+sessions cannot reach private addresses; an explicitly allowed localhost/private
+session is private-only and cannot pivot to public content. Restarting the bridge
+restores the exact HMAC-signed proxy/session record before CDP actions resume.
 
 ## Host Bridge
 

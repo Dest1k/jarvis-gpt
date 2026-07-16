@@ -39,6 +39,9 @@ class LLMStreamChunk:
 
 LLMPriority = Literal["foreground", "background"]
 BACKGROUND_PREEMPTED_ERROR = "Background LLM request preempted by foreground traffic."
+_LLM_MAX_ATTEMPTS = 3
+_LLM_RETRY_BASE_DELAY_SEC = 0.2
+_LLM_RETRY_MAX_DELAY_SEC = 2.0
 _T = TypeVar("_T")
 
 
@@ -326,20 +329,34 @@ class LLMRouter:
         if not thinking_enabled:
             body["chat_template_kwargs"] = {"enable_thinking": False}
         priority = self._priority.get()
+        attempt = 1
+        data: dict[str, Any] | None = None
         while True:
             lease = await self._acquire_admission(priority)
+            preempted = False
+            transient_error: Exception | None = None
             try:
                 data = await self._post_completion(body, lease)
             except _BackgroundPreempted:
                 # Generation is side-effect free. Discard the partial response,
                 # yield to all foreground traffic, then retry the same prompt.
-                continue
+                preempted = True
             except Exception as exc:  # noqa: BLE001
-                return LLMResult(ok=False, content="", error=_exc_message(exc))
+                if _is_transient_llm_error(exc) and attempt < _LLM_MAX_ATTEMPTS:
+                    transient_error = exc
+                else:
+                    return LLMResult(ok=False, content="", error=_exc_message(exc))
             finally:
                 await self._release_admission(lease)
+            if preempted:
+                continue
+            if transient_error is not None:
+                await asyncio.sleep(_llm_retry_delay(transient_error, attempt))
+                attempt += 1
+                continue
             break
 
+        assert data is not None
         choices = data.get("choices") or []
         if not choices:
             return LLMResult(ok=False, content="", error="LLM response has no choices", raw=data)
@@ -386,29 +403,44 @@ class LLMRouter:
         if include_usage:
             body["stream_options"] = {"include_usage": True}
         priority = self._priority.get()
+        attempt = 1
+        foreground_output_exposed = False
         while True:
             lease = await self._acquire_admission(priority)
             buffered: list[LLMStreamChunk] = []
-            retry = False
-            error: str | None = None
+            preempted = False
+            error: Exception | None = None
             try:
                 async for chunk in self._stream_completion(body, lease):
                     if priority == "background":
                         buffered.append(chunk)
                     else:
+                        # Once any chunk is observable (including usage/done), a
+                        # retry could violate stream order or duplicate terminal
+                        # metadata. Retry foreground streams only before their
+                        # first emitted chunk.
+                        foreground_output_exposed = True
                         yield chunk
             except _BackgroundPreempted:
                 # Background streams are buffered, so retrying cannot duplicate
                 # partial output in a nested mission consumer.
-                retry = True
+                preempted = True
             except Exception as exc:  # noqa: BLE001
-                error = _exc_message(exc)
+                error = exc
             finally:
                 await self._release_admission(lease)
-            if retry:
+            if preempted:
                 continue
             if error is not None:
-                yield LLMStreamChunk(kind="error", error=error)
+                if (
+                    _is_transient_llm_error(error)
+                    and not foreground_output_exposed
+                    and attempt < _LLM_MAX_ATTEMPTS
+                ):
+                    await asyncio.sleep(_llm_retry_delay(error, attempt))
+                    attempt += 1
+                    continue
+                yield LLMStreamChunk(kind="error", error=_exc_message(error))
                 return
             # Release the background lease before exposing buffered output. A
             # slow nested consumer must never hold up newly arrived foreground
@@ -578,6 +610,29 @@ class LLMRouter:
 def _exc_message(exc: Exception) -> str:
     message = str(exc).strip()
     return message or exc.__class__.__name__
+
+
+def _is_transient_llm_error(exc: Exception) -> bool:
+    if isinstance(exc, httpx.TransportError):
+        return True
+    if not isinstance(exc, httpx.HTTPStatusError):
+        return False
+    status_code = exc.response.status_code
+    return status_code in {408, 429} or 500 <= status_code <= 599
+
+
+def _llm_retry_delay(exc: Exception, attempt: int) -> float:
+    exponential = _LLM_RETRY_BASE_DELAY_SEC * (2 ** max(0, attempt - 1))
+    retry_after = 0.0
+    if isinstance(exc, httpx.HTTPStatusError):
+        raw = exc.response.headers.get("Retry-After", "").strip()
+        try:
+            parsed = float(raw)
+        except ValueError:
+            parsed = 0.0
+        if math.isfinite(parsed):
+            retry_after = max(0.0, parsed)
+    return min(_LLM_RETRY_MAX_DELAY_SEC, max(exponential, retry_after))
 
 
 def _optional_int(value: Any) -> int | None:

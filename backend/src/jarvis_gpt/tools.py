@@ -10,6 +10,7 @@ import json
 import math
 import os
 import re
+import secrets
 import shutil
 import socket
 import subprocess
@@ -36,6 +37,7 @@ from httpcore._backends.base import SOCKET_OPTION, AsyncNetworkBackend, AsyncNet
 from .browser_cdp import (
     DEFAULT_CHROME_DEBUG_URL,
     BrowserCdpError,
+    attest_chrome_debugger,
     chrome_debugger_status,
     normalize_debug_url,
     read_chrome_page,
@@ -89,6 +91,7 @@ from .models import ToolInfo, ToolRunResponse
 from .operations import OperationsManager, _cadence_interval, docker_container_allowed
 from .persona import INSIGHT_FIELDS, PersonaManager, load_persona
 from .redaction import redact_text, redact_value
+from .reliability import PolicyDecision, ToolFailure
 from .shop_registry import find_shop_source, get_shop_source, get_shop_source_by_host
 from .state_verification import (
     GateStatus,
@@ -556,9 +559,15 @@ class ToolRegistry:
         # SPARK-0009: canonicalize only filesystem.mkdir → fs.mkdir before lookup/approval.
         name, args = _canonicalize_tool_invocation(name, arguments or {})
         spec = self.get(name)
+        arguments_digest: str | None = None
+        arguments_error: str | None = None
+        try:
+            arguments_digest = _operator_arguments_sha256(args)
+        except (TypeError, ValueError) as exc:
+            arguments_error = f"Tool arguments are not canonical JSON: {exc}"
         operator_authorized = False
         authorization_error: str | None = None
-        if authorization is not None:
+        if authorization is not None and arguments_error is None:
             try:
                 authorization.consume(
                     conversation_id=conversation_id,
@@ -583,6 +592,13 @@ class ToolRegistry:
                 ),
                 data={"rejected_alias": True, "tool": name},
             )
+            response.data["policy_decision"] = PolicyDecision(
+                effect="deny",
+                code="non_canonical_tool_alias",
+                source="tool_registry",
+                reason=response.summary,
+                remediation="Use the canonical typed execution action named in the response.",
+            ).as_dict()
         elif spec is None:
             response = ToolRunResponse(
                 tool=name,
@@ -590,6 +606,29 @@ class ToolRegistry:
                 summary=f"Tool {name!r} is not registered.",
                 data={"available": [tool.name for tool in self.list()]},
             )
+            response.data["policy_decision"] = PolicyDecision(
+                effect="deny",
+                code="tool_not_registered",
+                source="tool_registry",
+                reason=response.summary,
+                remediation="Choose a registered tool from the returned availability list.",
+            ).as_dict()
+        elif arguments_error is not None:
+            response = ToolRunResponse(
+                tool=name,
+                ok=False,
+                summary=arguments_error,
+                data={"invalid_arguments": True},
+            )
+            response.data["policy_decision"] = PolicyDecision(
+                effect="deny",
+                code="arguments_not_canonical_json",
+                source="tool_registry",
+                reason=response.summary,
+                remediation=(
+                    "Use finite JSON numbers and JSON-compatible argument values."
+                ),
+            ).as_dict()
         elif authorization_error is not None:
             response = ToolRunResponse(
                 tool=name,
@@ -597,6 +636,16 @@ class ToolRegistry:
                 summary=f"Operator authorization rejected: {authorization_error}",
                 data={"authorization_rejected": True},
             )
+            response.data["policy_decision"] = PolicyDecision(
+                effect="deny",
+                code="operator_authorization_rejected",
+                source="operator_turn_authorization",
+                reason=response.summary,
+                remediation=(
+                    "Bind a fresh authorization to this exact conversation, message, tool, "
+                    "and canonical argument payload."
+                ),
+            ).as_dict()
         elif spec.danger_level != "safe" and not approved:
             response = ToolRunResponse(
                 tool=name,
@@ -611,6 +660,14 @@ class ToolRegistry:
                     "approval_payload": {"tool": name, "arguments": args},
                 },
             )
+            response.data["policy_decision"] = PolicyDecision(
+                effect="require_approval",
+                code="approval_required",
+                source="tool_registry",
+                reason=response.summary,
+                remediation="Approve this exact tool and argument payload, then resume it once.",
+                binding={"tool": name, "arguments_sha256": str(arguments_digest)},
+            ).as_dict()
         else:
             context = ToolContext(
                 settings=self.settings,
@@ -635,34 +692,71 @@ class ToolRegistry:
                     tool=name,
                     ok=False,
                     summary=f"Tool failed: {exc}",
-                    data={"error": str(exc)},
+                    data={
+                        "error": str(exc),
+                        "failure": ToolFailure(
+                            kind="handler_exception",
+                            outcome="unknown",
+                            outcome_known=False,
+                            retryable=False,
+                            requires_operator=True,
+                            remediation=(
+                                "Inspect the target state before deciding whether to retry."
+                            ),
+                            fallback="Use a read-only inspection or reconciliation action.",
+                        ).as_dict(),
+                    },
                 )
 
         response = _redact_tool_response_credentials(response)
         recorded_args = redact_value(_redact_search_credentials(args))
-        self.storage.record_tool_run(
-            tool=response.tool,
-            ok=response.ok,
-            summary=response.summary,
-            arguments=recorded_args,
-            data=response.data,
-            mission_id=mission_id,
-            task_id=task_id,
-        )
-        self.storage.add_event(
-            kind="tool.run",
-            title=response.summary,
-            level="info" if response.ok else "warn",
-            payload={
-                "tool": response.tool,
-                "mission_id": mission_id,
-                "task_id": task_id,
-                "authority": "operator_turn" if operator_authorized else "tool_policy",
-                "authorization_fingerprint": (
-                    authorization.fingerprint if operator_authorized and authorization else None
-                ),
-            },
-        )
+        failed_audit_sinks: list[str] = []
+        try:
+            self.storage.record_tool_run(
+                tool=response.tool,
+                ok=response.ok,
+                summary=response.summary,
+                arguments=recorded_args,
+                data=response.data,
+                mission_id=mission_id,
+                task_id=task_id,
+            )
+        except Exception:  # noqa: BLE001
+            # The handler has already returned a terminal outcome. Turning an
+            # audit outage into a tool exception would invite callers to replay
+            # a mutation whose effect may already be committed.
+            failed_audit_sinks.append("tool_run")
+        try:
+            self.storage.add_event(
+                kind="tool.run",
+                title=response.summary,
+                level="info" if response.ok else "warn",
+                payload={
+                    "tool": response.tool,
+                    "mission_id": mission_id,
+                    "task_id": task_id,
+                    "authority": "operator_turn" if operator_authorized else "tool_policy",
+                    "authorization_fingerprint": (
+                        authorization.fingerprint
+                        if operator_authorized and authorization
+                        else None
+                    ),
+                },
+            )
+        except Exception:  # noqa: BLE001
+            failed_audit_sinks.append("runtime_event")
+        if failed_audit_sinks:
+            failure = response.data.get("failure")
+            outcome_known = not isinstance(failure, dict) or bool(
+                failure.get("outcome_known", False)
+            )
+            response.data["audit_status"] = {
+                "protocol": "jarvis.audit-status.v1",
+                "persisted": False,
+                "failed_sinks": failed_audit_sinks,
+                "outcome_known": outcome_known,
+                "retryable": False,
+            }
         return response
 
     def _register_defaults(self) -> None:
@@ -1049,7 +1143,10 @@ class ToolRegistry:
         self.add(
             ToolSpec(
                 name="browser.open",
-                description="Open a validated HTTP(S) URL through the native host browser.",
+                description=(
+                    "Open a validated HTTP(S) URL in a dedicated host Chrome session whose "
+                    "redirects and network destinations are enforced by a fail-closed proxy."
+                ),
                 category="browser",
                 input_schema={"url": "HTTP(S) URL to open"},
                 handler=_browser_open,
@@ -1078,7 +1175,8 @@ class ToolRegistry:
             ToolSpec(
                 name="browser.chrome.launch",
                 description=(
-                    "Launch Chrome with a dedicated Jarvis profile and local DevTools endpoint."
+                    "Launch Chrome with a dedicated Jarvis profile, local DevTools endpoint, "
+                    "and fail-closed public-network proxy."
                 ),
                 category="browser",
                 input_schema={
@@ -1219,10 +1317,14 @@ class ToolRegistry:
         self.add(
             ToolSpec(
                 name="browser.open_many",
-                description="Open multiple validated HTTP(S) URLs through the native host browser.",
+                description=(
+                    "Open multiple validated HTTP(S) URLs in a dedicated, fail-closed "
+                    "public-network-guarded Chrome session."
+                ),
                 category="browser",
                 input_schema={"urls": "List of HTTP(S) URLs to open"},
                 handler=_browser_open_many,
+                danger_level="review",
             )
         )
         self.add(
@@ -3622,6 +3724,20 @@ def _host_bridge_status(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunRespo
 SAFE_INSPECT_ACTIONS = frozenset(
     {"capabilities", "process.top", "screen.capture", "window.list", "wmi.query"}
 )
+MODEL_NATIVE_ACTIONS = frozenset(
+    {
+        "app.open_and_type",
+        "capabilities",
+        "console.show_processes",
+        "keyboard.send",
+        "process.start",
+        "process.top",
+        "screen.capture",
+        "window.focus",
+        "window.list",
+        "wmi.query",
+    }
+)
 
 
 async def _run_native_bridge_command(
@@ -3638,9 +3754,10 @@ async def _run_native_bridge_command(
         payload=clean_payload,
         timeout_sec=timeout_sec,
     )
-    bridge_data = result.get("data") if isinstance(result.get("data"), dict) else result
-    native = bridge_data if isinstance(bridge_data, dict) else {}
-    ok = bool(result.get("ok")) and bool(native.get("ok", True))
+    bridge_data = dict(result)
+    native_data = result.get("data")
+    native = native_data if isinstance(native_data, dict) else {}
+    ok = result.get("ok") is True and native.get("ok", True) is True
     summary = str(
         native.get("summary")
         or result.get("summary")
@@ -3751,6 +3868,12 @@ def _nested_native_items(value: Any, *, depth: int = 0) -> list[Any]:
 
 async def _windows_native(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     action = str(args.get("action") or "capabilities").strip().lower()
+    if action not in MODEL_NATIVE_ACTIONS:
+        return ToolRunResponse(
+            tool="windows.native",
+            ok=False,
+            summary="This host action is reserved for a policy-specific Jarvis tool.",
+        )
     payload = args.get("payload")
     if not isinstance(payload, dict):
         payload = {}
@@ -3836,23 +3959,176 @@ async def _system_inspect(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResp
     )
 
 
+def _verified_browser_network_guard(
+    result: dict[str, Any],
+    *,
+    allowed_private_hosts: list[str],
+) -> dict[str, Any] | None:
+    native = result.get("data")
+    guard = native.get("network_guard") if isinstance(native, dict) else None
+    if not isinstance(guard, dict):
+        return None
+    if not (
+        guard.get("enforced") is True
+        and guard.get("version") == "public-proxy-v1"
+        and guard.get("private_networks") == "blocked"
+        and guard.get("redirects") == "validated_per_connection"
+        and guard.get("dns_rebinding") == "numeric_ip_pinned_per_connection"
+        and guard.get("direct_dns") == "disabled"
+        and guard.get("non_proxied_udp") == "disabled"
+        and guard.get("fail_closed") is True
+        and guard.get("session_class") in {"public-only", "private-only"}
+        and isinstance(guard.get("allowed_private_hosts"), list)
+        and all(isinstance(item, str) for item in guard["allowed_private_hosts"])
+    ):
+        return None
+    expected_hosts = sorted(set(allowed_private_hosts))
+    actual_hosts = sorted(
+        {str(item).casefold().rstrip(".") for item in guard["allowed_private_hosts"]}
+    )
+    expected_class = "private-only" if expected_hosts else "public-only"
+    if actual_hosts != expected_hosts or guard.get("session_class") != expected_class:
+        return None
+    return dict(guard)
+
+
+def _browser_guard_private_hosts(
+    url: str,
+    *,
+    policy: dict[str, Any] | None,
+) -> list[str]:
+    host = (urlparse(url).hostname or "").casefold().rstrip(".")
+    if not host or url == "about:blank":
+        return []
+    if _browser_host_network_scope(host) != "private":
+        return []
+    allowed = {str(item).casefold().rstrip(".") for item in (policy or {}).get("allowed_hosts", [])}
+    if (policy or {}).get("allow_localhost", True):
+        allowed.update({"localhost", "127.0.0.1", "::1"})
+    if host not in allowed:
+        raise ValueError(f"Private browser host {host!r} is not explicitly allowed by policy.")
+    return [host]
+
+
+def _guarded_chrome_session_key(debug_url: str) -> str:
+    digest = hashlib.sha256(debug_url.encode("utf-8")).hexdigest()
+    return f"browser.guarded_chrome_session.{digest}"
+
+
+async def _require_guarded_chrome_session(
+    ctx: ToolContext,
+    debug_url: str,
+    *,
+    url: str | None = None,
+) -> dict[str, Any]:
+    record = ctx.storage.get_runtime_value(_guarded_chrome_session_key(debug_url), None)
+    if not isinstance(record, dict):
+        raise BrowserCdpError(
+            "Chrome DevTools endpoint has no guarded launch attestation; "
+            "run browser.chrome.launch first."
+        )
+    required_strings = ("launch_nonce", "profile_dir", "proxy", "session_class")
+    if any(not isinstance(record.get(key), str) or not record[key] for key in required_strings):
+        raise BrowserCdpError("Stored Chrome launch attestation is malformed.")
+    allowed_private_hosts = record.get("allowed_private_hosts")
+    if not isinstance(allowed_private_hosts, list) or not all(
+        isinstance(item, str) for item in allowed_private_hosts
+    ):
+        raise BrowserCdpError("Stored Chrome network class is malformed.")
+    if url is not None:
+        host = (urlparse(url).hostname or "").casefold().rstrip(".")
+        scope = _browser_host_network_scope(host)
+        if record["session_class"] == "public-only":
+            if scope != "public":
+                raise BrowserCdpError("Public-only Chrome session cannot navigate privately.")
+        elif record["session_class"] == "private-only":
+            if scope != "private" or host not in set(allowed_private_hosts):
+                raise BrowserCdpError(
+                    "Private-only Chrome session can only navigate its exact host allowlist."
+                )
+        else:
+            raise BrowserCdpError("Stored Chrome network class is unsupported.")
+    parsed_debug = urlparse(debug_url)
+    debug_port = parsed_debug.port
+    if debug_port is None:
+        raise BrowserCdpError("Chrome DevTools endpoint has no port.")
+    bridge = await HostBridgeClient(ctx.settings).action(
+        action="chrome.attest_guarded",
+        payload={
+            "debug_port": debug_port,
+            "launch_nonce": record["launch_nonce"],
+            "profile_dir": record["profile_dir"],
+        },
+        timeout_sec=5,
+    )
+    native = bridge.get("data")
+    if not bridge.get("ok") or not isinstance(native, dict) or native.get("ok") is not True:
+        raise BrowserCdpError("Chrome debug-port owner no longer matches its guarded launch.")
+    if not (
+        native.get("owner_pid") == record.get("owner_pid")
+        and native.get("profile_dir") == record["profile_dir"]
+        and native.get("proxy") == record["proxy"]
+        and native.get("session_class") == record["session_class"]
+        and sorted(native.get("allowed_private_hosts") or ())
+        == sorted(allowed_private_hosts)
+    ):
+        raise BrowserCdpError("Chrome bridge attestation policy no longer matches local state.")
+    command_line = await attest_chrome_debugger(
+        debug_url=debug_url,
+        launch_nonce=record["launch_nonce"],
+        profile_dir=record["profile_dir"],
+        proxy=record["proxy"],
+    )
+    if command_line.get("ok") is not True:
+        raise BrowserCdpError(str(command_line.get("summary") or "Chrome attestation failed."))
+    return {
+        "bridge": native,
+        "command_line": command_line,
+        "session": {
+            "allowed_private_hosts": list(allowed_private_hosts),
+            "debug_port": debug_port,
+            "owner_pid": record.get("owner_pid"),
+            "profile_dir": record["profile_dir"],
+            "proxy": record["proxy"],
+            "session_class": record["session_class"],
+        },
+    }
+
+
 async def _browser_open(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     policy = OperationsManager(settings=ctx.settings, storage=ctx.storage).browser_policy()
     try:
-        url = _validate_browser_url(str(args.get("url") or ""), policy=policy)
+        url = _validate_browser_direct_url(
+            str(args.get("url") or ""),
+            policy=policy,
+            approved=ctx.approved,
+        )
+        allowed_private_hosts = _browser_guard_private_hosts(url, policy=policy)
     except ValueError as exc:
         return ToolRunResponse(tool="browser.open", ok=False, summary=str(exc))
     result = await HostBridgeClient(ctx.settings).action(
-        action="url.open",
-        payload={"url": url},
+        action="browser.open_guarded",
+        payload={
+            "url": url,
+            "profile_dir": str(ctx.settings.cache_dir / "browser-profile"),
+            "allowed_private_hosts": allowed_private_hosts,
+        },
         timeout_sec=10,
     )
-    data = result.get("data") if isinstance(result.get("data"), dict) else result
+    guard = _verified_browser_network_guard(
+        result,
+        allowed_private_hosts=allowed_private_hosts,
+    )
+    ok = result.get("ok") is True and guard is not None
     return ToolRunResponse(
         tool="browser.open",
-        ok=bool(result.get("ok")),
-        summary=str(result.get("summary") or "Browser open requested."),
-        data={"url": url, "bridge": data},
+        ok=ok,
+        summary=(
+            str(result.get("summary") or "Guarded browser open requested.")
+            if ok
+            else "Browser open was not verified behind the required public-network guard."
+        ),
+        data={"url": url, "network_guard": guard, "bridge": result},
     )
 
 
@@ -3866,17 +4142,30 @@ def _browser_policy(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunResponse:
     )
 
 
-async def _browser_chrome_status(_ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+async def _browser_chrome_status(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     try:
         debug_url = normalize_debug_url(str(args.get("debug_url") or DEFAULT_CHROME_DEBUG_URL))
         status = await chrome_debugger_status(debug_url)
     except BrowserCdpError as exc:
         return ToolRunResponse(tool="browser.chrome.status", ok=False, summary=str(exc))
+    attestation: dict[str, Any] | None = None
+    attestation_error = ""
+    if status.get("ok"):
+        try:
+            attestation = await _require_guarded_chrome_session(ctx, debug_url)
+        except BrowserCdpError as exc:
+            attestation_error = str(exc)
+    ok = bool(status.get("ok") and attestation is not None)
     return ToolRunResponse(
         tool="browser.chrome.status",
-        ok=bool(status.get("ok")),
-        summary=str(status.get("summary") or "Chrome DevTools status collected."),
-        data=status,
+        ok=ok,
+        summary=(
+            "Guarded Chrome DevTools endpoint is reachable and attested."
+            if ok
+            else attestation_error
+            or str(status.get("summary") or "Chrome DevTools status collected.")
+        ),
+        data={**status, "guarded_attestation": attestation},
     )
 
 
@@ -3887,7 +4176,11 @@ async def _browser_chrome_launch(ctx: ToolContext, args: dict[str, Any]) -> Tool
     raw_start_url = str(args.get("start_url") or "").strip()
     if raw_start_url:
         try:
-            start_url = _validate_browser_url(raw_start_url, policy=policy)
+            start_url = _validate_browser_direct_url(
+                raw_start_url,
+                policy=policy,
+                approved=ctx.approved,
+            )
         except ValueError as exc:
             return ToolRunResponse(tool="browser.chrome.launch", ok=False, summary=str(exc))
     else:
@@ -3903,23 +4196,33 @@ async def _browser_chrome_launch(ctx: ToolContext, args: dict[str, Any]) -> Tool
     except ValueError as exc:
         return ToolRunResponse(tool="browser.chrome.launch", ok=False, summary=str(exc))
 
+    try:
+        allowed_private_hosts = _browser_guard_private_hosts(start_url, policy=policy)
+    except ValueError as exc:
+        return ToolRunResponse(tool="browser.chrome.launch", ok=False, summary=str(exc))
+    launch_nonce = secrets.token_urlsafe(32)
     result = await HostBridgeClient(ctx.settings).action(
-        action="chrome.launch",
+        action="chrome.launch_guarded",
         payload={
             "debug_port": debug_port,
             "profile_dir": str(profile_dir),
             "start_url": start_url,
             "headless": False,
+            "allowed_private_hosts": allowed_private_hosts,
+            "launch_nonce": launch_nonce,
         },
         timeout_sec=15,
     )
-    data = result.get("data") if isinstance(result.get("data"), dict) else result
+    guard = _verified_browser_network_guard(
+        result,
+        allowed_private_hosts=allowed_private_hosts,
+    )
     verification: dict[str, Any] = {
         "ok": False,
         "status": "skipped",
         "summary": "Chrome launch did not reach independent CDP verification.",
     }
-    if result.get("ok"):
+    if result.get("ok") and guard is not None:
         deadline = asyncio.get_running_loop().time() + 10.0
         while True:
             try:
@@ -3927,30 +4230,82 @@ async def _browser_chrome_launch(ctx: ToolContext, args: dict[str, Any]) -> Tool
             except BrowserCdpError as exc:
                 status = {"ok": False, "summary": str(exc)}
             if status.get("ok") or asyncio.get_running_loop().time() >= deadline:
-                verification = {
-                    "ok": bool(status.get("ok")),
-                    "status": "passed" if status.get("ok") else "failed",
-                    "summary": str(
-                        status.get("summary") or "Chrome DevTools socket is unavailable."
-                    )[:1000],
-                    "debug_url": debug_url,
+                status_ok = bool(status.get("ok"))
+                native = result.get("data")
+                launch_attestation = (
+                    native.get("attestation") if isinstance(native, dict) else None
+                )
+                attestation_ok = bool(
+                    isinstance(launch_attestation, dict)
+                    and launch_attestation.get("verified") is True
+                    and launch_attestation.get("debug_port") == debug_port
+                    and launch_attestation.get("profile_dir") == guard.get("profile_dir")
+                )
+                command_line: dict[str, Any] = {
+                    "ok": False,
+                    "summary": "CDP command-line attestation was not attempted.",
                 }
+                if status_ok and attestation_ok:
+                    try:
+                        command_line = await attest_chrome_debugger(
+                            debug_url=debug_url,
+                            launch_nonce=launch_nonce,
+                            profile_dir=str(guard["profile_dir"]),
+                            proxy=str(guard["proxy"]),
+                        )
+                    except BrowserCdpError as exc:
+                        command_line = {"ok": False, "summary": str(exc)}
+                verified_now = status_ok and attestation_ok and command_line.get("ok") is True
+                verification = {
+                    "ok": verified_now,
+                    "status": "passed" if verified_now else "failed",
+                    "summary": (
+                        "Chrome endpoint, port owner, launch nonce, profile, and guard match."
+                        if verified_now
+                        else str(
+                            command_line.get("summary")
+                            or status.get("summary")
+                            or "Chrome guarded launch attestation failed."
+                        )[:1000]
+                    ),
+                    "debug_url": debug_url,
+                    "owner_pid": (
+                        launch_attestation.get("owner_pid")
+                        if isinstance(launch_attestation, dict)
+                        else None
+                    ),
+                    "command_line": command_line,
+                }
+                if verified_now:
+                    ctx.storage.set_runtime_value(
+                        _guarded_chrome_session_key(debug_url),
+                        {
+                            "allowed_private_hosts": list(allowed_private_hosts),
+                            "debug_port": debug_port,
+                            "launch_nonce": launch_nonce,
+                            "owner_pid": launch_attestation.get("owner_pid"),
+                            "profile_dir": str(guard["profile_dir"]),
+                            "proxy": str(guard["proxy"]),
+                            "session_class": str(guard["session_class"]),
+                        },
+                    )
                 break
             await asyncio.sleep(0.25)
-    verified = bool(result.get("ok") and verification["ok"])
+    verified = bool(result.get("ok") and guard is not None and verification["ok"])
     return ToolRunResponse(
         tool="browser.chrome.launch",
         ok=verified,
         summary=(
             str(result.get("summary") or "Chrome launch requested.")
             if verified
-            else "Chrome launch returned but the DevTools endpoint was not reachable."
+            else "Chrome launch was not bound to the required guarded endpoint attestation."
         ),
         data={
             "debug_url": debug_url,
-            "profile_dir": str(profile_dir),
+            "profile_dir": str(guard.get("profile_dir") if guard else profile_dir),
             "start_url": start_url,
-            "bridge": data,
+            "bridge": result,
+            "network_guard": guard,
             "verification": verification,
         },
     )
@@ -3959,8 +4314,16 @@ async def _browser_chrome_launch(ctx: ToolContext, args: dict[str, Any]) -> Tool
 async def _browser_read(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     policy = OperationsManager(settings=ctx.settings, storage=ctx.storage).browser_policy()
     try:
-        url = _validate_browser_url(str(args.get("url") or ""), policy=policy)
-        navigation_validator = _browser_navigation_validator(url, policy=policy)
+        url = _validate_browser_url(
+            str(args.get("url") or ""),
+            policy=policy,
+            approved=ctx.approved,
+        )
+        navigation_validator = _browser_navigation_validator(
+            url,
+            policy=policy,
+            approved=ctx.approved,
+        )
         debug_url = normalize_debug_url(str(args.get("debug_url") or DEFAULT_CHROME_DEBUG_URL))
     except (BrowserCdpError, ValueError) as exc:
         return ToolRunResponse(tool="browser.read", ok=False, summary=str(exc))
@@ -3968,6 +4331,7 @@ async def _browser_read(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
     max_chars = _int_arg(args.get("max_chars"), default=6000, minimum=256, maximum=30000)
     wait_ms = _int_arg(args.get("wait_ms"), default=5000, minimum=1000, maximum=30000)
     try:
+        attestation = await _require_guarded_chrome_session(ctx, debug_url, url=url)
         snapshot = await read_chrome_page(
             url=url,
             max_chars=max_chars,
@@ -3980,8 +4344,7 @@ async def _browser_read(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
             tool="browser.read",
             ok=False,
             summary=(
-                f"{exc}. Start Chrome with browser.chrome.launch or manually expose "
-                "a local DevTools endpoint."
+                f"{exc}. Start an attested Chrome session with browser.chrome.launch."
             ),
             data={"url": url, "debug_url": debug_url},
         )
@@ -4059,6 +4422,7 @@ async def _browser_read(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
             "handoff": handoff,
             "evidence_id": evidence["id"],
             "debug_url": debug_url,
+            "guarded_attestation": attestation,
         },
     )
 
@@ -4066,8 +4430,16 @@ async def _browser_read(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
 async def _browser_scroll(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     policy = OperationsManager(settings=ctx.settings, storage=ctx.storage).browser_policy()
     try:
-        url = _validate_browser_url(str(args.get("url") or ""), policy=policy)
-        navigation_validator = _browser_navigation_validator(url, policy=policy)
+        url = _validate_browser_url(
+            str(args.get("url") or ""),
+            policy=policy,
+            approved=ctx.approved,
+        )
+        navigation_validator = _browser_navigation_validator(
+            url,
+            policy=policy,
+            approved=ctx.approved,
+        )
         debug_url = normalize_debug_url(str(args.get("debug_url") or DEFAULT_CHROME_DEBUG_URL))
     except (BrowserCdpError, ValueError) as exc:
         return ToolRunResponse(tool="browser.scroll", ok=False, summary=str(exc))
@@ -4085,6 +4457,7 @@ async def _browser_scroll(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResp
     max_chars = _int_arg(args.get("max_chars"), default=9000, minimum=256, maximum=30000)
 
     try:
+        attestation = await _require_guarded_chrome_session(ctx, debug_url, url=url)
         result = await scroll_chrome_page(
             url=url,
             direction=direction,
@@ -4179,6 +4552,7 @@ async def _browser_scroll(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResp
             "handoff": handoff,
             "evidence_id": evidence["id"],
             "debug_url": debug_url,
+            "guarded_attestation": attestation,
         },
     )
 
@@ -4292,13 +4666,13 @@ def _browser_session_recommendation(
     if not chrome.ok:
         return {
             "route": "launch_chrome",
-            "summary": "Chrome CDP is unavailable; launch or attach operator Chrome first.",
+            "summary": "Guarded Chrome CDP is unavailable; launch it through Jarvis first.",
             "actions": ["browser.chrome.launch", "browser.chrome.status"],
         }
     if read_result is None:
         return {
             "route": "ready",
-            "summary": "Operator Chrome CDP is ready.",
+            "summary": "Attested, network-guarded Chrome CDP is ready.",
             "actions": ["browser.read", "browser.scroll", "browser.click"],
         }
     data = read_result.data if isinstance(read_result.data, dict) else {}
@@ -4333,7 +4707,7 @@ def _browser_session_recommendation(
         }
     return {
         "route": "browser_retry",
-        "summary": f"Chrome is attached but read failed: {read_result.summary}",
+        "summary": f"Guarded Chrome is attested but read failed: {read_result.summary}",
         "actions": ["browser.scroll", "web.render", "web.archive"],
     }
 
@@ -4346,8 +4720,16 @@ async def _browser_action(
 ) -> ToolRunResponse:
     policy = OperationsManager(settings=ctx.settings, storage=ctx.storage).browser_policy()
     try:
-        url = _validate_browser_url(str(args.get("url") or ""), policy=policy)
-        navigation_validator = _browser_navigation_validator(url, policy=policy)
+        url = _validate_browser_url(
+            str(args.get("url") or ""),
+            policy=policy,
+            approved=ctx.approved,
+        )
+        navigation_validator = _browser_navigation_validator(
+            url,
+            policy=policy,
+            approved=ctx.approved,
+        )
         debug_url = normalize_debug_url(str(args.get("debug_url") or DEFAULT_CHROME_DEBUG_URL))
         target = _browser_target_arg(args.get("target"))
         selector = _browser_selector_arg(
@@ -4370,6 +4752,7 @@ async def _browser_action(
     allow_sensitive = bool(args.get("allow_sensitive", False))
 
     try:
+        attestation = await _require_guarded_chrome_session(ctx, debug_url, url=url)
         result = await run_chrome_action(
             url=url,
             action=action,
@@ -4469,6 +4852,7 @@ async def _browser_action(
             "handoff": handoff,
             "evidence_id": evidence["id"],
             "debug_url": debug_url,
+            "guarded_attestation": attestation,
         },
     )
 
@@ -4485,10 +4869,21 @@ async def _browser_open_many(ctx: ToolContext, args: dict[str, Any]) -> ToolRunR
             summary="A list of URLs is required.",
         )
     limit = int(policy["max_urls_per_action"])
-    urls = []
-    for item in raw_urls[:limit]:
+    if len(raw_urls) > limit:
+        return ToolRunResponse(
+            tool="browser.open_many",
+            ok=False,
+            summary=f"At most {limit} URLs are allowed in one action.",
+        )
+    syntax_validated: list[str] = []
+    url_keys: set[tuple[str, str, int | None, str, str, str]] = set()
+    for item in raw_urls:
         try:
-            urls.append(_validate_browser_url(str(item), policy=policy))
+            validated = _validate_browser_url(
+                str(item),
+                policy=policy,
+                approved=ctx.approved,
+            )
         except ValueError as exc:
             return ToolRunResponse(
                 tool="browser.open_many",
@@ -4496,30 +4891,85 @@ async def _browser_open_many(ctx: ToolContext, args: dict[str, Any]) -> ToolRunR
                 summary=str(exc),
                 data={"url": str(item)},
             )
+        key = _canonical_browser_url_key(validated)
+        if key in url_keys:
+            return ToolRunResponse(
+                tool="browser.open_many",
+                ok=False,
+                summary="Duplicate browser URL targets are not allowed in one action.",
+                data={"url": validated},
+            )
+        url_keys.add(key)
+        syntax_validated.append(validated)
+    urls: list[str] = []
+    for validated in syntax_validated:
+        try:
+            urls.append(
+                _validate_browser_direct_url(
+                    validated,
+                    policy=policy,
+                    approved=ctx.approved,
+                )
+            )
+        except ValueError as exc:
+            return ToolRunResponse(
+                tool="browser.open_many",
+                ok=False,
+                summary=str(exc),
+                data={"url": validated},
+            )
     if not urls:
         return ToolRunResponse(tool="browser.open_many", ok=False, summary="No URLs provided.")
+    guarded_targets: list[tuple[str, list[str]]] = []
+    for url in urls:
+        try:
+            guarded_targets.append(
+                (url, _browser_guard_private_hosts(url, policy=policy))
+            )
+        except ValueError as exc:
+            return ToolRunResponse(
+                tool="browser.open_many",
+                ok=False,
+                summary=str(exc),
+                data={"url": url},
+            )
     client = HostBridgeClient(ctx.settings)
     concurrency = asyncio.Semaphore(min(4, len(urls)))
 
-    async def open_url(url: str) -> dict[str, Any]:
+    async def open_url(url: str, allowed_private_hosts: list[str]) -> dict[str, Any]:
         async with concurrency:
             return await client.action(
-                action="url.open",
-                payload={"url": url},
+                action="browser.open_guarded",
+                payload={
+                    "url": url,
+                    "profile_dir": str(ctx.settings.cache_dir / "browser-profile"),
+                    "allowed_private_hosts": allowed_private_hosts,
+                },
                 timeout_sec=10,
             )
 
-    results = list(await asyncio.gather(*(open_url(url) for url in urls)))
-    ok = all(bool(item.get("ok")) for item in results)
+    results = list(
+        await asyncio.gather(
+            *(open_url(url, hosts) for url, hosts in guarded_targets)
+        )
+    )
+    guards = [
+        _verified_browser_network_guard(item, allowed_private_hosts=hosts)
+        for item, (_url, hosts) in zip(results, guarded_targets, strict=True)
+    ]
+    ok = all(
+        bool(item.get("ok")) and guard is not None
+        for item, guard in zip(results, guards, strict=True)
+    )
     return ToolRunResponse(
         tool="browser.open_many",
         ok=ok,
         summary=(
             f"Requested {len(urls)} browser tab(s)."
             if ok
-            else "One or more structured browser-open actions failed."
+            else "One or more browser tabs were not verified behind the network guard."
         ),
-        data={"urls": urls, "bridge_results": results},
+        data={"urls": urls, "network_guards": guards, "bridge_results": results},
     )
 
 
@@ -10957,7 +11407,12 @@ def _is_allowed_docker_container(container: str, policy: dict[str, Any] | None =
     )
 
 
-def _validate_browser_url(raw_url: str, policy: dict[str, Any] | None = None) -> str:
+def _validate_browser_url(
+    raw_url: str,
+    policy: dict[str, Any] | None = None,
+    *,
+    approved: bool = False,
+) -> str:
     raw_url = raw_url.strip()
     if not raw_url:
         raise ValueError("URL is required.")
@@ -10975,6 +11430,10 @@ def _validate_browser_url(raw_url: str, policy: dict[str, Any] | None = None) ->
         raise ValueError(f"URL scheme is blocked by browser policy: {parsed.scheme}")
     if not parsed.hostname:
         raise ValueError("URL host is required.")
+    try:
+        _port = parsed.port
+    except ValueError as exc:
+        raise ValueError("URL port is invalid.") from exc
     if policy:
         if policy.get("mode") == "locked":
             raise ValueError("Browser automation policy is locked.")
@@ -10985,6 +11444,7 @@ def _validate_browser_url(raw_url: str, policy: dict[str, Any] | None = None) ->
             policy.get("mode") == "approval-only"
             and policy.get("require_approval_for_external", True)
             and not is_local
+            and not approved
         ):
             raise ValueError("Browser policy requires approval for external URLs.")
         if policy.get("mode") == "local-safe" and host not in allowed_hosts:
@@ -10994,13 +11454,61 @@ def _validate_browser_url(raw_url: str, policy: dict[str, Any] | None = None) ->
     return parsed.geturl()
 
 
+def _validate_browser_direct_url(
+    raw_url: str,
+    policy: dict[str, Any] | None = None,
+    *,
+    approved: bool = False,
+) -> str:
+    """Validate a one-shot navigation, including its resolved network scope.
+
+    Approval may release an approval-only external-navigation gate, but it never
+    authorizes private, link-local, reserved, or metadata-network targets that
+    are outside the explicit host allowlist.
+    """
+
+    validated = _validate_browser_url(raw_url, policy=policy, approved=approved)
+    host = (urlparse(validated).hostname or "").casefold()
+    allowed_private_hosts = {
+        str(item).casefold() for item in (policy or {}).get("allowed_hosts", [])
+    }
+    if (policy or {}).get("allow_localhost", True):
+        allowed_private_hosts.update({"localhost", "127.0.0.1", "::1"})
+    scope = _browser_host_network_scope(host)
+    if scope == "private" and host not in allowed_private_hosts:
+        raise ValueError(
+            f"Private browser target {host!r} is not explicitly allowed by policy."
+        )
+    return validated
+
+
+def _canonical_browser_url_key(
+    validated_url: str,
+) -> tuple[str, str, int | None, str, str, str]:
+    parsed = urlparse(validated_url)
+    host = (parsed.hostname or "").casefold().rstrip(".").removeprefix("www.")
+    return (
+        parsed.scheme.casefold(),
+        host,
+        parsed.port,
+        parsed.path.rstrip("/"),
+        parsed.query,
+        parsed.fragment,
+    )
+
+
 def _browser_navigation_validator(
     initial_url: str,
     *,
     policy: dict[str, Any] | None,
+    approved: bool = False,
 ) -> Callable[[str], str]:
     """Keep public browser sessions from redirecting or loading private-network URLs."""
-    validated_initial = _validate_browser_url(initial_url, policy=policy)
+    validated_initial = _validate_browser_url(
+        initial_url,
+        policy=policy,
+        approved=approved,
+    )
     initial_host = (urlparse(validated_initial).hostname or "").casefold()
     allowed_private_hosts = {
         str(item).casefold() for item in (policy or {}).get("allowed_hosts", [])
@@ -11014,12 +11522,20 @@ def _browser_navigation_validator(
         )
 
     def validate(candidate: str) -> str:
-        validated = _validate_browser_url(candidate, policy=policy)
+        validated = _validate_browser_url(
+            candidate,
+            policy=policy,
+            approved=approved,
+        )
         host = (urlparse(validated).hostname or "").casefold()
         scope = _browser_host_network_scope(host)
         if initial_scope == "public" and scope != "public":
             raise ValueError(
                 f"Public browser content cannot request private host {host!r}."
+            )
+        if initial_scope == "private" and scope != "private":
+            raise ValueError(
+                f"Private-only browser content cannot request public host {host!r}."
             )
         if scope == "private" and host not in allowed_private_hosts:
             raise ValueError(

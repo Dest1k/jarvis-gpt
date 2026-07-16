@@ -3,12 +3,15 @@ from __future__ import annotations
 import asyncio
 import json
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 from jarvis_gpt.agent import (
+    OPERATOR_EFFECT_LEDGER_MAX_REQUESTS,
     AgentContext,
     AgentRuntime,
     _looks_like_document_memory_query,
@@ -16,6 +19,7 @@ from jarvis_gpt.agent import (
     _operator_action_scopes,
     _operator_effect_key,
     _operator_tool_arguments_match,
+    _prune_operator_effect_ledger,
     _schema_hint,
     _tool_observation_excerpt,
 )
@@ -141,6 +145,129 @@ def test_operator_execution_effect_key_canonicalizes_explicit_defaults(tmp_path)
     )
 
 
+def test_operator_execution_effect_key_ignores_verification_metadata(tmp_path):
+    target = tmp_path / "verified.txt"
+    payload = {
+        "protocol": "jarvis.execution.v1",
+        "action": {
+            "kind": "fs.write",
+            "path": str(target),
+            "content_base64": "aGVsbG8=",
+        },
+    }
+    without_verification = {"payload": payload}
+    same_path_verification = {
+        "payload": payload,
+        "verification": {"paths": [{"path": str(target)}]},
+    }
+    contradictory_verification = {
+        "payload": payload,
+        "verification": {"paths": [{"path": str(target), "exists": False}]},
+    }
+
+    baseline = _operator_effect_key("execution.apply", without_verification)
+    assert baseline == _operator_effect_key("execution.apply", same_path_verification)
+    assert baseline == _operator_effect_key("execution.apply", contradictory_verification)
+
+
+def test_operator_effect_keys_canonicalize_windows_paths_but_preserve_posix_case():
+    write_upper = {
+        "path": r"C:\Temp\Case.txt",
+        "content": "hello",
+        "mode": "overwrite",
+    }
+    write_lower = {
+        "path": "c:/temp/case.txt",
+        "content": "hello",
+        "mode": "overwrite",
+    }
+    assert _operator_effect_key("filesystem.write_text", write_upper) == _operator_effect_key(
+        "filesystem.write_text", write_lower
+    )
+    assert _operator_effect_key(
+        "filesystem.write_text",
+        {**write_upper, "path": r"\\Server\Share\Notes.txt"},
+    ) == _operator_effect_key(
+        "filesystem.write_text",
+        {**write_upper, "path": r"\\server/share/notes.txt"},
+    )
+    assert _operator_effect_key(
+        "filesystem.write_text",
+        {**write_upper, "path": "/tmp/Foo.txt"},
+    ) != _operator_effect_key(
+        "filesystem.write_text",
+        {**write_upper, "path": "/tmp/foo.txt"},
+    )
+
+    copy_upper = {
+        "payload": {
+            "protocol": "jarvis.execution.v1",
+            "action": {
+                "kind": "fs.copy",
+                "source": r"C:\Data\Source.txt",
+                "destination": r"\\Server\Share\Target.txt",
+            },
+        }
+    }
+    copy_lower = {
+        "payload": {
+            "protocol": "jarvis.execution.v1",
+            "action": {
+                "kind": "fs.copy",
+                "source": "c:/data/source.txt",
+                "destination": r"\\server/share/target.txt",
+            },
+        }
+    }
+    assert _operator_effect_key("execution.apply", copy_upper) == _operator_effect_key(
+        "execution.apply", copy_lower
+    )
+
+    process_upper = {
+        "payload": {
+            "protocol": "jarvis.execution.v1",
+            "action": {
+                "kind": "process.run",
+                "executable": r"C:\Tools\Runner.exe",
+                "arguments": [r"C:\Input\Data.txt", "--quiet"],
+                "cwd": r"C:\Work",
+                "observe_paths": [r"\\Server\Share\Observed"],
+            },
+        }
+    }
+    process_lower = {
+        "payload": {
+            "protocol": "jarvis.execution.v1",
+            "action": {
+                "kind": "process.run",
+                "executable": "c:/tools/runner.exe",
+                "arguments": ["c:/input/data.txt", "--quiet"],
+                "cwd": "c:/work",
+                "observe_paths": [r"\\server/share/observed"],
+            },
+        }
+    }
+    assert _operator_effect_key("execution.apply", process_upper) == _operator_effect_key(
+        "execution.apply", process_lower
+    )
+
+    posix_upper = {
+        "payload": {
+            "protocol": "jarvis.execution.v1",
+            "action": {
+                "kind": "fs.write",
+                "path": "/tmp/Foo.txt",
+                "content_base64": "aGVsbG8=",
+            },
+        }
+    }
+    posix_lower = json.loads(json.dumps(posix_upper))
+    posix_lower["payload"]["action"]["path"] = "/tmp/foo.txt"
+    assert _operator_effect_key("execution.apply", posix_upper) != _operator_effect_key(
+        "execution.apply", posix_lower
+    )
+
+
 def test_operator_execution_rejects_unrequested_effect_flags(tmp_path):
     target = tmp_path / "exact.txt"
     message = f"Create file {target} and write hello"
@@ -257,6 +384,532 @@ def test_operator_gui_and_browser_authority_rejects_extra_operands():
     )
 
 
+def test_operator_url_authority_requires_exact_scheme_host_and_path():
+    message = "Open example.com"
+    scopes = _operator_action_scopes(message)
+    for substituted in (
+        "http://example.com",
+        "https://notexample.com",
+        "https://example.com.evil.test",
+        "https://safe-example.com/path",
+        "https://example.com/unrequested",
+    ):
+        assert not _operator_tool_arguments_match(
+            "browser.open",
+            {"url": substituted},
+            message=message,
+            scopes=scopes,
+        )
+
+    explicit_http = "Open http://bank.example"
+    assert not _operator_tool_arguments_match(
+        "browser.open",
+        {"url": "https://bank.example"},
+        message=explicit_http,
+        scopes=_operator_action_scopes(explicit_http),
+    )
+
+    wiki_message = "Открой Википедию"
+    wiki_scopes = _operator_action_scopes(wiki_message)
+    assert _operator_tool_arguments_match(
+        "browser.open",
+        {"url": "https://ru.wikipedia.org/wiki/Заглавная_страница"},
+        message=wiki_message,
+        scopes=wiki_scopes,
+    )
+    for substituted in (
+        "https://wikipedia.org.evil.example/phish",
+        "https://evilwikipedia.org/phish",
+        "https://ru.wikipedia.org/wiki/Special:Random",
+    ):
+        assert not _operator_tool_arguments_match(
+            "browser.open",
+            {"url": substituted},
+            message=wiki_message,
+            scopes=wiki_scopes,
+        )
+
+
+@pytest.mark.parametrize(
+    ("message", "tool", "arguments", "scope"),
+    [
+        (
+            "Click Search at https://example.com",
+            "browser.click",
+            {"url": "https://example.com", "target": "Search"},
+            "click",
+        ),
+        (
+            "Type hello into Search at https://example.com",
+            "browser.type",
+            {"url": "https://example.com", "target": "Search", "text": "hello"},
+            "type",
+        ),
+        (
+            "Scroll down at https://example.com",
+            "browser.scroll",
+            {"url": "https://example.com", "direction": "down"},
+            "scroll",
+        ),
+        (
+            "Take screenshot at https://example.com",
+            "browser.screenshot",
+            {"url": "https://example.com"},
+            "capture",
+        ),
+    ],
+)
+def test_url_only_browser_commands_get_action_specific_authority(
+    message,
+    tool,
+    arguments,
+    scope,
+):
+    scopes = _operator_action_scopes(message)
+    assert {"explicit", "browser", scope} <= scopes
+    assert _operator_tool_arguments_match(
+        tool,
+        arguments,
+        message=message,
+        scopes=scopes,
+    )
+
+
+def test_unrelated_explicit_scope_cannot_authorize_browser_action():
+    message = "Delete Search on https://example.com"
+    scopes = _operator_action_scopes(message)
+    assert "delete" in scopes and "click" not in scopes
+    assert not _operator_tool_arguments_match(
+        "browser.click",
+        {"url": "https://example.com", "target": "Search"},
+        message=message,
+        scopes=scopes,
+    )
+
+
+def test_posix_path_authority_is_case_sensitive_and_not_prefix_based():
+    message = "Create empty file /tmp/Foo.txt"
+    scopes = _operator_action_scopes(message)
+    exact = {"path": "/tmp/Foo.txt", "content": "", "mode": "create"}
+    assert _operator_tool_arguments_match(
+        "filesystem.write_text",
+        exact,
+        message=message,
+        scopes=scopes,
+    )
+    for path in ("/tmp/foo.txt", "/tmp/Foo.tx"):
+        assert not _operator_tool_arguments_match(
+            "filesystem.write_text",
+            {**exact, "path": path},
+            message=message,
+            scopes=scopes,
+        )
+
+
+def test_operator_effect_keys_canonicalize_browser_and_native_defaults():
+    assert _operator_effect_key(
+        "browser.click",
+        {"url": "https://www.EXAMPLE.com/", "target": "Search"},
+    ) == _operator_effect_key(
+        "browser.click",
+        {
+            "url": "https://example.com",
+            "target": "Search",
+            "wait_ms": 5000,
+            "debug_url": "http://127.0.0.1:9222",
+        },
+    )
+    assert _operator_effect_key("browser.chrome.launch", {}) == _operator_effect_key(
+        "browser.chrome.launch",
+        {"debug_port": 9222},
+    )
+    assert _operator_effect_key(
+        "browser.open_many",
+        {"urls": ["https://a.example", "https://b.example"]},
+    ) == _operator_effect_key(
+        "browser.open_many",
+        {"urls": ["https://b.example/", "https://www.A.EXAMPLE"]},
+    )
+    native_minimal = {
+        "action": "app.open_and_type",
+        "payload": {
+            "executable": "notepad.exe",
+            "text": "hello",
+            "process_name": "notepad.exe",
+            "window_title": "notes.txt",
+        },
+    }
+    native_explicit = json.loads(json.dumps(native_minimal))
+    native_explicit["payload"].update(
+        {
+            "executable": "NOTEPAD.EXE",
+            "process_name": "NOTEPAD.EXE",
+            "window_title": "NOTES.TXT",
+            "wait_ms": 900,
+        }
+    )
+    native_explicit["timeout_sec"] = 30
+    assert _operator_effect_key("windows.native", native_minimal) == _operator_effect_key(
+        "windows.native",
+        native_explicit,
+    )
+
+
+def test_operator_effect_ledger_prunes_expired_completions_and_is_bounded():
+    now = datetime(2026, 7, 16, 12, 0, tzinfo=UTC)
+    requests = {
+        **{
+            f"expired-{index}": {
+                "status": "completed",
+                "completed_at": (now - timedelta(hours=1)).isoformat(),
+                "updated_at": (now - timedelta(hours=1)).isoformat(),
+                "effects": {f"effect-{index}": {}},
+            }
+            for index in range(80)
+        },
+        "recent": {
+            "status": "completed",
+            "completed_at": (now - timedelta(minutes=10)).isoformat(),
+            "updated_at": (now - timedelta(minutes=10)).isoformat(),
+            "effects": {"recent-effect": {}},
+        },
+        "unfinished": {
+            "status": "incomplete",
+            "started_at": (now - timedelta(days=2)).isoformat(),
+            "updated_at": (now - timedelta(days=2)).isoformat(),
+            "effects": {"unfinished-effect": {}},
+        },
+    }
+    ledger = {
+        "protocol": "jarvis.operator-effect-ledger.v1",
+        "conversation_id": "conv_test",
+        "requests": requests,
+    }
+
+    pruned = _prune_operator_effect_ledger(
+        ledger,
+        conversation_id="conv_test",
+        now=now,
+    )
+
+    assert set(pruned["requests"]) == {"recent", "unfinished"}
+
+    overflow = {
+        **ledger,
+        "requests": {
+            f"pending-{index}": {
+                "status": "incomplete",
+                "started_at": (now - timedelta(seconds=index)).isoformat(),
+                "updated_at": (now - timedelta(seconds=index)).isoformat(),
+                "effects": {f"effect-{index}": {}},
+            }
+            for index in range(OPERATOR_EFFECT_LEDGER_MAX_REQUESTS + 20)
+        },
+    }
+    bounded = _prune_operator_effect_ledger(
+        overflow,
+        conversation_id="conv_test",
+        now=now,
+    )
+    assert len(bounded["requests"]) == OPERATOR_EFFECT_LEDGER_MAX_REQUESTS
+    assert bounded["overflowed"] is True
+
+
+def test_operator_effect_ledger_claim_is_atomic_for_concurrent_conversation_requests(
+    monkeypatch,
+    tmp_path,
+):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    conversation_id = storage.create_conversation("concurrent idempotency")
+    contexts: list[AgentContext] = []
+    for index, digest in enumerate(("same-request", "same-request", "other-request")):
+        context = AgentContext(
+            conversation_id=conversation_id,
+            memory_hits=[],
+            file_hits=[],
+            operator_message="Click Search at https://example.com",
+            operator_scopes=frozenset({"explicit", "browser", "click"}),
+            operator_request_digest=digest,
+        )
+        context.operator_message_id = storage.add_message(
+            conversation_id=conversation_id,
+            role="user",
+            content=f"request {index}",
+        )
+        contexts.append(context)
+
+    barrier = Barrier(len(contexts))
+
+    def claim(context: AgentContext) -> bool:
+        barrier.wait()
+        return agent._begin_operator_effect(
+            context,
+            tool="browser.click",
+            effect_key="canonical-effect",
+        )
+
+    with ThreadPoolExecutor(max_workers=len(contexts)) as executor:
+        acquired = list(executor.map(claim, contexts))
+
+    assert sum(acquired) == 2
+    ledger = storage.list_runtime_values(prefix="agent.operator_effect.")[0]["value"]
+    assert set(ledger["requests"]) == {"same-request", "other-request"}
+    storage.close()
+
+
+def test_browser_effect_key_canonicalizes_typed_control_spellings_but_matcher_is_strict():
+    numeric = {
+        "url": "https://example.com",
+        "target": "Search",
+        "wait_ms": 5000,
+    }
+    string_numeric = {**numeric, "wait_ms": "5000"}
+    assert _operator_effect_key("browser.click", numeric) == _operator_effect_key(
+        "browser.click",
+        string_numeric,
+    )
+
+    message = "Click Search at https://example.com and wait 5000 ms"
+    scopes = _operator_action_scopes(message)
+    assert _operator_tool_arguments_match(
+        "browser.click",
+        numeric,
+        message=message,
+        scopes=scopes,
+    )
+    assert not _operator_tool_arguments_match(
+        "browser.click",
+        string_numeric,
+        message=message,
+        scopes=scopes,
+    )
+    assert not _operator_tool_arguments_match(
+        "browser.click",
+        {**numeric, "wait_ms": True},
+        message=message,
+        scopes=scopes,
+    )
+
+    scroll_message = "Scroll down at https://example.com"
+    scroll_scopes = _operator_action_scopes(scroll_message)
+    scroll = {
+        "url": "https://example.com",
+        "direction": "down",
+        "wait_ms": 5000,
+        "pixels": 900,
+        "passes": 3,
+        "max_chars": 9000,
+    }
+    assert _operator_tool_arguments_match(
+        "browser.scroll",
+        scroll,
+        message=scroll_message,
+        scopes=scroll_scopes,
+    )
+    for field in ("wait_ms", "pixels", "passes", "max_chars"):
+        string_control = {**scroll, field: str(scroll[field])}
+        assert _operator_effect_key("browser.scroll", scroll) == _operator_effect_key(
+            "browser.scroll",
+            string_control,
+        )
+        assert not _operator_tool_arguments_match(
+            "browser.scroll",
+            string_control,
+            message=scroll_message,
+            scopes=scroll_scopes,
+        )
+
+    typed = {
+        "url": "https://example.com",
+        "target": "Password",
+        "text": "secret",
+        "allow_sensitive": False,
+    }
+    assert _operator_effect_key("browser.type", typed) == _operator_effect_key(
+        "browser.type",
+        {**typed, "allow_sensitive": "false"},
+    )
+    sensitive_message = (
+        "Type secret into Password at https://example.com; this is sensitive"
+    )
+    sensitive_scopes = _operator_action_scopes(sensitive_message)
+    assert not _operator_tool_arguments_match(
+        "browser.type",
+        {**typed, "allow_sensitive": "false"},
+        message=sensitive_message,
+        scopes=sensitive_scopes,
+    )
+
+    chrome_message = "Open Chrome on debug port 9222"
+    chrome_scopes = _operator_action_scopes(chrome_message)
+    assert _operator_effect_key(
+        "browser.chrome.launch", {"debug_port": 9222}
+    ) == _operator_effect_key("browser.chrome.launch", {"debug_port": "9222"})
+    assert not _operator_tool_arguments_match(
+        "browser.chrome.launch",
+        {"debug_port": "9222"},
+        message=chrome_message,
+        scopes=chrome_scopes,
+    )
+
+
+def test_exact_operand_matcher_rejects_path_substrings_and_text_prefixes(tmp_path):
+    process_message = "Execute /tmp/rm_payload.sh"
+    process_scopes = _operator_action_scopes(process_message)
+    process_payload = {
+        "protocol": "jarvis.execution.v1",
+        "action": {
+            "kind": "process.run",
+            "executable": "rm",
+            "arguments": [],
+        },
+    }
+    assert not _operator_tool_arguments_match(
+        "execution.apply",
+        {"payload": process_payload},
+        message=process_message,
+        scopes=process_scopes,
+    )
+
+    exact_process_message = "Execute rm /tmp/old.txt"
+    exact_process_scopes = _operator_action_scopes(exact_process_message)
+    exact_process_payload = json.loads(json.dumps(process_payload))
+    exact_process_payload["action"]["arguments"] = ["/tmp/old.txt"]
+    assert _operator_tool_arguments_match(
+        "execution.apply",
+        {"payload": exact_process_payload},
+        message=exact_process_message,
+        scopes=exact_process_scopes,
+    )
+
+    path = tmp_path / "prefix.txt"
+    for content_message in (
+        f"Create file {path} and write hello world",
+        f'Create file {path} and write "hello world"',
+    ):
+        content_scopes = _operator_action_scopes(content_message)
+        assert not _operator_tool_arguments_match(
+            "filesystem.write_text",
+            {"path": str(path), "content": "hello", "mode": "overwrite"},
+            message=content_message,
+            scopes=content_scopes,
+        )
+        assert _operator_tool_arguments_match(
+            "filesystem.write_text",
+            {"path": str(path), "content": "hello world", "mode": "overwrite"},
+            message=content_message,
+            scopes=content_scopes,
+        )
+
+    for target_message in (
+        "Click Search settings at https://example.com",
+        'Click "Search settings" at https://example.com',
+    ):
+        target_scopes = _operator_action_scopes(target_message)
+        assert not _operator_tool_arguments_match(
+            "browser.click",
+            {"url": "https://example.com", "target": "Search"},
+            message=target_message,
+            scopes=target_scopes,
+        )
+        assert _operator_tool_arguments_match(
+            "browser.click",
+            {"url": "https://example.com", "target": "Search settings"},
+            message=target_message,
+            scopes=target_scopes,
+        )
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Move file /tmp/source.txt to /tmp/destination.txt",
+        "Перемести файл /tmp/source.txt в /tmp/destination.txt",
+    ],
+)
+def test_operator_execution_binds_source_and_destination_roles(message):
+    scopes = _operator_action_scopes(message)
+
+    def move(source: str, destination: str) -> dict:
+        return {
+            "payload": {
+                "protocol": "jarvis.execution.v1",
+                "action": {
+                    "kind": "fs.move",
+                    "source": source,
+                    "destination": destination,
+                },
+            }
+        }
+
+    assert _operator_tool_arguments_match(
+        "execution.apply",
+        move("/tmp/source.txt", "/tmp/destination.txt"),
+        message=message,
+        scopes=scopes,
+    )
+    assert not _operator_tool_arguments_match(
+        "execution.apply",
+        move("/tmp/destination.txt", "/tmp/source.txt"),
+        message=message,
+        scopes=scopes,
+    )
+
+
+def test_operator_browser_binds_quoted_text_and_target_roles():
+    message = 'Type "hello" into "Search" at https://example.com'
+    scopes = _operator_action_scopes(message)
+
+    assert _operator_tool_arguments_match(
+        "browser.type",
+        {"url": "https://example.com", "target": "Search", "text": "hello"},
+        message=message,
+        scopes=scopes,
+    )
+    assert not _operator_tool_arguments_match(
+        "browser.type",
+        {"url": "https://example.com", "target": "hello", "text": "Search"},
+        message=message,
+        scopes=scopes,
+    )
+
+
+def test_operator_open_many_rejects_duplicate_targets():
+    message = "Open https://example.com and https://www.EXAMPLE.com/"
+    scopes = _operator_action_scopes(message)
+    assert not _operator_tool_arguments_match(
+        "browser.open_many",
+        {"urls": ["https://example.com", "https://www.EXAMPLE.com/"]},
+        message=message,
+        scopes=scopes,
+    )
+
+
+def test_operator_open_many_requires_complete_explicit_url_set():
+    message = "Open https://a.example/path and https://b.example/other"
+    scopes = _operator_action_scopes(message)
+    exact = ["https://a.example/path", "https://b.example/other"]
+
+    assert _operator_tool_arguments_match(
+        "browser.open_many",
+        {"urls": exact},
+        message=message,
+        scopes=scopes,
+    )
+    assert _operator_tool_arguments_match(
+        "browser.open_many",
+        {"urls": list(reversed(exact))},
+        message=message,
+        scopes=scopes,
+    )
+    assert not _operator_tool_arguments_match(
+        "browser.open_many",
+        {"urls": exact[:1]},
+        message=message,
+        scopes=scopes,
+    )
+
+
 @pytest.mark.parametrize(
     "message",
     [
@@ -287,21 +940,31 @@ def test_questions_and_retractions_are_not_operator_commands(message):
     assert _operator_action_scopes(message) == frozenset()
 
 
-def test_full_autonomy_authorizes_scope_matched_tool_without_exact_operands():
-    """Full autonomy runs any tool whose scope the operator named, loose args ok."""
+def test_full_autonomy_never_authorizes_scope_matched_tool_without_exact_operands():
+    """The legacy flag cannot turn a broad scope into operand authority."""
     message = "а консоль открой с топ 10 процессов"
     scopes = _operator_action_scopes(message)
-    # A process view the strict operand matcher would reject (extra sort field,
-    # non-canonical shape) is authorized once full autonomy is on.
+    exact_args = {
+        "action": "console.show_processes",
+        "payload": {"limit": 10, "sort": "cpu"},
+        "timeout_sec": 30,
+    }
     loose_args = {
         "action": "console.show_processes",
         "payload": {"limit": 10, "sort": "cpu", "extra": "whatever"},
         "timeout_sec": 30,
     }
+    assert _operator_tool_arguments_match(
+        "windows.native",
+        exact_args,
+        message=message,
+        scopes=scopes,
+        full_autonomy=True,
+    )
     assert not _operator_tool_arguments_match(
         "windows.native", loose_args, message=message, scopes=scopes
     )
-    assert _operator_tool_arguments_match(
+    assert not _operator_tool_arguments_match(
         "windows.native",
         loose_args,
         message=message,
@@ -311,7 +974,7 @@ def test_full_autonomy_authorizes_scope_matched_tool_without_exact_operands():
 
 
 def test_full_autonomy_still_rejects_tool_outside_requested_scope():
-    """Full autonomy never authorizes a tool whose scope was not requested."""
+    """The compatibility flag does not grant unrelated tool authority."""
     message = "посмотри топ 3 процессов по памяти"
     scopes = _operator_action_scopes(message)
     # A read-only inspection turn must not authorize a filesystem mutation tool
@@ -335,8 +998,8 @@ def test_full_autonomy_still_rejects_tool_outside_requested_scope():
     )
 
 
-def test_full_autonomy_runs_explicit_native_command_without_approval(monkeypatch, tmp_path):
-    """The screenshot scenario: filler-led explicit commands execute, no approval."""
+def test_exact_current_turn_native_command_executes_without_approval(monkeypatch, tmp_path):
+    """Filler-led explicit commands still execute after exact operand matching."""
     agent, storage = _agent_without_llm(monkeypatch, tmp_path)
     calls: list[dict] = []
     monkeypatch.setattr(
@@ -359,7 +1022,7 @@ def test_full_autonomy_runs_explicit_native_command_without_approval(monkeypatch
     storage.close()
 
 
-def test_full_autonomy_can_be_disabled_by_env(monkeypatch, tmp_path):
+def test_legacy_full_autonomy_setting_remains_parseable(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setenv("JARVIS_OPERATOR_FULL_AUTONOMY", "0")
     settings = load_settings()
@@ -452,6 +1115,22 @@ def test_agent_creates_mission_from_large_goal(monkeypatch, tmp_path):
     mission = storage.get_mission(response.mission_id)
     task_titles = [task["title"] for task in mission["tasks"]]
     assert any("Command Center" in title for title in task_titles)
+    storage.close()
+
+
+def test_agent_forwards_reserved_mission_id_through_planned_fallback(monkeypatch, tmp_path):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    reserved_id = "mis_reserved_agent_1234"
+
+    mission = asyncio.run(
+        agent.create_mission_planned(
+            "Build a reliable local runtime",
+            mission_id=reserved_id,
+        )
+    )
+
+    assert mission["id"] == reserved_id
+    assert storage.get_mission(reserved_id) is not None
     storage.close()
 
 
@@ -2712,7 +3391,9 @@ def test_agent_searches_and_opens_selected_shopping_result_in_same_turn(monkeypa
 
     monkeypatch.setattr(agent.tools, "run", fake_run)
 
-    response = asyncio.run(agent.chat("найди и открой самую дешёвую RTX 5090"))
+    message = "найди и открой самую дешёвую RTX 5090"
+    response = asyncio.run(agent.chat(message))
+    retry = asyncio.run(agent.chat(message, conversation_id=response.conversation_id))
 
     open_calls = [call for call in calls if call[0] == "browser.open"]
     assert len(open_calls) == 1
@@ -2724,6 +3405,8 @@ def test_agent_searches_and_opens_selected_shopping_result_in_same_turn(monkeypa
     assert "https://shop.example/cheap" in response.answer
     event = next(event for event in response.events if event.payload.get("derived_selection"))
     assert event.payload["authority"] == "operator_turn"
+    assert retry.answer == response.answer
+    assert any(event.title == "Idempotent response replay" for event in retry.events)
     storage.close()
 
 
@@ -3975,6 +4658,32 @@ def test_reasoning_arbiter_can_promote_research_to_mission(monkeypatch, tmp_path
     storage.close()
 
 
+def test_explicit_mission_creation_is_reserved_and_exact_retry_is_cached(
+    monkeypatch, tmp_path
+):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    prompt = (
+        "Создай миссию: проверить состояние локального runtime, собрать диагностику "
+        "и подготовить итоговый отчёт по результатам."
+    )
+
+    first = asyncio.run(agent.chat(prompt, mode="mission"))
+    retry = asyncio.run(
+        agent.chat(prompt, conversation_id=first.conversation_id, mode="mission")
+    )
+
+    assert first.mission_id is not None
+    assert first.mission_id.startswith("mis_op_")
+    assert len(storage.list_missions(limit=10)) == 1
+    assert retry.answer == first.answer
+    assert any(event.title == "Idempotent response replay" for event in retry.events)
+    ledger = storage.list_runtime_values(prefix="agent.operator_effect.")[0]["value"]
+    request = next(iter(ledger["requests"].values()))
+    assert request["status"] == "completed"
+    assert next(iter(request["effects"].values()))["tool"] == "mission.create"
+    storage.close()
+
+
 def test_intent_router_receives_operator_persona_context(monkeypatch, tmp_path):
     from jarvis_gpt.persona import PersonaManager
 
@@ -4998,6 +5707,41 @@ def test_rb3_unambiguous_exact_path_markdown_routes_to_generate(monkeypatch, tmp
     assert "hello acceptance RB3" in expected.read_text(encoding="utf-8")
     assert "exact-path-1.md" in response.answer
     assert str(expected) in response.answer or expected.name in response.answer
+    storage.close()
+
+
+def test_streamed_direct_document_is_claimed_before_write_and_retry_is_cached(
+    monkeypatch, tmp_path
+):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    calls: list[str] = []
+    real_run = agent.tools.run
+
+    async def tracked_run(name, arguments=None, **kwargs):
+        calls.append(name)
+        return await real_run(name, arguments, **kwargs)
+
+    monkeypatch.setattr(agent.tools, "run", tracked_run)
+    prompt = (
+        "Create a new markdown file named streamed-exact.md in document-outputs "
+        "with content: one durable streamed artifact"
+    )
+
+    streamed = asyncio.run(_collect(agent.stream_chat(prompt)))
+    done = next(item for item in streamed if item["type"] == "done")
+    retry = asyncio.run(
+        agent.chat(prompt, conversation_id=done["conversation_id"])
+    )
+
+    assert calls.count("documents.generate") == 1
+    assert retry.answer == done["answer"]
+    assert any(event.title == "Idempotent response replay" for event in retry.events)
+    output = Path(agent.settings.data_dir) / "document-outputs" / "streamed-exact.md"
+    assert "one durable streamed artifact" in output.read_text(encoding="utf-8")
+    ledger = storage.list_runtime_values(prefix="agent.operator_effect.")[0]["value"]
+    request = next(iter(ledger["requests"].values()))
+    assert request["status"] == "completed"
+    assert next(iter(request["effects"].values()))["tool"] == "documents.generate"
     storage.close()
 
 

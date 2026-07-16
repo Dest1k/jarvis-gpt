@@ -1571,7 +1571,8 @@ Claude Sync Note
   filesystem diff, timing, interrupt/kill flags, and error.
 - Host bridge contract `action.v1`: authenticated `POST /action` request
   `{"action":string,"payload":object,"timeout_sec":integer}`. Allowed actions are
-  `capabilities`, `app.open_and_type`, `process.start`, `chrome.launch`, `url.open`,
+  `capabilities`, `app.open_and_type`, `process.start`, `chrome.launch_guarded`,
+  `browser.open_guarded`,
   `window.list`, `window.focus`, `keyboard.send`, `screen.capture`, and `wmi.query`.
   `/execute` returns 410 and `host.bridge.execute` is no longer registered.
 - Policy environment: `JARVIS_EXECUTION_ROOTS`,
@@ -1804,7 +1805,7 @@ Claude Sync Note
   console view). Both accept only `limit=1..50` and `sort=cpu|memory|name|pid`; sorting occurs
   before limiting. The console action launches canonical Windows PowerShell with a fixed
   encoded script, `shell=False`, and independent PID/name verification. Raw command text is
-  never accepted. Bridge policy is now `native-app-v2`.
+  never accepted. Bridge policy is now `native-app-v3`.
 - Russian requests such as `открой топ 10 процессов в консоли` route deterministically to the
   fixed action and continue to a factual result. Plain top-process requests use the safe
   `system.inspect/process.top` path.

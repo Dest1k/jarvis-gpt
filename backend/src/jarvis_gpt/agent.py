@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import inspect
 import json
+import ntpath
 import os
 import re
 import time
@@ -41,6 +42,7 @@ from .executive_runtime import (
     validate_mission_decomposition,
     validate_mission_goal_coverage,
 )
+from .experience import DEFAULT_AUTONOMY_POLICY
 from .llm import LLMRouter
 from .models import (
     ChatEvent,
@@ -269,8 +271,26 @@ MISSION_MARKERS = (
 # extraction, and its writes are single-fact, deduplicated, capped per field,
 # audit-logged and editable from Command Center.
 DEFAULT_MAX_TOOL_STEPS = 4
+OPERATOR_EFFECT_COMPLETED_TTL_SECONDS = 20 * 60
+OPERATOR_EFFECT_LEDGER_MAX_REQUESTS = 64
 AGENTIC_TOOL_DENYLIST = frozenset(
-    {"memory.save", "learning.tick", "mission.brief", "browser.open", "browser.open_many"}
+    {"memory.save", "learning.tick", "mission.brief"}
+)
+# Tool metadata describes review risk, not whether a successful call persists a
+# durable mutation.  Keep that second property explicit so a newly added
+# danger_level="safe" document writer cannot silently bypass the operator-effect
+# ledger merely because it is low-risk.
+AGENTIC_DURABLE_MUTATORS = frozenset(
+    {
+        "documents.generate",
+        "documents.convert",
+        "documents.archive.create",
+        "documents.archive.extract",
+        "documents.apply_replacements",
+        "filesystem.write_text",
+        "filesystem.mkdir",
+        "mission.brief",
+    }
 )
 SAFE_DIRECT_NATIVE_ACTIONS = frozenset(
     {"capabilities", "process.top", "screen.capture", "window.list", "wmi.query"}
@@ -412,6 +432,15 @@ class AgentContext:
     operator_message_id: str | None = None
     operator_scopes: frozenset[str] = dataclass_field(default_factory=frozenset)
     operator_used_effects: set[str] = dataclass_field(default_factory=set)
+    # A review/mutation can outlive the LLM round that requested it.  Keep the
+    # exact request/effect identity separately from the ephemeral message id so
+    # a client retry after a crash or synthesis outage cannot replay it.
+    operator_request_digest: str | None = None
+    operator_retry_effects: set[str] = dataclass_field(default_factory=set)
+    operator_started_effects: set[str] = dataclass_field(default_factory=set)
+    operator_uncertain_effects: set[str] = dataclass_field(default_factory=set)
+    operator_retry_source_message_id: str | None = None
+    operator_cached_answer: str | None = None
     # RB-2: side-effect admission is decided before mission/artifact/tool mutation.
     side_effects_admitted: bool = True
     pending_clarification_goal: str | None = None
@@ -495,6 +524,78 @@ class _AgenticResult:
     continuation_count: int = 0
     used_tools: int = 0
     executed_tools: tuple[_ExecutedToolResult, ...] = ()
+
+
+def _agentic_recovery_answer(
+    executed_tools: list[_ExecutedToolResult],
+    approval_ids: list[str],
+    *,
+    reason: str,
+) -> str:
+    """Report durable outcomes when final LLM synthesis is unavailable.
+
+    Once a tool has returned, replacing its outcome with a generic offline
+    answer invites the operator or a client to submit the task again. This
+    deterministic summary makes the incomplete state explicit and never claims
+    that the overall task finished.
+    """
+
+    lines: list[str] = []
+    if approval_ids:
+        lines.append(
+            "Исполнение остановлено и ожидает точного подтверждения: "
+            + ", ".join(approval_ids[:4])
+            + "."
+        )
+    if executed_tools:
+        lines.append("До остановки зафиксированы результаты инструментов:")
+        for item in executed_tools[-6:]:
+            uncertain = _tool_result_outcome_unknown(item.result.data)
+            state = (
+                "исход неизвестен — нужна сверка состояния"
+                if uncertain
+                else "успешно"
+                if item.result.ok
+                else "ошибка"
+            )
+            summary = " ".join(item.result.summary.split())[:500]
+            try:
+                effect_id = _stable_json_sha256(item.arguments)[:12]
+            except (TypeError, ValueError):
+                effect_id = "unavailable"
+            lines.append(
+                f"- {item.tool} [effect={effect_id}] — {state}: {summary}"
+            )
+        if len(executed_tools) > 6:
+            lines.append(
+                f"Ещё {len(executed_tools) - 6} более ранних результатов здесь не "
+                "перечислены; проверь журнал и audit_status, а при разрыве аудита — "
+                "сверь целевое состояние."
+            )
+    if reason == "protocol_error":
+        lines.append(
+            "Следующий служебный вызов модели был некорректен и не исполнялся."
+        )
+    else:
+        lines.append(
+            "Финальное объяснение модели недоступно; завершение всей задачи не подтверждено."
+        )
+    if executed_tools:
+        lines.append(
+            "Уже выполненные действия автоматически не повторяю; перед повтором нужно "
+            "сверить текущее состояние."
+        )
+    return "\n".join(lines)
+
+
+def _tool_result_outcome_unknown(value: Any) -> bool:
+    if isinstance(value, dict):
+        if value.get("outcome_known") is False:
+            return True
+        return any(_tool_result_outcome_unknown(item) for item in value.values())
+    if isinstance(value, list | tuple):
+        return any(_tool_result_outcome_unknown(item) for item in value)
+    return False
 
 
 def _normalize_chat_attachments(attachments: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
@@ -703,6 +804,57 @@ class AgentRuntime:
         context = self._prepare_context(context_message, conversation_id)
         context.operator_message = message
         context.operator_scopes = _operator_action_scopes(message)
+        self._bind_operator_request_identity(
+            context,
+            message=message,
+            mode=mode,
+            attachments=attachments,
+        )
+        if context.operator_cached_answer is not None:
+            context.operator_message_id = self.storage.add_message(
+                conversation_id=context.conversation_id,
+                role="user",
+                content=message,
+                metadata=_chat_message_metadata(
+                    max_tokens=max_tokens,
+                    mode=mode,
+                    temperature=temperature,
+                    attachments=attachments,
+                    thinking_enabled=thinking_enabled,
+                ),
+            )
+            replay_event = ChatEvent(
+                type="thought",
+                title="Idempotent response replay",
+                content=(
+                    "Возвращаю сохранённый итог точного недавнего запроса; "
+                    "его действия повторно не отправлялись."
+                ),
+                payload={
+                    "replayed": True,
+                    "mutation_replayed": False,
+                    "source_user_message_id": context.operator_retry_source_message_id,
+                },
+            )
+            await self._emit(replay_event)
+            duration_ms = _elapsed_ms(started_at)
+            message_id = self.storage.add_message(
+                conversation_id=context.conversation_id,
+                role="assistant",
+                content=context.operator_cached_answer,
+                metadata={
+                    "duration_ms": duration_ms,
+                    "source": "idempotent_response_replay",
+                    "events": [replay_event.model_dump()],
+                },
+            )
+            return ChatResponse(
+                conversation_id=context.conversation_id,
+                message_id=message_id,
+                answer=context.operator_cached_answer,
+                events=[replay_event],
+                duration_ms=duration_ms,
+            )
         if attachments:
             context.file_hits = _merge_file_hits(
                 self._attached_file_hits(attachments),
@@ -835,6 +987,7 @@ class AgentRuntime:
         if context.resumed_from_clarification:
             resumed = await self._try_clarified_artifact_action(message, context)
             if resumed is not None:
+                self._complete_operator_effect_turn(context, answer=resumed.answer)
                 for event in resumed.events:
                     events.append(event)
                     await self._emit(event)
@@ -860,6 +1013,7 @@ class AgentRuntime:
         # RB-3: complete NEW_ARTIFACT_REQUEST binds exact path before shopping/recall.
         direct_artifact = await self._try_direct_new_artifact_action(message, context)
         if direct_artifact is not None:
+            self._complete_operator_effect_turn(context, answer=direct_artifact.answer)
             for event in direct_artifact.events:
                 events.append(event)
                 await self._emit(event)
@@ -892,6 +1046,10 @@ class AgentRuntime:
             for event in direct_action.events:
                 events.append(event)
                 await self._emit(event)
+            self._complete_operator_effect_turn(
+                context,
+                answer=direct_action.answer,
+            )
             duration_ms = _elapsed_ms(started_at)
             message_id = self.storage.add_message(
                 conversation_id=context.conversation_id,
@@ -1033,8 +1191,43 @@ class AgentRuntime:
                     events=events,
                     duration_ms=duration_ms,
                 )
-            mission = await self.create_mission_planned(message)
+            mission = await self._create_operator_mission_planned(message, context)
+            if mission is None:
+                answer = (
+                    "Точное создание этой миссии уже закреплено за другой "
+                    "незавершённой попыткой. Новую миссию не создаю: сначала "
+                    "нужно сверить зарезервированный результат."
+                )
+                events.append(
+                    ChatEvent(
+                        type="thought",
+                        title="Mission creation already in flight",
+                        content=answer,
+                        payload={"replayed": False, "outcome_known": False},
+                    )
+                )
+                await self._emit(events[-1])
+                duration_ms = _elapsed_ms(started_at)
+                message_id = self.storage.add_message(
+                    conversation_id=context.conversation_id,
+                    role="assistant",
+                    content=answer,
+                    metadata={
+                        "duration_ms": duration_ms,
+                        "source": "mission_effect_fenced",
+                        "mission_created": False,
+                        "events": [event.model_dump() for event in events],
+                    },
+                )
+                return ChatResponse(
+                    conversation_id=context.conversation_id,
+                    message_id=message_id,
+                    answer=answer,
+                    events=events,
+                    duration_ms=duration_ms,
+                )
             answer = self._mission_answer(mission)
+            self._complete_operator_effect_turn(context, answer=answer)
             events.append(
                 ChatEvent(
                     type="mission",
@@ -1128,6 +1321,9 @@ class AgentRuntime:
             verification_payload: dict[str, Any] | None = None
             if (
                 finish_reason != "length"
+                and not str(finish_reason or "").startswith(
+                    ("protocol_error", "synthesis_error")
+                )
                 and not agentic.blocked_by_approval
                 and self._verification_enabled()
                 and self._answer_worth_verifying(answer, agentic.used_tools)
@@ -1160,7 +1356,13 @@ class AgentRuntime:
                     "увеличь лимит токенов или попроси продолжить]"
                 )
             done_payload: dict[str, Any] = {
-                "source": "llm",
+                "source": (
+                    "tool_fallback"
+                    if str(finish_reason or "").startswith(
+                        ("protocol_error", "synthesis_error", "awaiting_approval")
+                    )
+                    else "llm"
+                ),
                 "finish_reason": finish_reason,
                 "tool_steps": agentic.used_tools,
                 "continuations": agentic.continuation_count,
@@ -1184,6 +1386,14 @@ class AgentRuntime:
                     payload={"source": "fallback"},
                 )
             )
+        if (
+            agentic.ok
+            and agentic.answer
+            and not str(agentic.finish_reason or "").startswith(
+                ("protocol_error", "synthesis_error")
+            )
+        ):
+            self._complete_operator_effect_turn(context, answer=answer)
         await self._emit(events[-1])
         duration_ms = _elapsed_ms(started_at)
         message_id = self.storage.add_message(
@@ -1220,6 +1430,64 @@ class AgentRuntime:
         context = self._prepare_context(context_message, conversation_id)
         context.operator_message = message
         context.operator_scopes = _operator_action_scopes(message)
+        self._bind_operator_request_identity(
+            context,
+            message=message,
+            mode=mode,
+            attachments=attachments,
+        )
+        if context.operator_cached_answer is not None:
+            yield {"type": "meta", "conversation_id": context.conversation_id}
+            context.operator_message_id = self.storage.add_message(
+                conversation_id=context.conversation_id,
+                role="user",
+                content=message,
+                metadata=_chat_message_metadata(
+                    max_tokens=max_tokens,
+                    mode=mode,
+                    temperature=temperature,
+                    attachments=attachments,
+                    thinking_enabled=thinking_enabled,
+                ),
+            )
+            replay_event = ChatEvent(
+                type="thought",
+                title="Idempotent response replay",
+                content=(
+                    "Возвращаю сохранённый итог точного недавнего запроса; "
+                    "его действия повторно не отправлялись."
+                ),
+                payload={
+                    "replayed": True,
+                    "mutation_replayed": False,
+                    "source_user_message_id": context.operator_retry_source_message_id,
+                },
+            )
+            await self._emit(replay_event)
+            yield {"type": "event", "event": replay_event.model_dump()}
+            yield {"type": "delta", "content": context.operator_cached_answer}
+            duration_ms = _elapsed_ms(started_at)
+            message_id = self.storage.add_message(
+                conversation_id=context.conversation_id,
+                role="assistant",
+                content=context.operator_cached_answer,
+                metadata={
+                    "duration_ms": duration_ms,
+                    "source": "idempotent_response_replay",
+                    "events": [replay_event.model_dump()],
+                    "stream": True,
+                },
+            )
+            yield {
+                "type": "done",
+                "answer": context.operator_cached_answer,
+                "conversation_id": context.conversation_id,
+                "duration_ms": duration_ms,
+                "events": [replay_event.model_dump()],
+                "message_id": message_id,
+                "source": "idempotent_response_replay",
+            }
+            return
         if attachments:
             context.file_hits = _merge_file_hits(
                 self._attached_file_hits(attachments),
@@ -1346,6 +1614,7 @@ class AgentRuntime:
         if context.resumed_from_clarification:
             resumed = await self._try_clarified_artifact_action(message, context)
             if resumed is not None:
+                self._complete_operator_effect_turn(context, answer=resumed.answer)
                 for event in resumed.events:
                     events.append(event)
                     await self._emit(event)
@@ -1375,6 +1644,7 @@ class AgentRuntime:
         # RB-3: complete NEW_ARTIFACT_REQUEST binds exact path before shopping/recall.
         direct_artifact = await self._try_direct_new_artifact_action(message, context)
         if direct_artifact is not None:
+            self._complete_operator_effect_turn(context, answer=direct_artifact.answer)
             for event in direct_artifact.events:
                 events.append(event)
                 await self._emit(event)
@@ -1413,6 +1683,10 @@ class AgentRuntime:
                 events.append(event)
                 await self._emit(event)
                 yield {"type": "event", "event": event.model_dump()}
+            self._complete_operator_effect_turn(
+                context,
+                answer=direct_action.answer,
+            )
             yield {"type": "delta", "content": direct_action.answer}
             duration_ms = _elapsed_ms(started_at)
             message_id = self.storage.add_message(
@@ -1558,8 +1832,48 @@ class AgentRuntime:
                     "mission_created": False,
                 }
                 return
-            mission = await self.create_mission_planned(message)
+            mission = await self._create_operator_mission_planned(message, context)
+            if mission is None:
+                answer = (
+                    "Точное создание этой миссии уже закреплено за другой "
+                    "незавершённой попыткой. Новую миссию не создаю: сначала "
+                    "нужно сверить зарезервированный результат."
+                )
+                events.append(
+                    ChatEvent(
+                        type="thought",
+                        title="Mission creation already in flight",
+                        content=answer,
+                        payload={"replayed": False, "outcome_known": False},
+                    )
+                )
+                await self._emit(events[-1])
+                yield {"type": "event", "event": events[-1].model_dump()}
+                yield {"type": "delta", "content": answer}
+                duration_ms = _elapsed_ms(started_at)
+                message_id = self.storage.add_message(
+                    conversation_id=context.conversation_id,
+                    role="assistant",
+                    content=answer,
+                    metadata={
+                        "duration_ms": duration_ms,
+                        "source": "mission_effect_fenced",
+                        "mission_created": False,
+                        "events": [event.model_dump() for event in events],
+                    },
+                )
+                yield {
+                    "type": "done",
+                    "answer": answer,
+                    "conversation_id": context.conversation_id,
+                    "duration_ms": duration_ms,
+                    "events": [event.model_dump() for event in events],
+                    "message_id": message_id,
+                    "mission_created": False,
+                }
+                return
             answer = self._mission_answer(mission)
+            self._complete_operator_effect_turn(context, answer=answer)
             events.append(
                 ChatEvent(
                     type="mission",
@@ -1657,8 +1971,11 @@ class AgentRuntime:
         answer_parts: list[str] = []
         stream_error: str | None = None
         stream_finish_reason: str | None = None
+        recovery_error: str | None = None
         used_tools = 0
         blocked_by_approval = False
+        approval_ids: list[str] = []
+        executed_tools: list[_ExecutedToolResult] = []
         tools = self._tools_for_context(context)
         allowed = {info.name for info in tools}
         messages = list(llm_messages)
@@ -1733,7 +2050,20 @@ class AgentRuntime:
                 round_parts, round_error, round_finish = await collect_round(messages)
                 raw = "".join(round_parts)
                 if round_error:
-                    stream_error = round_error
+                    if executed_tools or approval_ids:
+                        recovery_error = round_error
+                        stream_finish_reason = (
+                            "awaiting_approval" if approval_ids else "synthesis_error"
+                        )
+                        recovery = _agentic_recovery_answer(
+                            executed_tools,
+                            approval_ids,
+                            reason="synthesis_error",
+                        )
+                        answer_parts.append(recovery)
+                        yield {"type": "delta", "content": recovery}
+                    else:
+                        stream_error = round_error
                     break
                 turn = _classify_tool_turn(raw)
                 if (
@@ -1757,9 +2087,18 @@ class AgentRuntime:
                             {"role": "system", "content": TOOL_PROTOCOL_CORRECTION_PROMPT}
                         )
                         continue
-                    answer_parts.append(TOOL_PROTOCOL_FAILURE_ANSWER)
+                    recovery = (
+                        _agentic_recovery_answer(
+                            executed_tools,
+                            approval_ids,
+                            reason="protocol_error",
+                        )
+                        if executed_tools or approval_ids
+                        else TOOL_PROTOCOL_FAILURE_ANSWER
+                    )
+                    answer_parts.append(recovery)
                     stream_finish_reason = "protocol_error"
-                    yield {"type": "delta", "content": TOOL_PROTOCOL_FAILURE_ANSWER}
+                    yield {"type": "delta", "content": recovery}
                     break
                 if turn.kind == "answer":
                     stream_finish_reason = round_finish
@@ -1771,12 +2110,18 @@ class AgentRuntime:
                     break
                 action = turn.action
                 assert action is not None
-                observation, event, _executed = await self._run_agentic_tool(
+                observation, event, executed = await self._run_agentic_tool(
                     *action, allowed, context
                 )
                 await self._emit(event)
                 events.append(event)
                 yield {"type": "event", "event": event.model_dump()}
+                if executed is not None:
+                    executed_tools.append(executed)
+                if event.type == "approval":
+                    approval_id = event.payload.get("approval_id") if event.payload else None
+                    if isinstance(approval_id, str):
+                        approval_ids.append(approval_id)
                 used_tools += 1
                 messages.append({"role": "assistant", "content": raw})
                 messages.append({"role": "user", "content": observation})
@@ -1791,14 +2136,39 @@ class AgentRuntime:
                 )
                 raw = "".join(round_parts)
                 if round_error:
-                    stream_error = round_error
+                    if executed_tools or approval_ids:
+                        recovery_error = round_error
+                        stream_finish_reason = (
+                            "awaiting_approval" if approval_ids else "synthesis_error"
+                        )
+                        recovery = _agentic_recovery_answer(
+                            executed_tools,
+                            approval_ids,
+                            reason="synthesis_error",
+                        )
+                        answer_parts.append(recovery)
+                        yield {"type": "delta", "content": recovery}
+                    else:
+                        stream_error = round_error
                 else:
                     turn = _classify_tool_turn(raw)
                     answer = (
-                        turn.text if turn.kind == "answer" else TOOL_PROTOCOL_FAILURE_ANSWER
+                        turn.text
+                        if turn.kind == "answer"
+                        else _agentic_recovery_answer(
+                            executed_tools,
+                            approval_ids,
+                            reason="protocol_error",
+                        )
+                        if executed_tools or approval_ids
+                        else TOOL_PROTOCOL_FAILURE_ANSWER
                     )
                     stream_finish_reason = (
-                        round_finish if turn.kind == "answer" else "protocol_error"
+                        "awaiting_approval"
+                        if turn.kind == "answer" and approval_ids
+                        else round_finish
+                        if turn.kind == "answer"
+                        else "protocol_error"
                     )
                     visible_parts = (
                         round_parts if turn.kind == "answer" and turn.text == raw else [answer]
@@ -1844,6 +2214,9 @@ class AgentRuntime:
             if (
                 not stream_error
                 and stream_finish_reason != "length"
+                and not str(stream_finish_reason or "").startswith(
+                    ("protocol_error", "synthesis_error", "awaiting_approval")
+                )
                 and not blocked_by_approval
                 and self._verification_enabled()
                 and self._answer_worth_verifying(answer, used_tools)
@@ -1873,12 +2246,22 @@ class AgentRuntime:
                     answer = verified_answer
                     yield {"type": "delta", "content": addition}
             done_payload: dict[str, Any] = {
-                "source": "llm",
+                "source": (
+                    "tool_fallback"
+                    if str(stream_finish_reason or "").startswith(
+                        ("protocol_error", "synthesis_error", "awaiting_approval")
+                    )
+                    else "llm"
+                ),
                 "stream": True,
                 "finish_reason": stream_finish_reason,
                 "tool_steps": used_tools,
                 "continuations": continuation_count,
             }
+            if approval_ids:
+                done_payload["approval_ids"] = approval_ids
+            if recovery_error:
+                done_payload["recovery_error"] = recovery_error
             if verification_payload is not None:
                 done_payload["verification"] = verification_payload
             events.append(
@@ -1899,6 +2282,15 @@ class AgentRuntime:
                     payload={"source": "fallback", "stream": True},
                 )
             )
+
+        if (
+            answer_parts
+            and not stream_error
+            and not str(stream_finish_reason or "").startswith(
+                ("protocol_error", "synthesis_error")
+            )
+        ):
+            self._complete_operator_effect_turn(context, answer=answer)
 
         await self._emit(events[-1])
         yield {"type": "event", "event": events[-1].model_dump()}
@@ -1922,12 +2314,134 @@ class AgentRuntime:
             "message_id": message_id,
         }
 
+    def _reserved_operator_mission_id(
+        self,
+        context: AgentContext,
+    ) -> str:
+        """Derive a retry-stable mission id without making it permanent forever.
+
+        During the bounded response-replay window, an exact transport retry is
+        bound to the original user-message id.  Once that window expires, the
+        same words are a deliberate new request and receive a new reservation.
+        """
+
+        source_message_id = (
+            context.operator_retry_source_message_id or context.operator_message_id or ""
+        )
+        identity = _stable_json_sha256(
+            {
+                "conversation_id": context.conversation_id,
+                "request_digest": context.operator_request_digest,
+                "source_user_message_id": source_message_id,
+            }
+        )
+        return f"mis_op_{identity[:40]}"
+
+    async def _create_operator_mission_planned(
+        self,
+        goal: str,
+        context: AgentContext,
+    ) -> dict[str, Any] | None:
+        """Claim and create one exact explicit mission, or fail closed as busy.
+
+        The deterministic id lets a restarted process verify the only durable
+        outcome that may safely be adopted: that exact id already exists with
+        the exact same goal.  An in-flight claim with no verifiable mission is
+        never replayed automatically.
+        """
+
+        mission_id = self._reserved_operator_mission_id(context)
+        effect_key = _operator_effect_key(
+            "mission.create",
+            {"mission_id": mission_id, "goal": goal},
+        )
+
+        def verified_existing() -> dict[str, Any] | None:
+            existing = self.storage.get_mission(mission_id)
+            if existing is None:
+                return None
+            if str(existing.get("goal") or "") != goal:
+                raise RuntimeError(
+                    "reserved mission id is bound to a different goal; creation blocked"
+                )
+            if self.executive is not None:
+                self.executive.ensure_for_mission(existing)
+                existing = self.storage.get_mission(mission_id) or existing
+            return existing
+
+        mission = verified_existing()
+        if mission is not None:
+            self._record_operator_effect_outcome(
+                context,
+                effect_key=effect_key,
+                result=ToolRunResponse(
+                    tool="mission.create",
+                    ok=True,
+                    summary=f"Verified existing mission {mission_id} for the exact goal.",
+                    data={"mission_id": mission_id, "outcome_known": True},
+                ),
+                reconcile_existing=True,
+            )
+            return mission
+
+        if not self._begin_operator_effect(
+            context,
+            tool="mission.create",
+            effect_key=effect_key,
+        ):
+            # Close the narrow commit/visibility race without ever issuing a
+            # second create.  If the winner has not committed yet, the caller
+            # reports an in-flight reconciliation requirement.
+            mission = verified_existing()
+            if mission is None:
+                return None
+            self._record_operator_effect_outcome(
+                context,
+                effect_key=effect_key,
+                result=ToolRunResponse(
+                    tool="mission.create",
+                    ok=True,
+                    summary=f"Verified concurrently created mission {mission_id}.",
+                    data={"mission_id": mission_id, "outcome_known": True},
+                ),
+                reconcile_existing=True,
+            )
+            return mission
+
+        context.operator_used_effects.add(effect_key)
+        try:
+            mission = await self.create_mission_planned(goal, mission_id=mission_id)
+        except BaseException:
+            # Storage may have committed immediately before a later subsystem
+            # raised.  Adopt only the exact deterministic resource; otherwise
+            # leave the pre-dispatch claim incomplete and fail closed.
+            mission = verified_existing()
+            if mission is None:
+                raise
+        if (
+            str(mission.get("id") or "") != mission_id
+            or str(mission.get("goal") or "") != goal
+        ):
+            raise RuntimeError("mission creation returned an unbound durable outcome")
+        self._record_operator_effect_outcome(
+            context,
+            effect_key=effect_key,
+            result=ToolRunResponse(
+                tool="mission.create",
+                ok=True,
+                summary=f"Mission {mission_id} created for the exact goal.",
+                data={"mission_id": mission_id, "outcome_known": True},
+            ),
+        )
+        return mission
+
     def create_mission(
         self,
         goal: str,
         title: str | None = None,
         *,
         decomposition: MissionDecomposition | None = None,
+        mission_id: str | None = None,
     ) -> dict[str, Any]:
         # RB-2: never persist a mission while the deliverable still needs clarification.
         if _requires_side_effect_clarification(goal):
@@ -1946,11 +2460,12 @@ class AgentRuntime:
             title=mission_title,
             goal=goal,
             tasks=[item.title for item in selected.steps],
+            mission_id=mission_id,
         )
         executive_plan = None
         if self.executive is not None:
             try:
-                executive_plan = self.executive.create_for_mission(
+                executive_plan = self.executive.ensure_for_mission(
                     mission,
                     decomposition=selected,
                 )
@@ -1982,6 +2497,8 @@ class AgentRuntime:
         self,
         goal: str,
         title: str | None = None,
+        *,
+        mission_id: str | None = None,
     ) -> dict[str, Any]:
         """Create a mission from a validated LLM DAG or deterministic fallback.
 
@@ -1995,7 +2512,7 @@ class AgentRuntime:
             or self.executive is None
             or not hasattr(self.llm, "complete")
         ):
-            return self.create_mission(goal, title=title)
+            return self.create_mission(goal, title=title, mission_id=mission_id)
         try:
             response = await self._complete_llm(
                 [
@@ -2018,9 +2535,9 @@ class AgentRuntime:
                 thinking_enabled=False,
             )
         except Exception:  # noqa: BLE001 - deterministic planning remains available
-            return self.create_mission(goal, title=title)
+            return self.create_mission(goal, title=title, mission_id=mission_id)
         if not response.ok or not response.content.strip():
-            return self.create_mission(goal, title=title)
+            return self.create_mission(goal, title=title, mission_id=mission_id)
         try:
             payload = json.loads(response.content)
         except json.JSONDecodeError as exc:
@@ -2030,6 +2547,7 @@ class AgentRuntime:
             goal,
             title=title,
             decomposition=decomposition,
+            mission_id=mission_id,
         )
 
     async def execute_next_mission_step(self, mission_id: str) -> MissionExecutionResponse:
@@ -2454,13 +2972,12 @@ class AgentRuntime:
     def _mission_run_budget(self, max_steps: int | None) -> int:
         if max_steps is not None:
             return max(1, min(24, int(max_steps)))
-        policy = self.storage.get_runtime_value("experience.autonomy_policy", {})
+        policy = self._autonomy_policy()
         steps = 6
-        if isinstance(policy, dict):
-            try:
-                steps = int(policy.get("max_autonomous_steps", steps))
-            except (TypeError, ValueError):
-                steps = 6
+        try:
+            steps = int(policy.get("max_autonomous_steps", steps))
+        except (TypeError, ValueError):
+            steps = 6
         return max(1, min(24, steps))
 
     async def _execute_mission_step_agentic(
@@ -2524,7 +3041,15 @@ class AgentRuntime:
         summary = agentic.answer.strip() if agentic.answer else ""
         if not summary:
             summary = agentic.error or "Шаг не удалось выполнить: модель не вернула результат."
-        step_ok = agentic.ok and bool(agentic.answer) and not agentic.blocked_by_approval
+        incomplete_finish = str(agentic.finish_reason or "").startswith(
+            ("protocol_error", "synthesis_error", "awaiting_approval")
+        )
+        step_ok = (
+            agentic.ok
+            and bool(agentic.answer)
+            and not agentic.blocked_by_approval
+            and not incomplete_finish
+        )
         verification_payload: dict[str, Any] | None = None
         if step_ok and self._verification_enabled():
             # Mission steps are always substantive: check the report against the
@@ -2581,7 +3106,10 @@ class AgentRuntime:
                         executed.result,
                         outcome_tool=result.tool,
                         action_arguments=executed.arguments,
-                        read_only=(executed.tool in EXECUTIVE_AUTONOMOUS_TOOL_ALLOWLIST),
+                        read_only=(
+                            executed.tool in EXECUTIVE_AUTONOMOUS_TOOL_ALLOWLIST
+                            and executed.tool not in AGENTIC_DURABLE_MUTATORS
+                        ),
                     )
                 except (KeyError, TypeError, ValueError):
                     continue
@@ -2648,13 +3176,33 @@ class AgentRuntime:
             summary = agentic.answer.strip() if agentic.answer else ""
             if not summary:
                 summary = agentic.error or "Mission did not resume after approval."
+            incomplete_finish = str(agentic.finish_reason or "").startswith(
+                ("protocol_error", "synthesis_error", "awaiting_approval")
+            )
+            continuation_confirmed = bool(
+                agentic.ok
+                and agentic.answer
+                and not agentic.blocked_by_approval
+                and not incomplete_finish
+            )
+            finish_reason = agentic.finish_reason
+            if not continuation_confirmed and not finish_reason:
+                # The first post-approval synthesis call can fail before the
+                # continuation loop records a finish reason.  The approved tool
+                # has nevertheless already returned, so classify this as an
+                # incomplete synthesis instead of claiming continuation.
+                finish_reason = "synthesis_error"
+            if not continuation_confirmed and tool_response.ok:
+                summary = (
+                    f"Approved tool completed: {tool_response.summary}. "
+                    "Mission continuation is not confirmed. "
+                    f"{summary}"
+                )
             result = ToolRunResponse(
                 tool="mission.resume_after_approval",
                 ok=(
                     tool_response.ok
-                    and agentic.ok
-                    and bool(agentic.answer)
-                    and not agentic.blocked_by_approval
+                    and continuation_confirmed
                 ),
                 summary=summary[:2000],
                 data={
@@ -2665,6 +3213,8 @@ class AgentRuntime:
                     "tool_steps": agentic.used_tools,
                     "approval_ids": list(agentic.approval_ids),
                     "blocked_by_approval": agentic.blocked_by_approval,
+                    "finish_reason": finish_reason,
+                    "continuation_confirmed": continuation_confirmed,
                     "resumed": True,
                 },
             )
@@ -3220,12 +3770,45 @@ class AgentRuntime:
             arguments,
             message=context.operator_message or "",
             scopes=context.operator_scopes,
-            full_autonomy=self.settings.operator_full_autonomy,
         ):
             return None
         effect_key = _operator_effect_key(tool_name, arguments)
         if effect_key in context.operator_used_effects:
             return None
+        if effect_key in context.operator_retry_effects or not self._begin_operator_effect(
+            context,
+            tool=tool_name,
+            effect_key=effect_key,
+        ):
+            context.operator_used_effects.add(effect_key)
+            result = ToolRunResponse(
+                tool=tool_name,
+                ok=False,
+                summary=(
+                    "Этот точный эффект уже был начат предыдущей незавершённой "
+                    "попыткой и не отправлен повторно. Сверьте целевое состояние; "
+                    "для намеренного нового действия сформулируйте новый запрос."
+                ),
+                data={
+                    "idempotent_replay_suppressed": True,
+                    "effect": effect_key,
+                    "source_user_message_id": context.operator_retry_source_message_id,
+                    "outcome_known": False,
+                },
+            )
+            event = ChatEvent(
+                type="thought",
+                title="Durable duplicate effect skipped",
+                content=result.summary,
+                payload={
+                    "tool": tool_name,
+                    "action": action,
+                    "effect": effect_key,
+                    "replayed": False,
+                    "durable": True,
+                },
+            )
+            return result, event
         authorization = OperatorTurnAuthorization.bind(
             conversation_id=context.conversation_id,
             user_message_id=context.operator_message_id or "",
@@ -3239,6 +3822,11 @@ class AgentRuntime:
             conversation_id=context.conversation_id,
             user_message_id=context.operator_message_id,
             authorization=authorization,
+        )
+        self._record_operator_effect_outcome(
+            context,
+            effect_key=effect_key,
+            result=result,
         )
         event = ChatEvent(
             type="tool_call",
@@ -5087,12 +5675,32 @@ class AgentRuntime:
             "require_exact_path": True,
             "overwrite": False,
         }
-        result = await self.tools.run(
-            "documents.generate",
-            args,
-            conversation_id=context.conversation_id,
-            user_message_id=context.operator_message_id,
+        result = await self._run_claimed_operator_tool(
+            context,
+            tool="documents.generate",
+            arguments=args,
         )
+        if result is None:
+            return DirectAction(
+                answer=(
+                    "Этот точный документный эффект уже закреплён за другой "
+                    "незавершённой попыткой. Повторное создание файла отключено; "
+                    "сначала сверьте целевой путь."
+                ),
+                events=[
+                    ChatEvent(
+                        type="thought",
+                        title="Document effect already in flight",
+                        content="Durable duplicate documents.generate was not dispatched.",
+                        payload={
+                            "tool": "documents.generate",
+                            "effect": _operator_effect_key("documents.generate", args),
+                            "replayed": False,
+                            "outcome_known": False,
+                        },
+                    )
+                ],
+            )
         allowed_root = (self.settings.data_dir / _DOCUMENT_OUTPUT_DIR).resolve(
             strict=False
         )
@@ -5347,12 +5955,32 @@ class AgentRuntime:
                 "overwrite": bool(intent.get("overwrite")),
             }
 
-        result = await self.tools.run(
-            tool_name,
-            args,
-            conversation_id=context.conversation_id,
-            user_message_id=context.operator_message_id,
+        result = await self._run_claimed_operator_tool(
+            context,
+            tool=tool_name,
+            arguments=args,
         )
+        if result is None:
+            return DirectAction(
+                answer=(
+                    "Этот точный документный эффект уже закреплён за другой "
+                    "незавершённой попыткой. Автоматически повторять запись нельзя; "
+                    "сначала сверьте целевой файл."
+                ),
+                events=[
+                    ChatEvent(
+                        type="thought",
+                        title="Document effect already in flight",
+                        content="Durable duplicate document mutation was not dispatched.",
+                        payload={
+                            "tool": tool_name,
+                            "effect": _operator_effect_key(tool_name, args),
+                            "replayed": False,
+                            "outcome_known": False,
+                        },
+                    )
+                ],
+            )
         ok, path, answer = _verified_artifact_answer(
             result=result,
             intent=intent,
@@ -5497,6 +6125,39 @@ class AgentRuntime:
         effect_key = _operator_effect_key("browser.open", arguments)
         if effect_key in context.operator_used_effects:
             return None
+        if effect_key in context.operator_retry_effects or not self._begin_operator_effect(
+            context,
+            tool="browser.open",
+            effect_key=effect_key,
+        ):
+            context.operator_used_effects.add(effect_key)
+            result = ToolRunResponse(
+                tool="browser.open",
+                ok=False,
+                summary=(
+                    "Этот выбранный URL уже был передан браузеру предыдущей "
+                    "попыткой. Повторное открытие остановлено; сверьте состояние вкладки."
+                ),
+                data={
+                    "idempotent_replay_suppressed": True,
+                    "effect": effect_key,
+                    "source_user_message_id": context.operator_retry_source_message_id,
+                    "outcome_known": False,
+                },
+            )
+            return result, ChatEvent(
+                type="thought",
+                title="Durable duplicate effect skipped",
+                content=result.summary,
+                payload={
+                    "tool": "browser.open",
+                    "action": "shopping.selection",
+                    "effect": effect_key,
+                    "replayed": False,
+                    "durable": True,
+                    "derived_selection": "shopping",
+                },
+            )
         authorization = OperatorTurnAuthorization.bind(
             conversation_id=context.conversation_id,
             user_message_id=context.operator_message_id or "",
@@ -5510,6 +6171,11 @@ class AgentRuntime:
             conversation_id=context.conversation_id,
             user_message_id=context.operator_message_id,
             authorization=authorization,
+        )
+        self._record_operator_effect_outcome(
+            context,
+            effect_key=effect_key,
+            result=result,
         )
         event = ChatEvent(
             type="tool_call",
@@ -5873,6 +6539,287 @@ class AgentRuntime:
                 "conversation_id": conversation_id,
             },
         )
+
+    def _bind_operator_request_identity(
+        self,
+        context: AgentContext,
+        *,
+        message: str,
+        mode: str,
+        attachments: list[dict[str, Any]],
+    ) -> None:
+        """Load an active byte-equivalent operator-request replay fence.
+
+        ``messages.id`` is intentionally fresh on every HTTP retry, so it cannot
+        be the idempotency identity.  The digest binds the conversation, request
+        text, mode, and stable attachment identities.  A changed/restated
+        request therefore remains a deliberate new command, while the same
+        request after a crash inherits the unfinished effect set.  Recently
+        completed requests remain fenced briefly so loss of the HTTP response
+        cannot turn a client retry into a second mutation.
+        """
+
+        digest = _operator_request_digest(message, mode=mode, attachments=attachments)
+        context.operator_request_digest = digest
+        state_key = _operator_effect_ledger_key(context.conversation_id)
+        existing = self.storage.get_runtime_value(state_key, None)
+        if not isinstance(existing, dict):
+            return
+        ledger = self.storage.update_runtime_value_atomic(
+            state_key,
+            lambda current: _prune_operator_effect_ledger(
+                current,
+                conversation_id=context.conversation_id,
+            ),
+            default=existing,
+        )
+        requests = ledger.get("requests") if isinstance(ledger, dict) else None
+        state = requests.get(digest) if isinstance(requests, dict) else None
+        if not isinstance(state, dict) or state.get("status") not in {
+            "incomplete",
+            "completed",
+        }:
+            return
+        effects = state.get("effects")
+        if not isinstance(effects, dict):
+            return
+        context.operator_retry_effects.update(
+            str(effect)
+            for effect, record in effects.items()
+            if isinstance(effect, str) and isinstance(record, dict)
+        )
+        source_message_id = state.get("user_message_id")
+        if isinstance(source_message_id, str) and source_message_id:
+            context.operator_retry_source_message_id = source_message_id
+        response = state.get("response")
+        if state.get("status") == "completed" and isinstance(response, dict):
+            answer = response.get("answer")
+            if isinstance(answer, str) and answer:
+                context.operator_cached_answer = answer
+
+    def _begin_operator_effect(
+        self,
+        context: AgentContext,
+        *,
+        tool: str,
+        effect_key: str,
+    ) -> bool:
+        """Atomically claim an exact operator effect before invoking its handler.
+
+        Persisting *before* dispatch deliberately prefers a visible
+        reconciliation requirement over replaying a mutation whose handler may
+        have committed just before the process died.
+        """
+
+        request_digest = str(context.operator_request_digest or "")
+        user_message_id = str(context.operator_message_id or "")
+        if not request_digest or not user_message_id:
+            return False
+        claim_id = uuid.uuid4().hex
+        state_key = _operator_effect_ledger_key(context.conversation_id)
+
+        def update(current: Any) -> dict[str, Any]:
+            ledger = _prune_operator_effect_ledger(
+                current,
+                conversation_id=context.conversation_id,
+            )
+            if ledger.get("overflowed"):
+                return ledger
+            requests = dict(ledger.get("requests") or {})
+            state = requests.get(request_digest)
+            if isinstance(state, dict):
+                # The same persisted request under a fresh message id is a
+                # transport retry.  Fence the whole mutation set, including a
+                # model-proposed alternative effect, until the operator restates it.
+                if state.get("user_message_id") != user_message_id:
+                    return ledger
+                if state.get("status") != "incomplete":
+                    return ledger
+                effects = dict(state.get("effects") or {})
+            else:
+                if len(requests) >= OPERATOR_EFFECT_LEDGER_MAX_REQUESTS:
+                    return ledger
+                effects = {}
+                state = {
+                    "request_digest": request_digest,
+                    "user_message_id": user_message_id,
+                    "status": "incomplete",
+                    "started_at": utc_now(),
+                }
+            if effect_key in effects:
+                return ledger
+            effects[effect_key] = {
+                "tool": tool,
+                "state": "started",
+                "claim_id": claim_id,
+                "user_message_id": user_message_id,
+            }
+            requests[request_digest] = {
+                **state,
+                "updated_at": utc_now(),
+                "effects": effects,
+            }
+            return {**ledger, "requests": requests}
+
+        ledger = self.storage.update_runtime_value_atomic(state_key, update, default=None)
+        requests = ledger.get("requests") if isinstance(ledger, dict) else None
+        state = requests.get(request_digest) if isinstance(requests, dict) else None
+        record = (
+            state.get("effects", {}).get(effect_key)
+            if isinstance(state, dict) and isinstance(state.get("effects"), dict)
+            else None
+        )
+        acquired = isinstance(record, dict) and record.get("claim_id") == claim_id
+        if acquired:
+            context.operator_started_effects.add(effect_key)
+        else:
+            context.operator_retry_effects.add(effect_key)
+        return acquired
+
+    async def _run_claimed_operator_tool(
+        self,
+        context: AgentContext,
+        *,
+        tool: str,
+        arguments: dict[str, Any],
+    ) -> ToolRunResponse | None:
+        """Run one durable operator tool only after its effect is persisted."""
+
+        effect_key = _operator_effect_key(tool, arguments)
+        if not self._begin_operator_effect(
+            context,
+            tool=tool,
+            effect_key=effect_key,
+        ):
+            return None
+        context.operator_used_effects.add(effect_key)
+        result = await self.tools.run(
+            tool,
+            arguments,
+            conversation_id=context.conversation_id,
+            user_message_id=context.operator_message_id,
+        )
+        self._record_operator_effect_outcome(
+            context,
+            effect_key=effect_key,
+            result=result,
+        )
+        return result
+
+    def _record_operator_effect_outcome(
+        self,
+        context: AgentContext,
+        *,
+        effect_key: str,
+        result: ToolRunResponse,
+        reconcile_existing: bool = False,
+    ) -> None:
+        request_digest = str(context.operator_request_digest or "")
+        user_message_id = str(context.operator_message_id or "")
+        retry_message_id = str(context.operator_retry_source_message_id or "")
+        accepted_message_ids = {user_message_id}
+        if reconcile_existing and retry_message_id:
+            accepted_message_ids.add(retry_message_id)
+        if not request_digest or (
+            effect_key not in context.operator_started_effects and not reconcile_existing
+        ):
+            return
+        uncertain = _tool_result_outcome_unknown(result.data)
+        if uncertain:
+            context.operator_uncertain_effects.add(effect_key)
+        state_key = _operator_effect_ledger_key(context.conversation_id)
+
+        def update(current: Any) -> Any:
+            ledger = _prune_operator_effect_ledger(
+                current,
+                conversation_id=context.conversation_id,
+            )
+            requests = dict(ledger.get("requests") or {})
+            state = requests.get(request_digest)
+            if not isinstance(state, dict) or (
+                state.get("user_message_id") not in accepted_message_ids
+                or state.get("status") != "incomplete"
+            ):
+                return ledger
+            effects = dict(state.get("effects") or {})
+            record = effects.get(effect_key)
+            if not isinstance(record, dict) or (
+                record.get("user_message_id") not in accepted_message_ids
+            ):
+                return ledger
+            effects[effect_key] = {
+                **record,
+                "state": "returned",
+                "ok": bool(result.ok),
+                "outcome_known": not uncertain,
+            }
+            requests[request_digest] = {
+                **state,
+                "updated_at": utc_now(),
+                "effects": effects,
+            }
+            return {**ledger, "requests": requests}
+
+        updated = self.storage.update_runtime_value_atomic(state_key, update, default=None)
+        requests = updated.get("requests") if isinstance(updated, dict) else None
+        state = requests.get(request_digest) if isinstance(requests, dict) else None
+        record = (
+            state.get("effects", {}).get(effect_key)
+            if isinstance(state, dict) and isinstance(state.get("effects"), dict)
+            else None
+        )
+        if isinstance(record, dict) and record.get("state") == "returned":
+            context.operator_started_effects.add(effect_key)
+
+    def _complete_operator_effect_turn(
+        self,
+        context: AgentContext,
+        *,
+        answer: str,
+    ) -> None:
+        """Close a normally synthesized turn; uncertain outcomes stay fenced."""
+
+        if not context.operator_started_effects or context.operator_uncertain_effects:
+            return
+        request_digest = str(context.operator_request_digest or "")
+        user_message_id = str(context.operator_message_id or "")
+        state_key = _operator_effect_ledger_key(context.conversation_id)
+
+        def update(current: Any) -> Any:
+            ledger = _prune_operator_effect_ledger(
+                current,
+                conversation_id=context.conversation_id,
+            )
+            requests = dict(ledger.get("requests") or {})
+            state = requests.get(request_digest)
+            accepted_message_ids = {user_message_id}
+            retry_message_id = str(context.operator_retry_source_message_id or "")
+            if retry_message_id:
+                accepted_message_ids.add(retry_message_id)
+            if not isinstance(state, dict) or (
+                state.get("user_message_id") not in accepted_message_ids
+                or state.get("status") != "incomplete"
+            ):
+                return ledger
+            effects = state.get("effects")
+            if not isinstance(effects, dict):
+                return ledger
+            if any(
+                isinstance(record, dict) and record.get("outcome_known") is False
+                for record in effects.values()
+            ):
+                return ledger
+            completed_at = utc_now()
+            requests[request_digest] = {
+                **state,
+                "status": "completed",
+                "completed_at": completed_at,
+                "updated_at": completed_at,
+                "response": {"answer": answer},
+            }
+            return {**ledger, "requests": requests}
+
+        self.storage.update_runtime_value_atomic(state_key, update, default=None)
 
     def _prepare_context(self, message: str, conversation_id: str | None) -> AgentContext:
         if conversation_id is None:
@@ -6258,8 +7205,7 @@ class AgentRuntime:
             return False
         if not getattr(self.settings, "verify_answers", True):
             return False
-        policy = self.storage.get_runtime_value("experience.autonomy_policy", {})
-        return not (isinstance(policy, dict) and policy.get("verify_answers") is False)
+        return self._autonomy_policy().get("verify_answers") is not False
 
     @staticmethod
     def _answer_worth_verifying(answer: str, used_tools: int) -> bool:
@@ -6505,16 +7451,70 @@ class AgentRuntime:
             kwargs["thinking_enabled"] = thinking_enabled
         return self.llm.stream_complete(messages, **kwargs)
 
+    def _autonomy_policy(self) -> dict[str, Any]:
+        stored = self.storage.get_runtime_value("experience.autonomy_policy", {})
+        if not isinstance(stored, dict):
+            stored = {}
+        policy = {**DEFAULT_AUTONOMY_POLICY, **stored}
+        for key, fallback in (
+            ("allow_safe_tools", True),
+            ("allow_review_tools", False),
+            ("allow_danger_tools", False),
+            ("allow_background_learning", True),
+            ("allow_self_healing_suggestions", True),
+        ):
+            value = stored.get(key, fallback)
+            policy[key] = value if isinstance(value, bool) else fallback
+        configured = stored.get(
+            "approval_required_for",
+            DEFAULT_AUTONOMY_POLICY["approval_required_for"],
+        )
+        if isinstance(configured, list):
+            policy["approval_required_for"] = list(
+                dict.fromkeys(
+                    text
+                    for item in configured[:20]
+                    if (text := str(item).strip())
+                )
+            )
+        else:
+            policy["approval_required_for"] = list(
+                DEFAULT_AUTONOMY_POLICY["approval_required_for"]
+            )
+        if "verify_answers" in stored:
+            policy["verify_answers"] = (
+                stored["verify_answers"]
+                if isinstance(stored["verify_answers"], bool)
+                else True
+            )
+        return policy
+
+    def _approval_required_tools(self) -> frozenset[str]:
+        configured = self._autonomy_policy().get("approval_required_for", [])
+        if not isinstance(configured, list):
+            return frozenset()
+        return frozenset(
+            name
+            for item in configured
+            if (name := str(item).strip())
+        )
+
     def _autonomous_tools(self) -> list[ToolInfo]:
         if not self.settings.llm_enabled:
             return []
-        policy = self.storage.get_runtime_value("experience.autonomy_policy", {})
-        if isinstance(policy, dict) and policy.get("allow_safe_tools") is False:
-            return []
+        policy = self._autonomy_policy()
+        proposal_enabled = {
+            "safe": bool(policy.get("allow_safe_tools", True)),
+            "review": bool(policy.get("allow_review_tools", False)),
+            "danger": bool(policy.get("allow_danger_tools", False)),
+        }
         return [
             info
             for info in self.tools.list()
-            if info.danger_level == "safe" and info.name not in AGENTIC_TOOL_DENYLIST
+            if proposal_enabled[info.danger_level]
+            and not (
+                info.danger_level == "safe" and info.name in AGENTIC_TOOL_DENYLIST
+            )
         ]
 
     def _tools_for_context(self, context: AgentContext) -> list[ToolInfo]:
@@ -6528,14 +7528,13 @@ class AgentRuntime:
         return [tools[name] for name in sorted(tools)]
 
     def _max_tool_steps(self) -> int:
-        policy = self.storage.get_runtime_value("experience.autonomy_policy", {})
+        policy = self._autonomy_policy()
         steps = DEFAULT_MAX_TOOL_STEPS
-        if isinstance(policy, dict):
-            try:
-                steps = int(policy.get("max_autonomous_steps", DEFAULT_MAX_TOOL_STEPS))
-            except (TypeError, ValueError):
-                steps = DEFAULT_MAX_TOOL_STEPS
-        return max(1, min(8, steps))
+        try:
+            steps = int(policy.get("max_autonomous_steps", DEFAULT_MAX_TOOL_STEPS))
+        except (TypeError, ValueError):
+            steps = DEFAULT_MAX_TOOL_STEPS
+        return max(1, min(24, steps))
 
     async def _run_agentic_tool(
         self,
@@ -6546,6 +7545,20 @@ class AgentRuntime:
         resume: dict[str, Any] | None = None,
     ) -> tuple[str, ChatEvent, _ExecutedToolResult | None]:
         name, args = _canonicalize_tool_invocation(name, args)
+        try:
+            _stable_json_sha256(args)
+        except (TypeError, ValueError) as exc:
+            reason = f"Tool arguments are not canonical JSON: {exc}"
+            return (
+                f"observation[{name} · rejected]: {reason}",
+                ChatEvent(
+                    type="thought",
+                    title="Tool arguments rejected",
+                    content=reason,
+                    payload={"tool": name, "code": "arguments_not_canonical_json"},
+                ),
+                None,
+            )
         # RB-2 second-line gate: block mission/artifact mutation even if the model
         # selected a side-effect tool route after admission was denied or incomplete.
         block_reason = self._side_effect_tool_blocked(name, context)
@@ -6572,31 +7585,75 @@ class AgentRuntime:
             mission_id = conversation_id.split(":", 1)[1]
         task_id = context.task_id
         spec = self.tools.get(name)
+        policy_approval_required = name in self._approval_required_tools()
         operator_binding_required = bool(
             spec is not None
-            and (spec.danger_level != "safe" or name in AGENTIC_TOOL_DENYLIST)
+            and (
+                spec.danger_level != "safe"
+                or name in AGENTIC_TOOL_DENYLIST
+                or name in AGENTIC_DURABLE_MUTATORS
+                or policy_approval_required
+            )
         )
         authorization: OperatorTurnAuthorization | None = None
         effect_key: str | None = None
+        duplicate_effect = False
+        durable_duplicate = False
         if (
             operator_binding_required
+            and not policy_approval_required
             and name in allowed
             and _operator_tool_arguments_match(
                 name,
                 args,
                 message=context.operator_message or "",
                 scopes=context.operator_scopes,
-                full_autonomy=self.settings.operator_full_autonomy,
             )
         ):
             effect_key = _operator_effect_key(name, args)
-            if effect_key not in context.operator_used_effects:
+            durable_duplicate = effect_key in context.operator_retry_effects
+            duplicate_effect = effect_key in context.operator_used_effects or durable_duplicate
+            if not duplicate_effect:
                 authorization = OperatorTurnAuthorization.bind(
                     conversation_id=context.conversation_id,
                     user_message_id=context.operator_message_id or "",
                     tool=name,
                     arguments=args,
                 )
+        if duplicate_effect:
+            observation = (
+                f"observation[{name} · skipped]: этот точный эффект уже "
+                + (
+                    "был начат предыдущей незавершённой попыткой; исход нужно "
+                    "сверить, повторная отправка запрещена."
+                    if durable_duplicate
+                    else "выполнен в текущем запросе оператора и не будет повторён."
+                )
+            )
+            return (
+                observation,
+                ChatEvent(
+                    type="thought",
+                    title=(
+                        "Durable duplicate effect skipped"
+                        if durable_duplicate
+                        else "Duplicate effect skipped"
+                    ),
+                    content=(
+                        "The same effect belongs to an unfinished persisted operator request."
+                        if durable_duplicate
+                        else "The same operator-authorized effect already ran in this turn."
+                    ),
+                    payload={
+                        "tool": name,
+                        "effect": effect_key,
+                        "replayed": False,
+                        "durable": durable_duplicate,
+                        "source_user_message_id": context.operator_retry_source_message_id,
+                    },
+                ),
+                None,
+            )
         if (
             self.executive is not None
             and mission_id
@@ -6669,16 +7726,105 @@ class AgentRuntime:
                 payload["executive_claim"] = claim
             if resume:
                 payload["resume"] = resume
-            gate = self.storage.create_approval(
-                title=f"Автономный запрос инструмента {name}",
-                description=(
-                    f"Модель хочет вызвать {name} ({spec.danger_level}) во время ответа "
-                    f"оператору {context.conversation_id}."
-                ),
-                requested_action="tool.run",
-                risk=spec.danger_level if spec.danger_level in {"review", "danger"} else "review",
-                payload=payload,
+            if not context.operator_request_digest and mission_id and task_id:
+                # Mission steps have no chat message, but still need a stable
+                # atomic effect identity before they may mint an approval.
+                mission_request = _stable_json_sha256(
+                    {
+                        "conversation_id": context.conversation_id,
+                        "mission_id": mission_id,
+                        "task_id": task_id,
+                    }
+                )
+                context.operator_request_digest = mission_request
+                context.operator_message_id = f"mission-step:{mission_request[:40]}"
+            approval_effect_key = _operator_effect_key(
+                "approval.create",
+                {
+                    "tool": name,
+                    "arguments": args,
+                    "mission_id": mission_id,
+                    "task_id": task_id,
+                },
             )
+            payload["operator_effect_key"] = approval_effect_key
+            approval_claimed = self._begin_operator_effect(
+                context,
+                tool="approval.create",
+                effect_key=approval_effect_key,
+            )
+            gate = None
+            if not approval_claimed:
+                gate = next(
+                    (
+                        item
+                        for item in self.storage.list_approvals(limit=200)
+                        if isinstance(item.get("payload"), dict)
+                        and item["payload"].get("operator_effect_key")
+                        == approval_effect_key
+                    ),
+                    None,
+                )
+                if gate is None:
+                    observation = (
+                        f"observation[{name} · blocked]: точный approval уже "
+                        "закреплён за незавершённой попыткой; второй approval не создан."
+                    )
+                    return (
+                        observation,
+                        ChatEvent(
+                            type="thought",
+                            title="Approval creation already in flight",
+                            content="A second approval was not minted for the same effect.",
+                            payload={
+                                "tool": name,
+                                "effect": approval_effect_key,
+                                "replayed": False,
+                            },
+                        ),
+                        None,
+                    )
+                self._record_operator_effect_outcome(
+                    context,
+                    effect_key=approval_effect_key,
+                    result=ToolRunResponse(
+                        tool="approval.create",
+                        ok=True,
+                        summary=f"Verified existing approval {gate['id']}.",
+                        data={"approval_id": gate["id"], "outcome_known": True},
+                    ),
+                    reconcile_existing=True,
+                )
+            else:
+                gate = self.storage.create_approval(
+                    title=f"Автономный запрос инструмента {name}",
+                    description=(
+                        f"Модель хочет вызвать {name} ({spec.danger_level}) во время ответа "
+                        f"оператору {context.conversation_id}."
+                        + (
+                            " Политика автономии явно требует approval для этого инструмента."
+                            if policy_approval_required
+                            else ""
+                        )
+                    ),
+                    requested_action="tool.run",
+                    risk=(
+                        spec.danger_level
+                        if spec.danger_level in {"review", "danger"}
+                        else "review"
+                    ),
+                    payload=payload,
+                )
+                self._record_operator_effect_outcome(
+                    context,
+                    effect_key=approval_effect_key,
+                    result=ToolRunResponse(
+                        tool="approval.create",
+                        ok=True,
+                        summary=f"Approval {gate['id']} created.",
+                        data={"approval_id": gate["id"], "outcome_known": True},
+                    ),
+                )
             observation = (
                 f"observation[{name} · blocked]: инструмент требует подтверждения оператора; "
                 f"создан approval {gate['id']}. Ответь по доступным данным или предложи "
@@ -6696,6 +7842,7 @@ class AgentRuntime:
                         "risk": spec.danger_level,
                         "mission_id": mission_id,
                         "task_id": task_id,
+                        "policy_approval_required": policy_approval_required,
                     },
                 ),
                 None,
@@ -6725,6 +7872,31 @@ class AgentRuntime:
                 ),
                 None,
             )
+        if authorization is not None and effect_key is not None and not self._begin_operator_effect(
+            context,
+            tool=name,
+            effect_key=effect_key,
+        ):
+            observation = (
+                f"observation[{name} · skipped]: точный эффект уже закреплён за "
+                "незавершённой попыткой этого запроса; повторная отправка запрещена, "
+                "нужна сверка состояния."
+            )
+            return (
+                observation,
+                ChatEvent(
+                    type="thought",
+                    title="Durable duplicate effect skipped",
+                    content="A concurrent or crashed attempt already claimed this exact effect.",
+                    payload={
+                        "tool": name,
+                        "effect": effect_key,
+                        "replayed": False,
+                        "durable": True,
+                    },
+                ),
+                None,
+            )
         run_kwargs: dict[str, Any] = {
             "mission_id": context.mission_id,
             "task_id": context.task_id,
@@ -6739,6 +7911,12 @@ class AgentRuntime:
                 }
             )
         result = await self.tools.run(name, args, **run_kwargs)
+        if authorization is not None and effect_key is not None:
+            self._record_operator_effect_outcome(
+                context,
+                effect_key=effect_key,
+                result=result,
+            )
         event = ChatEvent(
             type="tool_call",
             title=name,
@@ -6865,9 +8043,18 @@ class AgentRuntime:
                         {"role": "system", "content": TOOL_PROTOCOL_CORRECTION_PROMPT}
                     )
                     continue
+                recovery_answer = (
+                    _agentic_recovery_answer(
+                        executed_tools,
+                        approval_ids,
+                        reason="protocol_error",
+                    )
+                    if executed_tools or approval_ids
+                    else TOOL_PROTOCOL_FAILURE_ANSWER
+                )
                 return _AgenticResult(
                     ok=True,
-                    answer=TOOL_PROTOCOL_FAILURE_ANSWER,
+                    answer=recovery_answer,
                     events=events,
                     finish_reason="protocol_error",
                     blocked_by_approval=bool(approval_ids),
@@ -6941,9 +8128,18 @@ class AgentRuntime:
         if result.ok and result.content:
             turn = _classify_tool_turn(result.content)
             if turn.kind != "answer":
+                recovery_answer = (
+                    _agentic_recovery_answer(
+                        executed_tools,
+                        approval_ids,
+                        reason="protocol_error",
+                    )
+                    if executed_tools or approval_ids
+                    else TOOL_PROTOCOL_FAILURE_ANSWER
+                )
                 return _AgenticResult(
                     ok=True,
-                    answer=TOOL_PROTOCOL_FAILURE_ANSWER,
+                    answer=recovery_answer,
                     events=events,
                     finish_reason="protocol_error",
                     blocked_by_approval=bool(approval_ids),
@@ -6952,7 +8148,11 @@ class AgentRuntime:
                     executed_tools=tuple(executed_tools),
                 )
             answer = turn.text
-            finish_reason = _finish_reason_from_llm_result(result)
+            finish_reason = (
+                "awaiting_approval"
+                if approval_ids
+                else _finish_reason_from_llm_result(result)
+            )
             continuation_count = 0
             if finish_reason == "length":
                 answer, continuation_count, finish_reason = await self._auto_continue_answer(
@@ -6973,15 +8173,30 @@ class AgentRuntime:
                 used_tools=used_tools,
                 executed_tools=tuple(executed_tools),
             )
+        if executed_tools or approval_ids:
+            finish_reason = "awaiting_approval" if approval_ids else "synthesis_error"
+            return _AgenticResult(
+                ok=True,
+                answer=_agentic_recovery_answer(
+                    executed_tools,
+                    approval_ids,
+                    reason="synthesis_error",
+                ),
+                events=events,
+                finish_reason=finish_reason,
+                error=result.error,
+                blocked_by_approval=bool(approval_ids),
+                approval_ids=tuple(approval_ids),
+                used_tools=used_tools,
+                executed_tools=tuple(executed_tools),
+            )
         return _AgenticResult(
             ok=False,
             answer="",
             events=events,
             error=result.error,
-            blocked_by_approval=bool(approval_ids),
-            approval_ids=tuple(approval_ids),
+            blocked_by_approval=False,
             used_tools=used_tools,
-            executed_tools=tuple(executed_tools),
         )
 
     def _build_llm_messages(
@@ -7062,21 +8277,29 @@ class AgentRuntime:
         task_id: str | None = None,
     ) -> str:
         tools = self.tools.list()
-        safe_allowed = {tool.name for tool in self._autonomous_tools()}
-        safe_tools = [tool.name for tool in tools if tool.name in safe_allowed]
-        gated_tools = [
-            f"{tool.name}:{tool.danger_level}"
-            for tool in tools
-            if tool.name not in safe_allowed and tool.danger_level != "safe"
-        ]
-        withheld_safe = [
+        policy = self._autonomy_policy()
+        proposal_infos = self._autonomous_tools()
+        proposal_names = {tool.name for tool in proposal_infos}
+        approval_required = self._approval_required_tools()
+        direct_proposal_tools = [
             tool.name
-            for tool in tools
-            if tool.danger_level == "safe" and tool.name not in safe_allowed
+            for tool in proposal_infos
+            if tool.danger_level == "safe"
+            and tool.name not in AGENTIC_TOOL_DENYLIST
+            and tool.name not in AGENTIC_DURABLE_MUTATORS
+            and tool.name not in approval_required
         ]
-        policy = self.storage.get_runtime_value("experience.autonomy_policy", {})
-        if not isinstance(policy, dict):
-            policy = {}
+        gated_proposal_tools = [
+            (
+                f"{tool.name}:"
+                f"{'policy-review' if tool.name in approval_required else tool.danger_level}"
+            )
+            for tool in proposal_infos
+            if tool.name not in direct_proposal_tools
+        ]
+        unavailable_proposal_tools = [
+            tool.name for tool in tools if tool.name not in proposal_names
+        ]
         jobs = self.storage.get_runtime_value("operations.autonomy.jobs", [])
         job_lines = []
         if isinstance(jobs, list):
@@ -7154,18 +8377,30 @@ class AgentRuntime:
                 f"allow_danger_tools={policy.get('allow_danger_tools', False)}."
             ),
             (
-                "- autonomous_safe_tools: "
-                + (", ".join(safe_tools[:40]) if safe_tools else "none available")
+                "- model_proposal_tools: "
+                + (
+                    ", ".join(tool.name for tool in proposal_infos[:50])
+                    if proposal_infos
+                    else "none available"
+                )
             ),
             (
-                "- gated_tools_need_operator_approval: "
-                + (", ".join(gated_tools[:30]) if gated_tools else "none")
+                "- proposal_tools_executable_without_additional_authority: "
+                + (", ".join(direct_proposal_tools[:40]) if direct_proposal_tools else "none")
+            ),
+            (
+                "- proposal_tools_that_create_approval: "
+                + (", ".join(gated_proposal_tools[:40]) if gated_proposal_tools else "none")
+            ),
+            (
+                "- policy_approval_required_for: "
+                + (", ".join(sorted(approval_required)[:30]) if approval_required else "none")
             ),
         ]
-        if withheld_safe:
+        if unavailable_proposal_tools:
             lines.append(
-                "- safe_tools_withheld_from_autonomous_llm_loop: "
-                + ", ".join(withheld_safe[:20])
+                "- tools_not_proposed_by_autonomy_policy: "
+                + ", ".join(unavailable_proposal_tools[:30])
                 + "."
             )
         lines.extend(
@@ -7184,8 +8419,11 @@ class AgentRuntime:
                     "and can run due mission jobs without a visible UI request."
                 ),
                 (
-                    "- rule: use safe tools for facts and local state; for review/danger tools "
-                    "create or respect approval gates instead of pretending the action ran."
+                    "- rule: proposal flags only expose tools to planning; they never grant "
+                    "execution authority. Safe tools may run directly, review/danger and "
+                    "policy-listed tools create approval gates. Within the agentic loop, an "
+                    "exact current-turn command may authorize only matching operands and never "
+                    "overrides policy_approval_required_for."
                 ),
             ]
         )
@@ -8583,6 +9821,13 @@ _TOOL_ENVELOPE_KEYS = frozenset(
 )
 
 
+def _strict_tool_json_loads(text: str) -> Any:
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"non-finite JSON number {value!r} is not allowed")
+
+    return json.loads(text, parse_constant=reject_constant)
+
+
 def _coerce_tool_arguments(value: Any) -> dict[str, Any] | None:
     """Normalise a tool arguments value; return None only when clearly malformed.
 
@@ -8599,8 +9844,8 @@ def _coerce_tool_arguments(value: Any) -> dict[str, Any] | None:
         if not text:
             return {}
         try:
-            parsed = json.loads(text)
-        except json.JSONDecodeError:
+            parsed = _strict_tool_json_loads(text)
+        except (json.JSONDecodeError, ValueError):
             return None
         return parsed if isinstance(parsed, dict) else None
     return None
@@ -8678,8 +9923,8 @@ def _classify_tool_turn(content: str) -> _ToolTurn:
     fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", text, re.IGNORECASE | re.DOTALL)
     candidate = fenced.group(1).strip() if fenced is not None else text
     try:
-        data = json.loads(candidate)
-    except json.JSONDecodeError:
+        data = _strict_tool_json_loads(candidate)
+    except (json.JSONDecodeError, ValueError):
         data = None
     if isinstance(data, dict):
         action = _coerce_tool_call(data)
@@ -9872,6 +11117,7 @@ SIDE_EFFECT_MUTATING_TOOLS = frozenset(
         "documents.generate",
         "documents.convert",
         "documents.archive.create",
+        "documents.archive.extract",
         "documents.apply_replacements",
         "filesystem.write_text",
         "filesystem.mkdir",
@@ -13882,8 +15128,8 @@ def _operator_action_scopes(message: str) -> frozenset[str]:
         if re.search(pattern, structural, re.IGNORECASE):
             scopes.add(scope)
     context_text = _operator_structural_text(message)
-    if re.search(
-        r"https?://|\b(?:browser|браузер|вкладк|страниц|сайт|wiki|wikipedia|вики|википед)\w*\b",
+    if re.search(r"https?://", message, re.IGNORECASE) or re.search(
+        r"\b(?:browser|браузер|вкладк|страниц|сайт|wiki|wikipedia|вики|википед)\w*\b",
         context_text,
         re.IGNORECASE,
     ):
@@ -13930,6 +15176,119 @@ def _has_current_operator_authority(context: AgentContext | None) -> bool:
     )
 
 
+def _operator_effect_ledger_key(conversation_id: str) -> str:
+    conversation_digest = hashlib.sha256(str(conversation_id).encode("utf-8")).hexdigest()
+    return f"agent.operator_effect.{conversation_digest}"
+
+
+def _prune_operator_effect_ledger(
+    value: Any,
+    *,
+    conversation_id: str,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Keep unfinished fences and only a bounded window of completed requests."""
+
+    current_time = now or datetime.now(UTC)
+    raw_requests = (
+        value.get("requests")
+        if isinstance(value, dict)
+        and value.get("protocol") == "jarvis.operator-effect-ledger.v1"
+        and value.get("conversation_id") == conversation_id
+        else {}
+    )
+    requests = raw_requests if isinstance(raw_requests, dict) else {}
+    active: list[tuple[str, dict[str, Any]]] = []
+    for digest, request in requests.items():
+        if not isinstance(digest, str) or not isinstance(request, dict):
+            continue
+        status = request.get("status")
+        if status == "incomplete" or (
+            status == "completed"
+            and _completed_operator_request_fence_active(request, now=current_time)
+        ):
+            active.append((digest, request))
+
+    # Incomplete entries are safety fences and take priority.  The writer
+    # refuses new request identities once this fixed-size ledger is full, so
+    # pruning never creates unbounded runtime_kv growth.
+    active.sort(
+        key=lambda item: (
+            item[1].get("status") == "incomplete",
+            str(item[1].get("updated_at") or item[1].get("started_at") or ""),
+        ),
+        reverse=True,
+    )
+    retained_items = active[:OPERATOR_EFFECT_LEDGER_MAX_REQUESTS]
+    retained = dict(retained_items)
+    overflowed = bool(isinstance(value, dict) and value.get("overflowed")) or any(
+        request.get("status") == "incomplete"
+        for _digest, request in active[OPERATOR_EFFECT_LEDGER_MAX_REQUESTS:]
+    )
+    ledger = {
+        "protocol": "jarvis.operator-effect-ledger.v1",
+        "conversation_id": conversation_id,
+        "requests": retained,
+    }
+    if overflowed:
+        # Fixed-size fail-closed tombstone: details remain bounded, while a
+        # legacy/corrupt overflow of unfinished requests can never be replayed.
+        ledger["overflowed"] = True
+    return ledger
+
+
+def _completed_operator_request_fence_active(
+    request: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> bool:
+    raw_completed_at = request.get("completed_at")
+    if not isinstance(raw_completed_at, str) or not raw_completed_at:
+        return False
+    try:
+        completed_at = datetime.fromisoformat(raw_completed_at.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if completed_at.tzinfo is None:
+        completed_at = completed_at.replace(tzinfo=UTC)
+    age = ((now or datetime.now(UTC)) - completed_at.astimezone(UTC)).total_seconds()
+    return age <= OPERATOR_EFFECT_COMPLETED_TTL_SECONDS
+
+
+def _operator_request_digest(
+    message: str,
+    *,
+    mode: str,
+    attachments: list[dict[str, Any]],
+) -> str:
+    attachment_identity = [
+        {
+            "id": str(item.get("id") or ""),
+            "name": str(item.get("name") or ""),
+            "mime_type": str(item.get("mime_type") or ""),
+            "size": item.get("size"),
+            "url": str(item.get("url") or ""),
+        }
+        for item in attachments
+        if isinstance(item, dict)
+    ]
+    payload = {
+        # Normalize transport-only whitespace, but preserve spelling and case:
+        # a restated command is a new operator request, not an HTTP retry.
+        "message": " ".join(str(message).split()),
+        "mode": str(mode),
+        "attachments": attachment_identity,
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 def _operator_requested_tool_names(scopes: frozenset[str]) -> set[str]:
     names: set[str] = set()
     if "native" in scopes and scopes & {"open", "execute", "focus", "type", "click", "capture"}:
@@ -13970,42 +15329,54 @@ def _operator_tool_arguments_match(
     scopes: frozenset[str],
     full_autonomy: bool = False,
 ) -> bool:
+    # Retain the keyword for configuration/test compatibility, but never let a
+    # broad lexical scope authorize model-selected operands. Current-turn
+    # authority is granted only after the exact per-tool matcher below succeeds.
+    del full_autonomy
     if not isinstance(args, dict) or "explicit" not in scopes:
         return False
-    # Full operator autonomy: an explicit command authorizes any tool whose
-    # capability scope the operator actually named this turn, without demanding
-    # that the model reproduce an exact pre-registered argument shape.  The
-    # scope check is the safety boundary — a tool outside the requested scopes
-    # (e.g. a filesystem write during a read-only "look at…" turn) is still not
-    # authorized here and falls through to the approval gate.
-    if full_autonomy and name in _operator_requested_tool_names(scopes):
-        return True
     if name == "browser.open":
-        if set(args) != {"url"}:
+        if set(args) != {"url"} or not isinstance(args.get("url"), str):
             return False
-        url = str(args.get("url") or "")
+        url = args.get("url", "")
         return "open" in scopes and (
             _operator_mentions_url(message, url)
             or (
                 re.search(r"\b(?:wiki|wikipedia|вики|википед)\w*\b", message, re.I)
-                and "wikipedia.org" in urlparse(url).netloc.casefold()
+                and (expected_url := _browser_url_from_message(message)) is not None
+                and _operator_url_identity(expected_url) == _operator_url_identity(url)
             )
         )
     if name == "browser.open_many":
         if set(args) != {"urls"}:
             return False
         urls = args.get("urls")
-        return isinstance(urls, list) and bool(urls) and all(
-            _operator_mentions_url(message, str(url)) for url in urls
+        identities = (
+            [_operator_url_identity(url) for url in urls]
+            if isinstance(urls, list) and all(isinstance(url, str) for url in urls)
+            else []
+        )
+        requested_identities = _operator_url_identities_from_message(message)
+        return (
+            "open" in scopes
+            and bool(identities)
+            and all(identity is not None for identity in identities)
+            and len(set(identities)) == len(identities)
+            and set(identities) == set(requested_identities)
         )
     if name == "windows.native":
         return _operator_native_arguments_match(message, args, scopes)
     if name == "filesystem.write_text":
         if not set(args) <= {"path", "content", "mode"}:
             return False
-        path = str(args.get("path") or "")
-        content = str(args.get("content") or "")
-        mode = str(args.get("mode") or "overwrite").casefold()
+        if any(
+            field in args and not isinstance(args[field], str)
+            for field in ("path", "content", "mode")
+        ):
+            return False
+        path = args.get("path", "")
+        content = args.get("content", "")
+        mode = args.get("mode", "overwrite").casefold()
         append = bool(re.search(r"\b(?:append|add|добавь|допиши)\b", message, re.I))
         create_empty = bool(
             not content
@@ -14017,7 +15388,13 @@ def _operator_tool_arguments_match(
             "filesystem" in scopes
             and scopes & {"create", "write", "modify"}
             and _operator_mentions_value(message, path, path_value=True)
-            and (create_empty or (content and _operator_mentions_value(message, content)))
+            and (
+                create_empty
+                or (
+                    content
+                    and _operator_mentions_text_operand(message, content, field="content")
+                )
+            )
             and (
                 create_empty
                 or (append and mode == "append")
@@ -14031,7 +15408,18 @@ def _operator_tool_arguments_match(
         "browser.scroll",
         "browser.screenshot",
     }:
-        return _operator_browser_arguments_match(name, message, args)
+        required_scope = {
+            "browser.click": "click",
+            "browser.type": "type",
+            "browser.select": "select",
+            "browser.scroll": "scroll",
+            "browser.screenshot": "capture",
+        }[name]
+        return bool(
+            "browser" in scopes
+            and required_scope in scopes
+            and _operator_browser_arguments_match(name, message, args)
+        )
     if name in {"execution.apply", "execution.transaction"}:
         return _operator_execution_arguments_match(name, message, args, scopes)
     if name == "browser.chrome.launch":
@@ -14078,7 +15466,12 @@ def _operator_browser_arguments_match(
         },
         "browser.screenshot": {"url", "wait_ms", "debug_url"},
     }[name]
-    if not set(args) <= allowed or not _operator_mentions_value(message, args.get("url")):
+    if not set(args) <= allowed or not _operator_browser_argument_types_match(name, args):
+        return False
+    if not _operator_mentions_url(
+        message,
+        args.get("url", ""),
+    ):
         return False
     fields = {
         "browser.click": ("target", "selector"),
@@ -14088,7 +15481,9 @@ def _operator_browser_arguments_match(
         "browser.screenshot": (),
     }[name]
     if not all(
-        not args.get(field) or _operator_mentions_value(message, args[field]) for field in fields
+        not args.get(field)
+        or _operator_mentions_text_operand(message, args[field], field=field)
+        for field in fields
     ):
         return False
     if bool(args.get("allow_sensitive")) and not re.search(
@@ -14097,9 +15492,6 @@ def _operator_browser_arguments_match(
         message,
         re.IGNORECASE,
     ):
-        return False
-    allow_sensitive = args.get("allow_sensitive")
-    if allow_sensitive is not None and not isinstance(allow_sensitive, bool):
         return False
     defaults: dict[str, Any] = {
         "wait_ms": 5000,
@@ -14115,12 +15507,50 @@ def _operator_browser_arguments_match(
     )
 
 
+def _operator_browser_argument_types_match(name: str, args: dict[str, Any]) -> bool:
+    if not isinstance(args.get("url"), str) or not args.get("url", "").strip():
+        return False
+    string_fields = {
+        "target",
+        "selector",
+        "text",
+        "value",
+        "direction",
+        "debug_url",
+    }
+    integer_fields = {"wait_ms", "pixels", "passes", "max_chars"}
+    if any(field in args and not isinstance(args[field], str) for field in string_fields):
+        return False
+    if any(
+        field in args
+        and (not isinstance(args[field], int) or isinstance(args[field], bool))
+        for field in integer_fields
+    ):
+        return False
+    if "allow_sensitive" in args and not isinstance(args["allow_sensitive"], bool):
+        return False
+    return not (
+        name == "browser.scroll"
+        and "direction" in args
+        and args["direction"].casefold() not in {"down", "up", "top", "bottom"}
+    )
+
+
 def _operator_chrome_launch_arguments_match(
     message: str,
     args: dict[str, Any],
     scopes: frozenset[str],
 ) -> bool:
     if not set(args) <= {"debug_port", "profile_dir", "start_url"}:
+        return False
+    if "debug_port" in args and (
+        not isinstance(args["debug_port"], int) or isinstance(args["debug_port"], bool)
+    ):
+        return False
+    if any(
+        field in args and not isinstance(args[field], str)
+        for field in ("profile_dir", "start_url")
+    ):
         return False
     if not (
         "open" in scopes
@@ -14135,7 +15565,7 @@ def _operator_chrome_launch_arguments_match(
     if profile_dir and not _operator_mentions_value(message, profile_dir, path_value=True):
         return False
     start_url = str(args.get("start_url") or "")
-    return not start_url or _operator_mentions_value(message, start_url)
+    return not start_url or _operator_mentions_url(message, start_url)
 
 
 def _operator_control_is_default_or_mentioned(
@@ -14143,7 +15573,20 @@ def _operator_control_is_default_or_mentioned(
     value: Any,
     default: Any,
 ) -> bool:
-    if value is None or value == default:
+    if value is None:
+        return True
+    if isinstance(default, bool):
+        if not isinstance(value, bool):
+            return False
+    elif isinstance(default, int) and not isinstance(default, bool):
+        if not isinstance(value, int) or isinstance(value, bool):
+            return False
+    elif isinstance(default, float):
+        if not isinstance(value, int | float) or isinstance(value, bool):
+            return False
+    elif isinstance(default, str) and not isinstance(value, str):
+        return False
+    if value == default:
         return True
     rendered = str(value)
     if isinstance(value, int | float) and not isinstance(value, bool):
@@ -14298,6 +15741,8 @@ def _operator_execution_arguments_match(
         )
         if required_scope not in scopes:
             return False
+        if not _operator_execution_role_bindings_match(message, kind, body):
+            return False
         values = [
             body.get(key)
             for key in (
@@ -14319,24 +15764,26 @@ def _operator_execution_arguments_match(
         encoded = body.get("content_base64")
         if encoded is not None:
             try:
-                values.append(base64.b64decode(str(encoded), validate=True).decode("utf-8"))
+                decoded_content = base64.b64decode(str(encoded), validate=True).decode("utf-8")
             except (ValueError, UnicodeDecodeError):
+                return False
+            if not _operator_mentions_text_operand(
+                message,
+                decoded_content,
+                field="content",
+            ):
                 return False
         encoded_value = body.get("value_base64")
         if encoded_value is not None:
             try:
-                values.append(base64.b64decode(str(encoded_value), validate=True).decode("utf-8"))
+                decoded_value = base64.b64decode(str(encoded_value), validate=True).decode("utf-8")
             except (ValueError, UnicodeDecodeError):
+                return False
+            if not _operator_mentions_text_operand(message, decoded_value, field="value"):
                 return False
         environment = body.get("environment") or {}
         if not isinstance(environment, dict) or any(
-            not (
-                _operator_mentions_value(message, f"{key}={value}")
-                or (
-                    _operator_mentions_value(message, key)
-                    and _operator_mentions_value(message, value)
-                )
-            )
+            not _operator_mentions_value(message, f"{key}={value}")
             for key, value in environment.items()
         ):
             return False
@@ -14353,6 +15800,154 @@ def _operator_execution_arguments_match(
         if not _operator_execution_controls_match(message, kind, body, scopes):
             return False
     return True
+
+
+def _operator_execution_role_bindings_match(
+    message: str,
+    kind: str,
+    body: dict[str, Any],
+) -> bool:
+    """Bind multi-operand execution fields to their command-clause roles.
+
+    Merely finding both paths in the turn is insufficient: ``move A to B``
+    must never authorize ``move B to A``.  The same ordering rule prevents an
+    executable from borrowing authority from one of its arguments and keeps
+    registry key/name/value identities in their stated order.
+    """
+
+    if kind in {"fs.copy", "fs.move"}:
+        verb = (
+            r"\b(?:copy|move|rename|скопир\w*|копир\w*|"
+            r"перемест\w*|перенес\w*|перенос\w*|переимен\w*)\b"
+        )
+        separator = r"(?:^|\s)(?:to|into|as|в|во|на|как)(?:\s|$)|(?:->|→)"
+        return _operator_ordered_operands_match(
+            message,
+            (body.get("source"), body.get("destination")),
+            leading_pattern=verb,
+            separator_pattern=separator,
+        )
+    if kind == "process.run":
+        operands: list[Any] = [body.get("executable")]
+        operands.extend(body.get("arguments") or [])
+        if body.get("cwd"):
+            operands.append(body["cwd"])
+        return _operator_ordered_operands_match(
+            message,
+            tuple(operands),
+            leading_pattern=(
+                r"\b(?:run|execute|launch|start|запуст\w*|выполн\w*)\b"
+            ),
+        )
+    if kind in {"registry.get", "registry.set", "registry.delete"}:
+        operands = [body.get("hive"), body.get("key"), body.get("name")]
+        if kind == "registry.set" and body.get("value") not in {None, ""}:
+            operands.append(body.get("value"))
+        return _operator_ordered_operands_match(
+            message,
+            tuple(operands),
+            leading_pattern=(
+                r"\b(?:set|write|update|delete|remove|"
+                r"установ\w*|запиш\w*|обнов\w*|удал\w*)\b"
+            ),
+        )
+    return True
+
+
+def _operator_ordered_operands_match(
+    message: str,
+    operands: tuple[Any, ...],
+    *,
+    leading_pattern: str,
+    separator_pattern: str | None = None,
+) -> bool:
+    rendered = [item for item in operands if item not in {None, ""}]
+    if not rendered:
+        return False
+    spans_by_operand = [
+        _operator_operand_spans(
+            message,
+            item,
+            path_value=_operator_value_is_path(item),
+        )
+        for item in rendered
+    ]
+    if any(not spans for spans in spans_by_operand):
+        return False
+    source = " ".join(str(message).split())
+
+    def choose(index: int, selected: list[tuple[int, int]]) -> bool:
+        if index == len(spans_by_operand):
+            first_start = selected[0][0]
+            if not re.search(leading_pattern, source[:first_start], re.IGNORECASE):
+                return False
+            if separator_pattern is not None:
+                for left, right in zip(selected, selected[1:], strict=False):
+                    if not re.search(
+                        separator_pattern,
+                        source[left[1] : right[0]],
+                        re.IGNORECASE,
+                    ):
+                        return False
+            return True
+        minimum_start = selected[-1][1] if selected else 0
+        for span in spans_by_operand[index]:
+            if span[0] < minimum_start:
+                continue
+            if choose(index + 1, [*selected, span]):
+                return True
+        return False
+
+    return choose(0, [])
+
+
+def _operator_operand_spans(
+    message: str,
+    value: Any,
+    *,
+    path_value: bool,
+) -> list[tuple[int, int]]:
+    rendered = " ".join(str(value or "").strip().split())
+    if not rendered:
+        return []
+    source = " ".join(str(message).split())
+    if path_value and re.match(r"^(?:[A-Za-z]:[\\/]|\\\\)", rendered):
+        rendered = rendered.replace("/", "\\").casefold()
+        source = source.replace("/", "\\").casefold()
+    spans: list[tuple[int, int]] = []
+    start = 0
+    while True:
+        index = source.find(rendered, start)
+        if index < 0:
+            return spans
+        end = index + len(rendered)
+        if path_value:
+            left_ok = (
+                index == 0
+                or source[index - 1].isspace()
+                or source[index - 1] in "'\"«“([{:="
+            )
+            right_ok = (
+                end == len(source)
+                or source[end].isspace()
+                or source[end] in "'\"»”)]},;!?:="
+            )
+            if not right_ok and source[end] == ".":
+                right_ok = end + 1 == len(source) or source[end + 1].isspace()
+        else:
+            left_ok = (
+                index == 0
+                or source[index - 1].isspace()
+                or source[index - 1] in "'\"«“([{:=>,;"
+            )
+            right_ok = (
+                end == len(source)
+                or source[end].isspace()
+                or source[end] in "'\"»”)]},;!?:="
+            )
+        if left_ok and right_ok:
+            spans.append((index, end))
+        start = index + 1
 
 
 def _operator_execution_controls_match(
@@ -14432,7 +16027,16 @@ def _operator_verification_arguments_match(message: str, value: Any) -> bool:
 
 
 def _operator_value_is_path(value: Any) -> bool:
-    return bool(re.match(r"^(?:[A-Za-z]:[\\/]|\\\\)", str(value or "")))
+    return bool(re.match(r"^(?:[A-Za-z]:[\\/]|\\\\|/)", str(value or "")))
+
+
+def _canonical_operator_path(value: Any) -> str:
+    """Canonicalize Windows paths without changing POSIX path identity."""
+
+    rendered = str(value or "")
+    if re.match(r"^(?:[A-Za-z]:[\\/]|\\\\)", rendered):
+        return ntpath.normpath(rendered.replace("/", "\\")).casefold()
+    return rendered
 
 
 def _operator_mentions_value(message: str, value: Any, *, path_value: bool = False) -> bool:
@@ -14441,24 +16045,190 @@ def _operator_mentions_value(message: str, value: Any, *, path_value: bool = Fal
         return False
     source = " ".join(message.split())
     if path_value:
-        rendered = rendered.replace("/", "\\").casefold()
-        source = source.replace("/", "\\").casefold()
-    return rendered in source
+        # Windows drive/UNC paths are case-insensitive and accept either slash.
+        # POSIX paths are case-sensitive: /tmp/Foo and /tmp/foo are distinct
+        # operands and must never share current-turn authority.
+        if re.match(r"^(?:[A-Za-z]:[\\/]|\\\\)", rendered):
+            rendered = rendered.replace("/", "\\").casefold()
+            source = source.replace("/", "\\").casefold()
+        return _operator_path_occurs_exactly(source, rendered)
+    quoted, source_without_quotes = _operator_quoted_operands(source)
+    if rendered in quoted:
+        return True
+    return _operator_value_occurs_structurally(source_without_quotes, rendered)
+
+
+def _operator_mentions_text_operand(message: str, value: Any, *, field: str) -> bool:
+    """Match free-form content/targets as complete operands, never prefixes.
+
+    Generic substring checks let ``text=hello`` borrow authority from the
+    operator's ``type hello world`` (and likewise ``target=Search`` from
+    ``Search settings``).  Quoted operands and action-clause captures give these
+    fields a structural end boundary while retaining ordinary concise commands.
+    """
+
+    rendered = " ".join(str(value or "").strip().split())
+    if not rendered:
+        return False
+    candidates = _operator_text_operand_candidates(message, field=field)
+    if field in {"content", "text", "target", "value", "selector"}:
+        # Quoting proves an operand's extent, not its semantic role.  Bind the
+        # value to the field-specific verb/preposition clause; otherwise two
+        # quoted values could be swapped while still passing exact authority.
+        return rendered in candidates
+    return _operator_mentions_value(message, rendered)
+
+
+def _operator_quoted_operands(source: str) -> tuple[set[str], str]:
+    quoted: set[str] = set()
+    masked = source
+    patterns = (
+        r'"([^"\n]*)"',
+        r"'([^'\n]*)'",
+        r"«([^»\n]*)»",
+        r"“([^”\n]*)”",
+    )
+    for pattern in patterns:
+        matches = list(re.finditer(pattern, masked))
+        for match in matches:
+            value = " ".join(match.group(1).strip().split())
+            if value:
+                quoted.add(value)
+        masked = re.sub(pattern, lambda match: " " * len(match.group(0)), masked)
+    return quoted, masked
+
+
+def _operator_text_operand_candidates(message: str, *, field: str) -> set[str]:
+    source = " ".join(str(message).split())
+    url_stop = r"(?=\s+(?:at|on|на)\s+https?://|\s+https?://|$)"
+    patterns: tuple[str, ...]
+    if field == "content":
+        patterns = (
+            r"\b(?:with\s+content|content|write|append|save|"
+            r"запиш\w*|напиш\w*|добав\w*|допиш\w*)\b\s*(?:[:=]\s*)?"
+            r"(?P<operand>.+?)(?=\s+(?:to|into)\s+(?:file|path|[/\\]|[A-Za-z]:)|$)",
+        )
+    elif field == "text":
+        patterns = (
+            r"\b(?:type|enter|input|введ\w*|напечат\w*)\b\s+"
+            r"(?P<operand>.+?)(?=\s+(?:into|in|to|в|на)\s+|\s+https?://|$)",
+        )
+    elif field == "target":
+        patterns = (
+            rf"\b(?:click|press|нажм\w*|кликн\w*)\b\s+(?P<operand>.+?){url_stop}",
+            r"\b(?:into|in|в)\b\s+(?P<operand>.+?)"
+            r"(?=\s+(?:at|on|на)\s+https?://|\s+(?:in|в)\s+(?:the\s+)?"
+            r"(?:browser|браузер\w*)|\s+https?://|$)",
+        )
+    elif field == "value":
+        patterns = (
+            r"\b(?:select|choose|выбер\w*|выбрат\w*)\b\s+(?P<operand>.+?)"
+            r"(?=\s+(?:in|into|at|on|в|на)\s+|\s+https?://|$)",
+            r"\b(?:value|значени\w*)\b\s*(?:[:=]\s*)?(?P<operand>.+?)$",
+        )
+    elif field == "selector":
+        patterns = (
+            r"\b(?:selector|css|селектор\w*)\b\s*(?:[:=]\s*)?(?P<operand>\S+)",
+        )
+    else:
+        return set()
+    candidates: set[str] = set()
+    for pattern in patterns:
+        for match in re.finditer(pattern, source, re.IGNORECASE):
+            candidate = " ".join(match.group("operand").strip().split())
+            candidate = candidate.strip("'\"«»“”")
+            if candidate:
+                candidates.add(candidate)
+    return candidates
+
+
+def _operator_value_occurs_structurally(source: str, rendered: str) -> bool:
+    start = 0
+    while True:
+        index = source.find(rendered, start)
+        if index < 0:
+            return False
+        end = index + len(rendered)
+        left_ok = index == 0 or source[index - 1].isspace() or source[index - 1] in "([{:=>,;"
+        right_ok = (
+            end == len(source)
+            or source[end].isspace()
+            or source[end] in ")]},;!?:="
+        )
+        # Slash, backslash, dot, dash, underscore, @ and word characters are
+        # deliberately absent from the boundary sets.  Thus executable="rm"
+        # cannot be authorized merely because /tmp/rm_payload.sh was named.
+        if left_ok and right_ok:
+            return True
+        start = index + 1
+
+
+def _operator_path_occurs_exactly(source: str, rendered: str) -> bool:
+    start = 0
+    while True:
+        index = source.find(rendered, start)
+        if index < 0:
+            return False
+        end = index + len(rendered)
+        left_ok = index == 0 or source[index - 1].isspace() or source[index - 1] in "'\"«“([{:="
+        right_ok = end == len(source) or source[end].isspace() or source[end] in "'\"»”)]},;!?:="
+        if not right_ok and source[end] == ".":
+            right_ok = end + 1 == len(source) or source[end + 1].isspace()
+        if left_ok and right_ok:
+            return True
+        start = index + 1
 
 
 def _operator_mentions_url(message: str, url: str) -> bool:
-    if _operator_mentions_value(message, url):
-        return True
-    parsed = urlparse(url)
-    host = parsed.netloc.casefold().removeprefix("www.")
-    if not host:
+    target = _operator_url_identity(url)
+    if target is None:
         return False
-    normalized_message = message.casefold().replace("www.", "")
-    suffix = parsed.path.rstrip("/")
-    if parsed.query:
-        suffix = f"{suffix}?{parsed.query}"
-    candidate = f"{host}{suffix}"
-    return candidate in normalized_message if suffix else host in normalized_message
+    return target in _operator_url_identities_from_message(message)
+
+
+def _operator_url_identities_from_message(
+    message: str,
+) -> list[tuple[str, str, int | None, str, str, str]]:
+    candidates = [
+        match.group(0).rstrip(".,;!?)]}")
+        for match in re.finditer(r"https?://[^\s<>\"'«»“”]+", message, re.IGNORECASE)
+    ]
+    candidates.extend(
+        match.group(1).rstrip(".,;!?)]}")
+        for match in re.finditer(
+            r"(?<![@\w.:/-])((?:www\.)?[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+            r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+"
+            r"(?::\d{2,5})?(?:/[^\s<>\"'«»“”]*)?)",
+            message,
+            re.IGNORECASE,
+        )
+    )
+    return [
+        identity
+        for candidate in candidates
+        if (identity := _operator_url_identity(candidate)) is not None
+    ]
+
+
+def _operator_url_identity(
+    raw_url: str,
+) -> tuple[str, str, int | None, str, str, str] | None:
+    text = str(raw_url or "").strip()
+    if not text:
+        return None
+    parsed = urlparse(text if re.match(r"^https?://", text, re.I) else f"https://{text}")
+    scheme = parsed.scheme.casefold()
+    if scheme not in {"http", "https"}:
+        return None
+    host = (parsed.hostname or "").casefold().rstrip(".").removeprefix("www.")
+    if not host:
+        return None
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    path = parsed.path.rstrip("/")
+    return scheme, host, port, path, parsed.query, parsed.fragment
 
 
 def _operator_effect_key(name: str, args: dict[str, Any]) -> str:
@@ -14479,6 +16249,16 @@ def _operator_effect_key(name: str, args: dict[str, Any]) -> str:
     if name in {"execution.apply", "execution.transaction"}:
         with suppress(TypeError, ValueError):
             effect_arguments = _canonical_operator_execution_effect(name, args)
+    elif name.startswith("browser."):
+        effect_arguments = _canonical_operator_browser_effect(name, args)
+    elif name == "filesystem.write_text":
+        effect_arguments = {
+            "path": _canonical_operator_path(args.get("path")),
+            "content": str(args.get("content") or ""),
+            "mode": str(args.get("mode") or "overwrite").casefold(),
+        }
+    elif name == "windows.native":
+        effect_arguments = _canonical_operator_native_effect(args)
     payload = json.dumps(
         {"tool": name, "arguments": normalize(effect_arguments)},
         ensure_ascii=False,
@@ -14488,15 +16268,153 @@ def _operator_effect_key(name: str, args: dict[str, Any]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _canonical_operator_browser_effect(name: str, args: dict[str, Any]) -> dict[str, Any]:
+    if name == "browser.open":
+        return {"url": _operator_url_identity(str(args.get("url") or ""))}
+    if name == "browser.open_many":
+        urls = args.get("urls")
+        identities = {
+            _operator_url_identity(str(item))
+            for item in (urls if isinstance(urls, list) else [])
+        }
+        return {
+            "urls": sorted(
+                (identity for identity in identities if identity is not None),
+                key=repr,
+            )
+        }
+    if name == "browser.chrome.launch":
+        return {
+            "debug_port": _canonical_operator_integer(args.get("debug_port", 9222), 9222),
+            "profile_dir": str(args.get("profile_dir") or ""),
+            "start_url": (
+                _operator_url_identity(str(args.get("start_url") or ""))
+                if args.get("start_url")
+                else None
+            ),
+        }
+    if name not in {
+        "browser.click",
+        "browser.type",
+        "browser.select",
+        "browser.scroll",
+        "browser.screenshot",
+    }:
+        return args
+    canonical: dict[str, Any] = {
+        "url": _operator_url_identity(str(args.get("url") or "")),
+        "wait_ms": _canonical_operator_integer(args.get("wait_ms", 5000), 5000),
+        "debug_url": str(args.get("debug_url") or DEFAULT_CHROME_DEBUG_URL),
+    }
+    if name in {"browser.click", "browser.type", "browser.select"}:
+        canonical.update(
+            {
+                "target": str(args.get("target") or ""),
+                "selector": str(args.get("selector") or ""),
+            }
+        )
+    if name == "browser.type":
+        canonical.update(
+            {
+                "text": str(args.get("text") or ""),
+                "allow_sensitive": _canonical_operator_boolean(
+                    args.get("allow_sensitive", False),
+                    False,
+                ),
+            }
+        )
+    elif name == "browser.select":
+        canonical["value"] = str(args.get("value") or "")
+    elif name == "browser.scroll":
+        canonical.update(
+            {
+                "direction": str(args.get("direction") or "down").casefold(),
+                "pixels": _canonical_operator_integer(args.get("pixels", 900), 900),
+                "passes": _canonical_operator_integer(args.get("passes", 3), 3),
+                "max_chars": _canonical_operator_integer(
+                    args.get("max_chars", 9000),
+                    9000,
+                ),
+            }
+        )
+    return canonical
+
+
+def _canonical_operator_integer(value: Any, default: int) -> int | Any:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str) and re.fullmatch(r"[+-]?\d+", value.strip()):
+        return int(value.strip())
+    return value
+
+
+def _canonical_operator_boolean(value: Any, default: bool) -> bool | Any:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().casefold() in {"true", "false"}:
+        return value.strip().casefold() == "true"
+    return value
+
+
+def _canonical_operator_native_effect(args: dict[str, Any]) -> dict[str, Any]:
+    action = str(args.get("action") or "").casefold()
+    raw_payload = args.get("payload")
+    payload = dict(raw_payload) if isinstance(raw_payload, dict) else {}
+    if action in {"process.start", "app.open_and_type"}:
+        payload["arguments"] = list(payload.get("arguments") or [])
+        payload["cwd"] = str(payload.get("cwd") or "")
+        payload["executable"] = str(payload.get("executable") or "").casefold()
+    if action == "app.open_and_type":
+        for field in ("keys", "text", "process_name", "window_title"):
+            payload[field] = str(payload.get(field) or "")
+        for field in ("process_name", "window_title"):
+            payload[field] = payload[field].casefold()
+        if "wait_ms" not in payload:
+            arguments = [str(item) for item in payload.get("arguments") or []]
+            calculator_launch = (
+                str(payload.get("executable") or "").casefold() == "explorer.exe"
+                and any("windowscalculator" in item.casefold() for item in arguments)
+            )
+            payload["wait_ms"] = 1800 if calculator_launch else 900
+    if action in {"window.focus", "keyboard.send"}:
+        payload["process_id"] = payload.get("process_id", 0)
+        for field in ("process_name", "window_title"):
+            payload[field] = str(payload.get(field) or "")
+    if action == "keyboard.send":
+        payload["keys"] = str(payload.get("keys") or "")
+        payload["text"] = str(payload.get("text") or "")
+    return {"action": action, "payload": payload, "timeout_sec": args.get("timeout_sec", 30)}
+
+
 def _canonical_operator_execution_effect(name: str, args: dict[str, Any]) -> dict[str, Any]:
     def envelope(value: Any) -> dict[str, Any]:
         canonical = ActionEnvelope.model_validate(value).model_dump(mode="json")
-        canonical["action"].pop("action_id", None)
+        action = canonical["action"]
+        action.pop("action_id", None)
+        for field in ("path", "source", "destination", "executable", "cwd"):
+            if action.get(field) not in {None, ""}:
+                action[field] = _canonical_operator_path(action[field])
+        for field in ("arguments", "observe_paths"):
+            values = action.get(field)
+            if isinstance(values, list):
+                action[field] = [
+                    _canonical_operator_path(item)
+                    if _operator_value_is_path(item)
+                    else item
+                    for item in values
+                ]
         return canonical
 
     common = {
         "session_id": str(args.get("session_id") or "") or None,
-        "verification": _canonical_operator_verification(args.get("verification")),
     }
     if name == "execution.apply":
         return {
@@ -14511,49 +16429,6 @@ def _canonical_operator_execution_effect(name: str, args: dict[str, Any]) -> dic
         "actions": [envelope(item) for item in actions],
         **common,
     }
-
-
-def _canonical_operator_verification(value: Any) -> dict[str, Any]:
-    if value is None:
-        value = {}
-    if not isinstance(value, dict):
-        raise ValueError("verification must be an object")
-    canonical: dict[str, Any] = {"paths": [], "tcp": [], "processes": []}
-    for item in value.get("paths") or []:
-        if not isinstance(item, dict):
-            raise ValueError("verification path must be an object")
-        canonical["paths"].append(
-            {
-                "path": item.get("path"),
-                "exists": item.get("exists", True),
-                "kind": item.get("kind"),
-                "sha256": item.get("sha256"),
-                "syntax_valid": item.get("syntax_valid", False),
-            }
-        )
-    for item in value.get("tcp") or []:
-        if not isinstance(item, dict):
-            raise ValueError("verification TCP item must be an object")
-        canonical["tcp"].append(
-            {
-                "host": item.get("host"),
-                "port": item.get("port"),
-                "reachable": item.get("reachable", True),
-                "timeout_seconds": item.get("timeout_seconds", 3.0),
-            }
-        )
-    for item in value.get("processes") or []:
-        if not isinstance(item, dict):
-            raise ValueError("verification process item must be an object")
-        canonical["processes"].append(
-            {
-                "session_id": item.get("session_id"),
-                "pid": item.get("pid"),
-                "running": item.get("running"),
-            }
-        )
-    return canonical
-
 
 APP_ALIASES: tuple[tuple[tuple[str, ...], str, str], ...] = (
     (("калькулятор", "calculator", "calc.exe", "calc"), "calc.exe", "калькулятор"),
@@ -14764,7 +16639,22 @@ def _explicit_windows_path_from_message(message: str) -> str | None:
         r"(?<!\w)([A-Za-z]:[\\/][^\s,;!?]+)",
         message,
     )
-    return match.group(1).rstrip(".") if match is not None else None
+    if match is not None:
+        return match.group(1).rstrip(".")
+    # Linux CI and WSL-facing callers use POSIX absolute paths. Keep the same
+    # explicit-operand requirement and reject URL slashes by requiring either a
+    # quoted absolute path or an unquoted slash not preceded by ':', '/' or a
+    # word character.
+    quoted_any = re.search(r"[\"'«“]([^\"'»”\r\n]+)[\"'»”]", message)
+    if quoted_any is not None:
+        candidate = quoted_any.group(1).strip()
+        if Path(candidate).is_absolute():
+            return candidate
+    posix = re.search(r"(?<![:/\w])(/[^\s,;!?\"'«»“”]+)", message)
+    if posix is None:
+        return None
+    candidate = posix.group(1).rstrip(".")
+    return candidate if Path(candidate).is_absolute() else None
 
 
 def _empty_file_path_from_message(message: str) -> str | None:
@@ -14775,7 +16665,17 @@ def _empty_file_path_from_message(message: str) -> str | None:
         re.IGNORECASE,
     ):
         return None
-    return _explicit_windows_path_from_message(message)
+    windows_path = _explicit_windows_path_from_message(message)
+    if windows_path is not None:
+        return windows_path
+    # Production is Windows-first, while Linux CI exercises the same authority
+    # binding with tmp_path. Accept only an explicitly quoted absolute POSIX
+    # path; the downstream filesystem policy still enforces configured roots.
+    quoted = re.search(r"[\"'«“]([^\"'»”\r\n]+)[\"'»”]", message)
+    if quoted is None:
+        return None
+    candidate = quoted.group(1).strip()
+    return candidate if Path(candidate).is_absolute() else None
 
 
 def _wmi_action_from_message(message: str) -> NativeAction:

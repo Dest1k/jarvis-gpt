@@ -684,6 +684,7 @@ class AutonomyJobResponse(BaseModel):
     deadline_at: str | None = None
     cancelled_at: str | None = None
     last_result: dict[str, Any] = Field(default_factory=dict)
+    observability_status: dict[str, Any] | None = None
 
 
 class AutonomyJobRunResponse(BaseModel):

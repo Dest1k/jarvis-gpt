@@ -136,6 +136,9 @@ def test_native_app_policy_rejects_path_aliases_and_accepts_explicit_exact_paths
     monkeypatch, tmp_path
 ):
     bridge = _load_bridge_module()
+    windows_root = tmp_path / "Windows"
+    windows_root.mkdir()
+    monkeypatch.setenv("SYSTEMROOT", str(windows_root))
     untrusted = tmp_path / "Untrusted" / "notepad.exe"
     untrusted.parent.mkdir()
     untrusted.write_bytes(b"not-an-app")
@@ -154,6 +157,7 @@ def test_native_app_policy_rejects_path_aliases_and_accepts_explicit_exact_paths
     assert bridge._resolve_executable(str(custom_code)) == str(custom_code.resolve())
 
 
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows path resolution")
 def test_native_app_argument_grammars_reject_windows_devices_and_ads(monkeypatch, tmp_path):
     bridge = _load_bridge_module()
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
@@ -217,6 +221,276 @@ def test_capabilities_publish_versioned_native_app_policy():
         "limit": {"minimum": 1, "maximum": 50},
         "sorts": ["cpu", "memory", "name", "pid"],
     }
+    assert capabilities["browser_network_guard"] == {
+        "required_actions": [
+            "browser.open_guarded",
+            "chrome.attest_guarded",
+            "chrome.launch_guarded",
+        ],
+        "version": "public-proxy-v1",
+        "proxy_host": "127.0.0.1",
+        "public_proxy_port": 18766,
+        "private_networks": "blocked",
+        "dns_rebinding": "numeric_ip_pinned_per_connection",
+        "fail_closed": True,
+        "recovery_error": "",
+    }
+
+
+def test_browser_bridge_contract_only_exposes_guarded_navigation_actions(tmp_path):
+    bridge = _load_bridge_module()
+
+    for removed_action in ("url.open", "chrome.launch"):
+        with pytest.raises(bridge.ActionValidationError, match="Unsupported action"):
+            bridge.validate_action_request({"action": removed_action, "payload": {}})
+
+    action, payload, _timeout = bridge.validate_action_request(
+        {
+            "action": "browser.open_guarded",
+            "payload": {
+                "url": "https://example.com/path",
+                "profile_dir": str(tmp_path),
+            },
+        }
+    )
+
+    assert action == "browser.open_guarded"
+    assert payload == {
+        "url": "https://example.com/path",
+        "profile_dir": str(tmp_path),
+        "allowed_private_hosts": (),
+    }
+
+
+def test_browser_guard_rejects_private_mixed_and_metadata_dns(monkeypatch):
+    bridge = _load_bridge_module()
+
+    def answers(*_args, **_kwargs):
+        return [
+            (2, 1, 6, "", ("93.184.216.34", 443)),
+            (2, 1, 6, "", ("169.254.169.254", 443)),
+        ]
+
+    monkeypatch.setattr(bridge.socket, "getaddrinfo", answers)
+
+    with pytest.raises(bridge.ActionValidationError, match="private, local, reserved"):
+        bridge._public_proxy_addresses("rebind.example", 443)
+    for literal in ("127.0.0.1", "10.0.0.1", "169.254.169.254", "::1"):
+        with pytest.raises(bridge.ActionValidationError, match="private, local, reserved"):
+            bridge._public_proxy_addresses(literal, 443)
+
+
+def test_browser_guard_keeps_public_and_exact_private_sessions_disjoint(monkeypatch):
+    bridge = _load_bridge_module()
+
+    assert bridge._public_proxy_addresses(
+        "127.0.0.1",
+        8080,
+        allowed_private_hosts=frozenset({"127.0.0.1"}),
+    ) == ["127.0.0.1"]
+    with pytest.raises(bridge.ActionValidationError, match="private-only"):
+        bridge._public_proxy_addresses(
+            "93.184.216.34",
+            443,
+            allowed_private_hosts=frozenset({"127.0.0.1"}),
+        )
+    with pytest.raises(bridge.ActionValidationError, match="private, local"):
+        bridge._public_proxy_addresses("127.0.0.1", 8080)
+    with pytest.raises(bridge.ActionValidationError, match="private, local"):
+        bridge._public_proxy_addresses(
+            "127.0.0.1",
+            8080,
+            allowed_private_hosts=frozenset({"localhost"}),
+        )
+
+
+def test_browser_guard_connects_to_the_validated_numeric_ip(monkeypatch):
+    bridge = _load_bridge_module()
+    calls = []
+    connected = object()
+
+    monkeypatch.setattr(
+        bridge,
+        "_public_proxy_addresses",
+        lambda host, port, **_kwargs: (
+            ["93.184.216.34"] if (host, port) == ("example.com", 443) else []
+        ),
+    )
+
+    def connect(address, *, timeout):
+        calls.append((address, timeout))
+        return connected
+
+    monkeypatch.setattr(bridge.socket, "create_connection", connect)
+
+    result, address = bridge._connect_public_host("example.com", 443)
+
+    assert result is connected
+    assert address == "93.184.216.34"
+    assert calls == [
+        (("93.184.216.34", 443), bridge.BROWSER_PROXY_CONNECT_TIMEOUT_SEC)
+    ]
+
+
+def test_guarded_chrome_launch_has_no_direct_network_fallback(monkeypatch, tmp_path):
+    bridge = _load_bridge_module()
+    captured = {}
+
+    monkeypatch.setattr(bridge, "_find_chrome", lambda: "chrome.exe")
+    monkeypatch.setattr(bridge, "_listening_tcp_owner_pid", lambda _port: None)
+    monkeypatch.setattr(bridge, "_wait_for_guarded_debug_owner", lambda _port: 4242)
+    monkeypatch.setattr(
+        bridge,
+        "_ensure_browser_guard_proxy",
+        lambda *_args: ("127.0.0.1", bridge.BROWSER_GUARD_PROXY_PORT),
+    )
+
+    def start(action, payload):
+        captured.update({"action": action, "payload": payload})
+        return {"ok": True, "pid": 42, "argv": list(payload["arguments"])}
+
+    monkeypatch.setattr(bridge, "_start_process", start)
+    monkeypatch.setattr(
+        bridge,
+        "_windows_process_identity",
+        lambda _pid: {
+            "name": "chrome.exe",
+            "creation_utc": "2026-01-01T00:00:00Z",
+            "command_line": " ".join(
+                (
+                    "chrome.exe",
+                    f"--user-data-dir={tmp_path / 'public-proxy-v1' / 'public'}",
+                    "--proxy-server=http://127.0.0.1:18766",
+                    "--proxy-bypass-list=<-loopback>",
+                    "--host-resolver-rules=MAP * ~NOTFOUND",
+                    "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+                    "--disable-quic",
+                    "--enable-automation",
+                    f"--jarvis-guard-nonce={'n' * 43}",
+                )
+            ),
+        },
+    )
+    monkeypatch.setattr(bridge, "_persist_guarded_chrome_attestations", lambda: None)
+
+    result = bridge._launch_guarded_chrome(
+        "chrome.launch_guarded",
+        {
+            "debug_port": 9222,
+            "headless": False,
+            "profile_dir": str(tmp_path),
+            "start_url": "https://example.com",
+            "allowed_private_hosts": (),
+            "launch_nonce": "n" * 43,
+        },
+    )
+
+    arguments = captured["payload"]["arguments"]
+    assert captured["action"] == "chrome.launch_guarded"
+    assert "--proxy-server=http://127.0.0.1:18766" in arguments
+    assert "--proxy-bypass-list=<-loopback>" in arguments
+    assert "--host-resolver-rules=MAP * ~NOTFOUND" in arguments
+    assert "--force-webrtc-ip-handling-policy=disable_non_proxied_udp" in arguments
+    assert "--disable-quic" in arguments
+    assert arguments[-1] == "https://example.com"
+    assert result["network_guard"]["enforced"] is True
+    assert result["network_guard"]["fail_closed"] is True
+    assert result["network_guard"]["dns_rebinding"] == (
+        "numeric_ip_pinned_per_connection"
+    )
+    assert "argv" not in result
+    assert "n" * 43 not in json.dumps(result)
+
+
+def test_guarded_chrome_rejects_a_preexisting_debug_endpoint(monkeypatch, tmp_path):
+    bridge = _load_bridge_module()
+    monkeypatch.setattr(bridge, "_listening_tcp_owner_pid", lambda _port: 999)
+    monkeypatch.setattr(
+        bridge,
+        "_find_chrome",
+        lambda: (_ for _ in ()).throw(AssertionError("Chrome must not launch")),
+    )
+
+    with pytest.raises(OSError, match="pre-existing endpoint"):
+        bridge._launch_guarded_chrome(
+            "chrome.launch_guarded",
+            {
+                "debug_port": 9222,
+                "headless": False,
+                "profile_dir": str(tmp_path),
+                "start_url": "about:blank",
+                "allowed_private_hosts": (),
+                "launch_nonce": "n" * 43,
+            },
+        )
+
+
+def test_guarded_chrome_attestation_recovers_after_bridge_restart(monkeypatch, tmp_path):
+    bridge = _load_bridge_module()
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    token = "persistent-test-token"
+    profile = str(tmp_path / "profile" / "public-proxy-v1" / "public")
+    proxy = "http://127.0.0.1:18766"
+    nonce = "r" * 43
+    command_line = " ".join(
+        (
+            "chrome.exe",
+            f"--user-data-dir={profile}",
+            f"--proxy-server={proxy}",
+            "--proxy-bypass-list=<-loopback>",
+            "--host-resolver-rules=MAP * ~NOTFOUND",
+            "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+            "--disable-quic",
+            "--enable-automation",
+            f"--jarvis-guard-nonce={nonce}",
+        )
+    )
+    record = {
+        "debug_port": 9222,
+        "launch_nonce": nonce,
+        "owner_pid": 4242,
+        "profile_dir": profile,
+        "proxy": proxy,
+        "allowed_private_hosts": [],
+        "session_class": "public-only",
+        "creation_utc": "2026-01-01T00:00:00Z",
+        "command_line_sha256": bridge.hashlib.sha256(command_line.encode()).hexdigest(),
+    }
+    first = bridge.BridgeServer(("127.0.0.1", 0), token)
+    try:
+        with bridge._guarded_chrome_attestations_lock:
+            bridge._guarded_chrome_attestations[9222] = record
+        bridge._persist_guarded_chrome_attestations()
+    finally:
+        first.server_close()
+
+    with bridge._guarded_chrome_attestations_lock:
+        bridge._guarded_chrome_attestations.clear()
+    second = bridge.BridgeServer(("127.0.0.1", 0), token)
+    monkeypatch.setattr(bridge, "_listening_tcp_owner_pid", lambda _port: 4242)
+    monkeypatch.setattr(
+        bridge,
+        "_windows_process_identity",
+        lambda _pid: {
+            "name": "chrome.exe",
+            "creation_utc": "2026-01-01T00:00:00Z",
+            "command_line": command_line,
+        },
+    )
+    try:
+        result = bridge._attest_guarded_chrome(
+            "chrome.attest_guarded",
+            {"debug_port": 9222, "launch_nonce": nonce, "profile_dir": profile},
+        )
+    finally:
+        second.server_close()
+        for proxy_server, proxy_thread in list(bridge._browser_guard_proxies.values()):
+            proxy_server.shutdown()
+            proxy_server.server_close()
+            proxy_thread.join(timeout=2)
+
+    assert result["ok"] is True
+    assert result["owner_pid"] == 4242
 
 
 @pytest.mark.parametrize(

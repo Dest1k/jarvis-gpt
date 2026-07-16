@@ -12,6 +12,11 @@ if ($SkipFrontend) {
 if ($SkipHttp) {
   $argsList += "--skip-http"
 }
+else {
+  # Doctor validates the live stack. Static-only smoke remains available via
+  # scripts/smoke.py without --require-runtime.
+  $argsList += "--require-runtime"
+}
 
 py -3.11 .\scripts\smoke.py @argsList
 # Propagate smoke.py process exit code. Windows PowerShell -File otherwise

@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import re
 import time
+from datetime import UTC, datetime
 from typing import Any
 
 from .agent import AgentRuntime
@@ -17,6 +18,9 @@ from .operations import OperationsManager
 from .storage import JarvisStorage, new_id, utc_now
 from .telemetry import TelemetryCollector
 from .tools import _web_watch_state_key as _watch_state_key
+
+_RETRY_SAFE_JOB_KINDS = frozenset({"diagnostics"})
+_MISSION_JOB_OWNER_PREFIX = "autonomy.mission_owner."
 
 
 class AutonomyExecutor:
@@ -56,9 +60,20 @@ class AutonomyExecutor:
         self._cancelled_job_ids: set[str] = set()
         self._run_lock = asyncio.Lock()
 
-    async def run_due_jobs(self, *, limit: int = 1) -> list[dict[str, Any]]:
+    async def run_due_jobs(
+        self,
+        *,
+        limit: int = 1,
+        now: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        # Reconciliation is part of every scheduler pass, not only process
+        # startup.  This closes the case where a backend restarts while a lease
+        # is still valid and remains alive until that lease later expires.
+        current = now or datetime.now(UTC)
+        self.operations.recover_stale_running_jobs(now=current)
+        self.operations.expire_deadline_jobs(now=current)
         results = []
-        for job in self.operations.due_jobs(limit=limit):
+        for job in self.operations.due_jobs(now=current, limit=limit):
             results.append(await self.run_job(job))
         return results
 
@@ -113,118 +128,246 @@ class AutonomyExecutor:
             started_perf = time.perf_counter()
             lease_id = new_id("joblease")
             lease_until = _lease_until(job)
-            self.operations.mark_job_started(
+            started = self.operations.mark_job_started(
                 job_id,
                 lease_id=lease_id,
                 started_at=started_at,
                 lease_until=lease_until,
             )
-            if _deadline_expired(job.get("deadline_at")):
-                result = {
+            if started is None:
+                return {
+                    "job": job,
                     "ok": False,
-                    "summary": "Autonomy job deadline expired before execution.",
-                    "data": {"job_id": job_id, "deadline_at": job.get("deadline_at")},
-                    "job_status": "cancelled",
+                    "summary": "Autonomy job disappeared before its lease was persisted.",
+                    "data": {
+                        "job_id": job_id,
+                        "lease_id": lease_id,
+                        "replay_original_action": False,
+                    },
                 }
-            else:
-                try:
-                    timeout = _job_timeout_seconds(job)
-                    task = asyncio.create_task(
-                        self.run_kind(str(job.get("kind") or ""), job.get("payload") or {})
-                    )
-                    async with self._run_lock:
-                        self._running_tasks[job_id] = task
-                        if job_id in self._cancelled_job_ids:
-                            task.cancel()
-                    if timeout:
-                        result = await asyncio.wait_for(task, timeout=timeout)
-                    else:
-                        result = await task
-                except asyncio.CancelledError:
-                    async with self._run_lock:
-                        explicitly_cancelled = job_id in self._cancelled_job_ids
-                    if not explicitly_cancelled:
-                        raise
+            job = started
+            try:
+                timeout = _job_timeout_seconds(job)
+                # Mission planning/binding is part of the leased operation. It
+                # must be cancellable and consume the same wall-clock budget as
+                # mission execution; otherwise cancel/timeout can arrive while
+                # an untracked planner keeps creating durable work.
+                task = asyncio.create_task(
+                    self._prepare_and_run_leased_job(job, lease_id=lease_id)
+                )
+                async with self._run_lock:
+                    self._running_tasks[job_id] = task
+                    if job_id in self._cancelled_job_ids:
+                        task.cancel()
+                if timeout:
+                    job, result = await asyncio.wait_for(task, timeout=timeout)
+                else:
+                    job, result = await task
+            except asyncio.CancelledError:
+                async with self._run_lock:
+                    explicitly_cancelled = job_id in self._cancelled_job_ids
+                if not explicitly_cancelled:
+                    raise
+                if str(job.get("kind") or "") in _RETRY_SAFE_JOB_KINDS:
                     result = {
                         "ok": False,
                         "summary": "Autonomy job was cancelled while running.",
-                        "data": {"job_id": job_id, "lease_id": lease_id},
+                        "data": {
+                            "job_id": job_id,
+                            "lease_id": lease_id,
+                            "outcome_known": True,
+                            "replay_original_action": False,
+                        },
                         "job_status": "cancelled",
+                        "reconcile_required": False,
                     }
-                except TimeoutError:
-                    result = {
-                        "ok": False,
-                        "summary": "Autonomy job exceeded its runtime budget.",
-                        "data": {"job_id": job_id, "timeout_sec": _job_timeout_seconds(job)},
-                        "job_status": "enabled",
-                    }
-                except Exception as exc:  # noqa: BLE001
-                    result = {
-                        "ok": False,
-                        "summary": f"Autonomy job failed: {exc}",
-                        "data": {"error": repr(exc), "job_id": job_id},
-                        "job_status": "enabled",
-                    }
+                else:
+                    result = _ambiguous_job_failure(
+                        job,
+                        summary=(
+                            "Autonomy job was cancelled after execution began; "
+                            "its external outcome must be reconciled."
+                        ),
+                        data={"job_id": job_id, "lease_id": lease_id},
+                    )
+            except TimeoutError:
+                result = _ambiguous_job_failure(
+                    job,
+                    summary="Autonomy job exceeded its runtime budget.",
+                    data={
+                        "job_id": job_id,
+                        "timeout_sec": _job_timeout_seconds(job),
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001
+                result = _ambiguous_job_failure(
+                    job,
+                    summary=f"Autonomy job failed: {exc}",
+                    data={"error": repr(exc), "job_id": job_id},
+                )
             finished_at = utc_now()
             duration_ms = int((time.perf_counter() - started_perf) * 1000)
-            if job.get("kind") == "mission":
-                try:
-                    self._persist_mission_payload(job, result)
-                except Exception as exc:  # noqa: BLE001
-                    result = {
-                        "ok": False,
-                        "summary": f"Mission job state persist failed: {exc}",
-                        "data": {
-                            "error": repr(exc),
-                            "job_id": job_id,
-                            "previous_result": result,
-                        },
-                        "job_status": "enabled",
-                    }
             updated = self.operations.mark_job_run(
                 job_id,
                 result,
                 started_at=started_at,
                 finished_at=finished_at,
                 duration_ms=duration_ms,
-            ) or job
-            run_record = self.operations.record_job_run(
-                job,
-                result,
-                started_at=started_at,
-                finished_at=finished_at,
-                duration_ms=duration_ms,
+                expected_lease_id=lease_id,
             )
-            response = {"job": updated, **result}
-            self.storage.add_event(
-                kind="autonomy.job.run",
-                title=str(result.get("summary") or job.get("title") or job_id)[:240],
-                level="info" if result.get("ok") else "warn",
-                payload={
-                    "job_id": job_id,
-                    "kind": job.get("kind"),
-                    "status": updated.get("status"),
-                    "ok": bool(result.get("ok")),
-                    "duration_ms": duration_ms,
-                    "run_id": run_record["id"],
-                },
-            )
-            if self.bus:
-                await self.bus.publish(
-                    {
-                        "channel": "autonomy.jobs",
-                        "action": "run",
-                        "job_id": job_id,
-                        "ok": bool(result.get("ok")),
-                        "status": updated.get("status"),
-                    }
+            if updated is None:
+                persisted = next(
+                    (
+                        item
+                        for item in self.operations.list_jobs()
+                        if item.get("id") == job_id
+                    ),
+                    None,
                 )
+                return {
+                    "job": persisted or {**job, "status": "paused"},
+                    "ok": False,
+                    "summary": (
+                        "Autonomy worker lost its lease before finalization; its outcome "
+                        "was not committed and requires reconciliation."
+                    ),
+                    "data": {
+                        "job_id": job_id,
+                        "lease_id": lease_id,
+                        "reconciliation": {
+                            "required": True,
+                            "reason": "lease_fence_lost",
+                            "replay_original_action": False,
+                        },
+                    },
+                    "job_status": "paused",
+                    "reconcile_required": True,
+                }
+            response = {"job": updated, **result}
+            observability_failures: list[str] = []
+            run_id: str | None = None
+            try:
+                run_record = self.operations.record_job_run(
+                    job,
+                    result,
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    duration_ms=duration_ms,
+                )
+                run_id = str(run_record["id"])
+            except Exception:  # noqa: BLE001
+                observability_failures.append("job_run_history")
+            try:
+                self.storage.add_event(
+                    kind="autonomy.job.run",
+                    title=str(result.get("summary") or job.get("title") or job_id)[:240],
+                    level="info" if result.get("ok") else "warn",
+                    payload={
+                        "job_id": job_id,
+                        "kind": job.get("kind"),
+                        "status": updated.get("status"),
+                        "ok": bool(result.get("ok")),
+                        "duration_ms": duration_ms,
+                        "run_id": run_id,
+                    },
+                )
+            except Exception:  # noqa: BLE001
+                observability_failures.append("runtime_event")
+            if self.bus:
+                try:
+                    await self.bus.publish(
+                        {
+                            "channel": "autonomy.jobs",
+                            "action": "run",
+                            "job_id": job_id,
+                            "ok": bool(result.get("ok")),
+                            "status": updated.get("status"),
+                        }
+                    )
+                except Exception:  # noqa: BLE001
+                    observability_failures.append("event_bus")
+            if observability_failures:
+                response["observability_status"] = {
+                    "protocol": "jarvis.audit-status.v1",
+                    "persisted": False,
+                    "failed_sinks": observability_failures,
+                    "outcome_known": True,
+                    "retryable": False,
+                }
             return response
         finally:
             async with self._run_lock:
                 self._running_job_ids.discard(job_id)
                 self._running_tasks.pop(job_id, None)
                 self._cancelled_job_ids.discard(job_id)
+
+    async def _prepare_and_run_leased_job(
+        self,
+        job: dict[str, Any],
+        *,
+        lease_id: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Prepare and execute one job only while its persisted lease remains ours."""
+
+        if _deadline_expired(job.get("deadline_at")):
+            return job, {
+                "ok": False,
+                "summary": "Autonomy job deadline expired before execution.",
+                "data": {"job_id": job["id"], "deadline_at": job.get("deadline_at")},
+                "job_status": "cancelled",
+            }
+        job, preparation_result = await self._prepare_mission_job(job)
+        if preparation_result is not None:
+            return job, preparation_result
+        current = next(
+            (
+                item
+                for item in self.operations.list_jobs()
+                if item.get("id") == job.get("id")
+            ),
+            None,
+        )
+        if (
+            current is None
+            or current.get("status") != "enabled"
+            or current.get("running_lease_id") != lease_id
+        ):
+            return current or job, {
+                "ok": False,
+                "summary": "Autonomy job lost its executable lease during preparation.",
+                "data": {
+                    "job_id": job.get("id"),
+                    "lease_id": lease_id,
+                    "reconciliation": {
+                        "required": True,
+                        "reason": "lease_lost_during_preparation",
+                        "replay_original_action": False,
+                    },
+                },
+                "job_status": "paused",
+                "reconcile_required": True,
+            }
+        # Mission preparation can involve a slow planner. Re-check the durable
+        # deadline after it completes and immediately before dispatching the
+        # actual job action; an active lease deliberately prevents the separate
+        # deadline sweeper from finalizing this job for us.
+        if _deadline_expired(current.get("deadline_at")):
+            return current, {
+                "ok": False,
+                "summary": "Autonomy job deadline expired during preparation.",
+                "data": {
+                    "job_id": current["id"],
+                    "deadline_at": current.get("deadline_at"),
+                    "expired_without_execution": True,
+                    "replay_original_action": False,
+                },
+                "job_status": "cancelled",
+                "deadline_expired": True,
+            }
+        return current, await self.run_kind(
+            str(current.get("kind") or ""),
+            current.get("payload") or {},
+        )
 
     async def cancel_job(self, job_id: str) -> dict[str, Any] | None:
         job = self.operations.update_job(job_id, {"status": "cancelled"})
@@ -307,6 +450,136 @@ class AutonomyExecutor:
             "summary": f"Unsupported operation kind: {kind}",
             "data": {"kind": kind},
         }
+
+    async def _prepare_mission_job(
+        self,
+        job: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        """Reserve one durable mission id before planning a goal-backed job.
+
+        The reservation is written to the job before mission planning or INSERT.
+        Mission creation accepts that id idempotently, so a crash on either side
+        of the INSERT can be reconciled without creating a second mission.
+        """
+
+        if str(job.get("kind") or "") != "mission":
+            return job, None
+        payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+        goal = _optional_text(payload.get("goal"))
+        if not goal:
+            return job, None
+        mission_id = _optional_text(payload.get("mission_id"))
+        if mission_id is None:
+            mission_id = new_id("mis")
+            try:
+                updated = self.operations.update_job(
+                    str(job["id"]),
+                    {"payload": {**payload, "mission_id": mission_id}},
+                )
+            except Exception as exc:  # noqa: BLE001 - state may have committed before audit
+                updated = next(
+                    (
+                        item
+                        for item in self.operations.list_jobs()
+                        if item.get("id") == job.get("id")
+                        and _optional_text((item.get("payload") or {}).get("mission_id"))
+                        == mission_id
+                    ),
+                    None,
+                )
+                if updated is None:
+                    return job, _mission_binding_failure(job, mission_id=mission_id, error=exc)
+            if updated is None:
+                return job, _mission_binding_failure(
+                    job,
+                    mission_id=mission_id,
+                    error=RuntimeError("job disappeared before mission id reservation"),
+                )
+            job = updated
+            payload = job.get("payload") if isinstance(job.get("payload"), dict) else payload
+        binding_error = self._claim_mission_job_owner(
+            job,
+            mission_id=mission_id,
+            goal=goal,
+        )
+        if binding_error is not None:
+            return job, _mission_binding_failure(
+                job,
+                mission_id=mission_id,
+                error=binding_error,
+            )
+        existing = self.storage.get_mission(mission_id)
+        if existing is not None:
+            if _optional_text(existing.get("goal")) == goal:
+                return job, None
+            return job, _mission_binding_failure(
+                job,
+                mission_id=mission_id,
+                error=ValueError("mission_id is already bound to a different goal"),
+            )
+        try:
+            mission = await self.agent.create_mission_planned(
+                goal,
+                title=_optional_text(payload.get("title")),
+                mission_id=mission_id,
+            )
+            if str(mission.get("id") or "") != mission_id:
+                raise RuntimeError("mission planner did not honor the reserved mission id")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            existing = self.storage.get_mission(mission_id)
+            if existing is not None and _optional_text(existing.get("goal")) == goal:
+                return job, None
+            bound = next(
+                (
+                    item
+                    for item in self.operations.list_jobs()
+                    if item.get("id") == job.get("id")
+                    and _optional_text((item.get("payload") or {}).get("mission_id"))
+                    == mission_id
+                ),
+                None,
+            )
+            return bound or job, _mission_binding_failure(
+                bound or job,
+                mission_id=mission_id,
+                error=exc,
+            )
+        return job, None
+
+    def _claim_mission_job_owner(
+        self,
+        job: dict[str, Any],
+        *,
+        mission_id: str,
+        goal: str,
+    ) -> Exception | None:
+        """Bind one durable mission id to exactly one autonomy job."""
+
+        job_id = str(job.get("id") or "")
+        expected = {
+            "protocol": "jarvis.autonomy-mission-owner.v1",
+            "job_id": job_id,
+            "mission_id": mission_id,
+            "goal": goal,
+        }
+        key = f"{_MISSION_JOB_OWNER_PREFIX}{mission_id}"
+
+        def claim(current: Any) -> Any:
+            if current is None:
+                return {**expected, "created_at": utc_now()}
+            return current
+
+        try:
+            owner = self.storage.update_runtime_value_atomic(key, claim, default=None)
+        except Exception as exc:  # noqa: BLE001 - caller converts to binding failure
+            return exc
+        if not isinstance(owner, dict) or any(
+            owner.get(field) != value for field, value in expected.items()
+        ):
+            return ValueError("mission_id is already owned by another autonomy job")
+        return None
 
     async def _run_web_watch(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Re-fetch a watched public page and raise a signal when it changes.
@@ -496,23 +769,64 @@ class AutonomyExecutor:
             },
         }
 
-    def _persist_mission_payload(self, job: dict[str, Any], result: dict[str, Any]) -> None:
-        data = result.get("data") if isinstance(result.get("data"), dict) else {}
-        mission_id = _optional_text(data.get("mission_id"))
-        if not mission_id:
-            return
-        payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
-        if payload.get("mission_id") == mission_id:
-            return
-        self.operations.update_job(job["id"], {"payload": {**payload, "mission_id": mission_id}})
-
-
 def _bounded_int(value: Any, minimum: int, maximum: int, fallback: int) -> int:
     try:
         parsed = int(value)
     except (TypeError, ValueError):
         parsed = fallback
     return max(minimum, min(maximum, parsed))
+
+
+def _ambiguous_job_failure(
+    job: dict[str, Any],
+    *,
+    summary: str,
+    data: dict[str, Any],
+) -> dict[str, Any]:
+    kind = str(job.get("kind") or "")
+    retry_safe = kind in _RETRY_SAFE_JOB_KINDS
+    return {
+        "ok": False,
+        "summary": summary,
+        "data": {
+            **data,
+            "outcome_known": False,
+            "retryable": retry_safe,
+            "reconciliation": {
+                "required": not retry_safe,
+                "reason": "ambiguous_job_outcome",
+                "replay_original_action": retry_safe,
+            },
+        },
+        "job_status": "enabled" if retry_safe else "paused",
+        "reconcile_required": not retry_safe,
+    }
+
+
+def _mission_binding_failure(
+    job: dict[str, Any],
+    *,
+    mission_id: str | None,
+    error: Exception,
+) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "summary": "Mission was not executed because its durable job binding failed.",
+        "data": {
+            "job_id": job.get("id"),
+            "mission_id": mission_id,
+            "error": repr(error),
+            "outcome_known": mission_id is not None,
+            "retryable": False,
+            "reconciliation": {
+                "required": True,
+                "reason": "mission_binding_failed",
+                "replay_original_action": False,
+            },
+        },
+        "job_status": "paused",
+        "reconcile_required": True,
+    }
 
 
 def _job_timeout_seconds(job: dict[str, Any]) -> float | None:

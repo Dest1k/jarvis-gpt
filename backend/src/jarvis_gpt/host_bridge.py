@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import math
 import os
 import socket
 from pathlib import Path
@@ -13,21 +15,33 @@ from .config import JarvisSettings
 BRIDGE_HOST = "127.0.0.1"
 BRIDGE_PORT = 8765
 BRIDGE_CONTRACT = "action.v1"
-BRIDGE_POLICY_REVISION = "native-app-v2"
+BRIDGE_POLICY_REVISION = "native-app-v3"
 BRIDGE_ACTIONS = (
     "app.open_and_type",
+    "browser.open_guarded",
     "capabilities",
-    "chrome.launch",
+    "chrome.attest_guarded",
+    "chrome.launch_guarded",
     "console.show_processes",
     "keyboard.send",
     "process.start",
     "process.top",
     "screen.capture",
-    "url.open",
     "window.focus",
     "window.list",
     "wmi.query",
 )
+BRIDGE_READ_ONLY_ACTIONS = frozenset(
+    {
+        "capabilities",
+        "process.top",
+        "window.list",
+        "wmi.query",
+    }
+)
+_BRIDGE_READ_MAX_ATTEMPTS = 3
+_BRIDGE_RETRY_BASE_DELAY_SEC = 0.1
+_BRIDGE_RETRY_MAX_DELAY_SEC = 1.0
 
 
 class HostBridgeStatus:
@@ -64,6 +78,7 @@ class HostBridgeStatus:
                 and capabilities.get("contract") == BRIDGE_CONTRACT
                 and capabilities.get("raw_command_execution") is False
                 and capabilities.get("policy_revision") == BRIDGE_POLICY_REVISION
+                and _browser_network_guard_ready(capabilities)
                 and capabilities.get("app_paths_sha256")
                 == _expected_app_paths_sha256()
             ),
@@ -78,6 +93,7 @@ class HostBridgeStatus:
             "policy_revision": BRIDGE_POLICY_REVISION,
             "action_endpoint": "/action",
             "raw_execute_available": False,
+            "browser_network_guard": capabilities.get("browser_network_guard"),
             "native_capabilities": list(BRIDGE_ACTIONS),
         }
 
@@ -100,6 +116,9 @@ class HostBridgeClient:
                     f"Unsupported host bridge action. Allowed: {', '.join(BRIDGE_ACTIONS)}."
                 ),
                 "contract": BRIDGE_CONTRACT,
+                "outcome_known": True,
+                "retryable": False,
+                "attempts": 0,
             }
         if payload is None:
             payload = {}
@@ -108,12 +127,18 @@ class HostBridgeClient:
                 "ok": False,
                 "summary": "Host bridge payload must be an object.",
                 "contract": BRIDGE_CONTRACT,
+                "outcome_known": True,
+                "retryable": False,
+                "attempts": 0,
             }
         if isinstance(timeout_sec, bool) or not isinstance(timeout_sec, int):
             return {
                 "ok": False,
                 "summary": "Host bridge timeout_sec must be an integer.",
                 "contract": BRIDGE_CONTRACT,
+                "outcome_known": True,
+                "retryable": False,
+                "attempts": 0,
             }
 
         token = read_bridge_token(self.settings)
@@ -123,6 +148,9 @@ class HostBridgeClient:
                 "summary": "Host bridge token is missing.",
                 "contract": BRIDGE_CONTRACT,
                 "status": HostBridgeStatus(self.settings).snapshot(),
+                "outcome_known": True,
+                "retryable": False,
+                "attempts": 0,
             }
 
         timeout_sec = max(1, min(120, timeout_sec))
@@ -131,31 +159,53 @@ class HostBridgeClient:
             "payload": payload,
             "timeout_sec": timeout_sec,
         }
-        try:
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(timeout_sec + 5.0),
-                trust_env=False,
-            ) as client:
-                response = await client.post(
-                    f"http://{BRIDGE_HOST}:{BRIDGE_PORT}/action",
-                    headers={"Authorization": f"Bearer {token}"},
-                    json=request_payload,
-                )
-        except httpx.HTTPError as exc:
-            return {
-                "ok": False,
-                "summary": f"Host bridge request failed: {exc.__class__.__name__}",
-                "error": str(exc),
-                "contract": BRIDGE_CONTRACT,
-                "status": HostBridgeStatus(self.settings).snapshot(),
-            }
+        read_only = action in BRIDGE_READ_ONLY_ACTIONS
+        max_attempts = _BRIDGE_READ_MAX_ATTEMPTS if read_only else 1
+        attempts = 0
+        response: httpx.Response | None = None
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(timeout_sec + 5.0),
+            trust_env=False,
+        ) as client:
+            while attempts < max_attempts:
+                attempts += 1
+                try:
+                    response = await client.post(
+                        f"http://{BRIDGE_HOST}:{BRIDGE_PORT}/action",
+                        headers={"Authorization": f"Bearer {token}"},
+                        json=request_payload,
+                    )
+                except httpx.HTTPError as exc:
+                    transport_failure = isinstance(exc, httpx.TransportError)
+                    if read_only and transport_failure and attempts < max_attempts:
+                        await asyncio.sleep(_bridge_retry_delay(attempts))
+                        continue
+                    return {
+                        "ok": False,
+                        "summary": f"Host bridge request failed: {exc.__class__.__name__}",
+                        "error": str(exc),
+                        "contract": BRIDGE_CONTRACT,
+                        "status": HostBridgeStatus(self.settings).snapshot(),
+                        "outcome_known": False,
+                        "retryable": bool(read_only and transport_failure),
+                        "attempts": attempts,
+                    }
+                if 500 <= response.status_code <= 599 and read_only and attempts < max_attempts:
+                    await asyncio.sleep(_bridge_retry_delay(attempts, response=response))
+                    continue
+                break
+
+        assert response is not None
 
         try:
-            data = response.json()
+            decoded = response.json()
         except ValueError:
-            data = {"raw": response.text}
-        if not isinstance(data, dict):
-            data = {"raw": data}
+            decoded = None
+        response_has_outcome = isinstance(decoded, dict) and isinstance(
+            decoded.get("ok"), bool
+        )
+        response_ok = response_has_outcome and decoded.get("ok") is True
+        data = decoded if isinstance(decoded, dict) else {"raw": response.text or decoded}
         stale_contract = response.status_code in {404, 410}
         summary = str(data.get("summary") or f"Host bridge returned {response.status_code}.")
         if stale_contract:
@@ -163,12 +213,21 @@ class HostBridgeClient:
                 "Running host bridge does not support action.v1; restart Jarvis so the "
                 "updated structured bridge can be loaded."
             )
+        uncertain_response = (
+            response.status_code == 408
+            or 500 <= response.status_code <= 599
+            or response.is_success
+            and not response_has_outcome
+        )
         return {
-            "ok": response.is_success and bool(data.get("ok", False)),
+            "ok": response.is_success and response_ok,
             "summary": summary,
             "status_code": response.status_code,
             "contract": BRIDGE_CONTRACT,
             "data": data,
+            "outcome_known": not uncertain_response,
+            "retryable": bool(read_only and 500 <= response.status_code <= 599),
+            "attempts": attempts,
         }
 
 
@@ -234,6 +293,7 @@ def _bridge_capabilities(token: str | None) -> dict[str, Any]:
             "raw_command_execution": None,
             "policy_revision": "",
             "process_policy": {},
+            "browser_network_guard": {},
             "app_paths_sha256": "",
         }
     try:
@@ -261,6 +321,9 @@ def _bridge_capabilities(token: str | None) -> dict[str, Any]:
             "process_policy": payload.get("process_policy")
             if isinstance(payload.get("process_policy"), dict)
             else {},
+            "browser_network_guard": payload.get("browser_network_guard")
+            if isinstance(payload.get("browser_network_guard"), dict)
+            else {},
             "app_paths_sha256": str(payload.get("app_paths_sha256") or ""),
         }
     except (httpx.HTTPError, ValueError):
@@ -272,10 +335,41 @@ def _bridge_capabilities(token: str | None) -> dict[str, Any]:
             "raw_command_execution": None,
             "policy_revision": "",
             "process_policy": {},
+            "browser_network_guard": {},
             "app_paths_sha256": "",
         }
+
+
+def _browser_network_guard_ready(capabilities: dict[str, Any]) -> bool:
+    guard = capabilities.get("browser_network_guard")
+    return bool(
+        isinstance(guard, dict)
+        and guard.get("version") == "public-proxy-v1"
+        and guard.get("fail_closed") is True
+        and guard.get("private_networks") == "blocked"
+        and set(guard.get("required_actions") or ())
+        == {
+            "browser.open_guarded",
+            "chrome.attest_guarded",
+            "chrome.launch_guarded",
+        }
+    )
 
 
 def _expected_app_paths_sha256() -> str:
     raw = os.environ.get("JARVIS_BRIDGE_APP_PATHS_JSON", "")
     return hashlib.sha256(raw.encode("utf-8", errors="strict")).hexdigest()
+
+
+def _bridge_retry_delay(attempt: int, *, response: httpx.Response | None = None) -> float:
+    exponential = _BRIDGE_RETRY_BASE_DELAY_SEC * (2 ** max(0, attempt - 1))
+    retry_after = 0.0
+    if response is not None:
+        raw = response.headers.get("Retry-After", "").strip()
+        try:
+            parsed = float(raw)
+        except ValueError:
+            parsed = 0.0
+        if math.isfinite(parsed):
+            retry_after = max(0.0, parsed)
+    return min(_BRIDGE_RETRY_MAX_DELAY_SEC, max(exponential, retry_after))

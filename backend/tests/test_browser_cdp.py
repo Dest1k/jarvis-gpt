@@ -174,3 +174,77 @@ def test_read_chrome_page_always_closes_temporary_target(monkeypatch):
         )
 
     assert closed == ["target-1"]
+
+
+def test_chrome_debugger_attestation_binds_nonce_profile_and_proxy(monkeypatch, tmp_path):
+    nonce = "n" * 43
+    profile = str(tmp_path / "guarded-profile")
+    proxy = "http://127.0.0.1:18766"
+    arguments = [
+        "chrome.exe",
+        f"--jarvis-guard-nonce={nonce}",
+        f"--user-data-dir={profile}",
+        f"--proxy-server={proxy}",
+        "--proxy-bypass-list=<-loopback>",
+        "--host-resolver-rules=MAP * ~NOTFOUND",
+        "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+        "--disable-quic",
+        "--enable-automation",
+    ]
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/browser/test"
+            }
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            return None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, _url):
+            return FakeResponse()
+
+    class WebSocketContext:
+        async def __aenter__(self):
+            return FakeWebSocket([{"id": 1, "result": {"arguments": arguments}}])
+
+        async def __aexit__(self, *_args):
+            return None
+
+    monkeypatch.setattr(browser_cdp.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(
+        browser_cdp.websockets,
+        "connect",
+        lambda *_args, **_kwargs: WebSocketContext(),
+    )
+
+    attested = asyncio.run(
+        browser_cdp.attest_chrome_debugger(
+            debug_url="http://127.0.0.1:9222",
+            launch_nonce=nonce,
+            profile_dir=profile,
+            proxy=proxy,
+        )
+    )
+    mismatched = asyncio.run(
+        browser_cdp.attest_chrome_debugger(
+            debug_url="http://127.0.0.1:9222",
+            launch_nonce="x" * 43,
+            profile_dir=profile,
+            proxy=proxy,
+        )
+    )
+
+    assert attested["ok"] is True
+    assert mismatched["ok"] is False
+    assert mismatched["required_switches_present"] is False

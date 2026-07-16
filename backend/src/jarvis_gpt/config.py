@@ -379,11 +379,9 @@ def load_settings(profile_name: str | None = None) -> JarvisSettings:
             os.environ.get("JARVIS_LLM_BASE_URL", "http://localhost:8001/v1"),
         ).rstrip("/"),
         embeddings_model=os.environ.get("JARVIS_EMBEDDINGS_MODEL", ""),
-        # When enabled (default), any tool whose capability scope the operator
-        # explicitly named in the current turn runs immediately under an
-        # operator-turn authorization instead of raising an approval gate.
-        # Set JARVIS_OPERATOR_FULL_AUTONOMY=0 to restore strict exact-operand
-        # matching where only narrowly recognized argument shapes auto-run.
+        # Compatibility switch retained for existing deployments. Current-turn
+        # authorization always requires the exact tool-specific operand matcher;
+        # this flag never turns a broad lexical scope into execution authority.
         operator_full_autonomy=_bool_env("JARVIS_OPERATOR_FULL_AUTONOMY", True),
         autonomy_enabled=_bool_env("JARVIS_AUTONOMY_ENABLED", True),
         telemetry_interval_sec=_int_env("JARVIS_TELEMETRY_INTERVAL_SEC", 120),

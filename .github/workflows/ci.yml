@@ -8,25 +8,58 @@ on:
 
 jobs:
   backend:
-    runs-on: windows-latest
+    name: backend (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            python: "3.11"
+            backend_test_args: backend/tests
+          - os: ubuntu-latest
+            python: "3.12"
+            # Portable production-path coverage. The full suite also contains
+            # Windows bridge/launcher and privileged process-containment cases.
+            backend_test_args: >-
+              backend/tests/test_agent.py
+              backend/tests/test_agentic_loop.py
+              backend/tests/test_tools.py
+              backend/tests/test_llm.py
+              backend/tests/test_host_bridge_client.py
+              backend/tests/test_operations.py
+              backend/tests/test_config_storage.py
+              backend/tests/test_learning_telemetry.py
+              backend/tests/test_api_smoke.py
+              backend/tests/test_smoke_script.py
+              backend/tests/test_tool_reliability.py
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python }}
       - name: Install backend dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r backend/requirements.txt -r backend/requirements-dev.txt
       - name: Lint backend
-        run: python -m ruff check backend/src backend/tests
+        run: python -m ruff check backend/src backend/tests qa
       - name: Test backend
-        run: python -m pytest
-      - name: Compile backend
-        run: python -m compileall backend/src backend/tests
+        run: python -m pytest -q ${{ matrix.backend_test_args }}
+      - name: Test assurance harness
+        run: python -m pytest -q qa/tests
+      - name: Compile Python sources
+        run: python -m compileall backend/src backend/tests qa
 
   frontend:
-    runs-on: windows-latest
+    name: frontend (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -43,6 +76,12 @@ jobs:
       - name: Typecheck frontend
         working-directory: frontend
         run: npm run typecheck
+      - name: Test runtime identity
+        working-directory: frontend
+        run: npm run test:runtime-identity
+      - name: Test interrupted stream placeholder handling
+        working-directory: frontend
+        run: npm run test:stream-placeholder
       - name: Build frontend
         working-directory: frontend
         run: npm run build

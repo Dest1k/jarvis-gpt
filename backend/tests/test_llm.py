@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import re
 
+import httpx
+import pytest
 from jarvis_gpt.config import load_settings
 from jarvis_gpt.llm import LLMRouter, LLMStreamChunk, _stream_chunk_from_line
 
@@ -395,3 +397,237 @@ def test_background_stream_releases_lease_before_buffer_delivery(
         await asyncio.wait_for(consumer, timeout=1)
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("status_code", [408, 429, 500, 503])
+def test_complete_retries_transient_http_status(monkeypatch, tmp_path, status_code):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setattr("jarvis_gpt.llm._LLM_RETRY_BASE_DELAY_SEC", 0.0)
+    router = LLMRouter(load_settings())
+    calls = 0
+
+    async def flaky_post(_body, _lease):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise _http_status_error(status_code)
+        return {"choices": [{"message": {"content": "recovered"}}]}
+
+    monkeypatch.setattr(router, "_post_completion", flaky_post)
+
+    result = asyncio.run(router.complete([{"role": "user", "content": "retry"}]))
+
+    assert result.ok is True
+    assert result.content == "recovered"
+    assert calls == 2
+
+
+def test_complete_does_not_retry_non_transient_http_status(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    router = LLMRouter(load_settings())
+    calls = 0
+
+    async def rejected_post(_body, _lease):
+        nonlocal calls
+        calls += 1
+        raise _http_status_error(400)
+
+    monkeypatch.setattr(router, "_post_completion", rejected_post)
+
+    result = asyncio.run(router.complete([{"role": "user", "content": "bad"}]))
+
+    assert result.ok is False
+    assert calls == 1
+
+
+def test_complete_bounds_timeout_retries(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setattr("jarvis_gpt.llm._LLM_RETRY_BASE_DELAY_SEC", 0.0)
+    router = LLMRouter(load_settings())
+    calls = 0
+
+    async def timed_out_post(_body, _lease):
+        nonlocal calls
+        calls += 1
+        request = httpx.Request("POST", "http://llm.test/chat/completions")
+        raise httpx.ReadTimeout("temporary timeout", request=request)
+
+    monkeypatch.setattr(router, "_post_completion", timed_out_post)
+
+    result = asyncio.run(router.complete([{"role": "user", "content": "retry"}]))
+
+    assert result.ok is False
+    assert result.error == "temporary timeout"
+    assert calls == 3
+
+
+def test_complete_retries_connection_reset(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setattr("jarvis_gpt.llm._LLM_RETRY_BASE_DELAY_SEC", 0.0)
+    router = LLMRouter(load_settings())
+    calls = 0
+
+    async def reset_post(_body, _lease):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            request = httpx.Request("POST", "http://llm.test/chat/completions")
+            raise httpx.RemoteProtocolError("connection reset", request=request)
+        return {"choices": [{"message": {"content": "recovered"}}]}
+
+    monkeypatch.setattr(router, "_post_completion", reset_post)
+
+    result = asyncio.run(router.complete([{"role": "user", "content": "retry"}]))
+
+    assert result.ok is True
+    assert result.content == "recovered"
+    assert calls == 2
+
+
+def test_foreground_stream_retries_before_first_exposed_chunk(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setattr("jarvis_gpt.llm._LLM_RETRY_BASE_DELAY_SEC", 0.0)
+    router = LLMRouter(load_settings())
+    calls = 0
+
+    async def flaky_stream(_body, _lease):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            request = httpx.Request("POST", "http://llm.test/chat/completions")
+            raise httpx.ConnectError("not ready", request=request)
+        yield LLMStreamChunk(kind="delta", content="once")
+        yield LLMStreamChunk(kind="done", finish_reason="stop")
+
+    monkeypatch.setattr(router, "_stream_completion", flaky_stream)
+
+    async def collect():
+        return [
+            chunk
+            async for chunk in router.stream_complete(
+                [{"role": "user", "content": "stream"}]
+            )
+        ]
+
+    chunks = asyncio.run(collect())
+
+    assert [(chunk.kind, chunk.content) for chunk in chunks] == [
+        ("delta", "once"),
+        ("done", ""),
+    ]
+    assert calls == 2
+
+
+def test_foreground_stream_never_retries_after_metadata_is_visible(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setattr("jarvis_gpt.llm._LLM_RETRY_BASE_DELAY_SEC", 0.0)
+    router = LLMRouter(load_settings())
+    calls = 0
+
+    async def reset_after_metadata(_body, _lease):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            yield LLMStreamChunk(kind="usage", raw={"usage": {"prompt_tokens": 1}})
+            request = httpx.Request("POST", "http://llm.test/chat/completions")
+            raise httpx.RemoteProtocolError("connection reset", request=request)
+        yield LLMStreamChunk(kind="delta", content="once")
+        yield LLMStreamChunk(kind="done")
+
+    monkeypatch.setattr(router, "_stream_completion", reset_after_metadata)
+
+    async def collect():
+        return [
+            chunk
+            async for chunk in router.stream_complete(
+                [{"role": "user", "content": "stream"}]
+            )
+        ]
+
+    chunks = asyncio.run(collect())
+
+    assert [(chunk.kind, chunk.content) for chunk in chunks] == [
+        ("usage", ""),
+        ("error", ""),
+    ]
+    assert chunks[-1].error == "connection reset"
+    assert calls == 1
+
+
+def test_foreground_stream_never_retries_after_partial_output(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setattr("jarvis_gpt.llm._LLM_RETRY_BASE_DELAY_SEC", 0.0)
+    router = LLMRouter(load_settings())
+    calls = 0
+
+    async def interrupted_stream(_body, _lease):
+        nonlocal calls
+        calls += 1
+        yield LLMStreamChunk(kind="delta", content="partial")
+        request = httpx.Request("POST", "http://llm.test/chat/completions")
+        raise httpx.ReadTimeout("stream interrupted", request=request)
+
+    monkeypatch.setattr(router, "_stream_completion", interrupted_stream)
+
+    async def collect():
+        return [
+            chunk
+            async for chunk in router.stream_complete(
+                [{"role": "user", "content": "stream"}]
+            )
+        ]
+
+    chunks = asyncio.run(collect())
+
+    assert [(chunk.kind, chunk.content) for chunk in chunks] == [
+        ("delta", "partial"),
+        ("error", ""),
+    ]
+    assert chunks[-1].error == "stream interrupted"
+    assert calls == 1
+
+
+def test_background_stream_discards_buffer_before_transient_retry(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setattr("jarvis_gpt.llm._LLM_RETRY_BASE_DELAY_SEC", 0.0)
+    router = LLMRouter(load_settings())
+    calls = 0
+
+    async def flaky_stream(_body, _lease):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            yield LLMStreamChunk(kind="delta", content="discarded")
+            request = httpx.Request("POST", "http://llm.test/chat/completions")
+            raise httpx.ReadTimeout("stream interrupted", request=request)
+        yield LLMStreamChunk(kind="delta", content="kept")
+        yield LLMStreamChunk(kind="done")
+
+    monkeypatch.setattr(router, "_stream_completion", flaky_stream)
+
+    async def collect():
+        with router.background_priority():
+            return [
+                chunk
+                async for chunk in router.stream_complete(
+                    [{"role": "user", "content": "stream"}]
+                )
+            ]
+
+    chunks = asyncio.run(collect())
+
+    assert [(chunk.kind, chunk.content) for chunk in chunks] == [
+        ("delta", "kept"),
+        ("done", ""),
+    ]
+    assert calls == 2
+
+
+def _http_status_error(status_code: int) -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", "http://llm.test/chat/completions")
+    response = httpx.Response(status_code, request=request)
+    return httpx.HTTPStatusError(
+        f"status {status_code}",
+        request=request,
+        response=response,
+    )

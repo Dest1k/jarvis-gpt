@@ -142,7 +142,7 @@ def test_launcher_is_local_only_and_preserves_foreign_listeners() -> None:
     assert 'action = "capabilities"' in launcher
     assert "function Wait-BridgeReady" in launcher
     assert "Wait-BridgeReady -TimeoutSec 15" in launcher
-    assert '$BridgePolicyRevision = "native-app-v2"' in launcher
+    assert '$BridgePolicyRevision = "native-app-v3"' in launcher
     assert "data.policy_revision -eq $BridgePolicyRevision" in launcher
     assert "data.app_paths_sha256 -eq $expectedAppPathsSha256" in launcher
     assert "Restarting stale or unauthenticated host bridge" in launcher

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -14,6 +15,7 @@ DOCKER_POLICY_KEY = "operations.docker_policy"
 AUTONOMY_JOBS_KEY = "operations.autonomy.jobs"
 AUTONOMY_JOB_RUNS_KEY = "operations.autonomy.job_runs"
 ROUTINE_RUNS_KEY = "operations.routine_runs"
+_LEASE_FENCE_UNSET = object()
 
 DEFAULT_BROWSER_POLICY: dict[str, Any] = {
     "mode": "open",
@@ -73,7 +75,7 @@ class OperationsManager:
         allowed = {key: value for key, value in patch.items() if key in DEFAULT_BROWSER_POLICY}
         updated = _normalize_browser_policy({**current, **allowed})
         self.storage.set_runtime_value(BROWSER_POLICY_KEY, updated)
-        self.storage.record_audit(
+        audit_status = self._record_audit_nonfatal(
             actor="operator",
             action="browser.policy.update",
             target_type="runtime",
@@ -82,7 +84,7 @@ class OperationsManager:
             before=current,
             after=updated,
         )
-        return updated
+        return {**updated, **({"observability_status": audit_status} if audit_status else {})}
 
     def docker_policy(self) -> dict[str, Any]:
         stored = self.storage.get_runtime_value(DOCKER_POLICY_KEY, {})
@@ -93,7 +95,7 @@ class OperationsManager:
         allowed = {key: value for key, value in patch.items() if key in DEFAULT_DOCKER_POLICY}
         updated = _normalize_docker_policy({**current, **allowed})
         self.storage.set_runtime_value(DOCKER_POLICY_KEY, updated)
-        self.storage.record_audit(
+        audit_status = self._record_audit_nonfatal(
             actor="operator",
             action="docker.policy.update",
             target_type="runtime",
@@ -102,7 +104,7 @@ class OperationsManager:
             before=current,
             after=updated,
         )
-        return updated
+        return {**updated, **({"observability_status": audit_status} if audit_status else {})}
 
     def docker_containers(self) -> dict[str, Any]:
         policy = self.docker_policy()
@@ -154,7 +156,7 @@ class OperationsManager:
                 }
             )
         ok = all(step["ok"] for step in steps)
-        self.storage.record_audit(
+        audit_status = self._record_audit_nonfatal(
             actor="operator",
             action="runtime.cleanup",
             target_type="runtime",
@@ -168,6 +170,7 @@ class OperationsManager:
             "aggressive": aggressive,
             "global_prune_skipped": True,
             "steps": steps,
+            **({"observability_status": audit_status} if audit_status else {}),
         }
 
     def list_jobs(self) -> list[dict[str, Any]]:
@@ -195,48 +198,123 @@ class OperationsManager:
         return due[: max(1, min(10, int(limit)))]
 
     def recover_stale_running_jobs(self, *, now: datetime | None = None) -> list[dict[str, Any]]:
+        """Fence interrupted work and require reconciliation before any replay.
+
+        A persisted lease represents an execution whose outcome may be unknown
+        after a worker/runtime failure.  Missing and malformed expiries are just
+        as unsafe as an expired lease: treating either as runnable could replay a
+        mutation.  Recovery therefore clears the lease, pauses the job, and
+        records an explicit reconcile-only result.  A valid unexpired lease is
+        left untouched.
+        """
+
         current = now or datetime.now(UTC)
         recovered: list[dict[str, Any]] = []
         for job in self.list_jobs():
-            lease_until = _parse_datetime(job.get("running_lease_until"))
-            if job.get("running_lease_id") and lease_until is not None and current > lease_until:
-                result = {
-                    "ok": False,
-                    "summary": (
-                        "Autonomy job running lease expired; previous backend run was "
-                        "interrupted."
-                    ),
-                    "data": {
-                        "job_id": job["id"],
-                        "lease_id": job.get("running_lease_id"),
-                        "running_started_at": job.get("running_started_at"),
+            raw_lease_id = job.get("running_lease_id")
+            if not raw_lease_id:
+                continue
+            lease_id = str(raw_lease_id).strip()
+            recovery_reason = (
+                "invalid_id" if not lease_id else _lease_recovery_reason(job, current)
+            )
+            if recovery_reason is None:
+                continue
+            finished_at = current.isoformat(timespec="seconds")
+            result = {
+                "ok": False,
+                "summary": (
+                    "Autonomy job running lease "
+                    f"{recovery_reason.replace('_', ' ')}; the previous run has "
+                    "an unknown outcome and requires reconciliation before retry."
+                ),
+                "data": {
+                    "job_id": job["id"],
+                    "lease_id": lease_id,
+                    "running_started_at": job.get("running_started_at"),
+                    "running_lease_until": job.get("running_lease_until"),
+                    "reconciliation": {
+                        "required": True,
+                        "reason": f"lease_{recovery_reason}",
+                        "replay_original_action": False,
                     },
-                    "job_status": "enabled",
-                    "stale_lease": True,
-                }
-                updated = self.mark_job_run(
-                    job["id"],
+                },
+                "job_status": "paused",
+                "stale_lease": True,
+                "reconcile_required": True,
+            }
+            updated = self.mark_job_run(
+                job["id"],
+                result,
+                started_at=job.get("running_started_at") or job.get("last_started_at"),
+                finished_at=finished_at,
+                duration_ms=None,
+                expected_lease_id=raw_lease_id,
+            )
+            if updated is not None:
+                run_started_at = job.get("running_started_at") or finished_at
+                self.record_job_run(
+                    job,
                     result,
-                    started_at=job.get("running_started_at") or job.get("last_started_at"),
-                    finished_at=current.isoformat(timespec="seconds"),
-                    duration_ms=None,
+                    started_at=run_started_at,
+                    finished_at=finished_at,
+                    duration_ms=0,
                 )
-                if updated is not None:
-                    run_started_at = job.get("running_started_at") or current.isoformat(
-                        timespec="seconds"
-                    )
-                    self.record_job_run(
-                        job,
-                        result,
-                        started_at=run_started_at,
-                        finished_at=current.isoformat(timespec="seconds"),
-                        duration_ms=0,
-                    )
-                    recovered.append(updated)
+                recovered.append(updated)
         return recovered
 
+    def expire_deadline_jobs(self, *, now: datetime | None = None) -> list[dict[str, Any]]:
+        """Persist terminal state for enabled jobs whose deadline elapsed.
+
+        ``due_jobs`` must not merely filter expired work: that leaves an enabled
+        job looking runnable while the scheduler silently ignores it.  Jobs with
+        an active lease are deliberately skipped because their outcome belongs
+        to lease reconciliation instead.
+        """
+
+        current = now or datetime.now(UTC)
+        expired: list[dict[str, Any]] = []
+        for job in self.list_jobs():
+            if job.get("status") != "enabled" or job.get("running_lease_id"):
+                continue
+            deadline = _parse_datetime(job.get("deadline_at"))
+            if deadline is None or current < deadline:
+                continue
+            finished_at = current.isoformat(timespec="seconds")
+            result = {
+                "ok": False,
+                "summary": "Autonomy job deadline expired before execution.",
+                "data": {
+                    "job_id": job["id"],
+                    "deadline_at": job.get("deadline_at"),
+                    "expired_without_execution": True,
+                    "replay_original_action": False,
+                },
+                "job_status": "cancelled",
+                "deadline_expired": True,
+            }
+            updated = self.mark_job_run(
+                job["id"],
+                result,
+                started_at=job.get("last_started_at") or finished_at,
+                finished_at=finished_at,
+                duration_ms=0,
+                expected_lease_id=None,
+                expected_status="enabled",
+            )
+            if updated is None:
+                continue
+            self.record_job_run(
+                job,
+                result,
+                started_at=job.get("last_started_at") or finished_at,
+                finished_at=finished_at,
+                duration_ms=0,
+            )
+            expired.append(updated)
+        return expired
+
     def create_job(self, payload: dict[str, Any]) -> dict[str, Any]:
-        jobs = self.list_jobs()
         job = _normalize_job(
             {
                 "id": new_id("job"),
@@ -245,9 +323,14 @@ class OperationsManager:
                 **payload,
             }
         )
-        jobs = [job, *jobs][:100]
-        self.storage.set_runtime_value(AUTONOMY_JOBS_KEY, jobs)
-        self.storage.record_audit(
+        self.storage.update_runtime_value_atomic(
+            AUTONOMY_JOBS_KEY,
+            lambda value: [job, *[_normalize_job(item) for item in _list(value)]][
+                :100
+            ],
+            default=[],
+        )
+        audit_status = self._record_audit_nonfatal(
             actor="operator",
             action="autonomy.job.create",
             target_type="autonomy_job",
@@ -255,34 +338,76 @@ class OperationsManager:
             summary=f"Autonomy job created: {job['title']}",
             after=job,
         )
+        if audit_status:
+            job = {**job, "observability_status": audit_status}
         return job
 
     def update_job(self, job_id: str, patch: dict[str, Any]) -> dict[str, Any] | None:
-        jobs = self.list_jobs()
         updated: dict[str, Any] | None = None
-        next_jobs: list[dict[str, Any]] = []
-        for job in jobs:
-            if job["id"] == job_id:
-                before = job
-                updated = _normalize_job({**job, **patch, "updated_at": utc_now()})
-                if updated["status"] == "cancelled" and not updated.get("cancelled_at"):
-                    updated["cancelled_at"] = utc_now()
-                self.storage.record_audit(
-                    actor="operator",
-                    action="autonomy.job.update",
-                    target_type="autonomy_job",
-                    target_id=job_id,
-                    summary=f"Autonomy job updated: {updated['title']}",
-                    before=before,
-                    after=updated,
-                )
-                next_jobs.append(updated)
-            else:
-                next_jobs.append(job)
+        before: dict[str, Any] | None = None
+
+        def mutate(value: Any) -> list[dict[str, Any]]:
+            nonlocal before, updated
+            next_jobs: list[dict[str, Any]] = []
+            for job in [_normalize_job(item) for item in _list(value)]:
+                if job["id"] == job_id:
+                    before = job
+                    updated = _normalize_job({**job, **patch, "updated_at": utc_now()})
+                    if updated["status"] == "cancelled" and not updated.get("cancelled_at"):
+                        updated["cancelled_at"] = utc_now()
+                    next_jobs.append(updated)
+                else:
+                    next_jobs.append(job)
+            return next_jobs
+
+        self.storage.update_runtime_value_atomic(
+            AUTONOMY_JOBS_KEY,
+            mutate,
+            default=[],
+        )
         if updated is None:
             return None
-        self.storage.set_runtime_value(AUTONOMY_JOBS_KEY, next_jobs)
+        audit_status = self._record_audit_nonfatal(
+            actor="operator",
+            action="autonomy.job.update",
+            target_type="autonomy_job",
+            target_id=job_id,
+            summary=f"Autonomy job updated: {updated['title']}",
+            before=before,
+            after=updated,
+        )
+        if audit_status:
+            updated = {**updated, "observability_status": audit_status}
         return updated
+
+    def _record_audit_nonfatal(self, **payload: Any) -> dict[str, Any] | None:
+        """Keep a committed operation successful when its audit sink is unavailable."""
+
+        try:
+            self.storage.record_audit(**payload)
+        except Exception as exc:  # noqa: BLE001 - audit is an observability sink
+            status = {
+                "protocol": "jarvis.audit-status.v1",
+                "persisted": False,
+                "failed_sinks": ["audit_log"],
+                "outcome_known": True,
+                "retryable": False,
+                "error": str(exc) or exc.__class__.__name__,
+            }
+            with suppress(Exception):
+                self.storage.add_event(
+                    kind="audit.sink.failure",
+                    title="Committed operation could not be written to the audit log",
+                    level="warn",
+                    payload={
+                        "action": payload.get("action"),
+                        "target_type": payload.get("target_type"),
+                        "target_id": payload.get("target_id"),
+                        **status,
+                    },
+                )
+            return status
+        return None
 
     def mark_job_started(
         self,
@@ -292,24 +417,35 @@ class OperationsManager:
         started_at: str,
         lease_until: str,
     ) -> dict[str, Any] | None:
-        jobs = self.list_jobs()
         updated: dict[str, Any] | None = None
-        next_jobs: list[dict[str, Any]] = []
-        for job in jobs:
-            if job["id"] == job_id:
-                updated = {
-                    **job,
-                    "running_lease_id": lease_id,
-                    "running_started_at": started_at,
-                    "running_lease_until": lease_until,
-                    "updated_at": started_at,
-                }
-                next_jobs.append(updated)
-            else:
-                next_jobs.append(job)
+
+        def mutate(value: Any) -> list[dict[str, Any]]:
+            nonlocal updated
+            next_jobs: list[dict[str, Any]] = []
+            for job in [_normalize_job(item) for item in _list(value)]:
+                if job["id"] == job_id:
+                    if job.get("status") != "enabled" or job.get("running_lease_id"):
+                        next_jobs.append(job)
+                        continue
+                    updated = {
+                        **job,
+                        "running_lease_id": lease_id,
+                        "running_started_at": started_at,
+                        "running_lease_until": lease_until,
+                        "updated_at": started_at,
+                    }
+                    next_jobs.append(updated)
+                else:
+                    next_jobs.append(job)
+            return next_jobs
+
+        self.storage.update_runtime_value_atomic(
+            AUTONOMY_JOBS_KEY,
+            mutate,
+            default=[],
+        )
         if updated is None:
             return None
-        self.storage.set_runtime_value(AUTONOMY_JOBS_KEY, next_jobs)
         return updated
 
     def mark_job_run(
@@ -320,51 +456,87 @@ class OperationsManager:
         started_at: str | None = None,
         finished_at: str | None = None,
         duration_ms: int | None = None,
+        expected_lease_id: object = _LEASE_FENCE_UNSET,
+        expected_status: str | None = None,
     ) -> dict[str, Any] | None:
-        jobs = self.list_jobs()
+        """Finalize a run, optionally fenced by expected lease and status.
+
+        The lease fence prevents a late worker from overwriting a paused
+        reconcile-required state after scheduler recovery has already declared
+        its outcome unknown. Passing ``expected_lease_id=None`` explicitly
+        requires the job to remain unleased, which lets deadline expiry race
+        safely with workers attempting to acquire a lease.
+        """
+
         updated: dict[str, Any] | None = None
-        next_jobs: list[dict[str, Any]] = []
         now = finished_at or utc_now()
-        for job in jobs:
-            if job["id"] == job_id:
-                status = job["status"]
-                run_count = int(job.get("run_count") or 0) + 1
-                requested_status = str(result.get("job_status") or "")
-                if status == "cancelled":
-                    requested_status = "cancelled"
-                if requested_status in {"enabled", "paused", "done", "cancelled"}:
-                    status = requested_status
-                elif run_count >= int(job["budget"]["max_runs"]):
-                    status = "done"
-                ok = bool(result.get("ok"))
-                consecutive_failures = 0 if ok else int(job.get("consecutive_failures") or 0) + 1
-                next_run_after = None
-                if status == "enabled" and not ok:
-                    next_run_after = _iso_after(now, _retry_delay(consecutive_failures))
-                updated = {
-                    **job,
-                    "status": status,
-                    "run_count": run_count,
-                    "consecutive_failures": consecutive_failures,
-                    "running_lease_id": None,
-                    "running_started_at": None,
-                    "running_lease_until": None,
-                    "last_started_at": started_at or now,
-                    "last_finished_at": now,
-                    "last_duration_ms": duration_ms,
-                    "last_run_at": now,
-                    "next_run_after": next_run_after,
-                    "last_result": result,
-                    "cancelled_at": job.get("cancelled_at")
-                    or (now if status == "cancelled" else None),
-                    "updated_at": now,
-                }
-                next_jobs.append(updated)
-            else:
-                next_jobs.append(job)
+
+        def mutate(value: Any) -> list[dict[str, Any]]:
+            nonlocal updated
+            next_jobs: list[dict[str, Any]] = []
+            for job in [_normalize_job(item) for item in _list(value)]:
+                if job["id"] == job_id:
+                    if (
+                        expected_lease_id is not _LEASE_FENCE_UNSET
+                        and job.get("running_lease_id") != expected_lease_id
+                    ):
+                        next_jobs.append(job)
+                        continue
+                    if expected_status is not None and job.get("status") != expected_status:
+                        next_jobs.append(job)
+                        continue
+                    status = job["status"]
+                    run_count = int(job.get("run_count") or 0) + 1
+                    requested_status = str(result.get("job_status") or "")
+                    # A live operator PATCH owns non-enabled state. The worker
+                    # may finalize/clear its lease and record its result, but it
+                    # must never re-enable a job that was paused, completed, or
+                    # cancelled while the action was in flight.
+                    if status in {"paused", "done", "cancelled"}:
+                        requested_status = status
+                    if requested_status in {"enabled", "paused", "done", "cancelled"}:
+                        status = requested_status
+                    elif run_count >= int(job["budget"]["max_runs"]):
+                        status = "done"
+                    ok = bool(result.get("ok"))
+                    consecutive_failures = (
+                        0
+                        if ok
+                        else int(job.get("consecutive_failures") or 0) + 1
+                    )
+                    next_run_after = None
+                    if status == "enabled" and not ok:
+                        next_run_after = _iso_after(now, _retry_delay(consecutive_failures))
+                    updated = {
+                        **job,
+                        "status": status,
+                        "run_count": run_count,
+                        "consecutive_failures": consecutive_failures,
+                        "running_lease_id": None,
+                        "running_started_at": None,
+                        "running_lease_until": None,
+                        "last_started_at": started_at or now,
+                        "last_finished_at": now,
+                        "last_duration_ms": duration_ms,
+                        "last_run_at": now,
+                        "next_run_after": next_run_after,
+                        "last_result": result,
+                        "cancelled_at": job.get("cancelled_at")
+                        or (now if status == "cancelled" else None),
+                        "updated_at": now,
+                    }
+                    next_jobs.append(updated)
+                else:
+                    next_jobs.append(job)
+            return next_jobs
+
+        self.storage.update_runtime_value_atomic(
+            AUTONOMY_JOBS_KEY,
+            mutate,
+            default=[],
+        )
         if updated is None:
             return None
-        self.storage.set_runtime_value(AUTONOMY_JOBS_KEY, next_jobs)
         return updated
 
     def record_job_run(
@@ -389,8 +561,11 @@ class OperationsManager:
             "job_status": result.get("job_status"),
             "priority": _bounded_int(job.get("priority"), 0, 100, 0),
         }
-        history = _list(self.storage.get_runtime_value(AUTONOMY_JOB_RUNS_KEY, []))
-        self.storage.set_runtime_value(AUTONOMY_JOB_RUNS_KEY, [item, *history][:200])
+        self.storage.update_runtime_value_atomic(
+            AUTONOMY_JOB_RUNS_KEY,
+            lambda value: [item, *_list(value)][:200],
+            default=[],
+        )
         return item
 
     def routines(self) -> list[dict[str, Any]]:
@@ -551,7 +726,7 @@ def _job_is_due(job: dict[str, Any], now: datetime) -> bool:
     if job.get("running_lease_id") and running_until is not None and now <= running_until:
         return False
     deadline = _parse_datetime(job.get("deadline_at"))
-    if deadline is not None and now > deadline:
+    if deadline is not None and now >= deadline:
         return False
     next_run_after = _parse_datetime(job.get("next_run_after"))
     if next_run_after is not None and now < next_run_after:
@@ -573,6 +748,20 @@ def _job_is_due(job: dict[str, Any], now: datetime) -> bool:
 def _job_due_sort_key(job: dict[str, Any]) -> tuple[int, datetime, str]:
     created = _parse_datetime(job.get("created_at")) or datetime.now(UTC)
     return (-_bounded_int(job.get("priority"), 0, 100, 0), created, str(job.get("id") or ""))
+
+
+def _lease_recovery_reason(job: dict[str, Any], now: datetime) -> str | None:
+    """Return why a persisted lease is unsafe, or ``None`` while it is valid."""
+
+    raw_expiry = job.get("running_lease_until")
+    if raw_expiry is None or not str(raw_expiry).strip():
+        return "missing_expiry"
+    expiry = _parse_datetime(raw_expiry)
+    if expiry is None:
+        return "invalid_expiry"
+    if now >= expiry:
+        return "expired"
+    return None
 
 
 def _cadence_interval(cadence: str) -> timedelta | None:

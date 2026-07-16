@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import ipaddress
 import json
 import zipfile
@@ -10,7 +11,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from jarvis_gpt.browser_cdp import BrowserActionResult, BrowserPageSnapshot
+from jarvis_gpt.browser_cdp import BrowserActionResult, BrowserCdpError, BrowserPageSnapshot
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
 from jarvis_gpt.document_runtime import extract_document
 from jarvis_gpt.ingest import FileIngestor
@@ -30,6 +31,36 @@ from jarvis_gpt.tools import (
     _store_web_evidence,
     _validate_native_payload,
 )
+
+
+def _guarded_browser_bridge_result(summary: str = "opened") -> dict:
+    return {
+        "ok": True,
+        "summary": summary,
+        "data": {
+            "ok": True,
+            "attestation": {
+                "verified": True,
+                "debug_port": 9222,
+                "owner_pid": 4242,
+                "profile_dir": "C:/jarvis/public-proxy-v1/public",
+            },
+            "network_guard": {
+                "enforced": True,
+                "version": "public-proxy-v1",
+                "private_networks": "blocked",
+                "redirects": "validated_per_connection",
+                "dns_rebinding": "numeric_ip_pinned_per_connection",
+                "direct_dns": "disabled",
+                "non_proxied_udp": "disabled",
+                "fail_closed": True,
+                "allowed_private_hosts": [],
+                "session_class": "public-only",
+                "profile_dir": "C:/jarvis/public-proxy-v1/public",
+                "proxy": "http://127.0.0.1:18766",
+            },
+        },
+    }
 
 
 def test_operator_turn_authorization_is_exact_and_single_use(monkeypatch, tmp_path):
@@ -709,6 +740,52 @@ def test_windows_native_is_gated_and_uses_winapi_wmi(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_windows_native_preserves_uncertain_bridge_envelope(monkeypatch, tmp_path):
+    class FakeBridgeClient:
+        def __init__(self, _settings):
+            return None
+
+        async def action(self, *, action, payload=None, timeout_sec=30):
+            assert action == "keyboard.send"
+            return {
+                "ok": False,
+                "summary": "Bridge response was uncertain.",
+                "status_code": 503,
+                "contract": "action.v1",
+                "data": {"ok": False, "summary": "temporary failure"},
+                "outcome_known": False,
+                "retryable": False,
+                "attempts": 1,
+            }
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr("jarvis_gpt.tools.HostBridgeClient", FakeBridgeClient)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    result = asyncio.run(
+        tools.run(
+            "windows.native",
+            {
+                "action": "keyboard.send",
+                "payload": {"keys": "ENTER"},
+            },
+            allow_danger=True,
+        )
+    )
+
+    assert result.ok is False
+    assert result.data["bridge"]["outcome_known"] is False
+    assert result.data["bridge"]["retryable"] is False
+    assert result.data["bridge"]["attempts"] == 1
+    assert result.data["bridge"]["status_code"] == 503
+    storage.close()
+
+
 def test_windows_native_process_launch_requires_independent_pid_verification(
     monkeypatch, tmp_path
 ):
@@ -909,16 +986,21 @@ def test_windows_native_screen_capture_payload_is_structured(tmp_path):
     assert payload == {"path": str(path), "limit": 8, "ocr": True}
 
 
-def test_browser_open_requires_approval_and_validates_after_override(monkeypatch, tmp_path):
+def test_browser_open_requires_approval_and_validates_after_override(
+    monkeypatch,
+    tmp_path,
+    public_example_dns,
+):
     class FakeBridgeClient:
         def __init__(self, _settings):
             return None
 
         async def action(self, *, action, payload=None, timeout_sec=30):
             assert timeout_sec == 10
-            assert action == "url.open"
-            assert payload == {"url": "https://example.com/path?q=1"}
-            return {"ok": True, "summary": "opened", "data": {"ok": True}}
+            assert action == "browser.open_guarded"
+            assert payload["url"] == "https://example.com/path?q=1"
+            assert payload["profile_dir"].endswith("browser-profile")
+            return _guarded_browser_bridge_result()
 
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
@@ -957,23 +1039,165 @@ def test_browser_open_requires_approval_and_validates_after_override(monkeypatch
     storage.close()
 
 
-def test_browser_policy_and_open_many(monkeypatch, tmp_path):
-    active_calls = 0
-    max_active_calls = 0
+def test_browser_approval_only_accepts_approved_external_but_not_hard_denials(
+    monkeypatch,
+    tmp_path,
+    public_example_dns,
+):
+    opened_urls: list[str] = []
 
     class FakeBridgeClient:
         def __init__(self, _settings):
             return None
 
         async def action(self, *, action, payload=None, timeout_sec=30):
-            nonlocal active_calls, max_active_calls
-            assert action == "url.open"
+            assert action == "browser.open_guarded"
             assert timeout_sec == 10
-            assert payload["url"] in {"https://example.com/a", "https://example.com/b"}
-            active_calls += 1
-            max_active_calls = max(max_active_calls, active_calls)
-            await asyncio.sleep(0.01)
-            active_calls -= 1
+            opened_urls.append(payload["url"])
+            assert payload["profile_dir"].endswith("browser-profile")
+            return _guarded_browser_bridge_result()
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr("jarvis_gpt.tools.HostBridgeClient", FakeBridgeClient)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+    storage.set_runtime_value(
+        "operations.browser_policy",
+        {"mode": "approval-only", "require_approval_for_external": True},
+    )
+
+    approved = asyncio.run(
+        tools.run(
+            "browser.open",
+            {"url": "https://example.com/approved"},
+            allow_danger=True,
+        )
+    )
+    credentialed = asyncio.run(
+        tools.run(
+            "browser.open",
+            {"url": "https://user:secret@example.com/"},
+            allow_danger=True,
+        )
+    )
+
+    assert approved.ok is True
+    assert opened_urls == ["https://example.com/approved"]
+    assert credentialed.ok is False
+    assert "Credentials embedded" in credentialed.summary
+
+    storage.set_runtime_value("operations.browser_policy", {"mode": "locked"})
+    locked = asyncio.run(
+        tools.run(
+            "browser.open",
+            {"url": "https://example.com/locked"},
+            allow_danger=True,
+        )
+    )
+    assert locked.ok is False
+    assert "locked" in locked.summary
+    assert opened_urls == ["https://example.com/approved"]
+    storage.close()
+
+
+def test_browser_approval_does_not_bypass_private_network_policy(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr(
+        "jarvis_gpt.tools._resolved_ip_addresses",
+        lambda _host: [ipaddress.ip_address("192.168.1.25")],
+    )
+
+    async def forbidden_read(**_kwargs):
+        raise AssertionError("private target reached Chrome")
+
+    monkeypatch.setattr("jarvis_gpt.tools.read_chrome_page", forbidden_read)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+    storage.set_runtime_value(
+        "operations.browser_policy",
+        {
+            "mode": "approval-only",
+            "require_approval_for_external": True,
+            "allowed_hosts": ["localhost", "127.0.0.1"],
+        },
+    )
+
+    result = asyncio.run(
+        tools.run(
+            "browser.read",
+            {"url": "http://router.example/admin"},
+            allow_danger=True,
+        )
+    )
+
+    assert result.ok is False
+    assert "not explicitly allowed" in result.summary
+    storage.close()
+
+
+def test_browser_open_preserves_explicit_localhost_policy_in_private_only_session(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr(
+        "jarvis_gpt.tools._resolved_ip_addresses",
+        lambda _host: [ipaddress.ip_address("127.0.0.1")],
+    )
+
+    class FakeBridgeClient:
+        def __init__(self, _settings):
+            return None
+
+        async def action(self, *, action, payload=None, timeout_sec=30):
+            assert action == "browser.open_guarded"
+            assert payload["url"] == "http://localhost:3000/"
+            assert payload["allowed_private_hosts"] == ["localhost"]
+            result = _guarded_browser_bridge_result()
+            guard = result["data"]["network_guard"]
+            guard["allowed_private_hosts"] = ["localhost"]
+            guard["session_class"] = "private-only"
+            guard["profile_dir"] = "C:/jarvis/public-proxy-v1/private"
+            guard["proxy"] = "http://127.0.0.1:19001"
+            return result
+
+    monkeypatch.setattr("jarvis_gpt.tools.HostBridgeClient", FakeBridgeClient)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    result = asyncio.run(
+        tools.run(
+            "browser.open",
+            {"url": "http://localhost:3000/"},
+            allow_danger=True,
+        )
+    )
+
+    assert result.ok is True
+    assert result.data["network_guard"]["session_class"] == "private-only"
+    assert result.data["network_guard"]["allowed_private_hosts"] == ["localhost"]
+    storage.close()
+
+
+def test_browser_open_fails_closed_when_bridge_omits_network_guard(
+    monkeypatch, tmp_path, public_example_dns
+):
+    class FakeBridgeClient:
+        def __init__(self, _settings):
+            return None
+
+        async def action(self, **_kwargs):
             return {"ok": True, "summary": "opened", "data": {"ok": True}}
 
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
@@ -985,22 +1209,230 @@ def test_browser_policy_and_open_many(monkeypatch, tmp_path):
     storage.initialize()
     tools = ToolRegistry(settings, storage, LLMRouter(settings))
 
+    result = asyncio.run(
+        tools.run(
+            "browser.open",
+            {"url": "https://example.com/"},
+            allow_danger=True,
+        )
+    )
+
+    assert result.ok is False
+    assert "not verified" in result.summary
+    storage.close()
+
+
+def test_browser_open_does_not_promote_rebound_public_dns_to_private_allowlist(
+    monkeypatch, tmp_path
+):
+    answers = iter(
+        (
+            [ipaddress.ip_address("93.184.216.34")],
+            [ipaddress.ip_address("10.0.0.10")],
+        )
+    )
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr("jarvis_gpt.tools._resolved_ip_addresses", lambda _host: next(answers))
+
+    class ForbiddenBridgeClient:
+        def __init__(self, _settings):
+            return None
+
+        async def action(self, **_kwargs):
+            raise AssertionError("rebound hostname must not reach the host bridge")
+
+    monkeypatch.setattr("jarvis_gpt.tools.HostBridgeClient", ForbiddenBridgeClient)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    result = asyncio.run(
+        tools.run(
+            "browser.open",
+            {"url": "https://rebind.example/"},
+            allow_danger=True,
+        )
+    )
+
+    assert result.ok is False
+    assert "not explicitly allowed" in result.summary
+    storage.close()
+
+
+@pytest.mark.parametrize(
+    ("tool", "arguments"),
+    [
+        ("browser.open", {"url": "http://private.example/admin"}),
+        ("browser.open_many", {"urls": ["http://private.example/admin"]}),
+        (
+            "browser.chrome.launch",
+            {"start_url": "http://private.example/admin"},
+        ),
+    ],
+)
+def test_direct_browser_actions_keep_private_network_boundary_after_approval(
+    monkeypatch,
+    tmp_path,
+    tool,
+    arguments,
+):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr(
+        "jarvis_gpt.tools._resolved_ip_addresses",
+        lambda _host: [ipaddress.ip_address("169.254.169.254")],
+    )
+
+    class ForbiddenBridgeClient:
+        def __init__(self, _settings):
+            return None
+
+        async def action(self, **_kwargs):
+            raise AssertionError("private target must be rejected before host bridge")
+
+    monkeypatch.setattr("jarvis_gpt.tools.HostBridgeClient", ForbiddenBridgeClient)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    result = asyncio.run(tools.run(tool, arguments, allow_danger=True))
+
+    assert result.ok is False
+    assert "forbidden network range" in result.summary
+    storage.close()
+
+
+def test_browser_open_many_rejects_duplicate_normalized_targets(
+    monkeypatch,
+    tmp_path,
+    public_example_dns,
+):
+    class ForbiddenBridgeClient:
+        def __init__(self, _settings):
+            return None
+
+        async def action(self, **_kwargs):
+            raise AssertionError("duplicate URLs must be rejected before bridge calls")
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr("jarvis_gpt.tools.HostBridgeClient", ForbiddenBridgeClient)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    result = asyncio.run(
+        tools.run(
+            "browser.open_many",
+            {"urls": ["https://example.com", "https://www.EXAMPLE.com/"]},
+            allow_danger=True,
+        )
+    )
+
+    assert result.ok is False
+    assert "Duplicate browser URL" in result.summary
+    storage.close()
+
+
+def test_browser_open_many_rejects_oversized_batch_without_truncation(
+    monkeypatch,
+    tmp_path,
+):
+    class ForbiddenBridgeClient:
+        def __init__(self, _settings):
+            return None
+
+        async def action(self, **_kwargs):
+            raise AssertionError("oversized URL batch must be rejected, not truncated")
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr("jarvis_gpt.tools.HostBridgeClient", ForbiddenBridgeClient)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    storage.set_runtime_value(
+        "operations.browser_policy",
+        {"max_urls_per_action": 1},
+    )
+    registry = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    result = asyncio.run(
+        registry.run(
+            "browser.open_many",
+            {"urls": ["https://example.com/a", "https://example.com/b"]},
+            allow_danger=True,
+        )
+    )
+
+    assert result.ok is False
+    assert "At most 1 URLs" in result.summary
+    storage.close()
+
+
+def test_browser_policy_and_open_many(monkeypatch, tmp_path, public_example_dns):
+    active_calls = 0
+    max_active_calls = 0
+
+    class FakeBridgeClient:
+        def __init__(self, _settings):
+            return None
+
+        async def action(self, *, action, payload=None, timeout_sec=30):
+            nonlocal active_calls, max_active_calls
+            assert action == "browser.open_guarded"
+            assert timeout_sec == 10
+            assert payload["url"] in {"https://example.com/a", "https://example.com/b"}
+            assert payload["profile_dir"].endswith("browser-profile")
+            active_calls += 1
+            max_active_calls = max(max_active_calls, active_calls)
+            await asyncio.sleep(0.01)
+            active_calls -= 1
+            return _guarded_browser_bridge_result()
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr("jarvis_gpt.tools.HostBridgeClient", FakeBridgeClient)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
     policy = asyncio.run(tools.run("browser.policy", {}))
-    opened = asyncio.run(
+    blocked = asyncio.run(
         tools.run(
             "browser.open_many",
             {"urls": ["https://example.com/a", "https://example.com/b"]},
         )
     )
+    opened = asyncio.run(
+        tools.run(
+            "browser.open_many",
+            {"urls": ["https://example.com/a", "https://example.com/b"]},
+            allow_danger=True,
+        )
+    )
 
     assert policy.ok is True
+    assert blocked.ok is False
+    assert "requires approval" in blocked.summary
+    assert tools.get("browser.open_many").danger_level == "review"
     assert opened.ok is True
     assert opened.data["urls"] == ["https://example.com/a", "https://example.com/b"]
     assert max_active_calls == 2
     storage.close()
 
 
-def test_browser_chrome_status_uses_local_cdp(monkeypatch, tmp_path):
+def test_browser_chrome_status_uses_local_cdp(monkeypatch, tmp_path, attested_chrome):
     async def fake_status(debug_url):
         assert debug_url == "http://127.0.0.1:9222"
         return {"ok": True, "summary": "ready", "debug_url": debug_url}
@@ -1026,7 +1458,216 @@ def test_browser_chrome_status_uses_local_cdp(monkeypatch, tmp_path):
     storage.close()
 
 
-def test_browser_read_is_gated_and_uses_chrome_session(monkeypatch, tmp_path):
+@pytest.fixture
+def public_example_dns(monkeypatch):
+    """Keep browser-session unit tests independent of external DNS availability."""
+
+    import jarvis_gpt.tools as tools_module
+
+    original = tools_module._resolved_ip_addresses
+
+    def resolve(host: str):
+        if host.casefold() == "example.com":
+            return [ipaddress.ip_address("93.184.216.34")]
+        return original(host)
+
+    monkeypatch.setattr(tools_module, "_resolved_ip_addresses", resolve)
+
+
+@pytest.fixture
+def attested_chrome(monkeypatch):
+    async def require(_ctx, debug_url, *, url=None):
+        return {
+            "bridge": {"ok": True, "owner_pid": 4242},
+            "command_line": {"ok": True},
+            "session": {
+                "allowed_private_hosts": [],
+                "debug_port": 9222,
+                "owner_pid": 4242,
+                "profile_dir": "C:/jarvis/public-proxy-v1/public",
+                "proxy": "http://127.0.0.1:18766",
+                "session_class": "public-only",
+                "url": url,
+            },
+        }
+
+    monkeypatch.setattr("jarvis_gpt.tools._require_guarded_chrome_session", require)
+
+
+def test_browser_read_rejects_preexisting_unattested_cdp_endpoint(
+    monkeypatch, tmp_path, public_example_dns
+):
+    async def forbidden_read(**_kwargs):
+        raise AssertionError("unattested CDP endpoint must never receive navigation")
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr("jarvis_gpt.tools.read_chrome_page", forbidden_read)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    result = asyncio.run(
+        tools.run(
+            "browser.read",
+            {"url": "https://example.com/"},
+            allow_danger=True,
+        )
+    )
+
+    assert result.ok is False
+    assert "no guarded launch attestation" in result.summary
+    storage.close()
+
+
+@pytest.mark.parametrize(
+    ("tool", "arguments"),
+    [
+        ("browser.read", {"url": "https://example.com/"}),
+        ("browser.scroll", {"url": "https://example.com/"}),
+        (
+            "browser.click",
+            {"url": "https://example.com/", "selector": "#next"},
+        ),
+        (
+            "browser.type",
+            {"url": "https://example.com/", "selector": "#query", "text": "safe"},
+        ),
+        (
+            "browser.select",
+            {"url": "https://example.com/", "selector": "#sort", "value": "price"},
+        ),
+        ("browser.screenshot", {"url": "https://example.com/"}),
+    ],
+)
+def test_every_cdp_content_action_requires_guarded_session(
+    monkeypatch, tmp_path, public_example_dns, tool, arguments
+):
+    async def reject(*_args, **_kwargs):
+        raise BrowserCdpError("guarded attestation required")
+
+    async def forbidden(*_args, **_kwargs):
+        raise AssertionError("CDP operation ran without attestation")
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / tool.replace(".", "-")))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr("jarvis_gpt.tools._require_guarded_chrome_session", reject)
+    monkeypatch.setattr("jarvis_gpt.tools.read_chrome_page", forbidden)
+    monkeypatch.setattr("jarvis_gpt.tools.scroll_chrome_page", forbidden)
+    monkeypatch.setattr("jarvis_gpt.tools.run_chrome_action", forbidden)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    result = asyncio.run(tools.run(tool, arguments, allow_danger=True))
+
+    assert result.ok is False
+    assert "guarded attestation required" in result.summary
+    storage.close()
+
+
+def test_browser_session_diagnose_does_not_trust_reachable_unattested_cdp(
+    monkeypatch, tmp_path
+):
+    async def reachable(_debug_url):
+        return {"ok": True, "summary": "reachable"}
+
+    async def reject(*_args, **_kwargs):
+        raise BrowserCdpError("endpoint is not attested")
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr("jarvis_gpt.tools.chrome_debugger_status", reachable)
+    monkeypatch.setattr("jarvis_gpt.tools._require_guarded_chrome_session", reject)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    result = asyncio.run(tools.run("browser.session.diagnose", {}))
+
+    assert result.ok is False
+    assert result.data["chrome"]["ok"] is False
+    assert result.data["diagnosis"]["route"] == "launch_chrome"
+    storage.close()
+
+
+def test_cdp_session_re_attestation_binds_bridge_policy_to_local_record(
+    monkeypatch, tmp_path, public_example_dns
+):
+    import jarvis_gpt.tools as tools_module
+
+    debug_url = "http://127.0.0.1:9222"
+    profile = "C:/jarvis/public-proxy-v1/public"
+    proxy = "http://127.0.0.1:18766"
+    record = {
+        "allowed_private_hosts": [],
+        "debug_port": 9222,
+        "launch_nonce": "n" * 43,
+        "owner_pid": 4242,
+        "profile_dir": profile,
+        "proxy": proxy,
+        "session_class": "public-only",
+    }
+
+    class FakeBridgeClient:
+        def __init__(self, _settings):
+            return None
+
+        async def action(self, **_kwargs):
+            return {
+                "ok": True,
+                "data": {
+                    "ok": True,
+                    "owner_pid": 4242,
+                    "profile_dir": profile,
+                    "proxy": proxy,
+                    "allowed_private_hosts": [],
+                    "session_class": "public-only",
+                },
+            }
+
+    async def command_line(**_kwargs):
+        return {"ok": True, "summary": "attested"}
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr("jarvis_gpt.tools.HostBridgeClient", FakeBridgeClient)
+    monkeypatch.setattr("jarvis_gpt.tools.attest_chrome_debugger", command_line)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    key = tools_module._guarded_chrome_session_key(debug_url)
+    storage.set_runtime_value(key, record)
+    ctx = SimpleNamespace(settings=settings, storage=storage)
+
+    attested = asyncio.run(
+        tools_module._require_guarded_chrome_session(
+            ctx,
+            debug_url,
+            url="https://example.com/",
+        )
+    )
+    storage.set_runtime_value(key, {**record, "session_class": "private-only"})
+    with pytest.raises(BrowserCdpError, match="policy no longer matches"):
+        asyncio.run(tools_module._require_guarded_chrome_session(ctx, debug_url))
+
+    assert attested["session"]["session_class"] == "public-only"
+    storage.close()
+
+
+def test_browser_read_is_gated_and_uses_chrome_session(
+    monkeypatch,
+    tmp_path,
+    public_example_dns,
+    attested_chrome,
+):
     async def fake_read_chrome_page(*, url, max_chars, wait_ms, debug_url, url_validator):
         assert url == "https://example.com/private"
         assert max_chars == 1024
@@ -1076,7 +1717,9 @@ def test_browser_read_is_gated_and_uses_chrome_session(monkeypatch, tmp_path):
     storage.close()
 
 
-def test_browser_read_reports_human_verification(monkeypatch, tmp_path):
+def test_browser_read_reports_human_verification(
+    monkeypatch, tmp_path, public_example_dns, attested_chrome
+):
     async def fake_read_chrome_page(**_kwargs):
         return BrowserPageSnapshot(
             title="Just a moment",
@@ -1110,7 +1753,9 @@ def test_browser_read_reports_human_verification(monkeypatch, tmp_path):
     storage.close()
 
 
-def test_browser_scroll_loads_lazy_page_after_review(monkeypatch, tmp_path):
+def test_browser_scroll_loads_lazy_page_after_review(
+    monkeypatch, tmp_path, public_example_dns, attested_chrome
+):
     async def fake_scroll_chrome_page(**kwargs):
         assert kwargs["direction"] == "bottom"
         assert kwargs["passes"] == 4
@@ -1160,17 +1805,23 @@ def test_browser_scroll_loads_lazy_page_after_review(monkeypatch, tmp_path):
     storage.close()
 
 
-def test_browser_chrome_launch_uses_dedicated_profile(monkeypatch, tmp_path):
+def test_browser_chrome_launch_uses_dedicated_profile(
+    monkeypatch,
+    tmp_path,
+    public_example_dns,
+):
     class FakeBridgeClient:
         def __init__(self, _settings):
             return None
 
         async def action(self, *, action, payload=None, timeout_sec=30):
-            assert action == "chrome.launch"
+            assert action == "chrome.launch_guarded"
             assert timeout_sec == 15
             assert payload["debug_port"] == 9222
             assert "chrome-profile" in payload["profile_dir"]
-            return {"ok": True, "summary": "launched", "data": {"ok": True}}
+            assert len(payload["launch_nonce"]) >= 32
+            assert payload["allowed_private_hosts"] == []
+            return _guarded_browser_bridge_result("launched")
 
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
@@ -1181,6 +1832,14 @@ def test_browser_chrome_launch_uses_dedicated_profile(monkeypatch, tmp_path):
         return {"ok": True, "summary": "CDP socket reachable"}
 
     monkeypatch.setattr("jarvis_gpt.tools.chrome_debugger_status", fake_chrome_status)
+
+    async def fake_attestation(**kwargs):
+        assert kwargs["debug_url"] == "http://127.0.0.1:9222"
+        assert len(kwargs["launch_nonce"]) >= 32
+        assert kwargs["profile_dir"] == "C:/jarvis/public-proxy-v1/public"
+        return {"ok": True, "summary": "attested"}
+
+    monkeypatch.setattr("jarvis_gpt.tools.attest_chrome_debugger", fake_attestation)
     settings = load_settings()
     ensure_runtime_dirs(settings)
     storage = JarvisStorage(settings.database_path)
@@ -1194,12 +1853,58 @@ def test_browser_chrome_launch_uses_dedicated_profile(monkeypatch, tmp_path):
     assert "requires approval" in blocked.summary
     assert launched.ok is True
     assert launched.data["debug_url"] == "http://127.0.0.1:9222"
-    assert launched.data["profile_dir"].endswith("chrome-profile")
+    assert launched.data["profile_dir"] == "C:/jarvis/public-proxy-v1/public"
     assert launched.data["verification"]["ok"] is True
     storage.close()
 
 
-def test_browser_click_is_gated_and_saves_evidence(monkeypatch, tmp_path):
+def test_browser_chrome_launch_rejects_preexisting_cdp_command_line(
+    monkeypatch, tmp_path, public_example_dns
+):
+    class FakeBridgeClient:
+        def __init__(self, _settings):
+            return None
+
+        async def action(self, **_kwargs):
+            return _guarded_browser_bridge_result("launched")
+
+    async def fake_status(_debug_url):
+        return {"ok": True, "summary": "pre-existing endpoint is reachable"}
+
+    async def mismatched_attestation(**_kwargs):
+        return {
+            "ok": False,
+            "summary": "Chrome command line does not match guarded launch attestation.",
+        }
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr("jarvis_gpt.tools.HostBridgeClient", FakeBridgeClient)
+    monkeypatch.setattr("jarvis_gpt.tools.chrome_debugger_status", fake_status)
+    monkeypatch.setattr("jarvis_gpt.tools.attest_chrome_debugger", mismatched_attestation)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+
+    result = asyncio.run(
+        tools.run("browser.chrome.launch", {}, allow_danger=True)
+    )
+
+    assert result.ok is False
+    assert result.data["verification"]["status"] == "failed"
+    assert storage.get_runtime_value(
+        "browser.guarded_chrome_session."
+        + hashlib.sha256(b"http://127.0.0.1:9222").hexdigest(),
+        None,
+    ) is None
+    storage.close()
+
+
+def test_browser_click_is_gated_and_saves_evidence(
+    monkeypatch, tmp_path, public_example_dns, attested_chrome
+):
     async def fake_run_chrome_action(**kwargs):
         assert kwargs["action"] == "click"
         assert kwargs["selector"] == "#next"
@@ -1250,7 +1955,9 @@ def test_browser_click_is_gated_and_saves_evidence(monkeypatch, tmp_path):
     storage.close()
 
 
-def test_browser_click_accepts_semantic_target(monkeypatch, tmp_path):
+def test_browser_click_accepts_semantic_target(
+    monkeypatch, tmp_path, public_example_dns, attested_chrome
+):
     async def fake_run_chrome_action(**kwargs):
         assert kwargs["selector"] == ""
         assert kwargs["target"] == "Next page"
@@ -1297,7 +2004,12 @@ def test_browser_click_accepts_semantic_target(monkeypatch, tmp_path):
     storage.close()
 
 
-def test_browser_type_blocks_sensitive_target_without_opt_in(monkeypatch, tmp_path):
+def test_browser_type_blocks_sensitive_target_without_opt_in(
+    monkeypatch,
+    tmp_path,
+    public_example_dns,
+    attested_chrome,
+):
     async def fake_run_chrome_action(**_kwargs):
         return BrowserActionResult(
             action="type",

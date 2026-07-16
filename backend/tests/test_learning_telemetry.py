@@ -227,6 +227,48 @@ def test_supervisor_records_health_snapshot(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_supervisor_keeps_health_loop_running_when_autonomy_is_disabled(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setenv("JARVIS_AUTONOMY_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    supervisor = RuntimeSupervisor(settings=settings, storage=storage)
+
+    async def scenario():
+        await supervisor.start()
+        assert [task.get_name() for task in supervisor._tasks] == ["jarvis-health-loop"]
+        await supervisor.stop()
+
+    asyncio.run(scenario())
+    storage.close()
+
+
+def test_health_recording_survives_observability_sink_failure(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    supervisor = RuntimeSupervisor(settings=settings, storage=storage)
+
+    def fail_event(**_kwargs):
+        raise RuntimeError("event sink unavailable")
+
+    monkeypatch.setattr(storage, "add_event", fail_event)
+    asyncio.run(supervisor._record_health())
+
+    assert supervisor.status()["last_health_at"] is not None
+    assert supervisor.status()["last_health_attempt_ok"] is True
+    assert storage.latest_complete_health(limit=20)
+    storage.close()
+
+
 def test_supervisor_background_cognition_persists_pulse(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "1")

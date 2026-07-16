@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -31,6 +32,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Jarvis local readiness smoke check")
     parser.add_argument("--skip-frontend", action="store_true")
     parser.add_argument("--skip-http", action="store_true")
+    parser.add_argument(
+        "--require-runtime",
+        action="store_true",
+        help="Fail when the running backend, autonomy API, or frontend is unavailable.",
+    )
     args = parser.parse_args()
 
     try:
@@ -55,13 +61,27 @@ def main() -> int:
             timeout=backend_test_timeout,
         ),
         run(
+            "assurance tests",
+            [sys.executable, "-m", "pytest", "qa/tests"],
+            env=sanitized_test_env(),
+            timeout=backend_test_timeout,
+        ),
+        run(
             "backend lint",
-            [sys.executable, "-m", "ruff", "check", "backend/src", "backend/tests"],
+            [
+                sys.executable,
+                "-m",
+                "ruff",
+                "check",
+                "backend/src",
+                "backend/tests",
+                "qa",
+            ],
             timeout=default_check_timeout,
         ),
         run(
             "backend compile",
-            [sys.executable, "-m", "compileall", "backend/src", "backend/tests"],
+            [sys.executable, "-m", "compileall", "backend/src", "backend/tests", "qa"],
             timeout=default_check_timeout,
         ),
         run(
@@ -90,19 +110,44 @@ def main() -> int:
                     cwd=ROOT / "frontend",
                     timeout=default_check_timeout,
                 ),
+                run(
+                    "frontend runtime identity tests",
+                    [executable("npm"), "run", "test:runtime-identity"],
+                    cwd=ROOT / "frontend",
+                    timeout=default_check_timeout,
+                ),
+                run(
+                    "frontend stream recovery tests",
+                    [executable("npm"), "run", "test:stream-placeholder"],
+                    cwd=ROOT / "frontend",
+                    timeout=default_check_timeout,
+                ),
                 run_frontend_build(
                     timeout=default_check_timeout,
                 ),
             ]
         )
     if not args.skip_http:
-        checks.extend(
-            [
-                http("backend health", "http://localhost:8000/health", optional=True),
-                http("backend autonomy", "http://localhost:8000/api/autonomy", optional=True),
-                http("frontend", "http://localhost:3000", optional=True),
-            ]
-        )
+        runtime_optional = not args.require_runtime
+        runtime_checks = [
+            http(
+                "backend health",
+                "http://localhost:8000/health",
+                optional=runtime_optional,
+                expect_json_ok=True,
+            ),
+            http(
+                "backend autonomy",
+                "http://localhost:8000/api/autonomy",
+                optional=runtime_optional,
+                headers=api_auth_headers(),
+            ),
+        ]
+        if not args.skip_frontend:
+            runtime_checks.append(
+                http("frontend", "http://localhost:3000", optional=runtime_optional)
+            )
+        checks.extend(runtime_checks)
 
     required_ok = all(bool(item["ok"]) for item in checks if not item["optional"])
     optional_gaps = sum(
@@ -203,11 +248,18 @@ def run_frontend_build(*, timeout: int | float) -> dict[str, object]:
 
     When a turbo/vLLM stack already holds host memory, ``npm run build`` can abort
     with a memory-allocation failure and corrupt an in-progress ``.next`` tree.
-    If a *proven* production build already exists (BUILD_ID present), reuse it
-    instead of reporting a false required failure. Real compile errors still fail.
+    If an unchanged, source-current production build already existed before the
+    attempt, it may be reused after an OOM. Real compile errors and any partial
+    mutation of the build tree still fail.
     """
 
     frontend = ROOT / "frontend"
+    existing_before = existing_production_frontend_build(frontend)
+    tree_before = (
+        production_build_tree_fingerprint(frontend / ".next")
+        if existing_before is not None
+        else None
+    )
     result = run(
         "frontend build",
         [executable("npm"), "run", "build"],
@@ -232,7 +284,14 @@ def run_frontend_build(*, timeout: int | float) -> dict[str, object]:
         return result
 
     existing = existing_production_frontend_build(frontend)
-    if existing is None:
+    tree_after = production_build_tree_fingerprint(frontend / ".next")
+    if (
+        existing_before is None
+        or existing is None
+        or existing != existing_before
+        or tree_before is None
+        or tree_after != tree_before
+    ):
         return result
 
     return {
@@ -270,18 +329,79 @@ def existing_production_frontend_build(frontend_dir: Path) -> dict[str, str] | N
     ]
     if not all(path.is_file() for path in required):
         return None
+    source_files = [
+        frontend_dir / "package.json",
+        frontend_dir / "package-lock.json",
+        frontend_dir / "tsconfig.json",
+        frontend_dir / "next-env.d.ts",
+    ]
+    source_files.extend(
+        path for path in frontend_dir.glob("next.config.*") if path.is_file()
+    )
+    for source_dir_name in ("app", "pages", "src", "components", "lib", "public"):
+        source_dir = frontend_dir / source_dir_name
+        if source_dir.is_dir():
+            source_files.extend(
+                path for path in source_dir.rglob("*") if path.is_file()
+            )
+    newest_source = max(
+        (path.stat().st_mtime_ns for path in source_files if path.is_file()),
+        default=0,
+    )
+    if build_id_path.stat().st_mtime_ns < newest_source:
+        return None
     return {"build_id": build_id, "path": str(next_dir)}
 
 
-def http(name: str, url: str, *, optional: bool = False) -> dict[str, object]:
+def production_build_tree_fingerprint(next_dir: Path) -> str | None:
+    """Fingerprint build-tree structure without reading large bundle contents."""
+
+    if not next_dir.is_dir():
+        return None
+    digest = hashlib.sha256()
+    files = sorted(path for path in next_dir.rglob("*") if path.is_file())
+    if not files:
+        return None
+    for path in files:
+        stat = path.stat()
+        relative = path.relative_to(next_dir).as_posix()
+        digest.update(relative.encode("utf-8", errors="strict"))
+        digest.update(b"\0")
+        digest.update(str(stat.st_size).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(str(stat.st_mtime_ns).encode("ascii"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def http(
+    name: str,
+    url: str,
+    *,
+    optional: bool = False,
+    expect_json_ok: bool = False,
+    headers: dict[str, str] | None = None,
+) -> dict[str, object]:
     try:
-        with urllib.request.urlopen(url, timeout=8) as response:
+        request = urllib.request.Request(url, headers=headers or {})
+        with urllib.request.urlopen(request, timeout=8) as response:
+            status_ok = 200 <= response.status < 400
+            body_ok = True
+            if expect_json_ok and status_ok:
+                try:
+                    body = json.loads(response.read(1_048_577).decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    body_ok = False
+                else:
+                    body_ok = isinstance(body, dict) and body.get("ok") is True
+            ok = status_ok and body_ok
             return {
                 "name": name,
-                "ok": 200 <= response.status < 400,
+                "ok": ok,
                 "optional": optional,
-                "status": "passed" if 200 <= response.status < 400 else "failed",
+                "status": "passed" if ok else "failed",
                 "http_status": response.status,
+                **({"body_ok": body_ok} if expect_json_ok else {}),
             }
     except urllib.error.HTTPError as exc:
         return {
@@ -290,6 +410,22 @@ def http(name: str, url: str, *, optional: bool = False) -> dict[str, object]:
         }
     except (urllib.error.URLError, TimeoutError) as exc:
         return _failed_check(name, optional=optional, error=str(exc), unavailable=True)
+
+
+def api_auth_headers() -> dict[str, str]:
+    token = os.environ.get("JARVIS_API_TOKEN", "").strip()
+    if not token:
+        home = os.environ.get("JARVIS_HOME", "").strip()
+        candidates = [Path(home) / ".jarvis" / "api.token"] if home else []
+        candidates.append(Path.home() / ".jarvis" / "api.token")
+        for path in candidates:
+            try:
+                token = path.read_text(encoding="utf-8").strip()
+            except (OSError, UnicodeError):
+                continue
+            if token:
+                break
+    return {"Authorization": f"Bearer {token}"} if token else {}
 
 
 def _failed_check(

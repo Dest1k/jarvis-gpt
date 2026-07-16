@@ -10,6 +10,7 @@ import re
 import secrets
 import socket
 from contextlib import asynccontextmanager, suppress
+from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -543,12 +544,106 @@ async def index() -> dict[str, str]:
     return {"name": "Jarvis", "status": "online"}
 
 
-@app.get("/health")
-async def health() -> dict[str, object]:
-    return {
-        "ok": True,
+@app.get("/health", response_model=None)
+async def health() -> dict[str, object] | JSONResponse:
+    try:
+        app.state.storage.ping()
+        rows = app.state.storage.latest_complete_health(limit=20)
+    except Exception as exc:  # noqa: BLE001 - health must report, never mask, storage failure
+        payload = {
+            "ok": False,
+            "profile": app.state.settings.profile.name,
+            "home": str(app.state.settings.home),
+            "error": f"health storage unavailable: {type(exc).__name__}",
+        }
+        return JSONResponse(status_code=503, content=payload)
+    readiness = _health_snapshot_readiness(app.state.settings, rows)
+    supervisor = getattr(app.state, "supervisor", None)
+    supervisor_status = supervisor.status() if supervisor is not None else {}
+    latest_attempt_ok = supervisor_status.get("last_health_attempt_ok")
+    latest_attempt_at = supervisor_status.get("last_health_attempt_at")
+    if latest_attempt_ok is not True:
+        readiness = {
+            **readiness,
+            "ok": False,
+            "probe_failure": True,
+        }
+    else:
+        readiness = {**readiness, "probe_failure": False}
+    payload = {
+        "ok": readiness["ok"],
         "profile": app.state.settings.profile.name,
         "home": str(app.state.settings.home),
+        "unhealthy_components": readiness["unhealthy_components"],
+        "missing_components": readiness["missing_components"],
+        "stale_components": readiness["stale_components"],
+        "max_snapshot_age_seconds": readiness["max_snapshot_age_seconds"],
+        "health_components": len(rows),
+        "latest_probe_ok": latest_attempt_ok,
+        "latest_probe_at": latest_attempt_at,
+        "probe_failure": readiness["probe_failure"],
+    }
+    if not readiness["ok"]:
+        return JSONResponse(status_code=503, content=payload)
+    return payload
+
+
+def _health_snapshot_readiness(
+    settings: Any,
+    rows: list[dict[str, Any]],
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Interpret persisted diagnostics as readiness without hiding warnings that matter."""
+
+    required = {
+        "runtime.home",
+        "runtime.data",
+        "runtime.cache",
+        "runtime.logs",
+        "storage.sqlite",
+    }
+    if bool(settings.llm_enabled):
+        required.add("llm.router")
+    by_component = {
+        str(row.get("component") or ""): row
+        for row in rows
+        if str(row.get("component") or "")
+    }
+    missing = sorted(required - set(by_component))
+    hard_failure_statuses = {"error", "failed", "critical", "unhealthy"}
+    unhealthy = {
+        component
+        for component, row in by_component.items()
+        if str(row.get("status") or "").casefold() in hard_failure_statuses
+    }
+    unhealthy.update(
+        component
+        for component in required
+        if component in by_component
+        and str(by_component[component].get("status") or "").casefold() != "ok"
+    )
+    max_age_seconds = max(180, max(60, int(settings.health_interval_sec)) * 2 + 30)
+    stale: set[str] = set()
+    current = (now or datetime.now(UTC)).astimezone(UTC)
+    for component in required & set(by_component):
+        raw_ts = str(by_component[component].get("ts") or "")
+        try:
+            timestamp = datetime.fromisoformat(raw_ts)
+        except ValueError:
+            stale.add(component)
+            continue
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=UTC)
+        age = (current - timestamp.astimezone(UTC)).total_seconds()
+        if age < -300 or age > max_age_seconds:
+            stale.add(component)
+    return {
+        "ok": not missing and not unhealthy and not stale,
+        "unhealthy_components": sorted(unhealthy),
+        "missing_components": missing,
+        "stale_components": sorted(stale),
+        "max_snapshot_age_seconds": max_age_seconds,
     }
 
 

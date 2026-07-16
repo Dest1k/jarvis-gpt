@@ -32,6 +32,8 @@ class RuntimeSupervisor:
         self._started_at: str | None = None
         self._last_telemetry_at: str | None = None
         self._last_health_at: str | None = None
+        self._last_health_attempt_at: str | None = None
+        self._last_health_attempt_ok: bool | None = None
         self._last_learning_at: str | None = None
         self._last_cognition_at: str | None = None
         self._last_cognition_error: str | None = None
@@ -45,30 +47,50 @@ class RuntimeSupervisor:
                 stale = self.autonomy_executor.operations.recover_stale_running_jobs()
             except Exception as exc:  # noqa: BLE001
                 stale = []
-                self.storage.add_event(
-                    kind="autonomy.recover",
-                    title=f"Autonomy stale lease recovery failed: {exc}",
-                    level="warn",
-                )
+                with suppress(Exception):
+                    self.storage.add_event(
+                        kind="autonomy.recover",
+                        title=f"Autonomy stale lease recovery failed: {exc}",
+                        level="warn",
+                    )
             if stale:
-                self.storage.add_event(
-                    kind="autonomy.recover",
-                    title=f"Recovered {len(stale)} stale autonomy job lease(s).",
-                    level="warn",
-                    payload={"job_ids": [item.get("id") for item in stale]},
-                )
-        if not self.settings.autonomy_enabled:
-            self.storage.add_event(
-                kind="autonomy.disabled",
-                title="Runtime supervisor is disabled",
-                payload=self.status(),
-            )
-            return
+                with suppress(Exception):
+                    self.storage.add_event(
+                        kind="autonomy.recover",
+                        title=f"Recovered {len(stale)} stale autonomy job lease(s).",
+                        level="warn",
+                        payload={"job_ids": [item.get("id") for item in stale]},
+                    )
+        # Readiness must be based on a current snapshot, not on an empty table
+        # or a result left by a previous process. This initial check also runs
+        # when background autonomy is disabled; disabled LLM routing is recorded
+        # as an intentional warning and interpreted by /health accordingly.
+        await self._record_health()
+        # Readiness monitoring is a runtime concern, not an autonomy feature.
+        # Keep refreshing diagnostics even when autonomous jobs, learning, and
+        # cognition have been disabled, otherwise /health can serve a stale
+        # successful snapshot forever after a dependency fails.
         self._tasks = [
-            asyncio.create_task(self._telemetry_loop(), name="jarvis-telemetry-loop"),
-            asyncio.create_task(self._health_loop(), name="jarvis-health-loop"),
-            asyncio.create_task(self._learning_loop(), name="jarvis-learning-loop"),
+            asyncio.create_task(self._health_loop(), name="jarvis-health-loop")
         ]
+        if not self.settings.autonomy_enabled:
+            with suppress(Exception):
+                self.storage.add_event(
+                    kind="autonomy.disabled",
+                    title="Runtime supervisor is disabled",
+                    payload=self.status(),
+                )
+            return
+        self._tasks.extend(
+            [
+                asyncio.create_task(
+                    self._telemetry_loop(), name="jarvis-telemetry-loop"
+                ),
+                asyncio.create_task(
+                    self._learning_loop(), name="jarvis-learning-loop"
+                ),
+            ]
+        )
         if self.settings.cognition_enabled and self.settings.llm_enabled:
             self._tasks.append(
                 asyncio.create_task(self._cognition_loop(), name="jarvis-cognition-loop")
@@ -77,11 +99,12 @@ class RuntimeSupervisor:
             self._tasks.append(
                 asyncio.create_task(self._background_job_loop(), name="jarvis-background-jobs")
             )
-        self.storage.add_event(
-            kind="autonomy.start",
-            title="Runtime supervisor started",
-            payload=self.status(),
-        )
+        with suppress(Exception):
+            self.storage.add_event(
+                kind="autonomy.start",
+                title="Runtime supervisor started",
+                payload=self.status(),
+            )
 
     async def stop(self) -> None:
         for task in self._tasks:
@@ -90,11 +113,12 @@ class RuntimeSupervisor:
             with suppress(asyncio.CancelledError):
                 await task
         self._tasks = []
-        self.storage.add_event(
-            kind="autonomy.stop",
-            title="Runtime supervisor stopped",
-            payload=self.status(),
-        )
+        with suppress(Exception):
+            self.storage.add_event(
+                kind="autonomy.stop",
+                title="Runtime supervisor stopped",
+                payload=self.status(),
+            )
 
     def status(self) -> dict[str, Any]:
         admission_status = getattr(self.llm, "admission_status", None)
@@ -112,6 +136,8 @@ class RuntimeSupervisor:
             "mission_interval_sec": self.settings.autonomy_mission_interval_sec,
             "last_telemetry_at": self._last_telemetry_at,
             "last_health_at": self._last_health_at,
+            "last_health_attempt_at": self._last_health_attempt_at,
+            "last_health_attempt_ok": self._last_health_attempt_ok,
             "last_learning_at": self._last_learning_at,
             "last_cognition_at": self._last_cognition_at,
             "last_cognition_error": self._last_cognition_error,
@@ -154,7 +180,6 @@ class RuntimeSupervisor:
             await self._run_cognition()
 
     async def _health_loop(self) -> None:
-        await self._record_health()
         while True:
             await asyncio.sleep(max(60, self.settings.health_interval_sec))
             await self._record_health()
@@ -171,14 +196,17 @@ class RuntimeSupervisor:
             self._last_telemetry_at = str(snapshot["ts"])
         except Exception as exc:  # noqa: BLE001
             self._last_error = str(exc) or exc.__class__.__name__
-            self.storage.add_event(
-                kind="autonomy.error",
-                title="Telemetry loop failed",
-                level="warn",
-                payload={"error": self._last_error},
-            )
+            with suppress(Exception):
+                self.storage.add_event(
+                    kind="autonomy.error",
+                    title="Telemetry loop failed",
+                    level="warn",
+                    payload={"error": self._last_error},
+                )
 
     async def _record_health(self) -> None:
+        self._last_health_attempt_at = utc_now()
+        self._last_health_attempt_ok = False
         try:
             result = await run_diagnostics(
                 settings=self.settings,
@@ -187,22 +215,28 @@ class RuntimeSupervisor:
                 persist=True,
             )
             self._last_health_at = utc_now()
+            self._last_health_attempt_ok = True
             error_count = sum(1 for check in result.checks if check.status == "error")
             warn_count = sum(1 for check in result.checks if check.status == "warn")
-            self.storage.add_event(
-                kind="autonomy.health",
-                title=f"Autonomous health snapshot: {error_count} error(s), {warn_count} warn(s)",
-                level="info" if error_count == 0 else "warn",
-                payload={"checks": len(result.checks), "ok": result.ok},
-            )
+            with suppress(Exception):
+                self.storage.add_event(
+                    kind="autonomy.health",
+                    title=(
+                        "Autonomous health snapshot: "
+                        f"{error_count} error(s), {warn_count} warn(s)"
+                    ),
+                    level="info" if error_count == 0 else "warn",
+                    payload={"checks": len(result.checks), "ok": result.ok},
+                )
         except Exception as exc:  # noqa: BLE001
             self._last_error = str(exc) or exc.__class__.__name__
-            self.storage.add_event(
-                kind="autonomy.error",
-                title="Health loop failed",
-                level="warn",
-                payload={"error": self._last_error},
-            )
+            with suppress(Exception):
+                self.storage.add_event(
+                    kind="autonomy.error",
+                    title="Health loop failed",
+                    level="warn",
+                    payload={"error": self._last_error},
+                )
 
     async def _run_learning(self) -> None:
         try:
@@ -215,12 +249,13 @@ class RuntimeSupervisor:
             )
         except Exception as exc:  # noqa: BLE001
             self._last_error = str(exc) or exc.__class__.__name__
-            self.storage.add_event(
-                kind="autonomy.error",
-                title="Learning loop failed",
-                level="warn",
-                payload={"error": self._last_error},
-            )
+            with suppress(Exception):
+                self.storage.add_event(
+                    kind="autonomy.error",
+                    title="Learning loop failed",
+                    level="warn",
+                    payload={"error": self._last_error},
+                )
 
     async def _run_cognition(self) -> None:
         if not self.settings.llm_enabled or not hasattr(self.llm, "complete"):
@@ -271,12 +306,13 @@ class RuntimeSupervisor:
             return
         except Exception as exc:  # noqa: BLE001
             self._last_cognition_error = str(exc) or exc.__class__.__name__
-            self.storage.add_event(
-                kind="cognition.error",
-                title="Background cognition loop failed",
-                level="warn",
-                payload={"error": self._last_cognition_error},
-            )
+            with suppress(Exception):
+                self.storage.add_event(
+                    kind="cognition.error",
+                    title="Background cognition loop failed",
+                    level="warn",
+                    payload={"error": self._last_cognition_error},
+                )
 
     async def _run_background_jobs(self) -> None:
         if self.autonomy_executor is None:
@@ -304,12 +340,13 @@ class RuntimeSupervisor:
                 )
         except Exception as exc:  # noqa: BLE001
             self._last_error = str(exc) or exc.__class__.__name__
-            self.storage.add_event(
-                kind="autonomy.error",
-                title="Background job loop failed",
-                level="warn",
-                payload={"error": self._last_error},
-            )
+            with suppress(Exception):
+                self.storage.add_event(
+                    kind="autonomy.error",
+                    title="Background job loop failed",
+                    level="warn",
+                    payload={"error": self._last_error},
+                )
 
 
 def _cognition_messages(storage: JarvisStorage) -> list[dict[str, str]]:

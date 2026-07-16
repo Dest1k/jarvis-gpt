@@ -3,15 +3,19 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+from types import SimpleNamespace
 
-from jarvis_gpt.agent import AgentRuntime
+import pytest
+from jarvis_gpt.agent import AgentContext, AgentRuntime
 from jarvis_gpt.approval_executor import ApprovalExecutor
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
 from jarvis_gpt.dispatcher import DispatcherManager
 from jarvis_gpt.event_bus import EventBus
 from jarvis_gpt.executive_runtime import ExecutiveCoordinator
+from jarvis_gpt.experience import DEFAULT_AUTONOMY_POLICY
 from jarvis_gpt.ingest import FileIngestor
 from jarvis_gpt.llm import LLMStreamChunk
+from jarvis_gpt.models import ToolRunResponse
 from jarvis_gpt.storage import JarvisStorage
 
 
@@ -92,6 +96,152 @@ def test_agentic_loop_runs_safe_tool_then_answers(monkeypatch, tmp_path):
         event.type == "tool_call" and event.payload.get("autonomous")
         for event in response.events
     )
+    storage.close()
+
+
+def test_agentic_loop_reports_completed_tool_when_final_synthesis_is_down(
+    monkeypatch,
+    tmp_path,
+):
+    class ToolThenOutageLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, messages, *, temperature=None, max_tokens=None, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return _result('{"tool":"runtime.status","arguments":{}}')
+            return type(
+                "Result",
+                (),
+                {
+                    "ok": False,
+                    "content": "",
+                    "error": "LLM temporarily unavailable",
+                    "raw": {},
+                },
+            )()
+
+    llm = ToolThenOutageLLM()
+    agent, storage = _agent(monkeypatch, tmp_path, llm)
+    storage.set_runtime_value("experience.autonomy_policy", {"verify_answers": False})
+    executions: list[str] = []
+
+    async def completed_tool(name, arguments=None, **kwargs):
+        executions.append(name)
+        return ToolRunResponse(
+            tool=name,
+            ok=True,
+            summary="Runtime status was captured.",
+            data={"ready": True},
+        )
+
+    monkeypatch.setattr(agent.tools, "run", completed_tool)
+
+    response = asyncio.run(agent.chat("собери данные и ответь"))
+
+    assert executions == ["runtime.status"]
+    assert "runtime.status [effect=" in response.answer
+    assert "— успешно" in response.answer
+    assert "Runtime status was captured" in response.answer
+    assert "автоматически не повторяю" in response.answer
+    assert "offline" not in response.answer.casefold()
+    assert response.events[-1].payload["source"] == "tool_fallback"
+    storage.close()
+
+
+def test_agentic_stream_reports_completed_tool_when_synthesis_stream_dies(
+    monkeypatch,
+    tmp_path,
+):
+    class ToolThenStreamOutageLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream_complete(self, messages, *, temperature=None, max_tokens=None, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                yield LLMStreamChunk(
+                    kind="delta",
+                    content='{"tool":"runtime.status","arguments":{}}',
+                )
+                yield LLMStreamChunk(kind="done", finish_reason="stop")
+                return
+            yield LLMStreamChunk(kind="error", error="LLM stream unavailable")
+
+    agent, storage = _agent(monkeypatch, tmp_path, ToolThenStreamOutageLLM())
+    storage.set_runtime_value("experience.autonomy_policy", {"verify_answers": False})
+    executions: list[str] = []
+
+    async def completed_tool(name, arguments=None, **kwargs):
+        executions.append(name)
+        return ToolRunResponse(
+            tool=name,
+            ok=True,
+            summary="Runtime status was captured.",
+            data={"ready": True},
+        )
+
+    monkeypatch.setattr(agent.tools, "run", completed_tool)
+
+    async def collect():
+        deltas = []
+        done = None
+        async for item in agent.stream_chat("собери данные и ответь"):
+            if item["type"] == "delta":
+                deltas.append(item["content"])
+            elif item["type"] == "done":
+                done = item
+        return "".join(deltas), done
+
+    visible, done = asyncio.run(collect())
+
+    assert executions == ["runtime.status"]
+    assert "runtime.status [effect=" in visible
+    assert "автоматически не повторяю" in visible
+    assert "offline" not in visible.casefold()
+    assert done is not None
+    assert done["events"][-1]["payload"]["source"] == "tool_fallback"
+    assert done["events"][-1]["payload"]["finish_reason"] == "synthesis_error"
+    storage.close()
+
+
+def test_agentic_recovery_labels_ambiguous_tool_outcome(monkeypatch, tmp_path):
+    class ToolThenOutageLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, messages, *, temperature=None, max_tokens=None, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return _result('{"tool":"runtime.status","arguments":{}}')
+            return _result("", ok=False)
+
+    agent, storage = _agent(monkeypatch, tmp_path, ToolThenOutageLLM())
+    storage.set_runtime_value("experience.autonomy_policy", {"verify_answers": False})
+
+    async def uncertain_tool(name, arguments=None, **kwargs):
+        return ToolRunResponse(
+            tool=name,
+            ok=False,
+            summary="Connection disappeared after dispatch.",
+            data={
+                "failure": {
+                    "protocol": "jarvis.tool-failure.v1",
+                    "outcome": "unknown",
+                    "outcome_known": False,
+                    "retryable": False,
+                }
+            },
+        )
+
+    monkeypatch.setattr(agent.tools, "run", uncertain_tool)
+
+    response = asyncio.run(agent.chat("собери данные и ответь"))
+
+    assert "исход неизвестен" in response.answer
+    assert "сверка состояния" in response.answer
+    assert "автоматически не повторяю" in response.answer
     storage.close()
 
 
@@ -340,6 +490,14 @@ def test_agentic_loop_gates_dangerous_tool_with_approval(monkeypatch, tmp_path):
 
     llm = DangerThenAnswerLLM()
     agent, storage = _agent(monkeypatch, tmp_path, llm)
+    storage.set_runtime_value(
+        "experience.autonomy_policy",
+        {
+            "allow_danger_tools": True,
+            "approval_required_for": [],
+            "verify_answers": False,
+        },
+    )
 
     async def fail_run(name, arguments=None, **kwargs):
         raise AssertionError(f"dangerous tool {name} must not run autonomously")
@@ -358,6 +516,161 @@ def test_agentic_loop_gates_dangerous_tool_with_approval(monkeypatch, tmp_path):
     assert pending[0]["payload"]["arguments"]["payload"]["protocol"] == "jarvis.execution.v1"
     assert not target.exists()
     assert any(event.type == "approval" for event in response.events)
+
+    # Losing the first HTTP response cannot mint a sibling approval: the
+    # normally synthesized awaiting-approval answer is durably replayed.
+    retry = asyncio.run(
+        agent.chat("посмотри дату на хосте", conversation_id=response.conversation_id)
+    )
+    assert retry.answer == response.answer
+    assert len(storage.list_approvals(limit=10, status="pending")) == 1
+    assert any(event.title == "Idempotent response replay" for event in retry.events)
+    ledger = storage.list_runtime_values(prefix="agent.operator_effect.")[0]["value"]
+    assert next(iter(ledger["requests"].values()))["status"] == "completed"
+    storage.close()
+
+
+def test_autonomy_policy_controls_proposals_without_granting_execution(monkeypatch, tmp_path):
+    agent, storage = _agent(monkeypatch, tmp_path, object())
+
+    storage.set_runtime_value(
+        "experience.autonomy_policy",
+        {
+            "allow_safe_tools": True,
+            "allow_review_tools": False,
+            "allow_danger_tools": False,
+        },
+    )
+    safe_only = {tool.name for tool in agent._autonomous_tools()}
+    assert "runtime.status" in safe_only
+    assert "browser.open" not in safe_only
+    assert "browser.open_many" not in safe_only
+    assert "execution.apply" not in safe_only
+
+    storage.set_runtime_value(
+        "experience.autonomy_policy",
+        {
+            "allow_safe_tools": False,
+            "allow_review_tools": True,
+            "allow_danger_tools": True,
+        },
+    )
+    gated_proposals = {tool.name for tool in agent._autonomous_tools()}
+    assert "runtime.status" not in gated_proposals
+    assert "browser.open" in gated_proposals
+    assert "browser.open_many" in gated_proposals
+    assert "execution.apply" in gated_proposals
+    assert agent.tools.get("browser.open").danger_level == "review"
+    assert agent.tools.get("browser.open_many").danger_level == "review"
+    assert agent.tools.get("execution.apply").danger_level == "danger"
+    storage.close()
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "arguments"),
+    [
+        (
+            "documents.archive.create",
+            {
+                "paths": ["/tmp/source.txt"],
+                "archive_format": "zip",
+                "output_name": "exact.zip",
+            },
+        ),
+        (
+            "documents.archive.extract",
+            {"path": "/tmp/exact.zip", "output_name": "exact-extracted"},
+        ),
+    ],
+)
+def test_safe_document_mutator_is_still_claimed_and_approval_gated(
+    monkeypatch, tmp_path, tool_name, arguments
+):
+    agent, storage = _agent(monkeypatch, tmp_path, object())
+    conversation_id = storage.create_conversation("durable mutator gate")
+    prompt = "Create archive exact.zip from /tmp/source.txt"
+    context = AgentContext(conversation_id=conversation_id, memory_hits=[], file_hits=[])
+    context.operator_message = prompt
+    context.side_effects_admitted = True
+    agent._bind_operator_request_identity(
+        context,
+        message=prompt,
+        mode="auto",
+        attachments=[],
+    )
+    context.operator_message_id = storage.add_message(
+        conversation_id=conversation_id,
+        role="user",
+        content=prompt,
+    )
+
+    async def must_not_run(name, arguments=None, **kwargs):
+        raise AssertionError(f"safe durable mutator {name} ran without a claim/gate")
+
+    monkeypatch.setattr(agent.tools, "run", must_not_run)
+    _observation, event, executed = asyncio.run(
+        agent._run_agentic_tool(
+            tool_name,
+            arguments,
+            {tool_name},
+            context,
+        )
+    )
+
+    assert executed is None
+    assert event.type == "approval"
+    pending = storage.list_approvals(limit=10, status="pending")
+    assert len(pending) == 1
+    assert pending[0]["payload"]["operator_effect_key"]
+    ledger = storage.list_runtime_values(prefix="agent.operator_effect.")[0]["value"]
+    request = next(iter(ledger["requests"].values()))
+    assert next(iter(request["effects"].values()))["tool"] == "approval.create"
+    storage.close()
+
+
+def test_agentic_policy_required_tool_never_uses_current_turn_authority(
+    monkeypatch,
+    tmp_path,
+):
+    target = tmp_path / "policy-gated.txt"
+    tool_call = _execution_write_call(
+        target,
+        action_id="policy-gated-write",
+        content=b"policy gated",
+    )
+
+    class ExplicitWriteLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, messages, *, temperature=None, max_tokens=None, **kwargs):
+            if any("Ты intent-router" in item["content"] for item in messages):
+                return _result(
+                    '{"route":"local_action","confidence":0.99,'
+                    '"rationale":"explicit file write"}'
+                )
+            self.calls += 1
+            if self.calls == 1:
+                return _result(tool_call)
+            return _result("Операция подготовлена и ждёт подтверждения.")
+
+    agent, storage = _agent(monkeypatch, tmp_path, ExplicitWriteLLM())
+    storage.set_runtime_value(
+        "experience.autonomy_policy",
+        {
+            "approval_required_for": ["execution.apply"],
+            "verify_answers": False,
+        },
+    )
+
+    response = asyncio.run(agent.chat(f"Создай файл {target} и запиши policy gated"))
+
+    pending = storage.list_approvals(limit=10, status="pending")
+    assert len(pending) == 1
+    assert pending[0]["payload"]["tool"] == "execution.apply"
+    assert not target.exists()
+    approval_event = next(event for event in response.events if event.type == "approval")
+    assert approval_event.payload["policy_approval_required"] is True
     storage.close()
 
 
@@ -387,7 +700,10 @@ def test_explicit_current_turn_write_executes_without_approval(monkeypatch, tmp_
 
     llm = ExplicitWriteLLM()
     agent, storage = _agent(monkeypatch, tmp_path, llm)
-    storage.set_runtime_value("experience.autonomy_policy", {"verify_answers": False})
+    storage.set_runtime_value(
+        "experience.autonomy_policy",
+        {"approval_required_for": [], "verify_answers": False},
+    )
 
     response = asyncio.run(
         agent.chat(f"Создай файл {target} и запиши approved current turn")
@@ -399,6 +715,415 @@ def test_explicit_current_turn_write_executes_without_approval(monkeypatch, tmp_
     assert run["ok"] is True
     event = next(event for event in response.events if event.payload.get("operator_requested"))
     assert event.payload["authority"] == "operator_turn"
+    storage.close()
+
+
+def test_equivalent_operator_effect_runs_only_once_per_turn(monkeypatch, tmp_path):
+    class DuplicateBrowserEffectLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, messages, *, temperature=None, max_tokens=None, **kwargs):
+            if any("Ты intent-router" in item["content"] for item in messages):
+                return _result(
+                    '{"route":"local_action","confidence":0.99,'
+                    '"rationale":"explicit browser click"}'
+                )
+            self.calls += 1
+            if self.calls == 1:
+                return _result(
+                    '{"tool":"browser.click","arguments":'
+                    '{"url":"https://example.com","target":"Search"}}'
+                )
+            if self.calls == 2:
+                return _result(
+                    '{"tool":"browser.click","arguments":'
+                    '{"url":"https://www.EXAMPLE.com/","target":"Search",'
+                    '"wait_ms":5000,"debug_url":"http://127.0.0.1:9222"}}'
+                )
+            return _result("Клик выполнен один раз.")
+
+    agent, storage = _agent(monkeypatch, tmp_path, DuplicateBrowserEffectLLM())
+    storage.set_runtime_value(
+        "experience.autonomy_policy",
+        {
+            "allow_review_tools": True,
+            "approval_required_for": [],
+            "verify_answers": False,
+        },
+    )
+    runs: list[tuple[str, dict]] = []
+
+    async def fake_run(name, arguments=None, **kwargs):
+        runs.append((name, dict(arguments or {})))
+        return ToolRunResponse(tool=name, ok=True, summary="clicked", data={})
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+
+    response = asyncio.run(agent.chat("Click Search at https://example.com"))
+
+    assert [name for name, _args in runs] == ["browser.click"]
+    assert response.answer == "Клик выполнен один раз."
+    assert storage.list_approvals(limit=10, status="pending") == []
+    assert any(event.title == "Duplicate effect skipped" for event in response.events)
+    storage.close()
+
+
+def test_unfinished_operator_effect_is_not_replayed_by_new_message_id(
+    monkeypatch,
+    tmp_path,
+):
+    class ToolThenOutageLLM:
+        def __init__(self) -> None:
+            self.round_number = 0
+
+        async def complete(self, messages, *, temperature=None, max_tokens=None, **kwargs):
+            if any("Ты intent-router" in item["content"] for item in messages):
+                return _result(
+                    '{"route":"local_action","confidence":0.99,'
+                    '"rationale":"explicit browser click"}'
+                )
+            self.round_number += 1
+            if self.round_number == 1:
+                return _result(
+                    '{"tool":"browser.click","arguments":'
+                    '{"url":"https://example.com","target":"Search"}}'
+                )
+            return type(
+                "Result",
+                (),
+                {
+                    "ok": False,
+                    "content": "",
+                    "error": "synthesis unavailable",
+                    "raw": {},
+                },
+            )()
+
+    class ToolThenAnswerLLM:
+        def __init__(self) -> None:
+            self.round_number = 0
+
+        async def complete(self, messages, *, temperature=None, max_tokens=None, **kwargs):
+            if any("Ты intent-router" in item["content"] for item in messages):
+                return _result(
+                    '{"route":"local_action","confidence":0.99,'
+                    '"rationale":"explicit browser click"}'
+                )
+            self.round_number += 1
+            if self.round_number == 1:
+                return _result(
+                    '{"tool":"browser.click","arguments":'
+                    '{"url":"https://example.com","target":"Search"}}'
+                )
+            return _result("Запрос обработан без повторного клика.")
+
+    llm = ToolThenOutageLLM()
+    agent, storage = _agent(monkeypatch, tmp_path, llm)
+    storage.set_runtime_value(
+        "experience.autonomy_policy",
+        {
+            "allow_review_tools": True,
+            "approval_required_for": [],
+            "verify_answers": False,
+        },
+    )
+    runs: list[tuple[str, dict]] = []
+
+    async def fake_run(name, arguments=None, **kwargs):
+        runs.append((name, dict(arguments or {})))
+        return ToolRunResponse(tool=name, ok=True, summary="clicked", data={})
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+    message = "Click Search at https://example.com"
+
+    first = asyncio.run(agent.chat(message))
+    agent.llm = ToolThenAnswerLLM()
+    second = asyncio.run(agent.chat(message, conversation_id=first.conversation_id))
+
+    assert [name for name, _args in runs] == ["browser.click"]
+    assert first.events[-1].payload["source"] == "tool_fallback"
+    assert any(
+        event.title == "Durable duplicate effect skipped" for event in second.events
+    )
+
+    # A restated command is a deliberate new operator request and gets a fresh
+    # effect claim even though the canonical tool effect is identical.
+    agent.llm = ToolThenAnswerLLM()
+    third = asyncio.run(
+        agent.chat(
+            "Again, click Search at https://example.com",
+            conversation_id=first.conversation_id,
+        )
+    )
+    assert [name for name, _args in runs] == ["browser.click", "browser.click"]
+    assert not any(
+        event.title == "Durable duplicate effect skipped" for event in third.events
+    )
+
+    # Even after successful synthesis, an exact immediate retry may mean the
+    # HTTP response was lost.  The bounded completed-request fence still wins.
+    agent.llm = ToolThenAnswerLLM()
+    fourth = asyncio.run(
+        agent.chat(
+            "Again, click Search at https://example.com",
+            conversation_id=first.conversation_id,
+        )
+    )
+    assert [name for name, _args in runs] == ["browser.click", "browser.click"]
+    assert any(
+        event.title == "Idempotent response replay" for event in fourth.events
+    )
+    assert fourth.answer == third.answer
+    storage.close()
+
+
+def test_operator_effect_claim_survives_process_crash_before_tool_return(
+    monkeypatch,
+    tmp_path,
+):
+    class ToolCallLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None, **kwargs):
+            if any("Ты intent-router" in item["content"] for item in messages):
+                return _result(
+                    '{"route":"local_action","confidence":0.99,'
+                    '"rationale":"explicit browser click"}'
+                )
+            if any("skipped" in item["content"] for item in messages if item["role"] == "user"):
+                return _result("Предыдущий эффект не отправлен повторно; нужна сверка.")
+            return _result(
+                '{"tool":"browser.click","arguments":'
+                '{"url":"https://example.com","target":"Search"}}'
+            )
+
+    agent, storage = _agent(monkeypatch, tmp_path, ToolCallLLM())
+    storage.set_runtime_value(
+        "experience.autonomy_policy",
+        {
+            "allow_review_tools": True,
+            "approval_required_for": [],
+            "verify_answers": False,
+        },
+    )
+    attempts: list[str] = []
+
+    async def crash_after_dispatch(name, arguments=None, **kwargs):
+        attempts.append(name)
+        raise RuntimeError("synthetic process crash after dispatch")
+
+    monkeypatch.setattr(agent.tools, "run", crash_after_dispatch)
+    message = "Click Search at https://example.com"
+
+    with pytest.raises(RuntimeError, match="synthetic process crash"):
+        asyncio.run(agent.chat(message))
+
+    conversation_id = storage.list_conversations(limit=1)[0]["id"]
+    restarted = AgentRuntime(
+        settings=agent.settings,
+        storage=storage,
+        llm=ToolCallLLM(),
+        bus=EventBus(),
+    )
+
+    async def must_not_run(name, arguments=None, **kwargs):
+        attempts.append(name)
+        return ToolRunResponse(tool=name, ok=True, summary="unexpected", data={})
+
+    monkeypatch.setattr(restarted.tools, "run", must_not_run)
+    response = asyncio.run(restarted.chat(message, conversation_id=conversation_id))
+
+    assert attempts == ["browser.click"]
+    assert any(
+        event.title == "Durable duplicate effect skipped" for event in response.events
+    )
+    persisted = storage.list_runtime_values(prefix="agent.operator_effect.")
+    assert len(persisted) == 1
+    requests = persisted[0]["value"]["requests"]
+    assert len(requests) == 1
+    assert next(iter(requests.values()))["status"] == "incomplete"
+    storage.close()
+
+
+def test_completed_operator_turn_fences_exact_http_response_retry(
+    monkeypatch,
+    tmp_path,
+):
+    class ToolThenAnswerLLM:
+        def __init__(self) -> None:
+            self.round_number = 0
+
+        async def complete(self, messages, *, temperature=None, max_tokens=None, **kwargs):
+            if any("Ты intent-router" in item["content"] for item in messages):
+                return _result(
+                    '{"route":"local_action","confidence":0.99,'
+                    '"rationale":"explicit browser click"}'
+                )
+            self.round_number += 1
+            if self.round_number == 1:
+                return _result(
+                    '{"tool":"browser.click","arguments":'
+                    '{"url":"https://example.com","target":"Search"}}'
+                )
+            return _result("Клик обработан.")
+
+    agent, storage = _agent(monkeypatch, tmp_path, ToolThenAnswerLLM())
+    storage.set_runtime_value(
+        "experience.autonomy_policy",
+        {
+            "allow_review_tools": True,
+            "approval_required_for": [],
+            "verify_answers": False,
+        },
+    )
+    runs: list[str] = []
+
+    async def fake_run(name, arguments=None, **kwargs):
+        runs.append(name)
+        return ToolRunResponse(tool=name, ok=True, summary="clicked", data={})
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+    message = "Click Search at https://example.com"
+
+    # Treat the first successful response as lost by the HTTP client.
+    first = asyncio.run(agent.chat(message))
+    agent.llm = ToolThenAnswerLLM()
+    retry = asyncio.run(agent.chat(message, conversation_id=first.conversation_id))
+
+    assert runs == ["browser.click"]
+    assert retry.answer == first.answer
+    assert any(
+        event.title == "Idempotent response replay" for event in retry.events
+    )
+
+    # Explicitly restating the intent creates a new digest and is not suppressed.
+    agent.llm = ToolThenAnswerLLM()
+    repeated = asyncio.run(
+        agent.chat(
+            "Again, click Search at https://example.com",
+            conversation_id=first.conversation_id,
+        )
+    )
+    assert runs == ["browser.click", "browser.click"]
+    assert not any(
+        event.title == "Durable duplicate effect skipped" for event in repeated.events
+    )
+    storage.close()
+
+
+def test_stream_completed_operator_turn_replays_exact_cached_answer(
+    monkeypatch,
+    tmp_path,
+):
+    class StreamToolThenAnswerLLM:
+        def __init__(self) -> None:
+            self.round_number = 0
+
+        async def complete(self, messages, *, temperature=None, max_tokens=None, **kwargs):
+            return _result(
+                '{"route":"local_action","confidence":0.99,'
+                '"rationale":"explicit browser click"}'
+            )
+
+        async def stream_complete(
+            self,
+            messages,
+            *,
+            temperature=None,
+            max_tokens=None,
+            **kwargs,
+        ):
+            self.round_number += 1
+            if self.round_number == 1:
+                yield LLMStreamChunk(
+                    kind="delta",
+                    content=(
+                        '{"tool":"browser.click","arguments":'
+                        '{"url":"https://example.com","target":"Search"}}'
+                    ),
+                )
+            else:
+                yield LLMStreamChunk(kind="delta", content="Точный потоковый итог.")
+            yield LLMStreamChunk(kind="done", finish_reason="stop")
+
+    agent, storage = _agent(monkeypatch, tmp_path, StreamToolThenAnswerLLM())
+    storage.set_runtime_value(
+        "experience.autonomy_policy",
+        {
+            "allow_review_tools": True,
+            "approval_required_for": [],
+            "verify_answers": False,
+        },
+    )
+    runs: list[str] = []
+
+    async def fake_run(name, arguments=None, **kwargs):
+        runs.append(name)
+        return ToolRunResponse(tool=name, ok=True, summary="clicked", data={})
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+    message = "Click Search at https://example.com"
+
+    async def collect(conversation_id=None):
+        return [
+            item
+            async for item in agent.stream_chat(message, conversation_id=conversation_id)
+        ]
+
+    first = asyncio.run(collect())
+    first_done = next(item for item in first if item["type"] == "done")
+    agent.llm = StreamToolThenAnswerLLM()
+    retry = asyncio.run(collect(first_done["conversation_id"]))
+    retry_done = next(item for item in retry if item["type"] == "done")
+
+    assert runs == ["browser.click"]
+    assert retry_done["answer"] == first_done["answer"] == "Точный потоковый итог."
+    assert any(
+        item.get("event", {}).get("title") == "Idempotent response replay"
+        for item in retry
+        if item["type"] == "event"
+    )
+    storage.close()
+
+
+def test_agentic_tool_step_budget_honors_policy_up_to_twenty_four(monkeypatch, tmp_path):
+    agent, storage = _agent(monkeypatch, tmp_path, object())
+
+    storage.set_runtime_value(
+        "experience.autonomy_policy",
+        {"max_autonomous_steps": 24},
+    )
+    assert agent._max_tool_steps() == 24
+
+    storage.set_runtime_value(
+        "experience.autonomy_policy",
+        {"max_autonomous_steps": 200},
+    )
+    assert agent._max_tool_steps() == 24
+    storage.close()
+
+
+def test_agentic_policy_fails_closed_on_malformed_persisted_values(monkeypatch, tmp_path):
+    agent, storage = _agent(monkeypatch, tmp_path, object())
+    storage.set_runtime_value(
+        "experience.autonomy_policy",
+        {
+            "allow_safe_tools": "false",
+            "allow_review_tools": "false",
+            "allow_danger_tools": 1,
+            "approval_required_for": "execution.apply",
+            "verify_answers": "false",
+        },
+    )
+
+    policy = agent._autonomy_policy()
+
+    assert policy["allow_safe_tools"] is True
+    assert policy["allow_review_tools"] is False
+    assert policy["allow_danger_tools"] is False
+    assert policy["approval_required_for"] == list(
+        DEFAULT_AUTONOMY_POLICY["approval_required_for"]
+    )
+    assert policy["verify_answers"] is True
     storage.close()
 
 
@@ -656,7 +1381,8 @@ def test_agentic_stream_forced_final_tool_payload_is_safe_error(monkeypatch, tmp
     visible = "".join(deltas)
 
     assert runs == ["runtime.status"]
-    assert "Не удалось безопасно завершить запрос" in visible
+    assert "runtime.status [effect=" in visible
+    assert "автоматически не повторяю" in visible
     assert '"tool"' not in visible
     assert done["answer"] == visible
     assert done["events"][-1]["payload"]["finish_reason"] == "protocol_error"
@@ -799,6 +1525,122 @@ def test_approval_execution_resumes_blocked_mission_step(monkeypatch, tmp_path):
     assert task["status"] == "done"
     assert "после допуска" in task["notes"]
     assert hits
+    storage.close()
+
+
+def test_approval_resume_protocol_failure_never_marks_mission_done(monkeypatch, tmp_path):
+    agent, storage = _agent(monkeypatch, tmp_path, object())
+    mission = storage.create_mission(
+        title="Approved action with broken synthesis",
+        goal="Run one approved action",
+        tasks=["Run approved action"],
+    )
+    task_id = mission["tasks"][0]["id"]
+    storage.update_mission_task(
+        task_id,
+        mission_id=mission["id"],
+        status="blocked",
+        notes="awaiting approval",
+    )
+    approval = {
+        "id": "apr_protocol_failure",
+        "payload": {
+            "mission_id": mission["id"],
+            "task_id": task_id,
+            "resume": {
+                "messages": [{"role": "user", "content": "continue"}],
+                "used_tools": 1,
+            },
+        },
+    }
+
+    async def protocol_failure(*_args, **_kwargs):
+        return SimpleNamespace(
+            answer="Не удалось безопасно завершить служебный протокол.",
+            error=None,
+            ok=True,
+            blocked_by_approval=False,
+            finish_reason="protocol_error",
+            used_tools=1,
+            approval_ids=(),
+        )
+
+    monkeypatch.setattr(agent, "_continue_agentic_answer", protocol_failure)
+    approved_tool = ToolRunResponse(
+        tool="execution.apply",
+        ok=True,
+        summary="Target mutation returned success.",
+        data={"outcome_known": True},
+    )
+
+    result = asyncio.run(agent.resume_mission_after_approval(approval, approved_tool))
+    refreshed = storage.get_mission(mission["id"])
+    refreshed_task = refreshed["tasks"][0]
+
+    assert result is not None
+    assert result.ok is False
+    assert result.data["finish_reason"] == "protocol_error"
+    assert result.data["continuation_confirmed"] is False
+    assert "Approved tool completed" in result.summary
+    assert "not confirmed" in result.summary
+    assert refreshed_task["status"] == "blocked"
+    storage.close()
+
+
+def test_approval_resume_immediate_synthesis_outage_reports_completed_tool(
+    monkeypatch,
+    tmp_path,
+):
+    class OutageLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None, **kwargs):
+            return SimpleNamespace(
+                ok=False,
+                content="",
+                error="post-approval synthesis unavailable",
+                raw={},
+            )
+
+    agent, storage = _agent(monkeypatch, tmp_path, OutageLLM())
+    mission = storage.create_mission(
+        title="Approved action with synthesis outage",
+        goal="Run one approved action",
+        tasks=["Run approved action"],
+    )
+    task_id = mission["tasks"][0]["id"]
+    storage.update_mission_task(
+        task_id,
+        mission_id=mission["id"],
+        status="blocked",
+        notes="awaiting approval",
+    )
+    approval = {
+        "id": "apr_synthesis_outage",
+        "payload": {
+            "mission_id": mission["id"],
+            "task_id": task_id,
+            "resume": {
+                "messages": [{"role": "user", "content": "continue"}],
+                "used_tools": 1,
+            },
+        },
+    }
+    approved_tool = ToolRunResponse(
+        tool="execution.apply",
+        ok=True,
+        summary="Target mutation returned success.",
+        data={"outcome_known": True},
+    )
+
+    result = asyncio.run(agent.resume_mission_after_approval(approval, approved_tool))
+    refreshed_task = storage.get_mission(mission["id"])["tasks"][0]
+
+    assert result is not None
+    assert result.ok is False
+    assert result.data["finish_reason"] == "synthesis_error"
+    assert result.data["continuation_confirmed"] is False
+    assert "Approved tool completed" in result.summary
+    assert "not confirmed" in result.summary
+    assert refreshed_task["status"] == "blocked"
     storage.close()
 
 

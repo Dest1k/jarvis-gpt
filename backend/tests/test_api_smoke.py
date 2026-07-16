@@ -11,12 +11,15 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Event
 
 import pytest
 from fastapi import FastAPI
 from jarvis_gpt.api import (
+    _health_snapshot_readiness,
     _is_local_machine_host,
     _is_loopback_host,
     _origin_allowed,
@@ -183,6 +186,110 @@ def test_health_and_status(client):
     surfer = client.get("/api/internet/web-surfer")
     assert surfer.status_code == 200
     assert surfer.json()["protocol"] == "jarvis.web-surfer-adapter.v1"
+
+
+def test_health_reports_latest_unhealthy_component(client):
+    current = app.state.storage.latest_complete_health(limit=20)
+    app.state.storage.record_health_snapshot(
+        [
+            {
+                "component": row["component"],
+                "status": row["status"],
+                "message": row["message"],
+                "details": row["details"],
+            }
+            for row in current
+        ]
+        + [
+            {
+                "component": "llm",
+                "status": "error",
+                "message": "model endpoint unavailable",
+            }
+        ]
+    )
+
+    health_response = client.get("/health")
+
+    assert health_response.status_code == 503
+    health = health_response.json()
+    assert health["ok"] is False
+    assert health["unhealthy_components"] == ["llm"]
+
+
+def test_health_fails_when_latest_complete_probe_attempt_failed(client):
+    assert app.state.storage.latest_complete_health(limit=20)
+    app.state.supervisor._last_health_attempt_ok = False
+    app.state.supervisor._last_health_attempt_at = datetime.now(UTC).isoformat()
+
+    response = client.get("/health")
+
+    assert response.status_code == 503
+    assert response.json()["probe_failure"] is True
+    assert response.json()["latest_probe_ok"] is False
+
+
+def test_health_readiness_requires_fresh_enabled_llm(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setenv("JARVIS_AUTONOMY_ENABLED", "1")
+    settings = load_settings()
+    now = datetime(2026, 7, 16, 12, tzinfo=UTC)
+    timestamp = now.isoformat(timespec="seconds")
+    rows = [
+        {"component": component, "status": "ok", "ts": timestamp}
+        for component in (
+            "runtime.home",
+            "runtime.data",
+            "runtime.cache",
+            "runtime.logs",
+            "storage.sqlite",
+        )
+    ]
+
+    offline = _health_snapshot_readiness(settings, rows, now=now)
+    missing_llm = _health_snapshot_readiness(
+        replace(settings, llm_enabled=True),
+        rows,
+        now=now,
+    )
+    unavailable_llm = _health_snapshot_readiness(
+        replace(settings, llm_enabled=True),
+        [*rows, {"component": "llm.router", "status": "warn", "ts": timestamp}],
+        now=now,
+    )
+    stale = _health_snapshot_readiness(
+        settings,
+        [
+            {**row, "ts": (now - timedelta(hours=1)).isoformat(timespec="seconds")}
+            for row in rows
+        ],
+        now=now,
+    )
+    stale_with_autonomy_disabled = _health_snapshot_readiness(
+        replace(settings, autonomy_enabled=False),
+        [
+            {**row, "ts": (now - timedelta(hours=1)).isoformat(timespec="seconds")}
+            for row in rows
+        ],
+        now=now,
+    )
+
+    assert offline["ok"] is True
+    assert missing_llm["ok"] is False
+    assert missing_llm["missing_components"] == ["llm.router"]
+    assert unavailable_llm["ok"] is False
+    assert unavailable_llm["unhealthy_components"] == ["llm.router"]
+    assert stale["ok"] is False
+    assert stale_with_autonomy_disabled["ok"] is False
+    assert stale_with_autonomy_disabled["stale_components"] == stale["stale_components"]
+    assert set(stale["stale_components"]) == {
+        "runtime.home",
+        "runtime.data",
+        "runtime.cache",
+        "runtime.logs",
+        "storage.sqlite",
+    }
 
 
 def test_read_only_web_status_endpoints_do_not_create_tool_runs(client):

@@ -41,10 +41,14 @@ import {
 } from "lucide-react";
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, KeyboardEvent, PointerEvent as ReactPointerEvent, ReactNode } from "react";
+import {
+  runtimeClientIdentity,
+  scopedChatSettingsKey,
+  scopedChatWindowsKey,
+  withoutEmptyAssistantPlaceholders
+} from "../lib/runtime-helpers.mjs";
 
 const API_PROXY_URL = "/jarvis-api";
-const CHAT_WINDOWS_KEY_BASE = "jarvis.chatWindows.v1";
-const CHAT_SETTINGS_KEY_BASE = "jarvis.chatSettings.v1";
 const LEGACY_STORAGE_SUFFIX = ["g", "pt"].join("");
 const LEGACY_CHAT_WINDOWS_KEY = `jarvis-${LEGACY_STORAGE_SUFFIX}.chatWindows.v1`;
 const LEGACY_CHAT_SETTINGS_KEY = `jarvis-${LEGACY_STORAGE_SUFFIX}.chatSettings.v1`;
@@ -55,19 +59,6 @@ const BOOT_MESSAGE = "Jarvis готов к подключению.";
 const LIVE_TELEMETRY_INTERVAL_MS = 1000;
 const BACKGROUND_TELEMETRY_INTERVAL_MS = 3000;
 const VITAL_STATUS_INTERVAL_MS = 3000;
-
-/** Stable client identity for browser storage (FUNC-FIND-015 / SPARK-0015). */
-function runtimeClientIdentity(home: string, profileName: string): string {
-  return `${String(home || "").trim().toLowerCase()}::${String(profileName || "").trim().toLowerCase()}`;
-}
-
-function scopedChatWindowsKey(identity: string): string {
-  return `${CHAT_WINDOWS_KEY_BASE}::${encodeURIComponent(identity)}`;
-}
-
-function scopedChatSettingsKey(identity: string): string {
-  return `${CHAT_SETTINGS_KEY_BASE}::${encodeURIComponent(identity)}`;
-}
 
 type RuntimeStatus = {
   settings: {
@@ -1167,21 +1158,6 @@ function normalizeStoredLine(line: ChatLine): ChatLine {
     pending: false,
     startedAt: null
   };
-}
-
-/** Empty pending assistant bubbles must not survive stream teardown (FUNC-FIND-011). */
-function isEmptyAssistantPlaceholder(line: ChatLine | null | undefined): boolean {
-  if (!line || line.role !== "assistant") return false;
-  const content = String(line.content ?? "").trim();
-  if (content) return false;
-  // Pending stream placeholder, or a finalized empty 0 ms bubble.
-  if (line.pending) return true;
-  const duration = coerceDurationMs(line.durationMs);
-  return duration === null || duration === 0;
-}
-
-function withoutEmptyAssistantPlaceholders(lines: ChatLine[]): ChatLine[] {
-  return lines.filter((line) => !isEmptyAssistantPlaceholder(line));
 }
 
 function coerceDurationMs(value: unknown): number | null {

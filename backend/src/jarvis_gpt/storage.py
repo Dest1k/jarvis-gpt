@@ -5,7 +5,7 @@ import re
 import sqlite3
 import threading
 import uuid
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -635,6 +635,52 @@ class JarvisStorage:
             self.connect().commit()
         return row
 
+    def update_runtime_value_atomic(
+        self,
+        key: str,
+        updater: Callable[[Any], Any],
+        *,
+        default: Any = None,
+    ) -> Any:
+        """Read, transform, and replace one runtime value under a SQLite write lock.
+
+        Runtime values such as autonomy jobs are JSON aggregates. A separate
+        ``get`` followed by ``set`` lets two scheduler connections both acquire
+        the same logical lease. ``BEGIN IMMEDIATE`` serializes the complete
+        read/modify/write sequence across connections and processes.
+
+        The updater must be a pure in-memory transform; it must not call back
+        into storage while this transaction is open.
+        """
+
+        safe_key = key[:160]
+        with self._lock:
+            conn = self.connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT value FROM runtime_kv WHERE key = ?",
+                    (safe_key,),
+                ).fetchone()
+                current = default if row is None else _loads(row["value"], default)
+                updated = updater(current)
+                now = utc_now()
+                conn.execute(
+                    """
+                    INSERT INTO runtime_kv(key, value, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value = excluded.value,
+                        updated_at = excluded.updated_at
+                    """,
+                    (safe_key, _json(updated), now),
+                )
+                conn.commit()
+            except Exception:  # noqa: BLE001 - atomic mutation must roll back fully
+                conn.rollback()
+                raise
+        return updated
+
     def list_runtime_values(self, prefix: str | None = None) -> list[dict[str, Any]]:
         with self._lock:
             if prefix:
@@ -1215,41 +1261,83 @@ class JarvisStorage:
             self._sync_memory_vault(conn)
         return self.memory_vault.graph()
 
-    def create_mission(self, *, title: str, goal: str, tasks: list[str]) -> dict[str, Any]:
+    def create_mission(
+        self,
+        *,
+        title: str,
+        goal: str,
+        tasks: list[str],
+        mission_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Create a mission once, optionally under a caller-reserved durable id."""
+
         now = utc_now()
-        mission_id = new_id("mis")
+        selected_id = str(mission_id or new_id("mis"))
+        if not re.fullmatch(r"mis_[A-Za-z0-9_-]{8,80}", selected_id):
+            raise ValueError("mission_id must be a bounded Jarvis mission identifier")
+        created = False
         with self._lock:
             conn = self.connect()
-            conn.execute(
-                """
-                INSERT INTO missions(id, title, goal, status, progress, created_at, updated_at)
-                VALUES (?, ?, ?, 'planned', 0, ?, ?)
-                """,
-                (mission_id, title[:240], goal, now, now),
-            )
-            for position, task_title in enumerate(tasks, start=1):
-                conn.execute(
+            if conn.in_transaction:
+                raise RuntimeError("mission creation requires a clean storage transaction")
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                cursor = conn.execute(
                     """
-                    INSERT INTO mission_tasks(
-                        id, mission_id, title, status, notes, position, created_at, updated_at
+                    INSERT OR IGNORE INTO missions(
+                        id, title, goal, status, progress, created_at, updated_at
                     )
-                    VALUES (?, ?, ?, 'pending', NULL, ?, ?, ?)
+                    VALUES (?, ?, ?, 'planned', 0, ?, ?)
                     """,
-                    (new_id("task"), mission_id, task_title, position, now, now),
+                    (selected_id, title[:240], goal, now, now),
                 )
-            self._refresh_mission_progress(conn, mission_id, now=now)
-            conn.commit()
-        mission = self.get_mission(mission_id)
+                created = cursor.rowcount == 1
+                if created:
+                    for position, task_title in enumerate(tasks, start=1):
+                        conn.execute(
+                            """
+                            INSERT INTO mission_tasks(
+                                id, mission_id, title, status, notes, position,
+                                created_at, updated_at
+                            )
+                            VALUES (?, ?, ?, 'pending', NULL, ?, ?, ?)
+                            """,
+                            (
+                                new_id("task"),
+                                selected_id,
+                                task_title,
+                                position,
+                                now,
+                                now,
+                            ),
+                        )
+                    self._refresh_mission_progress(conn, selected_id, now=now)
+                else:
+                    existing = conn.execute(
+                        "SELECT goal FROM missions WHERE id = ?",
+                        (selected_id,),
+                    ).fetchone()
+                    if existing is None or str(existing["goal"]) != goal:
+                        raise ValueError(
+                            "mission_id is already bound to a different goal"
+                        )
+                conn.commit()
+            except BaseException:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
+        mission = self.get_mission(selected_id)
         if mission is None:
             raise RuntimeError("Mission was not persisted")
-        self.record_audit(
-            actor="system",
-            action="mission.create",
-            target_type="mission",
-            target_id=mission_id,
-            summary=f"Mission created: {mission['title']}",
-            after=mission,
-        )
+        if created:
+            self.record_audit(
+                actor="system",
+                action="mission.create",
+                target_type="mission",
+                target_id=selected_id,
+                summary=f"Mission created: {mission['title']}",
+                after=mission,
+            )
         return mission
 
     def list_missions(self, limit: int = 50) -> list[dict[str, Any]]:
@@ -2888,17 +2976,146 @@ class JarvisStorage:
             )
             self.connect().commit()
 
+    def record_health_snapshot(self, checks: list[dict[str, Any]]) -> dict[str, Any]:
+        """Atomically publish one complete diagnostics generation.
+
+        Component-at-a-time commits let readers combine a partially written
+        current probe with successful rows from an older probe. The runtime KV
+        marker and every referenced row are therefore committed together.
+        """
+
+        normalized: list[dict[str, Any]] = []
+        seen_components: set[str] = set()
+        for raw in checks:
+            component = str(raw.get("component") or "").strip()
+            status = str(raw.get("status") or "").strip()
+            message = str(raw.get("message") or "")
+            details = raw.get("details")
+            if not component or not status:
+                raise ValueError("health snapshot checks require component and status")
+            if component in seen_components:
+                raise ValueError(f"duplicate health component: {component}")
+            if details is not None and not isinstance(details, dict):
+                raise TypeError("health snapshot details must be an object")
+            seen_components.add(component)
+            normalized.append(
+                {
+                    "id": new_id("health"),
+                    "component": component,
+                    "status": status,
+                    "message": message,
+                    "details": details or {},
+                }
+            )
+        if not normalized:
+            raise ValueError("health snapshot must contain at least one check")
+
+        snapshot_id = new_id("healthrun")
+        timestamp = utc_now()
+        marker = {
+            "protocol": "jarvis.health-snapshot.v1",
+            "snapshot_id": snapshot_id,
+            "ts": timestamp,
+            "row_ids": [row["id"] for row in normalized],
+            "components": [row["component"] for row in normalized],
+        }
+        with self._lock:
+            conn = self.connect()
+            if conn.in_transaction:
+                raise RuntimeError("health snapshot requires a clean storage transaction")
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.executemany(
+                    """
+                    INSERT INTO health_snapshots(
+                        id, ts, component, status, message, details
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            row["id"],
+                            timestamp,
+                            row["component"],
+                            row["status"],
+                            row["message"],
+                            _json(row["details"]),
+                        )
+                        for row in normalized
+                    ],
+                )
+                conn.execute(
+                    """
+                    INSERT INTO runtime_kv(key, value, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value = excluded.value,
+                        updated_at = excluded.updated_at
+                    """,
+                    ("health.latest_complete", _json(marker), timestamp),
+                )
+                conn.commit()
+            except BaseException:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
+        return marker
+
+    def latest_complete_health(self, limit: int = 20) -> list[dict[str, Any]]:
+        """Return only rows from the last atomically committed diagnostics run."""
+
+        bounded_limit = max(1, min(100, int(limit)))
+        with self._lock:
+            conn = self.connect()
+            marker_row = conn.execute(
+                "SELECT value FROM runtime_kv WHERE key = ?",
+                ("health.latest_complete",),
+            ).fetchone()
+            marker = _loads(marker_row["value"], {}) if marker_row is not None else {}
+            row_ids = marker.get("row_ids") if isinstance(marker, dict) else None
+            components = marker.get("components") if isinstance(marker, dict) else None
+            if (
+                marker.get("protocol") != "jarvis.health-snapshot.v1"
+                or not isinstance(row_ids, list)
+                or not row_ids
+                or len(row_ids) > 100
+                or len(set(row_ids)) != len(row_ids)
+                or not all(isinstance(item, str) and item for item in row_ids)
+                or not isinstance(components, list)
+                or len(components) != len(row_ids)
+            ):
+                return []
+            selected_ids = row_ids[:bounded_limit]
+            placeholders = ",".join("?" for _item in selected_ids)
+            rows = conn.execute(
+                f"""
+                SELECT id, ts, component, status, message, details
+                FROM health_snapshots
+                WHERE id IN ({placeholders})
+                """,  # noqa: S608 - placeholders are generated, values stay bound
+                selected_ids,
+            ).fetchall()
+        by_id = {str(row["id"]): row for row in rows}
+        if len(by_id) != len(selected_ids):
+            return []
+        return [
+            {**dict(by_id[row_id]), "details": _loads(by_id[row_id]["details"], {})}
+            for row_id in selected_ids
+        ]
+
     def latest_health(self, limit: int = 20) -> list[dict[str, Any]]:
         with self._lock:
             rows = self.connect().execute(
                 """
                 SELECT h.id, h.ts, h.component, h.status, h.message, h.details
                 FROM health_snapshots h
-                JOIN (
-                    SELECT component, MAX(ts) AS ts
-                    FROM health_snapshots
-                    GROUP BY component
-                ) latest ON latest.component = h.component AND latest.ts = h.ts
+                WHERE h.rowid = (
+                    SELECT latest.rowid
+                    FROM health_snapshots latest
+                    WHERE latest.component = h.component
+                    ORDER BY latest.ts DESC, latest.rowid DESC
+                    LIMIT 1
+                )
                 ORDER BY h.ts DESC
                 LIMIT ?
                 """,

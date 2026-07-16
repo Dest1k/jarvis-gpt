@@ -31,11 +31,15 @@ and after a change rather than assuming a red test is a new regression.
 ## Operator permissions / autonomy
 
 - An explicit "do X / open X" command in the operator's current turn is treated
-  as authorization for that action — it runs immediately without an approval
-  gate. See `JARVIS_OPERATOR_FULL_AUTONOMY` (default on) in
-  `backend/src/jarvis_gpt/config.py` and the operator-authority logic in
+  as authorization only when the tool-specific matcher proves the exact operands;
+  that exact deterministic action may then run without another approval.
+  The deprecated `JARVIS_OPERATOR_FULL_AUTONOMY` setting is a no-op retained for
+  configuration compatibility. See `backend/src/jarvis_gpt/config.py` and the
+  operator-authority logic in
   `backend/src/jarvis_gpt/agent.py` (`_operator_action_scopes`,
   `_operator_tool_arguments_match`, `_operator_requested_tool_names`).
-- The safety boundary is *scope*: a tool outside the scopes the operator named
-  (e.g. a filesystem write during a read-only "look at…" turn) still routes to
-  an approval gate.
+- Scope only selects candidate tools; it never authorizes model-selected paths,
+  URLs, payloads, or arguments. `allow_review_tools` / `allow_danger_tools` expose
+  tools for proposal but do not execute them, and `approval_required_for` remains
+  gated inside the model-driven agentic loop. The loop budget is bounded to
+  1..24 steps.

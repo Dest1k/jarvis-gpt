@@ -196,7 +196,12 @@ class ExecutiveCoordinator:
             self._persist(mission_id, record)
             return record
 
-    def ensure_for_mission(self, mission: dict[str, Any]) -> dict[str, Any]:
+    def ensure_for_mission(
+        self,
+        mission: dict[str, Any],
+        *,
+        decomposition: MissionDecomposition | None = None,
+    ) -> dict[str, Any]:
         """Return an existing plan or deterministically repair the create crash window.
 
         A mission row with only its original pending tasks is the sole safe
@@ -233,7 +238,10 @@ class ExecutiveCoordinator:
                 and all(item.get("status") == "pending" for item in tasks)
             )
             if clean_create_window:
-                return self.create_for_mission(mission)
+                return self.create_for_mission(
+                    mission,
+                    decomposition=decomposition,
+                )
             self._fail_closed_unplanned_mission(
                 mission,
                 "mission has execution state but no durable executive plan",
