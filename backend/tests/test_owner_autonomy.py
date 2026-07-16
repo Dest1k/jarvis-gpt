@@ -156,3 +156,29 @@ def test_chat_turn_emits_no_approval_or_clarify_under_autonomy(monkeypatch, tmp_
     )
     assert storage.list_approvals(limit=10) == []
     storage.close()
+
+
+def test_owner_autonomy_uses_full_profile_step_budget(monkeypatch, tmp_path):
+    # The multi-step budget is what lets the model finish "search -> extract ->
+    # compute" chains instead of stalling. Autonomy uses the profile's full budget.
+    agent, storage = _autonomy_agent(monkeypatch, tmp_path, full_autonomy=True)
+    assert agent._max_tool_steps() == agent.settings.profile.max_steps
+    assert agent._max_tool_steps() >= 12
+    storage.close()
+
+
+def test_gated_mode_keeps_conservative_step_budget(monkeypatch, tmp_path):
+    agent, storage = _autonomy_agent(monkeypatch, tmp_path, full_autonomy=False)
+    assert agent._max_tool_steps() <= 3
+    storage.close()
+
+
+def test_tool_protocol_prompt_adds_multistep_guidance_under_autonomy():
+    from jarvis_gpt.agent import _tool_protocol_prompt
+    from jarvis_gpt.models import ToolInfo
+
+    tools = [ToolInfo(name="web.search", description="search", category="web", input_schema={})]
+    autonomous = _tool_protocol_prompt(tools, full_autonomy=True)
+    gated = _tool_protocol_prompt(tools, full_autonomy=False)
+    assert "Многоходов" in autonomous
+    assert "Многоходов" not in gated

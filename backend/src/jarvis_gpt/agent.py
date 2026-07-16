@@ -1989,7 +1989,10 @@ class AgentRuntime:
         allowed = {info.name for info in tools}
         messages = list(llm_messages)
         if tools:
-            messages.append({"role": "system", "content": _tool_protocol_prompt(tools)})
+            tool_prompt = _tool_protocol_prompt(
+                tools, full_autonomy=self._owner_autonomy_active()
+            )
+            messages.append({"role": "system", "content": tool_prompt})
         max_steps = self._max_tool_steps() if tools else 0
 
         if not tools:
@@ -7572,6 +7575,13 @@ class AgentRuntime:
         return [tools[name] for name in sorted(tools)]
 
     def _max_tool_steps(self) -> int:
+        # Owner full autonomy: give the operator's turn the active profile's full step
+        # budget so the model can carry a multi-step task all the way to a concrete
+        # result (e.g. search transport -> extract fares -> sum -> answer; or compare
+        # a part's price across several shops) instead of truncating at the cautious
+        # background policy of a few steps. Bounded by the agentic loop's hard ceiling.
+        if self._owner_autonomy_active():
+            return max(1, min(24, int(self.settings.profile.max_steps)))
         policy = self._autonomy_policy()
         steps = DEFAULT_MAX_TOOL_STEPS
         try:
@@ -8040,7 +8050,8 @@ class AgentRuntime:
                 continuation_count=continuation_count,
             )
 
-        messages = [*base_messages, {"role": "system", "content": _tool_protocol_prompt(tools)}]
+        tool_prompt = _tool_protocol_prompt(tools, full_autonomy=self._owner_autonomy_active())
+        messages = [*base_messages, {"role": "system", "content": tool_prompt}]
         return await self._continue_agentic_answer(
             messages,
             context,
@@ -9755,7 +9766,7 @@ def _parse_intent_decision(content: str) -> IntentDecision | None:
     )
 
 
-def _tool_protocol_prompt(tools: list[ToolInfo]) -> str:
+def _tool_protocol_prompt(tools: list[ToolInfo], *, full_autonomy: bool = False) -> str:
     lines = [
         "У тебя есть инструменты для сбора фактов, локальной проверки и выполнения явно "
         "запрошенных действий. Для обычного вопроса используй их только когда нужны реальные "
@@ -9794,6 +9805,19 @@ def _tool_protocol_prompt(tools: list[ToolInfo]) -> str:
             "web.evidence.list to reuse recent evidence instead of refetching."
         ),
     )
+    if full_autonomy:
+        lines.insert(
+            -1,
+            (
+                "Многоходовые задачи доводи до конца сам: разбей цель на шаги, собери все "
+                "нужные реальные данные несколькими вызовами инструментов (например "
+                "маршрут и билеты на нужную дату, цены у разных продавцов), затем посчитай "
+                "или сопоставь и дай конкретный итог — сумму, самую дешёвую позицию, вывод. "
+                "Не останавливайся на полпути и не проси уточнений: действуй с разумными "
+                "допущениями и коротко укажи их в ответе. Продолжай вызывать инструменты, "
+                "пока задача не решена или не исчерпан бюджет шагов."
+            ),
+        )
     for tool in tools:
         lines.append(f"- {tool.name}({_schema_hint(tool.input_schema)}): {tool.description}")
     return "\n".join(lines)
