@@ -1257,7 +1257,8 @@ class AgentRuntime:
             if self._owner_autonomy_active():
                 try:
                     run = await self.run_mission(mission["id"], max_steps=self._max_tool_steps())
-                    answer = self._mission_run_answer(mission, run)
+                    deliverable = await self._ensure_goal_file_deliverable(mission, run, context)
+                    answer = self._mission_run_answer(mission, run, deliverable=deliverable)
                 except Exception as exc:  # noqa: BLE001 - execution is best-effort
                     answer = (
                         f"{answer}\n\nАвтозапуск прерван ({type(exc).__name__}); "
@@ -1919,7 +1920,8 @@ class AgentRuntime:
                     run = await self.run_mission(
                         mission["id"], max_steps=self._max_tool_steps()
                     )
-                    answer = self._mission_run_answer(mission, run)
+                    deliverable = await self._ensure_goal_file_deliverable(mission, run, context)
+                    answer = self._mission_run_answer(mission, run, deliverable=deliverable)
                 except Exception as exc:  # noqa: BLE001 - execution is best-effort
                     answer = (
                         f"{answer}\n\nАвтозапуск прерван ({type(exc).__name__}); "
@@ -2960,26 +2962,171 @@ class AgentRuntime:
             final_report=final_report,
         )
 
-    def _mission_run_answer(self, mission: dict[str, Any], run: MissionRunResponse) -> str:
+    def _mission_run_answer(
+        self,
+        mission: dict[str, Any],
+        run: MissionRunResponse,
+        *,
+        deliverable: dict[str, Any] | None = None,
+    ) -> str:
         """Operator-facing summary of a mission that autonomy executed this turn."""
 
         if run.final_report:
-            return run.final_report
-        title = str(mission.get("title") or "").strip()
-        status = _MISSION_STOP_LABELS.get(str(run.stopped_reason), str(run.stopped_reason))
-        lines = [f"Миссия «{title}»: шагов выполнено — {run.executed_steps}, статус — {status}."]
+            answer = run.final_report
+        else:
+            title = str(mission.get("title") or "").strip()
+            status = _MISSION_STOP_LABELS.get(str(run.stopped_reason), str(run.stopped_reason))
+            lines = [
+                f"Миссия «{title}»: шагов выполнено — {run.executed_steps}, статус — {status}."
+            ]
+            for outcome in run.steps:
+                task = outcome.task
+                result = outcome.result
+                label = task.title if task is not None else result.tool
+                mark = "✓" if result.ok else "✗"
+                summary = " ".join(str(result.summary or "").split())[:220]
+                lines.append(f"{mark} {label}: {summary}")
+            if run.stopped_reason == "blocked":
+                lines.append("Часть шагов требует вмешательства — сообщи, как продолжить.")
+            elif run.stopped_reason == "budget":
+                lines.append("Скажи «продолжи миссию», чтобы выполнить оставшиеся шаги.")
+            answer = "\n".join(lines)
+        if deliverable:
+            location = deliverable.get("path") or deliverable.get("filename")
+            answer = (
+                f"{answer}\n\n**Файл готов:** `{location}` "
+                f"({deliverable.get('format', '')})"
+            )
+        return answer
+
+    def _mission_deliverable_material(self, run: MissionRunResponse) -> str:
+        """Concatenate what the mission's steps produced, for file synthesis."""
+
+        chunks: list[str] = []
         for outcome in run.steps:
-            task = outcome.task
-            result = outcome.result
-            label = task.title if task is not None else result.tool
-            mark = "✓" if result.ok else "✗"
-            summary = " ".join(str(result.summary or "").split())[:220]
-            lines.append(f"{mark} {label}: {summary}")
-        if run.stopped_reason == "blocked":
-            lines.append("Часть шагов требует вмешательства — сообщи, как продолжить.")
-        elif run.stopped_reason == "budget":
-            lines.append("Скажи «продолжи миссию», чтобы выполнить оставшиеся шаги.")
-        return "\n".join(lines)
+            summary = str(outcome.result.summary or "").strip()
+            if not summary:
+                continue
+            title = outcome.task.title if outcome.task is not None else ""
+            chunks.append(f"## {title}\n{summary}" if title else summary)
+        return "\n\n".join(chunks)[:6000]
+
+    async def _synthesize_file_body(
+        self,
+        *,
+        goal: str,
+        material: str,
+        output_format: str,
+    ) -> str:
+        """Produce clean final file content in one focused generation pass.
+
+        Uses the model for what it is reliably good at — writing prose — rather
+        than trusting the agentic executor to remember to call the writer tool.
+        Falls back to the raw step material so a file is always produced.
+        """
+
+        fmt_label = {
+            "md": "Markdown",
+            "docx": "Markdown (будет отрендерён в DOCX)",
+            "txt": "простой текст",
+            "csv": "CSV",
+            "json": "корректный JSON",
+            "html": "HTML",
+            "pdf": "Markdown",
+            "xlsx": "Markdown-таблицу",
+        }.get(output_format, "Markdown")
+        system = (
+            "Ты — редактор, который оформляет ИТОГОВЫЙ документ. Выведи только "
+            f"содержимое файла в формате {fmt_label}. Без вступлений и пояснений, "
+            "без фраз вроде «вот ваш файл», без ограждения ```. Пиши по существу, "
+            "структурно и завершённо."
+        )
+        user = (
+            f"Задача: {goal}\n\n"
+            "Наработанный по шагам материал:\n"
+            f"{material or '(материал не сохранён — собери документ с нуля по задаче)'}\n\n"
+            "Собери финальный, аккуратно оформленный документ."
+        )
+        body = ""
+        try:
+            result = await self.llm.complete(
+                [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                temperature=0.3,
+                max_tokens=None,
+                thinking_enabled=False,
+            )
+            if result and result.ok and result.content:
+                body = _strip_code_fence(result.content)
+        except Exception:  # noqa: BLE001 - synthesis is best-effort; fall back to material
+            body = ""
+        if len(body.strip()) < 40:
+            body = material.strip()
+        return body.strip()
+
+    async def _ensure_goal_file_deliverable(
+        self,
+        mission: dict[str, Any],
+        run: MissionRunResponse,
+        context: AgentContext,
+    ) -> dict[str, Any] | None:
+        """Guarantee a goal's file deliverable exists even if the model only narrated it.
+
+        When the mission goal asks for a file but the executor produced the content
+        as chat text without writing the file, synthesize the file deterministically
+        from the work the steps produced. Returns info about the written file, or
+        ``None`` when no file deliverable applies or a real file already exists. This
+        backstop must never raise into the mission answer.
+        """
+
+        try:
+            spec = _goal_file_deliverable(str(mission.get("goal") or ""))
+            if spec is None or not self.settings.llm_enabled:
+                return None
+            output_format = spec["output_format"]
+            output_name = spec["output_name"]
+            output_dir = (self.settings.data_dir / _DOCUMENT_OUTPUT_DIR).resolve(strict=False)
+            target = output_dir / f"{output_name}.{output_format}"
+            if _existing_file_is_substantive(target, goal=str(mission.get("goal") or "")):
+                return None
+            material = self._mission_deliverable_material(run)
+            body = await self._synthesize_file_body(
+                goal=str(mission.get("goal") or ""),
+                material=material,
+                output_format=output_format,
+            )
+            if not body:
+                return None
+            args: dict[str, Any] = {
+                "title": spec["title"],
+                "body": body,
+                "output_format": output_format,
+                # documents.generate treats output_name as the exact destination
+                # filename, so it must carry the extension.
+                "output_name": spec["filename"],
+                "overwrite": True,
+            }
+            if output_format in {"md", "txt", "csv", "json", "html", "htm", "xml"}:
+                args["exact_body"] = True
+            result = await self._run_claimed_operator_tool(
+                context,
+                tool="documents.generate",
+                arguments=args,
+            )
+            if result is None or not result.ok:
+                return None
+            path = ""
+            if isinstance(result.data, dict):
+                path = str(result.data.get("path") or result.data.get("output_path") or "")
+            return {
+                "filename": f"{output_name}.{output_format}",
+                "path": path or str(target),
+                "format": output_format,
+            }
+        except Exception:  # noqa: BLE001 - a backstop must never break the mission answer
+            return None
 
     async def _maybe_finalize_mission(self, mission_id: str) -> dict[str, Any] | None:
         async with self._mission_report_lock:
@@ -12599,6 +12746,151 @@ def _artifact_filename_from_message(message: str) -> str | None:
         return dest
     names = _all_artifact_filenames(message)
     return names[0] if names else None
+
+
+_CYRILLIC_TRANSLIT = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
+    "ж": "zh", "з": "z", "и": "i", "й": "i", "к": "k", "л": "l", "м": "m",
+    "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+    "ф": "f", "х": "h", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "sch",
+    "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+}
+
+# A create/save verb (Russian stems + English) that marks an imperative "produce
+# a file" request.  Stems keep morphological variants ("создай"/"создать"/"создаю").
+_FILE_CREATE_VERB_STEMS = (
+    "созда", "сдела", "сохран", "подготов", "запиш", "состав", "сформир",
+    "выгруз", "оформ", "напиш", "сгенер", "экспорт",
+    "create", "generate", "write", "save", "make", "produce", "build", "export",
+)
+
+# Format keyword -> canonical extension.  Order matters: earlier entries win.
+_FILE_FORMAT_KEYWORDS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("markdown", "md-файл", "md файл", "md-file", ".md", "маркдаун"), "md"),
+    (("docx", "word", "ворд", "вордов"), "docx"),
+    (("xlsx", "excel", "эксель", "spreadsheet", "таблиц"), "xlsx"),
+    (("csv",), "csv"),
+    (("json",), "json"),
+    (("html", "htm"), "html"),
+    (("pdf",), "pdf"),
+    (("txt", "текстов", "text file", "plain text"), "txt"),
+)
+
+
+def _slugify_filename(text: str, *, default: str = "document", max_len: int = 48) -> str:
+    """ASCII, filesystem-safe slug (transliterating Cyrillic) for a derived name."""
+
+    lowered = str(text or "").strip().lower()
+    out: list[str] = []
+    for ch in lowered:
+        if ch in _CYRILLIC_TRANSLIT:
+            out.append(_CYRILLIC_TRANSLIT[ch])
+        elif ch.isascii() and ch.isalnum():
+            out.append(ch)
+        elif ch in " -_/\\\t.":
+            out.append("-")
+        # everything else (punctuation, other scripts) is dropped
+    slug = re.sub(r"-+", "-", "".join(out)).strip("-")
+    slug = slug[:max_len].strip("-")
+    return slug or default
+
+
+def _deliverable_title(text: str) -> str:
+    """Short human title derived from a goal (first clause, capped)."""
+
+    head = re.split(r"[:.\n]", str(text or "").strip(), maxsplit=1)[0].strip()
+    head = head or str(text or "").strip()
+    return head[:70] or "Документ"
+
+
+def _goal_file_deliverable(goal: str) -> dict[str, str] | None:
+    """Detect an imperative "create/save a file" deliverable inside a mission goal.
+
+    Returns ``{"output_name", "output_format", "filename", "title"}`` when the goal
+    asks for a file to be produced, else ``None``.  Deliberately conservative:
+    interrogative or explanatory goals ("как создать md-файл?") never trigger.
+    """
+
+    text = _fold_operator_confusables(str(goal or "")).strip()
+    if not text:
+        return None
+    lowered = text.casefold()
+    if lowered.endswith("?"):
+        return None
+    if re.search(
+        r"(?i)(?:как|how\s+to)\s+(?:\w+\s+){0,2}"
+        r"(?:созд|сдела|создать|make|create|write|generate)",
+        lowered,
+    ):
+        return None
+    explicit = _destination_filename_from_message(text)
+    if explicit and "." in explicit:
+        ext = explicit.rsplit(".", 1)[-1].lower()
+        stem = explicit[: -(len(ext) + 1)]
+        return {
+            "output_name": stem or _slugify_filename(text),
+            "output_format": ext,
+            "filename": explicit,
+            "title": _deliverable_title(text),
+        }
+    if not any(stem in lowered for stem in _FILE_CREATE_VERB_STEMS):
+        return None
+    output_format: str | None = None
+    for keywords, mapped in _FILE_FORMAT_KEYWORDS:
+        if any(kw in lowered for kw in keywords):
+            output_format = mapped
+            break
+    if output_format is None:
+        if re.search(r"(?i)\b(файл|file|документ|document)\b", lowered):
+            output_format = "md"
+        else:
+            return None
+    name = _slugify_filename(text)
+    return {
+        "output_name": name,
+        "output_format": output_format,
+        "filename": f"{name}.{output_format}",
+        "title": _deliverable_title(text),
+    }
+
+
+def _strip_code_fence(text: str) -> str:
+    """Remove a single wrapping ``` fence the model sometimes adds around a file body."""
+
+    stripped = str(text or "").strip()
+    if not stripped.startswith("```"):
+        return stripped
+    lines = stripped.splitlines()
+    if lines:
+        lines = lines[1:]  # drop opening ``` (with optional language tag)
+    if lines and lines[-1].strip().startswith("```"):
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+def _existing_file_is_substantive(path: Path, *, goal: str) -> bool:
+    """True when a file already holds real content worth keeping (not a placeholder)."""
+
+    try:
+        if not path.is_file():
+            return False
+        raw = path.read_bytes()
+    except OSError:
+        return False
+    if len(raw) < 120:
+        return False
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return True  # binary artifact (docx/xlsx) of real size — respect it
+    stripped = text.strip()
+    # Known placeholder signature: "# Report\n\n<echoed task text>".
+    if stripped.startswith("# Report") and len(stripped) < 400:
+        return False
+    goal_head = _fold_operator_confusables(goal).strip()[:60].casefold()
+    return not (
+        goal_head and goal_head in text.casefold() and len(stripped) < len(goal_head) + 220
+    )
 
 
 def _artifact_relative_dir_from_message(message: str) -> str:
