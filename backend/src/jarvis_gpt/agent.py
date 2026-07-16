@@ -11498,7 +11498,17 @@ def _looks_like_multistep(message: str) -> bool:
         re.search(r"(проанализируй|сделай\s+(обзор|анализ)|разбер[иё]|всесторонн)", text)
         or re.search(r"подробн\w*\b.{0,14}(про|о\b|обзор|разбор)", text)
     )
-    return comparison or best_of or compute_lookup or deep_analysis
+    # Research + a downstream operation over what was found is inherently multi-hop:
+    # gather, then compare/evaluate/analyze/choose. A single shallow pipe can't do both.
+    research_then_op = bool(
+        re.search(r"\b(узна|найд|изуч|исслед|провер|собер)\w+", text)
+        and re.search(
+            r"\b(сравн|сопостав|выдел|оцен|проанализир|подбер|выбер|рекоменд|"
+            r"сделай\s+(вывод|обзор|анализ))\w*",
+            text,
+        )
+    )
+    return comparison or best_of or compute_lookup or deep_analysis or research_then_op
 
 
 def _looks_like_shopping_query(normalized: str) -> bool:
