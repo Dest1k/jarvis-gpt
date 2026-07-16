@@ -3702,11 +3702,10 @@ class AgentRuntime:
         from .frontier_brain import select_brain
         from .task_orchestrator import TaskOrchestrator
 
-        available = {
-            info.name: info
-            for info in self._tools_for_context(context)
-            if getattr(info, "danger_level", "safe") not in {"review", "danger"}
-        }
+        # Expose ONLY the curated menu (which is itself the safety boundary): read-only
+        # research tools plus the single vetted action tool, browser.open. Every other
+        # danger tool stays out of autonomous planning entirely.
+        available = {info.name: info for info in self._tools_for_context(context)}
         tool_specs = [
             (name, available[name].description)
             for name in _ORCHESTRATOR_TOOL_MENU
@@ -3738,11 +3737,16 @@ class AgentRuntime:
             return await _complete(messages)
 
         async def _run_tool(name: str, arguments: dict[str, Any]) -> Any:
+            # A discovered URL cannot be pre-bound to an OperatorTurnAuthorization, so the
+            # vetted action tool runs with allow_danger under owner autonomy (which already
+            # authorizes danger tools). Read-only steps never get it.
+            allow_danger = name in _ORCHESTRATOR_ACTION_TOOLS and self._owner_autonomy_active()
             return await self.tools.run(
                 name,
                 arguments,
                 conversation_id=context.conversation_id,
                 user_message_id=context.operator_message_id,
+                allow_danger=allow_danger,
             )
 
         async def _emit_step(kind: str, payload: dict[str, Any]) -> None:
@@ -11453,7 +11457,13 @@ _ORCHESTRATOR_TOOL_MENU: tuple[str, ...] = (
     "web.fetch",
     "system.inspect",
     "documents.generate",
+    "browser.open",
 )
+# The curated menu IS the orchestrator's safety boundary, so it may name an action tool
+# even though it is danger-level. Only these run with allow_danger under owner autonomy,
+# so a plan step can open the cheapest store the model found — no other danger tool is
+# exposed to autonomous planning.
+_ORCHESTRATOR_ACTION_TOOLS: frozenset[str] = frozenset({"browser.open"})
 
 
 def _looks_like_multistep(message: str) -> bool:
