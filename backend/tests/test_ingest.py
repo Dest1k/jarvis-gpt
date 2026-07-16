@@ -203,6 +203,10 @@ def test_file_ingestor_reindexes_legacy_stored_extended_document(monkeypatch, tm
 
 
 def test_file_ingestor_reindexes_duplicate_with_corrected_extension(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "jarvis_gpt.ingest.mimetypes.guess_type",
+        lambda _name: ("application/octet-stream", None),
+    )
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
     settings = load_settings()
     ensure_runtime_dirs(settings)

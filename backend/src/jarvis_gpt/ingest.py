@@ -52,6 +52,9 @@ EXTENSION_MIME_TYPES = {
     **DOCUMENT_EXTENSION_MIME_TYPES,
     ".json": "application/json",
     ".md": "text/markdown",
+    ".odt": "application/vnd.oasis.opendocument.text",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".rtf": "application/rtf",
     ".toml": "text/toml",
     ".yaml": "application/x-yaml",
     ".yml": "application/x-yaml",
@@ -167,12 +170,7 @@ class FileIngestor:
         else:
             temp_path.replace(stored_path)
 
-        suffix = Path(safe_name).suffix.lower()
-        mime_type = (
-            mimetypes.guess_type(safe_name)[0]
-            or EXTENSION_MIME_TYPES.get(suffix)
-            or "application/octet-stream"
-        )
+        mime_type = _mime_type_for_name(safe_name)
         return StoredFile(
             name=safe_name,
             path=stored_path,
@@ -326,7 +324,7 @@ def extract_file_index(path: str | Path, mime_type: str = "") -> tuple[list[str]
         path=resolved,
         sha256="",
         size=resolved.stat().st_size,
-        mime_type=mime_type or mimetypes.guess_type(resolved.name)[0] or "application/octet-stream",
+        mime_type=mime_type or _mime_type_for_name(resolved.name),
     )
     return FileIngestor._extract_index(stored)
 
@@ -335,6 +333,17 @@ def _safe_filename(filename: str) -> str:
     raw = Path(filename or "upload.txt").name
     clean = re.sub(r"[^\w.\- ()\[\]]+", "_", raw, flags=re.UNICODE).strip(" .")
     return clean[:180] or "upload.txt"
+
+
+def _mime_type_for_name(name: str) -> str:
+    """Return a stable MIME type without trusting OS registry overrides first."""
+
+    suffix = Path(name).suffix.lower()
+    return (
+        EXTENSION_MIME_TYPES.get(suffix)
+        or mimetypes.guess_type(name)[0]
+        or "application/octet-stream"
+    )
 
 
 def _is_text_file(stored: StoredFile) -> bool:
