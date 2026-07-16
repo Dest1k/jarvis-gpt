@@ -6288,6 +6288,7 @@ class AgentRuntime:
         if (
             mode != "mission"
             and not attachments
+            and not _looks_like_live_web_query(message)
             and _classify_document_artifact_intent(message)
             != NEW_ARTIFACT_REQUEST
             and _looks_like_archive_memory_query(
@@ -6322,6 +6323,7 @@ class AgentRuntime:
         if (
             mode != "mission"
             and not attachments
+            and not _looks_like_live_web_query(message)
             and _classify_document_artifact_intent(message)
             not in {NEW_ARTIFACT_REQUEST, TRANSFORM_EXISTING_DOCUMENT}
             and _looks_like_document_memory_query(
@@ -10706,6 +10708,31 @@ def _looks_like_document_followup(message: str) -> bool:
         )
     )
     return explicit_reference or len(normalized.split()) <= 8
+
+
+_LIVE_PURCHASE_MARKERS = (
+    "купить", "куплю", "покупк", "заказать", "закажу", "оформить заказ",
+    "в наличии", "в продаж", "дешевле", "подешевле", "дешёвый", "дешевый",
+    "дешевл", "дешёвл", "сколько стоит", "по чём", "почём", "по чем", "почем",
+    "где купить", "цена на", "цены на", "по какой цене", "прайс", "маркетплейс",
+    "магазин", "cheapest", "where to buy", "price of", "in stock", "how much is",
+)
+_LIVE_TRAVEL_MARKERS = (
+    "билет", "авиабилет", "рейс", "перелёт", "перелет", "поезд", "электричк",
+    "маршрут", "доехать", "добраться", "поездк", "путешеств",
+    "flight", "ticket", "train", "trip to", "how to get to",
+)
+
+
+def _looks_like_live_web_query(message: str) -> bool:
+    """Clear intent that needs live external data — buying, prices, shopping, or
+    travel/availability. Such requests must reach the web/agentic path (and its
+    multi-step budget), never be intercepted as document/archive recall."""
+
+    normalized = " ".join(str(message or "").casefold().split())
+    return _contains_any(normalized, _LIVE_PURCHASE_MARKERS) or _contains_any(
+        normalized, _LIVE_TRAVEL_MARKERS
+    )
 
 
 def _looks_like_document_memory_query(
