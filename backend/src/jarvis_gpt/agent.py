@@ -1270,7 +1270,7 @@ class AgentRuntime:
             observation, event, recall_result = document_prefetch
             events.append(event)
             await self._emit(event)
-            if not recall_result.ok:
+            if not recall_result.ok and not self._owner_autonomy_active():
                 answer = _document_memory_failure_answer(recall_result)
                 events.append(
                     ChatEvent(
@@ -1922,7 +1922,7 @@ class AgentRuntime:
             events.append(event)
             await self._emit(event)
             yield {"type": "event", "event": event.model_dump()}
-            if not recall_result.ok:
+            if not recall_result.ok and not self._owner_autonomy_active():
                 answer = _document_memory_failure_answer(recall_result)
                 events.append(
                     ChatEvent(
