@@ -746,8 +746,44 @@ class JarvisWebSurfer:
             if hint and any(noise in hint for noise in _NOISE_HINTS):
                 tag.decompose()
 
+        # Drop navigation link-farms (menus, converter/cross-rate lists, related
+        # grids): a block of many short anchors dominated by link text is chrome,
+        # not content — dumping it verbatim buries the answer. Substantial-text
+        # blocks and data tables are kept.
+        for container in soup.find_all(["ul", "ol", "div", "section"]):
+            if not isinstance(container, Tag):
+                continue
+            anchors = container.find_all("a")
+            if len(anchors) < 10:
+                continue
+            total = _collapse(container.get_text(" ", strip=True))
+            link_text = _collapse(
+                " ".join(anchor.get_text(" ", strip=True) for anchor in anchors)
+            )
+            avg_anchor = len(link_text) / max(1, len(anchors))
+            if total and len(link_text) >= 0.7 * len(total) and avg_anchor < 30:
+                container.decompose()
+
         root = soup.body or soup
+        # Plain-text safety net captured AFTER link-farm pruning: excludes nav and
+        # cross-rate blocks but still recovers real content the structural walk below
+        # might miss — the result is never empty and never a URL dump.
+        fallback_text = _collapse(root.get_text(" ", strip=True))
         lines: list[str] = []
+        # Tables carry the primary data on many reference pages (rates, prices,
+        # schedules). Extract their rows first, then remove the tables so the block
+        # walk below does not re-emit the same cells.
+        for table in list(root.find_all("table")):
+            for row in table.find_all("tr"):
+                cells = [
+                    _collapse(cell.get_text(" ", strip=True))
+                    for cell in row.find_all(["td", "th"])
+                ]
+                cells = [cell for cell in cells if cell]
+                if cells:
+                    lines.append(" | ".join(cells))
+            table.decompose()
+
         for element in root.descendants:
             if not isinstance(element, Tag):
                 continue
@@ -758,19 +794,19 @@ class JarvisWebSurfer:
                     lines.append(f"{'#' * int(name[1])} {text}")
             elif name == "li":
                 text = _collapse(element.get_text(" ", strip=True))
-                if text:
+                # Skip bare navigation items: a short link with no surrounding prose.
+                if text and not (element.find("a") is not None and len(text) < 40):
                     lines.append(f"- {text}")
-            elif name == "a":
-                text = _collapse(element.get_text(" ", strip=True))
-                href = element.get("href") or ""
-                if text and href and not href.startswith("javascript"):
-                    absolute = urljoin(base_url, href) if base_url else href
-                    lines.append(f"[{text}]({absolute})")
             elif name == "p":
                 text = _collapse(element.get_text(" ", strip=True))
                 if text:
                     lines.append(text)
         markdown = _dedupe_lines(lines)
+        # If structural extraction yielded almost nothing (data hidden in link-heavy
+        # markup that got pruned), fall back to the page's plain text — never empty,
+        # never a URL dump.
+        if len(markdown) < 200 and len(fallback_text) > len(markdown):
+            markdown = fallback_text
         return markdown[: self.config.max_chars_per_page]
 
     @staticmethod
@@ -943,7 +979,9 @@ class JarvisWebSurfer:
         sections: list[dict[str, str]] = [
             item for item in gathered if isinstance(item, dict) and item.get("markdown")
         ]
-        return _compose_research_report(query, seed.get("answer", ""), sections)
+        return _compose_research_report(
+            query, seed.get("answer", ""), sections, seed.get("snippets", [])
+        )
 
     async def _research_one(self, url: str) -> dict[str, str] | None:
         context = await self._new_context()
@@ -2218,12 +2256,31 @@ def _compose_research_report(
     query: str,
     answer: str,
     sections: Sequence[dict[str, str]],
+    snippets: Sequence[dict[str, str]] = (),
 ) -> str:
     parts: list[str] = [f"# Исследование: {query}", ""]
     if answer:
         parts.append(f"**Кратко:** {answer}")
         parts.append("")
     if not sections:
+        # Full page bodies were unreadable (anti-bot / JS walls). Fall back to the
+        # search snippets — they usually carry the answer — instead of nothing.
+        usable = [item for item in snippets if _collapse(str(item.get("snippet") or ""))]
+        if usable:
+            parts.append(
+                "Полные страницы источников недоступны для автоматического чтения; "
+                "ниже — выдержки из результатов поиска:"
+            )
+            parts.append("")
+            for item in usable[:6]:
+                title = _collapse(str(item.get("title") or item.get("url") or ""))
+                url = str(item.get("url") or "")
+                parts.append(f"## {title}")
+                if url:
+                    parts.append(url)
+                parts.append(_collapse(str(item.get("snippet") or "")))
+                parts.append("")
+            return "\n".join(parts).strip()
         parts.append("Источники не дали читаемого текста.")
         return "\n".join(parts)
     for section in sections:
