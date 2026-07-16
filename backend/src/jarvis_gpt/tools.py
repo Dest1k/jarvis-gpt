@@ -3949,8 +3949,17 @@ async def _system_inspect(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResp
             ),
         )
     payload = args.get("payload")
+    if isinstance(payload, str) and action == "wmi.query":
+        # A model often passes the class name or a WQL string directly.
+        payload = _wmi_payload_from_string(payload)
     if not isinstance(payload, dict):
         payload = {}
+    if action == "wmi.query" and not payload.get("class_name"):
+        for key in ("class_name", "class", "wmi_class"):
+            top_level = args.get(key)
+            if isinstance(top_level, str) and top_level.strip():
+                payload = {**payload, "class_name": top_level.strip()}
+                break
     if action == "screen.capture":
         screen_dir = ctx.settings.cache_dir / "screens"
         payload = {
@@ -10790,6 +10799,33 @@ def _validate_process_view_payload(payload: dict[str, Any]) -> dict[str, Any]:
         allowed = ", ".join(sorted(PROCESS_TOP_SORTS))
         raise ValueError(f"sort must be one of: {allowed}.")
     return {"limit": raw_limit, "sort": sort}
+
+
+def _wmi_payload_from_string(text: str) -> dict[str, Any]:
+    """Accept the natural forms a model emits for a system.inspect WMI query: a bare
+    class name ("Win32_Processor") or a WQL query
+    ("SELECT Name, NumberOfCores FROM Win32_Processor")."""
+
+    cleaned = str(text or "").strip().rstrip(";").strip()
+    if not cleaned:
+        return {}
+    match = re.search(r"\bFROM\s+([A-Za-z_][A-Za-z0-9_]*)", cleaned, re.IGNORECASE)
+    if cleaned[:6].upper() == "SELECT" and match:
+        select_body = cleaned[6 : cleaned.upper().index("FROM")].strip()
+        properties = (
+            []
+            if select_body in {"", "*"}
+            else [
+                part.strip()
+                for part in select_body.split(",")
+                if part.strip() not in {"", "*"}
+            ]
+        )
+        return {"class_name": match.group(1), "properties": properties}
+    identifier = re.match(r"([A-Za-z_][A-Za-z0-9_]*)", cleaned)
+    if identifier:
+        return {"class_name": identifier.group(1)}
+    return {}
 
 
 def _validate_wmi_payload(payload: dict[str, Any]) -> dict[str, Any]:

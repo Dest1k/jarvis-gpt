@@ -6258,7 +6258,11 @@ class AgentRuntime:
             artifact_intent = _new_artifact_intent_from_message(
                 message, original_goal=message
             )
-        if artifact_intent and artifact_intent.get("complete"):
+        if (
+            artifact_intent
+            and artifact_intent.get("complete")
+            and not _request_needs_web_lookup(message)
+        ):
             kind = str(artifact_intent.get("kind") or NEW_ARTIFACT_REQUEST)
             tools: tuple[str, ...]
             if kind == TRANSFORM_EXISTING_DOCUMENT:
@@ -6355,7 +6359,7 @@ class AgentRuntime:
                 rationale="The request targets previously persisted document knowledge.",
             )
 
-        if _requires_side_effect_clarification(message):
+        if not self._owner_autonomy_active() and _requires_side_effect_clarification(message):
             # Incomplete artifact/mission deliverable: one precise question first.
             question = _clarification_question_from_message(message)
             return TaskKernelPlan(
@@ -10733,6 +10737,33 @@ def _looks_like_live_web_query(message: str) -> bool:
     return _contains_any(normalized, _LIVE_PURCHASE_MARKERS) or _contains_any(
         normalized, _LIVE_TRAVEL_MARKERS
     )
+
+
+def _request_needs_web_lookup(message: str) -> bool:
+    """True when the deliverable's content must be fetched from the web first —
+    "find out the latest X and save it", a price, current version, etc. Such a turn
+    must research before creating an artifact, so it is never sealed straight to a
+    one-shot document generator that would emit placeholder content."""
+
+    if _looks_like_live_web_query(message):
+        return True
+    normalized = " ".join(str(message or "").casefold().split())
+    has_lookup = _contains_any(
+        normalized,
+        (
+            "узнай", "узнать", "найди", "найти", "поищи", "проверь", "посмотри",
+            "загугли", "погугли", "в интернете", "в сети", "look up", "find out",
+            "search for", "how many", "how much",
+        ),
+    )
+    has_freshness = _contains_any(
+        normalized,
+        (
+            "последн", "актуальн", "свеж", "текущ", "новейш", "версия", "версию",
+            "версии", "latest", "current", "newest", "release", "сейчас", "сегодня",
+        ),
+    )
+    return has_lookup and has_freshness
 
 
 def _looks_like_document_memory_query(

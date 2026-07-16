@@ -8,16 +8,22 @@ the web.
 
 from __future__ import annotations
 
-from jarvis_gpt.agent import AgentContext, AgentRuntime, _looks_like_live_web_query
+from jarvis_gpt.agent import (
+    AgentContext,
+    AgentRuntime,
+    _looks_like_live_web_query,
+    _request_needs_web_lookup,
+)
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
 from jarvis_gpt.event_bus import EventBus
 from jarvis_gpt.llm import LLMRouter
 from jarvis_gpt.storage import JarvisStorage
 
 
-def _plan_agent(monkeypatch, tmp_path):
+def _plan_agent(monkeypatch, tmp_path, *, autonomy: bool = False):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setenv("JARVIS_OPERATOR_FULL_AUTONOMY", "1" if autonomy else "0")
     settings = load_settings()
     ensure_runtime_dirs(settings)
     storage = JarvisStorage(settings.database_path)
@@ -78,4 +84,30 @@ def test_document_query_still_routes_to_document_memory(monkeypatch, tmp_path):
     agent, storage = _plan_agent(monkeypatch, tmp_path)
     plan = _route(agent, "прочитай мой сохранённый документ про архитектуру и сделай выжимку")
     assert plan.intent == "document_memory"
+    storage.close()
+
+
+def test_needs_web_lookup_helper():
+    assert _request_needs_web_lookup("узнай последнюю версию Node.js и сохрани в файл")
+    assert _request_needs_web_lookup("найди актуальную цену и запиши")
+    assert not _request_needs_web_lookup("сделай отчёт по этим данным")
+    assert not _request_needs_web_lookup("напиши стихотворение про осень")
+
+
+def test_under_specified_artifact_does_not_clarify_under_autonomy(monkeypatch, tmp_path):
+    agent, storage = _plan_agent(monkeypatch, tmp_path, autonomy=True)
+    plan = _route(agent, "Сделай markdown-файл с планом на неделю из 5 пунктов.")
+    assert plan.intent != "clarification"
+    assert plan.needs_clarification is False
+    storage.close()
+
+
+def test_lookup_and_save_is_not_sealed_to_one_shot_generation(monkeypatch, tmp_path):
+    agent, storage = _plan_agent(monkeypatch, tmp_path, autonomy=True)
+    plan = _route(
+        agent, "Узнай последнюю LTS-версию Node.js и сохрани её в node-version.md."
+    )
+    # Must research before creating the artifact, not seal straight to generation.
+    assert plan.tools != ("documents.generate",)
+    assert plan.intent != "new_artifact"
     storage.close()

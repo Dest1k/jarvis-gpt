@@ -411,17 +411,64 @@ def _safe_sheet_name(name: str, used: set[str]) -> str:
     return candidate
 
 
+def _rows_from_cells(cells: Any) -> list[list[Any]]:
+    """Build a dense row grid from a sparse ``[{"row": r, "col": c, "value": v}]``
+    list — the natural cell format a model tends to emit for a spreadsheet."""
+
+    grid: dict[tuple[int, int], Any] = {}
+    max_row = max_col = 0
+    for cell in cells or []:
+        if not isinstance(cell, dict):
+            continue
+        try:
+            row = int(cell.get("row"))
+            col = int(cell.get("col") if cell.get("col") is not None else cell.get("column"))
+        except (TypeError, ValueError):
+            continue
+        if row < 1 or col < 1:
+            continue
+        grid[(row, col)] = _normalize_cell(cell.get("value"))
+        max_row = max(max_row, row)
+        max_col = max(max_col, col)
+    return [
+        [grid.get((row, col), "") for col in range(1, max_col + 1)]
+        for row in range(1, max_row + 1)
+    ]
+
+
+def _sheet_has_data(sheet: Any) -> bool:
+    if not isinstance(sheet, dict):
+        return False
+    rows = sheet.get("rows")
+    if isinstance(rows, list):
+        for row in rows:
+            if isinstance(row, list | tuple):
+                if any(cell not in (None, "") for cell in row):
+                    return True
+            elif row not in (None, "", []):
+                return True
+    cells = sheet.get("cells")
+    if isinstance(cells, list):
+        for cell in cells:
+            if isinstance(cell, dict) and str(cell.get("value") or "").strip():
+                return True
+    return False
+
+
 def _normalize_workbook_sheets(sheets: list[dict[str, Any]]) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     used_names: set[str] = set()
     for index, sheet in enumerate(sheets or []):
-        raw_rows = sheet.get("rows") if isinstance(sheet, dict) else sheet
-        rows: list[list[Any]] = []
-        for row in raw_rows or []:
-            if isinstance(row, list | tuple):
-                rows.append([_normalize_cell(cell) for cell in row])
-            else:
-                rows.append([_normalize_cell(row)])
+        if isinstance(sheet, dict) and not sheet.get("rows") and sheet.get("cells"):
+            rows = _rows_from_cells(sheet.get("cells"))
+        else:
+            raw_rows = sheet.get("rows") if isinstance(sheet, dict) else sheet
+            rows = []
+            for row in raw_rows or []:
+                if isinstance(row, list | tuple):
+                    rows.append([_normalize_cell(cell) for cell in row])
+                else:
+                    rows.append([_normalize_cell(row)])
         raw_name = sheet.get("name") if isinstance(sheet, dict) else None
         name = _safe_sheet_name(raw_name or f"Sheet{index + 1}", used_names)
         result.append({"name": name, "rows": rows})
@@ -680,30 +727,39 @@ def build_workbook_sheets(
     body: str | None = None,
     default_name: str = "Sheet1",
 ) -> list[dict[str, Any]]:
-    """Assemble workbook sheets from a structured ``sheets`` argument, or by parsing
-    Markdown tables (each becomes a sheet) or CSV/TSV text out of ``body``."""
+    """Assemble workbook sheets from a structured ``sheets`` argument (``rows`` or
+    ``cells``), or by parsing Markdown tables (each becomes a sheet) or CSV/TSV out
+    of ``body``. Structured sheets carrying no usable data fall back to the body."""
 
-    if isinstance(sheets, list) and sheets:
-        return [sheet for sheet in sheets if isinstance(sheet, dict)] or [
-            {"name": default_name, "rows": []}
-        ]
+    structured = (
+        [sheet for sheet in sheets if isinstance(sheet, dict)]
+        if isinstance(sheets, list)
+        else []
+    )
+    if structured and any(_sheet_has_data(sheet) for sheet in structured):
+        return structured
     text = str(body or "").strip()
-    if not text:
-        return [{"name": default_name, "rows": []}]
-    blocks = _parse_markdown_blocks(text)
-    tables = [block for block in blocks if block.get("type") == "table" and block.get("rows")]
-    if tables:
-        coerced = [
-            [[_coerce_scalar(cell) for cell in row] for row in table["rows"]]
-            for table in tables
+    if text:
+        blocks = _parse_markdown_blocks(text)
+        tables = [
+            block for block in blocks if block.get("type") == "table" and block.get("rows")
         ]
-        if len(coerced) == 1:
-            return [{"name": default_name, "rows": coerced[0]}]
-        return [
-            {"name": f"{default_name} {index}" if index > 1 else default_name, "rows": rows}
-            for index, rows in enumerate(coerced, start=1)
-        ]
-    return [{"name": default_name, "rows": _rows_from_delimited(text)}]
+        if tables:
+            coerced = [
+                [[_coerce_scalar(cell) for cell in row] for row in table["rows"]]
+                for table in tables
+            ]
+            if len(coerced) == 1:
+                return [{"name": default_name, "rows": coerced[0]}]
+            return [
+                {
+                    "name": f"{default_name} {index}" if index > 1 else default_name,
+                    "rows": rows,
+                }
+                for index, rows in enumerate(coerced, start=1)
+            ]
+        return [{"name": default_name, "rows": _rows_from_delimited(text)}]
+    return structured or [{"name": default_name, "rows": []}]
 
 
 def verify_document_artifact(

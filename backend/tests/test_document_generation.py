@@ -154,3 +154,41 @@ def test_docx_ordered_lists_restart_numbering(tmp_path):
     assert 'w:numId w:val="2"' in document
     assert 'w:numId w:val="3"' in document
     assert numbering.count("<w:num ") >= 3  # bullet(1) + two ordered
+
+
+def test_workbook_accepts_cells_format(tmp_path):
+    # The natural format a model emits: sparse {row, col, value} cells.
+    sheets = [
+        {
+            "name": "Бюджет",
+            "cells": [
+                {"row": 1, "col": 1, "value": "Статья"},
+                {"row": 1, "col": 2, "value": "Сумма"},
+                {"row": 2, "col": 1, "value": "Аренда"},
+                {"row": 2, "col": 2, "value": 30000},
+                {"row": 3, "col": 1, "value": "Итого"},
+                {"row": 3, "col": 2, "value": "=SUM(B2:B2)"},
+            ],
+        }
+    ]
+    built = build_workbook_sheets(sheets=sheets, body="", default_name="Бюджет")
+    out = tmp_path / "budget.xlsx"
+    result = write_workbook_xlsx(out, built, title="Бюджет")
+    assert result["verification"]["ok"] is True
+    structure = extract_document(out)["structure"]
+    first = structure["sheets"][0]
+    assert first["rows"] == 3  # not an empty sheet
+    assert first["preview_rows"][1] == ["Аренда", "30000"]
+    assert any("SUM" in formula for formula in first["formulas"])
+
+
+def test_workbook_falls_back_to_body_when_sheets_have_no_data(tmp_path):
+    built = build_workbook_sheets(
+        sheets=[{"name": "X", "cells": []}],
+        body="Аренда,30000\nЕда,20000\nИтого,=SUM(B1:B2)",
+    )
+    out = tmp_path / "fallback.xlsx"
+    write_workbook_xlsx(out, built)
+    structure = extract_document(out)["structure"]
+    assert structure["sheets"][0]["rows"] == 3
+    assert structure["sheets"][0]["preview_rows"][0] == ["Аренда", "30000"]
