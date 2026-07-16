@@ -1662,6 +1662,22 @@ public static class JarvisBridgeWinApi {
   [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
   [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
   [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+  [DllImport("user32.dll", EntryPoint="SystemParametersInfoW", SetLastError=true)] public static extern bool SpiSet(uint uiAction, uint uiParam, IntPtr pvParam, uint fWinIni);
+  [DllImport("user32.dll", EntryPoint="SystemParametersInfoW", SetLastError=true)] public static extern bool SpiGet(uint uiAction, uint uiParam, ref uint pvParam, uint fWinIni);
+
+  // The foreground lock timeout makes SetForegroundWindow a silent no-op for a
+  // background service. Zeroing it (the documented workaround) lets the bridge
+  // raise a window reliably; the original value is restored afterwards so the
+  // user's anti-focus-stealing setting is left untouched.
+  public static uint DisableForegroundLock() {
+    uint original = 0;
+    SpiGet(0x2000, 0, ref original, 0);   // SPI_GETFOREGROUNDLOCKTIMEOUT
+    SpiSet(0x2001, 0, IntPtr.Zero, 0);    // SPI_SETFOREGROUNDLOCKTIMEOUT -> 0
+    return original;
+  }
+  public static void RestoreForegroundLock(uint original) {
+    SpiSet(0x2001, 0, new IntPtr((long)original), 0x02);  // SPIF_SENDCHANGE
+  }
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindowEx(IntPtr parent, IntPtr child, string cls, string title);
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder buffer, int max);
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowTextLength(IntPtr hWnd);
@@ -1745,6 +1761,8 @@ public static class JarvisBridgeWinApi {
   }
 
   function ForceForeground($Handle) {
+    # Lift the OS foreground-steal lock for the duration of the raise, then restore.
+    $origLock = [JarvisBridgeWinApi]::DisableForegroundLock()
     if ([JarvisBridgeWinApi]::IsIconic($Handle)) {
       [void][JarvisBridgeWinApi]::ShowWindow($Handle, 9)
     } else {
@@ -1773,6 +1791,7 @@ public static class JarvisBridgeWinApi {
     [void][JarvisBridgeWinApi]::SetForegroundWindow($Handle)
     if ($attachedTarget) { [void][JarvisBridgeWinApi]::AttachThreadInput($current, $targetThread, $false) }
     if ($attachedForeground) { [void][JarvisBridgeWinApi]::AttachThreadInput($current, $foregroundThread, $false) }
+    [void][JarvisBridgeWinApi]::RestoreForegroundLock($origLock)
   }
 
   function FocusWindow($ProcessId, $ProcessName, $WindowTitle) {
