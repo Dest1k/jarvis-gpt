@@ -30,8 +30,26 @@ from typing import Any
 
 # A short plan keeps a weak planner honest and bounds latency; raise only with evidence.
 DEFAULT_MAX_STEPS = 6
-_PLACEHOLDER_RE = re.compile(r"\{\{\s*(s\d+)\s*\}\}")
+# {{s1}} -> the whole text output of step s1; {{s1.field}} / {{s1.a.0.b}} -> a specific
+# value dug out of step s1's structured .data, so a step can pass a discovered URL/price/id
+# to the next tool rather than the entire summary.
+_PLACEHOLDER_RE = re.compile(r"\{\{\s*(s\d+)(?:\.([a-zA-Z0-9_.]+))?\s*\}\}")
 _JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
+
+
+def _dig(data: Any, path: str) -> Any:
+    value: Any = data
+    for key in path.split("."):
+        if isinstance(value, dict):
+            value = value.get(key)
+        elif isinstance(value, list | tuple) and key.isdigit():
+            index = int(key)
+            value = value[index] if index < len(value) else None
+        else:
+            return None
+        if value is None:
+            return None
+    return value
 
 
 @dataclass
@@ -191,7 +209,15 @@ def _resolve_placeholders(value: Any, blackboard: dict[str, StepResult]) -> Any:
     if isinstance(value, str):
         def _sub(m: re.Match[str]) -> str:
             prior = blackboard.get(m.group(1))
-            return prior.output if prior is not None else m.group(0)
+            if prior is None:
+                return m.group(0)
+            field = m.group(2)
+            if not field:
+                return prior.output
+            dug = _dig(prior.data, field)
+            # Fall back to the text output when the structured field is absent, so a
+            # planner guessing a field name never blanks the argument entirely.
+            return str(dug) if dug is not None else prior.output
 
         return _PLACEHOLDER_RE.sub(_sub, value)
     if isinstance(value, list):

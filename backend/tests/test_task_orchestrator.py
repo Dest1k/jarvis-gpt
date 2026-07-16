@@ -75,6 +75,26 @@ def test_resolve_placeholders_threads_prior_output():
     assert resolved == {"query": "weather in PARIS today"}
 
 
+def test_structured_placeholder_pulls_a_field_from_prior_step_data():
+    # A step can hand the NEXT tool a specific discovered value (e.g. the cheapest
+    # store URL) from a prior step's structured .data, not just the whole summary.
+    bb = {
+        "s1": StepResult(
+            step_id="s1",
+            title="t",
+            ok=True,
+            output="полный текст выдачи",
+            data={"top_url": "https://shop/x", "candidates": [{"url": "https://a"}]},
+        )
+    }
+    assert _resolve_placeholders({"url": "{{s1.top_url}}"}, bb) == {"url": "https://shop/x"}
+    assert _resolve_placeholders("open {{s1.candidates.0.url}}", bb) == "open https://a"
+    # A missing field falls back to the text output rather than blanking the argument.
+    assert _resolve_placeholders("{{s1.nope}}", bb) == "полный текст выдачи"
+    # Whole-text reference still works unchanged.
+    assert _resolve_placeholders("{{s1}}", bb) == "полный текст выдачи"
+
+
 def test_end_to_end_plan_execute_synthesize():
     plan_json = (
         '{"steps":['
