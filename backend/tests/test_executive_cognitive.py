@@ -5,7 +5,7 @@ import hashlib
 import json
 
 import pytest
-from jarvis_gpt.agent import AgentRuntime
+from jarvis_gpt.agent import AgentContext, AgentRuntime
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
 from jarvis_gpt.event_bus import EventBus
 from jarvis_gpt.executive_runtime import (
@@ -470,6 +470,72 @@ def test_state_goal_cannot_be_recast_as_artifact_only_decomposition(
         asyncio.run(agent.create_mission_planned("Deploy Orion production service"))
 
     assert storage.list_missions(limit=10) == []
+    storage.close()
+
+
+def test_operator_mission_recovers_from_malformed_llm_decomposition(
+    monkeypatch,
+    tmp_path,
+):
+    """An operator's *own* explicit mission must still execute even when the LLM
+    proposes a malformed decomposition.
+
+    ``create_mission_planned`` keeps raising for every ordinary caller (the two
+    tests above pin that contract), but the operator layer rebuilds the mission
+    from the deterministic planner so an explicit command is never dropped just
+    because the local model returned an incoherent DAG.
+    """
+
+    class MalformedPlannerLLM:
+        async def complete(self, _messages, **_kwargs):
+            return LLMResult(
+                ok=True,
+                content=json.dumps(
+                    {
+                        "protocol": "jarvis.mission-decomposition.v1",
+                        "steps": [
+                            {
+                                "step_id": "a",
+                                "title": "A",
+                                "objective": "First cyclic step",
+                                "dependencies": ["b"],
+                                "assertion": "A is evidenced",
+                            },
+                            {
+                                "step_id": "b",
+                                "title": "B",
+                                "objective": "Second cyclic step",
+                                "dependencies": ["a"],
+                                "assertion": "B is evidenced",
+                            },
+                        ],
+                        "rationale": "Invalid cyclic proposal",
+                    }
+                ),
+            )
+
+    monkeypatch.setenv("JARVIS_OPERATOR_FULL_AUTONOMY", "1")
+    agent, storage = _agent(monkeypatch, tmp_path, MalformedPlannerLLM())
+
+    goal = "Deploy Orion production service"
+    context = AgentContext(
+        conversation_id="conv-operator-mission",
+        memory_hits=[],
+        file_hits=[],
+    )
+    context.operator_request_digest = "req-digest-operator-mission"
+    context.operator_message_id = "operator-msg-1"
+
+    # The strict planner still rejects the cyclic DAG for ordinary callers.
+    with pytest.raises(ValueError, match="acyclic"):
+        asyncio.run(agent.create_mission_planned(goal))
+
+    # The operator layer recovers and produces a persisted, goal-bound mission.
+    mission = asyncio.run(agent._create_operator_mission_planned(goal, context))
+    assert mission is not None
+    assert mission["goal"] == goal
+    assert len(mission["tasks"]) >= 2
+    assert storage.get_mission(mission["id"]) is not None
     storage.close()
 
 

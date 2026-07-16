@@ -302,6 +302,13 @@ SAFE_DIRECT_NATIVE_ACTIONS = frozenset(
 # streamed as chat noise. Action (tool_call), result (assistant_done), mission
 # progress and verification always stream.
 _NON_CHAT_EVENT_TYPES = frozenset({"thought", "memory", "approval", "task_kernel"})
+_MISSION_STOP_LABELS = {
+    "completed": "завершена",
+    "budget": "исчерпан бюджет шагов за этот ход",
+    "blocked": "часть шагов заблокирована",
+    "busy": "занята другой попыткой",
+    "empty": "нет выполнимых шагов",
+}
 
 # When lexical file search finds nothing, recent chunks are only allowed into
 # the prompt if their fuzzy-vector similarity to the query clears this bar.
@@ -1235,7 +1242,6 @@ class AgentRuntime:
                     duration_ms=duration_ms,
                 )
             answer = self._mission_answer(mission)
-            self._complete_operator_effect_turn(context, answer=answer)
             events.append(
                 ChatEvent(
                     type="mission",
@@ -1245,6 +1251,19 @@ class AgentRuntime:
                 )
             )
             await self._emit(events[-1])
+            # Owner autonomy executes the mission now instead of only planning it.
+            # Best-effort: any execution error leaves the created mission intact and
+            # never fails the turn.
+            if self._owner_autonomy_active():
+                try:
+                    run = await self.run_mission(mission["id"], max_steps=self._max_tool_steps())
+                    answer = self._mission_run_answer(mission, run)
+                except Exception as exc:  # noqa: BLE001 - execution is best-effort
+                    answer = (
+                        f"{answer}\n\nАвтозапуск прерван ({type(exc).__name__}); "
+                        "миссия создана и её можно выполнить отдельно."
+                    )
+            self._complete_operator_effect_turn(context, answer=answer)
             duration_ms = _elapsed_ms(started_at)
             message_id = self.storage.add_message(
                 conversation_id=context.conversation_id,
@@ -1882,7 +1901,6 @@ class AgentRuntime:
                 }
                 return
             answer = self._mission_answer(mission)
-            self._complete_operator_effect_turn(context, answer=answer)
             events.append(
                 ChatEvent(
                     type="mission",
@@ -1893,6 +1911,21 @@ class AgentRuntime:
             )
             await self._emit(events[-1])
             yield {"type": "event", "event": events[-1].model_dump()}
+            # Owner autonomy executes the mission now instead of only planning it.
+            # Best-effort: any execution error leaves the created mission intact and
+            # never fails the turn. Step-level progress streams via the event bus.
+            if self._owner_autonomy_active():
+                try:
+                    run = await self.run_mission(
+                        mission["id"], max_steps=self._max_tool_steps()
+                    )
+                    answer = self._mission_run_answer(mission, run)
+                except Exception as exc:  # noqa: BLE001 - execution is best-effort
+                    answer = (
+                        f"{answer}\n\nАвтозапуск прерван ({type(exc).__name__}); "
+                        "миссия создана и её можно выполнить отдельно."
+                    )
+            self._complete_operator_effect_turn(context, answer=answer)
             yield {"type": "delta", "content": answer}
             duration_ms = _elapsed_ms(started_at)
             message_id = self.storage.add_message(
@@ -2423,6 +2456,14 @@ class AgentRuntime:
         context.operator_used_effects.add(effect_key)
         try:
             mission = await self.create_mission_planned(goal, mission_id=mission_id)
+        except (ValueError, TypeError, KeyError):
+            # A goal-incoherent or malformed LLM decomposition must not fail the
+            # operator's own mission. Rebuild it from the deterministic planner, which
+            # is designed to satisfy the executive's structural and goal-coverage
+            # contracts; the strict LLM-DAG rejection stays intact for other callers.
+            mission = verified_existing()
+            if mission is None:
+                mission = self.create_mission(goal, mission_id=mission_id)
         except BaseException:
             # Storage may have committed immediately before a later subsystem
             # raised.  Adopt only the exact deterministic resource; otherwise
@@ -2918,6 +2959,27 @@ class AgentRuntime:
             executed_steps=len(steps),
             final_report=final_report,
         )
+
+    def _mission_run_answer(self, mission: dict[str, Any], run: MissionRunResponse) -> str:
+        """Operator-facing summary of a mission that autonomy executed this turn."""
+
+        if run.final_report:
+            return run.final_report
+        title = str(mission.get("title") or "").strip()
+        status = _MISSION_STOP_LABELS.get(str(run.stopped_reason), str(run.stopped_reason))
+        lines = [f"Миссия «{title}»: шагов выполнено — {run.executed_steps}, статус — {status}."]
+        for outcome in run.steps:
+            task = outcome.task
+            result = outcome.result
+            label = task.title if task is not None else result.tool
+            mark = "✓" if result.ok else "✗"
+            summary = " ".join(str(result.summary or "").split())[:220]
+            lines.append(f"{mark} {label}: {summary}")
+        if run.stopped_reason == "blocked":
+            lines.append("Часть шагов требует вмешательства — сообщи, как продолжить.")
+        elif run.stopped_reason == "budget":
+            lines.append("Скажи «продолжи миссию», чтобы выполнить оставшиеся шаги.")
+        return "\n".join(lines)
 
     async def _maybe_finalize_mission(self, mission_id: str) -> dict[str, Any] | None:
         async with self._mission_report_lock:
