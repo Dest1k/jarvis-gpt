@@ -38,6 +38,16 @@ def test_wmi_strips_trailing_semicolon_and_whitespace():
     assert _validate_wmi_payload(payload)["class_name"] == "Win32_OperatingSystem"
 
 
+def test_wmi_wql_where_clause_becomes_filter():
+    payload = _wmi_payload_from_string(
+        "SELECT FreeSpace, Size FROM Win32_LogicalDisk WHERE DeviceID='C:'"
+    )
+    validated = _validate_wmi_payload(payload)
+    assert validated["class_name"] == "Win32_LogicalDisk"
+    assert validated["properties"] == ["FreeSpace", "Size"]
+    assert validated["filter"] == "DeviceID='C:'"
+
+
 def test_wmi_empty_or_garbage_is_empty():
     assert _wmi_payload_from_string("") == {}
     assert _wmi_payload_from_string("   ") == {}

@@ -3959,6 +3959,7 @@ async def _system_inspect(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResp
     """
 
     action = str(args.get("action") or "wmi.query").strip().lower()
+    action = {"query": "wmi.query", "wql": "wmi.query", "wmi": "wmi.query"}.get(action, action)
     if action not in SAFE_INSPECT_ACTIONS:
         allowed = ", ".join(sorted(SAFE_INSPECT_ACTIONS))
         return ToolRunResponse(
@@ -3979,11 +3980,15 @@ async def _system_inspect(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResp
     if not isinstance(payload, dict):
         payload = {}
     if action == "wmi.query" and not payload.get("class_name"):
-        for key in ("class_name", "class", "wmi_class"):
-            top_level = args.get(key)
-            if isinstance(top_level, str) and top_level.strip():
-                payload = {**payload, "class_name": top_level.strip()}
-                break
+        wql = payload.get("query") or payload.get("wql") or payload.get("sql")
+        if isinstance(wql, str) and wql.strip():
+            payload = {**payload, **_wmi_payload_from_string(wql)}
+        else:
+            for key in ("class_name", "class", "wmi_class"):
+                top_level = args.get(key)
+                if isinstance(top_level, str) and top_level.strip():
+                    payload = {**payload, "class_name": top_level.strip()}
+                    break
     if action == "screen.capture":
         screen_dir = ctx.settings.cache_dir / "screens"
         payload = {
@@ -5574,7 +5579,11 @@ def _documents_generate(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
         )
         bound_destination = Path(destination)
         body_text = body if isinstance(body, str) else str(body or "")
-        if output_format in {"md", "txt"} and exact_body and body_text.strip():
+        if (
+            output_format in {"md", "txt", "csv", "json", "html", "htm", "xml"}
+            and exact_body
+            and body_text.strip()
+        ):
             written = write_exact_text_artifact(destination, body_text)
             result = {
                 "ok": True,
@@ -10845,7 +10854,11 @@ def _wmi_payload_from_string(text: str) -> dict[str, Any]:
                 if part.strip() not in {"", "*"}
             ]
         )
-        return {"class_name": match.group(1), "properties": properties}
+        result: dict[str, Any] = {"class_name": match.group(1), "properties": properties}
+        where = re.search(r"\bWHERE\b(.+)$", cleaned, re.IGNORECASE | re.DOTALL)
+        if where and where.group(1).strip():
+            result["filter"] = where.group(1).strip()
+        return result
     identifier = re.match(r"([A-Za-z_][A-Za-z0-9_]*)", cleaned)
     if identifier:
         return {"class_name": identifier.group(1)}
