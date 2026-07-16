@@ -149,6 +149,58 @@ def test_plan_complete_brain_handles_planning_only():
     assert result.ok
 
 
+def test_research_backstop_runs_when_plan_produced_no_data():
+    # A reason-only plan yields no external data, so the deterministic research
+    # backstop fires once on the goal to ground the answer.
+    plan_json = '{"steps":[{"id":"s1","goal":"порассуждать","kind":"reason"}]}'
+    tool_calls: list = []
+
+    async def complete(messages):
+        if "планировщик" in messages[0]["content"]:
+            return _LLM(True, plan_json)
+        return _LLM(True, "короткий текст")
+
+    async def run_tool(name, arguments):
+        tool_calls.append((name, arguments))
+        return _Tool(True, "РЕАЛЬНЫЕ ДАННЫЕ " * 12, {})
+
+    orch = TaskOrchestrator(
+        complete=complete,
+        run_tool=run_tool,
+        tool_specs=[("web.research", "research")],
+        fallback_query_tool="web.research",
+    )
+    result = asyncio.run(orch.run("узнай цену X"))
+    assert tool_calls == [("web.research", {"query": "узнай цену X", "limit": 5})]
+    assert result.ok
+
+
+def test_no_backstop_when_plan_is_already_grounded():
+    plan_json = (
+        '{"steps":[{"id":"s1","goal":"найти","kind":"tool","tool":"web.research",'
+        '"arguments":{"query":"x"}}]}'
+    )
+    tool_calls: list = []
+
+    async def complete(messages):
+        if "планировщик" in messages[0]["content"]:
+            return _LLM(True, plan_json)
+        return _LLM(True, "итог")
+
+    async def run_tool(name, arguments):
+        tool_calls.append((name, arguments))
+        return _Tool(True, "ДАННЫЕ " * 30, {})
+
+    orch = TaskOrchestrator(
+        complete=complete,
+        run_tool=run_tool,
+        tool_specs=[("web.research", "r")],
+        fallback_query_tool="web.research",
+    )
+    asyncio.run(orch.run("цель"))
+    assert len(tool_calls) == 1  # only the planned step ran; no backstop needed
+
+
 def test_failed_planner_still_answers():
     async def complete(messages):
         system = messages[0]["content"]

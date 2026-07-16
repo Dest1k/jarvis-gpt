@@ -222,8 +222,13 @@ class TaskOrchestrator:
         max_steps: int = DEFAULT_MAX_STEPS,
         emit: EmitFn | None = None,
         plan_complete: CompleteFn | None = None,
+        fallback_query_tool: str | None = None,
     ) -> None:
         self._complete = complete
+        # A tool that answers a plain {"query": goal}. When a plan produces no real
+        # data (thin/failed plan), the engine runs this once so the answer is grounded
+        # in evidence rather than the local planner's luck. None disables the backstop.
+        self._fallback_query_tool = fallback_query_tool
         # Planning is the hard part; it may use a stronger brain (e.g. the frontier
         # model via select_brain) while execution stays on the local model. Falls back
         # to the execution brain when no dedicated planner is injected.
@@ -231,6 +236,10 @@ class TaskOrchestrator:
         self._run_tool = run_tool
         self._tool_specs = list(tool_specs)
         self._allowed_tools = {name for name, _ in self._tool_specs}
+        # The backstop tool is deterministic (never planned), so it is allowed to run
+        # even when it is not part of the planner's curated menu.
+        if fallback_query_tool:
+            self._allowed_tools.add(fallback_query_tool)
         self._max_steps = max(1, min(12, int(max_steps)))
         self._emit = emit
 
@@ -330,6 +339,32 @@ class TaskOrchestrator:
             await self._emit_event(
                 "step",
                 {"id": step.id, "goal": step.goal, "kind": step.kind, "ok": result.ok},
+            )
+        # Reliability backstop: if no tool step produced substantial data, run one
+        # deterministic research pass on the goal so the answer is grounded in evidence.
+        tool_step_ids = {step.id for step in plan.steps if step.kind == "tool"}
+        grounded = any(
+            r.ok and r.step_id in tool_step_ids and len(r.output.strip()) >= 80
+            for r in results
+        )
+        if (
+            not grounded
+            and self._fallback_query_tool
+            and self._fallback_query_tool in self._allowed_tools
+        ):
+            fallback_step = TaskStep(
+                id="fallback",
+                goal=goal,
+                kind="tool",
+                tool=self._fallback_query_tool,
+                arguments={"query": goal, "limit": 5},
+            )
+            fallback = await self._run_tool_step(fallback_step, blackboard)
+            blackboard["fallback"] = fallback
+            results.append(fallback)
+            await self._emit_event(
+                "step",
+                {"id": "fallback", "goal": goal, "kind": "tool", "ok": fallback.ok},
             )
         answer = await self._synthesize(goal, results)
         return OrchestrationResult(

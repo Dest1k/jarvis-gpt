@@ -3761,6 +3761,15 @@ class AgentRuntime:
             tool_specs=tool_specs,
             emit=_emit_step,
             plan_complete=_plan_complete,
+            # web.search keeps a cache and recovers when live providers are throttled,
+            # so it is the more resilient grounding backstop than web.research.
+            fallback_query_tool=(
+                "web.search"
+                if "web.search" in available
+                else "web.research"
+                if "web.research" in available
+                else None
+            ),
         )
         result = await orchestrator.run(message)
         if not result.answer:
@@ -11448,29 +11457,48 @@ _ORCHESTRATOR_TOOL_MENU: tuple[str, ...] = (
 
 
 def _looks_like_multistep(message: str) -> bool:
-    """Detect requests that need a real multi-hop plan (lookup + compute/compare).
+    """Detect requests that genuinely need a multi-hop plan (research / compare / compute).
 
-    Deliberately conservative: it fires for the classes the owner named as painful —
-    cheapest-X comparison and cost-with-real-lookup — so the universal orchestrator
-    proves out on them before the trigger is widened. Everything else keeps its path.
+    Structural signals, not per-domain patterns: comparison, best-of/cheapest search,
+    compute-with-lookup, and deep analysis all need several coordinated steps that a
+    single shallow pipe handles poorly. File-deliverable requests are deliberately left
+    out — they have their own artifact/mission path with a synthesis backstop.
     """
 
-    text = _fold_operator_confusables(str(message or "")).casefold()
-    if not text:
+    folded = _fold_operator_confusables(str(message or ""))
+    text = folded.casefold()
+    if not text or len(text.split()) < 3:
         return False
-    cheapest = bool(
-        re.search(r"(где|куда|у кого)\b.{0,24}(дешевл|выгодн)", text)
-        or "дешевле всего" in text
-        or re.search(r"сам\w*\s+деш[её]в", text)
-    )
-    cost_lookup = bool(
-        re.search(r"(посчита|рассчита|сколько\b.{0,18}сто|во сколько\b.{0,18}(обойд|встан))", text)
-        and re.search(
-            r"(поездк|поездку|билет|перел[её]т|маршрут|доехать|добраться|доставк|тур\b)",
+    # A request that asks for a file has a better-suited path already.
+    if _goal_file_deliverable(folded) is not None:
+        return False
+    comparison = bool(
+        re.search(r"\bсравн", text)
+        or re.search(r"\bчем\b.{0,24}отлича", text)
+        or re.search(
+            r"\b(что|какой|кто|где|которы\w*)\b.{0,32}"
+            r"(лучш|выгодн|дешевл|быстре|мощне|над[её]жне|качествен)",
             text,
         )
     )
-    return cheapest or cost_lookup
+    best_of = bool(
+        "дешевле всего" in text
+        or re.search(r"(где|куда|у кого)\b.{0,24}(дешевл|выгодн)", text)
+        or re.search(r"сам\w*\s+(деш[её]в|дорог|лучш|быстр|мощн|надёжн|надежн)", text)
+    )
+    compute_lookup = bool(
+        re.search(r"(посчита|рассчита|сколько\b.{0,18}сто|во сколько\b.{0,18}(обойд|встан))", text)
+        and re.search(
+            r"(поездк|поездку|билет|перел[её]т|маршрут|доехать|добраться|доставк|тур\b|"
+            r"аренд|подписк|курс\b|обучени)",
+            text,
+        )
+    )
+    deep_analysis = bool(
+        re.search(r"(проанализируй|сделай\s+(обзор|анализ)|разбер[иё]|всесторонн)", text)
+        or re.search(r"подробн\w*\b.{0,14}(про|о\b|обзор|разбор)", text)
+    )
+    return comparison or best_of or compute_lookup or deep_analysis
 
 
 def _looks_like_shopping_query(normalized: str) -> bool:
