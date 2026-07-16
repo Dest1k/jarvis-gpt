@@ -3880,6 +3880,32 @@ def _nested_native_items(value: Any, *, depth: int = 0) -> list[Any]:
     return []
 
 
+def _native_payload_from_args(action: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Accept native fields whether the model nests them in ``payload`` or puts them at
+    the top level, and a bare string payload as the executable/URL target."""
+
+    payload = args.get("payload")
+    if isinstance(payload, str):
+        text = payload.strip()
+        if not text:
+            payload = {}
+        elif action in {"process.start", "app.open_and_type"}:
+            parts = text.split()
+            payload = {"executable": parts[0], "arguments": parts[1:]}
+        elif action == "browser.open" or action.startswith("chrome"):
+            payload = {"url": text}
+        else:
+            payload = {"executable": text}
+    payload = {} if not isinstance(payload, dict) else dict(payload)
+    for key in (
+        "executable", "arguments", "keys", "text",
+        "window_title", "process_name", "wait_ms", "url",
+    ):
+        if key not in payload and key in args and not isinstance(args[key], dict):
+            payload[key] = args[key]
+    return payload
+
+
 async def _windows_native(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     action = str(args.get("action") or "capabilities").strip().lower()
     if action not in MODEL_NATIVE_ACTIONS:
@@ -3888,9 +3914,7 @@ async def _windows_native(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResp
             ok=False,
             summary="This host action is reserved for a policy-specific Jarvis tool.",
         )
-    payload = args.get("payload")
-    if not isinstance(payload, dict):
-        payload = {}
+    payload = _native_payload_from_args(action, args)
     timeout_sec = _int_arg(args.get("timeout_sec"), default=30, minimum=1, maximum=120)
     try:
         native, ok, summary, bridge_data = await _run_native_bridge_command(

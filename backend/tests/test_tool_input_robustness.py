@@ -6,7 +6,11 @@ bare string or a WQL query instead of the strict {class_name, properties} dict.
 
 from __future__ import annotations
 
-from jarvis_gpt.tools import _validate_wmi_payload, _wmi_payload_from_string
+from jarvis_gpt.tools import (
+    _native_payload_from_args,
+    _validate_wmi_payload,
+    _wmi_payload_from_string,
+)
 
 
 def test_wmi_accepts_bare_class_name():
@@ -37,3 +41,26 @@ def test_wmi_strips_trailing_semicolon_and_whitespace():
 def test_wmi_empty_or_garbage_is_empty():
     assert _wmi_payload_from_string("") == {}
     assert _wmi_payload_from_string("   ") == {}
+
+
+def test_native_payload_accepts_top_level_executable():
+    payload = _native_payload_from_args(
+        "process.start", {"action": "process.start", "executable": "notepad.exe"}
+    )
+    assert payload["executable"] == "notepad.exe"
+
+
+def test_native_payload_accepts_bare_string_executable_with_args():
+    payload = _native_payload_from_args(
+        "process.start", {"payload": "powershell.exe -Command systeminfo"}
+    )
+    assert payload["executable"] == "powershell.exe"
+    assert payload["arguments"] == ["-Command", "systeminfo"]
+
+
+def test_native_payload_preserves_nested_dict():
+    payload = _native_payload_from_args(
+        "app.open_and_type", {"payload": {"executable": "calc.exe", "keys": "12+34="}}
+    )
+    assert payload["executable"] == "calc.exe"
+    assert payload["keys"] == "12+34="
