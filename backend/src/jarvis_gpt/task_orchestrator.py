@@ -91,6 +91,8 @@ def _planner_messages(
     rules = (
         "Правила: kind 'tool' — вызов ОДНОГО инструмента из списка (аргументы в arguments); "
         "kind 'reason' — фокусная под-задача мышления/письма без инструмента. "
+        "Если для ответа нужны свежие факты, цены или данные из интернета — ОБЯЗАТЕЛЬНО "
+        "добавь шаг 'tool', который их добывает, а не полагайся только на 'reason'. "
         "Ссылку на результат прошлого шага вставляй в строковый аргумент как {{s1}}. "
         "Только реально нужные шаги; зависимые ставь после тех, от кого зависят."
     )
@@ -219,8 +221,13 @@ class TaskOrchestrator:
         tool_specs: Sequence[tuple[str, str]],
         max_steps: int = DEFAULT_MAX_STEPS,
         emit: EmitFn | None = None,
+        plan_complete: CompleteFn | None = None,
     ) -> None:
         self._complete = complete
+        # Planning is the hard part; it may use a stronger brain (e.g. the frontier
+        # model via select_brain) while execution stays on the local model. Falls back
+        # to the execution brain when no dedicated planner is injected.
+        self._plan_complete = plan_complete or complete
         self._run_tool = run_tool
         self._tool_specs = list(tool_specs)
         self._allowed_tools = {name for name, _ in self._tool_specs}
@@ -231,7 +238,7 @@ class TaskOrchestrator:
         content = ""
         try:
             messages = _planner_messages(goal, self._tool_specs, self._max_steps)
-            result = await self._complete(messages)
+            result = await self._plan_complete(messages)
             content = getattr(result, "content", "") if getattr(result, "ok", False) else ""
         except Exception:  # noqa: BLE001 - planning must never crash the task
             content = ""

@@ -119,6 +119,36 @@ def test_end_to_end_plan_execute_synthesize():
     assert "Париж" in result.answer
 
 
+def test_plan_complete_brain_handles_planning_only():
+    # Planning may use a stronger brain (frontier) while execution stays local; the
+    # dedicated planner is used for the plan, the execution brain for steps + synthesis.
+    plan_json = '{"steps":[{"id":"s1","goal":"подумать","kind":"reason"}]}'
+    plan_calls: list = []
+    exec_calls: list = []
+
+    async def plan_complete(messages):
+        plan_calls.append(messages)
+        return _LLM(True, plan_json)
+
+    async def complete(messages):
+        exec_calls.append(messages)
+        return _LLM(True, "результат")
+
+    async def run_tool(name, arguments):  # pragma: no cover - no tool step here
+        raise AssertionError("no tool step expected")
+
+    orch = TaskOrchestrator(
+        complete=complete,
+        run_tool=run_tool,
+        tool_specs=[],
+        plan_complete=plan_complete,
+    )
+    result = asyncio.run(orch.run("сделай что-то"))
+    assert len(plan_calls) == 1  # exactly one planning call, via the dedicated brain
+    assert len(exec_calls) >= 1  # reason step + synthesis went to the execution brain
+    assert result.ok
+
+
 def test_failed_planner_still_answers():
     async def complete(messages):
         system = messages[0]["content"]

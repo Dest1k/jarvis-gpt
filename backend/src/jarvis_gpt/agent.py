@@ -3699,6 +3699,7 @@ class AgentRuntime:
         step-by-step trace is audit-only; the operator sees the synthesized answer.
         """
 
+        from .frontier_brain import select_brain
         from .task_orchestrator import TaskOrchestrator
 
         available = {
@@ -3719,6 +3720,22 @@ class AgentRuntime:
             return await self._complete_llm(
                 messages, temperature=0.2, max_tokens=None, thinking_enabled=False
             )
+
+        # Planning is the hard part: when the owner has enabled the hybrid brain it goes
+        # to the frontier model (Opus 4.8) while execution stays local. Dormant by
+        # default (select_brain -> "local"), and any frontier hiccup falls back to local.
+        frontier = getattr(self.llm, "frontier", None)
+        use_frontier = frontier is not None and select_brain(self.settings) == "frontier"
+
+        async def _plan_complete(messages: list[dict[str, str]]) -> Any:
+            if use_frontier and frontier is not None:
+                with suppress(Exception):
+                    frontier_result = await frontier.complete(messages)
+                    if getattr(frontier_result, "ok", False) and getattr(
+                        frontier_result, "content", ""
+                    ):
+                        return frontier_result
+            return await _complete(messages)
 
         async def _run_tool(name: str, arguments: dict[str, Any]) -> Any:
             return await self.tools.run(
@@ -3743,6 +3760,7 @@ class AgentRuntime:
             run_tool=_run_tool,
             tool_specs=tool_specs,
             emit=_emit_step,
+            plan_complete=_plan_complete,
         )
         result = await orchestrator.run(message)
         if not result.answer:
