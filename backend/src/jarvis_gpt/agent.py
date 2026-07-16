@@ -6194,10 +6194,28 @@ class AgentRuntime:
             if not args.get("file_id"):
                 args.pop("file_id", None)
         else:
+            body = intent["body"]
+            # The deterministic body builder echoes the task under a "# Report"
+            # heading when no inline content was supplied. Under owner autonomy that
+            # placeholder is unacceptable — generate the real document in one focused
+            # pass. On any failure the original body is kept, so behaviour never
+            # regresses below the deterministic baseline.
+            if (
+                self._owner_autonomy_active()
+                and self.settings.llm_enabled
+                and _artifact_body_is_placeholder(body)
+            ):
+                generated = await self._synthesize_file_body(
+                    goal=str(intent.get("request") or intent.get("title") or ""),
+                    material="",
+                    output_format=str(intent["output_format"]),
+                )
+                if generated and not _artifact_body_is_placeholder(generated):
+                    body = generated
             bound_dest = allowed_root / str(intent["output_name"])
             args = {
                 "title": intent["title"],
-                "body": intent["body"],
+                "body": body,
                 "output_format": intent["output_format"],
                 "output_name": intent["output_name"],
                 "destination": str(bound_dest),
@@ -12994,6 +13012,24 @@ def _artifact_body_from_message(message: str, *, original_goal: str = "") -> str
     )
 
 
+def _artifact_body_is_placeholder(body: str) -> bool:
+    """True when a NEW_ARTIFACT body is a deterministic placeholder, not real content.
+
+    ``_artifact_body_from_message`` never generates content; when the request did
+    not carry an inline body it echoes the task under a ``# Report`` heading. Under
+    owner autonomy that stub is replaced with a real, generated document.
+    """
+
+    text = str(body or "").strip()
+    if not text:
+        return True
+    if text.startswith("# Report\n\nPrepared for the original request"):
+        return True
+    # The residual/about stubs are always short "# Report\n\n<echo>" bodies; a real
+    # document that legitimately opens with "# Report" is far longer.
+    return text.startswith("# Report") and len(text) < 400
+
+
 def _looks_like_host_filesystem_write(message: str) -> bool:
     """True for absolute host paths that are not document-outputs artifacts.
 
@@ -13187,6 +13223,7 @@ def _new_artifact_intent_from_message(
         },
         "transformation_instruction": transformation_instruction,
         "allowed_root": _DOCUMENT_OUTPUT_DIR,
+        "request": (original_goal or message)[:2000],
     }
 
 
