@@ -68,3 +68,19 @@ and after a change rather than assuming a red test is a new regression.
 - Incoming requests are folded through `_fold_operator_confusables` before intent
   detection (zero-width/non-breaking spaces, `ё`→`е`, NFC) so copy-paste and phrasing
   quirks do not defeat command recognition.
+
+## Hybrid brain (scaffold — INACTIVE)
+
+- The active brain is the local Gemma profile. `backend/src/jarvis_gpt/frontier_brain.py`
+  is a **prepared-but-off** second brain that can delegate hard reasoning/synthesis to a
+  frontier model. It is dormant: `build_frontier_brain` returns `None` and `select_brain`
+  returns `"local"` unless the owner opts in, so `LLMRouter.frontier` is `None` and nothing
+  delegates. **Do not route through it or invoke it until the owner asks.**
+- By owner requirement it reaches the frontier model through the **logged-in Claude Code
+  CLI** (their subscription), **not** a billed API key: `claude -p <prompt> --model
+  claude-opus-4-8 --effort medium --output-format text`. The fixed target is **Opus 4.8 at
+  medium effort**.
+- Activate later with `JARVIS_ENABLE_HYBRID_BRAIN=1` (optional overrides:
+  `JARVIS_FRONTIER_MODEL`, `JARVIS_FRONTIER_EFFORT`, `JARVIS_FRONTIER_CLI`,
+  `JARVIS_FRONTIER_TIMEOUT_SEC`). `select_brain()` is the single flip-point to wire agent
+  hard-reasoning calls through. Tests: `backend/tests/test_frontier_brain.py`.

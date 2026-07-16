@@ -287,6 +287,16 @@ class JarvisSettings:
     api_host: str
     api_port: int
     api_require_token_on_loopback: bool
+    # ---- Hybrid brain (SCAFFOLD — INACTIVE by default) --------------------------
+    # A prepared-but-off delegation of hard reasoning/synthesis to a frontier model
+    # reached through the owner's *logged-in Claude Code CLI subscription* (NOT a
+    # billed API key). Nothing routes here while `hybrid_brain_enabled` is False.
+    # See frontier_brain.py for the whole story and how to activate it.
+    hybrid_brain_enabled: bool
+    frontier_cli_path: str
+    frontier_model: str
+    frontier_effort: str
+    frontier_timeout_sec: float
 
     def public_dict(self) -> dict[str, object]:
         return {
@@ -336,6 +346,16 @@ class JarvisSettings:
                 "host": self.api_host,
                 "port": self.api_port,
                 "require_token_on_loopback": self.api_require_token_on_loopback,
+            },
+            # Hybrid brain is a dormant scaffold; surfaced here so its status is
+            # always visible in the settings dump even while inactive.
+            "hybrid_brain": {
+                "enabled": self.hybrid_brain_enabled,
+                "status": "active" if self.hybrid_brain_enabled else "scaffold (inactive)",
+                "backend": "claude-code-cli-subscription",
+                "cli_path": self.frontier_cli_path,
+                "model": self.frontier_model,
+                "effort": self.frontier_effort,
             },
         }
 
@@ -398,6 +418,14 @@ def load_settings(profile_name: str | None = None) -> JarvisSettings:
         api_host=os.environ.get("JARVIS_API_HOST", "0.0.0.0"),
         api_port=_int_env("JARVIS_API_PORT", 8000),
         api_require_token_on_loopback=_bool_env("JARVIS_API_REQUIRE_TOKEN_ON_LOOPBACK", False),
+        # Hybrid brain: SCAFFOLD ONLY. Off unless the owner explicitly opts in. When
+        # enabled it delegates to the logged-in `claude` CLI (subscription, no key).
+        hybrid_brain_enabled=_bool_env("JARVIS_ENABLE_HYBRID_BRAIN", False),
+        frontier_cli_path=os.environ.get("JARVIS_FRONTIER_CLI", "claude"),
+        # Owner requirement: the frontier brain is Opus 4.8 at medium effort.
+        frontier_model=os.environ.get("JARVIS_FRONTIER_MODEL", "claude-opus-4-8"),
+        frontier_effort=os.environ.get("JARVIS_FRONTIER_EFFORT", "medium"),
+        frontier_timeout_sec=_float_env("JARVIS_FRONTIER_TIMEOUT_SEC", 180.0),
     )
 
 

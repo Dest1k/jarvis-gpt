@@ -15,6 +15,7 @@ from typing import Any, Literal, TypeVar
 import httpx
 
 from .config import JarvisSettings, detect_repeated_token_degeneration
+from .frontier_brain import FrontierBrain, build_frontier_brain
 from .model_catalog import ModelCatalog
 
 
@@ -88,6 +89,12 @@ def background_llm_priority(llm: Any) -> Iterator[None]:
 class LLMRouter:
     def __init__(self, settings: JarvisSettings) -> None:
         self.settings = settings
+        # Hybrid brain: SCAFFOLD, INACTIVE. `build_frontier_brain` returns None while
+        # the owner has not enabled it (JARVIS_ENABLE_HYBRID_BRAIN), so `self.frontier`
+        # is None and nothing delegates to the frontier model. When switched on it
+        # becomes a FrontierBrain that answers via the logged-in Claude Code CLI
+        # (subscription, not an API key). See frontier_brain.py.
+        self.frontier: FrontierBrain | None = build_frontier_brain(settings)
         self._priority: ContextVar[LLMPriority] = ContextVar(
             f"jarvis_llm_priority_{id(self)}",
             default="foreground",
