@@ -45,7 +45,10 @@ class WebBudgetLimits:
 MODE_LIMITS: Mapping[WebMode, WebBudgetLimits] = {
     WebMode.FAST_FACT: WebBudgetLimits(
         deadline_sec=5.0,
-        search_requests=3,
+        # 4 lets an independent fallback engine (Mojeek) be tried after the three
+        # mainstream engines; `stop_when` short-circuits on the first success, so a
+        # healthy DuckDuckGo still costs a single request.
+        search_requests=4,
         fetches=0,
         renders=0,
         network_bytes=1_000_000,

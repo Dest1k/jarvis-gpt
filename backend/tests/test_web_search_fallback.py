@@ -7,6 +7,7 @@ parser against markup shaped like Mojeek's real output.
 
 from __future__ import annotations
 
+from jarvis_gpt.tools import _parse_mojeek_results, _web_search_url
 from jarvis_gpt.web_surfer import _parse_mojeek_html
 
 # Shaped exactly like a real Mojeek results page (verified against a live fetch):
@@ -41,3 +42,17 @@ def test_parse_mojeek_html_extracts_results():
 def test_parse_mojeek_html_ignores_non_http_and_empty():
     assert _parse_mojeek_html("") == []
     assert _parse_mojeek_html("<a class='title' href='ftp://x'>x</a>") == []
+
+
+def test_tools_mojeek_provider_parser_and_url():
+    # The main web.search route uses Mojeek as an independent keyless fallback engine
+    # after DuckDuckGo/Bing/Yandex. Its parser yields the shared {title,url,snippet,rank}.
+    results = _parse_mojeek_results(_MOJEEK_HTML, limit=6)
+    assert len(results) == 2
+    assert results[0]["url"] == "https://nodejs.org/en/about/previous-releases"
+    assert results[0]["rank"] == 1
+    assert results[1]["rank"] == 2
+    assert "release cycle" in results[0]["snippet"]
+
+    url = _web_search_url("mojeek_html", "node lts", region="ru-RU", freshness="any", page=0)
+    assert url == "https://www.mojeek.com/search?q=node+lts"

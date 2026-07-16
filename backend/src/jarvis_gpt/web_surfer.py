@@ -228,7 +228,10 @@ class SurferConfig:
     viewport_height: int = 900
     nav_timeout_ms: int = 30_000
     default_timeout_ms: int = 15_000
-    fast_fact_budget_sec: float = 2.0
+    # 2s was too tight: the DuckDuckGo API alone routinely exceeded it and the whole
+    # fast-fact returned empty. 5s lets the primary provider answer and still leaves
+    # room for the HTML fallback while staying interactive.
+    fast_fact_budget_sec: float = 5.0
     deep_research_budget_sec: float = 45.0
     shopping_budget_sec: float = 60.0
     max_concurrency: int = 3

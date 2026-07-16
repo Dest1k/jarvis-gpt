@@ -11844,7 +11844,13 @@ def _web_search_requests(
     limit: int,
 ) -> list[dict[str, Any]]:
     selected = (
-        [*_available_api_search_providers(vertical), "duckduckgo_html", "bing_html", "yandex_html"]
+        [
+            *_available_api_search_providers(vertical),
+            "duckduckgo_html",
+            "bing_html",
+            "yandex_html",
+            "mojeek_html",
+        ]
         if provider in {"", "auto", "all"}
         else _available_api_search_providers(vertical)
         if provider == "api"
@@ -11902,6 +11908,8 @@ def _search_provider_name(provider: str) -> str:
         "yandex": "yandex_html",
         "ya": "yandex_html",
         "yandex_html": "yandex_html",
+        "mojeek": "mojeek_html",
+        "mojeek_html": "mojeek_html",
     }.get(provider, "")
 
 
@@ -12197,6 +12205,10 @@ def _web_search_url(
         if yandex_within:
             params["within"] = yandex_within
         return f"https://yandex.ru/search/?{urlencode(params)}"
+    if source == "mojeek_html":
+        # Keyless, independent engine. No regional/freshness params — Mojeek keeps
+        # it simple, which is exactly why it survives when the big engines throttle.
+        return f"https://www.mojeek.com/search?{urlencode({'q': query})}"
     return ""
 
 
@@ -12224,6 +12236,8 @@ def _web_parse_search_results(
         return _parse_bing_results(body, limit=limit)
     if source == "yandex_html":
         return _parse_yandex_results(body, limit=limit)
+    if source == "mojeek_html":
+        return _parse_mojeek_results(body, limit=limit)
     return _parse_duckduckgo_results(body, limit=limit)
 
 
@@ -12369,6 +12383,37 @@ def _parse_duckduckgo_results(html: str, *, limit: int) -> list[dict[str, Any]]:
                 "snippet": snippet,
                 "rank": len(results) + 1,
             }
+        )
+        seen.add(url)
+        if len(results) >= limit:
+            break
+    return results
+
+
+def _parse_mojeek_results(html: str, *, limit: int) -> list[dict[str, Any]]:
+    """Parse Mojeek HTML results — an independent, keyless fallback engine.
+
+    Mojeek's markup: <a class="title" ... href="URL">TITLE</a> then <p class="s">SNIPPET</p>.
+    """
+
+    results: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    title_pattern = re.compile(
+        r'<a\s+class="title"[^>]*href="(?P<href>[^"]+)"[^>]*>(?P<title>.*?)</a>',
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    snippet_pattern = re.compile(r'<p\s+class="s">(.*?)</p>', flags=re.IGNORECASE | re.DOTALL)
+    snippets = snippet_pattern.findall(html)
+    for index, match in enumerate(title_pattern.finditer(html)):
+        url = unescape(match.group("href"))
+        title = _html_to_text(match.group("title"))
+        if not url or not title or url in seen:
+            continue
+        if urlparse(url).scheme not in {"http", "https"}:
+            continue
+        snippet = _html_to_text(snippets[index]) if index < len(snippets) else ""
+        results.append(
+            {"title": title, "url": url, "snippet": snippet, "rank": len(results) + 1}
         )
         seen.add(url)
         if len(results) >= limit:
