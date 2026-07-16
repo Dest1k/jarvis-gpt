@@ -28,6 +28,22 @@ Note: some tests exercise Windows/PowerShell host-bridge scripts and fail on
 Linux CI hosts regardless of code changes — diff the failing-test set before
 and after a change rather than assuming a red test is a new regression.
 
+## Documents & spreadsheets
+
+- DOCX and XLSX are generated as **hand-rolled OpenXML** in
+  `backend/src/jarvis_gpt/document_runtime.py` — there is intentionally no
+  `python-docx`/`openpyxl` runtime dependency, so generation works offline with no
+  install step. `write_markdown_docx` renders Markdown (heading styles, inline
+  bold/italic/`code`/links, bullet & numbered lists, bordered tables with a shaded
+  header). `write_workbook_xlsx` builds real spreadsheets (typed cells, `=formulas`,
+  bold frozen auto-filtered header); `build_workbook_sheets` accepts a structured
+  `sheets` arg or parses Markdown tables / CSV. Both are exposed through
+  `documents.generate` (xlsx via `output_format="xlsx"` + optional `sheets`).
+- When changing the OpenXML writers, validate the output with a real Office parser
+  (openpyxl / python-docx via `uv run --with ...`) **and** round-trip through the
+  project's own `extract_document` — malformed XML still writes a file but won't open
+  in Office. Tests live in `backend/tests/test_document_generation.py`.
+
 ## Operator permissions / autonomy
 
 - The runtime ships in **owner full-autonomy** mode: `JARVIS_OPERATOR_FULL_AUTONOMY`

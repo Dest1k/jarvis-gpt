@@ -52,6 +52,7 @@ from .document_memory import DocumentMemory
 from .document_runtime import (
     DocumentRuntimeError,
     apply_document_replacements,
+    build_workbook_sheets,
     compare_documents,
     copy_document,
     document_mime_type,
@@ -62,6 +63,7 @@ from .document_runtime import (
     verify_document_artifact,
     write_exact_text_artifact,
     write_markdown_docx,
+    write_workbook_xlsx,
 )
 from .document_surfer import (
     DocumentGenerationError,
@@ -1596,14 +1598,26 @@ class ToolRegistry:
                 name="documents.generate",
                 description=(
                     "Generate a new document artifact (md/txt/csv/json/html/docx/xlsx) under "
-                    "document-outputs. Honors exact output_path/output_name including "
+                    "document-outputs. DOCX renders Markdown natively with heading styles, "
+                    "bold/italic/`code`/links, bullet & numbered lists, and bordered tables "
+                    "with a shaded header. XLSX builds a real spreadsheet: pass structured "
+                    "`sheets`, or Markdown tables / CSV in `body`; numeric cells are typed, "
+                    "cells starting with '=' become formulas, and the header row is bold, "
+                    "frozen and auto-filtered. Honors exact output_path/output_name including "
                     "subdirectories. Never overwrites source files."
                 ),
                 category="documents",
                 input_schema={
-                    "title": "Document title",
-                    "body": "Main body text or list of sections (written exactly for md/txt)",
+                    "title": "Document title (also the workbook title / first sheet name)",
+                    "body": (
+                        "Main body: Markdown for docx (headings/lists/tables/inline), exact "
+                        "text for md/txt, or Markdown tables / CSV for xlsx"
+                    ),
                     "output_format": "md|txt|csv|json|html|docx|xlsx",
+                    "sheets": (
+                        "XLSX only: list of {name, rows} where rows is a list of cell lists. "
+                        "Cells may be numbers, strings, or '=FORMULA'. Each list is a sheet."
+                    ),
                     "output_name": "Optional output filename or root-relative path",
                     "output_path": "Optional absolute/relative destination under document-outputs",
                     "destination": "Alias of output_path",
@@ -5557,6 +5571,29 @@ def _documents_generate(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
                     "path": written["path"],
                     "name": written["name"],
                     "format": "docx",
+                    "size": written["size"],
+                    "sha256": written["sha256"],
+                },
+                "title": title,
+                "structure": written.get("structure") or {},
+                "verification": written["verification"],
+                "warnings": [],
+            }
+            output_path = Path(written["path"])
+        elif output_format in {"xlsx", "xlsm"}:
+            sheets = build_workbook_sheets(
+                sheets=args.get("sheets"),
+                body=body_text,
+                default_name=title or "Sheet1",
+            )
+            written = write_workbook_xlsx(destination, sheets, title=title)
+            result = {
+                "ok": True,
+                "mode": "generate",
+                "output": {
+                    "path": written["path"],
+                    "name": written["name"],
+                    "format": "xlsx",
                     "size": written["size"],
                     "sha256": written["sha256"],
                 },
@@ -15603,19 +15640,33 @@ def _web_source_quality(url: str, *, fetched: bool) -> str:
     return "web-source"
 
 
+def _format_reference(index: int, title: str, site: str, url: str) -> str:
+    """One academic-style numbered reference: ``[n] Title. site. url``."""
+
+    parts = [f"[{index}] {_short_text(str(title), 160)}"]
+    if site:
+        parts.append(site)
+    parts.append(url)
+    return ". ".join(part for part in parts if part)
+
+
 def _research_citations(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
     citations = []
     for index, source in enumerate(sources, start=1):
         url = str(source.get("url") or "")
         if not url:
             continue
+        title = source.get("title") or url
+        site = _url_domain(url)
         citations.append(
             {
                 "id": str(index),
-                "title": source.get("title") or url,
+                "title": title,
                 "url": url,
+                "site": site,
                 "evidence_id": source.get("evidence_id"),
                 "quality": source.get("quality"),
+                "reference": _format_reference(index, title, site, url),
             }
         )
     return citations
