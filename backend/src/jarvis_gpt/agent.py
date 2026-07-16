@@ -3686,6 +3686,69 @@ class AgentRuntime:
         registry_run = getattr(run_method, "__self__", None) is self.tools
         return shop_keys if registry_run or _web_surfer_available() else []
 
+    async def _run_task_orchestration(
+        self,
+        message: str,
+        context: AgentContext,
+    ) -> DirectAction | None:
+        """Run a multi-step request through the universal plan-execute-synthesize engine.
+
+        Restricted to non-review/danger tools: the orchestrator advances research and
+        computation autonomously, while any mutating/dangerous capability still goes
+        through the normal operator-authorized path, never an unattended plan step. The
+        step-by-step trace is audit-only; the operator sees the synthesized answer.
+        """
+
+        from .task_orchestrator import TaskOrchestrator
+
+        available = {
+            info.name: info
+            for info in self._tools_for_context(context)
+            if getattr(info, "danger_level", "safe") not in {"review", "danger"}
+        }
+        tool_specs = [
+            (name, available[name].description)
+            for name in _ORCHESTRATOR_TOOL_MENU
+            if name in available
+        ]
+        if not tool_specs:
+            return None
+        events: list[ChatEvent] = []
+
+        async def _complete(messages: list[dict[str, str]]) -> Any:
+            return await self._complete_llm(
+                messages, temperature=0.2, max_tokens=None, thinking_enabled=False
+            )
+
+        async def _run_tool(name: str, arguments: dict[str, Any]) -> Any:
+            return await self.tools.run(
+                name,
+                arguments,
+                conversation_id=context.conversation_id,
+                user_message_id=context.operator_message_id,
+            )
+
+        async def _emit_step(kind: str, payload: dict[str, Any]) -> None:
+            event = ChatEvent(
+                type="thought",
+                title=f"orchestrator.{kind}",
+                content=str(payload.get("goal") or ""),
+                payload=payload,
+            )
+            events.append(event)
+            await self._emit(event)
+
+        orchestrator = TaskOrchestrator(
+            complete=_complete,
+            run_tool=_run_tool,
+            tool_specs=tool_specs,
+            emit=_emit_step,
+        )
+        result = await orchestrator.run(message)
+        if not result.answer:
+            return None
+        return DirectAction(answer=result.answer, events=events)
+
     async def _try_direct_action(
         self,
         message: str,
@@ -3702,6 +3765,16 @@ class AgentRuntime:
             # kernel. Weather, shopping, web follow-ups, and other fuzzy direct
             # routes must not intercept the turn before document evidence loads.
             return None
+        # Multi-step requests (lookup + compute/compare) go to the universal
+        # plan-execute-synthesize orchestrator instead of a single shallow pipe.
+        if (
+            context is not None
+            and self._owner_autonomy_active()
+            and _looks_like_multistep(message)
+        ):
+            orchestrated = await self._run_task_orchestration(message, context)
+            if orchestrated is not None:
+                return orchestrated
         native_action = _native_action_from_message(
             message,
             self.settings,
@@ -11340,6 +11413,46 @@ def _looks_like_osint_query(normalized: str) -> bool:
             "osint",
         ),
     )
+
+
+# A weak planner picks the wrong tool when handed the whole 30-tool surface (e.g.
+# web.shop_search, which needs a specific shop, for a general "compare prices" step).
+# The orchestrator plans against a small, curated menu of general-purpose tools; steps
+# still execute normally, just from a menu the planner can reason about reliably.
+# web.research (search + page fetch + synthesis) is the discovery tool rather than
+# snippets-only web.search, so a multi-hop step returns real data, not just links.
+_ORCHESTRATOR_TOOL_MENU: tuple[str, ...] = (
+    "web.research",
+    "web.fetch",
+    "system.inspect",
+    "documents.generate",
+)
+
+
+def _looks_like_multistep(message: str) -> bool:
+    """Detect requests that need a real multi-hop plan (lookup + compute/compare).
+
+    Deliberately conservative: it fires for the classes the owner named as painful —
+    cheapest-X comparison and cost-with-real-lookup — so the universal orchestrator
+    proves out on them before the trigger is widened. Everything else keeps its path.
+    """
+
+    text = _fold_operator_confusables(str(message or "")).casefold()
+    if not text:
+        return False
+    cheapest = bool(
+        re.search(r"(где|куда|у кого)\b.{0,24}(дешевл|выгодн)", text)
+        or "дешевле всего" in text
+        or re.search(r"сам\w*\s+деш[её]в", text)
+    )
+    cost_lookup = bool(
+        re.search(r"(посчита|рассчита|сколько\b.{0,18}сто|во сколько\b.{0,18}(обойд|встан))", text)
+        and re.search(
+            r"(поездк|поездку|билет|перел[её]т|маршрут|доехать|добраться|доставк|тур\b)",
+            text,
+        )
+    )
+    return cheapest or cost_lookup
 
 
 def _looks_like_shopping_query(normalized: str) -> bool:
