@@ -34,6 +34,55 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
+def load_local_env_file(path: str | Path | None = None) -> list[str]:
+    """Populate ``os.environ`` from a gitignored ``KEY=VALUE`` secrets file, if present.
+
+    The backend reads every secret from the process environment (no dotenv). To let
+    the owner persist secrets — search API keys, tokens — in a file instead of
+    exporting them on every launch, the CLI reads a simple ``.env``-style file at
+    startup. Rules are deliberately minimal and safe:
+
+    - default path ``backend/.env.local`` (already gitignored via ``.env.*``),
+      overridable with ``JARVIS_ENV_FILE``;
+    - ``KEY=VALUE`` lines; ``#`` comments and blank lines skipped; an optional
+      ``export`` prefix and surrounding single/double quotes on the value are stripped;
+    - an already-set environment variable is **never** overridden, so an explicit
+      shell ``export`` / ``$env:`` always wins over the file.
+
+    Returns the names (never the values) of the keys it applied, for optional logging.
+    """
+
+    if path is not None:
+        target = Path(path)
+    elif os.environ.get("JARVIS_ENV_FILE"):
+        target = Path(os.environ["JARVIS_ENV_FILE"])
+    else:
+        target = Path(__file__).resolve().parents[2] / ".env.local"
+    if not target.is_file():
+        return []
+    try:
+        raw = target.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    applied: list[str] = []
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("export "):
+            stripped = stripped[len("export ") :].strip()
+        key, sep, value = stripped.partition("=")
+        key = key.strip()
+        if not sep or not key or key in os.environ:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1]
+        os.environ[key] = value
+        applied.append(key)
+    return applied
+
+
 def default_home() -> Path:
     raw = os.environ.get("JARVIS_HOME")
     if raw:

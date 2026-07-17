@@ -14,7 +14,7 @@ import uvicorn
 from .agent import AgentRuntime
 from .approval_executor import ApprovalExecutor
 from .cognitive_memory import ExecutionPlaybookStore, HostProfileManager
-from .config import PROFILES, ensure_runtime_dirs, load_settings
+from .config import PROFILES, ensure_runtime_dirs, load_local_env_file, load_settings
 from .diagnostics import run_diagnostics
 from .dispatcher import DispatcherManager
 from .event_bus import EventBus
@@ -746,6 +746,9 @@ def _parse_set_value(value: str) -> Any:
 
 
 def main() -> None:
+    # Load the gitignored backend/.env.local (search API keys, tokens) into the
+    # environment before anything reads it. Explicit shell env always wins.
+    load_local_env_file()
     parser = build_parser()
     args = parser.parse_args()
     args.func(args)
