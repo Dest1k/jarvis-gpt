@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sqlite3
 from collections.abc import Iterator
 from contextlib import asynccontextmanager, contextmanager, suppress
@@ -506,6 +507,12 @@ def cmd_mission_run(args: argparse.Namespace) -> None:
 
 
 def cmd_serve(args: argparse.Namespace) -> None:
+    # uvicorn imports "jarvis_gpt.main:app" (optionally in a reloader subprocess), and that
+    # module calls load_settings() with no argument — it reads JARVIS_PROFILE from the env,
+    # not args.profile. Propagate the requested profile through the env so `--profile X
+    # serve` actually serves on profile X instead of the gemma default.
+    if args.profile:
+        os.environ["JARVIS_PROFILE"] = args.profile
     settings = load_settings(args.profile)
     uvicorn.run(
         "jarvis_gpt.main:app",
