@@ -32,3 +32,6 @@ D:/jarvis/
 /cache/
 /logs/
 /models/
+
+# HuggingFace token for model downloads (never commit)
+hf_token.txt
