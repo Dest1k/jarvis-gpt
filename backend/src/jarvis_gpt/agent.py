@@ -2446,7 +2446,15 @@ class AgentRuntime:
                     "reserved mission id is bound to a different goal; creation blocked"
                 )
             if self.executive is not None:
-                self.executive.ensure_for_mission(existing)
+                try:
+                    self.executive.ensure_for_mission(existing)
+                except RuntimeError:
+                    # The reserved mission (deterministic id = goal digest) is in a broken
+                    # state with no recoverable executive plan; the executive already
+                    # fail-closed it. Re-requesting the same goal must not surface a 500 —
+                    # return the now-failed mission so the mission runner reports it
+                    # gracefully instead of crashing the chat turn.
+                    return self.storage.get_mission(mission_id) or existing
                 existing = self.storage.get_mission(mission_id) or existing
             return existing
 
