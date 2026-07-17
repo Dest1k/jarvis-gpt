@@ -26,6 +26,7 @@ from . import persona as persona_module
 from .browser_cdp import DEFAULT_CHROME_DEBUG_URL
 from .cognitive_memory import ExecutionPlaybookStore
 from .config import JarvisSettings
+from .document_memory import parse_document_date_scope
 from .embeddings import (
     EmbeddingBackend,
     lexical_vector,
@@ -6692,10 +6693,16 @@ class AgentRuntime:
             and not _looks_like_live_web_query(message)
             and _classify_document_artifact_intent(message)
             not in {NEW_ARTIFACT_REQUEST, TRANSFORM_EXISTING_DOCUMENT}
-            and _looks_like_document_memory_query(
-                message,
-                has_file_context=bool(context.file_hits),
-                has_persisted_files=bool(self.storage.list_files(limit=1)),
+            and (
+                # A date-scoped document question ("какие документы были 15 июля?",
+                # "сделай вывод из документов за вчера") routes here so recall can
+                # select by upload date rather than by relevance.
+                parse_document_date_scope(message) is not None
+                or _looks_like_document_memory_query(
+                    message,
+                    has_file_context=bool(context.file_hits),
+                    has_persisted_files=bool(self.storage.list_files(limit=1)),
+                )
             )
         ):
             return TaskKernelPlan(
@@ -7474,15 +7481,40 @@ class AgentRuntime:
         arguments: dict[str, Any] = {"query": message}
         if file_ids:
             arguments["file_ids"] = file_ids[:4]
+        # A date-scoped question selects persisted documents by their upload date instead
+        # of by relevance, and lists them (or concludes over them) rather than needing a
+        # single file identity.
+        date_scope = parse_document_date_scope(message)
+        if date_scope is not None:
+            arguments["date_from"] = date_scope.start_utc
+            arguments["date_to"] = date_scope.end_utc
+            arguments["list_only"] = not date_scope.conclude
+            if date_scope.conclude:
+                arguments["max_files"] = 6
         result = await self.tools.run("documents.recall", arguments)
         # The recall result is the validated document boundary for this turn.
         # Do not also expose loose FTS chunks that the selector may have rejected.
         context.file_hits = []
         observation = _tool_observation_excerpt(result)
-        observation += (
-            "\nRespond to the operator from this evidence. Name source files used. "
-            "If selection is empty or ambiguous, ask for the missing file identity; do not guess."
-        )
+        if date_scope is not None:
+            observation += (
+                "\nThis is a date-scoped document recall (by upload date). Answer the "
+                "operator directly from `documents`: if any were found, list them with "
+                "name and upload date"
+                + (
+                    ", then give the requested conclusion drawn from their contents."
+                    if date_scope.conclude
+                    else "."
+                )
+                + " If `documents` is empty, state plainly that no documents were uploaded "
+                "in that period. Do not ask for a file name."
+            )
+        else:
+            observation += (
+                "\nRespond to the operator from this evidence. Name source files used. "
+                "If selection is empty or ambiguous, ask for the missing file identity; "
+                "do not guess."
+            )
         recalled_sources = _document_recall_sources(result)
         event = ChatEvent(
             type="tool_call",
@@ -10549,6 +10581,8 @@ def _observation_data(tool: str, data: dict[str, Any]) -> dict[str, Any]:
             "errors",
         ),
         "documents.recall": (
+            "date_scope",
+            "documents",
             "trust",
             "selection",
             "sources",

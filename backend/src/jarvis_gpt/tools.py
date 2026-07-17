@@ -5208,6 +5208,9 @@ def _documents_recall(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
     max_files = _int_arg(args.get("max_files"), default=3, minimum=1, maximum=8)
     max_chars = _int_arg(args.get("max_chars"), default=60000, minimum=1000, maximum=80000)
     focus = " ".join(str(args.get("focus") or "").split()).strip() or None
+    date_from = str(args.get("date_from") or "").strip() or None
+    date_to = str(args.get("date_to") or "").strip() or None
+    list_only = _bool_arg(args.get("list_only"), default=False)
     try:
         memory = DocumentMemory(storage=ctx.storage, surfer=_document_surfer_for(ctx))
         result = memory.recall(
@@ -5216,9 +5219,28 @@ def _documents_recall(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
             max_files=max_files,
             max_chars=max_chars,
             focus=focus,
+            date_from=date_from,
+            date_to=date_to,
+            list_only=list_only,
         )
     except (ValueError, DocumentSurferError) as exc:
         return ToolRunResponse(tool="documents.recall", ok=False, summary=str(exc))
+    # Date-scoped recall ("documents from 15 July") is always ok; report the count and
+    # whether it was a listing or a conclusion instead of the identity-match phrasing.
+    if result.get("date_scope"):
+        documents = result.get("documents") or []
+        if not documents:
+            summary = "No documents were uploaded in the given date range."
+        elif result.get("mode") == "list":
+            summary = f"Found {len(documents)} document(s) uploaded in the given date range."
+        else:
+            analyzed = int((result.get("selection") or {}).get("analyzed") or 0)
+            summary = (
+                f"Analyzed {analyzed} of {len(documents)} document(s) from the date range."
+            )
+        return ToolRunResponse(
+            tool="documents.recall", ok=True, summary=summary, data=result
+        )
     selection = result.get("selection") if isinstance(result.get("selection"), dict) else {}
     matched = int(selection.get("matched") or 0)
     analyzed = int(selection.get("analyzed") or 0)

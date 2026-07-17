@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +17,173 @@ from .storage import JarvisStorage
 
 DOCUMENT_MEMORY_PROTOCOL = "jarvis.document-memory.v1"
 DEFAULT_TOTAL_TEXT_CHARS = 18_000
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentDateScope:
+    """A resolved date window for recalling documents by their upload date.
+
+    ``start_utc``/``end_utc`` are ISO-8601 ``+00:00`` strings comparable directly against
+    ``files.created_at``; ``end_utc`` is exclusive. ``conclude`` is True when the operator
+    asked for an analysis/verdict over the documents rather than a bare listing.
+    """
+
+    start_utc: str
+    end_utc: str
+    label: str
+    conclude: bool
+
+
+_DATE_SCOPE_DOC_NOUNS = (
+    "документ", "докумен", "файл", "вложен", "document", "file", "attachment",
+)
+_DATE_SCOPE_CONCLUDE_MARKERS = (
+    "вывод", "выводы", "проанализир", "анализ", "что следует", "к чему",
+    "итог", "обобщ", "резюм", "подытож", "сделай вывод", "суть",
+    "summary", "summarize", "analyze", "analyse", "conclusion", "conclude",
+)
+# Month stems: "март" is distinct from "ма[йяе]" (may forms), so no conflict.
+_MONTH_STEMS: tuple[tuple[str, int], ...] = (
+    ("январ", 1), ("феврал", 2), ("март", 3), ("апрел", 4), ("ма[йяе]", 5),
+    ("июн", 6), ("июл", 7), ("август", 8), ("сентябр", 9), ("октябр", 10),
+    ("ноябр", 11), ("декабр", 12),
+)
+_MONTH_ALT = "|".join(stem for stem, _ in _MONTH_STEMS)
+_MONTH_NAMES_RU = (
+    "", "января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря",
+)
+
+
+def _month_from_word(word: str) -> int | None:
+    for stem, number in _MONTH_STEMS:
+        if re.match(rf"^{stem}", word):
+            return number
+    return None
+
+
+def _local_midnight(reference: datetime, year: int, month: int, day: int) -> datetime:
+    return datetime(year, month, day, tzinfo=reference.tzinfo)
+
+
+def _year_not_in_future(reference: datetime, month: int, day: int) -> int:
+    """Pick a year for a bare "DD month": current, or last year if that is still ahead."""
+
+    try:
+        candidate = _local_midnight(reference, reference.year, month, day)
+    except ValueError:
+        return reference.year
+    return reference.year if candidate <= reference else reference.year - 1
+
+
+def _match_document_date_window(
+    text: str, now: datetime
+) -> tuple[datetime, datetime, str] | None:
+    today = _local_midnight(now, now.year, now.month, now.day)
+    if "позавчера" in text:
+        start = today - timedelta(days=2)
+        return start, start + timedelta(days=1), "позавчера"
+    if "вчера" in text:
+        start = today - timedelta(days=1)
+        return start, start + timedelta(days=1), "вчера"
+    if "сегодня" in text:
+        return today, today + timedelta(days=1), "сегодня"
+    # ISO 2026-07-15
+    iso = re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", text)
+    if iso:
+        try:
+            start = _local_midnight(now, int(iso[1]), int(iso[2]), int(iso[3]))
+        except ValueError:
+            return None
+        return start, start + timedelta(days=1), start.strftime("%Y-%m-%d")
+    # DD.MM(.YYYY)
+    dmy = re.search(r"\b(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?\b", text)
+    if dmy:
+        day, month = int(dmy[1]), int(dmy[2])
+        year = int(dmy[3]) if dmy[3] else _year_not_in_future(now, month, day)
+        if year < 100:
+            year += 2000
+        try:
+            start = _local_midnight(now, year, month, day)
+        except ValueError:
+            return None
+        return start, start + timedelta(days=1), f"{day:02d}.{month:02d}.{year}"
+    # DD <month> [YYYY]
+    dm = re.search(rf"\b(\d{{1,2}})\s+({_MONTH_ALT})[а-яё]*(?:\s+(\d{{4}}))?", text)
+    if dm:
+        day = int(dm[1])
+        month = _month_from_word(dm[2]) or 0
+        if month:
+            year = int(dm[3]) if dm[3] else _year_not_in_future(now, month, day)
+            try:
+                start = _local_midnight(now, year, month, day)
+            except ValueError:
+                return None
+            label = f"{day} {_MONTH_NAMES_RU[month]} {year}"
+            return start, start + timedelta(days=1), label
+    # прошлая / эта неделя
+    if re.search(r"прошл\w*\s+недел", text) or "на прошлой неделе" in text:
+        monday = today - timedelta(days=today.weekday() + 7)
+        return monday, monday + timedelta(days=7), "прошлая неделя"
+    if re.search(r"(эт\w*|текущ\w*)\s+недел", text) or "на этой неделе" in text:
+        monday = today - timedelta(days=today.weekday())
+        return monday, monday + timedelta(days=7), "эта неделя"
+    # прошлый / этот месяц
+    if re.search(r"прошл\w*\s+месяц", text) or "в прошлом месяце" in text:
+        first = _local_midnight(now, now.year, now.month, 1)
+        prev_end = first
+        prev_start = _local_midnight(
+            now, first.year - 1 if first.month == 1 else first.year,
+            12 if first.month == 1 else first.month - 1, 1,
+        )
+        return prev_start, prev_end, "прошлый месяц"
+    if re.search(r"(эт\w*|текущ\w*)\s+месяц", text):
+        first = _local_midnight(now, now.year, now.month, 1)
+        nxt = _local_midnight(
+            now, now.year + 1 if now.month == 12 else now.year,
+            1 if now.month == 12 else now.month + 1, 1,
+        )
+        return first, nxt, "этот месяц"
+    # за последние N дней / за N дней
+    days = re.search(r"последн\w*\s+(\d{1,3})\s+дн|за\s+(\d{1,3})\s+дн", text)
+    if days:
+        count = int(days[1] or days[2] or 0)
+        if 1 <= count <= 366:
+            start = today - timedelta(days=count - 1)
+            return start, today + timedelta(days=1), f"последние {count} дн."
+    if re.search(r"(за|последн\w*)\s+недел", text):
+        start = today - timedelta(days=6)
+        return start, today + timedelta(days=1), "последняя неделя"
+    return None
+
+
+def parse_document_date_scope(
+    message: str, *, now: datetime | None = None
+) -> DocumentDateScope | None:
+    """Detect a date-scoped document query and resolve its UTC window, else None.
+
+    Requires both a document noun ("документ"/"файл"/…) and a parseable date expression,
+    so a generic dated question is not hijacked. Relative dates ("вчера") resolve in the
+    machine's local timezone, then map to a UTC ``created_at`` window.
+    """
+
+    text = " ".join(str(message or "").casefold().split())
+    if not text or not any(noun in text for noun in _DATE_SCOPE_DOC_NOUNS):
+        return None
+    reference = now or datetime.now().astimezone()
+    if reference.tzinfo is None:
+        reference = reference.astimezone()
+    window = _match_document_date_window(text, reference)
+    if window is None:
+        return None
+    start, end, label = window
+    conclude = any(marker in text for marker in _DATE_SCOPE_CONCLUDE_MARKERS)
+    return DocumentDateScope(
+        start_utc=start.astimezone(UTC).isoformat(timespec="seconds"),
+        end_utc=end.astimezone(UTC).isoformat(timespec="seconds"),
+        label=label,
+        conclude=conclude,
+    )
 
 _RECALL_NOISE_STEMS = (
     "анализ",
@@ -246,12 +415,26 @@ class DocumentMemory:
         max_files: int = 3,
         max_chars: int = 60_000,
         focus: str | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        list_only: bool = False,
     ) -> dict[str, Any]:
         query_clean = " ".join(str(query or "").split()).strip()
-        if not query_clean and not file_ids:
-            raise ValueError("query or file_ids is required")
+        date_scoped = bool(date_from and date_to)
+        if not query_clean and not file_ids and not date_scoped:
+            raise ValueError("query, file_ids or a date range is required")
         max_files = max(1, min(8, int(max_files)))
         max_chars = max(1_000, min(80_000, int(max_chars)))
+        if date_scoped:
+            return self._recall_by_date(
+                query_clean,
+                date_from=str(date_from),
+                date_to=str(date_to),
+                list_only=list_only,
+                focus=focus,
+                max_files=max_files,
+                max_chars=max_chars,
+            )
         retrieval_query = _retrieval_query(query_clean)
         candidates, selection_mode, selection_errors = self._select_candidates(
             query_clean,
@@ -416,6 +599,74 @@ class DocumentMemory:
             "errors": errors,
             "trust": "untrusted_document_data",
         }
+
+    def _recall_by_date(
+        self,
+        query: str,
+        *,
+        date_from: str,
+        date_to: str,
+        list_only: bool,
+        focus: str | None,
+        max_files: int,
+        max_chars: int,
+    ) -> dict[str, Any]:
+        """Recall documents by upload date: list them, or read+conclude over them."""
+
+        records = self.storage.list_files_in_range(date_from, date_to, limit=200)
+        documents = [
+            {
+                "file_id": str(record.get("id") or ""),
+                "name": str(record.get("name") or ""),
+                "created_at": str(record.get("created_at") or ""),
+                "mime_type": str(record.get("mime_type") or ""),
+                "size": int(record.get("size") or 0),
+                "status": str(record.get("status") or ""),
+            }
+            for record in records
+        ]
+        scope = {"from": date_from, "to": date_to, "count": len(documents)}
+        base: dict[str, Any] = {
+            "protocol": DOCUMENT_MEMORY_PROTOCOL,
+            "ok": True,
+            "query": query,
+            "date_scope": scope,
+            "documents": documents,
+            "selection": {
+                "mode": "date",
+                "matched": len(documents),
+                "analyzed": 0,
+                "ambiguous": False,
+                "truncated": len(records) >= 200,
+            },
+            "sources": [],
+            "passages": [],
+            "analyses": [],
+            "corpus": None,
+            "errors": [],
+            "trust": "untrusted_document_data",
+        }
+        if list_only or not documents:
+            base["mode"] = "list"
+            return base
+        # Conclude mode reuses the full read/analyze/synthesis path via explicit file_ids,
+        # so the date branch adds no duplicate document-reading logic.
+        file_ids = [doc["file_id"] for doc in documents[:max_files] if doc["file_id"]]
+        analysis = self.recall(
+            query or focus or "Сделай вывод по этим документам.",
+            file_ids=file_ids,
+            max_files=max_files,
+            max_chars=max_chars,
+            focus=focus,
+        )
+        analysis["date_scope"] = scope
+        analysis["documents"] = documents
+        analysis["mode"] = "conclude"
+        # Documents provably existed for the day; a read failure downgrades to a listing
+        # with errors rather than reporting "nothing found".
+        if not analysis.get("ok"):
+            analysis["ok"] = True
+        return analysis
 
     def _select_candidates(
         self,

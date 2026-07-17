@@ -2064,6 +2064,31 @@ class JarvisStorage:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def list_files_in_range(
+        self, start: str, end: str, *, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        """List files uploaded in the [start, end) window (ISO created_at), oldest first.
+
+        ``created_at`` is an ISO-8601 UTC string (``utc_now``), so a lexicographic
+        comparison against ISO boundaries in the same ``+00:00`` form is a correct time
+        range. Used by date-scoped document recall ("какие документы были 15 июля").
+        """
+
+        with self._lock:
+            rows = self.connect().execute(
+                """
+                SELECT
+                    id, name, source_path, stored_path, mime_type, size, sha256,
+                    status, error, chunk_count, created_at, updated_at
+                FROM files
+                WHERE created_at >= ? AND created_at < ?
+                ORDER BY created_at ASC, rowid ASC
+                LIMIT ?
+                """,
+                (start, end, max(1, limit)),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def search_files(self, query: str, limit: int = 20) -> list[dict[str, Any]]:
         """Resolve persisted files by filename and indexed content.
 
