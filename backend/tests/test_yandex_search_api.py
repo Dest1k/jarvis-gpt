@@ -17,6 +17,7 @@ from jarvis_gpt.tools import (
     _api_search_request,
     _available_api_search_providers,
     _parse_yandex_api_results,
+    _price_from_text,
     _search_api_readiness,
     _search_provider_auth_headers,
 )
@@ -98,6 +99,33 @@ def test_yandex_api_request_shape(monkeypatch):
     # The key itself never leaks into the request body/url; it rides the auth header.
     assert "AQVN-secret" not in json.dumps(request)
     assert _search_provider_auth_headers("yandex_api") == {"Authorization": "Api-Key AQVN-secret"}
+
+
+def test_price_extracted_from_snippet_when_no_structured_price():
+    # Yandex web search carries no structured price, so a price stated in the snippet
+    # must be surfaced — but a bare model number must never be read as one.
+    xml = """<?xml version="1.0" encoding="utf-8"?>
+<yandexsearch><response><results><grouping><group>
+<doc><url>https://www.dns-shop.ru/product/rtx-5090/</url>
+<title>RTX 5090 купить</title>
+<headline>Видеокарта RTX 5090 в наличии, цена от 199 990 ₽ в DNS.</headline>
+</doc></group>
+<group><doc><url>https://example.com/rtx</url>
+<title>RTX 5090 обзор</title><headline>Полный обзор видеокарты RTX 5090 без цен.</headline>
+</doc></group></grouping></results></response></yandexsearch>"""
+    results = _parse_yandex_api_results(_response_body(xml), limit=5, vertical="shopping")
+    assert results[0]["price"] == "199 990 ₽"
+    # The review page has a model number ("5090") but no currency -> no price invented.
+    assert "price" not in results[1]
+
+
+def test_price_from_text_shapes():
+    assert _price_from_text("цена от 199 990 ₽ в DNS") == "199 990 ₽"
+    assert _price_from_text("всего 2 099 руб. за штуку") == "2 099 ₽"
+    assert _price_from_text("MSRP $1,999 at Best Buy") == "$1,999"
+    # A bare product/model number without a currency is never a price.
+    assert _price_from_text("NVIDIA GeForce RTX 5090 32GB") is None
+    assert _price_from_text("нет цены здесь") is None
 
 
 def test_yandex_api_region_switches_search_type(monkeypatch):

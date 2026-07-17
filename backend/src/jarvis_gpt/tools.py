@@ -11924,11 +11924,15 @@ def _available_api_search_providers(vertical: str) -> list[str]:
     if _env_secret("SERPER_API_KEY"):
         providers.append("serper_api")
     # Yandex Search API v2 (the AI Studio key): needs BOTH the API key and the Cloud
-    # folder id, which travels in the request body. Web vertical only for now.
+    # folder id, which travels in the request body. The v2 web endpoint answers
+    # general web, news AND shopping-style queries (it returns store pages for
+    # "купить …"), so it must cover the shopping vertical too — otherwise a shopping
+    # search silently drops to the captcha-prone scrapers. Images use a separate
+    # endpoint we do not wire, so they stay excluded.
     if (
         _env_secret("YANDEX_SEARCH_API_KEY")
         and _env_secret("YANDEX_SEARCH_FOLDER_ID")
-        and vertical == "web"
+        and vertical in {"web", "news", "shopping"}
     ):
         providers.append("yandex_api")
     return providers
@@ -11957,7 +11961,7 @@ def _search_api_readiness() -> dict[str, Any]:
                 and _env_secret("YANDEX_SEARCH_FOLDER_ID")
             ),
             "env": "YANDEX_SEARCH_API_KEY",
-            "verticals": ["web"],
+            "verticals": ["web", "news", "shopping"],
         },
     }
     return {
@@ -12404,6 +12408,39 @@ def _yandex_xml_text(element: ElementTree.Element | None) -> str:
     return " ".join("".join(element.itertext()).split())
 
 
+# A price is a run of digits (with thousands spaces/dots/commas) next to a currency
+# token — either trailing ("199 990 ₽", "2 099 руб.") or leading ("$1,999", "€1.200").
+# Requiring the currency keeps model numbers like "RTX 5090" from being read as prices.
+_PRICE_TRAIL_RE = re.compile(
+    r"(?<![\w.])(\d[\d  .,]{2,}\d)\s*(₽|руб\.?|р\.|rub|usd|eur)",
+    re.IGNORECASE,
+)
+_PRICE_LEAD_RE = re.compile(r"([$€₽])\s?(\d[\d  .,]{2,}\d)")
+
+
+def _price_from_text(text: str) -> str | None:
+    """Pull the first currency amount out of free text, else None.
+
+    Returns the amount as it appears (normalised whitespace) with a currency marker,
+    e.g. "199 990 ₽" or "$1,999". Only used to enrich a result that carries no
+    structured price — never to invent one.
+    """
+
+    if not text:
+        return None
+    trail = _PRICE_TRAIL_RE.search(text)
+    if trail:
+        amount = " ".join(trail.group(1).split())
+        cur = trail.group(2)
+        marker = "₽" if cur.lower() in {"руб", "руб.", "р.", "rub", "₽"} else cur
+        return f"{amount} {marker}".strip()
+    lead = _PRICE_LEAD_RE.search(text)
+    if lead:
+        amount = " ".join(lead.group(2).split())
+        return f"{lead.group(1)}{amount}"
+    return None
+
+
 def _search_api_items(
     raw_results: Any,
     *,
@@ -12452,6 +12489,13 @@ def _search_api_items(
             item["published"] = str(published)
         if raw.get("price"):
             item["price"] = str(raw.get("price"))
+        else:
+            # Providers like Yandex web search carry no structured price, but a product
+            # snippet often states one ("от 199 990 ₽"). Surface it so a shopping
+            # comparison has real figures instead of the model inventing them.
+            snippet_price = _price_from_text(f"{title} {snippet}")
+            if snippet_price:
+                item["price"] = snippet_price
         if raw.get("rating"):
             item["rating"] = str(raw.get("rating"))
         results.append(item)
