@@ -129,6 +129,20 @@ class RuntimeProfile:
     cpu_offload_gb: float
     kv_offloading_gb: int
     vllm_extra_args: VllmExtraArgs = field(default_factory=VllmExtraArgs)
+    # vLLM tokenizer mode. Gemma needs the slow tokenizer (its fast tokenizer had a
+    # correctness bug on this stack), but a fast-only checkpoint (e.g. Qwen ships a
+    # self-contained tokenizer.json with NO merges.txt, so the slow BPE cannot be
+    # built) MUST use "auto" or the server fails to start.
+    tokenizer_mode: str = "slow"
+    # vLLM serving image for this profile. The certified Gemma stack stays pinned to
+    # v0.23.0; the Qwen3.5-VL NVFP4 checkpoint needs vLLM >= 0.25 for the fast NVFP4
+    # kernels (cutlass / flashinfer, not the 2x-slower Marlin fallback), so its profile
+    # selects a newer image. An explicit JARVIS_VLLM_IMAGE env override always wins.
+    vllm_image: str = "vllm/vllm-openai:v0.23.0"
+    # True when the served model is a vision-language model that understands image
+    # pixels. The chat pipeline only forwards image attachments as real vision content
+    # parts when this is set; a text-only brain keeps treating images as file metadata.
+    vision_capable: bool = False
     # Product certification on the current certified host (not a performance claim).
     certification: str = "unsupported"  # certified | experimental | unsupported
     interactive_certified: bool = False
@@ -271,6 +285,12 @@ PROFILES: dict[str, RuntimeProfile] = {
         max_num_seqs=16,
         cpu_offload_gb=0,
         kv_offloading_gb=0,
+        # Qwen ships only a fast tokenizer.json (no merges.txt) -> slow mode cannot load.
+        tokenizer_mode="auto",
+        # NVFP4 needs vLLM >= 0.25 for the fast cutlass/flashinfer kernels.
+        vllm_image="vllm/vllm-openai:v0.25.1",
+        # Qwen3.5-VL sees images/video: forward chat image attachments as vision input.
+        vision_capable=True,
         vllm_extra_args=VllmExtraArgs(
             skip_mm_profiling=True,
             mm_processor_cache_gb=4.0,
@@ -306,6 +326,9 @@ def profile_public_dict(profile: RuntimeProfile) -> dict[str, object]:
         "max_num_seqs": profile.max_num_seqs,
         "cpu_offload_gb": profile.cpu_offload_gb,
         "kv_offloading_gb": profile.kv_offloading_gb,
+        "tokenizer_mode": profile.tokenizer_mode,
+        "vllm_image": profile.vllm_image,
+        "vision_capable": profile.vision_capable,
         "certification": profile.certification,
         "interactive_certified": profile.interactive_certified,
         "default_recommended": profile.default_recommended,

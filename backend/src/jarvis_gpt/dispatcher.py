@@ -96,7 +96,7 @@ class DispatcherManager:
             "JARVIS_MODEL_ROOT": str(self.settings.model_root),
             "JARVIS_VLLM_IMAGE": os.environ.get(
                 "JARVIS_VLLM_IMAGE",
-                "vllm/vllm-openai:v0.23.0",
+                self.settings.profile.vllm_image,
             ),
             "VLLM_USE_V2_MODEL_RUNNER": os.environ.get("VLLM_USE_V2_MODEL_RUNNER", "0"),
             "VLLM_WEIGHT_OFFLOADING_DISABLE_UVA": os.environ.get(

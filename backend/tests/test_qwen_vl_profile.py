@@ -13,6 +13,9 @@ def test_qwen_vl_profile_is_registered_and_fits_vram():
     assert profile.cpu_offload_gb == 0 and profile.kv_offloading_gb == 0
     assert profile.kv_cache_dtype == "fp8"
     assert profile.max_model_len == 32768
+    # Qwen ships only a fast tokenizer.json (no merges.txt): the slow BPE cannot be
+    # built, so this profile MUST serve with tokenizer-mode auto (gemma stays slow).
+    assert profile.tokenizer_mode == "auto"
     # The model dir name is auto-registered so identity binding accepts it.
     assert "qwen3.6-35b-a3b-nvfp4" in PROFILE_MODEL_DIR_NAMES
 
@@ -67,6 +70,23 @@ def test_dispatcher_config_mounts_qwen_model(monkeypatch, tmp_path):
     assert env["JARVIS_QWEN_GPU_UTIL"] == "0.90"
     assert env["JARVIS_QWEN_MAX_LEN"] == "32768"
     assert env["JARVIS_QWEN_KV_DTYPE"] == "fp8"
+    assert env["JARVIS_QWEN_TOKENIZER_MODE"] == "auto"
+
+
+def test_qwen_vl_profile_selects_nvfp4_capable_vllm_image(monkeypatch, tmp_path):
+    # NVFP4 needs vLLM >= 0.25 for the fast kernels; the profile drives the image so a
+    # bare `--profile qwen36-vl dispatcher-up` serves on the right runtime. gemma stays
+    # pinned to v0.23.0. An explicit JARVIS_VLLM_IMAGE env override still wins.
+    from jarvis_gpt.dispatcher import DispatcherManager
+
+    monkeypatch.delenv("JARVIS_VLLM_IMAGE", raising=False)
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_PROFILE", "qwen36-vl")
+    settings = load_settings()
+    assert settings.profile.vllm_image == "vllm/vllm-openai:v0.25.1"
+    env = DispatcherManager(settings, repo_root=tmp_path).compose_env()
+    assert env["JARVIS_VLLM_IMAGE"] == "vllm/vllm-openai:v0.25.1"
+    assert PROFILES["gemma4-turbo"].vllm_image == "vllm/vllm-openai:v0.23.0"
 
 
 def test_profile_public_dict_exposes_new_vllm_fields():
