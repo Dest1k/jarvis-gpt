@@ -1807,7 +1807,8 @@ class ToolRegistry:
                     "freshness": "day, week, month, year, or empty",
                     "pages": "Search result pages to inspect",
                     "provider": (
-                        "auto, api, brave, tavily, serper, duckduckgo, bing, or yandex"
+                        "auto, api, brave, tavily, serper, yandex_api, duckduckgo, "
+                        "bing, or yandex"
                     ),
                     "vertical": "web, news, images, shopping, places, scholar, or auto",
                 },
@@ -11859,7 +11860,7 @@ def _web_search_requests(
     selected = [item for item in selected if item]
     requests: list[dict[str, Any]] = []
     for source in selected:
-        if source in {"brave_api", "tavily_api", "serper_api"}:
+        if source in {"brave_api", "tavily_api", "serper_api", "yandex_api"}:
             requests.append(
                 _api_search_request(
                     source,
@@ -11908,6 +11909,7 @@ def _search_provider_name(provider: str) -> str:
         "yandex": "yandex_html",
         "ya": "yandex_html",
         "yandex_html": "yandex_html",
+        "yandex_api": "yandex_api",
         "mojeek": "mojeek_html",
         "mojeek_html": "mojeek_html",
     }.get(provider, "")
@@ -11921,6 +11923,14 @@ def _available_api_search_providers(vertical: str) -> list[str]:
         providers.append("tavily_api")
     if _env_secret("SERPER_API_KEY"):
         providers.append("serper_api")
+    # Yandex Search API v2 (the AI Studio key): needs BOTH the API key and the Cloud
+    # folder id, which travels in the request body. Web vertical only for now.
+    if (
+        _env_secret("YANDEX_SEARCH_API_KEY")
+        and _env_secret("YANDEX_SEARCH_FOLDER_ID")
+        and vertical == "web"
+    ):
+        providers.append("yandex_api")
     return providers
 
 
@@ -11940,6 +11950,14 @@ def _search_api_readiness() -> dict[str, Any]:
             "configured": bool(_env_secret("SERPER_API_KEY")),
             "env": "SERPER_API_KEY",
             "verticals": ["web", "news", "images", "shopping", "places", "scholar"],
+        },
+        "yandex_api": {
+            "configured": bool(
+                _env_secret("YANDEX_SEARCH_API_KEY")
+                and _env_secret("YANDEX_SEARCH_FOLDER_ID")
+            ),
+            "env": "YANDEX_SEARCH_API_KEY",
+            "verticals": ["web"],
         },
     }
     return {
@@ -11963,6 +11981,9 @@ def _search_provider_auth_headers(source: str) -> dict[str, str]:
     if source == "serper_api":
         key = _env_secret("SERPER_API_KEY")
         return {"X-API-KEY": key} if key else {}
+    if source == "yandex_api":
+        key = _env_secret("YANDEX_SEARCH_API_KEY")
+        return {"Authorization": f"Api-Key {key}"} if key else {}
     return {}
 
 
@@ -12156,6 +12177,34 @@ def _api_search_request(
             "missing_key": not _env_secret("SERPER_API_KEY"),
             "env": "SERPER_API_KEY",
         }
+    if source == "yandex_api":
+        # Yandex Search API v2, synchronous web search. The result comes back as a
+        # base64-encoded XML document inside the JSON `rawData` field (see
+        # _parse_yandex_api_results). folderId travels in the body; the Api-Key auth
+        # header is added by _search_provider_auth_headers.
+        search_type = "SEARCH_TYPE_COM" if region.endswith("us") else "SEARCH_TYPE_RU"
+        return {
+            "source": source,
+            "page": 1,
+            "url": "https://searchapi.api.cloud.yandex.net/v2/web/search",
+            "method": "POST",
+            "headers": {"Content-Type": "application/json"},
+            "json": {
+                "query": {
+                    "searchType": search_type,
+                    "queryText": query,
+                    "page": "0",
+                },
+                "folderId": _env_secret("YANDEX_SEARCH_FOLDER_ID"),
+                "responseFormat": "FORMAT_XML",
+            },
+            "json_response": True,
+            "missing_key": not (
+                _env_secret("YANDEX_SEARCH_API_KEY")
+                and _env_secret("YANDEX_SEARCH_FOLDER_ID")
+            ),
+            "env": "YANDEX_SEARCH_API_KEY",
+        }
     return {"source": source, "page": 1, "url": "", "missing_key": True}
 
 
@@ -12232,6 +12281,8 @@ def _web_parse_search_results(
         return _parse_tavily_api_results(body, limit=limit, vertical=vertical)
     if source == "serper_api":
         return _parse_serper_api_results(body, limit=limit, vertical=vertical)
+    if source == "yandex_api":
+        return _parse_yandex_api_results(body, limit=limit, vertical=vertical)
     if source == "bing_html":
         return _parse_bing_results(body, limit=limit)
     if source == "yandex_html":
@@ -12293,6 +12344,64 @@ def _parse_serper_api_results(
         if isinstance(value, list):
             raw_results.extend(value)
     return _search_api_items(raw_results, limit=limit, vertical=vertical)
+
+
+def _parse_yandex_api_results(
+    body: str,
+    *,
+    limit: int,
+    vertical: str,
+) -> list[dict[str, Any]]:
+    """Parse a Yandex Search API v2 response.
+
+    The JSON body carries the search results as a base64-encoded XML document in the
+    ``rawData`` field; the XML is Yandex's classic search format (``<doc>`` per result
+    with ``<url>``/``<title>``/``<headline>``/``<passages>``). We decode, parse into the
+    common item shape and funnel through ``_search_api_items`` for dedup/ranking. Any
+    error (missing field, bad base64, malformed XML) degrades to an empty list so a
+    provider hiccup never crashes the search — the other providers still answer.
+    """
+
+    data = _json_object(body)
+    raw = data.get("rawData")
+    if not isinstance(raw, str) or not raw:
+        return []
+    try:
+        xml_bytes = base64.b64decode(raw, validate=False)
+    except (ValueError, binascii.Error):
+        return []
+    return _search_api_items(_yandex_xml_docs(xml_bytes), limit=limit, vertical=vertical)
+
+
+def _yandex_xml_docs(xml_bytes: bytes) -> list[dict[str, Any]]:
+    """Extract result docs from a Yandex search XML payload (trusted API source)."""
+
+    try:
+        root = ElementTree.fromstring(xml_bytes)
+    except ElementTree.ParseError:
+        return []
+    docs: list[dict[str, Any]] = []
+    for doc in root.iter("doc"):
+        url_el = doc.find("url")
+        url = (url_el.text or "").strip() if url_el is not None else ""
+        title = _yandex_xml_text(doc.find("title"))
+        snippet = _yandex_xml_text(doc.find("headline"))
+        if not snippet:
+            passages = doc.find("passages")
+            if passages is not None:
+                snippet = " ".join(
+                    _yandex_xml_text(passage) for passage in passages.findall("passage")
+                ).strip()
+        docs.append({"url": url, "title": title, "snippet": snippet})
+    return docs
+
+
+def _yandex_xml_text(element: ElementTree.Element | None) -> str:
+    """Flatten an element's text, dropping inline highlight tags like <hlword>."""
+
+    if element is None:
+        return ""
+    return " ".join("".join(element.itertext()).split())
 
 
 def _search_api_items(
