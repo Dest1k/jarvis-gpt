@@ -26,7 +26,7 @@ from . import persona as persona_module
 from .browser_cdp import DEFAULT_CHROME_DEBUG_URL
 from .cognitive_memory import ExecutionPlaybookStore
 from .config import JarvisSettings
-from .document_memory import parse_document_date_scope
+from .document_memory import _filenames_mentioned, parse_document_date_scope
 from .embeddings import (
     EmbeddingBackend,
     lexical_vector,
@@ -1287,6 +1287,8 @@ class AgentRuntime:
             )
 
         document_prefetch = await self._prefetch_document_memory(message, context)
+        if document_prefetch is None:
+            document_prefetch = await self._prefetch_document_edit(message, context)
         if document_prefetch is not None:
             observation, event, recall_result = document_prefetch
             events.append(event)
@@ -1953,6 +1955,8 @@ class AgentRuntime:
             return
 
         document_prefetch = await self._prefetch_document_memory(message, context)
+        if document_prefetch is None:
+            document_prefetch = await self._prefetch_document_edit(message, context)
         if document_prefetch is not None:
             observation, event, recall_result = document_prefetch
             events.append(event)
@@ -6612,6 +6616,42 @@ class AgentRuntime:
             preferences=self.storage.get_runtime_value("experience.preferences", {}),
         )
 
+        # Editing an EXISTING persisted document ("исправь дату в отчёте", "добавь строку
+        # в бюджет.xlsx") wins over new-artifact/recall routing: it needs an edit verb, a
+        # concrete existing-file reference, AND a resolvable editable target, so genuine
+        # "create a new file" requests (no edit verb) never match. Autonomy-only.
+        if (
+            mode != "mission"
+            and not attachments
+            and self._owner_autonomy_active()
+            and not _looks_like_live_web_query(message)
+            and _looks_like_document_edit_query(
+                message,
+                has_persisted_files=bool(self.storage.list_files(limit=1)),
+            )
+            and self._resolve_document_edit_target(message) is not None
+        ):
+            return TaskKernelPlan(
+                route="reasoning",
+                mode=task_mode,
+                intent="document_edit",
+                confidence=0.9,
+                query=message,
+                tools=(
+                    "documents.edit",
+                    "documents.read",
+                    "documents.inspect",
+                    "documents.recall",
+                ),
+                completion_criteria=(
+                    "edit the already-resolved existing document via documents.edit",
+                    "derive concrete operations from the request and the real content",
+                    "save a new version and report the new file name",
+                    "never ask for the file name — it is already resolved",
+                ),
+                rationale="The request edits a previously persisted document.",
+            )
+
         # RB-3/RB-5: complete new-artifact / transform requests must not fall
         # through to document recall, mission, shopping, or free tool JSON.
         # Prefer structural complete-transform detection even when intent body
@@ -7572,6 +7612,117 @@ class AgentRuntime:
                 "prefetch": True,
                 "file_ids": [item["file_id"] for item in recalled_sources],
                 "source_names": [item["name"] for item in recalled_sources],
+            },
+        )
+        return observation, event, result
+
+    def _resolve_document_edit_target(self, message: str) -> dict[str, Any] | None:
+        """Resolve the existing persisted document an edit request targets: a named file
+        first (exact/stem match), else the most-recently updated editable document.
+        Returns the file record or None when nothing suitable is persisted."""
+
+        mentions = _filenames_mentioned(message)
+        for mention in mentions:
+            for record in self.storage.search_files(mention, limit=8):
+                name = str(record.get("name") or "")
+                if _document_edit_name_matches(name, mention) and _is_editable_document_name(name):
+                    return record
+        normalized = " ".join(str(message or "").casefold().split())
+        allow_recent = not mentions or _contains_any(normalized, _DOCUMENT_DEICTIC_MARKERS)
+        if allow_recent:
+            for record in self.storage.list_files(limit=25):
+                name = str(record.get("name") or "")
+                if _is_editable_document_name(name) and str(record.get("status")) != "failed":
+                    return record
+        return None
+
+    async def _prefetch_document_edit(
+        self,
+        message: str,
+        context: AgentContext,
+    ) -> tuple[str, ChatEvent, ToolRunResponse] | None:
+        """Resolve the target of an edit request and hand the agentic loop the file id +
+        a worked documents.edit example, so the model applies the edit without asking for
+        a file name. Returns None (fall through to the loop) when nothing resolves."""
+
+        plan = context.task_plan
+        if plan is None or plan.intent != "document_edit":
+            return None
+        record = self._resolve_document_edit_target(message)
+        if record is None:
+            return None
+        file_id = str(record.get("id") or "")
+        name = str(record.get("name") or "")
+        suffix = Path(name.replace("\\", "/")).suffix.lower()
+        if suffix in {".xlsx", ".xlsm"}:
+            kind = "spreadsheet"
+            ops_hint = (
+                "append_row {values:[...]}, set_cell {cell:'B5'|row,col,value}, "
+                "update_row_where {match_col, match_value, set_col, value}, "
+                "delete_row {row|match_col, match_value}, add_sheet, rename_sheet"
+            )
+            example = (
+                f'{{"file_id":"{file_id}","operations":'
+                '[{"op":"append_row","values":["Реклама",15000]}]}'
+            )
+        elif suffix == ".docx":
+            kind = "Word document"
+            ops_hint = (
+                "replace {old,new}, append_section {title, level?, body}, "
+                "append_paragraph {text}, append_markdown {markdown}"
+            )
+            example = (
+                f'{{"file_id":"{file_id}","operations":'
+                '[{"op":"replace","old":"15 июля","new":"20 июля"}]}'
+            )
+        else:
+            kind = "text document"
+            ops_hint = (
+                "append {text}, prepend {text}, replace {old,new}, "
+                "insert_after {anchor,text}, set_text {text}"
+            )
+            example = (
+                f'{{"file_id":"{file_id}","operations":'
+                '[{"op":"append","text":"..."}]}'
+            )
+        preview = ""
+        try:
+            read_result = await self.tools.run(
+                "documents.read", {"file_id": file_id, "max_chars": 1500}
+            )
+            if read_result.ok:
+                text = " ".join(str(read_result.data.get("text") or "").split())
+                if text:
+                    preview = f"\nCurrent content (preview): {text[:1200]}"
+        except Exception:  # noqa: BLE001 — a preview is best-effort, never fatal
+            preview = ""
+        observation = (
+            f"The operator wants to EDIT an existing {kind}: '{name}' (file_id={file_id}). "
+            f"Apply the change by calling documents.edit with that file_id and `operations` "
+            f"that accomplish the request: \"{message.strip()}\". Operations for this file: "
+            f"{ops_hint}. Ground the operations in the real content — for a replacement, the "
+            f"'old' text must appear verbatim in the document. The source is never "
+            f"overwritten; a new version is saved and indexed. Example arguments: {example}. "
+            f"After documents.edit returns, tell the operator exactly what changed and the "
+            f"new file name. Do NOT ask for the file name — it is already resolved.{preview}"
+        )
+        result = ToolRunResponse(
+            tool="documents.edit",
+            ok=True,
+            summary=f"Resolved edit target: {name}",
+            data={"file_id": file_id, "name": name, "kind": suffix.lstrip(".")},
+        )
+        event = ChatEvent(
+            type="tool_call",
+            title="documents.edit:target",
+            content=name,
+            payload={
+                "tool": "documents.edit",
+                "ok": True,
+                "autonomous": True,
+                "prefetch": True,
+                "file_ids": [file_id],
+                "source_names": [name],
             },
         )
         return observation, event, result
@@ -11285,6 +11436,71 @@ def _looks_like_document_memory_query(
     ):
         return True
     return has_file_context and _looks_like_document_followup(normalized)
+
+
+# Verbs that ask to MODIFY an existing document (not create a new one). Kept distinct
+# from _DOCUMENT_ACTION_MARKERS (which are read/recall verbs) and from create verbs
+# (создай/сделай/сгенерируй), so an edit request routes to documents.edit, not recall
+# or new-artifact generation.
+_DOCUMENT_EDIT_MARKERS = (
+    "измени", "изменить", "исправь", "исправить", "поправь", "поправить",
+    "поменяй", "поменять", "замени", "заменить", "перепиши", "переписать",
+    "допиши", "дописать", "впиши", "вписать", "вставь", "вставить",
+    "удали", "удалить", "убери", "убрать", "переименуй", "переименовать",
+    "обнови", "обновить", "отредактируй", "редактировать", "отредактировать",
+    "edit", "change", "fix", "replace", "append", "insert", "rename",
+    "update", " modify",
+)
+# "добавь"/"add" are edit verbs only next to an existing-document reference (they are
+# also used for shopping/lists), so they are gated separately below.
+_DOCUMENT_ADD_MARKERS = ("добавь", "добавить", "add ", "add.")
+
+_EDITABLE_DOCUMENT_SUFFIXES = {
+    ".xlsx", ".xlsm", ".docx", ".md", ".markdown", ".txt", ".text", ".csv",
+    ".tsv", ".json", ".html", ".htm", ".xml", ".log",
+}
+
+
+def _is_editable_document_name(name: str) -> bool:
+    return Path(str(name or "").replace("\\", "/")).suffix.lower() in _EDITABLE_DOCUMENT_SUFFIXES
+
+
+def _document_edit_name_matches(record_name: str, mention: str) -> bool:
+    record = Path(str(record_name or "").replace("\\", "/")).name.casefold()
+    named = Path(str(mention or "").replace("\\", "/")).name.casefold()
+    if not record or not named:
+        return False
+    if record == named:
+        return True
+    # A bare stem ("бюджет") matches "бюджет.xlsx".
+    return "." not in named and Path(record).stem == named
+
+
+def _looks_like_document_edit_query(message: str, *, has_persisted_files: bool) -> bool:
+    """True when the request asks to MODIFY an existing persisted document — an edit verb
+    plus a concrete reference to an existing file (a filename, a document noun tied to
+    memory/deixis, or a deictic reference when documents exist)."""
+
+    normalized = " ".join(str(message or "").casefold().split())
+    if not normalized or _looks_like_live_web_query(normalized):
+        return False
+    has_edit_verb = _contains_any(normalized, _DOCUMENT_EDIT_MARKERS)
+    has_add_verb = _contains_any(normalized, _DOCUMENT_ADD_MARKERS)
+    if not has_edit_verb and not has_add_verb:
+        return False
+    has_filename = bool(_filenames_mentioned(message))
+    if has_filename:
+        return True
+    has_noun = _contains_any(normalized, _DOCUMENT_NOUN_MARKERS)
+    has_deictic = _contains_any(normalized, _DOCUMENT_DEICTIC_MARKERS)
+    has_memory = _contains_any(normalized, _DOCUMENT_MEMORY_MARKERS)
+    if not (has_noun or has_deictic):
+        return False
+    # A bare "добавь" needs a strong existing-doc anchor (memory/deixis) so it does not
+    # swallow "добавь пункт" style requests that are really about creating content.
+    if has_add_verb and not has_edit_verb:
+        return has_memory or has_deictic
+    return has_memory or has_deictic or has_persisted_files
 
 
 def _looks_like_archive_memory_query(
