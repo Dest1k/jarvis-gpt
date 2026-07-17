@@ -76,6 +76,17 @@ def test_parse_date_range_с_по_and_между():
     assert c is not None and c.label == "28 июня — 3 июля 2026"
 
 
+def test_parse_bare_month_and_topic():
+    july = parse_document_date_scope("документы про бюджет за июль", now=_NOW)
+    assert july is not None
+    assert july.start_utc == "2026-06-30T21:00:00+00:00"  # 1 July local
+    assert july.end_utc == "2026-07-31T21:00:00+00:00"  # 1 Aug local
+    assert july.label == "июля 2026"
+    assert july.topic == "бюджет"
+    assert parse_document_date_scope("файлы насчёт зарплаты за вчера", now=_NOW).topic == "зарплаты"
+    assert parse_document_date_scope("какие документы были 16 июля", now=_NOW).topic == ""
+
+
 def test_parse_detects_type_filter():
     assert parse_document_date_scope("какие xlsx были 16 июля", now=_NOW).type_exts == (
         "xls", "xlsx",
@@ -147,6 +158,23 @@ def test_date_recall_type_filter_keeps_only_matching_extensions(monkeypatch, tmp
         type_exts=("xlsx", "xls", "csv"),
     )
     assert sorted(doc["name"] for doc in tables["documents"]) == ["budget.xlsx", "data.csv"]
+    storage.close()
+
+
+def test_date_recall_topic_filter_uses_fts(monkeypatch, tmp_path):
+    settings, storage, surfer = _runtime(monkeypatch, tmp_path)
+    budget = tmp_path / "q3-plan.md"
+    budget.write_text("# План\n\nБюджет отдела на квартал: 500000 рублей.", encoding="utf-8")
+    garden = tmp_path / "garden.md"
+    garden.write_text("# Сад\n\nПолив томатов и график прополки.", encoding="utf-8")
+    FileIngestor(settings, storage).ingest_path(budget)
+    FileIngestor(settings, storage).ingest_path(garden)
+    result = DocumentMemory(storage=storage, surfer=surfer).recall(
+        "документы про бюджет", date_from=_WIDE[0], date_to=_WIDE[1],
+        list_only=True, topic="бюджет",
+    )
+    # The topic matches only the budget document by indexed content, not the garden note.
+    assert [doc["name"] for doc in result["documents"]] == ["q3-plan.md"]
     storage.close()
 
 

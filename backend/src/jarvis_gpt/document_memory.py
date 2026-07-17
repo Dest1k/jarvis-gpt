@@ -33,6 +33,7 @@ class DocumentDateScope:
     label: str
     conclude: bool
     type_exts: tuple[str, ...] = ()  # empty = any file type
+    topic: str = ""  # empty = no topic filter
 
 
 _DATE_SCOPE_DOC_NOUNS = (
@@ -89,6 +90,25 @@ def _detect_document_types(text: str) -> tuple[str, ...]:
 def _filename_extension(name: str) -> str:
     stem = str(name or "")
     return stem.rsplit(".", 1)[-1].lower() if "." in stem else ""
+
+
+# Explicit topic markers only (не bare "о"/"в"), so a date query is not mis-read as a
+# topic filter. The captured phrase is cut before any date preposition.
+_TOPIC_MARKER_RE = re.compile(
+    r"(?:\bпро\b|\bобо\b|насч[её]т|по\s+теме|касательно|содержащ\w*|где\s+(?:есть|упомина\w+))"
+    r"\s+(.+)"
+)
+_TOPIC_DATE_CUT_RE = re.compile(
+    r"\b(?:за|с|со|между|на|в|вчера|сегодня|позавчера|прошл\w*|эт\w*|последн\w*)\b|\d"
+)
+
+
+def _extract_topic(text: str) -> str:
+    match = _TOPIC_MARKER_RE.search(text)
+    if not match:
+        return ""
+    phrase = _TOPIC_DATE_CUT_RE.split(match.group(1))[0]
+    return " ".join(phrase.split())[:60]
 
 
 def _month_from_word(word: str) -> int | None:
@@ -214,6 +234,19 @@ def _match_document_date_window(
     if re.search(r"(за|последн\w*)\s+недел", text):
         start = today - timedelta(days=6)
         return start, today + timedelta(days=1), "последняя неделя"
+    # Bare month name last ("за июль", "в июле") -> that whole calendar month. Runs after
+    # the DD-month pattern, so "15 июля" stays a single day.
+    bare_month = re.search(rf"\b({_MONTH_ALT})[а-яё]*", text)
+    if bare_month:
+        month = _month_from_word(bare_month[1]) or 0
+        if month:
+            first_this_year = _local_midnight(now, now.year, month, 1)
+            year = now.year if first_this_year <= now else now.year - 1
+            start = _local_midnight(now, year, month, 1)
+            end = _local_midnight(
+                now, year + 1 if month == 12 else year, 1 if month == 12 else month + 1, 1
+            )
+            return start, end, f"{_MONTH_NAMES_RU[month]} {year}"
     return None
 
 
@@ -249,6 +282,7 @@ def parse_document_date_scope(
         label=label,
         conclude=conclude,
         type_exts=type_exts,
+        topic=_extract_topic(text),
     )
 
 _RECALL_NOISE_STEMS = (
@@ -485,6 +519,7 @@ class DocumentMemory:
         date_to: str | None = None,
         list_only: bool = False,
         type_exts: tuple[str, ...] | list[str] | None = None,
+        topic: str | None = None,
     ) -> dict[str, Any]:
         query_clean = " ".join(str(query or "").split()).strip()
         date_scoped = bool(date_from and date_to)
@@ -502,6 +537,7 @@ class DocumentMemory:
                 max_files=max_files,
                 max_chars=max_chars,
                 type_exts=tuple(type_exts or ()),
+                topic=" ".join(str(topic or "").split()),
             )
         retrieval_query = _retrieval_query(query_clean)
         candidates, selection_mode, selection_errors = self._select_candidates(
@@ -679,6 +715,7 @@ class DocumentMemory:
         max_files: int,
         max_chars: int,
         type_exts: tuple[str, ...] = (),
+        topic: str = "",
     ) -> dict[str, Any]:
         """Recall documents by upload date: list them, or read+conclude over them."""
 
@@ -696,11 +733,24 @@ class DocumentMemory:
             for record in records
             if not wanted or _filename_extension(str(record.get("name") or "")) in wanted
         ]
+        if topic:
+            # Keep only documents matching the topic by name or indexed content (FTS).
+            matching_ids = {
+                str(hit.get("id") or "")
+                for hit in self.storage.search_files(topic, limit=50)
+            }
+            topic_lower = topic.lower()
+            documents = [
+                doc
+                for doc in documents
+                if doc["file_id"] in matching_ids or topic_lower in doc["name"].lower()
+            ]
         scope = {
             "from": date_from,
             "to": date_to,
             "count": len(documents),
             "types": sorted(wanted) or None,
+            "topic": topic or None,
         }
         base: dict[str, Any] = {
             "protocol": DOCUMENT_MEMORY_PROTOCOL,
