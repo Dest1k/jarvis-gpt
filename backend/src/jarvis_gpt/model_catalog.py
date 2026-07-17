@@ -157,6 +157,16 @@ def _vllm_extra_args(profile: RuntimeProfile) -> str:
         )
     if options.max_num_batched_tokens is not None:
         args.extend(["--max-num-batched-tokens", str(options.max_num_batched_tokens)])
+    if options.trust_remote_code:
+        args.append("--trust-remote-code")
+    if options.reasoning_parser:
+        args.extend(["--reasoning-parser", options.reasoning_parser])
+    if options.tool_call_parser:
+        args.extend(["--tool-call-parser", options.tool_call_parser])
+        if options.enable_auto_tool_choice:
+            args.append("--enable-auto-tool-choice")
+    if options.limit_mm_per_prompt:
+        args.extend(["--limit-mm-per-prompt", options.limit_mm_per_prompt])
     return " ".join(args)
 
 

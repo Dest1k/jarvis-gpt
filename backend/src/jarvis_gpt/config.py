@@ -102,6 +102,15 @@ class VllmExtraArgs:
     skip_mm_profiling: bool = False
     mm_processor_cache_gb: float | None = None
     max_num_batched_tokens: int | None = None
+    # Reasoning / tool-call parsing (needed by newer Qwen chat models). Left unset by
+    # default so a profile serves cleanly even if a given vLLM build lacks a parser;
+    # enabling an unsupported parser makes vLLM fail to start, so these are opt-in.
+    reasoning_parser: str | None = None
+    tool_call_parser: str | None = None
+    enable_auto_tool_choice: bool = False
+    # Multimodal bounds for vision-language models, e.g. "image=2,video=1".
+    limit_mm_per_prompt: str | None = None
+    trust_remote_code: bool = False
 
 
 @dataclass(frozen=True)
@@ -237,6 +246,49 @@ PROFILES: dict[str, RuntimeProfile] = {
         menu_visible=True,
         requires_experimental_opt_in=False,
     ),
+    # Owner-approved local-brain migration target: Qwen3.5-MoE vision-language model
+    # (unsloth/Qwen3.6-35B-A3B-NVFP4). 35B total / ~3B active fits the 32 GB 5090 in
+    # NVFP4 with fp8 KV, no CPU offload. Vision+video capable. EXPERIMENTAL until it is
+    # validated live on the box. Startup-safe defaults: reasoning/tool parsers are OFF so
+    # the server always comes up; enable them (see MODEL_MIGRATION_QWEN.md) once the base
+    # serving is confirmed and the vLLM build is known to support the Qwen3.5-VL arch.
+    "qwen36-vl": RuntimeProfile(
+        name="qwen36-vl",
+        title="Qwen3.5-VL 35B-A3B NVFP4",
+        description=(
+            "EXPERIMENTAL local-brain migration target: Qwen3.5-MoE vision-language model "
+            "(35B total / ~3B active) in NVFP4 + fp8 KV, fully resident on the 5090. Adds "
+            "image/video understanding. Pending live validation; gemma4-turbo stays the "
+            "certified default until this is confirmed on the host."
+        ),
+        model_dir_name="qwen3.6-35b-a3b-nvfp4",
+        eager_mode=False,
+        max_steps=24,
+        temperature=0.25,
+        max_model_len=32768,
+        gpu_memory_utilization=0.90,
+        kv_cache_dtype="fp8",
+        max_num_seqs=16,
+        cpu_offload_gb=0,
+        kv_offloading_gb=0,
+        vllm_extra_args=VllmExtraArgs(
+            skip_mm_profiling=True,
+            mm_processor_cache_gb=4.0,
+            # Enable these live once base serving is confirmed (values may vary by vLLM
+            # build): reasoning_parser="qwen3", tool_call_parser="hermes",
+            # enable_auto_tool_choice=True, limit_mm_per_prompt="image=2,video=1".
+        ),
+        certification="experimental",
+        interactive_certified=False,
+        default_recommended=False,
+        research_only=True,
+        readiness_deadline_sec=900.0,
+        certification_reason=(
+            "Qwen3.5-VL migration; pending live validation on the current host."
+        ),
+        menu_visible=True,
+        requires_experimental_opt_in=False,
+    ),
 }
 
 
@@ -267,6 +319,11 @@ def profile_public_dict(profile: RuntimeProfile) -> dict[str, object]:
             "skip_mm_profiling": profile.vllm_extra_args.skip_mm_profiling,
             "mm_processor_cache_gb": profile.vllm_extra_args.mm_processor_cache_gb,
             "max_num_batched_tokens": profile.vllm_extra_args.max_num_batched_tokens,
+            "reasoning_parser": profile.vllm_extra_args.reasoning_parser,
+            "tool_call_parser": profile.vllm_extra_args.tool_call_parser,
+            "enable_auto_tool_choice": profile.vllm_extra_args.enable_auto_tool_choice,
+            "limit_mm_per_prompt": profile.vllm_extra_args.limit_mm_per_prompt,
+            "trust_remote_code": profile.vllm_extra_args.trust_remote_code,
         },
     }
 
