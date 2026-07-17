@@ -2672,7 +2672,9 @@ def _extract_catalog_items(html: str, *, base_url: str = "") -> list[dict[str, A
                 "in_stock": in_stock,
             }
         )
-    return results
+    # A single JSON-LD product (e.g. a product page, or a catalog whose CSS layout drifted
+    # past our anchor heuristic) still carries a real price — keep it over nothing.
+    return results or items
 
 
 def _catalog_from_wildberries(soup: Any, base_url: str) -> list[dict[str, Any]]:
@@ -2916,42 +2918,91 @@ def _filter_catalog_items_for_query(
     return matched
 
 
+def _jsonld_price_of(node: dict[str, Any]) -> str:
+    """A price string from a Product/Offer node — offers.price/lowPrice (dict or list),
+    else the node's own price/lowPrice. Currency-agnostic; the caller formats it."""
+
+    candidates: list[Any] = []
+    offers = node.get("offers")
+    if isinstance(offers, dict):
+        candidates += [offers.get("price"), offers.get("lowPrice")]
+    elif isinstance(offers, list):
+        for offer in offers:
+            if isinstance(offer, dict):
+                candidates += [offer.get("price"), offer.get("lowPrice")]
+    candidates += [node.get("price"), node.get("lowPrice")]
+    for value in candidates:
+        if value not in (None, ""):
+            return str(value)
+    return ""
+
+
+def _jsonld_availability_of(node: dict[str, Any]) -> bool | None:
+    offers = node.get("offers")
+    text = ""
+    if isinstance(offers, dict):
+        text = str(offers.get("availability") or "")
+    elif isinstance(offers, list) and offers and isinstance(offers[0], dict):
+        text = str(offers[0].get("availability") or "")
+    text = (text or str(node.get("availability") or "")).casefold().replace("/", "")
+    if not text:
+        return None
+    return "instock" in text and "outofstock" not in text
+
+
 def _catalog_from_jsonld(soup: Any, base_url: str) -> list[dict[str, Any]]:
+    """Extract priced products from schema.org JSON-LD, resilient to the exact shape:
+    ItemList, OfferCatalog, ``@graph``, a bare Product, or an Offer that wraps an
+    ``itemOffered`` Product (name and price can live on different nodes). Leaning on
+    JSON-LD keeps prices flowing when a store's CSS layout (and our selectors) drift."""
+
     items: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(name: str, price: str, url: str, node: dict[str, Any]) -> None:
+        name = " ".join(str(name or "").split())
+        if not name or not price:
+            return
+        key = (name.casefold(), str(price))
+        if key in seen:
+            return
+        seen.add(key)
+        items.append(
+            {
+                "title": name[:200],
+                "url": _canonical_catalog_product_url(
+                    urljoin(base_url, url) if (base_url and url) else url
+                ),
+                "price_text": f"{price} ₽",
+                "price_value": _parse_amount(price),
+                "in_stock": _jsonld_availability_of(node),
+            }
+        )
+
+    def visit(node: Any) -> None:
+        if len(items) >= 60:
+            return
+        if isinstance(node, list):
+            for child in node:
+                visit(child)
+            return
+        if not isinstance(node, dict):
+            return
+        # A priced, named node is a product regardless of whether @type is present —
+        # ItemList `item` wrappers and many stores omit it. Fold an Offer's price with
+        # its itemOffered Product's name when they are split across nodes.
+        offered = node.get("itemOffered") if isinstance(node.get("itemOffered"), dict) else None
+        name = node.get("name") or (offered.get("name") if offered else "")
+        price = _jsonld_price_of(node) or (_jsonld_price_of(offered) if offered else "")
+        if name and price:
+            url = node.get("url") or (offered.get("url") if offered else "")
+            add(str(name), price, str(url), node if _jsonld_price_of(node) else (offered or node))
+        for key in ("@graph", "itemListElement", "item", "mainEntity", "hasPart", "itemOffered"):
+            if key in node:
+                visit(node[key])
+
     for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
-        parsed = _safe_json_loads(script.string or "")
-        blocks = parsed if isinstance(parsed, list) else [parsed]
-        for block in blocks:
-            if not isinstance(block, dict):
-                continue
-            elements = block.get("itemListElement")
-            if not isinstance(elements, list):
-                continue
-            for element in elements:
-                node = element.get("item") if isinstance(element, dict) else None
-                node = node if isinstance(node, dict) else element
-                if not isinstance(node, dict):
-                    continue
-                name = str(node.get("name") or "").strip()
-                url = str(node.get("url") or element.get("url") or "").strip()
-                if not name:
-                    continue
-                price = _jsonld_offer_field([node], "price") or _jsonld_field([node], "price")
-                availability = _jsonld_offer_field([node], "availability").casefold()
-                in_stock = None
-                if availability:
-                    in_stock = "instock" in availability and "outofstock" not in availability
-                items.append(
-                    {
-                        "title": name[:200],
-                        "url": _canonical_catalog_product_url(
-                            urljoin(base_url, url) if (base_url and url) else url
-                        ),
-                        "price_text": f"{price} ₽" if price else "",
-                        "price_value": _parse_amount(price),
-                        "in_stock": in_stock,
-                    }
-                )
+        visit(_safe_json_loads(script.string or ""))
     return items
 
 

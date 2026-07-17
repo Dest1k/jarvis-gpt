@@ -107,6 +107,73 @@ def test_extract_catalog_items_from_dns_like_grid():
     assert values == [409999.0, 413999.0, 499999.0]
 
 
+_JSONLD_ITEMLIST = """
+<html><head><script type="application/ld+json">
+{"@context":"https://schema.org","@type":"ItemList","itemListElement":[
+ {"@type":"Product","name":"Видеокарта Palit RTX 5090 GameRock","url":"/p/1",
+  "offers":{"@type":"Offer","price":"413999","priceCurrency":"RUB",
+   "availability":"https://schema.org/InStock"}},
+ {"@type":"Product","name":"Видеокарта ASUS RTX 5090 ROG Astral","url":"/p/2",
+  "offers":{"@type":"Offer","price":"499999","priceCurrency":"RUB",
+   "availability":"https://schema.org/OutOfStock"}}
+]}
+</script></head><body></body></html>
+"""
+
+_JSONLD_OFFERCATALOG = """
+<html><head><script type="application/ld+json">
+{"@context":"https://schema.org","@type":"OfferCatalog","itemListElement":[
+ {"@type":"Offer","price":"419990","priceCurrency":"RUB","availability":"InStock",
+  "itemOffered":{"@type":"Product","name":"Palit RTX 5090","url":"https://www.regard.ru/p/aaa"}},
+ {"@type":"Offer","price":"526350","priceCurrency":"RUB",
+  "itemOffered":{"@type":"Product","name":"ASUS RTX 5090","url":"https://www.regard.ru/p/bbb"}}
+]}
+</script></head><body></body></html>
+"""
+
+_JSONLD_GRAPH_SINGLE = """
+<html><head><script type="application/ld+json">
+{"@context":"https://schema.org","@graph":[
+ {"@type":"WebPage"},
+ {"@type":"Product","name":"Single RTX 5090","url":"/single",
+  "offers":[{"@type":"Offer","lowPrice":"401000","priceCurrency":"RUB"}]}
+]}
+</script></head><body><nav><a href="/help">help</a></nav></body></html>
+"""
+
+
+def test_catalog_jsonld_itemlist_products_with_stock():
+    items = ws._extract_catalog_items(_JSONLD_ITEMLIST, base_url="https://www.dns-shop.ru/search/")
+    by_name = {item["title"]: item for item in items}
+    assert len(items) == 2
+    palit = by_name["Видеокарта Palit RTX 5090 GameRock"]
+    assert palit["price_value"] == 413999.0
+    assert palit["in_stock"] is True
+    assert palit["url"].startswith("https://www.dns-shop.ru/")
+    assert by_name["Видеокарта ASUS RTX 5090 ROG Astral"]["in_stock"] is False
+
+
+def test_catalog_jsonld_offercatalog_combines_offer_price_and_item_name():
+    # Name lives on itemOffered, price on the wrapping Offer — they must be combined.
+    items = ws._extract_catalog_items(
+        _JSONLD_OFFERCATALOG, base_url="https://www.regard.ru/catalog"
+    )
+    assert {item["title"] for item in items} == {"Palit RTX 5090", "ASUS RTX 5090"}
+    palit = next(item for item in items if item["title"] == "Palit RTX 5090")
+    assert palit["price_value"] == 419990.0
+    assert palit["in_stock"] is True
+    assert palit["url"] == "https://www.regard.ru/p/aaa"
+
+
+def test_catalog_jsonld_single_product_survives_when_css_finds_nothing():
+    # One @graph Product with lowPrice and no catalog grid — the price must not be dropped.
+    items = ws._extract_catalog_items(_JSONLD_GRAPH_SINGLE, base_url="https://shop.example/")
+    assert len(items) == 1
+    assert items[0]["title"] == "Single RTX 5090"
+    assert items[0]["price_value"] == 401000.0
+    assert items[0]["url"] == "https://shop.example/single"
+
+
 def test_dns_heuristic_parser_rejects_priced_catalog_recipe_links():
     html = """
     <div class="catalog-product">
