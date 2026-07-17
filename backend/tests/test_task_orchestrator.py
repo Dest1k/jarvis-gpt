@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from jarvis_gpt.task_orchestrator import (
     StepResult,
     TaskOrchestrator,
+    _first_http_url,
     _resolve_placeholders,
     parse_plan,
 )
@@ -219,6 +220,47 @@ def test_no_backstop_when_plan_is_already_grounded():
     )
     asyncio.run(orch.run("цель"))
     assert len(tool_calls) == 1  # only the planned step ran; no backstop needed
+
+
+def test_first_http_url_extracts_and_trims():
+    assert (
+        _first_http_url("Лучший вариант: https://dns-shop.ru/p/123 — дёшево")
+        == "https://dns-shop.ru/p/123"
+    )
+    assert _first_http_url("ссылка https://x.com/a).") == "https://x.com/a"
+    assert _first_http_url("нет ссылки тут") is None
+
+
+def test_browser_open_recovers_url_from_the_search_step():
+    # The planner hands browser.open prose ("Лучший вариант"); the engine must recover
+    # the real URL from the search step it depends on, not fail on a non-URL argument.
+    plan_json = (
+        '{"steps":['
+        '{"id":"s1","goal":"найти","kind":"tool","tool":"web.research","arguments":{"query":"5090"}},'
+        '{"id":"s2","goal":"открыть лучший","kind":"tool","tool":"browser.open",'
+        '"arguments":{"url":"Лучший вариант"},"depends_on":["s1"]}]}'
+    )
+    calls: list = []
+
+    async def complete(messages):
+        if "планировщик" in messages[0]["content"]:
+            return _LLM(True, plan_json)
+        return _LLM(True, "итог")
+
+    async def run_tool(name, arguments):
+        calls.append((name, dict(arguments)))
+        if name == "web.research":
+            return _Tool(True, "Дешевле всего: https://dns-shop.ru/product/rtx-5090/ в наличии", {})
+        return _Tool(True, "opened", {})
+
+    orch = TaskOrchestrator(
+        complete=complete,
+        run_tool=run_tool,
+        tool_specs=[("web.research", "r"), ("browser.open", "o")],
+    )
+    asyncio.run(orch.run("открой самый дешёвый 5090"))
+    open_call = next(call for call in calls if call[0] == "browser.open")
+    assert open_call[1]["url"] == "https://dns-shop.ru/product/rtx-5090/"
 
 
 def test_failed_planner_still_answers():

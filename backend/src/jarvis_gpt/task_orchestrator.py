@@ -239,6 +239,38 @@ def _curated_context(step: TaskStep, blackboard: dict[str, StepResult]) -> str:
     return "\n\n".join(parts)
 
 
+_HTTP_URL_RE = re.compile(r"""https?://[^\s"'<>)\]}]+""")
+
+
+def _first_http_url(text: str) -> str | None:
+    """Extract the first http(s) URL from a string, trimming trailing punctuation."""
+
+    match = _HTTP_URL_RE.search(str(text or ""))
+    if not match:
+        return None
+    return match.group(0).rstrip(".,;:!?)»")
+
+
+def _url_from_dependencies(
+    step: TaskStep, blackboard: dict[str, StepResult]
+) -> str | None:
+    """Recover a real link from the steps this one depends on (search results carry them)."""
+
+    sources = step.depends_on or list(blackboard.keys())
+    for dep in sources:
+        prior = blackboard.get(dep)
+        if prior is None:
+            continue
+        found = _first_http_url(prior.output)
+        if found:
+            return found
+        with suppress(TypeError, ValueError):
+            found = _first_http_url(json.dumps(prior.data, ensure_ascii=False))
+            if found:
+                return found
+    return None
+
+
 class TaskOrchestrator:
     """Plan -> execute-with-blackboard -> synthesize, over injected LLM + tools."""
 
@@ -307,6 +339,15 @@ class TaskOrchestrator:
         arguments = _resolve_placeholders(step.arguments, blackboard)
         if not isinstance(arguments, dict):
             arguments = {}
+        # A step that opens/visits a URL must receive a real link, not the model's prose
+        # ("Лучший вариант: …"). Take the URL from the argument itself, else recover it
+        # from the search step this one depends on.
+        if isinstance(arguments.get("url"), str):
+            recovered = _first_http_url(arguments["url"]) or _url_from_dependencies(
+                step, blackboard
+            )
+            if recovered:
+                arguments = {**arguments, "url": recovered}
         try:
             response = await self._run_tool(str(step.tool), arguments)
             ok = bool(getattr(response, "ok", False))
