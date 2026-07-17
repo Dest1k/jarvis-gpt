@@ -13,7 +13,7 @@ import httpx
 import pytest
 from jarvis_gpt.browser_cdp import BrowserActionResult, BrowserCdpError, BrowserPageSnapshot
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
-from jarvis_gpt.document_runtime import extract_document
+from jarvis_gpt.document_runtime import extract_document, read_workbook_grid, write_workbook_xlsx
 from jarvis_gpt.ingest import FileIngestor
 from jarvis_gpt.llm import LLMRouter
 from jarvis_gpt.models import ToolRunResponse
@@ -628,6 +628,80 @@ def test_documents_tools_use_file_id_and_create_edited_copy(monkeypatch, tmp_pat
     assert output_path.parent == settings.data_dir / "document-outputs"
     assert "Replace Beta with Beta" in output_doc["text"]
     assert result.data["output"]["file"]["chunk_count"] == 1
+    storage.close()
+
+
+def test_documents_edit_xlsx_by_file_id_creates_new_version(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+    source = tmp_path / "budget.xlsx"
+    write_workbook_xlsx(
+        source,
+        [
+            {
+                "name": "Budget",
+                "rows": [["Item", "Amount"], ["Rent", 30000], ["Marketing", 10000]],
+            }
+        ],
+        title="Budget",
+    )
+    ingested = FileIngestor(settings=settings, storage=storage).ingest_path(source)
+
+    result = asyncio.run(
+        tools.run(
+            "documents.edit",
+            {
+                "file_id": ingested["file"]["id"],
+                "operations": [
+                    {"op": "append_row", "values": ["Ads", 15000]},
+                    {"op": "update_row_where", "match_col": "Item",
+                     "match_value": "Marketing", "set_col": "Amount", "value": 12000},
+                ],
+                "output_name": "budget-updated.xlsx",
+            },
+        )
+    )
+
+    assert result.ok is True
+    output_path = Path(result.data["output"]["path"])
+    assert output_path.exists()
+    assert output_path.parent == settings.data_dir / "document-outputs"
+    # source workbook is never mutated in place
+    assert read_workbook_grid(source)[0]["rows"][2] == ["Marketing", 10000]
+    rows = read_workbook_grid(output_path)[0]["rows"]
+    names = [row[0] for row in rows]
+    assert "Ads" in names
+    marketing = next(row for row in rows if row[0] == "Marketing")
+    assert marketing[1] == 12000
+    # the new version is indexed so it can be recalled later
+    assert result.data["output"]["file"]["id"]
+    storage.close()
+
+
+def test_documents_edit_rejects_docx_with_pointer(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+    source = tmp_path / "note.docx"
+    _write_minimal_docx(source, "Alpha body")
+
+    result = asyncio.run(
+        tools.run(
+            "documents.edit",
+            {"path": str(source), "operations": [{"op": "append_row", "values": ["x"]}]},
+        )
+    )
+    assert result.ok is False
+    assert "apply_replacements" in result.summary
     storage.close()
 
 

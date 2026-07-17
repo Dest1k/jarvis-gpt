@@ -57,6 +57,7 @@ from .document_runtime import (
     compare_documents,
     copy_document,
     document_mime_type,
+    edit_workbook_xlsx,
     extract_document,
     file_sha256,
     is_supported_document,
@@ -1539,6 +1540,31 @@ class ToolRegistry:
                     "output_name": "Optional output filename",
                 },
                 handler=_documents_apply_replacements,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="documents.edit",
+                description=(
+                    "Structurally edit an existing spreadsheet and save a new version. "
+                    "Pass `operations`: a list of {op, ...} objects. XLSX/XLSM ops: "
+                    "append_row {values:[...]}, set_cell {cell:'B5' | row,col, value}, "
+                    "update_row_where {match_col, match_value, set_col, value}, "
+                    "delete_row {row | match_col, match_value}, set_rows {rows:[[...]]}, "
+                    "add_sheet {name, rows:[[...]]}, rename_sheet {name}. Columns accept "
+                    "an A1 letter, a 1-based index, or a header name; rows are 1-based; a "
+                    "value starting with '=' becomes a formula. The original file is never "
+                    "overwritten. For exact text edits in a DOCX/text file use "
+                    "documents.apply_replacements."
+                ),
+                category="documents",
+                input_schema={
+                    "file_id": "Target uploaded/indexed file id",
+                    "path": "Target local path",
+                    "operations": "List of edit operations (see description)",
+                    "output_name": "Optional output filename",
+                },
+                handler=_documents_edit,
             )
         )
         self.add(
@@ -5473,6 +5499,83 @@ def _documents_apply_replacements(ctx: ToolContext, args: dict[str, Any]) -> Too
                 "path": str(output_path),
                 "file": file_record,
                 "changed": result["changed"],
+            },
+        },
+    )
+
+
+def _workbook_operations_arg(value: Any) -> list[dict[str, Any]]:
+    """Coerce the ``operations`` argument into a list of operation objects, tolerating a
+    JSON string or a single object (dialects a weak model tends to emit)."""
+
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            raise ValueError("operations is required for a document edit.")
+        try:
+            value = json.loads(text)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise ValueError(
+                f"operations must be a JSON list of operation objects: {exc}"
+            ) from exc
+    if isinstance(value, dict):
+        value = [value]
+    if not isinstance(value, list) or not value:
+        raise ValueError("operations must be a non-empty list of operation objects.")
+    operations = [item for item in value if isinstance(item, dict)]
+    if not operations:
+        raise ValueError("No valid edit operations were provided.")
+    return operations
+
+
+def _documents_edit(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    """Structurally edit an existing document by applying operations, then write a new
+    version. XLSX/XLSM supports cell/row operations (append_row, set_cell,
+    update_row_where, delete_row, set_rows, add_sheet, rename_sheet). The source file is
+    never overwritten — a new versioned artifact is produced under document-outputs."""
+
+    try:
+        target = _document_target(ctx, args, max_chars=4000)
+    except ValueError as exc:
+        return ToolRunResponse(tool="documents.edit", ok=False, summary=str(exc))
+    path = target["path"]
+    suffix = path.suffix.lower()
+    if suffix not in {".xlsx", ".xlsm"}:
+        return ToolRunResponse(
+            tool="documents.edit",
+            ok=False,
+            summary=(
+                f"documents.edit currently supports XLSX/XLSM workbooks; {path.name} is "
+                f"{suffix or 'unknown'}. For exact text changes in a DOCX/text file use "
+                "documents.apply_replacements."
+            ),
+        )
+    try:
+        operations = _workbook_operations_arg(args.get("operations"))
+        output_path = _document_output_path(ctx.settings, path, args.get("output_name"))
+        result = edit_workbook_xlsx(path, operations, output_path)
+        file_record = _record_generated_document(ctx, output_path)
+    except (ValueError, DocumentRuntimeError, OSError, zipfile.BadZipFile) as exc:
+        return ToolRunResponse(tool="documents.edit", ok=False, summary=str(exc))
+    changes = list(result.get("changes") or [])
+    return ToolRunResponse(
+        tool="documents.edit",
+        ok=True,
+        summary=(
+            f"Edited workbook {path.name} ({'; '.join(changes[:6])}). "
+            f"Saved {output_path.name} with {result.get('sheet_count', 0)} sheet(s), "
+            f"{result.get('row_count', 0)} row(s)."
+        ),
+        data={
+            "source": _document_target_payload(target),
+            "output": {
+                "path": str(output_path),
+                "name": output_path.name,
+                "file": file_record,
+                "changes": changes,
+                "sheet_count": result.get("sheet_count"),
+                "row_count": result.get("row_count"),
+                "verification": result.get("verification"),
             },
         },
     )

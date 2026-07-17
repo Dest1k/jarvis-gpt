@@ -12,12 +12,15 @@ from jarvis_gpt.document_runtime import (
     DocumentRuntimeError,
     _parse_xml,
     copy_document,
+    edit_workbook_xlsx,
     extract_document,
     file_sha256,
+    read_workbook_grid,
     resolve_artifact_output_path,
     verify_document_artifact,
     write_exact_text_artifact,
     write_markdown_docx,
+    write_workbook_xlsx,
 )
 from jarvis_gpt.llm import LLMRouter
 from jarvis_gpt.storage import JarvisStorage
@@ -331,3 +334,116 @@ def test_documents_generate_preserves_source_hash(monkeypatch, tmp_path: Path) -
     assert out.name == "transform-out.md"
     assert out.is_file()
     storage.close()
+
+
+# ----------------------------------------------------------------- XLSX editing
+
+
+def _sample_budget_xlsx(path: Path) -> None:
+    write_workbook_xlsx(
+        path,
+        [
+            {
+                "name": "Budget",
+                "rows": [
+                    ["Item", "Amount", "Active"],
+                    ["Rent", 30000, True],
+                    ["Marketing", 10000, False],
+                    ["Total", "=SUM(B2:B3)", ""],
+                ],
+            }
+        ],
+        title="Budget",
+    )
+
+
+def test_read_workbook_grid_preserves_types_and_formulas(tmp_path: Path) -> None:
+    src = tmp_path / "budget.xlsx"
+    _sample_budget_xlsx(src)
+    grid = read_workbook_grid(src)
+    assert len(grid) == 1
+    rows = grid[0]["rows"]
+    assert rows[0] == ["Item", "Amount", "Active"]
+    # numbers stay numeric, not stringified
+    assert rows[1] == ["Rent", 30000, True]
+    assert isinstance(rows[1][1], int)
+    assert rows[2][2] is False
+    # a formula round-trips as a leading-"=" string
+    assert rows[3][1] == "=SUM(B2:B3)"
+
+
+def test_edit_workbook_append_update_delete(tmp_path: Path) -> None:
+    src = tmp_path / "budget.xlsx"
+    _sample_budget_xlsx(src)
+    out = tmp_path / "budget.edited.xlsx"
+    result = edit_workbook_xlsx(
+        src,
+        [
+            {"op": "append_row", "values": ["Ads", 15000, True]},
+            # resolve the column by its header name, not a letter
+            {"op": "update_row_where", "match_col": "Item", "match_value": "Marketing",
+             "set_col": "Amount", "value": 12000},
+            {"op": "delete_row", "match_col": "Item", "match_value": "Rent"},
+        ],
+        out,
+    )
+    assert out.exists()
+    assert result["verification"]["ok"] is True
+    assert len(result["changes"]) == 3
+    rows = read_workbook_grid(out)[0]["rows"]
+    names = [row[0] for row in rows]
+    assert "Ads" in names and "Rent" not in names
+    marketing = next(row for row in rows if row[0] == "Marketing")
+    assert marketing[1] == 12000 and isinstance(marketing[1], int)
+
+
+def test_edit_workbook_set_cell_a1_expands_grid(tmp_path: Path) -> None:
+    src = tmp_path / "budget.xlsx"
+    _sample_budget_xlsx(src)
+    out = tmp_path / "grown.xlsx"
+    edit_workbook_xlsx(
+        src,
+        [
+            {"op": "set_cell", "cell": "E7", "value": 42},
+            {"op": "set_cell", "row": 2, "col": "Active", "value": False},
+        ],
+        out,
+    )
+    rows = read_workbook_grid(out)[0]["rows"]
+    # E7 => row 7, col 5
+    assert rows[6][4] == 42
+    assert rows[1][2] is False
+
+
+def test_edit_workbook_add_and_rename_sheet(tmp_path: Path) -> None:
+    src = tmp_path / "budget.xlsx"
+    _sample_budget_xlsx(src)
+    out = tmp_path / "multi.xlsx"
+    edit_workbook_xlsx(
+        src,
+        [
+            {"op": "rename_sheet", "sheet": "Budget", "name": "Plan 2026"},
+            {"op": "add_sheet", "name": "Notes", "rows": [["Note"], ["reviewed"]]},
+        ],
+        out,
+    )
+    grid = read_workbook_grid(out)
+    names = [sheet["name"] for sheet in grid]
+    assert "Plan 2026" in names and "Notes" in names
+    assert extract_document(out)["structure"]["sheet_count"] == 2
+
+
+def test_edit_workbook_empty_ops_and_bad_match_raise(tmp_path: Path) -> None:
+    src = tmp_path / "budget.xlsx"
+    _sample_budget_xlsx(src)
+    out = tmp_path / "nope.xlsx"
+    with pytest.raises(DocumentRuntimeError):
+        edit_workbook_xlsx(src, [], out)
+    with pytest.raises(DocumentRuntimeError):
+        edit_workbook_xlsx(
+            src,
+            [{"op": "delete_row", "match_col": "Item", "match_value": "Missing"}],
+            out,
+        )
+    # the source is never touched and no partial output is left readable as valid
+    assert read_workbook_grid(src)[0]["rows"][0] == ["Item", "Amount", "Active"]

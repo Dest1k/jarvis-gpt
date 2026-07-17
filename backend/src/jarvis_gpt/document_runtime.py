@@ -382,6 +382,315 @@ def write_workbook_xlsx(
     }
 
 
+def read_workbook_grid(
+    path: Path,
+    *,
+    max_rows: int = 4096,
+    max_cols: int = 256,
+) -> list[dict[str, Any]]:
+    """Read every sheet of an XLSX/XLSM into a dense, TYPED row grid suitable for
+    round-trip editing and rewriting via :func:`write_workbook_xlsx`.
+
+    Unlike the bounded preview in :func:`_extract_xlsx`, this preserves cell TYPES
+    (numbers stay numbers, booleans stay booleans) and formulas (returned as a
+    leading-``=`` string so the writer re-emits them as formulas) across the full
+    used range of each sheet. Trailing blank cells are trimmed per row.
+    """
+
+    src = Path(path).resolve(strict=False)
+    if not src.exists() or not src.is_file():
+        raise DocumentRuntimeError(f"Workbook does not exist: {src}")
+    if src.suffix.lower() not in {".xlsx", ".xlsm"}:
+        raise DocumentRuntimeError(f"Not an XLSX/XLSM workbook: {src.suffix or src.name}")
+    if not zipfile.is_zipfile(src):
+        raise DocumentRuntimeError("XLSX is not a valid ZIP package.")
+    with zipfile.ZipFile(src) as archive:
+        shared_strings = _xlsx_shared_strings(archive)
+        sheet_map = _xlsx_sheet_map(archive)
+        sheets: list[dict[str, Any]] = []
+        for sheet_name, member_name in sheet_map[:64]:
+            xml = _read_zip_text_member(archive, member_name)
+            if not xml:
+                sheets.append({"name": sheet_name, "rows": []})
+                continue
+            sheets.append(
+                {
+                    "name": sheet_name,
+                    "rows": _xlsx_typed_rows(
+                        xml, shared_strings, max_rows=max_rows, max_cols=max_cols
+                    ),
+                }
+            )
+    if not sheets:
+        raise DocumentRuntimeError("Workbook has no readable sheets.")
+    return sheets
+
+
+def _xlsx_typed_rows(
+    xml: str,
+    shared_strings: list[str],
+    *,
+    max_rows: int,
+    max_cols: int,
+) -> list[list[Any]]:
+    root = _parse_xml(xml, "XLSX sheet")
+    grid: dict[int, dict[int, Any]] = {}
+    max_row_seen = 0
+    for order, row in enumerate(root.findall(f".//{{{_A_NS}}}row")):
+        if order >= max_rows:
+            break
+        attr_r = row.attrib.get("r")
+        row_number = int(attr_r) if attr_r and attr_r.isdigit() else order + 1
+        cells: dict[int, Any] = {}
+        for position, cell in enumerate(row.findall(f"./{{{_A_NS}}}c"), start=1):
+            ref = str(cell.attrib.get("r") or "")
+            col = _xlsx_col_index(ref) if ref else position
+            if col > max_cols:
+                continue
+            value = _xlsx_typed_cell_value(cell, shared_strings)
+            if value == "":
+                continue
+            cells[col] = value
+        if cells:
+            grid[row_number] = cells
+            max_row_seen = max(max_row_seen, row_number)
+    rows: list[list[Any]] = []
+    for row_number in range(1, max_row_seen + 1):
+        cells = grid.get(row_number, {})
+        width = max(cells) if cells else 0
+        rows.append([cells.get(col, "") for col in range(1, width + 1)])
+    return rows
+
+
+def _xlsx_typed_cell_value(cell: ET.Element, shared_strings: list[str]) -> Any:
+    formula = cell.find(f"./{{{_A_NS}}}f")
+    if formula is not None and (formula.text or "").strip():
+        return "=" + formula.text.strip()
+    cell_type = cell.attrib.get("t")
+    if cell_type == "inlineStr":
+        return "".join(node.text or "" for node in cell.findall(f".//{{{_A_NS}}}t"))
+    value_node = cell.find(f"./{{{_A_NS}}}v")
+    raw = value_node.text if value_node is not None and value_node.text is not None else ""
+    if raw == "":
+        return ""
+    if cell_type == "s":
+        try:
+            return shared_strings[int(raw)]
+        except (ValueError, IndexError):
+            return raw
+    if cell_type == "b":
+        return raw.strip() in {"1", "true", "True"}
+    if cell_type == "str":
+        return raw
+    return _coerce_scalar(raw)
+
+
+def edit_workbook_xlsx(
+    source_path: Path,
+    operations: list[dict[str, Any]],
+    output_path: Path,
+    *,
+    title: str | None = None,
+) -> dict[str, Any]:
+    """Apply structured edit operations to an existing workbook and write the result.
+
+    Reads the full typed grid of ``source_path``, applies ``operations`` in order,
+    then rewrites a real spreadsheet to ``output_path`` (typed cells, formulas kept,
+    bold frozen header). Supported ops (the ``op`` key):
+
+    - ``append_row``       {sheet?, values: [...]}                a row at the end
+    - ``set_cell``         {sheet?, cell:"B5" | row, col, value}
+    - ``update_row_where`` {sheet?, match_col, match_value, set_col, value}
+    - ``delete_row``       {sheet?, row | match_col, match_value}
+    - ``set_rows``         {sheet?, rows: [[...]]}                 replace the grid
+    - ``add_sheet``        {name, rows: [[...]]}
+    - ``rename_sheet``     {sheet, name}
+
+    Column selectors accept an A1 letter, a 1-based index, or a header-cell name
+    (matched against the sheet's first row). Rows are 1-based.
+    """
+
+    src = Path(source_path).resolve(strict=False)
+    sheets = read_workbook_grid(src)
+    changes: list[str] = []
+    for raw_op in operations or []:
+        if not isinstance(raw_op, dict):
+            continue
+        op = str(raw_op.get("op") or raw_op.get("action") or "").strip().casefold()
+        if not op:
+            continue
+        _apply_workbook_operation(sheets, op, raw_op, changes)
+    if not changes:
+        raise DocumentRuntimeError(
+            "No workbook edit operation changed anything; the source was left untouched."
+        )
+    result = write_workbook_xlsx(Path(output_path), sheets, title=title)
+    result["changes"] = changes
+    result["source"] = str(src)
+    return result
+
+
+def _apply_workbook_operation(
+    sheets: list[dict[str, Any]],
+    op: str,
+    spec: dict[str, Any],
+    changes: list[str],
+) -> None:
+    if op in {"add_sheet", "new_sheet"}:
+        name = str(spec.get("name") or spec.get("sheet") or f"Sheet{len(sheets) + 1}").strip()
+        rows = _workbook_rows_from_arg(spec.get("rows"))
+        sheets.append({"name": name or f"Sheet{len(sheets) + 1}", "rows": rows})
+        changes.append(f"added sheet '{name}' with {len(rows)} row(s)")
+        return
+    sheet = _workbook_select_sheet(sheets, spec.get("sheet"))
+    rows = sheet["rows"]
+    if op in {"append_row", "add_row"}:
+        raw = spec.get("values") if spec.get("values") is not None else spec.get("row")
+        values = _workbook_row_values(raw)
+        rows.append(values)
+        changes.append(f"appended a row to '{sheet['name']}'")
+    elif op in {"set_cell", "update_cell", "set"}:
+        if spec.get("cell"):
+            row_no, col_no = _workbook_parse_a1(spec.get("cell"))
+        else:
+            row_no = int(spec.get("row"))
+            col_spec = spec.get("col") if spec.get("col") is not None else spec.get("column")
+            col_no = _workbook_resolve_column(sheet, col_spec)
+        _workbook_ensure_cell(rows, row_no, col_no)
+        rows[row_no - 1][col_no - 1] = _workbook_edit_value(spec.get("value"))
+        changes.append(f"set {sheet['name']}!R{row_no}C{col_no}")
+    elif op in {"update_row_where", "update_where", "set_where"}:
+        match_col = spec.get("match_col") or spec.get("where_col") or spec.get("key_col")
+        col = _workbook_resolve_column(sheet, match_col)
+        match_value = spec.get("match_value") if "match_value" in spec else spec.get("where_value")
+        target = _workbook_resolve_row_by_match(rows, col, match_value)
+        set_spec = spec.get("set_col") or spec.get("col") or spec.get("column")
+        set_col = _workbook_resolve_column(sheet, set_spec)
+        _workbook_ensure_cell(rows, target, set_col)
+        rows[target - 1][set_col - 1] = _workbook_edit_value(spec.get("value"))
+        changes.append(f"updated row {target} in '{sheet['name']}'")
+    elif op in {"delete_row", "remove_row"}:
+        target = _workbook_resolve_row(sheet, spec)
+        if not 1 <= target <= len(rows):
+            raise DocumentRuntimeError(f"row out of range: {target}")
+        rows.pop(target - 1)
+        changes.append(f"deleted row {target} from '{sheet['name']}'")
+    elif op in {"set_rows", "replace_rows", "set_grid"}:
+        sheet["rows"] = _workbook_rows_from_arg(spec.get("rows"))
+        changes.append(f"replaced the grid of '{sheet['name']}' ({len(sheet['rows'])} row(s))")
+    elif op in {"rename_sheet", "rename"}:
+        new_name = str(spec.get("name") or spec.get("to") or "").strip()
+        if not new_name:
+            raise DocumentRuntimeError("rename_sheet requires a new name")
+        old = sheet["name"]
+        sheet["name"] = new_name
+        changes.append(f"renamed sheet '{old}' -> '{new_name}'")
+    else:
+        raise DocumentRuntimeError(f"unsupported workbook edit op: {op}")
+
+
+def _workbook_rows_from_arg(raw_rows: Any) -> list[list[Any]]:
+    return [_workbook_row_values(row) for row in (raw_rows or [])]
+
+
+def _workbook_row_values(raw: Any) -> list[Any]:
+    if raw is None:
+        return []
+    if isinstance(raw, list | tuple):
+        return [_workbook_edit_value(cell) for cell in raw]
+    return [_workbook_edit_value(raw)]
+
+
+def _workbook_edit_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return _coerce_scalar(value)
+    return _normalize_cell(value)
+
+
+def _workbook_select_sheet(sheets: list[dict[str, Any]], spec: Any) -> dict[str, Any]:
+    if not sheets:
+        raise DocumentRuntimeError("workbook has no sheets")
+    if spec is None or isinstance(spec, bool) or (isinstance(spec, str) and not spec.strip()):
+        return sheets[0]
+    if isinstance(spec, int):
+        if 0 <= spec < len(sheets):
+            return sheets[spec]
+        raise DocumentRuntimeError(f"sheet index out of range: {spec}")
+    text = str(spec).strip()
+    for sheet in sheets:
+        if str(sheet["name"]).casefold() == text.casefold():
+            return sheet
+    for sheet in sheets:
+        if text.casefold() in str(sheet["name"]).casefold():
+            return sheet
+    if text.isdigit():
+        idx = int(text) - 1
+        if 0 <= idx < len(sheets):
+            return sheets[idx]
+    raise DocumentRuntimeError(f"sheet not found: {spec}")
+
+
+def _workbook_resolve_column(sheet: dict[str, Any], spec: Any) -> int:
+    if spec is None or isinstance(spec, bool) or (isinstance(spec, str) and not spec.strip()):
+        raise DocumentRuntimeError("a column selector is required")
+    if isinstance(spec, int):
+        if spec < 1:
+            raise DocumentRuntimeError(f"invalid column index: {spec}")
+        return spec
+    text = str(spec).strip()
+    header = sheet["rows"][0] if sheet.get("rows") else []
+    for index, cell in enumerate(header, start=1):
+        if str(cell).strip().casefold() == text.casefold():
+            return index
+    if re.fullmatch(r"[A-Za-z]{1,3}", text):
+        return _xlsx_col_index(text.upper())
+    if text.isdigit():
+        return int(text)
+    raise DocumentRuntimeError(f"column not found: {spec!r}")
+
+
+def _workbook_resolve_row(sheet: dict[str, Any], spec: dict[str, Any]) -> int:
+    if spec.get("row") is not None:
+        row = int(spec["row"])
+        if row < 1:
+            raise DocumentRuntimeError(f"invalid row: {row}")
+        return row
+    match_col = spec.get("match_col") or spec.get("where_col") or spec.get("key_col")
+    if match_col is not None:
+        col = _workbook_resolve_column(sheet, match_col)
+        value = spec.get("match_value") if "match_value" in spec else spec.get("where_value")
+        return _workbook_resolve_row_by_match(sheet["rows"], col, value)
+    raise DocumentRuntimeError("delete_row needs a row number or match_col+match_value")
+
+
+def _workbook_resolve_row_by_match(rows: list[list[Any]], col: int, value: Any) -> int:
+    for index, row in enumerate(rows, start=1):
+        if col - 1 < len(row) and _workbook_cells_equal(row[col - 1], value):
+            return index
+    raise DocumentRuntimeError(f"no row where column {col} == {value!r}")
+
+
+def _workbook_cells_equal(cell: Any, value: Any) -> bool:
+    if cell == value:
+        return True
+    return str(cell).strip().casefold() == str(value).strip().casefold()
+
+
+def _workbook_parse_a1(ref: Any) -> tuple[int, int]:
+    match = re.fullmatch(r"\s*([A-Za-z]{1,3})(\d+)\s*", str(ref or ""))
+    if not match:
+        raise DocumentRuntimeError(f"invalid A1 cell reference: {ref!r}")
+    return int(match.group(2)), _xlsx_col_index(match.group(1).upper())
+
+
+def _workbook_ensure_cell(rows: list[list[Any]], row: int, col: int) -> None:
+    while len(rows) < row:
+        rows.append([])
+    target = rows[row - 1]
+    while len(target) < col:
+        target.append("")
+
+
 def _normalize_cell(value: Any) -> Any:
     if isinstance(value, bool):
         return value
