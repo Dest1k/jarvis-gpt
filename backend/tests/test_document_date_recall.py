@@ -76,6 +76,11 @@ def test_parse_date_range_с_по_and_между():
     assert c is not None and c.label == "28 июня — 3 июля 2026"
 
 
+def test_compare_query_triggers_conclude():
+    scope = parse_document_date_scope("сравни документы за 15 июля", now=_NOW)
+    assert scope is not None and scope.conclude is True  # comparison implies reading
+
+
 def test_parse_bare_month_and_topic():
     july = parse_document_date_scope("документы про бюджет за июль", now=_NOW)
     assert july is not None

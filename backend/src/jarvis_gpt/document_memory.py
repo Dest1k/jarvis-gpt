@@ -43,6 +43,9 @@ _DATE_SCOPE_CONCLUDE_MARKERS = (
     "вывод", "выводы", "проанализир", "анализ", "что следует", "к чему",
     "итог", "обобщ", "резюм", "подытож", "сделай вывод", "суть",
     "summary", "summarize", "analyze", "analyse", "conclusion", "conclude",
+    # Cross-document comparison verbs also require reading the documents (conclude mode).
+    "сравн", "сопостав", "противоречи", "различи", "различа", "отличи", "отлича",
+    "разниц", "что общего", "compare", "differ", "contradict", "versus",
 )
 # Month stems: "март" is distinct from "ма[йяе]" (may forms), so no conflict.
 _MONTH_STEMS: tuple[tuple[str, int], ...] = (

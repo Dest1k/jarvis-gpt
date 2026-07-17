@@ -7,7 +7,7 @@ document by identity. These tests pin the term extraction that gates that route.
 
 from __future__ import annotations
 
-from jarvis_gpt.agent import _archive_search_term
+from jarvis_gpt.agent import _archive_search_term, _document_compare_focus
 
 
 def test_extracts_term_from_russian_archive_queries():
@@ -37,3 +37,13 @@ def test_term_is_bounded_and_trimmed():
     )
     assert term is not None and len(term.split()) <= 6
     assert _archive_search_term("в каком файле есть НДС!") == "НДС"  # trailing punct stripped
+
+
+def test_compare_focus_detection():
+    # A comparison request yields a cross-document instruction; a plain summary does not.
+    assert _document_compare_focus("сравни документы за 15 июля") is not None
+    assert _document_compare_focus("найди противоречия между отчётами") is not None
+    assert _document_compare_focus("чем отличаются эти документы") is not None
+    assert _document_compare_focus("compare these files") is not None
+    assert _document_compare_focus("сделай вывод из документов за вчера") is None
+    assert _document_compare_focus("какие документы были 16 июля") is None

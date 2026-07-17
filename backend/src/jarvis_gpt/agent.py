@@ -7513,17 +7513,23 @@ class AgentRuntime:
         # A date-scoped question selects persisted documents by their upload date instead
         # of by relevance, and lists them (or concludes over them) rather than needing a
         # single file identity.
+        # A comparison request ("сравни документы за 15 июля", "найди противоречия
+        # между отчётами") reads the selected documents and asks the analysis to
+        # compare/contrast them rather than summarize each in isolation.
+        compare_focus = _document_compare_focus(message)
         date_scope = parse_document_date_scope(message)
         if date_scope is not None:
             arguments["date_from"] = date_scope.start_utc
             arguments["date_to"] = date_scope.end_utc
-            arguments["list_only"] = not date_scope.conclude
+            arguments["list_only"] = not (date_scope.conclude or compare_focus is not None)
             if date_scope.type_exts:
                 arguments["type_exts"] = list(date_scope.type_exts)
             if date_scope.topic:
                 arguments["topic"] = date_scope.topic
-            if date_scope.conclude:
+            if date_scope.conclude or compare_focus is not None:
                 arguments["max_files"] = 6
+        if compare_focus is not None:
+            arguments["focus"] = compare_focus
         result = await self.tools.run("documents.recall", arguments)
         # The recall result is the validated document boundary for this turn.
         # Do not also expose loose FTS chunks that the selector may have rejected.
@@ -7547,6 +7553,12 @@ class AgentRuntime:
                 "\nRespond to the operator from this evidence. Name source files used. "
                 "If selection is empty or ambiguous, ask for the missing file identity; "
                 "do not guess."
+            )
+        if compare_focus is not None:
+            observation += (
+                "\nThe operator asked to COMPARE the documents: present their common "
+                "points, key differences and any contradictions across them (use a table "
+                "where it helps), grounded strictly in the documents' contents."
             )
         recalled_sources = _document_recall_sources(result)
         event = ChatEvent(
@@ -11207,6 +11219,26 @@ _ARCHIVE_SEARCH_PATTERNS = (
     r"search\s+(?:my\s+)?(?:document|file|archive)\w*\s+for\s+(?P<t>.+)",
     r"which\s+(?:document|file)\w*\s+(?:mention|contain|reference)\w*\s+(?P<t>.+)",
 )
+
+
+_DOCUMENT_COMPARE_MARKERS = (
+    "сравн", "сопостав", "противоречи", "различи", "различа", "отличи", "отлича",
+    "разниц", "что общего", "общие черты", "compare", "differ", "contradict",
+    "versus", " vs ",
+)
+
+
+def _document_compare_focus(message: str) -> str | None:
+    """A cross-document comparison instruction when the query asks to compare/contrast."""
+
+    lowered = " ".join(str(message or "").casefold().split())
+    if not any(marker in lowered for marker in _DOCUMENT_COMPARE_MARKERS):
+        return None
+    return (
+        "Сравни документы между собой: выдели общие моменты, ключевые различия и любые "
+        "противоречия между ними. Где уместно, сведи сравнение в таблицу. Опирайся строго "
+        "на содержимое документов, не домысливай."
+    )
 
 
 def _archive_search_term(message: str) -> str | None:
