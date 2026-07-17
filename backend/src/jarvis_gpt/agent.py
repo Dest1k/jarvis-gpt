@@ -4681,6 +4681,19 @@ class AgentRuntime:
                 answer = f"{answer}\n\n{open_action.answer}"
         return DirectAction(answer=answer, events=events)
 
+    def _subject_from_recent_context(
+        self, message: str, conversation_id: str | None
+    ) -> str | None:
+        """Recover a dropped search subject from recent conversation, or None."""
+
+        if not conversation_id:
+            return None
+        try:
+            recent = self.storage.recent_messages(conversation_id, limit=12)
+        except Exception:  # noqa: BLE001 - context recovery is best-effort
+            return None
+        return _pick_subject_from_messages(message, recent)
+
     async def _run_shop_search(
         self,
         message: str,
@@ -4698,6 +4711,13 @@ class AgentRuntime:
 
         normalized = message.casefold()
         cleaned_product = _clean_shopping_subject(message) or message
+        # A follow-up like "найди ссылки на dns" carries no product of its own — recover
+        # the subject (e.g. "5070 5090") from the recent conversation instead of searching
+        # the store for the filler words.
+        if _subject_is_vague(cleaned_product):
+            carried = self._subject_from_recent_context(message, conversation_id)
+            if carried:
+                cleaned_product = carried
         product = _compact_shopping_subject(cleaned_product)
         criterion = _ranking_criterion_from_message(message) or "price_asc"
         criterion_label = _ranking_criterion_label(criterion)
@@ -4824,7 +4844,12 @@ class AgentRuntime:
     ) -> DirectAction:
         """Compare explicitly named shops without collapsing them to the first alias."""
 
-        product = _compact_shopping_subject(_clean_shopping_subject(message) or message)
+        cleaned = _clean_shopping_subject(message) or message
+        if _subject_is_vague(cleaned):
+            carried = self._subject_from_recent_context(message, conversation_id)
+            if carried:
+                cleaned = carried
+        product = _compact_shopping_subject(cleaned)
         criterion = _ranking_criterion_from_message(message) or "price_asc"
         criterion_label = _ranking_criterion_label(criterion)
         constraints = _shopping_constraints_from_message(message)
@@ -14332,6 +14357,72 @@ def _strip_shopping_criterion_noise(value: str, original_query: str) -> str:
     for pattern in _SHOPPING_CRITERION_NOISE.get(criterion or "", ()):
         value = re.sub(pattern, " ", value, flags=re.IGNORECASE)
     return value
+
+
+# Follow-up / deictic / meta words that carry no search subject on their own. A request
+# made only of these ("найди конкретные ссылки, где тебе удобно") has lost its subject and
+# must inherit it from the recent conversation instead of being searched literally.
+_FOLLOWUP_FILLER_WORDS = frozenset(
+    {
+        "найди", "найти", "поищи", "покажи", "дай", "пришли", "скинь", "кинь",
+        "конкретные", "конкретную", "конкретный", "конкретно", "точные", "точную",
+        "ссылки", "ссылку", "ссылка", "вариант", "варианты", "варианта", "варик",
+        "где", "куда", "как", "тебе", "удобно", "например", "или", "либо", "можно",
+        "это", "этот", "эту", "эти", "того", "тому", "их", "там", "тут", "ещё", "еще",
+        "пожалуйста", "плиз", "мне", "нам", "по", "на", "в", "и", "а", "с", "к", "у",
+        "же", "бы", "то", "не",
+        "цена", "цены", "цену", "стоимость", "стоит", "купить", "заказать", "взять",
+        "дешевле", "дешевые", "дешёвые", "выгоднее", "лучше", "оптимальный",
+        "подробнее", "детали", "подробности", "информацию", "инфу", "данные",
+        # currency / unit qualifiers — a "…в рублях?" follow-up has no subject either
+        "рублях", "рубли", "рублей", "руб", "долларах", "долларов", "доллары", "баксах",
+        "евро", "гривнах", "гривен", "грн", "тенге",
+    }
+)
+
+
+def _subject_is_vague(subject: str) -> bool:
+    """True when a subject holds no real search term — only follow-up/deictic filler."""
+
+    tokens = re.findall(r"[a-zа-яё0-9]+", str(subject or "").casefold())
+    substantive = [
+        token for token in tokens if token not in _FOLLOWUP_FILLER_WORDS and len(token) >= 2
+    ]
+    if not substantive:
+        return True
+    # A latin or digit-bearing token (model numbers, brands) is always a real subject.
+    if any(re.search(r"[a-z0-9]", token) for token in substantive):
+        return False
+    # Otherwise require at least one substantive cyrillic word (a noun, длиной >= 4).
+    return not any(len(token) >= 4 for token in substantive)
+
+
+def _pick_subject_from_messages(
+    message: str, messages: list[dict[str, Any]]
+) -> str | None:
+    """Recover the last concrete search subject from prior user turns.
+
+    ``messages`` is chronological (oldest -> newest). The current follow-up message is
+    skipped, and the most recent prior user turn with a non-vague subject wins.
+    """
+
+    current = " ".join(str(message or "").casefold().split())
+    product_like: str | None = None  # carries a model number / brand token
+    any_concrete: str | None = None
+    for item in messages:
+        if str(item.get("role") or "") != "user":
+            continue
+        content = str(item.get("content") or "")
+        if " ".join(content.casefold().split()) == current:
+            continue
+        subject = _clean_shopping_subject(content)
+        if not subject or _subject_is_vague(subject):
+            continue
+        compact = _compact_shopping_subject(subject)
+        any_concrete = compact
+        if re.search(r"[a-z0-9]", subject.casefold()):
+            product_like = compact
+    return product_like or any_concrete
 
 
 def _clean_shopping_subject(query: str) -> str:
