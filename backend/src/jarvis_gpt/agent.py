@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import inspect
 import json
+import mimetypes
 import ntpath
 import os
 import re
@@ -665,6 +666,13 @@ def _chat_message_metadata(
     if attachments:
         metadata["attachments"] = attachments
     return metadata
+
+
+# Vision attachment bounds: cap how many images and how large each image may be before
+# it is base64-embedded into a chat request (keeps the request bounded; the VLM's own
+# processor downsamples resolution server-side).
+_VISION_MAX_IMAGES = 4
+_VISION_MAX_IMAGE_BYTES = 16 * 1024 * 1024
 
 
 def _message_with_attachments(message: str, attachments: list[dict[str, Any]]) -> str:
@@ -1337,6 +1345,11 @@ class AgentRuntime:
             context,
             context_message,
             thinking_enabled=thinking_enabled,
+            image_parts=(
+                self._image_parts_for_attachments(attachments)
+                if self.settings.profile.vision_capable
+                else None
+            ),
         )
         if document_prefetch is not None:
             llm_messages.append({"role": "user", "content": observation})
@@ -2010,6 +2023,11 @@ class AgentRuntime:
             context,
             context_message,
             thinking_enabled=thinking_enabled,
+            image_parts=(
+                self._image_parts_for_attachments(attachments)
+                if self.settings.profile.vision_capable
+                else None
+            ),
         )
         if document_prefetch is not None:
             llm_messages.append({"role": "user", "content": observation})
@@ -8899,13 +8917,62 @@ class AgentRuntime:
             used_tools=used_tools,
         )
 
+    def _image_parts_for_attachments(
+        self, attachments: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Turn image chat attachments into OpenAI-style vision content parts.
+
+        The raw upload bytes already live on disk (POST /api/files/upload), so we load
+        them by id, base64-encode, and emit ``image_url`` data-URL parts a vision model
+        understands. Only used when the served profile is ``vision_capable``; a text-only
+        brain never sees these (images stay described as file metadata). Non-image
+        attachments, missing files, and oversized images are skipped silently to keep the
+        chat clean and the request bounded.
+        """
+
+        if not attachments:
+            return []
+        parts: list[dict[str, Any]] = []
+        for item in attachments:
+            if len(parts) >= _VISION_MAX_IMAGES:
+                break
+            mime = str(item.get("mime_type") or "").strip().lower()
+            if not mime:
+                mime = (mimetypes.guess_type(str(item.get("name") or ""))[0] or "").lower()
+            if not mime.startswith("image/"):
+                continue
+            record = self.storage.get_file(str(item.get("id") or ""))
+            if not record:
+                continue
+            stored_path = str(record.get("stored_path") or "")
+            if not stored_path:
+                continue
+            path = Path(stored_path)
+            try:
+                if not path.is_file() or path.stat().st_size > _VISION_MAX_IMAGE_BYTES:
+                    continue
+                raw = path.read_bytes()
+            except OSError:
+                continue
+            if not raw:
+                continue
+            encoded = base64.b64encode(raw).decode("ascii")
+            parts.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime};base64,{encoded}"},
+                }
+            )
+        return parts
+
     def _build_llm_messages(
         self,
         context: AgentContext,
         message: str,
         *,
         thinking_enabled: bool = True,
-    ) -> list[dict[str, str]]:
+        image_parts: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
         memory_block = ""
         if context.memory_hits:
             lines = [
@@ -8966,7 +9033,15 @@ class AgentRuntime:
         for item in recent:
             if item["role"] in {"user", "assistant"}:
                 messages.append({"role": item["role"], "content": item["content"]})
-        messages.append({"role": "user", "content": message})
+        if image_parts:
+            # Vision turn: text + image content parts (a VLM sees the pixels). vLLM's
+            # OpenAI-compatible server accepts a content list verbatim; llm.py forwards it
+            # unchanged. Falls back to the plain string when there are no images.
+            content: list[dict[str, Any]] = [{"type": "text", "text": message}]
+            content.extend(image_parts)
+            messages.append({"role": "user", "content": content})
+        else:
+            messages.append({"role": "user", "content": message})
         return messages
 
     def _capability_manifest(
