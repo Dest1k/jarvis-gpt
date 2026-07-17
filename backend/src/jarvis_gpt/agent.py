@@ -6698,6 +6698,8 @@ class AgentRuntime:
                 # "сделай вывод из документов за вчера") routes here so recall can
                 # select by upload date rather than by relevance.
                 parse_document_date_scope(message) is not None
+                # A full-text archive search ("в каком документе упоминается X?").
+                or _archive_search_term(message) is not None
                 or _looks_like_document_memory_query(
                     message,
                     has_file_context=bool(context.file_hits),
@@ -7471,6 +7473,33 @@ class AgentRuntime:
         plan = context.task_plan
         if plan is None or plan.intent != "document_memory":
             return None
+        # Archive full-text search ("в каком документе упоминается X?") runs a corpus-wide
+        # FTS sweep and answers with the matching documents + quoted passages, instead of
+        # selecting/reading one document by identity.
+        archive_term = _archive_search_term(message)
+        if archive_term is not None:
+            result = await self.tools.run(
+                "files.search", {"query": archive_term, "limit": 8}
+            )
+            context.file_hits = []
+            observation = _tool_observation_excerpt(result) + (
+                "\nThis is a full-text search across ALL uploaded documents. Answer which "
+                "documents mention the query, quoting the matching passage from `hits` and "
+                "naming each source file. If `hits` is empty, say plainly that no uploaded "
+                "document mentions it — do not invent documents."
+            )
+            event = ChatEvent(
+                type="tool_call",
+                title="files.search:archive",
+                content=result.summary,
+                payload={
+                    "tool": result.tool,
+                    "ok": result.ok,
+                    "autonomous": True,
+                    "term": archive_term,
+                },
+            )
+            return observation, event, result
         file_ids: list[str] = []
         for hit in context.file_hits:
             if hit.get("retrieval") != "recent-attachment":
@@ -11164,6 +11193,35 @@ def _request_needs_web_lookup(message: str) -> bool:
         ),
     )
     return has_lookup and has_freshness
+
+
+# Full-text archive search: "в каком документе упоминается X?", "найди в файлах X".
+# Each pattern captures the search term in group `t`; the archive noun (документ/файл/
+# архив) is required so "найди договор alpha" stays a recall, not an FTS sweep.
+_ARCHIVE_SEARCH_PATTERNS = (
+    r"в\s+как(?:ом|их)\s+(?:документ\w*|файл\w*)\s+"
+    r"(?:упомина\w+|есть|говорит\w+|встреча\w+|написан\w+|содержит\w+|фигурир\w+)\s+(?P<t>.+)",
+    r"в\s+(?:документ\w*|файл\w*)\s+(?:упомина\w+|встреча\w+|фигурир\w+)\s+(?P<t>.+)",
+    r"(?:найд[иьяе]\w*|поищ\w*|ищи|поиск\w*)\s+(?:по\s+)?(?:в\s+)?"
+    r"(?:документ\w*|файл\w*|архив\w*)\s+(?:про\s+|упоминани\w+\s+|слово\s+)?(?P<t>.+)",
+    r"search\s+(?:my\s+)?(?:document|file|archive)\w*\s+for\s+(?P<t>.+)",
+    r"which\s+(?:document|file)\w*\s+(?:mention|contain|reference)\w*\s+(?P<t>.+)",
+)
+
+
+def _archive_search_term(message: str) -> str | None:
+    """The search term of an archive full-text query ("в каких файлах есть X"), else None."""
+
+    text = " ".join(str(message or "").split())
+    if not text:
+        return None
+    for pattern in _ARCHIVE_SEARCH_PATTERNS:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            term = " ".join(match.group("t").split()[:6]).strip(" ?!.,:;\"'«»()")
+            if len(term) >= 2:
+                return term
+    return None
 
 
 def _looks_like_document_memory_query(
