@@ -63,6 +63,29 @@ def test_parse_requires_document_noun_and_a_date():
     assert parse_document_date_scope("покажи мои документы", now=_NOW) is None  # no date
 
 
+def test_parse_date_range_с_по_and_между():
+    a = parse_document_date_scope("какие документы были с 10 по 16 июля", now=_NOW)
+    assert a is not None
+    assert a.start_utc == "2026-07-09T21:00:00+00:00"  # 10 July local start
+    assert a.end_utc == "2026-07-16T21:00:00+00:00"  # 16 July local inclusive
+    assert a.label == "10 июля — 16 июля 2026"
+    b = parse_document_date_scope("документы между 10 и 16 июля", now=_NOW)
+    assert b is not None and (b.start_utc, b.end_utc) == (a.start_utc, a.end_utc)
+    # Cross-month range keeps both months.
+    c = parse_document_date_scope("файлы с 28 июня по 3 июля", now=_NOW)
+    assert c is not None and c.label == "28 июня — 3 июля 2026"
+
+
+def test_parse_detects_type_filter():
+    assert parse_document_date_scope("какие xlsx были 16 июля", now=_NOW).type_exts == (
+        "xls", "xlsx",
+    )
+    assert parse_document_date_scope("покажи таблицы за 16 июля", now=_NOW).type_exts == (
+        "csv", "xls", "xlsx",
+    )
+    assert parse_document_date_scope("какие документы были 16 июля", now=_NOW).type_exts == ()
+
+
 # --- storage range ---------------------------------------------------------------
 
 def test_list_files_in_range_filters_by_created_at(monkeypatch, tmp_path):
@@ -101,6 +124,29 @@ def test_date_recall_lists_documents_without_reading(monkeypatch, tmp_path):
     assert result["mode"] == "list"
     assert [doc["name"] for doc in result["documents"]] == ["invoice-july.txt"]
     assert result["analyses"] == []  # listing does not read file contents
+    storage.close()
+
+
+def test_date_recall_type_filter_keeps_only_matching_extensions(monkeypatch, tmp_path):
+    _settings, storage, surfer = _runtime(monkeypatch, tmp_path)
+    for fname in ("budget.xlsx", "notes.md", "data.csv"):
+        path = tmp_path / fname
+        path.write_text("x", encoding="utf-8")
+        storage.create_file_record(
+            name=fname, stored_path=path, sha256=fname.ljust(64, "0")[:64], size=1,
+            mime_type="application/octet-stream", status="stored", chunk_count=0,
+        )
+    memory = DocumentMemory(storage=storage, surfer=surfer)
+    only_xlsx = memory.recall(
+        "какие xlsx", date_from=_WIDE[0], date_to=_WIDE[1], list_only=True,
+        type_exts=("xlsx", "xls"),
+    )
+    assert [doc["name"] for doc in only_xlsx["documents"]] == ["budget.xlsx"]
+    tables = memory.recall(
+        "какие таблицы", date_from=_WIDE[0], date_to=_WIDE[1], list_only=True,
+        type_exts=("xlsx", "xls", "csv"),
+    )
+    assert sorted(doc["name"] for doc in tables["documents"]) == ["budget.xlsx", "data.csv"]
     storage.close()
 
 

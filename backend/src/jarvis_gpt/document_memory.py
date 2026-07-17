@@ -32,6 +32,7 @@ class DocumentDateScope:
     end_utc: str
     label: str
     conclude: bool
+    type_exts: tuple[str, ...] = ()  # empty = any file type
 
 
 _DATE_SCOPE_DOC_NOUNS = (
@@ -53,6 +54,41 @@ _MONTH_NAMES_RU = (
     "", "января", "февраля", "марта", "апреля", "мая", "июня",
     "июля", "августа", "сентября", "октября", "ноября", "декабря",
 )
+
+
+# File-type words → the filename extensions they select. Ordered longest/most-specific
+# first is unnecessary (we union all matches). Bare "md" is avoided (too many substrings).
+_DOC_TYPE_TOKENS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("xlsx", ("xlsx", "xls")),
+    ("excel", ("xlsx", "xls")),
+    ("эксель", ("xlsx", "xls")),
+    ("таблиц", ("xlsx", "xls", "csv")),
+    ("csv", ("csv",)),
+    ("docx", ("docx", "doc")),
+    ("word", ("docx", "doc")),
+    ("ворд", ("docx", "doc")),
+    ("pdf", ("pdf",)),
+    ("pptx", ("pptx", "ppt")),
+    ("powerpoint", ("pptx", "ppt")),
+    ("презентац", ("pptx", "ppt")),
+    ("json", ("json",)),
+    ("markdown", ("md",)),
+    ("текстов", ("txt", "md")),
+    ("txt", ("txt",)),
+)
+
+
+def _detect_document_types(text: str) -> tuple[str, ...]:
+    exts: set[str] = set()
+    for token, extensions in _DOC_TYPE_TOKENS:
+        if token in text:
+            exts.update(extensions)
+    return tuple(sorted(exts))
+
+
+def _filename_extension(name: str) -> str:
+    stem = str(name or "")
+    return stem.rsplit(".", 1)[-1].lower() if "." in stem else ""
 
 
 def _month_from_word(word: str) -> int | None:
@@ -80,6 +116,30 @@ def _match_document_date_window(
     text: str, now: datetime
 ) -> tuple[datetime, datetime, str] | None:
     today = _local_midnight(now, now.year, now.month, now.day)
+    # Range first: "с 10 [июля] по 16 июля [2026]" / "между 10 и 16 июля". The end day is
+    # inclusive, so the window extends to the start of the following day.
+    rng = re.search(
+        rf"(?:с|со|между)\s+(\d{{1,2}})(?:\s+({_MONTH_ALT})[а-яё]*)?\s+(?:по|и|до)\s+"
+        rf"(\d{{1,2}})\s+({_MONTH_ALT})[а-яё]*(?:\s+(\d{{4}}))?",
+        text,
+    )
+    if rng:
+        day1, day2 = int(rng[1]), int(rng[3])
+        month2 = _month_from_word(rng[4]) or 0
+        month1 = _month_from_word(rng[2]) if rng[2] else month2
+        if month1 and month2:
+            year = int(rng[5]) if rng[5] else _year_not_in_future(now, month2, day2)
+            try:
+                start = _local_midnight(now, year, month1, day1)
+                end = _local_midnight(now, year, month2, day2) + timedelta(days=1)
+            except ValueError:
+                return None
+            if end > start:
+                label = (
+                    f"{day1} {_MONTH_NAMES_RU[month1]} — "
+                    f"{day2} {_MONTH_NAMES_RU[month2]} {year}"
+                )
+                return start, end, label
     if "позавчера" in text:
         start = today - timedelta(days=2)
         return start, start + timedelta(days=1), "позавчера"
@@ -168,7 +228,12 @@ def parse_document_date_scope(
     """
 
     text = " ".join(str(message or "").casefold().split())
-    if not text or not any(noun in text for noun in _DATE_SCOPE_DOC_NOUNS):
+    if not text:
+        return None
+    type_exts = _detect_document_types(text)
+    # A document noun ("документ"/"файл"/…) or a file-type word ("xlsx", "таблицы")
+    # marks this as a document question; without either it is a generic dated query.
+    if not type_exts and not any(noun in text for noun in _DATE_SCOPE_DOC_NOUNS):
         return None
     reference = now or datetime.now().astimezone()
     if reference.tzinfo is None:
@@ -183,6 +248,7 @@ def parse_document_date_scope(
         end_utc=end.astimezone(UTC).isoformat(timespec="seconds"),
         label=label,
         conclude=conclude,
+        type_exts=type_exts,
     )
 
 _RECALL_NOISE_STEMS = (
@@ -418,6 +484,7 @@ class DocumentMemory:
         date_from: str | None = None,
         date_to: str | None = None,
         list_only: bool = False,
+        type_exts: tuple[str, ...] | list[str] | None = None,
     ) -> dict[str, Any]:
         query_clean = " ".join(str(query or "").split()).strip()
         date_scoped = bool(date_from and date_to)
@@ -434,6 +501,7 @@ class DocumentMemory:
                 focus=focus,
                 max_files=max_files,
                 max_chars=max_chars,
+                type_exts=tuple(type_exts or ()),
             )
         retrieval_query = _retrieval_query(query_clean)
         candidates, selection_mode, selection_errors = self._select_candidates(
@@ -610,10 +678,12 @@ class DocumentMemory:
         focus: str | None,
         max_files: int,
         max_chars: int,
+        type_exts: tuple[str, ...] = (),
     ) -> dict[str, Any]:
         """Recall documents by upload date: list them, or read+conclude over them."""
 
         records = self.storage.list_files_in_range(date_from, date_to, limit=200)
+        wanted = {ext.lower() for ext in type_exts}
         documents = [
             {
                 "file_id": str(record.get("id") or ""),
@@ -624,8 +694,14 @@ class DocumentMemory:
                 "status": str(record.get("status") or ""),
             }
             for record in records
+            if not wanted or _filename_extension(str(record.get("name") or "")) in wanted
         ]
-        scope = {"from": date_from, "to": date_to, "count": len(documents)}
+        scope = {
+            "from": date_from,
+            "to": date_to,
+            "count": len(documents),
+            "types": sorted(wanted) or None,
+        }
         base: dict[str, Any] = {
             "protocol": DOCUMENT_MEMORY_PROTOCOL,
             "ok": True,

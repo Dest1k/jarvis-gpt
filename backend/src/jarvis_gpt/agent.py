@@ -7489,6 +7489,8 @@ class AgentRuntime:
             arguments["date_from"] = date_scope.start_utc
             arguments["date_to"] = date_scope.end_utc
             arguments["list_only"] = not date_scope.conclude
+            if date_scope.type_exts:
+                arguments["type_exts"] = list(date_scope.type_exts)
             if date_scope.conclude:
                 arguments["max_files"] = 6
         result = await self.tools.run("documents.recall", arguments)

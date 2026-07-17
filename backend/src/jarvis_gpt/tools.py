@@ -5211,6 +5211,12 @@ def _documents_recall(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
     date_from = str(args.get("date_from") or "").strip() or None
     date_to = str(args.get("date_to") or "").strip() or None
     list_only = _bool_arg(args.get("list_only"), default=False)
+    type_filter = args.get("type_exts") or args.get("type_filter")
+    if isinstance(type_filter, str):
+        type_filter = [type_filter]
+    type_exts = [str(item).strip().lower() for item in type_filter] if isinstance(
+        type_filter, list
+    ) else []
     try:
         memory = DocumentMemory(storage=ctx.storage, surfer=_document_surfer_for(ctx))
         result = memory.recall(
@@ -5222,6 +5228,7 @@ def _documents_recall(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
             date_from=date_from,
             date_to=date_to,
             list_only=list_only,
+            type_exts=type_exts or None,
         )
     except (ValueError, DocumentSurferError) as exc:
         return ToolRunResponse(tool="documents.recall", ok=False, summary=str(exc))
