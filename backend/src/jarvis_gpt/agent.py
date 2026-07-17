@@ -4537,6 +4537,12 @@ class AgentRuntime:
         if answer_action is not None:
             return answer_action
 
+        # A vague web follow-up ("расскажи подробнее про это", "а что там по X") inherits
+        # its subject from recent conversation, same as the shop-search paths do.
+        if _subject_is_vague(_clean_research_subject(query)):
+            carried = self._subject_from_recent_context(message, conversation_id)
+            if carried:
+                query = f"{carried} {query}".strip()
         search = await self.tools.run("web.search", {"query": query, "limit": 6})
         events = [
             ChatEvent(
