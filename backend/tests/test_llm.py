@@ -631,3 +631,43 @@ def _http_status_error(status_code: int) -> httpx.HTTPStatusError:
         request=request,
         response=response,
     )
+
+
+def test_suppress_model_thinking_profile_forces_enable_thinking_off(monkeypatch, tmp_path):
+    # Qwen dumps an unparseable thinking trace into the answer; its profile sets
+    # suppress_model_thinking, so the router must send enable_thinking=False even when the
+    # caller asked for thinking.
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_PROFILE", "qwen36-vl")
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "1")
+    router = LLMRouter(load_settings())
+    captured: dict[str, object] = {}
+
+    async def fake_post(body, _lease):
+        captured["body"] = body
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    monkeypatch.setattr(router, "_post_completion", fake_post)
+    result = asyncio.run(
+        router.complete([{"role": "user", "content": "hi"}], thinking_enabled=True)
+    )
+    assert result.ok is True
+    assert captured["body"]["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def test_non_suppressing_profile_keeps_thinking_when_enabled(monkeypatch, tmp_path):
+    # A profile without the flag must NOT inject enable_thinking=False when the caller
+    # left thinking on.
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_PROFILE", "gemma4-turbo")
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "1")
+    router = LLMRouter(load_settings())
+    captured: dict[str, object] = {}
+
+    async def fake_post(body, _lease):
+        captured["body"] = body
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    monkeypatch.setattr(router, "_post_completion", fake_post)
+    asyncio.run(router.complete([{"role": "user", "content": "hi"}], thinking_enabled=True))
+    assert "chat_template_kwargs" not in captured["body"]

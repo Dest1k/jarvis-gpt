@@ -333,7 +333,7 @@ class LLMRouter:
             "max_tokens": self.settings.llm_max_tokens if max_tokens is None else max_tokens,
             "stream": False,
         }
-        if not thinking_enabled:
+        if not thinking_enabled or self.settings.profile.suppress_model_thinking:
             body["chat_template_kwargs"] = {"enable_thinking": False}
         priority = self._priority.get()
         attempt = 1
@@ -405,7 +405,7 @@ class LLMRouter:
             "max_tokens": self.settings.llm_max_tokens if max_tokens is None else max_tokens,
             "stream": True,
         }
-        if not thinking_enabled:
+        if not thinking_enabled or self.settings.profile.suppress_model_thinking:
             body["chat_template_kwargs"] = {"enable_thinking": False}
         if include_usage:
             body["stream_options"] = {"include_usage": True}

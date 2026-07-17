@@ -143,6 +143,12 @@ class RuntimeProfile:
     # pixels. The chat pipeline only forwards image attachments as real vision content
     # parts when this is set; a text-only brain keeps treating images as file metadata.
     vision_capable: bool = False
+    # True when the model's "thinking" mode emits an unparseable chain-of-thought into
+    # the answer body (Qwen3.5 dumps a free-form "Here's a thinking process:" trace with
+    # no <think> delimiters and no reasoning_content, so it cannot be stripped). For such
+    # models the LLM router forces enable_thinking=False so chat answers stay clean and
+    # fast; Jarvis supplies its own reasoning at the agent/orchestrator layer.
+    suppress_model_thinking: bool = False
     # Product certification on the current certified host (not a performance claim).
     certification: str = "unsupported"  # certified | experimental | unsupported
     interactive_certified: bool = False
@@ -291,6 +297,9 @@ PROFILES: dict[str, RuntimeProfile] = {
         vllm_image="vllm/vllm-openai:v0.25.1",
         # Qwen3.5-VL sees images/video: forward chat image attachments as vision input.
         vision_capable=True,
+        # Qwen dumps a free-form thinking trace into the answer with no <think> tags to
+        # strip; run it non-thinking for clean, fast chat (Jarvis reasons at its own layer).
+        suppress_model_thinking=True,
         vllm_extra_args=VllmExtraArgs(
             skip_mm_profiling=True,
             mm_processor_cache_gb=4.0,
@@ -335,6 +344,7 @@ def profile_public_dict(profile: RuntimeProfile) -> dict[str, object]:
         "tokenizer_mode": profile.tokenizer_mode,
         "vllm_image": profile.vllm_image,
         "vision_capable": profile.vision_capable,
+        "suppress_model_thinking": profile.suppress_model_thinking,
         "certification": profile.certification,
         "interactive_certified": profile.interactive_certified,
         "default_recommended": profile.default_recommended,
