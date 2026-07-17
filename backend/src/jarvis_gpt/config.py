@@ -111,6 +111,13 @@ class VllmExtraArgs:
     # Multimodal bounds for vision-language models, e.g. "image=2,video=1".
     limit_mm_per_prompt: str | None = None
     trust_remote_code: bool = False
+    # Speculative decoding, e.g. MTP. Compact JSON with NO spaces (survives the compose
+    # command word-split); emitted single-quoted so the inner double quotes are preserved.
+    # Example: '{"method":"mtp","num_speculative_tokens":2}'.
+    speculative_config: str | None = None
+    # Async scheduling for lower per-step latency (vLLM >= 0.25). Harmless if the build
+    # already enables it by default.
+    async_scheduling: bool = False
 
 
 @dataclass(frozen=True)
@@ -309,9 +316,15 @@ PROFILES: dict[str, RuntimeProfile] = {
             # crashes EngineCore init. Raise it so the constraint holds (also a better
             # prefill chunk).
             max_num_batched_tokens=4096,
+            # MTP self-speculation was measured LIVE on this box (5090 + vLLM 0.25.1
+            # FLASHINFER_CUTLASS NVFP4) and was a NET LOSS: ~150 vs ~203 tok/s pure decode
+            # (400 forced tokens, apples-to-apples) — the already memory-bound NVFP4 decode
+            # doesn't benefit from the extra draft forward passes (num_speculative_tokens>1
+            # also lowers acceptance). Left OFF; the field stays available for hardware
+            # where it wins: speculative_config='{"method":"mtp","num_speculative_tokens":2}'.
             # Enable these live once base serving is confirmed (values may vary by vLLM
             # build): reasoning_parser="qwen3", tool_call_parser="hermes",
-            # enable_auto_tool_choice=True, limit_mm_per_prompt="image=2,video=1".
+            # enable_auto_tool_choice=True.
         ),
         certification="experimental",
         interactive_certified=False,

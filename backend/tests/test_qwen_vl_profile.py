@@ -45,8 +45,10 @@ def test_vllm_extra_args_emits_advanced_flags_when_enabled():
         reasoning_parser="qwen3",
         tool_call_parser="hermes",
         enable_auto_tool_choice=True,
-        limit_mm_per_prompt="image=2,video=1",
+        limit_mm_per_prompt='{"image":2,"video":1}',
         trust_remote_code=True,
+        speculative_config='{"method":"mtp","num_speculative_tokens":2}',
+        async_scheduling=True,
     )
     profile = PROFILES["qwen36-vl"]
     from dataclasses import replace
@@ -55,8 +57,12 @@ def test_vllm_extra_args_emits_advanced_flags_when_enabled():
     assert "--reasoning-parser qwen3" in args
     assert "--tool-call-parser hermes" in args
     assert "--enable-auto-tool-choice" in args
-    assert "--limit-mm-per-prompt image=2,video=1" in args
+    # vLLM >= 0.25 wants JSON for --limit-mm-per-prompt; it is single-quoted so the
+    # docker-compose word-split preserves the inner double quotes.
+    assert "--limit-mm-per-prompt '{\"image\":2,\"video\":1}'" in args
     assert "--trust-remote-code" in args
+    assert "--async-scheduling" in args
+    assert "--speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":2}'" in args
 
 
 def test_enable_auto_tool_choice_requires_a_tool_parser():

@@ -166,7 +166,15 @@ def _vllm_extra_args(profile: RuntimeProfile) -> str:
         if options.enable_auto_tool_choice:
             args.append("--enable-auto-tool-choice")
     if options.limit_mm_per_prompt:
-        args.extend(["--limit-mm-per-prompt", options.limit_mm_per_prompt])
+        # vLLM >= 0.25 parses this as JSON (json.loads); single-quote so the compose
+        # command word-split keeps the JSON's inner double quotes intact.
+        args.extend(["--limit-mm-per-prompt", f"'{options.limit_mm_per_prompt}'"])
+    if options.async_scheduling:
+        args.append("--async-scheduling")
+    if options.speculative_config:
+        # Single-quote the compact JSON so the docker-compose command word-split keeps it
+        # as one argument with its inner double quotes intact.
+        args.extend(["--speculative-config", f"'{options.speculative_config}'"])
     return " ".join(args)
 
 
