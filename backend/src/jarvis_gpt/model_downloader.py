@@ -479,6 +479,7 @@ def download_model(
     segment_workers: int = DEFAULT_SEGMENT_WORKERS,
     segment_size: int = DEFAULT_SEGMENT_SIZE,
     console: bool = True,
+    trust_env: bool = False,
     client: httpx.Client | None = None,
 ) -> dict:
     """Download every file of ``repo`` into ``dest_dir`` with parallel files + segments,
@@ -492,7 +493,7 @@ def download_model(
     dest_root = Path(dest_dir)
     dest_root.mkdir(parents=True, exist_ok=True)
     owns_client = client is None
-    client = client or httpx.Client(follow_redirects=True, trust_env=False)
+    client = client or httpx.Client(follow_redirects=True, trust_env=trust_env)
     try:
         files = list_repo_files(repo, revision=revision, token=token, client=client)
         total_bytes = sum(max(0, f.size) for f in files)
@@ -551,11 +552,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--token-file", default="hf_token.txt")
     parser.add_argument("--file-workers", type=int, default=DEFAULT_FILE_WORKERS)
     parser.add_argument("--segment-workers", type=int, default=DEFAULT_SEGMENT_WORKERS)
+    parser.add_argument(
+        "--trust-env", action="store_true", help="Honor HTTP(S)_PROXY / system proxy (VPN)."
+    )
     args = parser.parse_args(argv)
     try:
         summary = download_model(
             args.repo, args.dest, revision=args.revision, token_path=args.token_file,
             file_workers=args.file_workers, segment_workers=args.segment_workers, console=True,
+            trust_env=args.trust_env,
         )
     except ModelDownloadError as exc:
         print(f"Download failed: {exc}", file=sys.stderr)
