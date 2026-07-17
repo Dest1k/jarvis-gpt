@@ -14,6 +14,7 @@ from jarvis_gpt.tools import (
     _format_price_value,
     _jsonld_offer_price,
     _jsonld_products_from_html,
+    _shop_query_focus,
 )
 
 _YANDEX_MARKET = """
@@ -100,3 +101,25 @@ def test_price_formatting_by_currency():
     assert _format_price_value(539740, "RUB") == "539 740 ₽"
     assert _format_price_value(1999, "USD") == "$1 999"
     assert _format_price_value(1200, "EUR") == "1 200 €"
+
+
+def test_shop_query_focus_strips_filler_and_finds_model_anchor():
+    # The messy orchestrator query keeps the product, drops command/filler words, and
+    # anchors on the model number so a store's "you might also like" items get filtered.
+    text, anchors = _shop_query_focus(
+        "где сейчас дешевле всего купить видеокарту RTX 5090? сравни несколько магазинов"
+    )
+    assert "rtx" in text and "5090" in text
+    assert "купить" not in text and "дешевле" not in text and "магазинов" not in text
+    assert anchors == ["5090"]
+
+
+def test_shop_query_focus_anchor_falls_back_to_brand_token():
+    _text, anchors = _shop_query_focus("холодильник Bosch недорого")
+    assert anchors == ["bosch"]  # no digit token -> distinctive latin brand token
+
+
+def test_shop_query_focus_no_anchor_for_generic_category():
+    # A bare category has nothing distinctive to filter on -> no targeted store fetch.
+    _text, anchors = _shop_query_focus("купить видеокарту")
+    assert anchors == []

@@ -19,13 +19,14 @@ import threading
 import time
 import zipfile
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html import unescape
 from pathlib import Path, PureWindowsPath
 from typing import Any, Literal
-from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlparse
+from urllib.parse import parse_qs, quote_plus, unquote, urlencode, urljoin, urlparse
 from xml.etree import ElementTree
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -7577,6 +7578,125 @@ async def _web_crawl(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     )
 
 
+# Command/filler words stripped before searching a store and before choosing anchor
+# tokens; category and brand/model words are kept.
+_SHOP_FILLER_TOKENS = frozenset(
+    {
+        "где", "сейчас", "дешевле", "дешёвле", "дешевый", "дешёвый", "всего", "купить",
+        "куплю", "покупка", "сравни", "сравнить", "сравнение", "несколько", "этих",
+        "разных", "магазин", "магазины", "магазинов", "магазине", "цена", "цены", "цену",
+        "ценам", "стоимость", "сколько", "стоит", "наличие", "есть", "самый", "самая",
+        "самое", "самые", "лучший", "лучшая", "лучшее", "онлайн", "россии", "рублях",
+        "price", "prices", "buy", "cheapest", "cheap", "best", "compare", "comparison",
+        "shop", "store", "stores", "the", "for", "and", "find", "where", "how", "much",
+    }
+)
+# SSR stores that emit schema.org JSON-LD offers within the first bytes of the page, so a
+# bounded fetch yields real prices. (Yandex Market also emits JSON-LD but only ~380 KB in,
+# so it is intentionally not here — a later increment handles heavy-SPA stores.) Extendable.
+_STRUCTURED_SHOP_STORES: tuple[tuple[str, str, int], ...] = (
+    ("Regard", "https://www.regard.ru/catalog?search={q}", 160_000),
+)
+
+
+def _shop_query_focus(query: str) -> tuple[str, list[str]]:
+    """Clean a shopping query into (store search text, anchor tokens for filtering).
+
+    Anchor tokens — a model number like "5090", else a distinctive latin/brand token —
+    are what a returned product's name must contain, so a store's promoted/"you might
+    also like" items (an RX 5700 in an RTX 5090 search) are filtered out.
+    """
+
+    tokens = [
+        token
+        for token in re.findall(r"[\w-]+", str(query or "").lower(), flags=re.UNICODE)
+        if token not in _SHOP_FILLER_TOKENS and len(token) >= 2
+    ]
+    search_text = " ".join(tokens)
+    anchors = [token for token in tokens if any(ch.isdigit() for ch in token)]
+    if not anchors:
+        anchors = [token for token in tokens if token.isascii() and len(token) >= 4]
+    return search_text, anchors
+
+
+async def _fetch_structured_offers(
+    url: str, anchors: list[str], *, cap_bytes: int
+) -> list[dict[str, Any]]:
+    """Bounded fetch of a store page → schema.org offers whose name matches every anchor.
+
+    Reads at most ``cap_bytes`` (the JSON-LD sits near the top of these SSR stores), then
+    keeps only anchor-matching products sorted by price. Fails soft to an empty list.
+    """
+
+    try:
+        safe_url = await _validate_public_http_url_async(url)
+    except ValueError:
+        return []
+    body = bytearray()
+    try:
+        async with (
+            httpx.AsyncClient(
+                timeout=httpx.Timeout(20.0),
+                follow_redirects=True,
+                trust_env=False,
+                transport=_PublicOnlyAsyncHTTPTransport(),
+            ) as client,
+            client.stream("GET", safe_url, headers=WEB_HEADERS) as response,
+        ):
+            if response.status_code >= 400:
+                return []
+            async for chunk in response.aiter_bytes():
+                body.extend(chunk)
+                if len(body) >= cap_bytes:
+                    break
+    except httpx.HTTPError:
+        return []
+    products = _jsonld_products_from_html(bytes(body).decode("utf-8", errors="replace"))
+    lowered = [anchor for anchor in anchors if anchor]
+    matched = [
+        product
+        for product in products
+        if isinstance(product, dict)
+        and all(anchor in str(product.get("name") or "").lower() for anchor in lowered)
+    ]
+    matched.sort(key=lambda product: product.get("price_value") or float("inf"))
+    return matched
+
+
+async def _targeted_shop_source(query: str) -> dict[str, Any] | None:
+    """A high-quality source of real priced offers for a shopping query, or None.
+
+    Searches a structured-data store for the cleaned query and returns its anchor-matched
+    offers (cheapest first) as a research source carrying ``products`` — so the answer
+    shows concrete "name — price" rows instead of a bare store link.
+    """
+
+    search_text, anchors = _shop_query_focus(query)
+    if not search_text or not anchors:
+        return None
+    for name, template, cap_bytes in _STRUCTURED_SHOP_STORES:
+        url = template.format(q=quote_plus(search_text))
+        offers = await _fetch_structured_offers(url, anchors, cap_bytes=cap_bytes)
+        if offers:
+            return {
+                "rank": 0,
+                "title": f"{name} — предложения по запросу",
+                "url": url,
+                "snippet": "",
+                "vertical": "shopping",
+                "price": offers[0].get("price"),
+                "products": offers[:10],
+                "rating": None,
+                "fetched": True,
+                "tool": "web.fetch",
+                "evidence_id": None,
+                "excerpt": "",
+                "quality": "structured",
+                "extraction": None,
+            }
+    return None
+
+
 async def _web_research(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     query = " ".join(str(args.get("query") or "").split())
     claim = " ".join(str(args.get("claim") or "").split())
@@ -7872,6 +7992,13 @@ async def _web_research(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
             for evidence_id in evidence_ids
             if evidence_id in accepted_evidence_ids
         ]
+        # Most top store results are anti-bot SPAs that yield no price on a plain fetch.
+        # Pull real priced offers from a structured-data (schema.org JSON-LD) store and
+        # lead with them, so the comparison shows concrete figures.
+        with suppress(Exception):
+            targeted = await _targeted_shop_source(claim or query)
+            if targeted is not None:
+                sources.insert(0, targeted)
 
     if evidence_ids:
         verification = await _web_verify(
