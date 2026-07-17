@@ -633,6 +633,39 @@ def _http_status_error(status_code: int) -> httpx.HTTPStatusError:
     )
 
 
+def test_system_first_merges_all_system_into_one_leading_block():
+    from jarvis_gpt.llm import _system_first
+
+    msgs = [
+        {"role": "system", "content": "A"},
+        {"role": "user", "content": "lessons"},
+        {"role": "system", "content": "B"},  # Qwen forbids a 2nd system message
+        {"role": "user", "content": "hi"},
+    ]
+    out = _system_first(msgs)
+    # Exactly one system message, at the front, content merged in order.
+    assert [m["role"] for m in out] == ["system", "user", "user"]
+    assert out[0]["content"] == "A\n\nB"
+    assert [m["content"] for m in out[1:]] == ["lessons", "hi"]
+
+
+def test_system_first_is_noop_when_single_leading_system():
+    from jarvis_gpt.llm import _system_first
+
+    msgs = [
+        {"role": "system", "content": "A"},
+        {"role": "user", "content": "hi"},
+    ]
+    assert _system_first(msgs) is msgs
+
+
+def test_system_first_handles_no_system_messages():
+    from jarvis_gpt.llm import _system_first
+
+    msgs = [{"role": "user", "content": "hi"}]
+    assert _system_first(msgs) is msgs
+
+
 def test_suppress_model_thinking_profile_forces_enable_thinking_off(monkeypatch, tmp_path):
     # Qwen dumps an unparseable thinking trace into the answer; its profile sets
     # suppress_model_thinking, so the router must send enable_thinking=False even when the

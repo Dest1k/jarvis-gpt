@@ -86,6 +86,36 @@ def background_llm_priority(llm: Any) -> Iterator[None]:
         yield
 
 
+def _system_first(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse every system message into a single leading system message.
+
+    Qwen's chat template allows EXACTLY ONE system message and it must be messages[0] —
+    any later system message (even one immediately following another system message)
+    raises "System message must be at the beginning". Jarvis emits several system prompts
+    (base, executive, date, capability manifest, tool protocol, thinking-disabled, ...)
+    and interleaves user context (lessons / playbook / memory / file), so merge every
+    system message into one block at the front (order preserved) and keep the rest in
+    order. Doing it here — the single point every LLM request funnels through — fixes
+    chat, missions, orchestrator and synthesis at once. A no-op when there is already a
+    single leading system message. System content is always plain text (the template
+    forbids images in system messages), so joining strings is safe.
+    """
+
+    system = [m for m in messages if m.get("role") == "system"]
+    if not system:
+        return messages
+    if len(system) == 1 and messages and messages[0].get("role") == "system":
+        return messages
+    others = [m for m in messages if m.get("role") != "system"]
+    merged = {
+        "role": "system",
+        "content": "\n\n".join(
+            str(m.get("content", "")) for m in system if str(m.get("content", "")).strip()
+        ),
+    }
+    return [merged, *others]
+
+
 class LLMRouter:
     def __init__(self, settings: JarvisSettings) -> None:
         self.settings = settings
@@ -323,6 +353,7 @@ class LLMRouter:
         if not self.settings.llm_enabled:
             return LLMResult(ok=False, content="", error="LLM router is disabled")
 
+        messages = _system_first(messages)
         request_temperature = (
             self.settings.profile.temperature if temperature is None else temperature
         )
@@ -395,6 +426,7 @@ class LLMRouter:
             yield LLMStreamChunk(kind="error", error="LLM router is disabled")
             return
 
+        messages = _system_first(messages)
         request_temperature = (
             self.settings.profile.temperature if temperature is None else temperature
         )
