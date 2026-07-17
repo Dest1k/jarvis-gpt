@@ -7785,7 +7785,18 @@ async def _web_research(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
                     "snippet": result.get("snippet"),
                     "vertical": result.get("vertical") or vertical,
                     "published": result.get("published"),
-                    "price": result.get("price"),
+                    # Prefer a real structured price (JSON-LD) from the fetched page over
+                    # the search-result price, falling back to whatever the search gave.
+                    "price": (
+                        fetched.data.get("price")
+                        if isinstance(fetched.data, dict) and fetched.data.get("price")
+                        else result.get("price")
+                    ),
+                    "products": (
+                        fetched.data.get("products")
+                        if isinstance(fetched.data, dict)
+                        else None
+                    ),
                     "rating": result.get("rating"),
                     "fetched": fetched.ok,
                     "tool": fetched.tool,
@@ -8803,6 +8814,20 @@ async def _web_fetch(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
                         "consent_wall": consent_wall,
                         "evidence_id": evidence["id"],
                     }
+                    # Structured product offers (schema.org JSON-LD): real prices from
+                    # SSR store/catalog pages (Яндекс Маркет, Regard, …). Best-effort —
+                    # anti-bot SPAs return no HTML here and simply yield nothing.
+                    products = (
+                        _jsonld_products_from_html(raw_text)
+                        if html_metadata is not None
+                        else []
+                    )
+                    if products:
+                        data["products"] = products
+                        data.setdefault(
+                            "price",
+                            min(products, key=lambda item: item["price_value"])["price"],
+                        )
                     if ok and use_cache:
                         _web_fetch_cache_store(
                             ctx.storage,
@@ -12439,6 +12464,112 @@ def _price_from_text(text: str) -> str | None:
         amount = " ".join(lead.group(2).split())
         return f"{lead.group(1)}{amount}"
     return None
+
+
+_LDJSON_RE = re.compile(
+    r"<script\b[^>]*type=[\"']application/ld\+json[\"'][^>]*>(.*?)</script>",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _format_price_value(value: float, currency: str | None) -> str:
+    grouped = f"{int(round(value)):,}".replace(",", " ")
+    cur = (currency or "RUB").upper()
+    symbol = {"RUB": "₽", "RUR": "₽", "USD": "$", "EUR": "€"}.get(cur, cur)
+    return f"${grouped}" if symbol == "$" else f"{grouped} {symbol}".strip()
+
+
+def _jsonld_offer_price(node: dict[str, Any]) -> tuple[float | None, str | None]:
+    """Cheapest price + currency from a schema.org node's offers (or its own price)."""
+
+    offers = node.get("offers")
+    candidates = offers if offers is not None else node
+    items = candidates if isinstance(candidates, list) else [candidates]
+    best: float | None = None
+    currency: str | None = None
+    for offer in items:
+        if not isinstance(offer, dict):
+            continue
+        raw = offer.get("price")
+        if raw is None:
+            raw = offer.get("lowPrice", offer.get("lowprice"))
+        try:
+            value = float(
+                str(raw).replace(" ", "").replace(" ", "").replace(",", ".")
+            )
+        except (TypeError, ValueError):
+            continue
+        if value > 0 and (best is None or value < best):
+            best = value
+            currency = str(offer.get("priceCurrency") or currency or "") or currency
+    return best, currency
+
+
+def _jsonld_products_from_html(html: str, *, limit: int = 12) -> list[dict[str, Any]]:
+    """Extract product offers (name/price/url/stock) from schema.org JSON-LD in a page.
+
+    Works off the standard ``<script type="application/ld+json">`` blocks that SSR
+    stores emit (Product/Offer/ItemList/OfferCatalog), so it yields real prices from
+    many shops with a plain fetch — far more robust than per-store CSS selectors. It is
+    best-effort: anti-bot SPAs that return no HTML (DNS/Ozon) simply produce nothing,
+    and a truncated/invalid block is skipped rather than fatal.
+    """
+
+    if not html:
+        return []
+    products: list[dict[str, Any]] = []
+    seen: set[tuple[str, int]] = set()
+
+    def visit(node: Any) -> None:
+        if len(products) >= limit:
+            return
+        if isinstance(node, list):
+            for item in node:
+                visit(item)
+            return
+        if not isinstance(node, dict):
+            return
+        raw_type = node.get("@type")
+        types = {
+            str(t).lower() for t in (raw_type if isinstance(raw_type, list) else [raw_type]) if t
+        }
+        if types & {"product", "offer", "aggregateoffer"}:
+            name = " ".join(str(node.get("name") or "").split())
+            price, currency = _jsonld_offer_price(node)
+            if name and price is not None:
+                key = (name.lower(), int(round(price)))
+                if key not in seen:
+                    seen.add(key)
+                    offer0 = node.get("offers")
+                    holder = offer0 if isinstance(offer0, dict) else node
+                    availability = str(
+                        (holder.get("availability") if isinstance(holder, dict) else "")
+                        or node.get("availability")
+                        or ""
+                    ).lower()
+                    products.append(
+                        {
+                            "name": name,
+                            "price": _format_price_value(price, currency),
+                            "price_value": int(round(price)),
+                            "currency": (currency or "RUB").upper(),
+                            "url": str(node.get("url") or "").strip(),
+                            "in_stock": "instock" in availability.replace("/", ""),
+                        }
+                    )
+        for key in ("@graph", "itemListElement", "item", "mainEntity", "hasPart"):
+            if key in node:
+                visit(node[key])
+
+    for block in _LDJSON_RE.findall(html):
+        try:
+            payload = json.loads(block.strip())
+        except (ValueError, TypeError):
+            continue
+        visit(payload)
+        if len(products) >= limit:
+            break
+    return products[:limit]
 
 
 def _search_api_items(

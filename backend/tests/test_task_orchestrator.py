@@ -290,6 +290,28 @@ def test_tool_result_text_surfaces_report_sources_and_prices():
     assert len(_tool_result_text("s", {"report": "x" * 9000})) <= 4000
 
 
+def test_tool_result_text_lists_structured_offers():
+    # A store page contributes individual name — price offers, not just a bare link.
+    text = _tool_result_text(
+        "inspected 1 source",
+        {
+            "sources": [
+                {
+                    "title": "RTX 5090 — Яндекс Маркет",
+                    "url": "https://market.yandex.ru/search?text=rtx+5090",
+                    "price": "477 712 ₽",
+                    "products": [
+                        {"name": "MSI RTX 5090 Gaming Trio", "price": "539 740 ₽"},
+                        {"name": "nVidia RTX 5090 32Gb", "price": "477 712 ₽"},
+                    ],
+                }
+            ]
+        },
+    )
+    assert "MSI RTX 5090 Gaming Trio — 539 740 ₽" in text
+    assert "nVidia RTX 5090 32Gb — 477 712 ₽" in text
+
+
 def test_synthesis_sees_evidence_and_grounding_rules():
     # End-to-end: the tool's data (report + priced source) must reach the synthesis
     # prompt, and the synthesis system prompt must forbid inventing missing facts.

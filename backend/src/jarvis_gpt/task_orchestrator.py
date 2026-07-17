@@ -265,6 +265,17 @@ def _tool_result_text(summary: str, data: dict[str, Any]) -> str:
                 head = f"{head}\n  {snippet[:220]}" if head else snippet[:220]
             if head.strip():
                 lines.append(f"- {head}")
+            # Structured offers parsed from the page (name — price) make a shopping
+            # comparison concrete instead of a bare store link.
+            products = row.get("products")
+            if isinstance(products, list):
+                for product in products[:5]:
+                    if not isinstance(product, dict):
+                        continue
+                    pname = str(product.get("name") or "").strip()
+                    pprice = str(product.get("price") or "").strip()
+                    if pname and pprice:
+                        lines.append(f"    · {pname} — {pprice}")
         if lines:
             parts.append("Источники:\n" + "\n".join(lines))
     text = "\n\n".join(part for part in parts if part).strip()
