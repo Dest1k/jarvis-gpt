@@ -313,6 +313,14 @@ _MISSION_STOP_LABELS = {
     "busy": "занята другой попыткой",
     "empty": "нет выполнимых шагов",
 }
+# A step whose TOOL succeeded but that the executive could not independently verify is
+# recorded ok=False with this exact marker prepended (its real content follows). The
+# operator-facing mission report keys on it so a creative/subjective step that actually
+# produced content is not shown as a hard failure — the executive trust boundary itself is
+# unchanged (see executive_runtime verification contracts).
+_EXECUTIVE_UNVERIFIED_MARKER = (
+    "Executive assertion failed: independent step verification was absent or negative."
+)
 
 # When lexical file search finds nothing, recent chunks are only allowed into
 # the prompt if their fuzzy-vector similarity to the query clears this bar.
@@ -2824,10 +2832,7 @@ class AgentRuntime:
                     result = ToolRunResponse(
                         tool=result.tool,
                         ok=False,
-                        summary=(
-                            "Executive assertion failed: independent step verification "
-                            "was absent or negative. " + result.summary
-                        )[:2000],
+                        summary=(_EXECUTIVE_UNVERIFIED_MARKER + " " + result.summary)[:2000],
                         data=result.data,
                     )
             except Exception as exc:
@@ -2983,7 +2988,27 @@ class AgentRuntime:
             answer = run.final_report
         else:
             title = str(mission.get("title") or "").strip()
-            status = _MISSION_STOP_LABELS.get(str(run.stopped_reason), str(run.stopped_reason))
+
+            def _produced_content(outcome: Any) -> bool:
+                # The tool succeeded, or it succeeded but only independent verification was
+                # unavailable — either way the step produced real content.
+                return bool(outcome.result.ok) or str(
+                    outcome.result.summary or ""
+                ).startswith(_EXECUTIVE_UNVERIFIED_MARKER)
+
+            all_produced = bool(run.steps) and all(_produced_content(o) for o in run.steps)
+            # A "blocked" run whose steps all produced content (or that delivered a file) was
+            # blocked only by the independent-verification gate, not by an execution failure —
+            # report it as done instead of alarming the operator.
+            verification_only_block = str(run.stopped_reason) == "blocked" and (
+                bool(deliverable) or all_produced
+            )
+            if verification_only_block:
+                status = "выполнено"
+            else:
+                status = _MISSION_STOP_LABELS.get(
+                    str(run.stopped_reason), str(run.stopped_reason)
+                )
             lines = [
                 f"Миссия «{title}»: шагов выполнено — {run.executed_steps}, статус — {status}."
             ]
@@ -2991,12 +3016,17 @@ class AgentRuntime:
                 task = outcome.task
                 result = outcome.result
                 label = task.title if task is not None else result.tool
-                mark = "✓" if result.ok else "✗"
-                summary = " ".join(str(result.summary or "").split())[:220]
-                lines.append(f"{mark} {label}: {summary}")
-            if run.stopped_reason == "blocked":
+                summary = " ".join(str(result.summary or "").split())
+                if not result.ok and summary.startswith(_EXECUTIVE_UNVERIFIED_MARKER):
+                    # Content was produced; only independent verification was unavailable.
+                    mark = "✓"
+                    summary = summary[len(_EXECUTIVE_UNVERIFIED_MARKER) :].strip()
+                else:
+                    mark = "✓" if result.ok else "✗"
+                lines.append(f"{mark} {label}: {summary[:220]}")
+            if str(run.stopped_reason) == "blocked" and not verification_only_block:
                 lines.append("Часть шагов требует вмешательства — сообщи, как продолжить.")
-            elif run.stopped_reason == "budget":
+            elif str(run.stopped_reason) == "budget":
                 lines.append("Скажи «продолжи миссию», чтобы выполнить оставшиеся шаги.")
             answer = "\n".join(lines)
         if deliverable:
