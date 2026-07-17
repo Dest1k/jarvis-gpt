@@ -7992,9 +7992,16 @@ async def _web_research(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
             for evidence_id in evidence_ids
             if evidence_id in accepted_evidence_ids
         ]
-        # Most top store results are anti-bot SPAs that yield no price on a plain fetch.
-        # Pull real priced offers from a structured-data (schema.org JSON-LD) store and
-        # lead with them, so the comparison shows concrete figures.
+    # A shopping question — even one the orchestrator dispatches as a generic
+    # DEEP_RESEARCH web query (not AGGRESSIVE_SHOPPING) — gets real priced offers from a
+    # structured-data store, led at the top of the sources. Most organic top results are
+    # anti-bot SPAs (DNS 401, Ozon/WB) that yield no price on a plain fetch.
+    looks_like_shopping = (
+        orchestrator.mode is WebMode.AGGRESSIVE_SHOPPING
+        or vertical == "shopping"
+        or _web_answer_looks_like_shopping(_repair_mojibake(query).lower())
+    )
+    if looks_like_shopping:
         with suppress(Exception):
             targeted = await _targeted_shop_source(claim or query)
             if targeted is not None:
