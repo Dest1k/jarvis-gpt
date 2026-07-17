@@ -264,6 +264,71 @@ def test_browser_open_recovers_url_from_the_search_step():
     assert open_call[1]["url"] == "https://dns-shop.ru/product/rtx-5090/"
 
 
+def test_browser_open_recovers_url_with_no_url_key():
+    # The planner omits the url key entirely; browser.open must still receive a real link
+    # recovered from the search step it depends on (the previously-uncovered edge).
+    plan_json = (
+        '{"steps":['
+        '{"id":"s1","goal":"найти","kind":"tool","tool":"web.research","arguments":{"query":"5090"}},'
+        '{"id":"s2","goal":"открыть","kind":"tool","tool":"browser.open",'
+        '"arguments":{},"depends_on":["s1"]}]}'
+    )
+    calls: list = []
+
+    async def complete(messages):
+        if "планировщик" in messages[0]["content"]:
+            return _LLM(True, plan_json)
+        return _LLM(True, "итог")
+
+    async def run_tool(name, arguments):
+        calls.append((name, dict(arguments)))
+        if name == "web.research":
+            return _Tool(True, "Самый дешёвый: https://www.regard.ru/product/999/ есть", {})
+        return _Tool(True, "opened", {})
+
+    orch = TaskOrchestrator(
+        complete=complete,
+        run_tool=run_tool,
+        tool_specs=[("web.research", "r"), ("browser.open", "o")],
+    )
+    asyncio.run(orch.run("открой самый дешёвый 5090"))
+    open_call = next(call for call in calls if call[0] == "browser.open")
+    assert open_call[1]["url"] == "https://www.regard.ru/product/999/"
+
+
+def test_browser_open_recovers_url_placed_under_another_key():
+    # The planner puts the link (with prose) under a non-url key ("link"); it must still
+    # be extracted into url so browser.open opens the real page.
+    plan_json = (
+        '{"steps":['
+        '{"id":"s1","goal":"найти","kind":"tool","tool":"web.research","arguments":{"query":"5090"}},'
+        '{"id":"s2","goal":"открыть","kind":"tool","tool":"browser.open",'
+        '"arguments":{"link":"открой https://shop.example/p/5090 пожалуйста"},'
+        '"depends_on":["s1"]}]}'
+    )
+    calls: list = []
+
+    async def complete(messages):
+        if "планировщик" in messages[0]["content"]:
+            return _LLM(True, plan_json)
+        return _LLM(True, "итог")
+
+    async def run_tool(name, arguments):
+        calls.append((name, dict(arguments)))
+        if name == "web.research":
+            return _Tool(True, "варианты найдены", {})
+        return _Tool(True, "opened", {})
+
+    orch = TaskOrchestrator(
+        complete=complete,
+        run_tool=run_tool,
+        tool_specs=[("web.research", "r"), ("browser.open", "o")],
+    )
+    asyncio.run(orch.run("открой ссылку"))
+    open_call = next(call for call in calls if call[0] == "browser.open")
+    assert open_call[1]["url"] == "https://shop.example/p/5090"
+
+
 def test_tool_result_text_surfaces_report_sources_and_prices():
     # The one-line summary alone starved synthesis; the step output must now carry the
     # report body plus a compact source list with prices and URLs.

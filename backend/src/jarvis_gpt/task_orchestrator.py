@@ -293,6 +293,11 @@ def _curated_context(step: TaskStep, blackboard: dict[str, StepResult]) -> str:
 
 _HTTP_URL_RE = re.compile(r"""https?://[^\s"'<>)\]}]+""")
 
+# Tools whose step MUST receive a real http(s) URL even when the planner passed prose or
+# omitted the url key entirely — browser.open would otherwise fail "Only http and https
+# URLs can be opened". For these, recover a URL from any string arg or a prior step.
+_URL_REQUIRED_TOOLS = frozenset({"browser.open"})
+
 
 def _first_http_url(text: str) -> str | None:
     """Extract the first http(s) URL from a string, trimming trailing punctuation."""
@@ -392,14 +397,24 @@ class TaskOrchestrator:
         if not isinstance(arguments, dict):
             arguments = {}
         # A step that opens/visits a URL must receive a real link, not the model's prose
-        # ("Лучший вариант: …"). Take the URL from the argument itself, else recover it
-        # from the search step this one depends on.
-        if isinstance(arguments.get("url"), str):
-            recovered = _first_http_url(arguments["url"]) or _url_from_dependencies(
-                step, blackboard
-            )
-            if recovered:
-                arguments = {**arguments, "url": recovered}
+        # ("Лучший вариант: …") — and browser.open must get one even if the url key is
+        # missing or the link was placed under another key. Take a real URL from the url
+        # arg, else any string arg, else recover it from the step this one depends on.
+        if "url" in arguments or str(step.tool) in _URL_REQUIRED_TOOLS:
+            candidate: str | None = None
+            raw_url = arguments.get("url")
+            if isinstance(raw_url, str):
+                candidate = _first_http_url(raw_url)
+            if not candidate:
+                for value in arguments.values():
+                    if isinstance(value, str):
+                        candidate = _first_http_url(value)
+                        if candidate:
+                            break
+            if not candidate:
+                candidate = _url_from_dependencies(step, blackboard)
+            if candidate:
+                arguments = {**arguments, "url": candidate}
         try:
             response = await self._run_tool(str(step.tool), arguments)
             ok = bool(getattr(response, "ok", False))
