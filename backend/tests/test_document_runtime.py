@@ -12,6 +12,8 @@ from jarvis_gpt.document_runtime import (
     DocumentRuntimeError,
     _parse_xml,
     copy_document,
+    edit_docx_document,
+    edit_text_document,
     edit_workbook_xlsx,
     extract_document,
     file_sha256,
@@ -447,3 +449,81 @@ def test_edit_workbook_empty_ops_and_bad_match_raise(tmp_path: Path) -> None:
         )
     # the source is never touched and no partial output is left readable as valid
     assert read_workbook_grid(src)[0]["rows"][0] == ["Item", "Amount", "Active"]
+
+
+# ------------------------------------------------------------- DOCX/text editing
+
+
+def test_edit_docx_replaces_and_appends_preserving_source(tmp_path: Path) -> None:
+    src = tmp_path / "report.docx"
+    write_markdown_docx(
+        src,
+        "# Report\n\nDeadline: 15 July. Owner: Ivanov.\n\n## Summary\n\n- one\n- two\n",
+        title="Report",
+    )
+    with zipfile.ZipFile(src) as archive:
+        original_members = set(archive.namelist())
+        original_styles = archive.read("word/styles.xml")
+
+    out = tmp_path / "report.edited.docx"
+    result = edit_docx_document(
+        src,
+        [
+            {"op": "replace", "old": "15 July", "new": "20 July"},
+            {"op": "append_section", "title": "Risks", "level": 2,
+             "body": "Key risks:\n\n- delays\n- budget\n\nSee [portal](https://example.com)."},
+        ],
+        out,
+    )
+    assert result["verification"]["ok"] is True
+    assert any("replaced" in change for change in result["changes"])
+
+    with zipfile.ZipFile(out) as archive:
+        new_members = set(archive.namelist())
+        new_styles = archive.read("word/styles.xml")
+    # every original part survives and untouched parts are byte-identical
+    assert original_members <= new_members
+    assert new_styles == original_styles
+
+    text = extract_document(out)["text"]
+    assert "20 July" in text and "15 July" not in text
+    assert "Risks" in text and "delays" in text
+    # a link in appended content is preserved as visible text (no external rels)
+    assert "example.com" in text
+
+
+def test_edit_docx_missing_replacement_text_raises(tmp_path: Path) -> None:
+    src = tmp_path / "doc.docx"
+    write_markdown_docx(src, "# Doc\n\nAlpha content.\n", title="Doc")
+    out = tmp_path / "doc.edited.docx"
+    with pytest.raises(DocumentRuntimeError):
+        edit_docx_document(src, [{"op": "replace", "old": "Zeta", "new": "Omega"}], out)
+
+
+def test_edit_text_append_prepend_replace_insert(tmp_path: Path) -> None:
+    src = tmp_path / "notes.md"
+    src.write_text("# Notes\n\nFirst line.\n", encoding="utf-8")
+    out = tmp_path / "notes.edited.md"
+    result = edit_text_document(
+        src,
+        [
+            {"op": "append", "text": "## Added\n\nmore."},
+            {"op": "prepend", "text": "<!-- top -->"},
+            {"op": "replace", "old": "First line.", "new": "First line (edited)."},
+            {"op": "insert_after", "anchor": "# Notes", "text": "_subtitle_"},
+        ],
+        out,
+    )
+    body = out.read_text(encoding="utf-8")
+    assert result["verification"]["ok"] is True
+    assert body.startswith("<!-- top -->")
+    assert "First line (edited)." in body
+    assert "_subtitle_" in body and "## Added" in body
+
+
+def test_edit_text_replace_missing_raises(tmp_path: Path) -> None:
+    src = tmp_path / "t.txt"
+    src.write_text("hello world\n", encoding="utf-8")
+    out = tmp_path / "t.edited.txt"
+    with pytest.raises(DocumentRuntimeError):
+        edit_text_document(src, [{"op": "replace", "old": "absent", "new": "x"}], out)

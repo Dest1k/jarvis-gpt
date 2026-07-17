@@ -57,6 +57,8 @@ from .document_runtime import (
     compare_documents,
     copy_document,
     document_mime_type,
+    edit_docx_document,
+    edit_text_document,
     edit_workbook_xlsx,
     extract_document,
     file_sha256,
@@ -1546,16 +1548,17 @@ class ToolRegistry:
             ToolSpec(
                 name="documents.edit",
                 description=(
-                    "Structurally edit an existing spreadsheet and save a new version. "
-                    "Pass `operations`: a list of {op, ...} objects. XLSX/XLSM ops: "
-                    "append_row {values:[...]}, set_cell {cell:'B5' | row,col, value}, "
-                    "update_row_where {match_col, match_value, set_col, value}, "
-                    "delete_row {row | match_col, match_value}, set_rows {rows:[[...]]}, "
-                    "add_sheet {name, rows:[[...]]}, rename_sheet {name}. Columns accept "
-                    "an A1 letter, a 1-based index, or a header name; rows are 1-based; a "
-                    "value starting with '=' becomes a formula. The original file is never "
-                    "overwritten. For exact text edits in a DOCX/text file use "
-                    "documents.apply_replacements."
+                    "Edit an existing document (add/change/remove content) and save a new "
+                    "version; the original is never overwritten. Pass `operations`: a list "
+                    "of {op, ...} objects. XLSX/XLSM: append_row {values:[...]}, set_cell "
+                    "{cell:'B5' | row,col, value}, update_row_where {match_col, match_value, "
+                    "set_col, value}, delete_row {row | match_col, match_value}, set_rows "
+                    "{rows:[[...]]}, add_sheet {name, rows:[[...]]}, rename_sheet {name} — "
+                    "columns accept an A1 letter, 1-based index, or header name; a value "
+                    "starting with '=' becomes a formula. DOCX: replace {old,new}, "
+                    "append_section {title, level?, body}, append_paragraph {text}, "
+                    "append_markdown {markdown}. Text/Markdown/CSV: append {text}, prepend "
+                    "{text}, replace {old,new}, insert_after {anchor,text}, set_text {text}."
                 ),
                 category="documents",
                 input_schema={
@@ -5504,7 +5507,13 @@ def _documents_apply_replacements(ctx: ToolContext, args: dict[str, Any]) -> Too
     )
 
 
-def _workbook_operations_arg(value: Any) -> list[dict[str, Any]]:
+_EDITABLE_TEXT_SUFFIXES = {
+    ".md", ".markdown", ".txt", ".text", ".csv", ".tsv", ".json", ".html", ".htm",
+    ".xml", ".log",
+}
+
+
+def _edit_operations_arg(value: Any) -> list[dict[str, Any]]:
     """Coerce the ``operations`` argument into a list of operation objects, tolerating a
     JSON string or a single object (dialects a weak model tends to emit)."""
 
@@ -5530,54 +5539,82 @@ def _workbook_operations_arg(value: Any) -> list[dict[str, Any]]:
 
 def _documents_edit(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     """Structurally edit an existing document by applying operations, then write a new
-    version. XLSX/XLSM supports cell/row operations (append_row, set_cell,
-    update_row_where, delete_row, set_rows, add_sheet, rename_sheet). The source file is
-    never overwritten — a new versioned artifact is produced under document-outputs."""
+    version. XLSX/XLSM: cell/row operations. DOCX: exact replacements + append section/
+    paragraph/markdown. Text/Markdown/CSV: append/prepend/replace/insert_after/set_text.
+    The source file is never overwritten — a new versioned artifact is produced under
+    document-outputs and indexed so it can be recalled."""
 
+    # Resolve the target path only (the edit engines re-read the file themselves), so an
+    # unsupported type is rejected cheaply without depending on the reader stack.
+    file_id = str(args.get("file_id") or "").strip()
+    raw_path = str(args.get("path") or "").strip()
     try:
-        target = _document_target(ctx, args, max_chars=4000)
+        if file_id:
+            record = ctx.storage.get_file(file_id)
+            if record is None:
+                raise ValueError(f"File not found: {file_id}")
+            path = Path(str(record["stored_path"])).resolve(strict=False)
+        elif raw_path:
+            record = None
+            path = _resolve_document_path(ctx.settings, raw_path)
+        else:
+            raise ValueError("file_id or path is required.")
     except ValueError as exc:
         return ToolRunResponse(tool="documents.edit", ok=False, summary=str(exc))
-    path = target["path"]
-    suffix = path.suffix.lower()
-    if suffix not in {".xlsx", ".xlsm"}:
+    if not path.exists() or not path.is_file():
         return ToolRunResponse(
-            tool="documents.edit",
-            ok=False,
-            summary=(
-                f"documents.edit currently supports XLSX/XLSM workbooks; {path.name} is "
-                f"{suffix or 'unknown'}. For exact text changes in a DOCX/text file use "
-                "documents.apply_replacements."
-            ),
+            tool="documents.edit", ok=False, summary=f"Document does not exist: {path}"
         )
+    suffix = path.suffix.lower()
     try:
-        operations = _workbook_operations_arg(args.get("operations"))
+        operations = _edit_operations_arg(args.get("operations"))
         output_path = _document_output_path(ctx.settings, path, args.get("output_name"))
-        result = edit_workbook_xlsx(path, operations, output_path)
+        if suffix in {".xlsx", ".xlsm"}:
+            result = edit_workbook_xlsx(path, operations, output_path)
+            kind_label = "workbook"
+        elif suffix == ".docx":
+            result = edit_docx_document(path, operations, output_path)
+            kind_label = "document"
+        elif suffix in _EDITABLE_TEXT_SUFFIXES:
+            result = edit_text_document(path, operations, output_path)
+            kind_label = "text file"
+        else:
+            return ToolRunResponse(
+                tool="documents.edit",
+                ok=False,
+                summary=(
+                    f"documents.edit cannot edit {suffix or 'this file type'} "
+                    f"({path.name}). Supported: XLSX/XLSM, DOCX, and text/Markdown/CSV."
+                ),
+            )
         file_record = _record_generated_document(ctx, output_path)
     except (ValueError, DocumentRuntimeError, OSError, zipfile.BadZipFile) as exc:
         return ToolRunResponse(tool="documents.edit", ok=False, summary=str(exc))
     changes = list(result.get("changes") or [])
+    output_data: dict[str, Any] = {
+        "path": str(output_path),
+        "name": output_path.name,
+        "file": file_record,
+        "changes": changes,
+        "verification": result.get("verification"),
+    }
+    if result.get("sheet_count") is not None:
+        output_data["sheet_count"] = result.get("sheet_count")
+        output_data["row_count"] = result.get("row_count")
+    source_payload = {
+        "file_id": record.get("id") if record else None,
+        "name": path.name,
+        "path": str(path),
+        "kind": suffix.lstrip(".") or None,
+    }
     return ToolRunResponse(
         tool="documents.edit",
         ok=True,
         summary=(
-            f"Edited workbook {path.name} ({'; '.join(changes[:6])}). "
-            f"Saved {output_path.name} with {result.get('sheet_count', 0)} sheet(s), "
-            f"{result.get('row_count', 0)} row(s)."
+            f"Edited {kind_label} {path.name} ({'; '.join(changes[:6])}). "
+            f"Saved {output_path.name}."
         ),
-        data={
-            "source": _document_target_payload(target),
-            "output": {
-                "path": str(output_path),
-                "name": output_path.name,
-                "file": file_record,
-                "changes": changes,
-                "sheet_count": result.get("sheet_count"),
-                "row_count": result.get("row_count"),
-                "verification": result.get("verification"),
-            },
-        },
+        data={"source": source_payload, "output": output_data},
     )
 
 

@@ -13,7 +13,12 @@ import httpx
 import pytest
 from jarvis_gpt.browser_cdp import BrowserActionResult, BrowserCdpError, BrowserPageSnapshot
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
-from jarvis_gpt.document_runtime import extract_document, read_workbook_grid, write_workbook_xlsx
+from jarvis_gpt.document_runtime import (
+    extract_document,
+    read_workbook_grid,
+    write_markdown_docx,
+    write_workbook_xlsx,
+)
 from jarvis_gpt.ingest import FileIngestor
 from jarvis_gpt.llm import LLMRouter
 from jarvis_gpt.models import ToolRunResponse
@@ -683,7 +688,7 @@ def test_documents_edit_xlsx_by_file_id_creates_new_version(monkeypatch, tmp_pat
     storage.close()
 
 
-def test_documents_edit_rejects_docx_with_pointer(monkeypatch, tmp_path):
+def test_documents_edit_docx_replace_and_append_via_tool(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
     settings = load_settings()
@@ -692,16 +697,57 @@ def test_documents_edit_rejects_docx_with_pointer(monkeypatch, tmp_path):
     storage.initialize()
     tools = ToolRegistry(settings, storage, LLMRouter(settings))
     source = tmp_path / "note.docx"
-    _write_minimal_docx(source, "Alpha body")
+    write_markdown_docx(source, "# Note\n\nReplace Alpha here.\n", title="Note")
+    ingested = FileIngestor(settings=settings, storage=storage).ingest_path(source)
 
     result = asyncio.run(
         tools.run(
             "documents.edit",
-            {"path": str(source), "operations": [{"op": "append_row", "values": ["x"]}]},
+            {
+                "file_id": ingested["file"]["id"],
+                "operations": [
+                    {"op": "replace", "old": "Alpha", "new": "Beta"},
+                    {"op": "append_paragraph", "text": "Appended line."},
+                ],
+                "output_name": "note-updated.docx",
+            },
+        )
+    )
+    assert result.ok is True
+    output_path = Path(result.data["output"]["path"])
+    assert output_path.parent == settings.data_dir / "document-outputs"
+    text = extract_document(output_path)["text"]
+    assert "Replace Beta here" in text
+    assert "Appended line." in text
+    assert result.data["output"]["file"]["id"]
+    storage.close()
+
+
+def test_documents_edit_rejects_unsupported_type(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+    source = settings.home / "scan.pdf"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(
+        b"%PDF-1.7\n1 0 obj<< /Type /Catalog /Pages 2 0 R >>endobj\n"
+        b"2 0 obj<< /Type /Pages /Kids [3 0 R] /Count 1 >>endobj\n"
+        b"3 0 obj<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>endobj\n"
+        b"trailer<< /Root 1 0 R >>\n%%EOF\n"
+    )
+
+    result = asyncio.run(
+        tools.run(
+            "documents.edit",
+            {"path": str(source), "operations": [{"op": "append", "text": "x"}]},
         )
     )
     assert result.ok is False
-    assert "apply_replacements" in result.summary
+    assert "Supported" in result.summary
     storage.close()
 
 

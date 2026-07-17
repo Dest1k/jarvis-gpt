@@ -208,6 +208,175 @@ def apply_document_replacements(
     }
 
 
+def edit_docx_document(
+    source_path: Path,
+    operations: list[dict[str, Any]],
+    output_path: Path,
+) -> dict[str, Any]:
+    """Edit an existing DOCX and write a new version, preserving the source package
+    byte-for-byte except ``word/document.xml``. Supported ops (the ``op`` key):
+
+    - ``replace`` {old, new}                      exact visible-text replacement
+    - ``replacements`` {items:[{old,new}, ...]}   several replacements at once
+    - ``append_section`` {title?, level?, body}   heading + Markdown body at the end
+    - ``append_paragraph`` / ``append`` {text}    Markdown appended at the end
+    - ``append_markdown`` {markdown}              raw Markdown appended at the end
+
+    Appended content is self-contained (no new hyperlink/numbering parts): links become
+    ``text (url)`` and list items get a bullet/number prefix. Replacements match only
+    within a single run (Word may split a phrase across runs)."""
+
+    src = Path(source_path).resolve(strict=False)
+    if src.suffix.lower() != ".docx":
+        raise DocumentRuntimeError(f"Not a DOCX document: {src.suffix or src.name}")
+    if not zipfile.is_zipfile(src):
+        raise DocumentRuntimeError("DOCX is not a valid ZIP package.")
+    with zipfile.ZipFile(src) as archive:
+        members = [(info, archive.read(info.filename)) for info in archive.infolist()]
+    document_bytes = next(
+        (data for info, data in members if info.filename == "word/document.xml"), None
+    )
+    if document_bytes is None:
+        raise DocumentRuntimeError("DOCX has no word/document.xml.")
+    document_xml = document_bytes.decode("utf-8")
+    changes: list[str] = []
+    replacements: list[dict[str, str]] = []
+    append_blocks: list[dict[str, Any]] = []
+    for raw_op in operations or []:
+        if not isinstance(raw_op, dict):
+            continue
+        op = str(raw_op.get("op") or raw_op.get("action") or "").strip().casefold()
+        if op in {"replace", "substitute"}:
+            old = str(raw_op.get("old") or raw_op.get("find") or "")
+            new = str(raw_op.get("new") or raw_op.get("value") or raw_op.get("replace") or "")
+            if old:
+                replacements.append({"old": old, "new": new})
+        elif op in {"replacements", "replace_all"}:
+            for item in raw_op.get("items") or raw_op.get("replacements") or []:
+                if isinstance(item, dict) and item.get("old"):
+                    replacements.append(
+                        {"old": str(item["old"]), "new": str(item.get("new") or "")}
+                    )
+        elif op in {"append_section", "add_section"}:
+            title = str(raw_op.get("title") or raw_op.get("heading") or "").strip()
+            body = str(raw_op.get("body") or raw_op.get("content") or raw_op.get("text") or "")
+            if title:
+                level = max(1, min(6, int(raw_op.get("level") or 2)))
+                append_blocks.append({"type": "heading", "level": level, "text": title})
+            append_blocks.extend(_parse_markdown_blocks(body))
+            changes.append(f"appended section {title!r}" if title else "appended content")
+        elif op in {"append_paragraph", "append_text", "append", "add_paragraph"}:
+            text = str(raw_op.get("text") or raw_op.get("value") or raw_op.get("body") or "")
+            if text.strip():
+                append_blocks.extend(_parse_markdown_blocks(text))
+                changes.append("appended a paragraph")
+        elif op in {"append_markdown", "append_md"}:
+            markdown = str(raw_op.get("markdown") or raw_op.get("text") or "")
+            if markdown.strip():
+                append_blocks.extend(_parse_markdown_blocks(markdown))
+                changes.append("appended Markdown content")
+        else:
+            raise DocumentRuntimeError(f"unsupported docx edit op: {op or '(missing op)'}")
+    if replacements:
+        document_xml, changed = _replace_xml_text(document_xml, replacements)
+        if changed == 0:
+            raise DocumentRuntimeError(
+                "None of the replacement text was found in the document (Word may split a "
+                "phrase across runs; try a shorter, contiguous snippet)."
+            )
+        changes.append(f"replaced {changed} occurrence(s)")
+    if append_blocks:
+        document_xml = _docx_insert_body(document_xml, _docx_append_blocks_xml(append_blocks))
+    if not changes:
+        raise DocumentRuntimeError("No document edit operation changed anything.")
+    dest = Path(output_path)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as out:
+        for info, data in members:
+            if info.filename == "word/document.xml":
+                out.writestr(info, document_xml.encode("utf-8"))
+            else:
+                out.writestr(info, data)
+    verification = verify_document_artifact(dest, expected_format="docx")
+    extracted = extract_document(dest)
+    return {
+        "path": str(dest),
+        "name": dest.name,
+        "size": dest.stat().st_size,
+        "sha256": file_sha256(dest),
+        "format": "docx",
+        "changes": changes,
+        "structure": dict(extracted.get("structure") or {}),
+        "verification": verification,
+    }
+
+
+def edit_text_document(
+    source_path: Path,
+    operations: list[dict[str, Any]],
+    output_path: Path,
+) -> dict[str, Any]:
+    """Edit a plain-text / Markdown / CSV-like document and write a new version. Ops:
+    ``append``/``prepend`` {text}, ``replace`` {old,new}, ``insert_after`` {anchor,text},
+    ``set_text`` {text}."""
+
+    src = Path(source_path).resolve(strict=False)
+    text = src.read_text(encoding="utf-8", errors="replace")
+    changes: list[str] = []
+    for raw_op in operations or []:
+        if not isinstance(raw_op, dict):
+            continue
+        op = str(raw_op.get("op") or raw_op.get("action") or "").strip().casefold()
+        addition = str(raw_op.get("text") or raw_op.get("value") or "")
+        if op in {"append", "add", "append_text"}:
+            if addition:
+                text = text + ("" if not text or text.endswith("\n") else "\n") + addition
+                changes.append("appended text")
+        elif op in {"prepend", "prepend_text"}:
+            if addition:
+                text = addition + ("" if addition.endswith("\n") else "\n") + text
+                changes.append("prepended text")
+        elif op in {"replace", "substitute"}:
+            old = str(raw_op.get("old") or raw_op.get("find") or "")
+            new = str(raw_op.get("new") or raw_op.get("replace") or raw_op.get("value") or "")
+            if old and old in text:
+                text = text.replace(old, new)
+                changes.append(f"replaced {old!r}")
+            elif old:
+                raise DocumentRuntimeError(f"text to replace was not found: {old!r}")
+        elif op in {"insert_after"}:
+            anchor = str(raw_op.get("anchor") or "")
+            index = text.find(anchor) if anchor else -1
+            if anchor and index >= 0:
+                cut = index + len(anchor)
+                lead = "" if addition.startswith("\n") else "\n"
+                text = text[:cut] + lead + addition + text[cut:]
+                changes.append(f"inserted after {anchor!r}")
+            elif anchor:
+                raise DocumentRuntimeError(f"anchor was not found: {anchor!r}")
+        elif op in {"set_text", "replace_all_text", "set"}:
+            text = addition
+            changes.append("replaced the full text")
+        else:
+            raise DocumentRuntimeError(f"unsupported text edit op: {op or '(missing op)'}")
+    if not changes:
+        raise DocumentRuntimeError("No text edit operation changed anything.")
+    dest = Path(output_path)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if not text.endswith("\n"):
+        text += "\n"
+    dest.write_text(text, encoding="utf-8", newline="\n")
+    verification = verify_document_artifact(dest)
+    return {
+        "path": str(dest),
+        "name": dest.name,
+        "size": dest.stat().st_size,
+        "sha256": file_sha256(dest),
+        "changes": changes,
+        "verification": verification,
+    }
+
+
 def copy_document(path: Path, output_path: Path) -> dict[str, Any]:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(path, output_path)
@@ -1405,6 +1574,112 @@ def _docx_numbering_xml(ordered_num_ids: list[int]) -> str:
     )
 
 
+def _docx_plain_runs_xml(runs: list[dict[str, Any]], *, force_bold: bool = False) -> str:
+    """Render inline runs WITHOUT hyperlink relationships — a link becomes styled
+    ``text (url)`` text. Used for appended content so the edit needs no rels/numbering
+    surgery and the source package stays otherwise byte-identical."""
+
+    parts: list[str] = []
+    for run in runs:
+        href = run.get("href")
+        text = str(run.get("text") or "")
+        if href:
+            text = f"{text} ({href})" if text else str(href)
+        escaped = html.escape(text, quote=False)
+        rpr = _docx_run_props(run, force_bold=force_bold, hyperlink=bool(href))
+        parts.append(f'<w:r>{rpr}<w:t xml:space="preserve">{escaped}</w:t></w:r>')
+    return "".join(parts)
+
+
+def _docx_table_xml(rows: list[list[Any]], render_runs: Any) -> str:
+    """Render a self-contained bordered table. ``render_runs(cell_text, is_header)``
+    returns the run XML for a cell, so callers decide how links are handled."""
+
+    if not rows:
+        return ""
+    col_count = max(len(row) for row in rows)
+    row_xml: list[str] = []
+    for row_index, row in enumerate(rows):
+        is_header = row_index == 0
+        cell_xml: list[str] = []
+        for col in range(col_count):
+            cell = row[col] if col < len(row) else ""
+            runs = render_runs(str(cell), is_header)
+            shading = (
+                '<w:shd w:val="clear" w:color="auto" w:fill="DDE6F0"/>' if is_header else ""
+            )
+            cell_xml.append(
+                f'<w:tc><w:tcPr><w:tcW w:w="0" w:type="auto"/>{shading}</w:tcPr>'
+                f"<w:p>{runs}</w:p></w:tc>"
+            )
+        row_xml.append(f"<w:tr>{''.join(cell_xml)}</w:tr>")
+    grid = "".join("<w:gridCol/>" for _ in range(col_count))
+    borders = (
+        "<w:tblBorders>"
+        '<w:top w:val="single" w:sz="4" w:color="BFBFBF"/>'
+        '<w:left w:val="single" w:sz="4" w:color="BFBFBF"/>'
+        '<w:bottom w:val="single" w:sz="4" w:color="BFBFBF"/>'
+        '<w:right w:val="single" w:sz="4" w:color="BFBFBF"/>'
+        '<w:insideH w:val="single" w:sz="4" w:color="BFBFBF"/>'
+        '<w:insideV w:val="single" w:sz="4" w:color="BFBFBF"/>'
+        "</w:tblBorders>"
+    )
+    return (
+        '<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/>'
+        f'<w:tblLook w:firstRow="1" w:val="0420"/>{borders}</w:tblPr>'
+        f'<w:tblGrid>{grid}</w:tblGrid>{"".join(row_xml)}</w:tbl>'
+    )
+
+
+def _docx_append_blocks_xml(blocks: list[dict[str, Any]]) -> str:
+    """Render Markdown blocks to self-contained DOCX body XML for appending: headings
+    use style refs, lists get a text bullet/number prefix, tables are self-contained,
+    and links render as ``text (url)`` — nothing that needs new package parts."""
+
+    out: list[str] = []
+    for block in blocks:
+        kind = str(block.get("type") or "")
+        if kind == "heading":
+            level = max(1, min(6, int(block.get("level") or 1)))
+            runs = _docx_plain_runs_xml(_parse_inline_runs(str(block.get("text") or "")))
+            out.append(f'<w:p><w:pPr><w:pStyle w:val="Heading{level}"/></w:pPr>{runs}</w:p>')
+        elif kind == "list":
+            ordered = bool(block.get("ordered"))
+            for position, item in enumerate(block.get("items") or [], start=1):
+                prefix = f"{position}. " if ordered else "• "
+                runs = _docx_plain_runs_xml(_parse_inline_runs(prefix + str(item)))
+                out.append(f"<w:p>{runs}</w:p>")
+        elif kind == "table":
+            out.append(
+                _docx_table_xml(
+                    list(block.get("rows") or []),
+                    lambda text, is_header: _docx_plain_runs_xml(
+                        _parse_inline_runs(text), force_bold=is_header
+                    ),
+                )
+            )
+        elif kind == "empty":
+            out.append("<w:p/>")
+        else:
+            runs = _docx_plain_runs_xml(_parse_inline_runs(str(block.get("text") or "")))
+            out.append(f"<w:p>{runs}</w:p>" if runs else "<w:p/>")
+    return "".join(out)
+
+
+def _docx_insert_body(document_xml: str, appended_xml: str) -> str:
+    """Insert body XML before the final body-level ``<w:sectPr>`` (else before
+    ``</w:body>``), so appended content lands in the document's last section."""
+
+    if not appended_xml:
+        return document_xml
+    marker = document_xml.rfind("<w:sectPr")
+    if marker == -1:
+        marker = document_xml.rfind("</w:body>")
+    if marker == -1:
+        raise DocumentRuntimeError("DOCX body has no <w:sectPr> or </w:body> to append before.")
+    return document_xml[:marker] + appended_xml + document_xml[marker:]
+
+
 def _write_structured_docx(
     path: Path,
     blocks: list[dict[str, Any]],
@@ -1441,41 +1716,13 @@ def _write_structured_docx(
             rows = list(block.get("rows") or [])
             if not rows:
                 continue
-            col_count = max(len(row) for row in rows)
-            row_xml: list[str] = []
-            for row_index, row in enumerate(rows):
-                is_header = row_index == 0
-                cell_xml: list[str] = []
-                for col in range(col_count):
-                    cell = row[col] if col < len(row) else ""
-                    runs = _docx_runs_xml(
-                        _parse_inline_runs(str(cell)), hyperlinks, force_bold=is_header
-                    )
-                    shading = (
-                        '<w:shd w:val="clear" w:color="auto" w:fill="DDE6F0"/>'
-                        if is_header
-                        else ""
-                    )
-                    cell_xml.append(
-                        f'<w:tc><w:tcPr><w:tcW w:w="0" w:type="auto"/>{shading}</w:tcPr>'
-                        f'<w:p>{runs}</w:p></w:tc>'
-                    )
-                row_xml.append(f"<w:tr>{''.join(cell_xml)}</w:tr>")
-            grid = "".join('<w:gridCol/>' for _ in range(col_count))
-            borders = (
-                "<w:tblBorders>"
-                '<w:top w:val="single" w:sz="4" w:color="BFBFBF"/>'
-                '<w:left w:val="single" w:sz="4" w:color="BFBFBF"/>'
-                '<w:bottom w:val="single" w:sz="4" w:color="BFBFBF"/>'
-                '<w:right w:val="single" w:sz="4" w:color="BFBFBF"/>'
-                '<w:insideH w:val="single" w:sz="4" w:color="BFBFBF"/>'
-                '<w:insideV w:val="single" w:sz="4" w:color="BFBFBF"/>'
-                "</w:tblBorders>"
-            )
             body_xml.append(
-                '<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/>'
-                f'<w:tblLook w:firstRow="1" w:val="0420"/>{borders}</w:tblPr>'
-                f'<w:tblGrid>{grid}</w:tblGrid>{"".join(row_xml)}</w:tbl>'
+                _docx_table_xml(
+                    rows,
+                    lambda text, is_header: _docx_runs_xml(
+                        _parse_inline_runs(str(text)), hyperlinks, force_bold=is_header
+                    ),
+                )
             )
         elif kind == "empty":
             body_xml.append("<w:p/>")
