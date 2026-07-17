@@ -30,6 +30,16 @@ def test_qwen_vl_profile_starts_without_risky_parser_flags():
     assert "--mm-processor-cache-gb" in args
 
 
+def test_qwen_vl_max_num_batched_tokens_satisfies_mamba_block_size():
+    # Qwen3.5's hybrid Mamba/GDN layers force the attention block size to 2096; vLLM
+    # asserts block_size <= max_num_batched_tokens, so the default 2048 crashes engine
+    # init. The profile must raise it above that block size.
+    profile = PROFILES["qwen36-vl"]
+    assert profile.vllm_extra_args.max_num_batched_tokens is not None
+    assert profile.vllm_extra_args.max_num_batched_tokens >= 2096
+    assert "--max-num-batched-tokens 4096" in _vllm_extra_args(profile)
+
+
 def test_vllm_extra_args_emits_advanced_flags_when_enabled():
     options = VllmExtraArgs(
         reasoning_parser="qwen3",

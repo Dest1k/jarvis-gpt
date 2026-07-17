@@ -294,6 +294,12 @@ PROFILES: dict[str, RuntimeProfile] = {
         vllm_extra_args=VllmExtraArgs(
             skip_mm_profiling=True,
             mm_processor_cache_gb=4.0,
+            # Qwen3.5's hybrid Mamba/Gated-DeltaNet layers force the attention block
+            # size up to 2096 (to align with the mamba page size); vLLM then asserts
+            # block_size <= max_num_batched_tokens, whose default 2048 is too small and
+            # crashes EngineCore init. Raise it so the constraint holds (also a better
+            # prefill chunk).
+            max_num_batched_tokens=4096,
             # Enable these live once base serving is confirmed (values may vary by vLLM
             # build): reasoning_parser="qwen3", tool_call_parser="hermes",
             # enable_auto_tool_choice=True, limit_mm_per_prompt="image=2,video=1".
