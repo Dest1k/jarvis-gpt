@@ -11483,11 +11483,16 @@ def _looks_like_osint_query(normalized: str) -> bool:
 # still execute normally, just from a menu the planner can reason about reliably.
 # web.research (search + page fetch + synthesis) is the discovery tool rather than
 # snippets-only web.search, so a multi-hop step returns real data, not just links.
+# The orchestrator's job is to research and SYNTHESIZE a text answer; file
+# deliverables route through the artifact/mission path (excluded from
+# _looks_like_multistep), so documents.generate is deliberately NOT here — as a plan
+# step it only ever added a spurious report-file write that failed on the
+# output_name/output_path exact-path contract. Keep the menu to research + the one
+# vetted action tool.
 _ORCHESTRATOR_TOOL_MENU: tuple[str, ...] = (
     "web.research",
     "web.fetch",
     "system.inspect",
-    "documents.generate",
     "browser.open",
 )
 # The curated menu IS the orchestrator's safety boundary, so it may name an action tool

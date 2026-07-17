@@ -14,6 +14,7 @@ from jarvis_gpt.task_orchestrator import (
     TaskOrchestrator,
     _first_http_url,
     _resolve_placeholders,
+    _tool_result_text,
     parse_plan,
 )
 
@@ -261,6 +262,79 @@ def test_browser_open_recovers_url_from_the_search_step():
     asyncio.run(orch.run("открой самый дешёвый 5090"))
     open_call = next(call for call in calls if call[0] == "browser.open")
     assert open_call[1]["url"] == "https://dns-shop.ru/product/rtx-5090/"
+
+
+def test_tool_result_text_surfaces_report_sources_and_prices():
+    # The one-line summary alone starved synthesis; the step output must now carry the
+    # report body plus a compact source list with prices and URLs.
+    text = _tool_result_text(
+        "Internet research inspected 2 source(s).",
+        {
+            "report": "Сравнение цен на RTX 5090 в российских магазинах.",
+            "results": [
+                {
+                    "title": "RTX 5090 — DNS",
+                    "url": "https://www.dns-shop.ru/product/rtx-5090/",
+                    "price": "199 990 ₽",
+                    "snippet": "В наличии, доставка сегодня.",
+                },
+                {"title": "RTX 5090 — Ozon", "url": "https://ozon.ru/rtx5090"},
+            ],
+        },
+    )
+    assert "Сравнение цен на RTX 5090" in text
+    assert "199 990 ₽" in text
+    assert "https://www.dns-shop.ru/product/rtx-5090/" in text
+    assert "https://ozon.ru/rtx5090" in text
+    # Bounded so a huge report cannot swamp the synthesis prompt.
+    assert len(_tool_result_text("s", {"report": "x" * 9000})) <= 4000
+
+
+def test_synthesis_sees_evidence_and_grounding_rules():
+    # End-to-end: the tool's data (report + priced source) must reach the synthesis
+    # prompt, and the synthesis system prompt must forbid inventing missing facts.
+    plan_json = (
+        '{"steps":[{"id":"s1","goal":"найти цены","kind":"tool","tool":"web.research",'
+        '"arguments":{"query":"rtx 5090"}}]}'
+    )
+    synth_user: list[str] = []
+    synth_system: list[str] = []
+
+    async def complete(messages):
+        system = messages[0]["content"]
+        if "планировщик" in system:
+            return _LLM(True, plan_json)
+        if "итоговый ответ" in system:
+            synth_system.append(system)
+            synth_user.append(messages[-1]["content"])
+            return _LLM(True, "ответ по источникам")
+        return _LLM(True, "x")
+
+    async def run_tool(name, arguments):
+        return _Tool(
+            True,
+            "Internet research inspected 1 source(s).",
+            {
+                "results": [
+                    {
+                        "title": "RTX 5090 DNS",
+                        "url": "https://dns-shop.ru/p/5090",
+                        "price": "199 990 ₽",
+                    }
+                ]
+            },
+        )
+
+    orch = TaskOrchestrator(
+        complete=complete, run_tool=run_tool, tool_specs=[("web.research", "r")]
+    )
+    asyncio.run(orch.run("сравни цены на rtx 5090"))
+    assert synth_user, "synthesis was not reached"
+    # The real evidence (price + url) is in front of the synthesizer now.
+    assert "199 990 ₽" in synth_user[0]
+    assert "https://dns-shop.ru/p/5090" in synth_user[0]
+    # And it is told not to fabricate what the sources do not contain.
+    assert "собственных знаний" in synth_system[0]
 
 
 def test_failed_planner_still_answers():

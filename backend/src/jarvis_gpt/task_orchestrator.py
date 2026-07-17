@@ -230,6 +230,47 @@ def _resolve_placeholders(value: Any, blackboard: dict[str, StepResult]) -> Any:
     return value
 
 
+def _tool_result_text(summary: str, data: dict[str, Any]) -> str:
+    """Build the substantive text a tool step contributes to synthesis.
+
+    Tools return a one-line ``summary`` ("Internet research inspected 4 source(s).")
+    and put the real content — report, sources, prices, URLs — in ``data``. Feeding
+    synthesis only the summary is what starved the model into inventing facts, so we
+    surface the report and a compact source list (title — price — url + snippet) here.
+    Bounded so a long report cannot swamp the synthesis prompt.
+    """
+
+    parts: list[str] = []
+    if summary:
+        parts.append(summary.strip())
+    report = data.get("report")
+    if isinstance(report, str) and report.strip():
+        parts.append(report.strip()[:3500])
+    rows = data.get("sources")
+    if not isinstance(rows, list) or not rows:
+        rows = data.get("results")
+    if isinstance(rows, list) and rows:
+        lines: list[str] = []
+        for row in rows[:8]:
+            if not isinstance(row, dict):
+                continue
+            title = str(row.get("title") or "").strip()
+            url = str(row.get("url") or "").strip()
+            price = row.get("price")
+            snippet = str(row.get("snippet") or row.get("excerpt") or "").strip()
+            head = " — ".join(
+                piece for piece in (title, str(price).strip() if price else "", url) if piece
+            )
+            if snippet:
+                head = f"{head}\n  {snippet[:220]}" if head else snippet[:220]
+            if head.strip():
+                lines.append(f"- {head}")
+        if lines:
+            parts.append("Источники:\n" + "\n".join(lines))
+    text = "\n\n".join(part for part in parts if part).strip()
+    return text[:4000]
+
+
 def _curated_context(step: TaskStep, blackboard: dict[str, StepResult]) -> str:
     parts: list[str] = []
     for dep in step.depends_on:
@@ -356,7 +397,10 @@ class TaskOrchestrator:
             data = dict(data) if isinstance(data, dict) else {}
         except Exception as exc:  # noqa: BLE001 - tool errors are recorded, not fatal
             ok, summary, data = False, f"{type(exc).__name__}: {exc}"[:400], {}
-        return StepResult(step_id=step.id, title=step.goal, ok=ok, output=summary, data=data)
+        # Carry the substantive content (report/sources/prices/URLs), not just the
+        # one-line summary, so synthesis is grounded in evidence instead of guessing.
+        output = _tool_result_text(summary, data)
+        return StepResult(step_id=step.id, title=step.goal, ok=ok, output=output, data=data)
 
     async def _synthesize(self, goal: str, results: list[StepResult]) -> str:
         evidence = "\n\n".join(
@@ -364,10 +408,24 @@ class TaskOrchestrator:
         )
         if not evidence:
             return ""
+        # A weak model, asked to "сравни цены", will happily invent a plausible price
+        # table from its own training data when the retrieved sources contain none —
+        # which is exactly the failure we are guarding against. The rules below force
+        # it to answer strictly from the step results and to admit missing specifics
+        # instead of fabricating them.
         system = (
-            "Собери итоговый ответ на цель пользователя из результатов выполненных шагов. "
-            "Кратко, конкретно, по делу. Не выдумывай того, чего нет в результатах; если "
-            "чего-то не хватает — честно скажи, чего именно."
+            "Ты собираешь итоговый ответ на цель пользователя СТРОГО по результатам "
+            "выполненных шагов ниже. Обязательные правила:\n"
+            "1. Используй ТОЛЬКО факты, числа, цены, названия и ссылки, которые есть в "
+            "результатах шагов. Никогда не подставляй цены, цифры, названия магазинов, "
+            "модели или даты из собственных знаний — если их нет в результатах, их нет.\n"
+            "2. Если конкретных данных, которые просил пользователь (например цен), в "
+            "результатах нет — прямо напиши это (например «точные цены в источниках не "
+            "приведены») и перечисли то, что реально нашлось: магазины/источники и "
+            "ссылки на них, чтобы пользователь мог проверить сам.\n"
+            "3. Указывай конкретные ссылки (URL) из результатов, когда они есть.\n"
+            "4. Отвечай на языке запроса, кратко и по делу, без вступлений и "
+            "мета-комментариев."
         )
         user = f"Цель: {goal}\n\nРезультаты шагов:\n{evidence}"
         try:
