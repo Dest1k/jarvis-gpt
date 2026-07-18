@@ -6,11 +6,68 @@ bare string or a WQL query instead of the strict {class_name, properties} dict.
 
 from __future__ import annotations
 
+import pytest
 from jarvis_gpt.tools import (
     _native_payload_from_args,
+    _normalize_tool_action,
     _validate_wmi_payload,
     _wmi_payload_from_string,
 )
+
+
+def _action_after(tool: str, action: str) -> str:
+    args = {"action": action}
+    _normalize_tool_action(tool, args)
+    return args["action"]
+
+
+@pytest.mark.parametrize(
+    ("given", "expected"),
+    [
+        # separator/case folds (underscore-for-dot is the model's most common tic)
+        ("wmi_query", "wmi.query"),
+        ("WMI_QUERY", "wmi.query"),
+        ("wmi.query", "wmi.query"),  # already valid → untouched
+        ("hardware_memory", "hardware.memory"),
+        ("hardware_disk", "hardware.disk"),
+        # bare resource words a "сколько памяти / места на диске" turn tends to emit
+        ("memory", "hardware.memory"),
+        ("ram", "hardware.memory"),
+        ("cpu", "hardware.cpu"),
+        ("disk", "hardware.disk"),
+        ("gpu", "hardware.gpu"),
+        # NOVEL typos the old hardcoded alias dict never enumerated — only the general
+        # fuzzy normalizer catches these (proves it fixes the cause, not each symptom)
+        ("wmiqery", "wmi.query"),
+        ("memmory", "hardware.memory"),
+    ],
+)
+def test_system_inspect_action_normalizes(given: str, expected: str) -> None:
+    assert _action_after("system.inspect", given) == expected
+
+
+def test_system_inspect_unknown_action_left_for_fail_closed() -> None:
+    # A genuinely-unknown action must be left in place so the tool's own read-only
+    # validation still rejects it (fail-closed preserved, no wrong snap).
+    assert _action_after("system.inspect", "teleport") == "teleport"
+
+
+def test_windows_native_folds_underscores() -> None:
+    assert _action_after("windows.native", "window_focus") == "window.focus"
+    assert _action_after("windows.native", "clipboard_write") == "clipboard.write"
+    assert _action_after("windows.native", "app_open_and_type") == "app.open_and_type"
+
+
+def test_windows_native_never_fuzzy_snaps_a_mutation() -> None:
+    # process.stop is invalid and textually close to process.start, but a mutating tool
+    # must NEVER fuzzy-substitute one action for an opposite-meaning one.
+    assert _action_after("windows.native", "process.stop") == "process.stop"
+
+
+def test_normalizer_is_noop_for_unregistered_tool() -> None:
+    args = {"action": "anything"}
+    _normalize_tool_action("documents.generate", args)
+    assert args["action"] == "anything"
 
 
 def test_wmi_accepts_bare_class_name():

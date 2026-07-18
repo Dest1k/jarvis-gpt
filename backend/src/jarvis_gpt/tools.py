@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import difflib
 import fnmatch
 import hashlib
 import inspect
@@ -572,6 +573,10 @@ class ToolRegistry:
         # SPARK-0009: canonicalize only filesystem.mkdir → fs.mkdir before lookup/approval.
         name, args = _canonicalize_tool_invocation(name, arguments or {})
         spec = self.get(name)
+        if spec is not None:
+            # Root-cause repair of a model-invented action name, before the digest and
+            # operator authorization so both bind the canonical action (Fix B).
+            _normalize_tool_action(name, args)
         arguments_digest: str | None = None
         arguments_error: str | None = None
         try:
@@ -3962,6 +3967,126 @@ MODEL_NATIVE_ACTIONS = frozenset(
         "wmi.query",
     }
 )
+
+
+# --- General tool-action-name normalizer (root-cause fix, not per-alias whack-a-mole) ---
+# The weak local model reliably INVENTS action names — underscores for dots
+# ("wmi_query"), bare resource words ("disk"/"memory"), and near-miss typos. The
+# historical fix was a hardcoded alias dict per tool, which only ever catches the
+# misspellings someone thought to enumerate. Instead we fold + fuzzy-map a
+# model-supplied action onto an already-valid member of THIS tool's action set at the
+# single dispatch chokepoint (ToolRegistry.run). Invariants: only an INVALID action is
+# ever rewritten (a valid one is a no-op); the target is always an existing member of
+# the SAME tool's set (never a new capability, never a cross-tool jump); fuzzy nearest-
+# match is enabled ONLY for read-only tools where a wrong guess cannot cause a harmful
+# side effect (a mutating tool gets deterministic fold/synonym mapping only, so
+# "process.stop"→"process.start" can never happen); an unresolvable action is left in
+# place so the tool's own fail-closed validation still fires.
+
+_ACTION_FUZZY_CUTOFF = 0.88
+
+
+def _collapse_action_token(value: str) -> str:
+    """Reduce an action name to its alphanumeric core so separator/case differences
+    ("wmi.query" / "wmi_query" / "WMI Query") all collapse to the same key."""
+
+    return "".join(ch for ch in str(value).lower() if ch.isalnum())
+
+
+@dataclass
+class _ActionSpec:
+    arg: str
+    valid: frozenset[str]
+    synonyms: dict[str, str]
+    fuzzy: bool
+    collapsed: dict[str, str]
+
+
+def _make_action_spec(
+    arg: str,
+    valid: frozenset[str] | set[str],
+    synonyms: dict[str, str] | None = None,
+    *,
+    fuzzy: bool,
+) -> _ActionSpec:
+    synonyms = dict(synonyms or {})
+    collapsed: dict[str, str] = {}
+    for canonical in valid:  # valid actions win any collapse collision
+        collapsed.setdefault(_collapse_action_token(canonical), canonical)
+    for alias, canonical in synonyms.items():
+        collapsed.setdefault(_collapse_action_token(alias), canonical)
+    return _ActionSpec(arg, frozenset(valid), synonyms, fuzzy, collapsed)
+
+
+def _build_tool_action_specs() -> dict[str, _ActionSpec]:
+    inspect_valid = set(SAFE_INSPECT_ACTIONS) | {
+        "hardware.memory",
+        "hardware.ram",
+        "hardware.cpu",
+        "hardware.disk",
+        "hardware.disks",
+        "hardware.gpu",
+        "hardware.os",
+        "hardware.system",
+    }
+    inspect_synonyms = {
+        "query": "wmi.query",
+        "wql": "wmi.query",
+        "wmi": "wmi.query",
+        "memory": "hardware.memory",
+        "ram": "hardware.memory",
+        "cpu": "hardware.cpu",
+        "disk": "hardware.disk",
+        "disks": "hardware.disk",
+        "gpu": "hardware.gpu",
+    }
+    return {
+        # Read-only: fuzzy nearest-match is safe (worst case is a harmless snapshot read).
+        "system.inspect": _make_action_spec(
+            "action", inspect_valid, inspect_synonyms, fuzzy=True
+        ),
+        # Mutating: deterministic fold/synonym only — never fuzzy-snap onto a different
+        # action, so an opposite-meaning mutation can never be substituted.
+        "windows.native": _make_action_spec("action", MODEL_NATIVE_ACTIONS, fuzzy=False),
+    }
+
+
+_TOOL_ACTION_SPECS = _build_tool_action_specs()
+
+
+def _normalize_tool_action(name: str, args: dict[str, Any]) -> None:
+    """In-place fold/synonym/fuzzy repair of a model-invented action name.
+
+    Runs at the single dispatch chokepoint before the argument digest and operator
+    authorization, so both see the canonical action. Leaves an unresolvable action
+    untouched (fail-closed preserved) and never rewrites an already-valid action.
+    """
+
+    spec = _TOOL_ACTION_SPECS.get(name)
+    if spec is None:
+        return
+    raw = args.get(spec.arg)
+    if not isinstance(raw, str):
+        return
+    lowered = raw.strip().lower()
+    if not lowered:
+        return
+    if lowered in spec.valid:
+        if raw != lowered:
+            args[spec.arg] = lowered
+        return
+    resolved = spec.synonyms.get(lowered)
+    collapsed = _collapse_action_token(lowered)
+    if resolved is None and collapsed:
+        resolved = spec.collapsed.get(collapsed)
+    if resolved is None and spec.fuzzy and collapsed:
+        match = difflib.get_close_matches(
+            collapsed, list(spec.collapsed), n=1, cutoff=_ACTION_FUZZY_CUTOFF
+        )
+        if match:
+            resolved = spec.collapsed[match[0]]
+    if resolved is not None and resolved != raw:
+        args[spec.arg] = resolved
 
 
 async def _run_native_bridge_command(
