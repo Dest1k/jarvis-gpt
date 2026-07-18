@@ -318,6 +318,67 @@ def test_pdf_multipage(tmp_path):
     assert "Line number 199" in text
 
 
+def test_pdf_cyrillic_roundtrip(tmp_path):
+    """Cyrillic must render as real glyphs and read back verbatim (never '?')."""
+    pypdf = pytest.importorskip("pypdf")
+    from jarvis_gpt.document_runtime import _find_unicode_font
+
+    if _find_unicode_font() is None:
+        pytest.skip("no Unicode TrueType font installed on this host")
+
+    out = tmp_path / "ru.pdf"
+    text = "Привет, мир! Отчёт №1 — тест."
+    result = write_pdf(out, text, title="Отчёт")
+
+    assert result["format"] == "pdf"
+    assert result["verification"]["ok"] is True
+    assert "font" in result  # a real TrueType program was embedded
+    assert "warnings" not in result
+
+    raw = out.read_bytes()
+    assert raw.startswith(b"%PDF")
+    assert raw.rstrip().endswith(b"%%EOF")
+    assert b"/Type0" in raw and b"/Identity-H" in raw
+    assert b"/FontFile2" in raw and b"/ToUnicode" in raw
+
+    reader = pypdf.PdfReader(str(out))
+    assert not reader.is_encrypted
+    extracted = "\n".join(page.extract_text() or "" for page in reader.pages)
+    assert text in extracted  # exact Cyrillic, not mojibake
+    assert "?" not in extracted  # did not degrade to WinAnsi replacement
+
+    # The project's own reader (pypdf-backed) must recover it too.
+    assert "Привет, мир" in extract_document(out)["text"]
+
+
+def test_pdf_mixed_ru_en_roundtrip(tmp_path):
+    """A single line mixing Russian and Latin/ASCII round-trips intact."""
+    pypdf = pytest.importorskip("pypdf")
+    from jarvis_gpt.document_runtime import _find_unicode_font
+
+    if _find_unicode_font() is None:
+        pytest.skip("no Unicode TrueType font installed on this host")
+
+    out = tmp_path / "mixed.pdf"
+    line = "Отчёт Q3: revenue вырос на 25%."
+    write_pdf(out, line, title="Mixed RU/EN")
+
+    reader = pypdf.PdfReader(str(out))
+    extracted = "\n".join(page.extract_text() or "" for page in reader.pages)
+    assert line in extracted
+
+
+def test_pdf_ascii_stays_latin1(tmp_path):
+    """Pure-ASCII text keeps the lean built-in Helvetica path (no font embedded)."""
+    out = tmp_path / "ascii.pdf"
+    result = write_pdf(out, "Plain ASCII report body.", title="ASCII")
+    assert result["verification"]["ok"] is True
+    assert "font" not in result
+    raw = out.read_bytes()
+    assert b"/Helvetica" in raw
+    assert b"/FontFile2" not in raw
+
+
 # --------------------------------------------------------------------------- SVG
 
 

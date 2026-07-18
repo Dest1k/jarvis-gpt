@@ -6,10 +6,13 @@ import hashlib
 import html
 import math
 import mimetypes
+import os
 import re
 import shutil
+import struct
 import textwrap
 import zipfile
+import zlib
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -890,16 +893,36 @@ def write_pdf(
     *,
     title: str | None = None,
 ) -> dict[str, Any]:
-    """Write a minimal but valid PDF (US-Letter, Helvetica) from Markdown flattened to
-    plain lines. Text is WinAnsi/Latin-1 only — characters outside that range (e.g.
-    Cyrillic) degrade to ``?``; prefer DOCX for non-Latin scripts."""
+    """Write a minimal but valid PDF (US-Letter) from Markdown flattened to plain lines.
+
+    Pure-ASCII / Latin-1 text uses a built-in Helvetica font. As soon as the text
+    contains characters outside Latin-1 (Cyrillic, ``№``, em dash, …) the writer
+    locates a Unicode-capable TrueType font already installed on the host (see
+    ``_find_unicode_font``; override with ``JARVIS_PDF_FONT``) and embeds it as a
+    Type0/CIDFontType2 program with Identity-H encoding and a ``/ToUnicode`` CMap, so
+    the glyphs render correctly and stay searchable/extractable. If no such font is
+    found it falls back to the Latin-1 path (non-Latin characters degrade to ``?``)."""
 
     destination = Path(output_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     pages = _pdf_paginate(_pdf_flatten_lines(body, title=title))
-    destination.write_bytes(_render_pdf_bytes(pages, title=title or "Document"))
+    text_all = "".join(line for page in pages for line in page)
+    warnings: list[str] = []
+    font: _EmbeddedTrueTypeFont | None = None
+    if not _pdf_text_is_latin1(text_all):
+        font = _load_pdf_unicode_font()
+        if font is None:
+            warnings.append(
+                "No Unicode TrueType font was found on this host (set JARVIS_PDF_FONT "
+                "to a .ttf path); non-Latin-1 characters degraded to '?'."
+            )
+    if font is not None:
+        payload = _render_pdf_bytes_unicode(pages, title=title or "Document", font=font)
+    else:
+        payload = _render_pdf_bytes(pages, title=title or "Document")
+    destination.write_bytes(payload)
     verification = verify_document_artifact(destination, expected_format="pdf")
-    return {
+    result: dict[str, Any] = {
         "path": str(destination),
         "name": destination.name,
         "size": destination.stat().st_size,
@@ -908,6 +931,11 @@ def write_pdf(
         "page_count": len(pages),
         "verification": verification,
     }
+    if font is not None:
+        result["font"] = str(font.source_path)
+    if warnings:
+        result["warnings"] = warnings
+    return result
 
 
 def _pdf_flatten_lines(body: Any, *, title: str | None) -> list[str]:
@@ -995,6 +1023,11 @@ def _render_pdf_bytes(pages: list[list[str]], *, title: str) -> bytes:
             f"/Resources << /Font << /F1 {font_id} 0 R >> >> "
             f"/Contents {content_ids[index]} 0 R >>"
         ).encode("latin-1")
+    return _assemble_pdf(objs, total)
+
+
+def _assemble_pdf(objs: dict[int, bytes], total: int) -> bytes:
+    """Serialize numbered PDF objects with a byte-accurate classic xref table."""
     out = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
     offsets: dict[int, int] = {}
     for oid in range(1, total + 1):
@@ -1007,6 +1040,392 @@ def _render_pdf_bytes(pages: list[list[str]], *, title: str) -> bytes:
     out += b"trailer\n" + f"<< /Size {total + 1} /Root 1 0 R >>\n".encode("latin-1")
     out += f"startxref\n{xref_pos}\n".encode("latin-1") + b"%%EOF\n"
     return bytes(out)
+
+
+# --------------------------------------------------------------------------- #
+# PDF — Unicode/Cyrillic via an embedded Type0 (CIDFontType2) TrueType program.
+# --------------------------------------------------------------------------- #
+
+_PDF_FONT_CANDIDATES: tuple[str, ...] = (
+    # Windows — the operator's own installed fonts (never bundled into the repo).
+    r"C:\Windows\Fonts\segoeui.ttf",
+    r"C:\Windows\Fonts\arial.ttf",
+    r"C:\Windows\Fonts\tahoma.ttf",
+    r"C:\Windows\Fonts\verdana.ttf",
+    r"C:\Windows\Fonts\calibri.ttf",
+    # Linux (CI / tests) — common DejaVu / Liberation / Noto locations.
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/liberation-sans/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    "/usr/share/fonts/TTF/LiberationSans-Regular.ttf",
+    # macOS (best effort).
+    "/Library/Fonts/Arial.ttf",
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+)
+
+
+def _pdf_text_is_latin1(text: str) -> bool:
+    try:
+        text.encode("latin-1")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _find_unicode_font() -> Path | None:
+    """Locate a Cyrillic-capable TrueType (.ttf) font already installed on the host.
+
+    Reads the operator's own font at runtime — nothing is bundled into the repo. The
+    search list is overridable with the ``JARVIS_PDF_FONT`` env var (an explicit .ttf
+    path, tried first). ``.ttc`` collections and non-existent paths are skipped.
+    Returns the first usable ``.ttf`` or ``None`` when none is found."""
+    candidates: list[str] = []
+    override = os.environ.get("JARVIS_PDF_FONT")
+    if override:
+        candidates.append(override)
+    candidates.extend(_PDF_FONT_CANDIDATES)
+    for name in candidates:
+        if not name:
+            continue
+        try:
+            path = Path(name)
+        except (TypeError, ValueError):
+            continue
+        if path.suffix.lower() != ".ttf":
+            continue
+        if path.is_file():
+            return path
+    return None
+
+
+def _load_pdf_unicode_font() -> _EmbeddedTrueTypeFont | None:
+    """Return a parsed embeddable font, or ``None`` if none is found/parseable."""
+    path = _find_unicode_font()
+    if path is None:
+        return None
+    try:
+        return _EmbeddedTrueTypeFont(path)
+    except Exception:  # noqa: BLE001 — any parse failure degrades to Latin-1, never crashes
+        return None
+
+
+class _FontUnusableError(Exception):
+    """Raised when a candidate font cannot be embedded (wrong outlines, no cmap, …)."""
+
+
+class _EmbeddedTrueTypeFont:
+    """Minimal TrueType reader — enough to embed the raw program as a PDF
+    CIDFontType2 and map Unicode codepoints to glyph ids. Pure stdlib ``struct``
+    parsing (``cmap`` formats 4 and 12, ``head``, ``hhea``, ``hmtx``, ``name``);
+    no ``fontTools`` or any other third-party dependency."""
+
+    def __init__(self, path: Path) -> None:
+        self.source_path = Path(path)
+        self.raw = self.source_path.read_bytes()
+        self._tables: dict[str, tuple[int, int]] = {}
+        self._read_table_directory()
+        self.units_per_em = self._u16(self._tables["head"][0] + 18) or 1000
+        self._num_h_metrics = self._u16(self._tables["hhea"][0] + 34)
+        self._cmap_fmt, self._cmap = self._read_cmap()
+        self.font_bbox, self.ascent, self.descent = self._read_metrics()
+        self.ps_name = self._read_ps_name()
+
+    # -- primitive readers -------------------------------------------------- #
+    def _u16(self, off: int) -> int:
+        return struct.unpack(">H", self.raw[off : off + 2])[0]
+
+    def _s16(self, off: int) -> int:
+        return struct.unpack(">h", self.raw[off : off + 2])[0]
+
+    def _u32(self, off: int) -> int:
+        return struct.unpack(">I", self.raw[off : off + 4])[0]
+
+    # -- table directory ---------------------------------------------------- #
+    def _read_table_directory(self) -> None:
+        if len(self.raw) < 12:
+            raise _FontUnusableError("truncated font file")
+        sfnt = self._u32(0)
+        if sfnt not in (0x00010000, 0x74727565):  # 'true' — TrueType outlines only
+            raise _FontUnusableError("not a TrueType (glyf) font")
+        num_tables = self._u16(4)
+        off = 12
+        for _ in range(num_tables):
+            tag = self.raw[off : off + 4].decode("latin-1", "replace")
+            self._tables[tag] = (self._u32(off + 8), self._u32(off + 12))
+            off += 16
+        for required in ("cmap", "head", "hhea", "hmtx", "glyf"):
+            if required not in self._tables:
+                raise _FontUnusableError(f"missing required table {required!r}")
+
+    def _read_metrics(self) -> tuple[list[int], int, int]:
+        head = self._tables["head"][0]
+        scale = 1000.0 / self.units_per_em
+        bbox = [
+            round(self._s16(head + 36) * scale),
+            round(self._s16(head + 38) * scale),
+            round(self._s16(head + 40) * scale),
+            round(self._s16(head + 42) * scale),
+        ]
+        hhea = self._tables["hhea"][0]
+        return bbox, round(self._s16(hhea + 4) * scale), round(self._s16(hhea + 6) * scale)
+
+    def _read_ps_name(self) -> str:
+        table = self._tables.get("name")
+        if table is None:
+            return "EmbeddedFont"
+        base = table[0]
+        count = self._u16(base + 2)
+        strings = base + self._u16(base + 4)
+        chosen = ""
+        for i in range(count):
+            rec = base + 6 + i * 12
+            platform = self._u16(rec)
+            name_id = self._u16(rec + 6)
+            length = self._u16(rec + 8)
+            offset = self._u16(rec + 10)
+            if name_id != 6:  # 6 = PostScript name
+                continue
+            raw = self.raw[strings + offset : strings + offset + length]
+            if platform in (0, 3):
+                candidate = raw.decode("utf-16-be", "ignore")
+            else:
+                candidate = raw.decode("latin-1", "ignore")
+            candidate = re.sub(r"[^A-Za-z0-9._-]", "", candidate)
+            if candidate:
+                chosen = candidate
+                if platform == 3:
+                    break
+        return chosen or "EmbeddedFont"
+
+    # -- cmap --------------------------------------------------------------- #
+    def _read_cmap(self) -> tuple[int, Any]:
+        base = self._tables["cmap"][0]
+        num = self._u16(base + 2)
+        best: tuple[int, int, int] | None = None  # (priority, subtable_off, format)
+        for i in range(num):
+            rec = base + 4 + i * 8
+            platform = self._u16(rec)
+            encoding = self._u16(rec + 2)
+            sub = base + self._u32(rec + 4)
+            fmt = self._u16(sub)
+            priority = -1
+            if platform == 3 and encoding == 10 and fmt == 12:
+                priority = 4
+            elif platform == 0 and fmt == 12:
+                priority = 3
+            elif platform == 3 and encoding == 1 and fmt == 4:
+                priority = 2
+            elif platform == 0 and fmt == 4:
+                priority = 1
+            elif fmt in (4, 12):
+                priority = 0
+            if priority >= 0 and (best is None or priority > best[0]):
+                best = (priority, sub, fmt)
+        if best is None:
+            raise _FontUnusableError("no usable Unicode cmap subtable")
+        _, sub, fmt = best
+        return (fmt, self._parse_format4(sub) if fmt == 4 else self._parse_format12(sub))
+
+    def _parse_format4(self, sub: int) -> tuple[Any, ...]:
+        seg_x2 = self._u16(sub + 6)
+        seg_count = seg_x2 // 2
+        pos = sub + 14
+        end = struct.unpack(f">{seg_count}H", self.raw[pos : pos + seg_x2])
+        pos += seg_x2 + 2  # skip reservedPad
+        start = struct.unpack(f">{seg_count}H", self.raw[pos : pos + seg_x2])
+        pos += seg_x2
+        delta = struct.unpack(f">{seg_count}h", self.raw[pos : pos + seg_x2])
+        pos += seg_x2
+        range_off_pos = pos
+        range_off = struct.unpack(f">{seg_count}H", self.raw[pos : pos + seg_x2])
+        return (seg_count, end, start, delta, range_off, range_off_pos)
+
+    def _parse_format12(self, sub: int) -> list[tuple[int, int, int]]:
+        n_groups = self._u32(sub + 12)
+        pos = sub + 16
+        groups: list[tuple[int, int, int]] = []
+        for _ in range(n_groups):
+            groups.append((self._u32(pos), self._u32(pos + 4), self._u32(pos + 8)))
+            pos += 12
+        return groups
+
+    def gid(self, codepoint: int) -> int:
+        """Return the glyph id for a Unicode codepoint (0 = .notdef / no glyph)."""
+        if self._cmap_fmt == 4:
+            seg_count, end, start, delta, range_off, range_off_pos = self._cmap
+            for i in range(seg_count):
+                if codepoint > end[i]:
+                    continue
+                if codepoint < start[i]:
+                    return 0
+                if range_off[i] == 0:
+                    return (codepoint + delta[i]) & 0xFFFF
+                glyph_pos = range_off_pos + i * 2 + range_off[i] + (codepoint - start[i]) * 2
+                if glyph_pos + 2 > len(self.raw):
+                    return 0
+                glyph = self._u16(glyph_pos)
+                return (glyph + delta[i]) & 0xFFFF if glyph else 0
+            return 0
+        for first, last, first_gid in self._cmap:
+            if first <= codepoint <= last:
+                return first_gid + (codepoint - first)
+        return 0
+
+    def advance(self, glyph_id: int) -> int:
+        """Advance width of a glyph in font units (last hmetric repeats past the table)."""
+        off, length = self._tables["hmtx"]
+        if self._num_h_metrics == 0:
+            return self.units_per_em
+        index = glyph_id if glyph_id < self._num_h_metrics else self._num_h_metrics - 1
+        pos = off + index * 4
+        if pos + 2 > off + length:
+            return self.units_per_em
+        return self._u16(pos)
+
+
+def _utf16be_units(codepoint: int) -> list[int]:
+    if codepoint <= 0xFFFF:
+        return [codepoint]
+    codepoint -= 0x10000
+    return [0xD800 + (codepoint >> 10), 0xDC00 + (codepoint & 0x3FF)]
+
+
+def _pdf_unicode_content_stream(lines: list[str], cp_to_gid: dict[int, int]) -> str:
+    parts = [
+        "BT",
+        f"/F1 {_PDF_FONT_SIZE} Tf",
+        f"{_PDF_LEADING} TL",
+        f"{_PDF_MARGIN} {_PDF_PAGE_H - _PDF_MARGIN} Td",
+    ]
+    for index, line in enumerate(lines):
+        if index:
+            parts.append("T*")
+        if line:
+            glyphs = "".join(f"{cp_to_gid.get(ord(ch), 0):04X}" for ch in line)
+            parts.append(f"<{glyphs}> Tj")
+    parts.append("ET")
+    return "\n".join(parts) + "\n"
+
+
+def _pdf_cid_widths(font: _EmbeddedTrueTypeFont, used_gids: dict[int, int]) -> str:
+    if not used_gids:
+        return "[ ]"
+    scale = 1000.0 / font.units_per_em
+    widths = {gid: round(font.advance(gid) * scale) for gid in used_gids}
+    gids = sorted(widths)
+    runs: list[str] = []
+    i = 0
+    while i < len(gids):
+        j = i + 1
+        while j < len(gids) and gids[j] == gids[j - 1] + 1:
+            j += 1
+        run = " ".join(str(widths[g]) for g in gids[i:j])
+        runs.append(f"{gids[i]} [ {run} ]")
+        i = j
+    return "[ " + " ".join(runs) + " ]"
+
+
+def _pdf_tounicode_cmap(used_gids: dict[int, int]) -> str:
+    items = sorted(used_gids.items())
+    lines = [
+        "/CIDInit /ProcSet findresource begin",
+        "12 dict begin",
+        "begincmap",
+        "/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def",
+        "/CMapName /Adobe-Identity-UCS def",
+        "/CMapType 2 def",
+        "1 begincodespacerange",
+        "<0000> <FFFF>",
+        "endcodespacerange",
+    ]
+    for chunk_start in range(0, len(items), 100):
+        chunk = items[chunk_start : chunk_start + 100]
+        lines.append(f"{len(chunk)} beginbfchar")
+        for gid, codepoint in chunk:
+            target = "".join(f"{unit:04X}" for unit in _utf16be_units(codepoint))
+            lines.append(f"<{gid:04X}> <{target}>")
+        lines.append("endbfchar")
+    lines += ["endcmap", "CMapResource endresource end", "end", "end"]
+    return "\n".join(lines) + "\n"
+
+
+def _render_pdf_bytes_unicode(
+    pages: list[list[str]], *, title: str, font: _EmbeddedTrueTypeFont
+) -> bytes:
+    cp_to_gid: dict[int, int] = {}
+    for page in pages:
+        for line in page:
+            for ch in line:
+                codepoint = ord(ch)
+                if codepoint not in cp_to_gid:
+                    cp_to_gid[codepoint] = font.gid(codepoint)
+    used_gids: dict[int, int] = {}
+    for codepoint, glyph_id in cp_to_gid.items():
+        if glyph_id != 0:
+            used_gids[glyph_id] = codepoint
+
+    n = len(pages)
+    catalog_id, pages_id, type0_id, cid_id, desc_id, file_id, tounicode_id = range(1, 8)
+    next_id = 8
+    page_ids: list[int] = []
+    content_ids: list[int] = []
+    for _ in pages:
+        page_ids.append(next_id)
+        content_ids.append(next_id + 1)
+        next_id += 2
+    total = next_id - 1
+
+    base_font = font.ps_name
+    objs: dict[int, bytes] = {}
+    objs[catalog_id] = b"<< /Type /Catalog /Pages 2 0 R >>"
+    kids = " ".join(f"{pid} 0 R" for pid in page_ids)
+    objs[pages_id] = f"<< /Type /Pages /Kids [{kids}] /Count {n} >>".encode("latin-1")
+    objs[type0_id] = (
+        f"<< /Type /Font /Subtype /Type0 /BaseFont /{base_font} "
+        f"/Encoding /Identity-H /DescendantFonts [{cid_id} 0 R] "
+        f"/ToUnicode {tounicode_id} 0 R >>"
+    ).encode("latin-1")
+    objs[cid_id] = (
+        f"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /{base_font} "
+        f"/CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> "
+        f"/FontDescriptor {desc_id} 0 R /CIDToGIDMap /Identity "
+        f"/DW 1000 /W {_pdf_cid_widths(font, used_gids)} >>"
+    ).encode("latin-1")
+    bbox = " ".join(str(v) for v in font.font_bbox)
+    objs[desc_id] = (
+        f"<< /Type /FontDescriptor /FontName /{base_font} /Flags 4 "
+        f"/FontBBox [{bbox}] /ItalicAngle 0 /Ascent {font.ascent} "
+        f"/Descent {font.descent} /CapHeight {font.ascent} /StemV 80 "
+        f"/FontFile2 {file_id} 0 R >>"
+    ).encode("latin-1")
+    compressed = zlib.compress(font.raw)
+    objs[file_id] = (
+        b"<< /Length " + str(len(compressed)).encode("latin-1")
+        + b" /Length1 " + str(len(font.raw)).encode("latin-1")
+        + b" /Filter /FlateDecode >>\nstream\n" + compressed + b"\nendstream"
+    )
+    tounicode = _pdf_tounicode_cmap(used_gids).encode("latin-1")
+    objs[tounicode_id] = (
+        b"<< /Length " + str(len(tounicode)).encode("latin-1") + b" >>\nstream\n"
+        + tounicode + b"\nendstream"
+    )
+    for index, page_lines in enumerate(pages):
+        stream = _pdf_unicode_content_stream(page_lines, cp_to_gid).encode("latin-1")
+        objs[content_ids[index]] = (
+            b"<< /Length " + str(len(stream)).encode("latin-1") + b" >>\nstream\n"
+            + stream + b"\nendstream"
+        )
+        objs[page_ids[index]] = (
+            f"<< /Type /Page /Parent 2 0 R "
+            f"/MediaBox [0 0 {_PDF_PAGE_W} {_PDF_PAGE_H}] "
+            f"/Resources << /Font << /F1 {type0_id} 0 R >> >> "
+            f"/Contents {content_ids[index]} 0 R >>"
+        ).encode("latin-1")
+    return _assemble_pdf(objs, total)
 
 
 # --------------------------------------------------------------------------- #
