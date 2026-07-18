@@ -2203,7 +2203,22 @@ class AgentRuntime:
                     break
                 if turn.kind == "answer":
                     stream_finish_reason = round_finish
-                    visible_parts = round_parts if turn.text == raw else [turn.text]
+                    if executed_tools and _looks_like_raw_tool_echo(turn.text):
+                        # Buffer the final answer turn only: replace a raw tool dump with a
+                        # clean synthesis before it reaches the operator's screen (parity
+                        # with the non-streaming gate; the streamed answer is append-only,
+                        # so a raw dump can only be prevented by buffering this last turn).
+                        clean = await self._resynthesize_raw_tool_echo(
+                            messages,
+                            raw,
+                            turn.text,
+                            temperature=temperature,
+                            max_tokens=max_tokens,
+                            thinking_enabled=thinking_enabled,
+                        )
+                        visible_parts = [clean]
+                    else:
+                        visible_parts = round_parts if turn.text == raw else [turn.text]
                     for content in visible_parts:
                         if content:
                             answer_parts.append(content)
@@ -7000,6 +7015,25 @@ class AgentRuntime:
                 rationale="The request targets a previously persisted local archive.",
             )
 
+        if mode != "mission" and not attachments and _looks_like_filesystem_search(message):
+            # A concrete on-disk file/content search. Route it deterministically to
+            # filesystem.find (scoping the agentic loop to that one read-only tool) so a
+            # documents.recall prefetch can never hijack "найди …" — the root cause of the
+            # observed recall-vs-disk-search confusion.
+            return TaskKernelPlan(
+                route="local_action",
+                mode=task_mode,
+                intent="filesystem.find",
+                confidence=0.82,
+                query=message,
+                tools=("filesystem.find",),
+                completion_criteria=(
+                    "grep the requested name/content under the workspace or home roots",
+                    "report the matching file paths and lines, or say plainly nothing matched",
+                ),
+                rationale="The request targets a concrete on-disk file/content search.",
+            )
+
         if (
             mode != "mission"
             and not attachments
@@ -8933,6 +8967,45 @@ class AgentRuntime:
             initial_used_tools=0,
         )
 
+    async def _resynthesize_raw_tool_echo(
+        self,
+        messages: list[dict[str, str]],
+        assistant_content: str,
+        answer: str,
+        *,
+        temperature: float | None,
+        max_tokens: int | None,
+        thinking_enabled: bool,
+    ) -> str:
+        """Force one clean synthesis pass when an 'answer' is a pasted raw tool dump.
+
+        The weak local model sometimes copies a tool's raw observation/result JSON into
+        its final answer instead of writing a natural reply. This shared gate (used by
+        both the non-streaming and live streaming loops) re-asks the model to synthesize
+        over the observations. Returns the clean answer, or the original if the synthesis
+        pass did not produce a better one. Never raises.
+        """
+
+        if not _looks_like_raw_tool_echo(answer):
+            return answer
+        synth_messages = [
+            *messages,
+            {"role": "assistant", "content": assistant_content},
+            {"role": "system", "content": FINAL_ANSWER_PROMPT},
+        ]
+        try:
+            clean = await self._complete_llm(
+                synth_messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                thinking_enabled=thinking_enabled,
+            )
+        except Exception:  # noqa: BLE001 — synthesis is best-effort; keep the raw answer
+            return answer
+        if clean.ok and clean.content.strip() and not _looks_like_raw_tool_echo(clean.content):
+            return clean.content.strip()
+        return answer
+
     async def _continue_agentic_answer(
         self,
         messages: list[dict[str, str]],
@@ -9007,23 +9080,17 @@ class AgentRuntime:
                 )
             if turn.kind == "answer":
                 answer = turn.text
-                if _looks_like_raw_tool_echo(answer) and used_tools > initial_used_tools:
-                    # The model pasted a raw tool observation/JSON as its answer. Force one
-                    # clean synthesis over the observations instead of showing raw output.
-                    messages.append({"role": "assistant", "content": content})
-                    messages.append({"role": "system", "content": FINAL_ANSWER_PROMPT})
-                    clean = await self._complete_llm(
+                if used_tools > initial_used_tools:
+                    # The model may have pasted a raw tool observation/JSON as its answer;
+                    # force one clean synthesis instead of showing raw output.
+                    answer = await self._resynthesize_raw_tool_echo(
                         messages,
+                        content,
+                        answer,
                         temperature=temperature,
                         max_tokens=max_tokens,
                         thinking_enabled=thinking_enabled,
                     )
-                    if (
-                        clean.ok
-                        and clean.content.strip()
-                        and not _looks_like_raw_tool_echo(clean.content)
-                    ):
-                        answer = clean.content.strip()
                 continuation_count = 0
                 if finish_reason == "length":
                     answer, continuation_count, finish_reason = await self._auto_continue_answer(
@@ -10155,6 +10222,56 @@ def _stable_windows_paths(text: str) -> list[str]:
     return paths
 
 
+_FILESYSTEM_SEARCH_VERBS = (
+    "найди",
+    "найти",
+    "поищи",
+    "поиск",
+    "ищи",
+    "разыщи",
+    "search",
+    "find",
+    "grep",
+    "locate",
+)
+# Unambiguous on-disk scope words only — deliberately excludes "каталог"/"catalog"
+# (shopping) and bare "файлы" (archive full-text search) so this never steals those.
+_FILESYSTEM_SCOPE_MARKERS = (
+    "на диске",
+    "в папке",
+    "в папку",
+    "в директории",
+    "в директорию",
+    "on disk",
+    "in folder",
+    "in the folder",
+    "in directory",
+    "filesystem",
+    "файловой систем",
+)
+
+
+def _looks_like_filesystem_search(message: str) -> bool:
+    """A concrete on-disk file/content search (grep under the workspace/home roots),
+    distinct from recalling an uploaded document.
+
+    Kept conservative on purpose: requires a search verb AND either a real drive path or
+    an explicit disk/folder scope marker, and never fires for a live-web query — so it
+    can't hijack a document-recall, an archive full-text search, or a shopping query.
+    """
+
+    normalized = " ".join(str(message or "").casefold().split())
+    if not normalized:
+        return False
+    if _looks_like_live_web_query(message):
+        return False
+    if not any(verb in normalized for verb in _FILESYSTEM_SEARCH_VERBS):
+        return False
+    if _stable_windows_paths(message):
+        return True
+    return any(marker in normalized for marker in _FILESYSTEM_SCOPE_MARKERS)
+
+
 def _memory_content_from_match(message: str, value: str, namespace: str) -> str:
     value = value.strip(" .,:;\"'«»")
     if len(value) < 3:
@@ -11159,7 +11276,17 @@ def _looks_like_raw_tool_echo(text: str) -> bool:
         low = stripped.lower()
         return any(
             marker in low
-            for marker in ('"snippets"', '"error"', '"ok":', '"query":', '"code":', '"results"')
+            for marker in (
+                '"snippets"',
+                '"error"',
+                '"ok":',
+                '"query":',
+                '"code":',
+                '"results"',
+                # filesystem.find dumps its raw result object ({"root":…,"matches":[…]})
+                '"matches"',
+                '"files_scanned"',
+            )
         )
     return False
 

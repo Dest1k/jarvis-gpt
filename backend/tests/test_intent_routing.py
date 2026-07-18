@@ -11,7 +11,9 @@ from __future__ import annotations
 from jarvis_gpt.agent import (
     AgentContext,
     AgentRuntime,
+    _looks_like_filesystem_search,
     _looks_like_live_web_query,
+    _looks_like_raw_tool_echo,
     _request_needs_web_lookup,
 )
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
@@ -85,6 +87,50 @@ def test_document_query_still_routes_to_document_memory(monkeypatch, tmp_path):
     plan = _route(agent, "прочитай мой сохранённый документ про архитектуру и сделай выжимку")
     assert plan.intent == "document_memory"
     storage.close()
+
+
+def test_filesystem_search_predicate():
+    # Concrete on-disk searches (verb + drive path or explicit disk/folder scope).
+    assert _looks_like_filesystem_search("найди слово TODO в папке D:\\jarvis-gpt\\backend")
+    assert _looks_like_filesystem_search("search for TODO on disk")
+    assert _looks_like_filesystem_search("поищи config.py в директории проекта")
+    # NOT filesystem searches — must not steal these.
+    assert not _looks_like_filesystem_search(
+        "прочитай мой сохранённый документ про архитектуру"
+    )
+    assert not _looks_like_filesystem_search(
+        "найди в загруженных документах упоминание про архитектуру"
+    )
+    assert not _looks_like_filesystem_search("в каких файлах упоминается ковид")
+    assert not _looks_like_filesystem_search("найди в каталоге ноутбук подешевле")
+    assert not _looks_like_filesystem_search("где дешевле всего купить rtx 5090")
+
+
+def test_filesystem_search_routes_to_filesystem_find(monkeypatch, tmp_path):
+    agent, storage = _plan_agent(monkeypatch, tmp_path)
+    plan = _route(agent, "найди слово TODO в папке D:\\jarvis-gpt\\backend")
+    assert plan.route == "local_action"
+    assert plan.intent == "filesystem.find"
+    assert plan.tools == ("filesystem.find",)
+    storage.close()
+
+
+def test_filesystem_route_does_not_steal_document_recall(monkeypatch, tmp_path):
+    # A "найди" with no drive path / disk marker must stay eligible for document recall,
+    # never be hijacked into the filesystem.find route.
+    agent, storage = _plan_agent(monkeypatch, tmp_path)
+    plan = _route(agent, "найди в загруженных документах упоминание про архитектуру")
+    assert plan.intent != "filesystem.find"
+    storage.close()
+
+
+def test_raw_tool_echo_detects_filesystem_find_dump():
+    dump = (
+        '{"root": "D:/x", "matches": [{"path": "a.py", "line": 3}], '
+        '"truncated": false, "files_scanned": 12}'
+    )
+    assert _looks_like_raw_tool_echo(dump)
+    assert not _looks_like_raw_tool_echo("Нашёл 1 совпадение в файле a.py на строке 3.")
 
 
 def test_needs_web_lookup_helper():

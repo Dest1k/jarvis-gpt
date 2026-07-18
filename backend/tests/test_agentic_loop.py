@@ -206,6 +206,72 @@ def test_agentic_stream_reports_completed_tool_when_synthesis_stream_dies(
     storage.close()
 
 
+def test_streaming_gate_resynthesizes_raw_tool_dump(monkeypatch, tmp_path):
+    # The live streaming loop must not emit a pasted raw tool result verbatim: it buffers
+    # the final answer turn and forces one clean synthesis (parity with the non-stream gate).
+    raw_dump = (
+        '{"root":"D:/x","matches":[{"path":"a.py","line":3}],'
+        '"truncated":false,"files_scanned":12}'
+    )
+
+    class ToolThenRawDumpLLM:
+        def __init__(self) -> None:
+            self.stream_calls = 0
+            self.complete_calls = 0
+
+        async def stream_complete(
+            self, messages, *, temperature=None, max_tokens=None, **kwargs
+        ):
+            self.stream_calls += 1
+            if self.stream_calls == 1:
+                yield LLMStreamChunk(
+                    kind="delta",
+                    content='{"tool":"filesystem.find","arguments":{"query":"TODO"}}',
+                )
+                yield LLMStreamChunk(kind="done", finish_reason="stop")
+                return
+            # Round 2: the weak model pastes the raw tool result JSON as its "answer".
+            yield LLMStreamChunk(kind="delta", content=raw_dump)
+            yield LLMStreamChunk(kind="done", finish_reason="stop")
+
+        async def complete(self, messages, *, temperature=None, max_tokens=None, **kwargs):
+            # The synthesis gate re-asks the model for a clean natural-language answer.
+            self.complete_calls += 1
+            return _result("Нашёл 1 совпадение: a.py, строка 3.")
+
+    llm = ToolThenRawDumpLLM()
+    agent, storage = _agent(monkeypatch, tmp_path, llm)
+    storage.set_runtime_value("experience.autonomy_policy", {"verify_answers": False})
+
+    async def fake_run(name, arguments=None, **kwargs):
+        return ToolRunResponse(
+            tool=name,
+            ok=True,
+            summary="Found 1 match(es) across 12 file(s).",
+            data={
+                "root": "D:/x",
+                "matches": [{"path": "a.py", "line": 3}],
+                "files_scanned": 12,
+            },
+        )
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+
+    async def collect():
+        deltas = []
+        async for item in agent.stream_chat("найди TODO в папке D:\\x"):
+            if item["type"] == "delta":
+                deltas.append(item["content"])
+        return "".join(deltas)
+
+    visible = asyncio.run(collect())
+
+    assert llm.complete_calls >= 1  # the synthesis gate fired
+    assert "Нашёл 1 совпадение" in visible
+    assert raw_dump not in visible
+    storage.close()
+
+
 def test_agentic_recovery_labels_ambiguous_tool_outcome(monkeypatch, tmp_path):
     class ToolThenOutageLLM:
         def __init__(self) -> None:
