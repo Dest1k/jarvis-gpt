@@ -241,9 +241,14 @@ def test_supervisor_keeps_health_loop_running_when_autonomy_is_disabled(
 
     async def scenario():
         await supervisor.start()
-        # Health AND reminders are user-facing loops: both must run even with autonomy off.
+        # Health, reminders AND self-healing are reliability/user-facing loops: all run
+        # even with background autonomy off (self-healing keeps the local brain alive).
         names = {task.get_name() for task in supervisor._tasks}
-        assert names == {"jarvis-health-loop", "jarvis-reminder-loop"}
+        assert names == {
+            "jarvis-health-loop",
+            "jarvis-reminder-loop",
+            "jarvis-self-heal-loop",
+        }
         await supervisor.stop()
 
     asyncio.run(scenario())

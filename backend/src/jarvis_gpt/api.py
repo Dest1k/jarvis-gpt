@@ -290,6 +290,7 @@ async def lifespan(app: FastAPI):
             llm=llm,
             autonomy_executor=autonomy_executor,
             bus=bus,
+            dispatcher=dispatcher,
         )
         approval_executor = ApprovalExecutor(
             storage=storage,

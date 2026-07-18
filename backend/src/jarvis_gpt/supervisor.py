@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+import time
 from contextlib import suppress
 from typing import Any
 
@@ -113,12 +115,17 @@ class RuntimeSupervisor:
         llm: LLMRouter | None = None,
         autonomy_executor: Any | None = None,
         bus: Any | None = None,
+        dispatcher: Any | None = None,
     ) -> None:
         self.settings = settings
         self.storage = storage
         self.llm = llm or LLMRouter(settings)
         self.autonomy_executor = autonomy_executor
         self.bus = bus
+        # The dispatcher handle self-healing restarts. Prefer an injected one, fall back
+        # to the executor's, and lazily construct one on first need (see
+        # `_dispatcher_manager`) so a supervisor built without either can still heal.
+        self.dispatcher = dispatcher or getattr(autonomy_executor, "dispatcher", None)
         self.telemetry = TelemetryCollector(settings)
         self.learning = LearningEngine(storage, llm=self.llm)
         self._tasks: list[asyncio.Task[None]] = []
@@ -136,6 +143,18 @@ class RuntimeSupervisor:
         # standing breach alerts once (not every telemetry tick) and clearing it emits a
         # single recovery notice.
         self._alert_active: dict[str, dict[str, Any]] = {}
+        # Self-healing state. `_self_heal_streak` counts consecutive unhealthy probes so a
+        # single blip never triggers a restart; `_self_heal_history` holds the monotonic
+        # timestamps of recent restarts for the rolling-window budget; `_self_heal_blocked`
+        # is set when the dispatcher is down for a reason we must NOT auto-fix (owner
+        # stopped it cleanly / no container / no docker) and cleared when it comes back;
+        # `_self_heal_budget_alerted` makes the budget-exhausted escalation fire once.
+        self._self_heal_streak = 0
+        self._self_heal_history: list[float] = []
+        self._self_heal_blocked = False
+        self._self_heal_budget_alerted = False
+        self._self_heal_count = 0
+        self._last_self_heal_at: str | None = None
 
     async def start(self) -> None:
         self._started_at = utc_now()
@@ -174,6 +193,12 @@ class RuntimeSupervisor:
             asyncio.create_task(self._health_loop(), name="jarvis-health-loop"),
             asyncio.create_task(self._reminder_loop(), name="jarvis-reminder-loop"),
         ]
+        # Self-healing is a reliability guarantee (keep the local brain alive), not an
+        # opt-in autonomy behavior, so it runs even when background autonomy is disabled.
+        if self.settings.self_healing_enabled:
+            self._tasks.append(
+                asyncio.create_task(self._self_heal_loop(), name="jarvis-self-heal-loop")
+            )
         if not self.settings.autonomy_enabled:
             with suppress(Exception):
                 self.storage.add_event(
@@ -244,12 +269,18 @@ class RuntimeSupervisor:
             "last_cognition_error": self._last_cognition_error,
             "last_background_job_at": self._last_background_job_at,
             "last_error": self._last_error,
+            "self_healing_enabled": self.settings.self_healing_enabled,
+            "self_heal_count": self._self_heal_count,
+            "last_self_heal_at": self._last_self_heal_at,
             "llm_admission": admission,
             "capabilities": [
                 "telemetry.persist",
                 "health.persist",
                 "health.alert.threshold",
                 "health.alert.telegram",
+                "health.self_heal.dispatcher_restart",
+                "health.self_heal.restart_budget",
+                "health.self_heal.telegram_escalation",
                 "learning.tick",
                 "learning.observe_dialogues",
                 "learning.observe_web",
@@ -444,6 +475,181 @@ class RuntimeSupervisor:
                 )
         with suppress(Exception):
             await push_telegram_alert(phone_text)
+
+    async def _self_heal_loop(self) -> None:
+        while True:
+            await asyncio.sleep(max(30, self.settings.self_healing_interval_sec))
+            with suppress(Exception):
+                await self._maybe_self_heal()
+
+    async def _maybe_self_heal(self) -> None:
+        """Restart the local model dispatcher when it has crashed/OOM'd or hung.
+
+        Detection is a cheap ``llm.health()`` probe (a GET to the model endpoint). A
+        single failure never acts — a restart fires only after ``self_healing_min_failures``
+        consecutive unhealthy probes, and only after ``_classify_dispatcher`` confirms the
+        container actually crashed (not a clean owner stop or a never-started box). A
+        rolling-window restart budget prevents restart storms; exhausting it escalates to
+        the owner once instead of looping.
+        """
+
+        if not self.settings.self_healing_enabled or not self.settings.llm_enabled:
+            return
+        if await self._dispatcher_is_live():
+            self._self_heal_streak = 0
+            self._self_heal_blocked = False
+            self._self_heal_budget_alerted = False
+            return
+        if self._self_heal_blocked:
+            # Already classified as "not ours to fix"; wait for it to return on its own.
+            return
+        self._self_heal_streak += 1
+        if self._self_heal_streak < max(1, self.settings.self_healing_min_failures):
+            return
+        dispatcher = self._dispatcher_manager()
+        if dispatcher is None:
+            self._self_heal_blocked = True
+            return
+        decision, detail = await asyncio.to_thread(self._classify_dispatcher, dispatcher)
+        if decision != "restart":
+            self._self_heal_blocked = True
+            with suppress(Exception):
+                self.storage.add_event(
+                    kind="self_heal.skip",
+                    title=f"Self-healing: перезапуск не требуется ({detail})",
+                    level="info",
+                    payload={"detail": detail},
+                )
+            return
+        if not self._self_heal_budget_ok():
+            await self._escalate_budget_exhausted(detail)
+            return
+        await self._perform_self_heal(dispatcher, detail)
+
+    async def _dispatcher_is_live(self) -> bool:
+        try:
+            result = await self.llm.health()
+        except Exception:  # noqa: BLE001
+            return False
+        return bool(isinstance(result, dict) and result.get("ok"))
+
+    def _dispatcher_manager(self) -> Any | None:
+        if self.dispatcher is not None:
+            return self.dispatcher
+        try:
+            from .dispatcher import DispatcherManager
+
+            self.dispatcher = DispatcherManager(self.settings, storage=self.storage)
+        except Exception:  # noqa: BLE001
+            self.dispatcher = None
+        return self.dispatcher
+
+    def _classify_dispatcher(self, dispatcher: Any) -> tuple[str, str]:
+        """Decide whether an unresponsive dispatcher should be auto-restarted.
+
+        Returns ``("restart", detail)`` only for a genuine failure — a crashed/OOM-killed
+        container (non-zero exit) or one that claims to run but does not serve. A clean
+        ``Exited (0)`` (owner stopped it), a missing container (never started), a recovered
+        port, or no Docker all return ``("skip", detail)`` so self-healing never fights the
+        owner or auto-starts something they never launched.
+        """
+
+        try:
+            status = dispatcher.status()
+        except Exception as exc:  # noqa: BLE001
+            return ("skip", f"status-error:{exc.__class__.__name__}")
+        if not isinstance(status, dict):
+            return ("skip", "status-unavailable")
+        if not status.get("docker_available"):
+            return ("skip", "docker-unavailable")
+        if status.get("port_open"):
+            return ("skip", "port-open")
+        container = status.get("container_status")
+        if not isinstance(container, dict) or not container.get("exists"):
+            return ("skip", "no-container")
+        state = str(container.get("status") or "")
+        if state.casefold().startswith("up"):
+            return ("restart", "running-but-unresponsive")
+        exit_code = _container_exit_code(state)
+        if exit_code not in (None, 0):
+            return ("restart", f"exited-{exit_code}")
+        return ("skip", "stopped-clean")
+
+    def _self_heal_budget_ok(self) -> bool:
+        now = time.monotonic()
+        window = max(60, self.settings.self_healing_window_sec)
+        self._self_heal_history = [t for t in self._self_heal_history if now - t < window]
+        return len(self._self_heal_history) < max(1, self.settings.self_healing_max_restarts)
+
+    def _restart_dispatcher(self, dispatcher: Any) -> dict[str, Any]:
+        # Force a fresh container: stop first (clears a hung process a bare `up` would
+        # happily "reuse"), then bring it up with independent state verification.
+        with suppress(Exception):
+            dispatcher.run_compose("down")
+        return dispatcher.run_compose_verified("up")
+
+    async def _perform_self_heal(self, dispatcher: Any, detail: str) -> None:
+        self._self_heal_history.append(time.monotonic())
+        self._self_heal_streak = 0
+        self._self_heal_count += 1
+        self._last_self_heal_at = utc_now()
+        with suppress(Exception):
+            self.storage.add_event(
+                kind="self_heal.restart",
+                title=f"Self-healing: перезапуск диспетчера ({detail})",
+                level="warn",
+                payload={"detail": detail, "attempt": len(self._self_heal_history)},
+            )
+        await self._push_owner(
+            f"🛠 Self-healing: локальный мозг не отвечает ({detail}). Перезапускаю диспетчер…"
+        )
+        result = await asyncio.to_thread(self._restart_dispatcher, dispatcher)
+        ok = bool(isinstance(result, dict) and result.get("ok"))
+        summary = str(result.get("summary")) if isinstance(result, dict) else ""
+        with suppress(Exception):
+            self.storage.add_event(
+                kind="self_heal.result",
+                title="Диспетчер восстановлен" if ok else "Перезапуск диспетчера не удался",
+                level="info" if ok else "error",
+                payload={"detail": detail, "ok": ok, "summary": summary},
+            )
+        if self.bus is not None:
+            with suppress(Exception):
+                await self.bus.publish(
+                    {
+                        "channel": "health",
+                        "action": "self_heal",
+                        "self_heal": {"detail": detail, "ok": ok, "summary": summary},
+                    }
+                )
+        if ok:
+            await self._push_owner("✅ Self-healing: диспетчер перезапущен и снова отвечает.")
+        else:
+            await self._push_owner(
+                f"❌ Self-healing: перезапуск не удался — {summary}. Нужно вмешательство."
+            )
+
+    async def _escalate_budget_exhausted(self, detail: str) -> None:
+        if self._self_heal_budget_alerted:
+            return
+        self._self_heal_budget_alerted = True
+        window_min = max(1, self.settings.self_healing_window_sec // 60)
+        with suppress(Exception):
+            self.storage.add_event(
+                kind="self_heal.exhausted",
+                title="Self-healing: лимит автоперезапусков исчерпан — нужна помощь",
+                level="error",
+                payload={"detail": detail, "restarts": len(self._self_heal_history)},
+            )
+        await self._push_owner(
+            f"🆘 Self-healing: диспетчер падает повторно ({detail}). Исчерпан лимит "
+            f"{self.settings.self_healing_max_restarts} перезапуск(ов) за {window_min} мин — "
+            "нужно вмешаться вручную."
+        )
+
+    async def _push_owner(self, text: str) -> None:
+        with suppress(Exception):
+            await push_telegram_alert(text)
 
     async def _record_health(self) -> None:
         self._last_health_attempt_at = utc_now()
@@ -724,3 +930,14 @@ def _bounded_int(value: Any, minimum: int, maximum: int, fallback: int) -> int:
     except (TypeError, ValueError):
         parsed = fallback
     return max(minimum, min(maximum, parsed))
+
+
+def _container_exit_code(status_text: str) -> int | None:
+    """Parse the exit code out of a docker status string like 'Exited (137) 2 min ago'.
+
+    Returns ``None`` when the status is not an exited-with-code form (e.g. 'Up 3 min',
+    'Created', 'Restarting'), so the caller treats a missing code as "not a clean stop".
+    """
+
+    match = re.search(r"exited \((\d+)\)", status_text.casefold())
+    return int(match.group(1)) if match else None

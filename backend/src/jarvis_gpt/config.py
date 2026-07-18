@@ -456,6 +456,18 @@ class JarvisSettings:
     health_alert_gpu_vram_ratio: float
     health_alert_disk_ratio: float
     health_alert_memory_ratio: float
+    # ---- Self-healing runtime ---------------------------------------------------
+    # The supervisor probes the local model dispatcher; when its container has
+    # crashed/OOM-killed or hung (running but not serving) it auto-restarts it and
+    # alerts the owner. It never auto-starts a dispatcher the owner never launched
+    # (no container) nor one they stopped cleanly (Exited 0). A restart budget +
+    # consecutive-failure confirmation prevent restart storms; exhausting the budget
+    # escalates to the owner instead of looping.
+    self_healing_enabled: bool
+    self_healing_interval_sec: int
+    self_healing_min_failures: int
+    self_healing_max_restarts: int
+    self_healing_window_sec: int
     api_host: str
     api_port: int
     api_require_token_on_loopback: bool
@@ -524,6 +536,13 @@ class JarvisSettings:
                 "gpu_vram_ratio": self.health_alert_gpu_vram_ratio,
                 "disk_ratio": self.health_alert_disk_ratio,
                 "memory_ratio": self.health_alert_memory_ratio,
+            },
+            "self_healing": {
+                "enabled": self.self_healing_enabled,
+                "interval_sec": self.self_healing_interval_sec,
+                "min_failures": self.self_healing_min_failures,
+                "max_restarts": self.self_healing_max_restarts,
+                "window_sec": self.self_healing_window_sec,
             },
             "api": {
                 "host": self.api_host,
@@ -605,6 +624,11 @@ def load_settings(profile_name: str | None = None) -> JarvisSettings:
         health_alert_gpu_vram_ratio=_float_env("JARVIS_HEALTH_ALERT_GPU_VRAM_RATIO", 0.97),
         health_alert_disk_ratio=_float_env("JARVIS_HEALTH_ALERT_DISK_RATIO", 0.95),
         health_alert_memory_ratio=_float_env("JARVIS_HEALTH_ALERT_MEMORY_RATIO", 0.95),
+        self_healing_enabled=_bool_env("JARVIS_SELF_HEALING_ENABLED", True),
+        self_healing_interval_sec=_int_env("JARVIS_SELF_HEALING_INTERVAL_SEC", 90),
+        self_healing_min_failures=_int_env("JARVIS_SELF_HEALING_MIN_FAILURES", 2),
+        self_healing_max_restarts=_int_env("JARVIS_SELF_HEALING_MAX_RESTARTS", 3),
+        self_healing_window_sec=_int_env("JARVIS_SELF_HEALING_WINDOW_SEC", 1800),
         api_host=os.environ.get("JARVIS_API_HOST", "0.0.0.0"),
         api_port=_int_env("JARVIS_API_PORT", 8000),
         api_require_token_on_loopback=_bool_env("JARVIS_API_REQUIRE_TOKEN_ON_LOOPBACK", False),
