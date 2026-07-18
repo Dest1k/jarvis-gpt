@@ -5507,16 +5507,17 @@ def test_public_observability_helper_does_not_record_itself(monkeypatch, tmp_pat
     storage.close()
 
 def test_canonicalize_tool_invocation_maps_filesystem_mkdir_alias():
-    """SPARK-0009: model-facing filesystem.mkdir becomes execution.apply/fs.mkdir."""
+    """filesystem.mkdir is now a real registered tool, so the invocation is left as-is;
+    the action.kind alias filesystem.mkdir->fs.mkdir inside execution.apply payloads holds."""
     from jarvis_gpt.tools import _canonicalize_tool_invocation
 
     name, args = _canonicalize_tool_invocation(
         "filesystem.mkdir",
         {"path": r"D:\tmp\jarvis-mkdir-canary", "parents": True},
     )
-    assert name == "execution.apply"
-    assert args["payload"]["action"]["kind"] == "fs.mkdir"
-    assert args["payload"]["action"]["path"] == r"D:\tmp\jarvis-mkdir-canary"
+    assert name == "filesystem.mkdir"
+    assert "payload" not in args
+    assert args["path"] == r"D:\tmp\jarvis-mkdir-canary"
 
     name2, args2 = _canonicalize_tool_invocation(
         "execution.apply",
@@ -5542,10 +5543,6 @@ def test_canonicalize_tool_invocation_does_not_rewrite_mutation_aliases():
         "filesystem.write",
         "filesystem.overwrite",
         "filesystem.append",
-        "filesystem.move",
-        "filesystem.rename",
-        "filesystem.copy",
-        "filesystem.delete",
         "filesystem.remove",
     ):
         name, args = _canonicalize_tool_invocation(alias, {"path": r"D:\tmp\x"})
@@ -5605,3 +5602,304 @@ def test_memory_save_honors_explicit_namespace(monkeypatch, tmp_path):
     assert not operator_hits
     assert not core_hits
     storage.close()
+
+
+
+def _fs_registry(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+    return settings, storage, tools
+
+
+def _seed_file(tools, path, content):
+    result = asyncio.run(
+        tools.run(
+            "filesystem.write_text",
+            {"path": str(path), "content": content},
+            allow_danger=True,
+        )
+    )
+    assert result.ok is True, result.summary
+
+
+def test_filesystem_tools_are_exposed_and_classified(monkeypatch, tmp_path):
+    _settings, storage, tools = _fs_registry(monkeypatch, tmp_path)
+    names = {tool.name for tool in tools.list()}
+    for name in (
+        "filesystem.mkdir",
+        "filesystem.copy",
+        "filesystem.move",
+        "filesystem.rename",
+        "filesystem.delete",
+        "filesystem.find",
+    ):
+        assert name in names, name
+    levels = {tool.name: tool.danger_level for tool in tools.list()}
+    for name in (
+        "filesystem.mkdir",
+        "filesystem.copy",
+        "filesystem.move",
+        "filesystem.rename",
+        "filesystem.delete",
+    ):
+        assert levels[name] == "review", name
+    assert levels["filesystem.find"] == "safe"
+    storage.close()
+
+
+def test_filesystem_mkdir_creates_dir_and_is_gated(monkeypatch, tmp_path):
+    settings, storage, tools = _fs_registry(monkeypatch, tmp_path)
+    target = settings.home / "made" / "here"
+
+    blocked = asyncio.run(tools.run("filesystem.mkdir", {"path": str(target)}))
+    assert blocked.ok is False
+    assert "requires approval" in blocked.summary
+    assert not target.exists()
+
+    ok = asyncio.run(tools.run("filesystem.mkdir", {"path": str(target)}, allow_danger=True))
+    assert ok.ok is True, ok.summary
+    assert target.is_dir()
+
+    denied = asyncio.run(
+        tools.run("filesystem.mkdir", {"path": "C:/Windows/jarvis-nope"}, allow_danger=True)
+    )
+    assert denied.ok is False
+    assert "outside allowed roots" in denied.summary
+    storage.close()
+
+
+def test_filesystem_copy_move_rename_roundtrip(monkeypatch, tmp_path):
+    settings, storage, tools = _fs_registry(monkeypatch, tmp_path)
+    src = settings.home / "src.txt"
+    _seed_file(tools, src, "payload-content")
+
+    copy_dest = settings.home / "copy.txt"
+    copied = asyncio.run(
+        tools.run(
+            "filesystem.copy",
+            {"source": str(src), "destination": str(copy_dest)},
+            allow_danger=True,
+        )
+    )
+    assert copied.ok is True, copied.summary
+    assert copy_dest.read_text(encoding="utf-8") == "payload-content"
+    assert src.exists()
+
+    move_dest = settings.home / "moved.txt"
+    moved = asyncio.run(
+        tools.run(
+            "filesystem.move",
+            {"source": str(src), "destination": str(move_dest)},
+            allow_danger=True,
+        )
+    )
+    assert moved.ok is True, moved.summary
+    assert move_dest.read_text(encoding="utf-8") == "payload-content"
+    assert not src.exists()
+
+    renamed = asyncio.run(
+        tools.run(
+            "filesystem.rename",
+            {"path": str(move_dest), "new_name": "renamed.txt"},
+            allow_danger=True,
+        )
+    )
+    assert renamed.ok is True, renamed.summary
+    assert (settings.home / "renamed.txt").exists()
+    assert not move_dest.exists()
+
+    bad_name = asyncio.run(
+        tools.run(
+            "filesystem.rename",
+            {"path": str(settings.home / "renamed.txt"), "new_name": "nested/evil.txt"},
+            allow_danger=True,
+        )
+    )
+    assert bad_name.ok is False
+    assert "bare filename" in bad_name.summary
+    storage.close()
+
+
+def test_filesystem_delete_removes_regular_file_and_is_gated(monkeypatch, tmp_path):
+    settings, storage, tools = _fs_registry(monkeypatch, tmp_path)
+    target = settings.home / "trash.txt"
+    _seed_file(tools, target, "delete me")
+
+    blocked = asyncio.run(tools.run("filesystem.delete", {"path": str(target)}))
+    assert blocked.ok is False
+    assert "requires approval" in blocked.summary
+    assert target.exists()
+
+    deleted = asyncio.run(
+        tools.run("filesystem.delete", {"path": str(target)}, allow_danger=True)
+    )
+    assert deleted.ok is True, deleted.summary
+    assert not target.exists()
+
+    absent = settings.home / "already-gone.txt"
+    missing_ok = asyncio.run(
+        tools.run(
+            "filesystem.delete",
+            {"path": str(absent), "missing_ok": True},
+            allow_danger=True,
+        )
+    )
+    assert missing_ok.ok is True, missing_ok.summary
+
+    missing_err = asyncio.run(
+        tools.run(
+            "filesystem.delete",
+            {"path": str(absent), "missing_ok": False},
+            allow_danger=True,
+        )
+    )
+    assert missing_err.ok is False
+    storage.close()
+
+
+def test_filesystem_delete_and_copy_refuse_directories(monkeypatch, tmp_path):
+    settings, storage, tools = _fs_registry(monkeypatch, tmp_path)
+    a_dir = settings.home / "a-directory"
+    asyncio.run(tools.run("filesystem.mkdir", {"path": str(a_dir)}, allow_danger=True))
+    assert a_dir.is_dir()
+
+    del_dir = asyncio.run(
+        tools.run("filesystem.delete", {"path": str(a_dir)}, allow_danger=True)
+    )
+    assert del_dir.ok is False
+    assert a_dir.is_dir()
+
+    copy_dir = asyncio.run(
+        tools.run(
+            "filesystem.copy",
+            {"source": str(a_dir), "destination": str(settings.home / "copy-dir")},
+            allow_danger=True,
+        )
+    )
+    assert copy_dir.ok is False
+    storage.close()
+
+
+def test_filesystem_mutations_stay_inside_roots(monkeypatch, tmp_path):
+    settings, storage, tools = _fs_registry(monkeypatch, tmp_path)
+    src = settings.home / "inside.txt"
+    _seed_file(tools, src, "x")
+
+    outside = asyncio.run(
+        tools.run(
+            "filesystem.copy",
+            {"source": str(src), "destination": "C:/Windows/jarvis-escape.txt"},
+            allow_danger=True,
+        )
+    )
+    assert outside.ok is False
+    assert "outside allowed roots" in outside.summary
+
+    # A runtime-secret path is denied by the kernel PathPolicy even with allow_danger.
+    secret = settings.home / "bridge.token"
+    secret.write_text("TOPSECRET", encoding="utf-8")
+    denied = asyncio.run(
+        tools.run("filesystem.delete", {"path": str(secret)}, allow_danger=True)
+    )
+    assert denied.ok is False
+    assert secret.exists()
+    storage.close()
+
+
+def test_filesystem_find_greps_content(monkeypatch, tmp_path):
+    settings, storage, tools = _fs_registry(monkeypatch, tmp_path)
+    root = settings.home / "corpus"
+    _seed_file(tools, root / "one.txt", "alpha NEEDLE beta\nsecond line")
+    _seed_file(tools, root / "two.txt", "Mixed Needle Here")
+    (root / "binary.bin").write_bytes(b"NEEDLE\x00binarypart")
+
+    hit = asyncio.run(
+        tools.run("filesystem.find", {"path": str(root), "query": "NEEDLE"})
+    )
+    assert hit.ok is True, hit.summary
+    matched_paths = {m["path"] for m in hit.data["matches"]}
+    assert str(root / "one.txt") in matched_paths
+    # Case-sensitive by default: two.txt "Needle" and the binary file are not matched.
+    assert str(root / "two.txt") not in matched_paths
+    assert all("binary.bin" not in p for p in matched_paths)
+    first = hit.data["matches"][0]
+    assert set(first) == {"path", "line", "text"}
+
+    insensitive = asyncio.run(
+        tools.run(
+            "filesystem.find",
+            {"path": str(root), "query": "needle", "ignore_case": True},
+        )
+    )
+    ci_paths = {m["path"] for m in insensitive.data["matches"]}
+    assert str(root / "two.txt") in ci_paths
+
+    regex = asyncio.run(
+        tools.run(
+            "filesystem.find",
+            {"path": str(root), "query": r"N\w+E", "regex": True},
+        )
+    )
+    assert regex.ok is True
+    assert regex.data["matches"]
+
+    capped = asyncio.run(
+        tools.run(
+            "filesystem.find",
+            {"path": str(root), "query": "line", "max_results": 1},
+        )
+    )
+    assert len(capped.data["matches"]) == 1
+    assert capped.data["truncated"] is True
+
+    # Read-only: runs WITHOUT approval.
+    unapproved = asyncio.run(tools.run("filesystem.find", {"path": str(root), "query": "alpha"}))
+    assert unapproved.ok is True
+    storage.close()
+
+
+def test_filesystem_find_is_confined_and_skips_secrets(monkeypatch, tmp_path):
+    settings, storage, tools = _fs_registry(monkeypatch, tmp_path)
+    _seed_file(tools, settings.home / "notes.txt", "shared TOPSECRET value")
+    secret = settings.home / "bridge.token"
+    secret.write_text("bearer TOPSECRET value", encoding="utf-8")
+
+    result = asyncio.run(
+        tools.run("filesystem.find", {"path": str(settings.home), "query": "TOPSECRET"})
+    )
+    assert result.ok is True, result.summary
+    paths = {m["path"] for m in result.data["matches"]}
+    assert str(settings.home / "notes.txt") in paths
+    assert str(secret) not in paths
+
+    outside = asyncio.run(
+        tools.run("filesystem.find", {"path": "C:/Windows", "query": "x"})
+    )
+    assert outside.ok is False
+    assert "outside allowed roots" in outside.summary
+    storage.close()
+
+
+def test_validate_native_payload_clipboard_write():
+    from jarvis_gpt.tools import (
+        MODEL_NATIVE_ACTIONS,
+        SAFE_INSPECT_ACTIONS,
+        _validate_native_payload,
+    )
+
+    assert _validate_native_payload("clipboard.write", {"text": "multi\nline"}) == {
+        "text": "multi\nline"
+    }
+    for bad in ({"text": ""}, {"text": "\x00"}, {"text": "a" * 16385}):
+        with pytest.raises(ValueError):
+            _validate_native_payload("clipboard.write", bad)
+
+    assert "clipboard.read" in SAFE_INSPECT_ACTIONS
+    assert "clipboard.write" not in SAFE_INSPECT_ACTIONS
+    assert "clipboard.read" in MODEL_NATIVE_ACTIONS
+    assert "clipboard.write" in MODEL_NATIVE_ACTIONS

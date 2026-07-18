@@ -38,6 +38,8 @@ ACTION_NAMES = frozenset(
         "capabilities",
         "chrome.attest_guarded",
         "chrome.launch_guarded",
+        "clipboard.read",
+        "clipboard.write",
         "console.show_processes",
         "hardware.gpu",
         "keyboard.send",
@@ -907,6 +909,8 @@ def validate_action_request(request: dict[str, Any]) -> tuple[str, dict[str, Any
         "capabilities": _validate_empty_payload,
         "chrome.attest_guarded": _validate_guarded_chrome_attestation,
         "chrome.launch_guarded": _validate_guarded_chrome_launch,
+        "clipboard.read": _validate_empty_payload,
+        "clipboard.write": _validate_clipboard_write,
         "console.show_processes": _validate_process_view,
         "hardware.gpu": _validate_empty_payload,
         "keyboard.send": _validate_keyboard_send,
@@ -923,6 +927,19 @@ def validate_action_request(request: dict[str, Any]) -> tuple[str, dict[str, Any
 def _validate_empty_payload(payload: dict[str, Any]) -> dict[str, Any]:
     _reject_extra_keys(payload, set(), "payload")
     return {}
+
+
+def _validate_clipboard_write(payload: dict[str, Any]) -> dict[str, Any]:
+    _reject_extra_keys(payload, {"text"}, "clipboard.write payload")
+    text = payload.get("text")
+    if not isinstance(text, str) or not text:
+        raise ActionValidationError("clipboard.write requires a non-empty text string.")
+    # NOTE: intentionally NOT _reject_control_chars — clipboard text may contain \r\n.
+    if "\x00" in text:
+        raise ActionValidationError("clipboard.write text contains a null byte.")
+    if len(text) > 16_384:
+        raise ActionValidationError("clipboard.write text is too long (max 16384).")
+    return {"text": text}
 
 
 def _validate_process_start(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1642,7 +1659,8 @@ try {
   $Payload = $Envelope.payload
   $Allowed = @(
     'app.open_and_type', 'keyboard.send', 'screen.capture',
-    'process.top', 'window.focus', 'window.list', 'wmi.query', 'hardware.gpu'
+    'process.top', 'window.focus', 'window.list', 'wmi.query', 'hardware.gpu',
+    'clipboard.read', 'clipboard.write'
   )
   if ($Allowed -notcontains $Action) { throw 'Unsupported fixed native action.' }
 
@@ -1979,6 +1997,23 @@ public static class JarvisBridgeWinApi {
         }
       }
       Out $true "nvidia-smi reported $(@($gpus).Count) GPU(s)." @{ gpus = @($gpus) }
+    }
+    'clipboard.read' {
+      $text = ''
+      try { $text = [string](Get-Clipboard -Raw -ErrorAction Stop) } catch { $text = '' }
+      if ($null -eq $text) { $text = '' }
+      $length = $text.Length
+      $truncated = $false
+      if ($length -gt 16384) { $text = $text.Substring(0, 16384); $truncated = $true }
+      Out $true "Clipboard holds $length character(s)." @{
+        text = $text
+        length = $length
+        truncated = $truncated
+      }
+    }
+    'clipboard.write' {
+      Set-Clipboard -Value ([string]$Payload.text)
+      Out $true 'Clipboard updated.' @{ length = ([string]$Payload.text).Length }
     }
   }
 } catch {

@@ -5262,8 +5262,8 @@ def test_request_direct_tool_approval_rejects_unknown_alias(monkeypatch, tmp_pat
     assert after == before
     assert "rejected" in action.answer.lower() or "unknown" in action.answer.lower()
 
-    # Mutation aliases also must not create pending approvals.
-    for alias in ("filesystem.write", "filesystem.move", "filesystem.delete"):
+    # Still-rejected non-canonical spellings must not create pending approvals.
+    for alias in ("filesystem.write", "filesystem.remove"):
         before_m = len(storage.list_approvals(limit=50))
         action_m = agent._request_direct_tool_approval(
             alias,
@@ -5278,7 +5278,8 @@ def test_request_direct_tool_approval_rejects_unknown_alias(monkeypatch, tmp_pat
 
 
 def test_request_direct_tool_approval_canonicalizes_mkdir_alias(monkeypatch, tmp_path):
-    """SPARK-0009: filesystem.mkdir approval stores canonical execution.apply/fs.mkdir."""
+    """filesystem.mkdir is a real review tool: the approval binds the exact directory
+    without creating it, and no neighbor is touched."""
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
     settings = load_settings()
@@ -5303,19 +5304,9 @@ def test_request_direct_tool_approval_canonicalizes_mkdir_alias(monkeypatch, tmp
     assert approvals, action.answer
     latest = approvals[0]
     payload = latest.get("payload") or {}
-    assert payload.get("tool") == "execution.apply"
-    kind = (
-        ((payload.get("arguments") or {}).get("payload") or {})
-        .get("action", {})
-        .get("kind")
-    )
-    assert kind == "fs.mkdir"
-    path = (
-        ((payload.get("arguments") or {}).get("payload") or {})
-        .get("action", {})
-        .get("path")
-    )
-    assert path == str(target)
+    assert payload.get("tool") == "filesystem.mkdir"
+    arguments = payload.get("arguments") or {}
+    assert arguments.get("path") == str(target)
     assert not target.exists()
     assert not neighbor.exists()
     storage.close()

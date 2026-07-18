@@ -912,3 +912,83 @@ def test_focus_script_uses_robust_foreground_and_reports_focus():
     # The focused window's identity is reported for downstream verification.
     for field in ("focus_pid", "focus_process", "foreground_confirmed"):
         assert field in script, field
+
+
+def test_clipboard_actions_are_in_every_bridge_allowlist():
+    bridge = _load_bridge_module()
+    assert "clipboard.read" in bridge.ACTION_NAMES
+    assert "clipboard.write" in bridge.ACTION_NAMES
+    assert bridge.validate_action_request(
+        {"action": "clipboard.read", "payload": {}}
+    ) == ("clipboard.read", {}, 30)
+    action, payload, _timeout = bridge.validate_action_request(
+        {"action": "clipboard.write", "payload": {"text": "hi"}}
+    )
+    assert action == "clipboard.write"
+    assert payload == {"text": "hi"}
+
+
+def test_clipboard_write_validation():
+    bridge = _load_bridge_module()
+    for bad in (
+        {},
+        {"text": ""},
+        {"text": "x", "extra": 1},
+        {"text": "\x00"},
+        {"text": "a" * 16385},
+    ):
+        with pytest.raises(bridge.ActionValidationError):
+            bridge.validate_action_request({"action": "clipboard.write", "payload": bad})
+    # CRUCIAL regression guard: newlines are legitimate clipboard content and must
+    # survive validation (would fail if a control-char-rejecting helper were used).
+    action, payload, _timeout = bridge.validate_action_request(
+        {"action": "clipboard.write", "payload": {"text": "line1\nline2"}}
+    )
+    assert action == "clipboard.write"
+    assert payload == {"text": "line1\nline2"}
+
+
+def test_clipboard_in_fixed_script():
+    bridge = _load_bridge_module()
+    script = bridge.FIXED_NATIVE_POWERSHELL
+    assert "'clipboard.read'" in script
+    assert "'clipboard.write'" in script
+    assert "Get-Clipboard -Raw" in script
+    assert "Set-Clipboard -Value" in script
+    allowed_region = script.split("$Allowed = @(", 1)[1].split(")", 1)[0]
+    assert "'clipboard.read'" in allowed_region
+    assert "'clipboard.write'" in allowed_region
+
+
+def test_clipboard_write_text_only_in_env(monkeypatch):
+    bridge = _load_bridge_module()
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        captured["kwargs"] = kwargs
+        script_path = argv[argv.index("-File") + 1]
+        captured["script"] = Path(script_path).read_text(encoding="utf-8-sig")
+        native = {
+            "ok": True,
+            "summary": "Clipboard updated.",
+            "action": "clipboard.write",
+            "data": {"length": 11},
+        }
+        return subprocess.CompletedProcess(argv, 0, json.dumps(native), "")
+
+    monkeypatch.setattr(bridge, "powershell_path", lambda: "powershell.exe")
+    monkeypatch.setattr(bridge.subprocess, "run", fake_run)
+
+    result, status = bridge.execute_action(
+        {"action": "clipboard.write", "payload": {"text": "SECRET_CLIP"}}
+    )
+
+    assert status == 200
+    assert result["ok"] is True
+    # The clipboard text is confined to the env payload; it never appears on the
+    # command line, and the executed script is the fixed constant.
+    assert "SECRET_CLIP" not in " ".join(captured["argv"])
+    assert captured["script"] == bridge.FIXED_NATIVE_POWERSHELL
+    envelope = json.loads(captured["kwargs"]["env"]["JARVIS_BRIDGE_ACTION_JSON"])
+    assert envelope["payload"]["text"] == "SECRET_CLIP"

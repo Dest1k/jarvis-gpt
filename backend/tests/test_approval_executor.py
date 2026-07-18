@@ -1170,11 +1170,12 @@ def test_filesystem_mkdir_alias_canonicalizes_to_fs_mkdir_on_approval(monkeypatc
         "filesystem.mkdir",
         {"path": str(tmp_path / "from-tool-name"), "parents": True},
     )
-    assert name == "execution.apply"
-    assert args["payload"]["action"]["kind"] == "fs.mkdir"
+    # filesystem.mkdir is now a real tool, so the invocation is not rewritten.
+    assert name == "filesystem.mkdir"
+    assert "payload" not in args
 
-    # Mutation aliases must remain non-canonical.
-    for alias in ("filesystem.write", "filesystem.move", "filesystem.delete"):
+    # Still-rejected non-canonical spellings must remain non-canonical.
+    for alias in ("filesystem.write", "filesystem.remove"):
         bad_name, bad_args = _canonicalize_tool_invocation(alias, {"path": "x"})
         assert bad_name == alias
         assert "payload" not in bad_args
@@ -1236,11 +1237,10 @@ def test_filesystem_mkdir_alias_canonicalizes_to_fs_mkdir_on_approval(monkeypatc
     assert result.ok is False
     assert not ghost.exists()
 
-    # write/move/delete aliases do not become executable via canonicalize.
+    # Still-rejected non-canonical spellings do not become executable.
     for alias, path_name in (
         ("filesystem.write", "no-write"),
-        ("filesystem.move", "no-move"),
-        ("filesystem.delete", "no-delete"),
+        ("filesystem.remove", "no-remove"),
     ):
         target = tmp_path / path_name
         approval = storage.create_approval(
@@ -1258,7 +1258,8 @@ def test_filesystem_mkdir_alias_canonicalizes_to_fs_mkdir_on_approval(monkeypatc
 
 
 def test_tools_run_rewrites_filesystem_mkdir_alias(monkeypatch, tmp_path):
-    """SPARK-0009: tools.run packages filesystem.mkdir as execution.apply/fs.mkdir."""
+    """filesystem.mkdir is a real review tool: gated without approval, creates the dir
+    once approved, and never touches a neighbor path."""
     executor, storage = _runtime(monkeypatch, tmp_path)
     target = tmp_path / "tools-run-mkdir"
     neighbor = tmp_path / "tools-run-neighbor"
@@ -1268,9 +1269,8 @@ def test_tools_run_rewrites_filesystem_mkdir_alias(monkeypatch, tmp_path):
     assert response.ok is False
     assert response.data.get("approval_action") == "tool.run"
     payload = response.data.get("approval_payload") or {}
-    assert payload.get("tool") == "execution.apply"
-    assert payload["arguments"]["payload"]["action"]["kind"] == "fs.mkdir"
-    assert payload["arguments"]["payload"]["action"]["path"] == str(target)
+    assert payload.get("tool") == "filesystem.mkdir"
+    assert payload["arguments"]["path"] == str(target)
     assert not target.exists()
     assert not neighbor.exists()
 
@@ -1282,7 +1282,7 @@ def test_tools_run_rewrites_filesystem_mkdir_alias(monkeypatch, tmp_path):
         )
     )
     assert approved.ok is True
-    assert approved.tool == "execution.apply"
+    assert approved.tool == "filesystem.mkdir"
     assert target.is_dir()
     assert not neighbor.exists()
 

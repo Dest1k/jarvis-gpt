@@ -22,6 +22,8 @@ BRIDGE_ACTIONS = (
     "capabilities",
     "chrome.attest_guarded",
     "chrome.launch_guarded",
+    "clipboard.read",
+    "clipboard.write",
     "console.show_processes",
     "hardware.gpu",
     "keyboard.send",
@@ -35,6 +37,7 @@ BRIDGE_ACTIONS = (
 BRIDGE_READ_ONLY_ACTIONS = frozenset(
     {
         "capabilities",
+        "clipboard.read",
         "hardware.gpu",
         "process.top",
         "window.list",

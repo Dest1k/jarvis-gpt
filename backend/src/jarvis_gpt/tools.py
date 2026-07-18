@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import fnmatch
 import hashlib
 import inspect
 import ipaddress
@@ -1111,9 +1112,11 @@ class ToolRegistry:
                     "action": (
                         "capabilities, process.top, console.show_processes, process.start, "
                         "app.open_and_type, window.focus, screen.capture, window.list, "
-                        "keyboard.send or wmi.query"
+                        "keyboard.send, clipboard.read, clipboard.write or wmi.query"
                     ),
-                    "payload": "Structured action payload",
+                    "payload": (
+                        "Structured action payload; clipboard.write: {text}"
+                    ),
                     "timeout_sec": "1-120 second timeout",
                 },
                 handler=_windows_native,
@@ -1140,6 +1143,7 @@ class ToolRegistry:
                 input_schema={
                     "action": (
                         "wmi.query (default), process.top, window.list, screen.capture, "
+                        "clipboard.read (current clipboard text), "
                         "capabilities, or the convenience shortcuts hardware.memory / "
                         "hardware.cpu / hardware.disk / hardware.gpu (RAM/CPU/disk/GPU "
                         "telemetry with no class name needed — prefer these for "
@@ -2347,6 +2351,84 @@ class ToolRegistry:
                 danger_level="review",
             )
         )
+        for _fs_name, _fs_handler, _fs_schema in (
+            (
+                "filesystem.mkdir",
+                _filesystem_mkdir,
+                {
+                    "path": "Directory to create",
+                    "parents": "Create missing parents (default true)",
+                },
+            ),
+            (
+                "filesystem.copy",
+                _filesystem_copy,
+                {
+                    "source": "Source file",
+                    "destination": "Destination file",
+                    "overwrite": "Overwrite destination",
+                    "create_parents": "Create destination parents",
+                },
+            ),
+            (
+                "filesystem.move",
+                _filesystem_move,
+                {
+                    "source": "Source file",
+                    "destination": "Destination file",
+                    "overwrite": "Overwrite destination",
+                    "create_parents": "Create destination parents",
+                },
+            ),
+            (
+                "filesystem.rename",
+                _filesystem_rename,
+                {
+                    "path": "File to rename",
+                    "new_name": "New bare filename",
+                    "overwrite": "Overwrite an existing destination",
+                },
+            ),
+            (
+                "filesystem.delete",
+                _filesystem_delete,
+                {
+                    "path": "Regular file to delete",
+                    "missing_ok": "Succeed if already absent",
+                },
+            ),
+        ):
+            self.add(
+                ToolSpec(
+                    name=_fs_name,
+                    description=(
+                        f"{_fs_name} (regular files only) below cwd/JARVIS_HOME after approval."
+                    ),
+                    category="filesystem",
+                    input_schema=_fs_schema,
+                    handler=_fs_handler,
+                    danger_level="review",
+                )
+            )
+        self.add(
+            ToolSpec(
+                name="filesystem.find",
+                description=(
+                    "Search file contents (grep) below cwd/JARVIS_HOME; read-only and safe."
+                ),
+                category="filesystem",
+                input_schema={
+                    "path": "Root to search (default .)",
+                    "query": "Text or regex to find",
+                    "regex": "Treat query as a regular expression",
+                    "ignore_case": "Case-insensitive match",
+                    "glob": "Filename glob filter (e.g. *.py)",
+                    "max_results": "Maximum hits (default 100)",
+                    "max_file_bytes": "Skip files larger than this",
+                },
+                handler=_filesystem_find,
+            )
+        )
 
 
 def _execution_action_tool_schema() -> dict[str, Any]:
@@ -2983,18 +3065,16 @@ async def _execution_verify(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRe
 
 
 
-# SPARK-0009 / FUNC-FIND-009: only the mkdir model-facing alias is rewritten.
-# Do not expand this set to write/move/delete or other mutation kinds.
-_MKDIR_ALIAS_TOOL_NAMES = frozenset({"filesystem.mkdir"})
+# filesystem.mkdir/copy/move/rename/delete are now real registered tools that build
+# typed jarvis.execution.v1 payloads themselves, so they no longer need the mkdir
+# alias rewrite or the fail-closed reject. The remaining names have no dedicated
+# handler and must still fail closed toward the canonical execution.* tools.
+_MKDIR_ALIAS_TOOL_NAMES: frozenset[str] = frozenset()
 _REJECTED_NON_CANONICAL_ALIASES = frozenset(
     {
         "filesystem.write",
         "filesystem.overwrite",
         "filesystem.append",
-        "filesystem.move",
-        "filesystem.rename",
-        "filesystem.copy",
-        "filesystem.delete",
         "filesystem.remove",
         "mkdir",
     }
@@ -3839,6 +3919,7 @@ def _host_bridge_status(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunRespo
 SAFE_INSPECT_ACTIONS = frozenset(
     {
         "capabilities",
+        "clipboard.read",
         "hardware.gpu",
         "process.top",
         "screen.capture",
@@ -3868,6 +3949,8 @@ MODEL_NATIVE_ACTIONS = frozenset(
     {
         "app.open_and_type",
         "capabilities",
+        "clipboard.read",
+        "clipboard.write",
         "console.show_processes",
         "hardware.gpu",
         "keyboard.send",
@@ -11341,6 +11424,214 @@ async def _filesystem_write_text(ctx: ToolContext, args: dict[str, Any]) -> Tool
     )
 
 
+def _fs_execution_payload(action: dict[str, Any]) -> dict[str, Any]:
+    """Wrap a typed fs.* action into a jarvis.execution.v1 mutation payload."""
+    return {
+        "protocol": "jarvis.execution.v1",
+        "action": {"action_id": new_id("fs-op"), **action},
+    }
+
+
+async def _filesystem_mkdir(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    tool = "filesystem.mkdir"
+    try:
+        path = _resolve_allowed_path(ctx.settings, str(args.get("path") or ""))
+    except ValueError as exc:
+        return ToolRunResponse(tool=tool, ok=False, summary=str(exc))
+    payload = _fs_execution_payload(
+        {
+            "kind": "fs.mkdir",
+            "path": str(path),
+            "parents": _bool_arg(args.get("parents"), default=True),
+        }
+    )
+    return await _execution_action(
+        ctx, {"payload": payload}, expected=ActionClass.MUTATION, tool=tool
+    )
+
+
+async def _filesystem_copy_or_move(
+    ctx: ToolContext, args: dict[str, Any], *, kind: str, tool: str
+) -> ToolRunResponse:
+    try:
+        source = _resolve_allowed_path(ctx.settings, str(args.get("source") or ""))
+        destination = _resolve_allowed_path(ctx.settings, str(args.get("destination") or ""))
+    except ValueError as exc:
+        return ToolRunResponse(tool=tool, ok=False, summary=str(exc))
+    payload = _fs_execution_payload(
+        {
+            "kind": kind,
+            "source": str(source),
+            "destination": str(destination),
+            "overwrite": _bool_arg(args.get("overwrite"), default=False),
+            "create_parents": _bool_arg(args.get("create_parents"), default=False),
+        }
+    )
+    return await _execution_action(
+        ctx, {"payload": payload}, expected=ActionClass.MUTATION, tool=tool
+    )
+
+
+async def _filesystem_copy(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    return await _filesystem_copy_or_move(ctx, args, kind="fs.copy", tool="filesystem.copy")
+
+
+async def _filesystem_move(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    return await _filesystem_copy_or_move(ctx, args, kind="fs.move", tool="filesystem.move")
+
+
+async def _filesystem_rename(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    tool = "filesystem.rename"
+    new_name = str(args.get("new_name") or "").strip()
+    if not new_name or new_name in {".", ".."} or any(sep in new_name for sep in ("/", "\\")):
+        return ToolRunResponse(tool=tool, ok=False, summary="new_name must be a bare filename.")
+    try:
+        source = _resolve_allowed_path(ctx.settings, str(args.get("path") or ""))
+        destination = _resolve_allowed_path(ctx.settings, str(source.parent / new_name))
+    except ValueError as exc:
+        return ToolRunResponse(tool=tool, ok=False, summary=str(exc))
+    payload = _fs_execution_payload(
+        {
+            "kind": "fs.move",
+            "source": str(source),
+            "destination": str(destination),
+            "overwrite": _bool_arg(args.get("overwrite"), default=False),
+            "create_parents": False,
+        }
+    )
+    return await _execution_action(
+        ctx, {"payload": payload}, expected=ActionClass.MUTATION, tool=tool
+    )
+
+
+async def _filesystem_delete(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    tool = "filesystem.delete"
+    try:
+        path = _resolve_allowed_path(ctx.settings, str(args.get("path") or ""))
+    except ValueError as exc:
+        return ToolRunResponse(tool=tool, ok=False, summary=str(exc))
+    missing_ok = _bool_arg(args.get("missing_ok"), default=False)
+    # The transactional safe-gate resolves a delete target with must_exist=True and
+    # demands an expected_sha256 precondition, so it cannot express "no-op if the file
+    # is already gone". Honor missing_ok at the tool layer before entering the kernel:
+    # a truly-absent path (not even a dangling symlink) short-circuits here.
+    if not path.exists() and not path.is_symlink():
+        if missing_ok:
+            return ToolRunResponse(tool=tool, ok=True, summary=f"{path} already absent.")
+        return ToolRunResponse(tool=tool, ok=False, summary=f"{path} does not exist.")
+    # The kernel's safe-gate refuses a destructive delete without a content digest
+    # precondition, so snapshot the exact file identity being removed (mirrors how
+    # filesystem.write_text pins expected_sha256 for an overwrite).
+    expected_sha256: str | None = None
+    with suppress(OSError):
+        if path.is_file() and not path.is_symlink():
+            expected_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+    action: dict[str, Any] = {
+        "kind": "fs.delete",
+        "path": str(path),
+        "missing_ok": missing_ok,
+    }
+    if expected_sha256 is not None:
+        action["expected_sha256"] = expected_sha256
+    payload = _fs_execution_payload(action)
+    return await _execution_action(
+        ctx, {"payload": payload}, expected=ActionClass.MUTATION, tool=tool
+    )
+
+
+def _iter_files(base: Path, cap: int):
+    """Yield regular files under base, never following symlinks, capped at `cap`."""
+    seen = 0
+    for root, dirs, files in os.walk(base, followlinks=False):
+        # Prune symlinked subdirectories so the walk cannot escape the allowed roots.
+        dirs[:] = [d for d in dirs if not Path(root, d).is_symlink()]
+        for name in files:
+            if seen >= cap:
+                return
+            candidate = Path(root) / name
+            seen += 1
+            yield candidate
+
+
+def _filesystem_find(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    # Lazy import to avoid a tools <-> execution_config import cycle.
+    from .execution_config import execution_denied_paths
+
+    tool = "filesystem.find"
+    try:
+        base = _resolve_allowed_path(ctx.settings, str(args.get("path") or "."))
+    except ValueError as exc:
+        return ToolRunResponse(tool=tool, ok=False, summary=str(exc))
+    query = str(args.get("query") or args.get("pattern") or "")
+    if not query:
+        return ToolRunResponse(tool=tool, ok=False, summary="query is required.")
+    use_regex = _bool_arg(args.get("regex"), default=False)
+    ignore_case = _bool_arg(args.get("ignore_case"), default=False)
+    glob = str(args.get("glob") or "").strip()
+    max_results = _int_arg(args.get("max_results"), default=100, minimum=1, maximum=1000)
+    max_file_bytes = _int_arg(
+        args.get("max_file_bytes"), default=1_000_000, minimum=1, maximum=8_000_000
+    )
+    max_files = 5000
+    flags = re.IGNORECASE if ignore_case else 0
+    try:
+        matcher = re.compile(query, flags) if use_regex else None
+    except re.error as exc:
+        return ToolRunResponse(tool=tool, ok=False, summary=f"Invalid regex: {exc}")
+    needle = query.casefold() if (ignore_case and not use_regex) else query
+    denied = tuple(execution_denied_paths(ctx.settings))
+
+    def _blocked(target: Path) -> bool:
+        resolved = target.resolve(strict=False)
+        return any(resolved == d or resolved.is_relative_to(d) for d in denied)
+
+    hits: list[dict[str, Any]] = []
+    scanned = 0
+    truncated = False
+    candidates = [base] if base.is_file() else _iter_files(base, max_files)
+    for file in candidates:
+        if len(hits) >= max_results:
+            truncated = True
+            break
+        if file.is_symlink() or _blocked(file):
+            continue
+        if glob and not fnmatch.fnmatch(file.name, glob):
+            continue
+        try:
+            if file.stat().st_size > max_file_bytes:
+                continue
+            raw = file.read_bytes()
+        except OSError:
+            continue
+        if b"\x00" in raw:  # binary heuristic — skip non-text files
+            continue
+        scanned += 1
+        text = raw.decode("utf-8", errors="replace")
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            if matcher is not None:
+                found = matcher.search(line) is not None
+            elif ignore_case:
+                found = needle in line.casefold()
+            else:
+                found = needle in line
+            if found:
+                hits.append({"path": str(file), "line": lineno, "text": line[:400]})
+                if len(hits) >= max_results:
+                    truncated = True
+                    break
+    return ToolRunResponse(
+        tool=tool,
+        ok=True,
+        summary=f"Found {len(hits)} match(es) across {scanned} file(s).",
+        data={
+            "root": str(base),
+            "matches": hits,
+            "truncated": truncated,
+            "files_scanned": scanned,
+        },
+    )
+
+
 def _validate_native_payload(action: str, payload: dict[str, Any]) -> dict[str, Any]:
     clean = dict(payload)
     if action in {"console.show_processes", "process.top"}:
@@ -11403,6 +11694,15 @@ def _validate_native_payload(action: str, payload: dict[str, Any]) -> dict[str, 
         clean["path"] = _native_string(clean.get("path"), "path", max_length=500)
         clean["limit"] = _int_arg(clean.get("limit"), default=30, minimum=1, maximum=100)
         clean["ocr"] = bool(clean.get("ocr", False))
+    if action == "clipboard.write":
+        text = clean.get("text")
+        if not isinstance(text, str) or not text:
+            raise ValueError("clipboard.write requires text.")
+        if "\x00" in text:
+            raise ValueError("clipboard.write text contains a null byte.")
+        if len(text) > 16384:
+            raise ValueError("clipboard.write text is too long.")
+        clean = {"text": text}  # do NOT use _native_string — it rejects newlines
     if action == "wmi.query":
         clean = _validate_wmi_payload(clean)
     return clean

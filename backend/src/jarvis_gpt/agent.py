@@ -295,13 +295,19 @@ AGENTIC_DURABLE_MUTATORS = frozenset(
         "documents.apply_replacements",
         "filesystem.write_text",
         "filesystem.mkdir",
+        "filesystem.copy",
+        "filesystem.move",
+        "filesystem.rename",
+        "filesystem.delete",
         "mission.brief",
     }
 )
 SAFE_DIRECT_NATIVE_ACTIONS = frozenset(
     {
         "capabilities",
+        "clipboard.read",
         "hardware.gpu",
+        "hardware.summary",
         "process.top",
         "screen.capture",
         "window.list",
@@ -447,6 +453,7 @@ EXECUTIVE_AUTONOMOUS_TOOL_ALLOWLIST = frozenset(
         "internet.search_api.status",
         "filesystem.list",
         "filesystem.read_text",
+        "filesystem.find",
     }
 )
 
@@ -3860,6 +3867,38 @@ class AgentRuntime:
             return None
         return DirectAction(answer=result.answer, events=events)
 
+    async def _machine_health_summary(self, answer: str) -> DirectAction:
+        """Gather RAM + CPU + disk + GPU via read-only system.inspect and format one report."""
+
+        async def _inspect(action: str) -> ToolRunResponse:
+            return await self.tools.run(
+                "system.inspect", {"action": action, "payload": {}, "timeout_sec": 30}
+            )
+
+        memory = await _inspect("hardware.memory")
+        cpu = await _inspect("hardware.cpu")
+        disk = await _inspect("hardware.disk")
+        gpu = await _inspect("hardware.gpu")
+        report = _format_machine_health(
+            _native_observation_data(memory).get("items"),
+            _native_observation_data(cpu).get("items"),
+            _native_observation_data(disk).get("items"),
+            _native_observation_data(gpu).get("gpus"),
+        )
+        ok = memory.ok or cpu.ok or disk.ok or gpu.ok
+        status = "Готово" if ok else "Не смог собрать полную картину"
+        event = ChatEvent(
+            type="tool_call",
+            title="system.inspect:hardware.summary",
+            content=report,
+            payload={
+                "tool": "system.inspect",
+                "ok": ok,
+                "action": "hardware.summary",
+            },
+        )
+        return DirectAction(answer=f"{status}: {answer}\n\n{report}", events=[event])
+
     async def _try_direct_action(
         self,
         message: str,
@@ -3906,6 +3945,11 @@ class AgentRuntime:
             # explicit operator authority. Under owner full-autonomy the single admin's own
             # "посмотри на экран" turn authorizes it — let the screen-vision route run.
             native_action = None
+        if native_action is not None and native_action.action == "hardware.summary":
+            # A consolidated "как дела у ПК / здоровье машины" report. There is no single
+            # bridge action for it; gather RAM + CPU + disk + GPU via the read-only
+            # system.inspect facade and format one combined summary.
+            return await self._machine_health_summary(native_action.answer)
         if native_action is not None:
             arguments = {
                 "action": native_action.action,
@@ -10132,7 +10176,18 @@ def _native_result_excerpt(result: ToolRunResponse) -> str:
         return _format_screen_capture(native_data)
     if action == "hardware.gpu":
         return _format_gpu(native_data.get("gpus"))
+    if action == "clipboard.read":
+        return _format_clipboard(native_data)
     return ""
+
+
+def _format_clipboard(data: dict[str, Any]) -> str:
+    text = data.get("text")
+    if not isinstance(text, str) or not text:
+        return "\n\nБуфер обмена пуст."
+    length = data.get("length", len(text))
+    preview = text if len(text) <= 2000 else text[:2000] + "…"
+    return f"\n\nБуфер обмена ({length} симв.):\n{preview}"
 
 
 def _format_gpu(value: Any) -> str:
@@ -10157,6 +10212,108 @@ def _format_gpu(value: Any) -> str:
     if not lines:
         return ""
     return "\n\nGPU (nvidia-smi):\n" + "\n".join(lines)
+
+
+def _native_observation_data(result: ToolRunResponse) -> dict[str, Any]:
+    """Pull the doubly-nested native data dict out of a system.inspect result."""
+    if not isinstance(result.data, dict):
+        return {}
+    native = result.data.get("native")
+    if not isinstance(native, dict):
+        return {}
+    parsed = native.get("result")
+    observation = parsed if isinstance(parsed, dict) else native
+    native_data = observation.get("data")
+    return native_data if isinstance(native_data, dict) else {}
+
+
+def _coerce_number(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int | float):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _format_machine_health(
+    memory_items: Any,
+    cpu_items: Any,
+    disk_items: Any,
+    gpus: Any,
+) -> str:
+    """Combine RAM + CPU + disk + GPU snapshots into one Russian health report."""
+    lines: list[str] = ["Состояние машины:"]
+
+    mem_rows = memory_items if isinstance(memory_items, list) else []
+    mem = mem_rows[0] if mem_rows and isinstance(mem_rows[0], dict) else {}
+    total_kb = _coerce_number(mem.get("TotalVisibleMemorySize"))
+    free_kb = _coerce_number(mem.get("FreePhysicalMemory"))
+    if total_kb and free_kb is not None:
+        total_gb = total_kb / (1024 * 1024)
+        free_gb = free_kb / (1024 * 1024)
+        used_gb = total_gb - free_gb
+        pct = (used_gb / total_gb * 100) if total_gb else 0
+        lines.append(
+            f"- RAM: {used_gb:.1f}/{total_gb:.1f} ГБ занято ({pct:.0f}%), "
+            f"свободно {free_gb:.1f} ГБ"
+        )
+    else:
+        lines.append("- RAM: нет данных")
+
+    cpu_rows = cpu_items if isinstance(cpu_items, list) else []
+    cpu = cpu_rows[0] if cpu_rows and isinstance(cpu_rows[0], dict) else {}
+    cpu_name = cpu.get("Name")
+    load = _coerce_number(cpu.get("LoadPercentage"))
+    cores = _coerce_number(cpu.get("NumberOfLogicalProcessors"))
+    if cpu_name or load is not None:
+        parts = [str(cpu_name).strip()] if cpu_name else ["CPU"]
+        if load is not None:
+            parts.append(f"загрузка {load:.0f}%")
+        if cores:
+            parts.append(f"{int(cores)} потоков")
+        lines.append("- CPU: " + "; ".join(parts))
+    else:
+        lines.append("- CPU: нет данных")
+
+    disk_rows = disk_items if isinstance(disk_items, list) else []
+    disk_lines: list[str] = []
+    for disk in disk_rows:
+        if not isinstance(disk, dict):
+            continue
+        drive_type = _coerce_number(disk.get("DriveType"))
+        size = _coerce_number(disk.get("Size"))
+        if size is None or size <= 0:
+            continue
+        # DriveType 3 == local fixed disk. Keep unknown types too, skip empty removables.
+        if drive_type is not None and drive_type not in (3, 0):
+            continue
+        free = _coerce_number(disk.get("FreeSpace")) or 0
+        total_gb = size / (1024**3)
+        free_gb = free / (1024**3)
+        used_gb = total_gb - free_gb
+        name = str(disk.get("DeviceID") or "диск").strip()
+        disk_lines.append(
+            f"  {name} {used_gb:.0f}/{total_gb:.0f} ГБ занято, свободно {free_gb:.0f} ГБ"
+        )
+    if disk_lines:
+        lines.append("- Диски:")
+        lines.extend(disk_lines)
+    else:
+        lines.append("- Диски: нет данных")
+
+    gpu_text = _format_gpu(gpus)
+    if gpu_text:
+        # _format_gpu prefixes two blank lines + a header; fold it into the report.
+        lines.append(gpu_text.strip())
+    else:
+        lines.append("- GPU: нет данных")
+
+    return "\n".join(lines)
 
 
 def _format_screen_capture(data: dict[str, Any]) -> str:
@@ -12344,6 +12501,10 @@ SIDE_EFFECT_MUTATING_TOOLS = frozenset(
         "documents.apply_replacements",
         "filesystem.write_text",
         "filesystem.mkdir",
+        "filesystem.copy",
+        "filesystem.move",
+        "filesystem.rename",
+        "filesystem.delete",
         "mission.brief",
     }
 )
@@ -16784,6 +16945,15 @@ def _operator_requested_tool_names(scopes: frozenset[str]) -> set[str]:
         names.add("browser.screenshot")
     if "filesystem" in scopes and scopes & {"create", "write", "modify"}:
         names.add("filesystem.write_text")
+    if "filesystem" in scopes:
+        if "create" in scopes:
+            names.add("filesystem.mkdir")
+        if "copy" in scopes:
+            names.add("filesystem.copy")
+        if "move" in scopes:
+            names.update({"filesystem.move", "filesystem.rename"})
+        if "delete" in scopes:
+            names.add("filesystem.delete")
     if (
         (
             "filesystem" in scopes
@@ -16877,6 +17047,47 @@ def _operator_tool_arguments_match(
                 or (append and mode == "append")
                 or (not append and mode == "overwrite")
             )
+        )
+    if name == "filesystem.mkdir":
+        if not set(args) <= {"path", "parents"} or not isinstance(args.get("path"), str):
+            return False
+        return bool(
+            "filesystem" in scopes
+            and "create" in scopes
+            and _operator_mentions_value(message, args.get("path", ""), path_value=True)
+        )
+    if name in {"filesystem.copy", "filesystem.move"}:
+        if not set(args) <= {"source", "destination", "overwrite", "create_parents"}:
+            return False
+        if not isinstance(args.get("source"), str) or not isinstance(
+            args.get("destination"), str
+        ):
+            return False
+        required = "copy" if name == "filesystem.copy" else "move"
+        return bool(
+            "filesystem" in scopes
+            and required in scopes
+            and _operator_mentions_value(message, args.get("source", ""), path_value=True)
+            and _operator_mentions_value(message, args.get("destination", ""), path_value=True)
+        )
+    if name == "filesystem.rename":
+        if not set(args) <= {"path", "new_name", "overwrite"}:
+            return False
+        if not isinstance(args.get("path"), str) or not isinstance(args.get("new_name"), str):
+            return False
+        return bool(
+            "filesystem" in scopes
+            and "move" in scopes
+            and _operator_mentions_value(message, args.get("path", ""), path_value=True)
+            and _operator_mentions_value(message, args.get("new_name", ""))
+        )
+    if name == "filesystem.delete":
+        if not set(args) <= {"path", "missing_ok"} or not isinstance(args.get("path"), str):
+            return False
+        return bool(
+            "filesystem" in scopes
+            and "delete" in scopes
+            and _operator_mentions_value(message, args.get("path", ""), path_value=True)
         )
     if name in {
         "browser.click",
@@ -17734,6 +17945,27 @@ def _operator_effect_key(name: str, args: dict[str, Any]) -> str:
             "content": str(args.get("content") or ""),
             "mode": str(args.get("mode") or "overwrite").casefold(),
         }
+    elif name == "filesystem.mkdir":
+        effect_arguments = {
+            "path": _canonical_operator_path(args.get("path")),
+            "parents": bool(args.get("parents", True)),
+        }
+    elif name in {"filesystem.copy", "filesystem.move"}:
+        effect_arguments = {
+            "source": _canonical_operator_path(args.get("source")),
+            "destination": _canonical_operator_path(args.get("destination")),
+            "overwrite": bool(args.get("overwrite", False)),
+        }
+    elif name == "filesystem.rename":
+        effect_arguments = {
+            "path": _canonical_operator_path(args.get("path")),
+            "new_name": str(args.get("new_name") or ""),
+        }
+    elif name == "filesystem.delete":
+        effect_arguments = {
+            "path": _canonical_operator_path(args.get("path")),
+            "missing_ok": bool(args.get("missing_ok", False)),
+        }
     elif name == "windows.native":
         effect_arguments = _canonical_operator_native_effect(args)
     payload = json.dumps(
@@ -18024,6 +18256,67 @@ def _native_action_from_message(
             action="hardware.gpu",
             payload={},
             answer="снял телеметрию GPU через nvidia-smi",
+        )
+
+    # Consolidated machine-health report ("как дела у ПК / здоровье машины / проверь
+    # систему / как чувствует себя") — one combined RAM + CPU + disk + GPU snapshot
+    # instead of separate queries. Placed after gpu_status so a GPU-specific telemetry
+    # question still routes to the dedicated nvidia-smi action.
+    machine_health = _contains_any(
+        normalized,
+        (
+            "здоровье машины",
+            "здоровье пк",
+            "здоровье компьютер",
+            "здоровье систем",
+            "состояние систем",
+            "состояние машины",
+            "состояние пк",
+            "состояние компьютер",
+            "проверь систему",
+            "проверь пк",
+            "проверь машину",
+            "проверь компьютер",
+            "как дела у пк",
+            "как дела у компьютер",
+            "как дела у машины",
+            "как там пк",
+            "как там компьютер",
+            "как чувствует себя",
+            "как себя чувствует",
+            "как поживает пк",
+            "как поживает компьютер",
+            "самочувствие",
+        ),
+    )
+    if machine_health:
+        return NativeAction(
+            action="hardware.summary",
+            payload={},
+            answer="собрал сводку о состоянии машины",
+        )
+
+    # Read the current clipboard contents ("что в буфере обмена / прочитай буфер").
+    if _contains_any(
+        normalized,
+        (
+            "буфер обмена",
+            "буфере обмена",
+            "что в буфере",
+            "прочитай буфер",
+            "прочти буфер",
+            "содержимое буфера",
+            "clipboard",
+        ),
+    ) and not _contains_any(
+        # "скопируй ... в буфер" is a write and must go through the tool path.
+        normalized,
+        ("скопируй", "скопировать", "положи в буфер", "запиши в буфер", "copy to clipboard"),
+    ):
+        return NativeAction(
+            action="clipboard.read",
+            payload={},
+            answer="прочитал буфер обмена",
         )
 
     if _contains_any(normalized, ("wmi", "cim", "через wmi", "через cim")):

@@ -397,3 +397,14 @@ def _load_bridge_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_clipboard_actions_classified_read_vs_write():
+    from jarvis_gpt.host_bridge import BRIDGE_ACTIONS, BRIDGE_READ_ONLY_ACTIONS
+
+    assert "clipboard.read" in BRIDGE_ACTIONS
+    assert "clipboard.write" in BRIDGE_ACTIONS
+    # clipboard.read is read-only (auto-retried); clipboard.write is a mutation and
+    # must never be retried, so it is excluded from the read-only set.
+    assert "clipboard.read" in BRIDGE_READ_ONLY_ACTIONS
+    assert "clipboard.write" not in BRIDGE_READ_ONLY_ACTIONS
