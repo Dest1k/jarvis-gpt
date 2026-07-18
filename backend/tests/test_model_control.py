@@ -93,6 +93,18 @@ def test_format_model_status_combines_sources():
     assert "VRAM 31000/32607" in report
 
 
+def test_format_model_status_handles_dict_active_model():
+    # dispatcher.status returns active_model as a rich dict, not a bare string.
+    settings = load_settings("qwen36-vl")
+    disp = {
+        "active_model": {"id": "qwen3.6-35b-a3b-nvfp4", "path": "/models/qwen", "active": True},
+        "port_open": True,
+    }
+    report = _format_model_status(settings, disp, {}, None)
+    assert "Модель: qwen3.6-35b-a3b-nvfp4" in report
+    assert "{" not in report  # never dump a raw dict
+
+
 # --------------------------------------------------------------------------- #
 # Direct-action handlers.
 # --------------------------------------------------------------------------- #

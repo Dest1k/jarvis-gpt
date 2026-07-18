@@ -10990,16 +10990,22 @@ def _format_model_status(
 ) -> str:
     """One Russian report: loaded model + profile + dispatcher state + live VRAM."""
 
+    def _name(value: Any) -> str | None:
+        # dispatcher.status returns active_model/model as a rich dict, not a bare string.
+        if isinstance(value, dict):
+            return value.get("id") or value.get("model_id") or value.get("name")
+        return value if isinstance(value, str) and value.strip() else None
+
     lines = ["Состояние модели:"]
     served = health.get("served_models") if isinstance(health, dict) else None
     served_name = served[0] if isinstance(served, list) and served else None
     runtime = disp.get("runtime") if isinstance(disp.get("runtime"), dict) else {}
     model = (
-        disp.get("active_model")
+        _name(disp.get("active_model"))
         or runtime.get("model_id")
         or served_name
-        or disp.get("model")
-        or disp.get("desired_model")
+        or _name(disp.get("model"))
+        or _name(disp.get("desired_model"))
         or "неизвестно"
     )
     lines.append(f"- Модель: {model}")
