@@ -29,6 +29,7 @@ from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import quote
 
 import httpx
 
@@ -36,6 +37,55 @@ from .config import load_local_env_file
 from .telegram_format import html_to_plain, render_telegram_html, split_telegram_html
 
 log = logging.getLogger("jarvis.telegram")
+
+_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
+_REDACTED = "[REDACTED]"
+
+
+class _TelegramTokenRedactingFormatter(logging.Formatter):
+    """Redact the bot token after the complete record, including traceback, is rendered."""
+
+    def __init__(self, bot_token: str) -> None:
+        super().__init__(_LOG_FORMAT)
+        encoded = quote(bot_token, safe="")
+        self._secrets = tuple(
+            sorted(
+                {bot_token, encoded, encoded.replace("%3A", "%3a")}.difference({""}),
+                key=len,
+                reverse=True,
+            )
+        )
+
+    def _redact(self, text: str) -> str:
+        for secret in self._secrets:
+            text = text.replace(secret, _REDACTED)
+        return text
+
+    def format(self, record: logging.LogRecord) -> str:
+        rendered = super().format(record)
+        # Formatter caches rendered exception text on the record. Sanitise that cache too,
+        # so a later handler cannot reuse the unredacted traceback.
+        if record.exc_text:
+            record.exc_text = self._redact(record.exc_text)
+        return self._redact(rendered)
+
+
+def _configure_logging(bot_token: str) -> None:
+    """Configure bridge logging without ever exposing Telegram credential-bearing URLs."""
+
+    root = logging.getLogger()
+    if not root.handlers:
+        root.addHandler(logging.StreamHandler())
+    formatter = _TelegramTokenRedactingFormatter(bot_token)
+    for handler in root.handlers:
+        handler.setFormatter(formatter)
+    root.setLevel(logging.INFO)
+
+    # httpx INFO records include the complete request URL. Telegram embeds the credential
+    # in that URL, so those access-style records must never be emitted in the first place.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 
 TG_MSG_LIMIT = 4096
 # Telegram bots can send documents up to 50 MB; guard a little under that.
@@ -480,9 +530,10 @@ class TelegramBridge:
 
 
 async def _amain() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     load_local_env_file()
-    bridge = TelegramBridge(load_config())
+    cfg = load_config()
+    _configure_logging(cfg.bot_token)
+    bridge = TelegramBridge(cfg)
     try:
         await bridge.run()
     finally:

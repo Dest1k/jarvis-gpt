@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
+import logging
 
 import httpx
 import pytest
@@ -11,6 +13,7 @@ from jarvis_gpt.telegram_bridge import (
     TelegramBridge,
     TelegramConfig,
     _chunks,
+    _configure_logging,
     _looks_like_audio,
     load_config,
 )
@@ -51,6 +54,33 @@ def test_load_config_fails_closed_without_allowlist():
 def test_load_config_parses_allowlist():
     cfg = load_config({"TELEGRAM_BOT_TOKEN": "T", "TELEGRAM_ALLOWED_CHAT_IDS": "42, 7 99"})
     assert cfg.allowed_chat_ids == frozenset({42, 7, 99})
+
+
+def test_logging_never_exposes_bot_token(monkeypatch):
+    token = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZ_secret"
+    telegram_url = f"https://api.telegram.org/bot{token}/getMe"
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    root = logging.getLogger()
+    httpx_log = logging.getLogger("httpx")
+
+    monkeypatch.setattr(root, "handlers", [handler])
+    monkeypatch.setattr(root, "level", logging.WARNING)
+    monkeypatch.setattr(httpx_log, "level", logging.NOTSET)
+    _configure_logging(token)
+
+    # httpx normally logs the full credential-bearing request URL at INFO.
+    httpx_log.info('HTTP Request: GET %s "HTTP/1.1 200 OK"', telegram_url)
+    try:
+        response = httpx.Response(401, request=httpx.Request("GET", telegram_url))
+        response.raise_for_status()
+    except httpx.HTTPStatusError:
+        root.exception("Telegram request failed")
+
+    output = stream.getvalue()
+    assert "HTTP/1.1 200 OK" not in output
+    assert token not in output
+    assert "bot[REDACTED]/getMe" in output
 
 
 def test_chunks_splits_long_text():
