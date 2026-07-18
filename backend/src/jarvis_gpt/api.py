@@ -9,6 +9,7 @@ import os
 import re
 import secrets
 import socket
+import tempfile
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
 from functools import lru_cache
@@ -27,8 +28,9 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 
+from . import speech
 from .agent import AgentRuntime
 from .approval_executor import ApprovalExecutor
 from .autonomy_executor import AutonomyExecutor
@@ -110,6 +112,7 @@ from .models import (
     ToolInfo,
     ToolRunRequest,
     ToolRunResponse,
+    VoiceSpeakRequest,
 )
 from .operations import OperationsManager
 from .operator_queue import (
@@ -1235,6 +1238,52 @@ async def chat(request: ChatRequest) -> ChatResponse:
         attachments=[item.model_dump() for item in request.attachments],
         thinking_enabled=request.thinking_enabled,
     )
+
+
+@app.get("/api/voice/status")
+async def voice_status() -> dict[str, Any]:
+    return speech.voice_status()
+
+
+@app.post("/api/voice/speak")
+async def voice_speak(request: VoiceSpeakRequest) -> Response:
+    """Synthesize text to the stylized 'Jarvis' voice and return WAV bytes.
+
+    Deterministic (not model-driven) so both the web composer's speak button and the
+    Telegram bridge can rely on it. Renders off the event loop; 503 when TTS is unavailable.
+    """
+
+    text = request.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+
+    def _render() -> tuple[Any, bytes]:
+        fd, tmp_name = tempfile.mkstemp(suffix=".wav", prefix="jarvis-tts-")
+        os.close(fd)
+        tmp_path = Path(tmp_name)
+        try:
+            result = speech.synthesize(
+                text,
+                tmp_path,
+                voice=request.voice,
+                style=request.style,
+                engine=request.engine,
+            )
+            data = tmp_path.read_bytes() if result.ok and tmp_path.exists() else b""
+        finally:
+            with suppress(OSError):
+                tmp_path.unlink()
+        return result, data
+
+    result, data = await asyncio.to_thread(_render)
+    if not result.ok or not data:
+        raise HTTPException(status_code=503, detail=result.error or "text-to-speech unavailable")
+    headers = {
+        "X-Voice-Engine": str(result.engine or ""),
+        "X-Voice-Style": str(result.extra.get("style") or ""),
+        "Cache-Control": "no-store",
+    }
+    return Response(content=data, media_type="audio/wav", headers=headers)
 
 
 INTERRUPTED_STREAM_KEY_PREFIX = "agent.stream.interrupted."

@@ -18,6 +18,7 @@ from threading import Event
 
 import pytest
 from fastapi import FastAPI
+from jarvis_gpt import speech
 from jarvis_gpt.api import (
     _health_snapshot_readiness,
     _is_local_machine_host,
@@ -885,6 +886,48 @@ def test_operator_queue_and_memory_and_tools(client):
     assert gated.json()["data"]["approval_action"] == "tool.run"
     assert gated.json()["data"]["approval_payload"]["tool"] == "execution.apply"
     assert not structured_target.exists()
+
+
+def test_voice_status_endpoint(client):
+    response = client.get("/api/voice/status")
+    assert response.status_code == 200
+    body = response.json()
+    assert "stt" in body
+    assert "tts" in body
+
+
+def test_voice_speak_returns_wav_bytes(client, monkeypatch):
+    def fake_synth(text, out_path, **kwargs):
+        Path(out_path).write_bytes(b"RIFF" + b"\x00" * 60)
+        return speech.SpeechResult(
+            ok=True,
+            path=Path(out_path),
+            engine="silero",
+            voice="silero:eugene",
+            extra={"style": "jarvis", "bytes": 64},
+        )
+
+    monkeypatch.setattr("jarvis_gpt.speech.synthesize", fake_synth)
+    response = client.post("/api/voice/speak", json={"text": "Добрый вечер, сэр."})
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "audio/wav"
+    assert response.content.startswith(b"RIFF")
+    assert response.headers.get("x-voice-engine") == "silero"
+    assert response.headers.get("x-voice-style") == "jarvis"
+
+
+def test_voice_speak_returns_503_when_unavailable(client, monkeypatch):
+    monkeypatch.setattr(
+        "jarvis_gpt.speech.synthesize",
+        lambda text, out_path, **kwargs: speech.SpeechResult(ok=False, error="no engine"),
+    )
+    response = client.post("/api/voice/speak", json={"text": "привет"})
+    assert response.status_code == 503
+
+
+def test_voice_speak_rejects_empty_text(client):
+    response = client.post("/api/voice/speak", json={"text": ""})
+    assert response.status_code == 422
 
 
 def test_approvals_and_persona(client):

@@ -30,6 +30,13 @@ class ChatRequest(BaseModel):
     thinking_enabled: bool = True
 
 
+class VoiceSpeakRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=20000)
+    voice: str | None = Field(default=None, max_length=100)
+    style: str | None = Field(default=None, max_length=40)
+    engine: str | None = Field(default=None, max_length=40)
+
+
 class ChatEvent(BaseModel):
     type: str
     title: str
