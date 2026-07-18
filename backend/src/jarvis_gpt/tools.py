@@ -37,6 +37,7 @@ import httpx
 from httpcore._backends.auto import AutoBackend
 from httpcore._backends.base import SOCKET_OPTION, AsyncNetworkBackend, AsyncNetworkStream
 
+from . import speech
 from .browser_cdp import (
     DEFAULT_CHROME_DEBUG_URL,
     BrowserCdpError,
@@ -10020,7 +10021,7 @@ def _web_transcript_local_media(
         return ToolRunResponse(
             tool="web.transcript",
             ok=False,
-            summary="Local media transcription is unavailable; install the whisper CLI.",
+            summary="Local transcription unavailable; install faster-whisper or the whisper CLI.",
             data={"path": str(path), "local_transcription": status, "download": download or None},
         )
     try:
@@ -10072,53 +10073,19 @@ def _web_transcript_local_media(
 
 
 def _media_transcription_status() -> dict[str, Any]:
-    whisper = shutil.which("whisper")
-    return {
-        "available": bool(whisper),
-        "engine": "whisper" if whisper else None,
-        "command": whisper,
-        "supported_extensions": sorted(MEDIA_TRANSCRIPT_EXTENSIONS),
-    }
+    # Delegate to the speech module (faster-whisper first, whisper CLI fallback);
+    # keep the tool's own media-extension gate as the advertised set.
+    status = dict(speech.stt_status())
+    status["command"] = shutil.which("whisper")
+    status["supported_extensions"] = sorted(MEDIA_TRANSCRIPT_EXTENSIONS)
+    return status
 
 
 def _run_whisper_transcription(path: Path, *, lang: str, max_chars: int) -> str:
-    whisper = shutil.which("whisper")
-    if not whisper:
-        raise ValueError("whisper CLI not found")
-    with tempfile.TemporaryDirectory(prefix="jarvis-whisper-") as tmp_dir:
-        command = [
-            whisper,
-            str(path),
-            "--output_format",
-            "txt",
-            "--output_dir",
-            tmp_dir,
-            "--fp16",
-            "False",
-        ]
-        if lang and lang != "auto":
-            command.extend(["--language", lang])
-        result = subprocess.run(
-            command,
-            check=False,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=600,
-        )
-        if result.returncode != 0:
-            raise subprocess.SubprocessError(_short_text(result.stderr or result.stdout, 500))
-        output_path = Path(tmp_dir) / f"{path.stem}.txt"
-        if not output_path.exists():
-            candidates = sorted(Path(tmp_dir).glob("*.txt"))
-            output_path = candidates[0] if candidates else output_path
-        text = (
-            output_path.read_text(encoding="utf-8", errors="replace")
-            if output_path.exists()
-            else ""
-        )
-    return _short_text(text, max_chars)
+    result = speech.transcribe(path, language=lang, max_chars=max_chars)
+    if not result.ok:
+        raise ValueError(result.error or "local transcription failed")
+    return result.text
 
 
 def _url_looks_like_media(raw_url: str) -> bool:
