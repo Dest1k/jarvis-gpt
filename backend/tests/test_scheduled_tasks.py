@@ -114,6 +114,22 @@ def test_reminders_create_marks_agent_task(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_reminders_create_recovers_recurrence_from_text(monkeypatch, tmp_path):
+    tools, storage = _registry(monkeypatch, tmp_path)
+    # The model split the request: recurrence sits in `text`, `when` is a bare time.
+    result = asyncio.run(
+        tools.run(
+            "reminders.create",
+            {"text": "каждое утро в 9 присылай сводку по ИИ", "when": "в 9"},
+        )
+    )
+    assert result.ok is True
+    recurrence = result.data["reminder"]["recurrence"]
+    assert recurrence and recurrence["kind"] == "daily"  # recovered, not one-shot
+    assert result.data["agent_task"] is True
+    storage.close()
+
+
 def test_reminders_create_plain_nudge_has_no_task_payload(monkeypatch, tmp_path):
     tools, storage = _registry(monkeypatch, tmp_path)
     result = asyncio.run(

@@ -5565,6 +5565,16 @@ def _reminders_create(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
                 "'каждый день в 9', 'в понедельник в 14:00'."
             ),
         )
+    # The model often splits "каждое утро в 9 …" into text + a bare when ("в 9"), losing the
+    # recurrence. Recover it from the fuller phrase so a daily task doesn't become one-shot.
+    if parsed.recurrence is None:
+        for fuller in (text, str(args.get("phrase") or "")):
+            if not fuller or fuller == when:
+                continue
+            alt = parse_when(fuller, tz=tz)
+            if alt.matched and alt.recurrence is not None and alt.due_local is not None:
+                parsed = alt
+                break
     title = text or when
     # An explicit prompt arg wins; otherwise classify the text as task-or-nudge.
     explicit_prompt = str(args.get("prompt") or "").strip()
