@@ -206,6 +206,33 @@ def test_agentic_stream_reports_completed_tool_when_synthesis_stream_dies(
     storage.close()
 
 
+def test_fuzzy_resolve_tool_name(monkeypatch, tmp_path):
+    class _IdleLLM:
+        async def complete(self, *a, **k):
+            return _result("ok")
+
+    agent, storage = _agent(monkeypatch, tmp_path, _IdleLLM())
+    resolve = agent._fuzzy_resolve_tool_name
+    allowed = {
+        "filesystem.find",
+        "filesystem.write_text",
+        "web.search",
+        "documents.generate",
+    }
+    # Exact separator/case fold → the identically-named tool (accepted at any danger
+    # level; the normal authorization/approval gates still apply downstream).
+    assert resolve("filesystem_find", allowed) == "filesystem.find"
+    assert resolve("filesystem_write_text", allowed) == "filesystem.write_text"
+    # High-confidence fuzzy match onto a SAFE (read-only) tool.
+    assert resolve("filesystm.find", allowed) == "filesystem.find"
+    # A fuzzy GUESS must never resolve onto a mutating (non-safe) tool.
+    assert resolve("filesystem.write_txt", allowed) is None
+    # Genuinely unknown / too short → keep today's fail-closed reject.
+    assert resolve("teleport", allowed) is None
+    assert resolve("ab", allowed) is None
+    storage.close()
+
+
 def test_streaming_gate_resynthesizes_raw_tool_dump(monkeypatch, tmp_path):
     # The live streaming loop must not emit a pasted raw tool result verbatim: it buffers
     # the final answer turn and forces one clean synthesis (parity with the non-stream gate).

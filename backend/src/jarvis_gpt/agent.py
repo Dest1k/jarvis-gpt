@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import difflib
 import hashlib
 import importlib.util
 import inspect
@@ -8579,6 +8580,42 @@ class AgentRuntime:
             steps = DEFAULT_MAX_TOOL_STEPS
         return max(1, min(24, steps))
 
+    def _fuzzy_resolve_tool_name(self, name: str, allowed: set[str]) -> str | None:
+        """Conservatively repair a model-invented tool NAME (the top-level analog of the
+        action-name normalizer, Fix D-2).
+
+        Resolves an UNREGISTERED name onto an already-allowed tool. An exact
+        separator/case fold ("filesystem_find" → "filesystem.find") is accepted for any
+        danger level because it is the identically-named tool and the normal
+        authorization/approval gates still apply downstream. An approximate (fuzzy) match
+        is accepted only when it is the UNIQUE high-confidence winner AND the resolved
+        tool is read-only ("safe"), so a fuzzy guess can never trigger a mutation. Returns
+        the canonical name, or ``None`` to keep today's fail-closed reject.
+        """
+
+        def _collapse(value: str) -> str:
+            return "".join(ch for ch in str(value).lower() if ch.isalnum())
+
+        target = _collapse(name)
+        if len(target) < 3:
+            return None
+        by_collapsed: dict[str, str] = {}
+        for candidate in sorted(allowed):
+            if self.tools.get(candidate) is None:
+                continue
+            by_collapsed.setdefault(_collapse(candidate), candidate)
+        exact = by_collapsed.get(target)
+        if exact is not None:
+            return exact
+        matches = difflib.get_close_matches(target, list(by_collapsed), n=2, cutoff=0.87)
+        if len(matches) != 1:
+            return None
+        resolved = by_collapsed[matches[0]]
+        spec = self.tools.get(resolved)
+        if spec is None or spec.danger_level != "safe":
+            return None
+        return resolved
+
     async def _run_agentic_tool(
         self,
         name: str,
@@ -8588,6 +8625,12 @@ class AgentRuntime:
         resume: dict[str, Any] | None = None,
     ) -> tuple[str, ChatEvent, _ExecutedToolResult | None]:
         name, args = _canonicalize_tool_invocation(name, args)
+        if self.tools.get(name) is None:
+            # The model invented a tool name; try to resolve it before rejecting so the
+            # whole turn then runs (and re-authorizes) under the canonical name.
+            resolved_name = self._fuzzy_resolve_tool_name(name, allowed)
+            if resolved_name is not None and resolved_name != name:
+                name = resolved_name
         try:
             _stable_json_sha256(args)
         except (TypeError, ValueError) as exc:
