@@ -5866,8 +5866,20 @@ def test_filesystem_find_greps_content(monkeypatch, tmp_path):
 def test_filesystem_find_is_confined_and_skips_secrets(monkeypatch, tmp_path):
     settings, storage, tools = _fs_registry(monkeypatch, tmp_path)
     _seed_file(tools, settings.home / "notes.txt", "shared TOPSECRET value")
-    secret = settings.home / "bridge.token"
-    secret.write_text("bearer TOPSECRET value", encoding="utf-8")
+    # Credential-bearing filenames must be skipped by NAME wherever they live — the
+    # path denylist only knows a few fixed absolute paths, so a repo's real secrets
+    # (.env.local, an HF token, *.key/*.pem) would otherwise be grepped and echoed.
+    secret_files = {
+        settings.home / "bridge.token": "bearer TOPSECRET value",
+        settings.home / ".env.local": "JARVIS_YANDEX_SEARCH_API_KEY=TOPSECRET",
+        settings.home / ".env.production": "API=TOPSECRET",
+        settings.home / "hf_token.txt": "hf_TOPSECRET",
+        settings.home / "nested" / "server.key": "-----BEGIN KEY----- TOPSECRET",
+        settings.home / "cert.pem": "TOPSECRET pem body",
+    }
+    for path, body in secret_files.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body, encoding="utf-8")
 
     result = asyncio.run(
         tools.run("filesystem.find", {"path": str(settings.home), "query": "TOPSECRET"})
@@ -5875,7 +5887,8 @@ def test_filesystem_find_is_confined_and_skips_secrets(monkeypatch, tmp_path):
     assert result.ok is True, result.summary
     paths = {m["path"] for m in result.data["matches"]}
     assert str(settings.home / "notes.txt") in paths
-    assert str(secret) not in paths
+    for secret in secret_files:
+        assert str(secret) not in paths, secret
 
     outside = asyncio.run(
         tools.run("filesystem.find", {"path": "C:/Windows", "query": "x"})
@@ -5883,6 +5896,48 @@ def test_filesystem_find_is_confined_and_skips_secrets(monkeypatch, tmp_path):
     assert outside.ok is False
     assert "outside allowed roots" in outside.summary
     storage.close()
+
+
+def test_filesystem_find_marks_truncated_when_walk_cap_is_hit(monkeypatch, tmp_path):
+    from jarvis_gpt import tools as tools_module
+
+    settings, storage, tools = _fs_registry(monkeypatch, tmp_path)
+    corpus = settings.home / "big"
+    corpus.mkdir(parents=True, exist_ok=True)
+    # More files than a tiny cap, with the ONLY match placed last so the capped walk
+    # never reaches it — the result must honestly report truncated=True, not a silent
+    # false negative of "no matches, whole tree searched".
+    for i in range(8):
+        (corpus / f"f{i:02d}.txt").write_text("nothing here", encoding="utf-8")
+    (corpus / "zz_last.txt").write_text("the NEEDLE is here", encoding="utf-8")
+
+    monkeypatch.setattr(tools_module, "_iter_files", _capped_iter_files(3))
+    result = asyncio.run(
+        tools.run("filesystem.find", {"path": str(corpus), "query": "NEEDLE"})
+    )
+    assert result.ok is True, result.summary
+    assert result.data["matches"] == []
+    assert result.data["truncated"] is True
+    storage.close()
+
+
+def _capped_iter_files(cap):
+    """A tiny _iter_files stand-in with a small cap to exercise the walk-cap path."""
+    import os
+    from pathlib import Path
+
+    def _iter(base, _cap, stats):
+        seen = 0
+        for root, dirs, files in os.walk(base, followlinks=False):
+            dirs[:] = [d for d in dirs if not Path(root, d).is_symlink()]
+            for name in sorted(files):
+                if seen >= cap:
+                    stats["capped"] = True
+                    return
+                seen += 1
+                yield Path(root) / name
+
+    return _iter
 
 
 def test_validate_native_payload_clipboard_write():

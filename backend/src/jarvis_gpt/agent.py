@@ -18259,21 +18259,19 @@ def _native_action_from_message(
         )
 
     # Consolidated machine-health report ("как дела у ПК / здоровье машины / проверь
-    # систему / как чувствует себя") — one combined RAM + CPU + disk + GPU snapshot
-    # instead of separate queries. Placed after gpu_status so a GPU-specific telemetry
-    # question still routes to the dedicated nvidia-smi action.
+    # компьютер") — one combined RAM + CPU + disk + GPU snapshot instead of separate
+    # queries. Placed after gpu_status so a GPU-specific telemetry question still routes
+    # to the dedicated nvidia-smi action.
+    # Strong markers already name the PC explicitly, so they match on their own.
     machine_health = _contains_any(
         normalized,
         (
             "здоровье машины",
             "здоровье пк",
             "здоровье компьютер",
-            "здоровье систем",
-            "состояние систем",
             "состояние машины",
             "состояние пк",
             "состояние компьютер",
-            "проверь систему",
             "проверь пк",
             "проверь машину",
             "проверь компьютер",
@@ -18282,13 +18280,46 @@ def _native_action_from_message(
             "как дела у машины",
             "как там пк",
             "как там компьютер",
-            "как чувствует себя",
-            "как себя чувствует",
             "как поживает пк",
             "как поживает компьютер",
-            "самочувствие",
         ),
     )
+    if not machine_health:
+        # Ambiguous phrasings ("проверь систему", "состояние системы", "самочувствие",
+        # "как себя чувствует") mean the PC ONLY when a hardware/PC word is also present.
+        # Otherwise they belong to unrelated domains (система налогообложения, система
+        # здравоохранения, самочувствие пациента) and must NOT hijack the real answer.
+        ambiguous = _contains_any(
+            normalized,
+            (
+                "здоровье систем",
+                "состояние систем",
+                "проверь систему",
+                "как чувствует себя",
+                "как себя чувствует",
+                "самочувствие",
+            ),
+        )
+        machine_health = ambiguous and _contains_any(
+            normalized,
+            (
+                "пк",
+                "компьютер",
+                "машин",
+                "ноутбук",
+                "железо",
+                "оперативк",
+                "озу",
+                "процессор",
+                "видеокарт",
+                "gpu",
+                "cpu",
+                "диск",
+                "ssd",
+                "памят",
+                "нагрузк",
+            ),
+        )
     if machine_health:
         return NativeAction(
             action="hardware.summary",
@@ -18297,6 +18328,10 @@ def _native_action_from_message(
         )
 
     # Read the current clipboard contents ("что в буфере обмена / прочитай буфер").
+    # The Russian "буфер" markers are specific; the bare English word "clipboard" is
+    # NOT (it also appears in "как работает clipboard api"), so English only counts as a
+    # read request via an explicit "read/paste/…-clipboard" phrasing, never bare
+    # "clipboard".
     if _contains_any(
         normalized,
         (
@@ -18306,7 +18341,17 @@ def _native_action_from_message(
             "прочитай буфер",
             "прочти буфер",
             "содержимое буфера",
-            "clipboard",
+            "read clipboard",
+            "read the clipboard",
+            "read my clipboard",
+            "clipboard content",
+            "paste from clipboard",
+            "from clipboard",
+            "what's in the clipboard",
+            "what is in the clipboard",
+            "whats in the clipboard",
+            "show clipboard",
+            "get clipboard",
         ),
     ) and not _contains_any(
         # "скопируй ... в буфер" is a write and must go through the tool path.

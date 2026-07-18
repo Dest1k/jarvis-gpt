@@ -11539,14 +11539,60 @@ async def _filesystem_delete(ctx: ToolContext, args: dict[str, Any]) -> ToolRunR
     )
 
 
-def _iter_files(base: Path, cap: int):
-    """Yield regular files under base, never following symlinks, capped at `cap`."""
+# Filenames that hold credentials and must never be grepped and echoed back to the
+# model, regardless of where in the tree they live (execution_denied_paths only knows
+# a few fixed absolute paths, so a repo's real secrets — backend/.env.local, an HF
+# token — slip past it). filesystem.find reads and returns file CONTENT with no
+# approval gate, so it applies this name-based skip in addition to the path denylist.
+_SECRET_FILENAME_EXACT = frozenset(
+    {
+        "hf_token.txt",
+        "bridge.token",
+        "id_rsa",
+        "id_dsa",
+        "id_ecdsa",
+        "id_ed25519",
+        ".netrc",
+        "credentials",
+        "credentials.json",
+    }
+)
+_SECRET_FILENAME_SUFFIXES = (
+    ".token",
+    ".key",
+    ".pem",
+    ".secret",
+    ".p12",
+    ".pfx",
+    ".keystore",
+    ".jks",
+)
+
+
+def _is_secret_filename(name: str) -> bool:
+    lower = name.casefold()
+    if lower in _SECRET_FILENAME_EXACT:
+        return True
+    # .env, .env.local, .env.production, .env.<anything> all carry secrets.
+    if lower == ".env" or lower.startswith(".env."):
+        return True
+    return lower.endswith(_SECRET_FILENAME_SUFFIXES)
+
+
+def _iter_files(base: Path, cap: int, stats: dict[str, bool]):
+    """Yield regular files under base, never following symlinks, capped at `cap`.
+
+    Sets ``stats["capped"] = True`` when the walk stops because it hit ``cap`` before
+    the tree was exhausted, so the caller can honestly report a truncated result
+    instead of a silent false-negative.
+    """
     seen = 0
     for root, dirs, files in os.walk(base, followlinks=False):
         # Prune symlinked subdirectories so the walk cannot escape the allowed roots.
         dirs[:] = [d for d in dirs if not Path(root, d).is_symlink()]
         for name in files:
             if seen >= cap:
+                stats["capped"] = True
                 return
             candidate = Path(root) / name
             seen += 1
@@ -11588,12 +11634,13 @@ def _filesystem_find(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     hits: list[dict[str, Any]] = []
     scanned = 0
     truncated = False
-    candidates = [base] if base.is_file() else _iter_files(base, max_files)
+    walk_stats: dict[str, bool] = {"capped": False}
+    candidates = [base] if base.is_file() else _iter_files(base, max_files, walk_stats)
     for file in candidates:
         if len(hits) >= max_results:
             truncated = True
             break
-        if file.is_symlink() or _blocked(file):
+        if file.is_symlink() or _blocked(file) or _is_secret_filename(file.name):
             continue
         if glob and not fnmatch.fnmatch(file.name, glob):
             continue
@@ -11619,6 +11666,11 @@ def _filesystem_find(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
                 if len(hits) >= max_results:
                     truncated = True
                     break
+    # If the directory walk itself hit the 5000-file cap before exhausting the tree,
+    # the result is partial even when the hit-cap was never reached — surface that so a
+    # caller never reads an empty/short result as "the whole tree was searched".
+    if walk_stats["capped"]:
+        truncated = True
     return ToolRunResponse(
         tool=tool,
         ok=True,

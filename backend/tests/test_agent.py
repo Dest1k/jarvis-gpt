@@ -5961,3 +5961,57 @@ def test_network_unavailable_result_is_single_actionable_message():
     assert _valid_web_synthesis_answer(
         "Краткий вывод по теме с опорой на источники.\n\nИсточники:\n1. Example: https://a.example"
     ) is True
+
+
+def _native_action_name(message: str) -> str | None:
+    action = _native_action_from_message(message)
+    return action.action if action is not None else None
+
+
+def test_machine_health_route_requires_pc_anchor_for_ambiguous_phrases():
+    # Strong, explicitly-PC-anchored phrasings route to the combined summary.
+    for phrase in (
+        "какое здоровье машины",
+        "проверь пк",
+        "как дела у пк",
+        "состояние компьютера",
+    ):
+        assert _native_action_name(phrase) == "hardware.summary", phrase
+
+    # Ambiguous phrasings WITHOUT a hardware/PC word must NOT hijack the answer — they
+    # belong to unrelated domains.
+    for phrase in (
+        "проверь систему налогообложения для ИП",
+        "какое состояние системы здравоохранения",
+        "как себя чувствует пациент после операции",
+        "как улучшить самочувствие после болезни",
+    ):
+        assert _native_action_name(phrase) != "hardware.summary", phrase
+
+    # The same ambiguous phrasings WITH a hardware anchor do mean the PC.
+    assert _native_action_name("проверь систему, как там процессор и диск") == "hardware.summary"
+    assert _native_action_name("какое самочувствие у компьютера") == "hardware.summary"
+
+
+def test_clipboard_read_route_ignores_conceptual_clipboard_questions():
+    # Real "read my clipboard" requests route to clipboard.read.
+    for phrase in (
+        "что в буфере обмена",
+        "прочитай буфер обмена",
+        "покажи содержимое буфера",
+        "read the clipboard please",
+        "what's in the clipboard",
+    ):
+        assert _native_action_name(phrase) == "clipboard.read", phrase
+
+    # A conceptual question that merely mentions the word "clipboard" must NOT dump the
+    # operator's real clipboard.
+    for phrase in (
+        "как работает clipboard api в браузере",
+        "что такое clipboard",
+        "how does the clipboard work in windows",
+    ):
+        assert _native_action_name(phrase) != "clipboard.read", phrase
+
+    # A write ("скопируй ... в буфер") is not a read and goes through the tool path.
+    assert _native_action_name("скопируй это в буфер обмена") != "clipboard.read"
