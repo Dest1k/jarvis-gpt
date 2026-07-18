@@ -7886,6 +7886,12 @@ class AgentRuntime:
     def _prepare_context(self, message: str, conversation_id: str | None) -> AgentContext:
         if conversation_id is None:
             conversation_id = self.storage.create_conversation(self._title_from_goal(message))
+        else:
+            # A caller-supplied id may not exist yet (external client, resumed session).
+            # Materialize the row before add_message so the FK never 500s; no-op if present.
+            conversation_id = self.storage.ensure_conversation(
+                conversation_id, self._title_from_goal(message)
+            )
         recent = self.storage.recent_messages(conversation_id, limit=6)
         memory_hits = self.storage.search_memory(_memory_search_query(message, recent), limit=8)
         file_hits = self.storage.search_file_chunks(message[:160], limit=5)

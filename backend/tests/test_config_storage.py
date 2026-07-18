@@ -181,6 +181,34 @@ def test_storage_lists_conversations_and_messages(tmp_path):
     storage.close()
 
 
+def test_ensure_conversation_creates_row_then_add_message_succeeds(tmp_path):
+    # Regression: a caller-supplied conversation_id that has no row must not make
+    # add_message trip the messages.conversation_id foreign key (was a 500).
+    storage = JarvisStorage(tmp_path / "state" / "jarvis.sqlite3")
+    storage.initialize()
+
+    assert storage.get_conversation("conv_client_chosen") is None
+    returned = storage.ensure_conversation("conv_client_chosen", "First turn")
+    assert returned == "conv_client_chosen"
+    row = storage.get_conversation("conv_client_chosen")
+    assert row is not None and row["title"] == "First turn"
+
+    # The FK insert that previously raised now works.
+    message_id = storage.add_message(
+        conversation_id="conv_client_chosen",
+        role="user",
+        content="hello",
+    )
+    assert storage.get_message(message_id)["conversation_id"] == "conv_client_chosen"
+
+    # Idempotent: a second ensure with a different title neither duplicates nor renames.
+    storage.ensure_conversation("conv_client_chosen", "Different title")
+    conversations = [c for c in storage.list_conversations() if c["id"] == "conv_client_chosen"]
+    assert len(conversations) == 1
+    assert storage.get_conversation("conv_client_chosen")["title"] == "First turn"
+    storage.close()
+
+
 def test_storage_get_message_by_id_preserves_metadata(tmp_path):
     storage = JarvisStorage(tmp_path / "state" / "jarvis.sqlite3")
     storage.initialize()

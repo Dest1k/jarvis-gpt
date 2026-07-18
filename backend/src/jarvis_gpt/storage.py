@@ -725,6 +725,29 @@ class JarvisStorage:
             self.connect().commit()
         return cid
 
+    def ensure_conversation(self, conversation_id: str, title: str = "Новый диалог") -> str:
+        """Guarantee a conversation row exists for a caller-supplied id (idempotent).
+
+        A client may drive the chat with its own ``conversation_id`` instead of
+        letting the backend mint one. Without a row the first ``add_message`` fails
+        the ``messages.conversation_id`` foreign key and the turn 500s. ``INSERT OR
+        IGNORE`` under the storage lock creates the row on first use and is a no-op
+        (title preserved) on every later turn, with no check-then-insert race.
+        """
+
+        now = utc_now()
+        with self._lock:
+            conn = self.connect()
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO conversations(id, title, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (conversation_id, title[:200], now, now),
+            )
+            conn.commit()
+        return conversation_id
+
     def add_message(
         self,
         *,
