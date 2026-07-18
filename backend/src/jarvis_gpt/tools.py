@@ -1428,15 +1428,20 @@ class ToolRegistry:
             ToolSpec(
                 name="reminders.create",
                 description=(
-                    "Create a reminder or calendar entry from natural language "
-                    "('напомни завтра в 10 …', 'через 2 часа', 'каждый день в 9'). Parses "
-                    "relative/absolute Russian times and recurrence; stores it and fires it later."
+                    "Create a reminder, calendar entry, or SCHEDULED AGENT TASK from natural "
+                    "language ('напомни завтра в 10 …', 'каждый день в 9'). Parses Russian "
+                    "relative/absolute times + recurrence. A passive nudge ('напомни …') just "
+                    "pings; a recurring 'do X and report' ('каждое утро присылай сводку по ИИ', "
+                    "'каждый вечер проверяй систему') becomes a scheduled task — Jarvis runs a "
+                    "full turn on schedule and delivers the result to Telegram. Pass 'prompt' to "
+                    "force the task action explicitly."
                 ),
                 category="reminders",
                 input_schema={
-                    "text": "What to remind about",
-                    "when": "When, in natural language (e.g. 'завтра в 10', 'через 2 часа')",
+                    "text": "What to remind about / the scheduled request",
+                    "when": "When, in natural language (e.g. 'завтра в 10', 'каждый день в 9')",
                     "phrase": "Optional whole request phrase if text/when are not split out",
+                    "prompt": "Optional: the action to run on schedule (forces a scheduled task)",
                 },
                 handler=_reminders_create,
             )
@@ -5512,6 +5517,34 @@ def _memory_save(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     )
 
 
+# Active work/report verbs that turn a scheduled reminder into an AGENT TASK: when it
+# fires Jarvis runs a full turn and delivers the result. A plain "напомни …" nudge is
+# excluded (it stays a passive reminder).
+_SCHEDULED_TASK_VERBS = (
+    "присыла", "пришли", "пришл", "делай", "сделай", "проверя", "проверь", "собери",
+    "собира", "собрать", "отчит", "отчёт", "отчет", "сводк", "дайджест", "анализир",
+    "проанализир", "мониторь", "монитор", "следи", "подготов", "составь", "составля",
+    "оцен", "подведи", "статус", "расскаж", "напиши", "покажи новост",
+)
+
+
+def _scheduled_task_prompt(text: str) -> str | None:
+    """If a reminder is really a recurring 'do X and report', return X (else None).
+
+    Conservative: an explicit passive nudge ('напомни …') is never a task; otherwise an
+    active work/report verb marks it, and the prompt starts at that verb so the schedule
+    lead-in ('каждое утро в 9') does not derail the agent turn.
+    """
+
+    low = text.strip().lower()
+    if low.startswith(("напомни", "напоминай", "напомнить", "не забудь")):
+        return None
+    positions = [low.find(verb) for verb in _SCHEDULED_TASK_VERBS if verb in low]
+    if not positions:
+        return None
+    return text[min(positions) :].strip(" ,.:;—-") or text.strip()
+
+
 def _reminders_create(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     tz = reminder_zone(ctx.settings.reminder_tz)
     text = str(args.get("text") or args.get("phrase") or "").strip()
@@ -5533,20 +5566,38 @@ def _reminders_create(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
             ),
         )
     title = text or when
+    # An explicit prompt arg wins; otherwise classify the text as task-or-nudge.
+    explicit_prompt = str(args.get("prompt") or "").strip()
+    task_prompt = explicit_prompt or _scheduled_task_prompt(title)
+    payload = None
+    if task_prompt:
+        payload = {
+            "kind": "agent_task",
+            "prompt": task_prompt,
+            "deliver": str(args.get("deliver") or "telegram"),
+        }
     reminder = ctx.storage.create_reminder(
         text=title,
         due_at=to_utc_iso(parsed.due_local),
         recurrence=parsed.recurrence,
         conversation_id=ctx.conversation_id,
         source_text=when,
+        payload=payload,
     )
     local = render_local(reminder["due_at"], tz=tz)
     suffix = " (повтор)" if parsed.recurrence else ""
+    if payload:
+        summary = (
+            f"Плановая задача — {local}{suffix}: «{task_prompt}». "
+            "Выполню и пришлю результат."
+        )
+    else:
+        summary = f"Напомню: {title} — {local}{suffix}"
     return ToolRunResponse(
         tool="reminders.create",
         ok=True,
-        summary=f"Напомню: {title} — {local}{suffix}",
-        data={"reminder": reminder, "due_local": local},
+        summary=summary,
+        data={"reminder": reminder, "due_local": local, "agent_task": bool(payload)},
     )
 
 

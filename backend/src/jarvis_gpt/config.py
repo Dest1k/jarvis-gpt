@@ -447,6 +447,11 @@ class JarvisSettings:
     autonomy_mission_interval_sec: int
     reminder_interval_sec: int
     reminder_tz: str
+    # ---- Scheduled agent tasks --------------------------------------------------
+    # A recurring "do X and report" reminder (payload.kind == "agent_task") fires a
+    # full agent turn on its wall-clock schedule and delivers the answer to Telegram.
+    # Off flips such reminders back to a passive text nudge.
+    scheduled_tasks_enabled: bool
     # ---- Proactive health alerts -----------------------------------------------
     # The supervisor watches each telemetry snapshot and, on an ok→bad transition,
     # emits a runtime event, pushes it to the UI bus, and (if Telegram is wired)
@@ -630,6 +635,7 @@ def load_settings(profile_name: str | None = None) -> JarvisSettings:
         autonomy_mission_interval_sec=_int_env("JARVIS_AUTONOMY_MISSION_INTERVAL_SEC", 120),
         reminder_interval_sec=_int_env("JARVIS_REMINDER_INTERVAL_SEC", 30),
         reminder_tz=os.environ.get("JARVIS_REMINDER_TZ", "Europe/Moscow"),
+        scheduled_tasks_enabled=_bool_env("JARVIS_SCHEDULED_TASKS_ENABLED", True),
         health_alerts_enabled=_bool_env("JARVIS_HEALTH_ALERTS_ENABLED", True),
         health_alert_gpu_temp_c=_float_env("JARVIS_HEALTH_ALERT_GPU_TEMP_C", 85.0),
         health_alert_gpu_vram_ratio=_float_env("JARVIS_HEALTH_ALERT_GPU_VRAM_RATIO", 0.97),

@@ -129,6 +129,8 @@ class RuntimeSupervisor:
         self.telemetry = TelemetryCollector(settings)
         self.learning = LearningEngine(storage, llm=self.llm)
         self._tasks: list[asyncio.Task[None]] = []
+        # Fire-and-forget scheduled-task runs, held so they are not GC'd mid-flight.
+        self._scheduled_runs: set[asyncio.Task[None]] = set()
         self._started_at: str | None = None
         self._last_telemetry_at: str | None = None
         self._last_health_at: str | None = None
@@ -360,6 +362,8 @@ class RuntimeSupervisor:
             return
         for reminder in due:
             recurring = bool(reminder.get("recurrence"))
+            payload = reminder.get("payload") if isinstance(reminder.get("payload"), dict) else {}
+            is_task = payload.get("kind") == "agent_task" and self.settings.scheduled_tasks_enabled
             with suppress(Exception):
                 self.storage.add_event(
                     kind="reminder.fire",
@@ -369,11 +373,18 @@ class RuntimeSupervisor:
                         "reminder_id": reminder["id"],
                         "due_at": reminder["due_at"],
                         "recurring": recurring,
+                        "agent_task": is_task,
                         "conversation_id": reminder.get("conversation_id"),
                     },
                 )
             conversation_id = reminder.get("conversation_id")
-            if conversation_id:
+            if is_task:
+                # A scheduled agent task runs a full turn and delivers its own answer;
+                # spawn it so a long turn never blocks the reminder tick.
+                run = asyncio.create_task(self._run_scheduled_task(reminder))
+                self._scheduled_runs.add(run)
+                run.add_done_callback(self._scheduled_runs.discard)
+            elif conversation_id:
                 with suppress(Exception):
                     self.storage.add_message(
                         conversation_id=str(conversation_id),
@@ -396,6 +407,53 @@ class RuntimeSupervisor:
                             },
                         }
                     )
+
+    async def _run_scheduled_task(self, reminder: dict[str, Any]) -> None:
+        """Run one scheduled agent task: a full agent turn whose answer is pushed to the owner.
+
+        Runs even with the autonomy background loops off — the owner explicitly scheduled it.
+        Never raises into the reminder loop (it is spawned fire-and-forget).
+        """
+
+        payload = reminder.get("payload") if isinstance(reminder.get("payload"), dict) else {}
+        prompt = str(payload.get("prompt") or reminder.get("text") or "").strip()
+        label = str(reminder.get("text") or "Плановая задача").strip()
+        agent = getattr(self.autonomy_executor, "agent", None)
+        if not prompt or agent is None:
+            return
+        answer = ""
+        error: str | None = None
+        try:
+            response = await agent.chat(prompt, conversation_id=reminder.get("conversation_id"))
+            answer = (getattr(response, "answer", "") or "").strip()
+        except Exception as exc:  # noqa: BLE001 — a task failure must not touch the loop
+            error = str(exc) or exc.__class__.__name__
+        delivered = False
+        if answer:
+            if str(payload.get("deliver") or "telegram") == "telegram":
+                with suppress(Exception):
+                    delivered = await push_telegram_alert(f"🕒 {label}\n\n{answer}"[:3900])
+            conversation_id = reminder.get("conversation_id")
+            if conversation_id:
+                with suppress(Exception):
+                    self.storage.add_message(
+                        conversation_id=str(conversation_id),
+                        role="assistant",
+                        content=answer,
+                        metadata={"kind": "scheduled_task", "reminder_id": reminder["id"]},
+                    )
+        with suppress(Exception):
+            self.storage.add_event(
+                kind="scheduled_task.run",
+                title=f"Плановая задача: {label}",
+                level="warn" if error else "info",
+                payload={
+                    "reminder_id": reminder["id"],
+                    "delivered": delivered,
+                    "chars": len(answer),
+                    "error": error,
+                },
+            )
 
     async def _record_telemetry(self) -> None:
         try:
