@@ -468,6 +468,7 @@ class JarvisSettings:
     self_healing_min_failures: int
     self_healing_max_restarts: int
     self_healing_window_sec: int
+    self_healing_grace_sec: int
     # ---- Self-replanning missions -----------------------------------------------
     # After an autonomously-run mission stops on the step budget, the runtime keeps
     # continuing it (bounded by max_rounds) until it finishes. A mission that stays
@@ -552,6 +553,7 @@ class JarvisSettings:
                 "min_failures": self.self_healing_min_failures,
                 "max_restarts": self.self_healing_max_restarts,
                 "window_sec": self.self_healing_window_sec,
+                "grace_sec": self.self_healing_grace_sec,
             },
             "api": {
                 "host": self.api_host,
@@ -638,6 +640,7 @@ def load_settings(profile_name: str | None = None) -> JarvisSettings:
         self_healing_min_failures=_int_env("JARVIS_SELF_HEALING_MIN_FAILURES", 2),
         self_healing_max_restarts=_int_env("JARVIS_SELF_HEALING_MAX_RESTARTS", 3),
         self_healing_window_sec=_int_env("JARVIS_SELF_HEALING_WINDOW_SEC", 1800),
+        self_healing_grace_sec=_int_env("JARVIS_SELF_HEALING_GRACE_SEC", 300),
         mission_self_replan_enabled=_bool_env("JARVIS_MISSION_SELF_REPLAN_ENABLED", True),
         mission_self_replan_max_rounds=_int_env("JARVIS_MISSION_SELF_REPLAN_MAX_ROUNDS", 2),
         api_host=os.environ.get("JARVIS_API_HOST", "0.0.0.0"),

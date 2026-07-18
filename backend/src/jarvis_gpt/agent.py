@@ -3038,6 +3038,11 @@ class AgentRuntime:
         """
 
         run = await self.run_mission(mission["id"], max_steps=self._max_tool_steps())
+        # Accumulate the steps produced across ALL rounds. Each run_mission call returns
+        # only its own round's steps, so without this the deliverable backstop would
+        # synthesize from the last round alone and the operator report/escalation would
+        # under-count the real work done this turn.
+        all_steps = list(run.steps)
         if self.settings.mission_self_replan_enabled:
             rounds = 0
             while (
@@ -3048,6 +3053,12 @@ class AgentRuntime:
             ):
                 rounds += 1
                 run = await self.run_mission(mission["id"], max_steps=self._max_tool_steps())
+                all_steps.extend(run.steps)
+            if len(all_steps) != len(run.steps):
+                # Fold the cumulative steps into the final result the rest of the turn sees.
+                run = run.model_copy(
+                    update={"steps": all_steps, "executed_steps": len(all_steps)}
+                )
         deliverable = await self._ensure_goal_file_deliverable(mission, run, context)
         if self.settings.mission_self_replan_enabled:
             with suppress(Exception):

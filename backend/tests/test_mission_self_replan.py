@@ -95,7 +95,9 @@ def test_autonomous_run_continues_until_done_on_budget(monkeypatch, tmp_path):
     )
     _patch_push(monkeypatch)
 
-    run, deliverable = asyncio.run(agent._run_mission_autonomously({"id": "m1", "title": "M"}, None))
+    run, deliverable = asyncio.run(
+        agent._run_mission_autonomously({"id": "m1", "title": "M"}, None)
+    )
 
     assert calls["n"] == 3  # initial + 2 continuations, last one completed
     assert run.completed is True
@@ -132,6 +134,46 @@ def test_autonomous_run_respects_max_rounds(monkeypatch, tmp_path):
     asyncio.run(agent._run_mission_autonomously({"id": "m1", "title": "M"}, None))
 
     assert calls["n"] == 3  # initial + max_rounds(2) continuations, then stop
+    storage.close()
+
+
+def _step(summary: str, ok: bool = True, tool: str = "reason") -> MissionStepOutcome:
+    return MissionStepOutcome(task=None, result=ToolRunResponse(tool=tool, ok=ok, summary=summary))
+
+
+def test_autonomous_run_accumulates_steps_across_rounds(monkeypatch, tmp_path):
+    agent, storage = _agent(
+        monkeypatch, tmp_path, env={"JARVIS_MISSION_SELF_REPLAN_MAX_ROUNDS": "3"}
+    )
+    scripted = [
+        _run("budget", False, 2, steps=[_step("s1"), _step("s2")]),
+        _run("budget", False, 2, steps=[_step("s3"), _step("s4")]),
+        _run("completed", True, 1, steps=[_step("s5")]),
+    ]
+    calls = {"n": 0}
+
+    async def fake_run_mission(mission_id, *, max_steps=None):
+        calls["n"] += 1
+        return scripted[min(calls["n"] - 1, len(scripted) - 1)]
+
+    captured: dict = {}
+
+    async def fake_deliverable(mission, run, context):
+        captured["run"] = run
+        return None
+
+    monkeypatch.setattr(agent, "run_mission", fake_run_mission)
+    monkeypatch.setattr(agent, "_ensure_goal_file_deliverable", fake_deliverable)
+    _patch_push(monkeypatch)
+
+    run, _ = asyncio.run(agent._run_mission_autonomously({"id": "m1", "title": "M"}, None))
+
+    # 3 rounds ran 2 + 2 + 1 = 5 steps; the merged run the deliverable backstop / report /
+    # escalation all see must reflect all 5, not just the last round's 1.
+    assert captured["run"].executed_steps == 5
+    assert len(captured["run"].steps) == 5
+    assert run.executed_steps == 5
+    assert run.completed is True
     storage.close()
 
 
@@ -226,8 +268,9 @@ def test_no_escalation_on_completed_or_budget(monkeypatch, tmp_path):
     agent, storage = _agent(monkeypatch, tmp_path)
     pushes = _patch_push(monkeypatch)
 
-    asyncio.run(agent._maybe_escalate_mission({"id": "m1", "title": "M"}, _run("completed", True, 2), None))
-    asyncio.run(agent._maybe_escalate_mission({"id": "m1", "title": "M"}, _run("budget", False, 5), None))
+    mission = {"id": "m1", "title": "M"}
+    asyncio.run(agent._maybe_escalate_mission(mission, _run("completed", True, 2), None))
+    asyncio.run(agent._maybe_escalate_mission(mission, _run("budget", False, 5), None))
 
     assert pushes == []  # done needs no help; budget self-continues, never escalates
     storage.close()
