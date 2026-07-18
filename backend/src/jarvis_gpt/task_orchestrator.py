@@ -175,6 +175,42 @@ def _replanner_messages(
     ]
 
 
+def _critic_messages(
+    goal: str,
+    plan_json: str,
+    tool_specs: Sequence[tuple[str, str]],
+    max_steps: int,
+) -> list[dict[str, str]]:
+    """Ask the planner brain to sanity-check a fresh plan before it runs.
+
+    The weak local planner mis-picks tools (a non-existent action, a WMI class it can't
+    build, prose where a URL is required) and drops or duplicates steps. One critique pass
+    catches those before any tool call is wasted.
+    """
+
+    schema = (
+        '{"steps":[{"id":"s1","goal":"...","kind":"tool|reason",'
+        '"tool":"<tool-name-or-null>","arguments":{},"depends_on":[]}]}'
+    )
+    tools_block = "\n".join(f"- {name}: {desc}" for name, desc in tool_specs) or "- (нет)"
+    rules = (
+        "Проверь план на цель: правильно ли выбраны ИНСТРУМЕНТЫ (только из списка!), нет ли "
+        "лишних, пропущенных или переставленных шагов, реалистичны ли аргументы, добывают ли "
+        "шаги свежие данные там, где нужно. Если план уже хороший — верни строго {\"ok\":true}. "
+        f"Если нужно поправить — верни ИСПРАВЛЕННЫЙ план тем же форматом (1..{max_steps} шагов): "
+        + schema
+        + ". Только валидный JSON, без пояснений."
+    )
+    system = "\n".join(
+        ["Ты — критик плана многошаговой задачи.", rules, "Инструменты:", tools_block]
+    )
+    user = f"Цель: {goal}\n\nПлан:\n{plan_json}\n\nПлан хороший или его нужно исправить?"
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+
 def _results_digest(results: Sequence[StepResult], *, limit: int = 3000) -> str:
     """A compact, bounded summary of the blackboard so far, for the replanner."""
 
@@ -432,6 +468,7 @@ class TaskOrchestrator:
         emit: EmitFn | None = None,
         plan_complete: CompleteFn | None = None,
         fallback_query_tool: str | None = None,
+        critique_plan: bool = True,
     ) -> None:
         self._complete = complete
         # A tool that answers a plain {"query": goal}. When a plan produces no real
@@ -452,6 +489,9 @@ class TaskOrchestrator:
         self._max_steps = max(1, min(12, int(max_steps)))
         # 1 round == the old single-plan behaviour; more rounds unlock deep chains.
         self._max_rounds = max(1, min(8, int(max_rounds)))
+        # One self-critique pass over the fresh plan before executing (catches the weak
+        # planner's wrong tool picks). Fails safe to the original plan.
+        self._critique_plan = bool(critique_plan)
         self._emit = emit
 
     async def _plan(self, goal: str) -> TaskPlan:
@@ -563,6 +603,51 @@ class TaskOrchestrator:
             with suppress(Exception):
                 await self._emit(kind, payload)
 
+    async def _critique(self, goal: str, plan: TaskPlan) -> TaskPlan:
+        """One self-critique pass over a fresh plan; returns a revised plan or the original.
+
+        Never raises and only replaces the plan when the critic returns an explicit revised
+        ``steps`` list — a bare {"ok":true} or garbage keeps the original untouched.
+        """
+
+        if not self._critique_plan or not plan.steps:
+            return plan
+        plan_json = json.dumps(
+            {
+                "steps": [
+                    {
+                        "id": s.id,
+                        "goal": s.goal,
+                        "kind": s.kind,
+                        "tool": s.tool,
+                        "arguments": s.arguments,
+                    }
+                    for s in plan.steps
+                ]
+            },
+            ensure_ascii=False,
+        )
+        try:
+            messages = _critic_messages(goal, plan_json, self._tool_specs, self._max_steps)
+            result = await self._plan_complete(messages)
+            content = getattr(result, "content", "") if getattr(result, "ok", False) else ""
+        except Exception:  # noqa: BLE001 - critique must never crash the task
+            return plan
+        match = _JSON_OBJECT_RE.search(content or "")
+        if not match:
+            return plan
+        try:
+            payload = json.loads(match.group(0))
+        except (ValueError, TypeError):
+            return plan
+        # {"ok":true} (or anything without an explicit steps list) -> keep the good plan.
+        if not isinstance(payload, dict) or "steps" not in payload:
+            return plan
+        revised = _coerce_steps(
+            payload.get("steps"), allowed_tools=self._allowed_tools, max_steps=self._max_steps
+        )
+        return TaskPlan(goal=goal, steps=revised) if revised else plan
+
     async def _replan(
         self, goal: str, results: list[StepResult], executed: int
     ) -> TaskPlan | None:
@@ -607,6 +692,7 @@ class TaskOrchestrator:
                 ok=False, answer="", plan=empty, results=[], stopped_reason="empty"
             )
         plan = await self._plan(goal)
+        plan = await self._critique(goal, plan)
         first_plan = plan
         blackboard: dict[str, StepResult] = {}
         results: list[StepResult] = []

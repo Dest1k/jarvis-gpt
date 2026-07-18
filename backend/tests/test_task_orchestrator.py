@@ -202,6 +202,7 @@ def test_replan_runs_multiple_rounds_until_done():
         tool_specs=[],
         plan_complete=plan_complete,
         max_rounds=4,
+        critique_plan=False,  # isolate the replan loop from the critique pass
     )
     result = asyncio.run(orch.run("многоходовка"))
     # Two rounds ran (one step each); ids continue s1 -> s2; then the replanner stopped.
@@ -247,10 +248,64 @@ def test_replan_stops_at_round_cap():
         tool_specs=[],
         plan_complete=plan_complete,
         max_rounds=3,
+        critique_plan=False,
     )
     result = asyncio.run(orch.run("бесконечная"))
     assert len(result.results) == 3  # exactly max_rounds steps, no runaway
     assert result.stopped_reason == "completed:3round"
+
+
+def test_critique_revises_a_bad_plan():
+    # The critic returns a corrected plan; execution runs the REVISED step, not the original.
+    responses = [
+        '{"steps":[{"id":"s1","goal":"плохой шаг","kind":"reason"}]}',
+        '{"steps":[{"id":"s1","goal":"исправленный шаг","kind":"reason"}]}',
+        '{"done":true}',
+    ]
+    calls = {"n": 0}
+
+    async def plan_complete(messages):
+        idx = min(calls["n"], len(responses) - 1)
+        calls["n"] += 1
+        return _LLM(True, responses[idx])
+
+    async def complete(messages):
+        return _LLM(True, "результат")
+
+    async def run_tool(name, arguments):  # pragma: no cover
+        raise AssertionError("no tool step")
+
+    orch = TaskOrchestrator(
+        complete=complete, run_tool=run_tool, tool_specs=[], plan_complete=plan_complete
+    )
+    result = asyncio.run(orch.run("задача"))
+    assert result.results[0].title == "исправленный шаг"
+
+
+def test_critique_ok_keeps_original_plan():
+    responses = [
+        '{"steps":[{"id":"s1","goal":"хороший шаг","kind":"reason"}]}',
+        '{"ok":true}',
+        '{"done":true}',
+    ]
+    calls = {"n": 0}
+
+    async def plan_complete(messages):
+        idx = min(calls["n"], len(responses) - 1)
+        calls["n"] += 1
+        return _LLM(True, responses[idx])
+
+    async def complete(messages):
+        return _LLM(True, "результат")
+
+    async def run_tool(name, arguments):  # pragma: no cover
+        raise AssertionError("no tool step")
+
+    orch = TaskOrchestrator(
+        complete=complete, run_tool=run_tool, tool_specs=[], plan_complete=plan_complete
+    )
+    result = asyncio.run(orch.run("задача"))
+    assert result.results[0].title == "хороший шаг"
 
 
 def test_research_backstop_runs_when_plan_produced_no_data():
