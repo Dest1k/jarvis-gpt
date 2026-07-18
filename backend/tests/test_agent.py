@@ -6013,5 +6013,26 @@ def test_clipboard_read_route_ignores_conceptual_clipboard_questions():
     ):
         assert _native_action_name(phrase) != "clipboard.read", phrase
 
-    # A write ("скопируй ... в буфер") is not a read and goes through the tool path.
+    # A write ("скопируй ... в буфер") is a write, not a read.
     assert _native_action_name("скопируй это в буфер обмена") != "clipboard.read"
+
+
+def test_clipboard_write_route_extracts_text():
+    # The weak model does not reliably call clipboard.write, so a copy request is routed
+    # deterministically here with the literal text extracted.
+    cases = {
+        "Скопируй в буфер обмена ровно этот текст: HELLO-42": "HELLO-42",
+        "положи в буфер обмена привет мир": "привет мир",
+        "скопируй «важный текст» в буфер": "важный текст",
+        'запиши в буфер "PASSWORD-77"': "PASSWORD-77",  # quoted span
+        "скопируй ЗДРАВСТВУЙ в буфер обмена": "ЗДРАВСТВУЙ",
+    }
+    for phrase, expected in cases.items():
+        action = _native_action_from_message(phrase)
+        assert action is not None and action.action == "clipboard.write", phrase
+        assert action.payload.get("text") == expected, (phrase, action.payload)
+
+    # A filesystem copy ("скопируй файл … в папку …") has no clipboard reference and must
+    # NOT be treated as a clipboard write.
+    fs = _native_action_from_message("скопируй файл report.txt в папку backup")
+    assert fs is None or fs.action != "clipboard.write"

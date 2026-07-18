@@ -4048,6 +4048,31 @@ class AgentRuntime:
             # bridge action for it; gather RAM + CPU + disk + GPU via the read-only
             # system.inspect facade and format one combined summary.
             return await self._machine_health_summary(native_action.answer)
+        if (
+            native_action is not None
+            and native_action.action == "clipboard.write"
+            and self._owner_autonomy_active()
+        ):
+            # The weak local model does not reliably drive clipboard.write (it often
+            # narrates a fake success). The deterministic route already extracted the
+            # exact text and the owner's own turn authorizes this benign mutation, so run
+            # it directly — mirrors the orchestrator's autonomous browser.open, which also
+            # runs with allow_danger under owner autonomy. (Gated posture falls through to
+            # the operator-authorization path below.)
+            arguments = {
+                "action": "clipboard.write",
+                "payload": native_action.payload,
+                "timeout_sec": 30,
+            }
+            result = await self.tools.run("windows.native", arguments, allow_danger=True)
+            status = "Готово" if result.ok else "Не смог записать в буфер обмена"
+            event = ChatEvent(
+                type="tool_call",
+                title="windows.native:clipboard.write",
+                content=result.summary,
+                payload={"tool": result.tool, "ok": result.ok, "action": "clipboard.write"},
+            )
+            return DirectAction(answer=f"{status}: {native_action.answer}", events=[event])
         if native_action is not None:
             arguments = {
                 "action": native_action.action,
@@ -18307,6 +18332,57 @@ def _process_view_action_from_message(message: str) -> NativeAction | None:
     )
 
 
+_CLIPBOARD_WRITE_VERB_RE = re.compile(
+    r"(?i)^\s*(скопируй(?:-ка)?|скопировать|запиши(?:-ка)?|положи|помести|copy)\b"
+)
+
+
+def _clipboard_write_text_from_message(message: str) -> str | None:
+    """Extract the literal text to place on the clipboard from a copy request.
+
+    Preserves the original case/content of the payload (works off the raw message, not the
+    lowercased form). Returns None when nothing usable is found so the caller falls back to
+    the tool path rather than copying filler. Handles the common shapes:
+    "…текст: X" (after the last colon), a quoted span, "…в буфер обмена X" (after the
+    anchor), and "скопируй X в буфер" (before the anchor).
+    """
+
+    text = message.strip()
+    if not text:
+        return None
+
+    def _clean(value: str) -> str | None:
+        value = value.strip().strip("\"'«»“”`").strip()
+        return value[:16384] if value else None
+
+    # 1) An explicit "…: X" — take everything after the LAST colon.
+    if ":" in text:
+        cleaned = _clean(text.rsplit(":", 1)[1])
+        if cleaned:
+            return cleaned
+    # 2) A quoted span.
+    for pattern in (r'"([^"]+)"', r"«([^»]+)»", r"“([^”]+)”", r"'([^']+)'"):
+        match = re.search(pattern, text)
+        if match:
+            cleaned = _clean(match.group(1))
+            if cleaned:
+                return cleaned
+    # 3) Text after the clipboard anchor; if empty, the text may precede it.
+    lowered = text.lower()
+    for anchor in ("в буфер обмена", "в буфер", "буфер обмена", "to clipboard", "clipboard"):
+        idx = lowered.find(anchor)
+        if idx < 0:
+            continue
+        after = _clean(text[idx + len(anchor) :].lstrip(" :.-—\t"))
+        if after:
+            return after
+        before = _CLIPBOARD_WRITE_VERB_RE.sub("", text[:idx])
+        cleaned = _clean(before)
+        if cleaned:
+            return cleaned
+    return None
+
+
 def _native_action_from_message(
     message: str,
     settings: JarvisSettings | None = None,
@@ -18452,7 +18528,7 @@ def _native_action_from_message(
             "get clipboard",
         ),
     ) and not _contains_any(
-        # "скопируй ... в буфер" is a write and must go through the tool path.
+        # "скопируй ... в буфер" is a write, handled by the write route just below.
         normalized,
         ("скопируй", "скопировать", "положи в буфер", "запиши в буфер", "copy to clipboard"),
     ):
@@ -18461,6 +18537,22 @@ def _native_action_from_message(
             payload={},
             answer="прочитал буфер обмена",
         )
+
+    # Write text to the clipboard ("скопируй в буфер обмена: X" / "положи в буфер X").
+    # The weak local model does NOT reliably route this to the clipboard.write native
+    # action (it often narrates a fake success), so extract the text deterministically
+    # here and copy it. Only fires when a copy verb AND a clipboard reference are present
+    # (so "скопируй файл X в папку Y" — a filesystem copy — never triggers).
+    if _contains_any(
+        normalized, ("скопируй", "скопировать", "запиши", "положи", "помести", "copy")
+    ) and _contains_any(normalized, ("буфер", "clipboard")):
+        clip_text = _clipboard_write_text_from_message(message)
+        if clip_text:
+            return NativeAction(
+                action="clipboard.write",
+                payload={"text": clip_text},
+                answer="скопировал текст в буфер обмена",
+            )
 
     if _contains_any(normalized, ("wmi", "cim", "через wmi", "через cim")):
         return _wmi_action_from_message(message)
