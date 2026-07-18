@@ -7,7 +7,13 @@ import json
 
 import httpx
 import pytest
-from jarvis_gpt.telegram_bridge import TelegramBridge, TelegramConfig, _chunks, load_config
+from jarvis_gpt.telegram_bridge import (
+    TelegramBridge,
+    TelegramConfig,
+    _chunks,
+    _looks_like_audio,
+    load_config,
+)
 
 
 def _cfg(**over) -> TelegramConfig:
@@ -186,3 +192,122 @@ def test_inbound_photo_is_uploaded_and_attached():
     assert chat_bodies[0]["attachments"] == [
         {"id": "f1", "name": "photo.jpg", "mime_type": "image/jpeg", "size": 8}
     ]
+
+
+def test_looks_like_audio_detection():
+    assert _looks_like_audio({"mime_type": "audio/ogg", "name": "voice.ogg"})
+    assert _looks_like_audio({"mime_type": None, "name": "clip.mp3"})
+    assert not _looks_like_audio({"mime_type": "image/jpeg", "name": "photo.jpg"})
+    assert not _looks_like_audio({"mime_type": "text/plain", "name": "notes.txt"})
+
+
+def test_load_config_voice_replies_toggle():
+    common = {"TELEGRAM_BOT_TOKEN": "T", "TELEGRAM_ALLOWED_CHAT_IDS": "42"}
+    assert load_config(common).voice_replies is True
+    assert load_config({**common, "TELEGRAM_VOICE_REPLIES": "0"}).voice_replies is False
+
+
+def _voice_bridge(monkeypatch, *, ogg: bytes | None):
+    monkeypatch.setattr("jarvis_gpt.telegram_bridge._wav_to_ogg_opus", lambda wav: ogg)
+    tg_posts: list[str] = []
+    chat_bodies: list[dict] = []
+
+    def tg_handler(request):
+        path = request.url.path
+        if path.endswith("/getFile"):
+            return httpx.Response(200, json={"ok": True, "result": {"file_path": "voice/x.ogg"}})
+        if "/file/botT/" in path:
+            return httpx.Response(200, content=b"OggS-voice-bytes")
+        tg_posts.append(path)
+        return httpx.Response(200, json={"ok": True, "result": {}})
+
+    def api_handler(request):
+        path = request.url.path
+        if path == "/api/files/upload":
+            return httpx.Response(
+                200,
+                json={
+                    "file": {"id": "v1", "name": "voice.ogg", "mime_type": "audio/ogg", "size": 16},
+                    "chunks_indexed": 0,
+                },
+            )
+        if path == "/api/chat":
+            chat_bodies.append(json.loads(request.content))
+            return httpx.Response(
+                200,
+                json={
+                    "conversation_id": "c1",
+                    "message_id": "m",
+                    "answer": "Готово, сэр.",
+                    "events": [],
+                },
+            )
+        if path == "/api/voice/speak":
+            return httpx.Response(200, content=b"RIFFwav-bytes")
+        if path == "/api/files":
+            return httpx.Response(200, json=[])
+        return httpx.Response(404, json={})
+
+    return _bridge(tg_handler, api_handler), tg_posts, chat_bodies
+
+
+def test_inbound_voice_transcribed_and_answered_with_voice(monkeypatch):
+    bridge, tg_posts, chat_bodies = _voice_bridge(monkeypatch, ogg=b"OggS-opus")
+    update = {
+        "update_id": 1,
+        "message": {
+            "chat": {"id": 42, "type": "private"},
+            "voice": {"file_id": "vf", "mime_type": "audio/ogg", "duration": 3},
+        },
+    }
+    asyncio.run(bridge._handle(update))
+    # A voice-only note is relayed as an attachment; the message is a space so the backend
+    # folds the transcript in as the real query.
+    assert chat_bodies[0]["message"] == " "
+    assert chat_bodies[0]["attachments"][0]["id"] == "v1"
+    # Spoken input -> a synthesized voice note reply (inline OGG/Opus).
+    assert any(p.endswith("/sendVoice") for p in tg_posts)
+
+
+def test_voice_reply_falls_back_to_audio_when_no_opus(monkeypatch):
+    bridge, tg_posts, _ = _voice_bridge(monkeypatch, ogg=None)
+    update = {
+        "update_id": 1,
+        "message": {
+            "chat": {"id": 42, "type": "private"},
+            "voice": {"file_id": "vf", "mime_type": "audio/ogg"},
+        },
+    }
+    asyncio.run(bridge._handle(update))
+    assert any(p.endswith("/sendAudio") for p in tg_posts)
+    assert not any(p.endswith("/sendVoice") for p in tg_posts)
+
+
+def test_text_input_never_triggers_a_voice_reply():
+    speak_calls: list[str] = []
+
+    def tg_handler(request):
+        return httpx.Response(200, json={"ok": True, "result": {}})
+
+    def api_handler(request):
+        if request.url.path == "/api/voice/speak":
+            speak_calls.append("speak")
+            return httpx.Response(200, content=b"wav")
+        if request.url.path == "/api/chat":
+            return httpx.Response(
+                200,
+                json={
+                    "conversation_id": "c1",
+                    "message_id": "m",
+                    "answer": "просто текст",
+                    "events": [],
+                },
+            )
+        if request.url.path == "/api/files":
+            return httpx.Response(200, json=[])
+        return httpx.Response(404, json={})
+
+    bridge = _bridge(tg_handler, api_handler)
+    update = {"update_id": 1, "message": {"chat": {"id": 42, "type": "private"}, "text": "привет"}}
+    asyncio.run(bridge._handle(update))
+    assert speak_calls == []  # text in -> text out, never voice

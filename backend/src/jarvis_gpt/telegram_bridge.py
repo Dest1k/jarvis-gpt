@@ -23,9 +23,12 @@ import asyncio
 import logging
 import os
 import re
+import shutil
+import subprocess
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
+from pathlib import Path
 
 import httpx
 
@@ -39,6 +42,50 @@ TG_DOC_CAP = 45 * 1024 * 1024
 TYPING_REFRESH_SEC = 4.0
 _RESET_COMMANDS = {"/start", "/new", "/reset", "/новый", "/сброс"}
 
+# Audio/video attachments are transcribed backend-side; the bridge only relays them and,
+# for a spoken turn, mirrors the modality by replying with a synthesized voice note.
+_AUDIO_MIME_PREFIXES = ("audio/", "video/")
+_AUDIO_EXTENSIONS = frozenset(
+    {
+        ".ogg", ".oga", ".opus", ".mp3", ".wav", ".m4a", ".aac", ".flac", ".wma",
+        ".mp4", ".webm", ".mov", ".mkv", ".m4v", ".avi",
+    }
+)
+
+
+def _looks_like_audio(attachment: Mapping[str, object]) -> bool:
+    mime = str(attachment.get("mime_type") or "").lower()
+    if mime.startswith(_AUDIO_MIME_PREFIXES):
+        return True
+    name = str(attachment.get("name") or "").lower()
+    return Path(name).suffix in _AUDIO_EXTENSIONS
+
+
+def _wav_to_ogg_opus(wav: bytes) -> bytes | None:
+    """Transcode WAV bytes to OGG/Opus so Telegram shows an inline voice note.
+
+    Returns None (caller falls back to sendAudio) when ffmpeg is absent or fails.
+    """
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg or not wav:
+        return None
+    try:
+        proc = subprocess.run(
+            [
+                ffmpeg, "-hide_banner", "-loglevel", "error",
+                "-i", "pipe:0", "-c:a", "libopus", "-b:a", "48k", "-f", "ogg", "pipe:1",
+            ],
+            input=wav,
+            capture_output=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0 or not proc.stdout:
+        return None
+    return proc.stdout
+
 
 @dataclass(frozen=True)
 class TelegramConfig:
@@ -49,6 +96,10 @@ class TelegramConfig:
     poll_timeout: int = 25
     request_timeout: float = 300.0  # agent turns (missions, web, vision) can be long
     max_files_out: int = 6
+    # Voice-out mirrors the input modality: a spoken reply is sent ONLY when the incoming
+    # message was itself voice/audio. A text message always gets a text-only reply.
+    voice_replies: bool = True
+    voice_reply_max_chars: int = 1500
 
 
 def load_config(env: Mapping[str, str] | None = None) -> TelegramConfig:
@@ -71,11 +122,23 @@ def load_config(env: Mapping[str, str] | None = None) -> TelegramConfig:
             "TELEGRAM_ALLOWED_CHAT_IDS is empty — set your numeric Telegram chat id in "
             "backend/.env.local. Refusing to start open to the world."
         )
+    voice_replies = (env.get("TELEGRAM_VOICE_REPLIES") or "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+    try:
+        voice_max = int((env.get("TELEGRAM_VOICE_REPLY_MAX_CHARS") or "").strip())
+    except (TypeError, ValueError):
+        voice_max = 1500
     return TelegramConfig(
         bot_token=token,
         allowed_chat_ids=ids,
         backend_url=(env.get("JARVIS_BACKEND_URL") or "http://127.0.0.1:8000").rstrip("/"),
         api_token=(env.get("JARVIS_API_TOKEN") or "").strip(),
+        voice_replies=voice_replies,
+        voice_reply_max_chars=voice_max,
     )
 
 
@@ -204,9 +267,15 @@ class TelegramBridge:
         attachments = await self._ingest_inbound(message)
         if not text and not attachments:
             return
+        audio_in = any(_looks_like_audio(a) for a in attachments)
+        visual_in = any(not _looks_like_audio(a) for a in attachments)
         if not text:
-            text = "Посмотри на вложение и ответь."
-        await self._run_turn(chat_id, text, attachments)
+            # Voice-only note IS the message: a single space passes the API's non-empty gate
+            # while the backend folds the audio transcript in as the real query; a
+            # visual-only attachment gets a look-at-it nudge instead.
+            text = " " if audio_in and not visual_in else "Посмотри на вложение и ответь."
+        # Voice-out ONLY mirrors a spoken input; a text message always gets text back.
+        await self._run_turn(chat_id, text, attachments, voice_reply=audio_in)
 
     # -- inbound files (photo/document -> /api/files/upload) ------------------
     async def _ingest_inbound(self, message: dict) -> list[dict]:
@@ -224,6 +293,21 @@ class TelegramBridge:
                     document.get("mime_type"),
                 )
             )
+        voice = message.get("voice")
+        if isinstance(voice, dict) and voice.get("file_id"):
+            specs.append((voice["file_id"], "voice.ogg", voice.get("mime_type") or "audio/ogg"))
+        audio = message.get("audio")
+        if isinstance(audio, dict) and audio.get("file_id"):
+            specs.append(
+                (
+                    audio["file_id"],
+                    audio.get("file_name") or "audio.mp3",
+                    audio.get("mime_type") or "audio/mpeg",
+                )
+            )
+        video_note = message.get("video_note")
+        if isinstance(video_note, dict) and video_note.get("file_id"):
+            specs.append((video_note["file_id"], "circle.mp4", "video/mp4"))
         attachments: list[dict] = []
         for file_id, name, mime in specs:
             try:
@@ -263,7 +347,9 @@ class TelegramBridge:
         }
 
     # -- the agent turn -------------------------------------------------------
-    async def _run_turn(self, chat_id: int, text: str, attachments: list[dict]) -> None:
+    async def _run_turn(
+        self, chat_id: int, text: str, attachments: list[dict], *, voice_reply: bool = False
+    ) -> None:
         before = await self._file_ids()
         typing = asyncio.create_task(self._typing_keepalive(chat_id))
         try:
@@ -288,10 +374,41 @@ class TelegramBridge:
 
         if body.get("conversation_id"):
             self.conversations[chat_id] = body["conversation_id"]
-        await self._send(chat_id, body.get("answer") or "(пустой ответ)")
+        answer = body.get("answer") or "(пустой ответ)"
+        await self._send(chat_id, answer)
+        if voice_reply and self.cfg.voice_replies:
+            await self._reply_with_voice(chat_id, answer)
 
         inbound_ids = {a["id"] for a in attachments}
         await self._deliver_new_files(chat_id, before | inbound_ids)
+
+    async def _reply_with_voice(self, chat_id: int, answer: str) -> None:
+        """Speak the answer back as a Telegram voice note (spoken input → spoken reply)."""
+
+        text = (answer or "").strip()
+        if not text or len(text) > self.cfg.voice_reply_max_chars:
+            return
+        try:
+            response = await self.api.post("/api/voice/speak", json={"text": text})
+            if response.status_code != 200 or not response.content:
+                return
+            wav = response.content
+        except httpx.HTTPError:
+            return
+        ogg = await asyncio.to_thread(_wav_to_ogg_opus, wav)
+        with suppress(httpx.HTTPError, RuntimeError):
+            if ogg:
+                await self.tg.post(
+                    "/sendVoice",
+                    data={"chat_id": chat_id},
+                    files={"voice": ("jarvis.ogg", ogg, "audio/ogg")},
+                )
+            else:  # no ffmpeg — fall back to a playable audio file
+                await self.tg.post(
+                    "/sendAudio",
+                    data={"chat_id": chat_id},
+                    files={"audio": ("jarvis.wav", wav, "audio/wav")},
+                )
 
     async def _file_ids(self) -> set[str]:
         try:
