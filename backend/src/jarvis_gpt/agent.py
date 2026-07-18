@@ -17950,23 +17950,35 @@ def _native_action_from_message(
     # Live GPU telemetry (nvidia-smi) for "загрузка GPU / сколько VRAM / температура
     # видеокарты" — WMI's Win32_VideoController reports a wrong 32-bit AdapterRAM for
     # large-VRAM cards, so route GPU-status questions to the dedicated bridge action.
-    gpu_status = _contains_any(normalized, ("vram", "видеопам")) or (
-        _contains_any(normalized, ("gpu", "видеокарт", "видеочип", "graphics", "5090"))
-        and _contains_any(
-            normalized,
-            (
-                "загруз",
-                "занят",
-                "свободн",
-                "температур",
-                "сколько",
-                "утилиз",
-                "нагруз",
-                "память",
-                "memory",
-                "util",
-            ),
+    gpu_status = (
+        _contains_any(normalized, ("vram", "видеопам"))
+        or (
+            _contains_any(normalized, ("gpu", "видеокарт", "видеочип", "graphics"))
+            and _contains_any(
+                normalized,
+                ("загруз", "занят", "свободн", "температур", "утилиз", "нагруз", "util"),
+            )
         )
+    ) and not _contains_any(
+        # A price/shopping question about a GPU ("где дешевле купить 5090") is NOT a
+        # telemetry query — let it route to web research.
+        normalized,
+        (
+            "купить",
+            "куплю",
+            "дешевл",
+            "дешев",
+            "дешёв",
+            "цена",
+            "цены",
+            "ценой",
+            "магазин",
+            "заказ",
+            "стоит",
+            "стоимост",
+            "price",
+            "buy",
+        ),
     )
     if gpu_status:
         return NativeAction(
