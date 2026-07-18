@@ -75,6 +75,23 @@ def test_compose_defaults_to_loopback_and_propagates_build_contract() -> None:
     assert compose.count("read_only: true") >= 3
 
 
+def test_qwen_vllm_derivative_is_digest_pinned_and_patches_only_http_loop() -> None:
+    dockerfile = _read("docker/vllm-asyncio/Dockerfile")
+
+    assert (
+        "FROM vllm/vllm-openai@sha256:"
+        "e4f88a835143cd22aee2397a26ec6bb80b3a4a6fe0c882bcbc63822904766089"
+        in dockerfile
+    )
+    assert "abaa0233f6e00ac8acbd528c3cc6a63d6e5ee09e5baedffd922d961eefe91af8" in dockerfile
+    assert "sha256sum -c -" in dockerfile
+    assert "uvloop\\.run(run_server(args))" in dockerfile
+    assert "asyncio.run(run_server(args))" in dockerfile
+    assert "grep -Fxc '            uvloop.run(run_server(args))'" in dockerfile
+    assert "grep -Fxc '            asyncio.run(run_server(args))'" in dockerfile
+    assert "pip install" not in dockerfile
+
+
 def test_chromium_seccomp_profile_keeps_default_deny_and_allows_namespaces() -> None:
     profile = _read("backend/chromium-seccomp.json")
 

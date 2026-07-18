@@ -239,12 +239,21 @@ CONTINUE_INCOMPLETE_TOOL_PROMPT = (
 WEB_SYNTHESIS_PROMPT = (
     "web-evidence-synthesis-v1\n"
     "You are the evidence synthesis layer for JARVIS. Reply in Russian.\n"
-    "Use only the supplied search/fetch evidence. Do not add facts from memory, guesses, "
-    "or generic model knowledge. Put the conclusion first, then the key confirmed facts, "
+    "Use only the supplied search/fetch evidence. The current_date field is authoritative; "
+    "never replace its year with a remembered year or call a source future/fake merely because "
+    "its date is newer than model pretraining. Do not add facts from memory, guesses, "
+    "or generic model knowledge. Ignore evidence unrelated to the exact requested subject "
+    "instead of summarizing the unrelated page. Public-source journalism and analysis of wars, "
+    "markets, and politics are allowed: attribute contested claims and uncertainty, but do not "
+    "invent a blanket refusal or claim that live access is unavailable after tools supplied "
+    "evidence. For finance, distinguish commodities, futures, company shares, indexes, and FX; "
+    "name the instrument, currency/unit, and source timestamp instead of merging unlike quotes. "
+    "Put the conclusion first, then the key confirmed facts, "
     "then uncertainty/gaps if evidence is weak. Prefer fetched page excerpts over search "
     "snippets. Treat snippet-only sources as weak. If the evidence does not support a "
     "conclusion, say that plainly and suggest the next verification step. Keep the answer "
-    "concise and human. Include source URLs in an 'Источники' section."
+    "concise and human. Include source URLs in an 'Источники' section unless the operator's "
+    "current/follow-up question explicitly asks for conclusions without links."
 )
 
 
@@ -4704,6 +4713,18 @@ class AgentRuntime:
         if sealed_document_intent:
             return None
 
+        live_query_probe = message
+        if context is not None:
+            live_query_probe = self._contextualize_web_query(
+                message,
+                task_plan.query if task_plan is not None and task_plan.query else message,
+                context.conversation_id,
+            )
+        normalized_live_request = f"{message} {live_query_probe}".casefold()
+        requires_live_web = _looks_like_financial_market_query(
+            normalized_live_request
+        ) or _looks_like_current_public_events_query(normalized_live_request)
+
         # Reasoning-first arbiter: before any fuzzy web-ish branch (shopping,
         # weather, generic research) fires on keyword matches, let the model judge
         # whether the task actually needs external data or is solvable by reasoning
@@ -4715,6 +4736,7 @@ class AgentRuntime:
                 arbiter is not None
                 and arbiter.route in {"reasoning", "chat"}
                 and arbiter.confidence >= 0.6
+                and not requires_live_web
             ):
                 context.task_plan = _reroute_plan(context.task_plan, arbiter)
                 return None
@@ -4838,11 +4860,29 @@ class AgentRuntime:
                 if task_plan is not None and task_plan.route == "web_research" and task_plan.query
                 else _web_research_query_from_message(message)
             )
+            if research_query is None and requires_live_web:
+                research_query = live_query_probe
         if research_query is not None:
+            # The kernel plan is built from the current turn and can therefore
+            # contain only an elliptical phrase ("Какие цены сейчас?").  The
+            # live-data guard above correctly keeps the turn on the web route,
+            # but the actual tool query must carry the same recovered subject;
+            # otherwise the search provider receives the ambiguous phrase.
+            if context is not None:
+                research_query = self._contextualize_web_query(
+                    message,
+                    research_query,
+                    context.conversation_id,
+                )
             intent = None
             if context is not None:
                 intent = await self._understand_intent(message, context)
-            if intent and intent.route in {"reasoning", "chat"} and intent.confidence >= 0.55:
+            if (
+                intent
+                and intent.route in {"reasoning", "chat"}
+                and intent.confidence >= 0.55
+                and not requires_live_web
+            ):
                 return None
             if intent and intent.route == "web_research" and intent.query:
                 research_query = intent.query
@@ -5302,6 +5342,7 @@ class AgentRuntime:
         registry_run = getattr(run_method, "__self__", None) is self.tools
         if (
             _looks_like_shopping_query(normalized)
+            and not _looks_like_financial_market_query(normalized)
             and (registry_run or _web_surfer_available())
             and self.tools.get("web.shop_search") is not None
         ):
@@ -5323,6 +5364,10 @@ class AgentRuntime:
                 )
                 return shop_action
 
+        # Resolve conversational ellipsis before the first provider call. Previously
+        # "Какие цены сейчас?" hit web.answer as a subjectless shopping query and only
+        # inherited "нефть" after that answer had already failed.
+        query = self._contextualize_web_query(message, query, conversation_id)
         answer_action = await self._run_web_answer_engine(
             message=message,
             query=query,
@@ -5331,12 +5376,6 @@ class AgentRuntime:
         if answer_action is not None:
             return answer_action
 
-        # A vague web follow-up ("расскажи подробнее про это", "а что там по X") inherits
-        # its subject from recent conversation, same as the shop-search paths do.
-        if _subject_is_vague(_clean_research_subject(query)):
-            carried = self._subject_from_recent_context(message, conversation_id)
-            if carried:
-                query = f"{carried} {query}".strip()
         search = await self.tools.run("web.search", {"query": query, "limit": 6})
         events = [
             ChatEvent(
@@ -5493,6 +5532,25 @@ class AgentRuntime:
         except Exception:  # noqa: BLE001 - context recovery is best-effort
             return None
         return _pick_subject_from_messages(message, recent)
+
+    def _contextualize_web_query(
+        self,
+        message: str,
+        query: str,
+        conversation_id: str | None,
+    ) -> str:
+        """Carry a missing subject into an elliptical live-data follow-up."""
+
+        if not _web_query_needs_context(message, query):
+            return query
+        carried = self._subject_from_recent_context(message, conversation_id)
+        if not carried:
+            return query
+        carried_terms = set(_web_context_terms(carried))
+        query_terms = set(_web_context_terms(query))
+        if carried_terms and carried_terms.intersection(query_terms):
+            return query
+        return _normalize_search_query(f"{carried} {query}")[:300]
 
     async def _run_shop_search(
         self,
@@ -5872,10 +5930,44 @@ class AgentRuntime:
         normalized = message.casefold()
         news_request = _looks_like_news_query(normalized)
         news_window = _relative_date_window_for_message(normalized) if news_request else None
+        resolved_live_text = f"{normalized} {query.casefold()}"
+        financial_request = _looks_like_financial_market_query(resolved_live_text)
+        current_sensitive = financial_request or _looks_like_current_public_events_query(
+            resolved_live_text
+        )
+
+        def financial_failure(detail: str) -> DirectAction:
+            answer = (
+                "Не удалось подтвердить свежую рыночную котировку через live web-поиск. "
+                "Старые сниппеты и знания модели за текущую цену не выдаю. "
+                "Уточни бенчмарк (Brent/WTI), тикер/биржу, ETF или фьючерсный контракт, "
+                "если нужен конкретный инструмент."
+            )
+            return DirectAction(
+                answer=answer,
+                events=[
+                    ChatEvent(
+                        type="tool_call",
+                        title="web.answer",
+                        content=detail[:500],
+                        payload={
+                            "tool": "web.answer",
+                            "ok": False,
+                            "query": query,
+                            "vertical": "financial_market",
+                            "freshness": "day",
+                        },
+                    )
+                ],
+            )
         # A multi-event, date-bounded news request is not a two-second fact lookup.
         # Keep it in the structured answer engine, which can enforce publication
         # dates and fall back to publisher RSS feeds.
-        if not news_request and self.tools.get("web.surfer") is not None:
+        if (
+            not news_request
+            and not current_sensitive
+            and self.tools.get("web.surfer") is not None
+        ):
             mode = _web_surfer_mode_for_request(message)
             arguments: dict[str, Any] | None = {"query": query}
             if mode == "aggressive_shopping":
@@ -5892,7 +5984,10 @@ class AgentRuntime:
                     surfer = None
             if surfer is not None and surfer.ok and isinstance(surfer.data, dict):
                 payload = surfer.data.get("data")
-                answer = _web_surfer_answer_text(payload)
+                answer = _web_surfer_answer_text(
+                    payload,
+                    allow_structured_products=mode == "aggressive_shopping",
+                )
                 if answer:
                     return DirectAction(
                         answer=answer,
@@ -5927,6 +6022,8 @@ class AgentRuntime:
             "query": query,
             "max_sources": 6,
         }
+        if financial_request:
+            answer_arguments.update({"freshness": "day", "use_cache": False})
         if news_request:
             answer_arguments["vertical"] = "news"
             if news_window is not None:
@@ -5965,6 +6062,8 @@ class AgentRuntime:
                         )
                     ],
                 )
+            if financial_request:
+                return financial_failure(f"Live market lookup failed: {type(exc).__name__}")
             return None
         if news_window is not None and (
             not result.ok
@@ -6007,9 +6106,13 @@ class AgentRuntime:
                 ],
             )
         if not result.ok or not isinstance(result.data, dict):
+            if financial_request:
+                return financial_failure(result.summary)
             return None
         answer = str(result.data.get("answer") or "").strip()
         if not answer:
+            if financial_request:
+                return financial_failure("Live market lookup returned no grounded answer.")
             return None
         event = ChatEvent(
             type="tool_call",
@@ -6135,6 +6238,9 @@ class AgentRuntime:
         answer = _clean_web_synthesis_answer(str(result.content))
         if not _valid_web_synthesis_answer(answer):
             return None
+        presentation_request = followup_message or message
+        if _requests_conclusions_without_links(presentation_request):
+            return _remove_source_links(answer)
         return _ensure_synthesis_sources(answer, evidence)
 
     def _remember_web_research(
@@ -7683,6 +7789,11 @@ class AgentRuntime:
 
         research_query = _web_research_query_from_message(message)
         if research_query is not None:
+            research_query = self._contextualize_web_query(
+                message,
+                research_query,
+                context.conversation_id,
+            )
             research_intent = _research_intent_from_message(normalized)
             named_catalog = (
                 research_intent == "shopping_research"
@@ -12403,8 +12514,9 @@ def _web_surfer_mode_for_request(message: str) -> str:
         "магазин",
         "стоимость",
     )
-    if _looks_like_shopping_query(normalized) or any(
-        marker in normalized for marker in shopping_markers
+    if not _looks_like_financial_market_query(normalized) and (
+        _looks_like_shopping_query(normalized)
+        or any(marker in normalized for marker in shopping_markers)
     ):
         return "aggressive_shopping"
     deep_markers = (
@@ -12472,27 +12584,41 @@ def _explicit_web_product_url(*values: str) -> str | None:
     return None
 
 
-def _web_surfer_answer_text(value: Any) -> str:
+def _web_surfer_answer_text(
+    value: Any,
+    *,
+    allow_structured_products: bool = False,
+) -> str:
     if isinstance(value, str):
-        return value.strip()[:20000]
+        candidate = value.strip()[:20000]
+        return candidate if _web_surfer_answer_is_usable(candidate) else ""
     if isinstance(value, dict):
         for key in ("answer", "report", "summary", "text"):
             candidate = value.get(key)
             if isinstance(candidate, str) and candidate.strip():
-                return candidate.strip()[:20000]
-        for key in ("products", "items", "results", "sources", "snippets"):
-            candidate = value.get(key)
-            if isinstance(candidate, list) and candidate:
-                rendered = _web_surfer_list_text(candidate)
-                if rendered:
-                    return rendered
-    elif isinstance(value, list):
-        rendered = _web_surfer_list_text(value)
-        if rendered:
-            return rendered
-    # Never surface the raw tool JSON as the user's answer: an empty result here makes the
-    # caller fall through to web.answer, which SYNTHESIZES from the sources instead.
+                answer = candidate.strip()[:20000]
+                return answer if _web_surfer_answer_is_usable(answer) else ""
+        if allow_structured_products:
+            for key in ("products", "items"):
+                candidate = value.get(key)
+                if isinstance(candidate, list) and candidate:
+                    return _web_surfer_list_text(candidate)
+    elif allow_structured_products and isinstance(value, list):
+        return _web_surfer_list_text(value)
+    # Raw products/results/sources are evidence, not a final answer. Returning an empty
+    # string makes the caller fall through to web.answer, which synthesizes conclusions
+    # instead of dumping numbered links or product snippets into the chat.
     return ""
+
+
+def _web_surfer_answer_is_usable(answer: str) -> bool:
+    if _has_false_live_capability_refusal(answer):
+        return False
+    urls = re.findall(r"https?://\S+", answer, flags=re.IGNORECASE)
+    prose = re.sub(r"https?://\S+", " ", answer, flags=re.IGNORECASE)
+    prose = re.sub(r"(?m)^\s*\d+[.)]\s*", " ", prose)
+    prose_words = re.findall(r"[a-zа-яё0-9]{3,}", prose, flags=re.IGNORECASE)
+    return len(urls) < 2 or len(prose_words) >= 12
 
 
 def _web_surfer_list_text(items: list[Any]) -> str:
@@ -12694,6 +12820,8 @@ def _web_research_query_from_message(
         or _looks_like_technical_freshness_query(normalized, technical_freshness_markers)
         or _looks_like_shopping_query(normalized)
         or _looks_like_place_lookup_query(normalized)
+        or _looks_like_financial_market_query(normalized)
+        or _looks_like_current_public_events_query(normalized)
         or (_contains_any(normalized, osint_markers) and not _looks_like_local_query(normalized))
         or (_contains_any(normalized, search_verbs) and not _looks_like_local_query(normalized))
     ):
@@ -12732,6 +12860,126 @@ def _web_research_query_from_message(
     if _looks_like_osint_query(normalized) and not _looks_like_shopping_query(normalized):
         query = f"{query} публичные источники"
     return query[:300]
+
+
+def _looks_like_financial_market_query(normalized: str) -> bool:
+    market_subject = _contains_any(
+        normalized,
+        (
+            "нефт",
+            "brent",
+            "wti",
+            "акци",
+            "облигац",
+            "фьючерс",
+            "etf",
+            "биржевой фонд",
+            "котиров",
+            "бирж",
+            "moex",
+            "ммвб",
+            "дивиденд",
+            "индекс",
+            "index",
+            "imoex",
+            "rts",
+            "dow jones",
+            "nasdaq",
+            "валют",
+            "форекс",
+            "forex",
+            "доллар",
+            "евро",
+            "юан",
+            " usd",
+            " eur",
+            " gbp",
+            " rub",
+            " cny",
+            " stock",
+            " shares",
+            " equity",
+            " bond",
+            "золот",
+            "gold",
+            "серебр",
+            "silver",
+            "природн газ",
+            "natural gas",
+            "биткоин",
+            "bitcoin",
+            " btc",
+            "ethereum",
+            "эфир",
+            "крипт",
+        ),
+    )
+    market_question = _contains_any(
+        normalized,
+        (
+            "что там",
+            "что по",
+            "какие",
+            "сколько",
+            "сейчас",
+            "сегодня",
+            "текущ",
+            "цен",
+            "стоим",
+            "стоит",
+            "курс",
+            "котиров",
+            "динамик",
+            "прогноз",
+            "влияни",
+            "оценк",
+            "доходност",
+            "купон",
+            "ytm",
+            "nav",
+            "price",
+            "current",
+            "quote",
+            "yield",
+        ),
+    )
+    short_market_followup = normalized.strip().startswith(("а ", "и ")) and len(
+        re.findall(r"[a-zа-яё0-9]+", normalized)
+    ) <= 5
+    return market_subject and (market_question or short_market_followup)
+
+
+def _looks_like_current_public_events_query(normalized: str) -> bool:
+    subject = _contains_any(
+        normalized,
+        (
+            "обстановк",
+            "на фронт",
+            "передов",
+            "боев",
+            "военн",
+            "линия соприкоснов",
+            "направлени",
+            "наступлен",
+            "контрнаступ",
+        ),
+    )
+    current = _contains_any(
+        normalized,
+        (
+            "обстановк",
+            "что там",
+            "что по",
+            "сейчас",
+            "сегодня",
+            "текущ",
+            "последн",
+            "за неделю",
+            "сводк",
+            "новост",
+        ),
+    )
+    return subject and current
 
 
 _DOCUMENT_ACTION_MARKERS = (
@@ -15868,7 +16116,9 @@ def _deterministic_named_shop_keys(
     ):
         return []
     normalized = message.casefold()
-    if not _looks_like_shopping_query(normalized):
+    if not _looks_like_shopping_query(normalized) or _looks_like_financial_market_query(
+        normalized
+    ):
         return []
     product = _compact_shopping_subject(_clean_shopping_subject(message) or message)
     if not product:
@@ -16340,6 +16590,8 @@ _FOLLOWUP_FILLER_WORDS = frozenset(
         "ссылки", "ссылку", "ссылка", "вариант", "варианты", "варианта", "варик",
         "где", "куда", "как", "тебе", "удобно", "например", "или", "либо", "можно",
         "это", "этот", "эту", "эти", "того", "тому", "их", "там", "тут", "ещё", "еще",
+        "какой", "какая", "какое", "какие", "какую", "сколько", "сейчас", "ныне",
+        "текущий", "текущая", "текущее", "текущие", "актуальный", "актуальные",
         "пожалуйста", "плиз", "мне", "нам", "по", "на", "в", "и", "а", "с", "к", "у",
         "же", "бы", "то", "не",
         "цена", "цены", "цену", "стоимость", "стоит", "купить", "заказать", "взять",
@@ -16378,9 +16630,7 @@ def _pick_subject_from_messages(
     """
 
     current = " ".join(str(message or "").casefold().split())
-    product_like: str | None = None  # carries a model number / brand token
-    any_concrete: str | None = None
-    for item in messages:
+    for item in reversed(messages):
         if str(item.get("role") or "") != "user":
             continue
         content = str(item.get("content") or "")
@@ -16389,11 +16639,33 @@ def _pick_subject_from_messages(
         subject = _clean_shopping_subject(content)
         if not subject or _subject_is_vague(subject):
             continue
-        compact = _compact_shopping_subject(subject)
-        any_concrete = compact
-        if re.search(r"[a-z0-9]", subject.casefold()):
-            product_like = compact
-    return product_like or any_concrete
+        return _compact_shopping_subject(subject)
+    return None
+
+
+def _web_query_needs_context(message: str, query: str) -> bool:
+    if _subject_is_vague(_clean_research_subject(query)):
+        return True
+    normalized = " ".join(str(message or "").casefold().split())
+    tokens = re.findall(r"[a-zа-яё0-9]+", normalized)
+    if len(tokens) > 16:
+        return False
+    return bool(
+        re.match(
+            r"^(?:а\s+|и\s+|тогда\s+)?(?:версия|вариант|модель|подробнее|детали)\b",
+            normalized,
+        )
+        or " а не " in f" {normalized} "
+        or re.search(r"\b(?:это|этот|эта|эти|он|она|они|там|тут)\b", normalized)
+    )
+
+
+def _web_context_terms(value: str) -> list[str]:
+    return [
+        token
+        for token in re.findall(r"[a-zа-яё0-9]+", str(value or "").casefold())
+        if token not in _FOLLOWUP_FILLER_WORDS and len(token) >= 3
+    ]
 
 
 def _clean_shopping_subject(query: str) -> str:
@@ -16649,6 +16921,11 @@ def _relative_date_window_for_message(
         dates.append(today + timedelta(days=2))
     if "завтра" in without_day_after:
         dates.append(today + timedelta(days=1))
+    if re.search(
+        r"(?:за\s+)?(?:последн\w+|прошл\w+)\s+(?:7\s+дн\w*|недел\w*)|last\s+week|past\s+week",
+        normalized,
+    ):
+        dates.extend((today - timedelta(days=6), today))
     if not dates:
         return None
     return min(dates), max(dates)
@@ -17017,11 +17294,30 @@ def _valid_web_synthesis_answer(answer: str) -> bool:
         return False
     if re.fullmatch(r"\s*\{.*\}\s*", answer, flags=re.DOTALL):
         return False
+    if _has_false_live_capability_refusal(answer):
+        return False
     # Reject link dumps without synthesis: useful answer must have prose claims.
     lines = [line.strip() for line in answer.splitlines() if line.strip()]
     url_only = sum(1 for line in lines if re.search(r"https?://", line))
     prose = sum(1 for line in lines if not re.search(r"https?://", line) and len(line) > 20)
     return not (url_only >= 2 and prose == 0)
+
+
+def _has_false_live_capability_refusal(answer: str) -> bool:
+    normalized = " ".join(str(answer or "").casefold().split())
+    markers = (
+        "не имею доступа к интернету",
+        "нет доступа к интернету",
+        "не имею доступа к данным в реальном времени",
+        "нет доступа к данным в реальном времени",
+        "не могу получить актуальные данные",
+        "не имею доступа к актуальным данным",
+        "i don't have access to the internet",
+        "i do not have access to the internet",
+        "i don't have access to real-time data",
+        "i do not have access to real-time data",
+    )
+    return any(marker in normalized for marker in markers)
 
 
 def _ensure_synthesis_sources(answer: str, evidence: list[dict[str, str]]) -> str:
@@ -17063,6 +17359,10 @@ def _web_research_followup_intent(message: str) -> bool:
     direct_markers = (
         "какой вывод",
         "какие выводы",
+        "краткие выводы",
+        "выводы напиши",
+        "выводы без ссылок",
+        "сформулируй вывод",
         "что понял",
         "что из этого следует",
         "итог по поиску",
@@ -17074,6 +17374,35 @@ def _web_research_followup_intent(message: str) -> bool:
         "сделай вывод по",
     )
     return _contains_any(normalized, direct_markers)
+
+
+def _requests_conclusions_without_links(message: str) -> bool:
+    normalized = " ".join(str(message or "").casefold().split())
+    return bool(
+        _contains_any(normalized, ("вывод", "итог", "резюм"))
+        and _contains_any(
+            normalized,
+            (
+                "без ссыл",
+                "не ссыл",
+                "а не ссыл",
+                "только вывод",
+                "кратк",
+            ),
+        )
+    )
+
+
+def _remove_source_links(answer: str) -> str:
+    kept: list[str] = []
+    for line in str(answer or "").splitlines():
+        if re.match(r"^\s*(?:#+\s*)?(?:источники|sources)\s*:?\s*$", line, re.IGNORECASE):
+            break
+        cleaned = re.sub(r"\[([^\]]+)\]\(https?://[^)]+\)", r"\1", line)
+        cleaned = re.sub(r"https?://\S+", "", cleaned).rstrip(" -—:;")
+        if cleaned.strip():
+            kept.append(cleaned.rstrip())
+    return "\n".join(kept).strip()
 
 
 def _format_web_research_followup_answer(

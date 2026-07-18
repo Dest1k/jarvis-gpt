@@ -102,9 +102,9 @@ def test_qwen_vl_profile_selects_nvfp4_capable_vllm_image(monkeypatch, tmp_path)
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setenv("JARVIS_PROFILE", "qwen36-vl")
     settings = load_settings()
-    assert settings.profile.vllm_image == "vllm/vllm-openai:v0.25.1"
+    assert settings.profile.vllm_image == "jarvis/vllm-openai:v0.25.1-asyncio-e4f88a8"
     env = DispatcherManager(settings, repo_root=tmp_path).compose_env()
-    assert env["JARVIS_VLLM_IMAGE"] == "vllm/vllm-openai:v0.25.1"
+    assert env["JARVIS_VLLM_IMAGE"] == "jarvis/vllm-openai:v0.25.1-asyncio-e4f88a8"
     assert PROFILES["gemma4-turbo"].vllm_image == "vllm/vllm-openai:v0.23.0"
 
 

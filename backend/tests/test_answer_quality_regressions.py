@@ -1,0 +1,1119 @@
+from __future__ import annotations
+
+import asyncio
+from datetime import date
+from types import MethodType, SimpleNamespace
+
+from jarvis_gpt import agent as agent_module
+from jarvis_gpt import tools as tools_module
+from jarvis_gpt.config import ensure_runtime_dirs, load_settings
+from jarvis_gpt.event_bus import EventBus
+from jarvis_gpt.llm import LLMRouter
+from jarvis_gpt.models import ToolRunResponse
+from jarvis_gpt.storage import JarvisStorage
+from jarvis_gpt.tools import ToolRegistry
+
+
+def test_current_date_is_authoritative_and_last_week_uses_2026_window(monkeypatch):
+    today = date(2026, 7, 19)
+    monkeypatch.setattr(agent_module, "_moscow_today", lambda now=None: today)
+
+    message = "Дай анализ обстановки на фронте за последнюю неделю"
+
+    assert "current_date field is authoritative" in agent_module.WEB_SYNTHESIS_PROMPT
+    assert agent_module._relative_date_window_for_message(message.casefold()) == (
+        date(2026, 7, 13),
+        today,
+    )
+    query = agent_module._web_research_query_from_message(message)
+    assert query is not None
+    assert "2026-07-13 2026-07-19" in query
+    assert "2024" not in query
+
+
+def test_public_battlefield_status_query_routes_to_web_research():
+    message = "А что по обстановке на направлении Комар - Богатырь"
+
+    assert agent_module._looks_like_current_public_events_query(message.casefold())
+    assert agent_module._web_research_query_from_message(message) == message
+
+
+def test_current_oil_and_stock_prices_route_to_web_not_shopping():
+    messages = (
+        "Какие цены на нефть сейчас?",
+        "Что там по акциям на нефть?",
+        "Какие цены сейчас? нефть Brent и WTI",
+        "Какой сейчас курс акций нефтяных компаний?",
+    )
+
+    for message in messages:
+        normalized = message.casefold()
+        assert agent_module._looks_like_financial_market_query(normalized)
+        assert agent_module._web_research_query_from_message(message) is not None
+        assert tools_module._web_answer_looks_like_financial_market(normalized)
+        assert not tools_module._web_answer_looks_like_shopping(normalized)
+        assert tools_module._web_answer_infer_vertical(message) == "web"
+
+    assert tools_module._web_answer_infer_freshness(messages[1]) == "day"
+
+
+def test_short_oil_price_shorthand_still_requires_live_web():
+    message = "Цены на нефть"
+
+    assert agent_module._looks_like_financial_market_query(message.casefold())
+    assert agent_module._web_research_query_from_message(message) == message
+
+
+def test_named_shop_stock_quote_can_never_enter_catalog_search():
+    message = "Какая цена акций Ozon сейчас?"
+    plan = agent_module.TaskKernelPlan(
+        route="web_research",
+        mode="concise",
+        intent="shopping_research",
+        confidence=0.9,
+        query=message,
+    )
+
+    assert agent_module._looks_like_financial_market_query(message.casefold())
+    assert agent_module._deterministic_named_shop_keys(message, plan) == []
+
+
+def test_short_gold_and_crypto_quotes_are_financial_live_web_requests():
+    cases = {
+        "А золото?": "commodity",
+        "Цена биткоина сейчас?": "crypto",
+    }
+
+    for message, kind in cases.items():
+        normalized = message.casefold()
+        assert agent_module._looks_like_financial_market_query(normalized)
+        assert agent_module._web_research_query_from_message(message) is not None
+        assert tools_module._web_answer_looks_like_financial_market(normalized)
+        assert tools_module._web_answer_financial_instrument_kind(message) == kind
+        assert tools_module._web_answer_infer_freshness(message) == "day"
+
+
+def test_financial_query_variants_do_not_mix_crude_quotes_with_company_shares():
+    crude = tools_module._web_answer_financial_query_variant("Какие цены на нефть сейчас?")
+    shares = tools_module._web_answer_financial_query_variant("Что по акциям нефтяных компаний?")
+
+    assert "Brent WTI" in crude
+    assert "USD per barrel" in crude
+    assert "stock ticker" not in crude
+    assert "stock ticker" in shares
+    assert "share price" in shares
+
+
+class _ContextRuntime:
+    def __init__(self, messages: list[dict[str, str]]) -> None:
+        self.messages = messages
+
+    def _subject_from_recent_context(
+        self,
+        message: str,
+        conversation_id: str | None,
+    ) -> str | None:
+        assert conversation_id == "conv-regression"
+        return agent_module._pick_subject_from_messages(message, self.messages)
+
+
+def test_bmw_spec_followup_keeps_the_recent_bmw_subject():
+    messages = [
+        {"role": "user", "content": "Что по BMW 3 серии на вторичном рынке?"},
+        {"role": "assistant", "content": "Нашёл варианты BMW 3 серии."},
+    ]
+    followup = "Версия 1.5 АТ 2016 года, 136 лошадей, передний привод"
+    runtime = _ContextRuntime(messages)
+
+    query = agent_module.AgentRuntime._contextualize_web_query(
+        runtime,
+        followup,
+        followup,
+        "conv-regression",
+    )
+
+    assert "bmw" in query.casefold()
+    assert "1.5" in query
+    assert "2016" in query
+
+
+def test_elliptical_price_followup_keeps_the_recent_oil_subject():
+    messages = [
+        {"role": "user", "content": "Цены на нефть Brent и WTI"},
+        {"role": "assistant", "content": "Проверяю текущие котировки."},
+    ]
+    followup = "Какие цены сейчас?"
+    runtime = _ContextRuntime(messages)
+
+    query = agent_module.AgentRuntime._contextualize_web_query(
+        runtime,
+        followup,
+        followup,
+        "conv-regression",
+    )
+
+    assert "brent" in query.casefold()
+    assert "wti" in query.casefold()
+
+
+def test_raw_web_surfer_links_are_evidence_not_a_final_answer():
+    raw_search = {
+        "results": [
+            {"title": "Brent quote", "url": "https://example.test/brent"},
+            {"title": "WTI quote", "url": "https://example.test/wti"},
+        ]
+    }
+
+    assert agent_module._web_surfer_answer_text(raw_search) == ""
+    assert agent_module._web_surfer_answer_text({"sources": raw_search["results"]}) == ""
+    assert agent_module._web_surfer_answer_text({"answer": "Краткий вывод"}) == "Краткий вывод"
+    assert (
+        agent_module._web_surfer_answer_text(
+            {"answer": "Я не имею доступа к данным в реальном времени."}
+        )
+        == ""
+    )
+
+
+def test_conclusions_without_links_are_recognized_and_cleaned():
+    request = "Краткие выводы напиши, а не ссылки на источники"
+    answer = (
+        "Brent вырос, WTI следует за ним: https://example.test/quote\n"
+        "[Рыночная сводка](https://example.test/report) подтверждает динамику.\n\n"
+        "Источники:\n"
+        "1. https://example.test/source"
+    )
+
+    assert agent_module._web_research_followup_intent(request)
+    assert agent_module._requests_conclusions_without_links(request)
+    cleaned = agent_module._remove_source_links(answer)
+    assert "Brent вырос" in cleaned
+    assert "Рыночная сводка" in cleaned
+    assert "http" not in cleaned
+    assert "Источники" not in cleaned
+
+
+def test_most_recent_concrete_subject_wins_over_an_older_latin_brand():
+    messages = [
+        {"role": "user", "content": "Что по BMW 3 серии?"},
+        {"role": "assistant", "content": "Ответ про BMW."},
+        {"role": "user", "content": "Цены на нефть Brent и WTI"},
+        {"role": "assistant", "content": "Ответ про нефть."},
+    ]
+
+    subject = agent_module._pick_subject_from_messages("Какие цены сейчас?", messages)
+
+    assert subject is not None
+    assert "brent" in subject.casefold()
+    assert "wti" in subject.casefold()
+    assert "bmw" not in subject.casefold()
+
+
+def test_contextual_financial_followup_cannot_be_downgraded_to_chat(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    conversation_id = storage.create_conversation("market context")
+    storage.add_message(
+        conversation_id=conversation_id,
+        role="user",
+        content="Цены на нефть Brent и WTI",
+    )
+    storage.add_message(
+        conversation_id=conversation_id,
+        role="assistant",
+        content="Смотрю котировки.",
+    )
+    storage.add_message(
+        conversation_id=conversation_id,
+        role="user",
+        content="Какие цены сейчас?",
+    )
+    runtime = agent_module.AgentRuntime(
+        settings=settings,
+        storage=storage,
+        llm=LLMRouter(settings),
+        bus=EventBus(),
+    )
+    context = agent_module.AgentContext(
+        conversation_id=conversation_id,
+        memory_hits=[],
+        file_hits=[],
+        task_plan=agent_module.TaskKernelPlan(
+            route="web_research",
+            mode="concise",
+            intent="current_market_data",
+            confidence=0.8,
+            query="Какие цены сейчас?",
+        ),
+    )
+    captured: dict[str, str] = {}
+
+    async def fake_intent(_self, _message, _context):
+        return agent_module.IntentDecision(route="chat", confidence=0.95)
+
+    async def fake_research(_self, message, query, **_kwargs):
+        captured.update(message=message, query=query)
+        return agent_module.DirectAction(answer="live web used", events=[])
+
+    monkeypatch.setattr(runtime, "_understand_intent", MethodType(fake_intent, runtime))
+    monkeypatch.setattr(runtime, "_run_web_research", MethodType(fake_research, runtime))
+    try:
+        action = asyncio.run(runtime._try_direct_action("Какие цены сейчас?", context))
+    finally:
+        storage.close()
+
+    assert action is not None
+    assert action.answer == "live web used"
+    assert "brent" in captured["query"].casefold()
+    assert "wti" in captured["query"].casefold()
+
+
+def test_exact_false_realtime_refusal_is_rejected_in_all_synthesis_paths():
+    refusal = (
+        "Я не имею доступа к данным в реальном времени, поэтому проверьте котировки "
+        "самостоятельно на портале https://market.example/quote"
+    )
+    source = {
+        "title": "Brent market quote",
+        "url": "https://market.example/quote",
+        "excerpt": "Brent latest settlement 70.25 USD per barrel on 2026-07-17.",
+    }
+
+    assert not agent_module._valid_web_synthesis_answer(refusal)
+    assert (
+        tools_module._web_answer_synthesis_rejection(
+            refusal,
+            [source],
+            question="Какие цены на нефть сейчас?",
+        )
+        == "capability_refusal"
+    )
+
+
+def test_financial_source_relevance_requires_instrument_anchors():
+    question = "Какие цены на нефть сейчас?"
+    phone = {
+        "title": "Смартфоны: какие цены сейчас",
+        "url": "https://shop.example/phones",
+        "snippet": "Какие цены сейчас на популярные телефоны",
+    }
+    fx = {
+        "title": "Курс доллара USD/RUB сейчас",
+        "url": "https://fx.example/usdrub",
+        "snippet": "Текущий валютный курс доллара к рублю",
+    }
+    brent = {
+        "title": "Brent crude oil latest settlement",
+        "url": "https://market.example/brent",
+        "snippet": "Brent crude oil 70.25 USD per barrel, settlement 2026-07-17",
+    }
+
+    for irrelevant in (phone, fx):
+        assert not tools_module._web_answer_source_relevant(
+            question,
+            irrelevant,
+            preferred_domains=[],
+            vertical="web",
+        )
+    assert tools_module._web_answer_source_relevant(
+        question,
+        brent,
+        preferred_domains=[],
+        vertical="web",
+    )
+
+
+def test_financial_identity_constraints_are_not_relevance_boosts():
+    wti_question = "Какая сейчас цена WTI?"
+    brent = {
+        "title": "Brent crude oil latest settlement",
+        "url": "https://market.example/brent",
+        "excerpt": "Brent settlement 70.25 USD per barrel on 2026-07-17.",
+    }
+    apple = {
+        "title": "Apple AAPL stock quote on Nasdaq",
+        "url": "https://market.example/aapl",
+        "excerpt": "AAPL share price 210.25 USD on 2026-07-17.",
+    }
+
+    assert not tools_module._web_answer_source_relevant(
+        wti_question,
+        brent,
+        preferred_domains=[],
+        vertical="web",
+    )
+    assert not tools_module._web_answer_source_relevant(
+        "Какая цена акций Газпрома сейчас?",
+        apple,
+        preferred_domains=[],
+        vertical="web",
+    )
+    assert tools_module._web_answer_financial_entity_terms(
+        "Какая цена акций Газпрома сейчас?"
+    ) == ["газпрома"]
+
+
+def test_financial_answer_contract_rejects_unsupported_quote_and_accepts_grounded_one():
+    source = {
+        "title": "Brent crude oil latest settlement",
+        "url": "https://market.example/brent",
+        "excerpt": "Brent futures settlement 70.25 USD per barrel on 2026-07-17.",
+    }
+    grounded = (
+        "Последняя доступная котировка Brent — фьючерсный settlement 70.25 USD за баррель "
+        "на 2026-07-17; рынок закрыт. Источник: https://market.example/brent"
+    )
+    invented = grounded.replace("70.25", "99.99")
+
+    assert (
+        tools_module._web_answer_synthesis_rejection(
+            grounded,
+            [source],
+            question="Какие цены на нефть сейчас?",
+        )
+        == ""
+    )
+    assert (
+        tools_module._web_answer_synthesis_rejection(
+            invented,
+            [source],
+            question="Какие цены на нефть сейчас?",
+        )
+        == "unsupported_financial_number"
+    )
+
+
+def test_financial_answer_rejects_wrong_identity_currency_and_stale_quote():
+    current_source = {
+        "title": "Brent crude oil latest settlement",
+        "url": "https://market.example/brent",
+        "excerpt": "Brent futures settlement 70.25 USD per barrel on 2026-07-17.",
+    }
+    wrong_currency = (
+        "Последняя доступная котировка Brent — фьючерсный settlement 70.25 RUB за баррель "
+        "на 2026-07-17; рынок закрыт. Источник: https://market.example/brent"
+    )
+    wti_answer = (
+        "Последняя доступная котировка WTI — фьючерсный settlement 70.25 USD за баррель "
+        "на 2026-07-17; рынок закрыт. Источник: https://market.example/brent"
+    )
+    stale_source = {
+        **current_source,
+        "excerpt": "Brent futures settlement 70.25 USD per barrel on 2024-07-18.",
+    }
+    stale_answer = (
+        "Последняя доступная котировка Brent — фьючерсный settlement 70.25 USD за баррель "
+        "на 2024-07-18; рынок закрыт. Источник: https://market.example/brent"
+    )
+
+    assert (
+        tools_module._web_answer_synthesis_rejection(
+            wrong_currency,
+            [current_source],
+            question="Какие цены на нефть сейчас?",
+        )
+        == "unsupported_financial_currency"
+    )
+    assert (
+        tools_module._web_answer_synthesis_rejection(
+            wti_answer,
+            [current_source],
+            question="Какая сейчас цена WTI?",
+        )
+        == "source_identity_mismatch"
+    )
+    assert (
+        tools_module._web_answer_synthesis_rejection(
+            stale_answer,
+            [stale_source],
+            question="Какие цены на нефть сейчас?",
+        )
+        == "stale_financial_quote"
+    )
+
+
+def test_fresh_page_date_cannot_relabel_an_old_quote_as_current():
+    source = {
+        "title": "Latest Brent market history update",
+        "url": "https://market.example/brent-history",
+        "published_date": "2026-07-18",
+        "excerpt": "Historical Brent futures settlement was 74.00 USD per barrel on 2024-01-05.",
+    }
+    answer = (
+        "Latest Brent futures settlement was 74.00 USD per barrel on 2026-07-17; "
+        "this is the latest available quote. Source: https://market.example/brent-history"
+    )
+
+    assert (
+        tools_module._web_answer_synthesis_rejection(
+            answer,
+            [source],
+            question="What is the current Brent price?",
+        )
+        == "unsupported_financial_number"
+    )
+
+
+def test_multi_benchmark_values_cannot_be_swapped_between_sources():
+    sources = [
+        {
+            "title": "Brent latest settlement",
+            "url": "https://market.example/brent",
+            "excerpt": "Brent futures settlement 70.25 USD per barrel on 2026-07-17.",
+        },
+        {
+            "title": "WTI latest settlement",
+            "url": "https://market.example/wti",
+            "excerpt": "WTI futures settlement 65.12 USD per barrel on 2026-07-17.",
+        },
+    ]
+    grounded = (
+        "Brent futures settlement is 70.25 USD per barrel on 2026-07-17 "
+        "(https://market.example/brent). WTI futures settlement is 65.12 USD per barrel "
+        "on 2026-07-17 (https://market.example/wti). These are latest available quotes."
+    )
+    swapped = grounded.replace("70.25", "TMP").replace("65.12", "70.25").replace(
+        "TMP", "65.12"
+    )
+
+    assert (
+        tools_module._web_answer_synthesis_rejection(
+            grounded,
+            sources,
+            question="Какие сейчас цены Brent и WTI?",
+        )
+        == ""
+    )
+    assert (
+        tools_module._web_answer_synthesis_rejection(
+            swapped,
+            sources,
+            question="Какие сейчас цены Brent и WTI?",
+        )
+        == "unsupported_financial_number"
+    )
+
+
+def test_unqualified_dollar_rate_cannot_turn_into_an_arbitrary_fx_pair():
+    source = {
+        "title": "EUR/USD exchange rate",
+        "url": "https://fx.example/eurusd",
+        "excerpt": "EUR/USD latest quote 1.08 USD per EUR on 2026-07-17.",
+    }
+    answer = (
+        "The latest EUR/USD exchange rate is 1.08 USD per EUR on 2026-07-17. "
+        "This is a current market quote. Source: https://fx.example/eurusd"
+    )
+
+    assert tools_module._web_answer_requested_currency_pair(
+        "Какой сейчас курс доллара?"
+    ) == ("USD", "RUB")
+    assert (
+        tools_module._web_answer_synthesis_rejection(
+            answer,
+            [source],
+            question="Какой сейчас курс доллара?",
+        )
+        == "missing_currency_pair"
+    )
+
+
+def test_index_etf_and_bond_metrics_cannot_be_interchanged():
+    spy = {
+        "title": "SPDR S&P 500 ETF Trust (SPY)",
+        "url": "https://market.example/spy",
+        "excerpt": "SPY ETF market price was 680.25 USD on 2026-07-17.",
+    }
+    spy_as_index = (
+        "The S&P 500 index level is 680.25 points on 2026-07-17, based on the SPY ETF. "
+        "Source: https://market.example/spy"
+    )
+    bond_price = {
+        "title": "OFZ 26238 bond market price",
+        "url": "https://market.example/ofz26238",
+        "excerpt": "OFZ 26238 bond market price was 57.25 RUB on MOEX on 2026-07-17.",
+    }
+    price_as_yield = (
+        "OFZ 26238 bond current yield is 57.25 percent on MOEX on 2026-07-17. "
+        "This is the latest quote. Source: https://market.example/ofz26238"
+    )
+
+    assert tools_module._web_answer_financial_instrument_kind(
+        "Какой сейчас индекс S&P 500?"
+    ) == "index"
+    assert (
+        tools_module._web_answer_synthesis_rejection(
+            spy_as_index,
+            [spy],
+            question="Какой сейчас индекс S&P 500?",
+        )
+        in {
+            "wrong_financial_instrument",
+            "source_identity_mismatch",
+            "source_metric_mismatch",
+        }
+    )
+    assert tools_module._web_answer_financial_instrument_kind(
+        "Какая сейчас доходность облигации ОФЗ 26238?"
+    ) == "bond"
+    assert (
+        tools_module._web_answer_synthesis_rejection(
+            price_as_yield,
+            [bond_price],
+            question="Какая сейчас доходность облигации ОФЗ 26238?",
+        )
+        == "source_metric_mismatch"
+    )
+
+
+def test_etf_nav_is_not_a_market_price_and_crypto_quote_cannot_be_week_old():
+    nav_source = {
+        "title": "USO ETF NAV",
+        "url": "https://market.example/uso",
+        "excerpt": "USO ETF NAV was 75.25 USD on NYSE on 2026-07-17.",
+    }
+    nav_as_price = (
+        "USO ETF market price was 75.25 USD on NYSE on 2026-07-17. This is the latest "
+        "available quote. Source: https://market.example/uso"
+    )
+    crypto_source = {
+        "title": "Bitcoin BTC/USD spot quote",
+        "url": "https://crypto.example/btcusd",
+        "excerpt": "Bitcoin BTC/USD spot quote was 65000 USD on 2026-07-13.",
+    }
+    stale_crypto = (
+        "Bitcoin BTC/USD spot quote was 65000 USD on 2026-07-13. This is the current "
+        "exchange price. Source: https://crypto.example/btcusd"
+    )
+
+    assert tools_module._web_answer_financial_instrument_kind(
+        "Какая сейчас рыночная цена ETF USO?"
+    ) == "etf"
+    assert (
+        tools_module._web_answer_synthesis_rejection(
+            nav_as_price,
+            [nav_source],
+            question="Какая сейчас рыночная цена ETF USO?",
+        )
+        == "source_metric_mismatch"
+    )
+    assert (
+        tools_module._web_answer_synthesis_rejection(
+            stale_crypto,
+            [crypto_source],
+            question="Какая сейчас цена биткоина?",
+        )
+        == "stale_financial_quote"
+    )
+
+
+def test_valid_trailing_zero_multi_equity_and_russian_fx_quotes_are_accepted():
+    wti_source = {
+        "title": "WTI latest settlement",
+        "url": "https://market.example/wti",
+        "excerpt": "WTI futures settlement was 65.10 USD per barrel on 2026-07-17.",
+    }
+    wti_answer = (
+        "WTI futures settlement was 65.10 USD per barrel on 2026-07-17. This is the "
+        "latest available market quote. Source: https://market.example/wti"
+    )
+    equity_sources = [
+        {
+            "title": "Apple AAPL stock quote",
+            "url": "https://market.example/aapl",
+            "excerpt": "Apple AAPL stock price was 210.25 USD on Nasdaq on 2026-07-17.",
+        },
+        {
+            "title": "Microsoft MSFT stock quote",
+            "url": "https://market.example/msft",
+            "excerpt": "Microsoft MSFT stock price was 510.50 USD on Nasdaq on 2026-07-17.",
+        },
+    ]
+    equity_answer = (
+        "Apple AAPL stock price was 210.25 USD on Nasdaq on 2026-07-17 "
+        "(https://market.example/aapl). Microsoft MSFT stock price was 510.50 USD on "
+        "Nasdaq on 2026-07-17 (https://market.example/msft). These are latest quotes."
+    )
+    fx_source = {
+        "title": "Курс доллара к рублю",
+        "url": "https://fx.example/usdrub",
+        "excerpt": "Один доллар США стоил 90.25 рубля на 2026-07-17.",
+    }
+    fx_answer = (
+        "Последний курс доллара к рублю составил 90.25 рубля за доллар на 2026-07-17. "
+        "Это подтверждённая котировка. Источник: https://fx.example/usdrub"
+    )
+
+    assert (
+        tools_module._web_answer_synthesis_rejection(
+            wti_answer,
+            [wti_source],
+            question="Какая сейчас цена WTI?",
+        )
+        == ""
+    )
+    assert all(
+        tools_module._web_answer_source_relevant(
+            "Какие сейчас цены акций Apple и Microsoft?",
+            source,
+            preferred_domains=[],
+            vertical="web",
+        )
+        for source in equity_sources
+    )
+    assert (
+        tools_module._web_answer_synthesis_rejection(
+            equity_answer,
+            equity_sources,
+            question="Какие сейчас цены акций Apple и Microsoft?",
+        )
+        == ""
+    )
+    assert (
+        tools_module._web_answer_synthesis_rejection(
+            fx_answer,
+            [fx_source],
+            question="Какой сейчас курс доллара к рублю?",
+        )
+        == ""
+    )
+
+
+def test_fx_rate_requires_live_web_and_an_explicit_grounded_currency_pair():
+    question = "Какой сейчас курс доллара к рублю?"
+    normalized = question.casefold()
+    source = {
+        "title": "USD/RUB exchange rate",
+        "url": "https://market.example/usdrub",
+        "excerpt": "1 USD = 7.25 RUB, latest quote on 2026-07-17.",
+    }
+    grounded = (
+        "Последняя доступная котировка валютной пары USD/RUB — 7.25 RUB за 1 USD "
+        "на 2026-07-17. Это подтверждённое источником значение, а не оценка из памяти "
+        "модели. Источник: https://market.example/usdrub"
+    )
+
+    assert agent_module._looks_like_financial_market_query(normalized)
+    assert agent_module._web_research_query_from_message(question) is not None
+    assert tools_module._web_answer_looks_like_financial_market(normalized)
+    assert tools_module._web_answer_financial_instrument_kind(question) == "fx"
+    assert tools_module._web_answer_infer_freshness(question) == "day"
+    assert "currency pair" in tools_module._web_answer_financial_query_variant(question)
+    assert (
+        tools_module._web_answer_synthesis_rejection(
+            grounded,
+            [source],
+            question=question,
+        )
+        == ""
+    )
+    assert (
+        tools_module._web_answer_synthesis_rejection(
+            grounded.replace("7.25", "6.50"),
+            [source],
+            question=question,
+        )
+        == "unsupported_financial_number"
+    )
+    assert (
+        tools_module._web_answer_synthesis_rejection(
+            grounded.replace("USD/RUB", "USD").replace("RUB за", "доллара за"),
+            [source],
+            question=question,
+        )
+        == "missing_currency_pair"
+    )
+
+
+def test_equity_source_relevance_does_not_accept_a_currency_exchange_page():
+    question = "Какой сейчас курс акций Apple, а не доллара?"
+    fx = {
+        "title": "USD/EUR currency exchange rate",
+        "url": "https://fx.example/usdeur",
+        "snippet": "Current dollar and euro exchange rate",
+    }
+    equity = {
+        "title": "Apple stock quote (AAPL) on Nasdaq",
+        "url": "https://market.example/aapl",
+        "snippet": "AAPL share price in USD, latest trade 2026-07-17",
+    }
+
+    assert not tools_module._web_answer_source_relevant(
+        question,
+        fx,
+        preferred_domains=[],
+        vertical="web",
+    )
+    assert tools_module._web_answer_source_relevant(
+        question,
+        equity,
+        preferred_domains=[],
+        vertical="web",
+    )
+
+
+class _FailingFinancialTools:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict]] = []
+
+    def get(self, name: str):
+        return object() if name == "web.answer" else None
+
+    async def run(self, name: str, arguments: dict):
+        self.calls.append((name, arguments))
+        return ToolRunResponse(
+            tool=name,
+            ok=False,
+            summary="provider offline",
+            data={},
+        )
+
+
+def test_financial_provider_failure_never_falls_back_to_model_memory():
+    runtime = object.__new__(agent_module.AgentRuntime)
+    runtime.tools = _FailingFinancialTools()
+
+    action = asyncio.run(
+        runtime._run_web_answer_engine(
+            message="Какие цены на нефть сейчас?",
+            query="Какие цены на нефть сейчас?",
+            conversation_id=None,
+        )
+    )
+
+    assert action is not None
+    assert "Не удалось подтвердить свежую рыночную котировку" in action.answer
+    assert "нет доступа к данным" not in action.answer.casefold()
+    assert runtime.tools.calls == [
+        (
+            "web.answer",
+            {
+                "question": "Какие цены на нефть сейчас?",
+                "query": "Какие цены на нефть сейчас?",
+                "max_sources": 6,
+                "freshness": "day",
+                "use_cache": False,
+            },
+        )
+    ]
+
+
+def test_financial_web_answer_bypasses_answer_cache_on_every_turn(monkeypatch, tmp_path):
+    calls: list[dict] = []
+
+    async def fake_research(_ctx, args):
+        calls.append(dict(args))
+        return ToolRunResponse(
+            tool="web.research",
+            ok=True,
+            summary="live provider called",
+            data={
+                "sources": [
+                    {
+                        "title": "Brent crude oil latest settlement",
+                        "url": "https://market.example/brent",
+                        "excerpt": (
+                            "Brent futures settlement 70.25 USD per barrel "
+                            "on 2026-07-17."
+                        ),
+                        "fetched": True,
+                    }
+                ]
+            },
+        )
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr(tools_module, "_web_research", fake_research)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    registry = ToolRegistry(settings, storage, SimpleNamespace())
+    try:
+        first = asyncio.run(
+            registry.run("web.answer", {"question": "Какие цены на нефть сейчас?"})
+        )
+        calls_after_first = len(calls)
+        second = asyncio.run(
+            registry.run("web.answer", {"question": "Какие цены на нефть сейчас?"})
+        )
+    finally:
+        storage.close()
+
+    assert first.ok and second.ok
+    assert calls_after_first > 0
+    assert len(calls) == calls_after_first * 2
+    assert all(call["use_cache"] is False for call in calls)
+    assert all(call["archive_fallback"] is False for call in calls)
+    assert first.data["cache"] == {"hit": False, "enabled": False, "ttl_sec": 600}
+    assert second.data["cache"] == first.data["cache"]
+
+
+def test_financial_web_answer_fails_closed_when_only_quote_is_stale(monkeypatch, tmp_path):
+    async def fake_research(_ctx, _args):
+        return ToolRunResponse(
+            tool="web.research",
+            ok=True,
+            summary="old market page",
+            data={
+                "sources": [
+                    {
+                        "title": "Brent historical settlement",
+                        "url": "https://market.example/brent-old",
+                        "excerpt": (
+                            "Brent futures settlement was 74.00 USD per barrel "
+                            "on 2024-01-05."
+                        ),
+                        "fetched": True,
+                    }
+                ]
+            },
+        )
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr(tools_module, "_web_research", fake_research)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    registry = ToolRegistry(settings, storage, SimpleNamespace())
+    try:
+        result = asyncio.run(
+            registry.run("web.answer", {"question": "Какие цены на нефть сейчас?"})
+        )
+    finally:
+        storage.close()
+
+    assert result.ok is False
+    assert result.data["financial_contract"]["accepted"] is False
+    assert result.data["synthesis"]["reason"] == "financial_contract_rejected"
+    assert "74.00" not in result.data["answer"]
+    assert "Устаревшие или смешанные данные не выдаю" in result.data["answer"]
+
+
+def test_web_research_propagates_no_cache_to_fetch_and_disables_archive(monkeypatch, tmp_path):
+    fetch_calls: list[dict] = []
+
+    async def fake_search(_ctx, _args):
+        return ToolRunResponse(
+            tool="web.search",
+            ok=True,
+            summary="live search",
+            data={
+                "results": [
+                    {
+                        "rank": 1,
+                        "title": "Brent quote",
+                        "url": "https://market.example/brent",
+                        "snippet": "Brent market quote",
+                        "vertical": "web",
+                    }
+                ]
+            },
+        )
+
+    async def fake_fetch(_ctx, args):
+        fetch_calls.append(dict(args))
+        return ToolRunResponse(
+            tool="web.fetch",
+            ok=False,
+            summary="blocked live page",
+            data={"url": args["url"], "text": "", "blocked": True},
+        )
+
+    async def archive_must_not_run(*_args, **_kwargs):
+        raise AssertionError("archive fallback must be disabled for live quotes")
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setattr(tools_module, "_web_search", fake_search)
+    monkeypatch.setattr(tools_module, "_web_fetch", fake_fetch)
+    monkeypatch.setattr(tools_module, "_web_archive", archive_must_not_run)
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    registry = ToolRegistry(settings, storage, SimpleNamespace())
+    try:
+        result = asyncio.run(
+            registry.run(
+                "web.research",
+                {
+                    "query": "Brent current quote",
+                    "claim": "Какие цены на нефть сейчас?",
+                    "freshness": "day",
+                    "use_cache": False,
+                    "archive_fallback": False,
+                    "max_sources": 2,
+                },
+            )
+        )
+    finally:
+        storage.close()
+
+    assert result.ok is True
+    assert fetch_calls
+    assert all(call["use_cache"] is False for call in fetch_calls)
+
+
+def test_same_sentence_brent_and_wti_values_keep_their_own_benchmark():
+    source = {
+        "title": "Brent and WTI latest settlements",
+        "url": "https://market.example/oil",
+        "excerpt": (
+            "On 2026-07-17 Brent latest settlement is 70.25 USD per barrel and WTI "
+            "latest settlement is 65.12 USD per barrel."
+        ),
+    }
+    grounded = (
+        "On 2026-07-17 Brent latest settlement is 70.25 USD per barrel and WTI latest "
+        "settlement is 65.12 USD per barrel. Source: https://market.example/oil"
+    )
+    swapped = grounded.replace("70.25", "TMP").replace("65.12", "70.25").replace(
+        "TMP", "65.12"
+    )
+    question = "What are the current Brent and WTI prices?"
+
+    assert tools_module._web_answer_financial_synthesis_rejection(
+        grounded,
+        question=question,
+        sources=[source],
+    ) == ""
+    assert tools_module._web_answer_financial_synthesis_rejection(
+        swapped,
+        question=question,
+        sources=[source],
+    ) == "unsupported_financial_number"
+
+
+def test_same_sentence_equity_values_cannot_be_swapped_between_companies():
+    source = {
+        "title": "Apple and Microsoft stock quotes",
+        "url": "https://market.example/mega-cap",
+        "excerpt": (
+            "Apple AAPL stock on NASDAQ was 225.25 USD on 2026-07-17 and Microsoft "
+            "MSFT stock on NASDAQ was 510.50 USD on 2026-07-17."
+        ),
+    }
+    swapped = (
+        "Apple AAPL stock on NASDAQ was 510.50 USD on 2026-07-17 and Microsoft MSFT "
+        "stock on NASDAQ was 225.25 USD on 2026-07-17. "
+        "Source: https://market.example/mega-cap"
+    )
+
+    assert tools_module._web_answer_financial_synthesis_rejection(
+        swapped,
+        question="What are the current Apple and Microsoft stock prices?",
+        sources=[source],
+    ) == "unsupported_financial_number"
+
+
+def test_each_etf_and_bond_value_keeps_its_own_metric():
+    etf_source = {
+        "title": "SPY ETF price and NAV",
+        "url": "https://market.example/spy",
+        "excerpt": (
+            "SPY ETF market price was 630.00 USD on NYSE on 2026-07-17 and NAV was "
+            "629.00 USD on NYSE on 2026-07-17."
+        ),
+    }
+    bond_source = {
+        "title": "OFZ bond price and yield",
+        "url": "https://market.example/ofz",
+        "excerpt": (
+            "OFZ 26238 bond price was 98.50 RUB on MOEX on 2026-07-17 and current yield "
+            "was 4.25 percent on MOEX on 2026-07-17."
+        ),
+    }
+
+    assert tools_module._web_answer_financial_synthesis_rejection(
+        (
+            "SPY ETF NAV was 630.00 USD on NYSE on 2026-07-17. "
+            "Source: https://market.example/spy"
+        ),
+        question="What is the current NAV of SPY ETF?",
+        sources=[etf_source],
+    ) == "unsupported_financial_number"
+    assert tools_module._web_answer_financial_synthesis_rejection(
+        (
+            "OFZ 26238 bond current yield was 98.50 percent on MOEX on 2026-07-17. "
+            "Source: https://market.example/ofz"
+        ),
+        question="What is the current yield of OFZ 26238 bond?",
+        sources=[bond_source],
+    ) == "unsupported_financial_number"
+
+
+def test_english_stock_price_is_not_mistaken_for_the_ice_oil_venue():
+    question = "What is the current Apple stock price?"
+    source = {
+        "title": "Apple AAPL stock quote",
+        "url": "https://market.example/aapl",
+        "excerpt": "Apple AAPL stock on NASDAQ last traded at 225.25 USD on 2026-07-17.",
+    }
+    answer = (
+        "Apple AAPL stock on NASDAQ last traded at 225.25 USD on 2026-07-17. "
+        "Source: https://market.example/aapl"
+    )
+
+    assert tools_module._web_answer_looks_like_financial_market(question.casefold())
+    assert tools_module._web_answer_financial_synthesis_rejection(
+        answer,
+        question=question,
+        sources=[source],
+    ) == ""
+
+
+def test_current_exchange_quote_requires_latest_available_weekday_session():
+    today = date(2026, 7, 19)  # Sunday; Friday the 17th is the latest session.
+
+    assert tools_module._web_answer_financial_date_is_fresh(
+        date(2026, 7, 17), kind="equity", today=today
+    )
+    assert not tools_module._web_answer_financial_date_is_fresh(
+        date(2026, 7, 16), kind="equity", today=today
+    )
+    assert not tools_module._web_answer_financial_date_is_fresh(
+        date(2026, 7, 20), kind="equity", today=today
+    )
+
+
+def test_cash_index_source_rejects_index_futures_contract():
+    question = "What is the current S&P 500 index level?"
+    source_text = (
+        "S&P 500 index futures contract latest level is 6550.25 points today."
+    )
+
+    assert tools_module._web_answer_financial_instrument_kind(question) == "index"
+    assert not tools_module._web_answer_financial_source_relevant(
+        question,
+        source_text,
+        kind="index",
+    )
+
+
+def test_fx_value_cannot_be_borrowed_from_another_pair_in_the_same_sentence():
+    source = {
+        "title": "USD/RUB and EUR/USD live forex quotes",
+        "url": "https://fx.example/live",
+        "excerpt": (
+            "On 2026-07-17 USD/RUB latest forex quote was 90.25 and EUR/USD latest "
+            "forex quote was 1.08."
+        ),
+    }
+    answer = (
+        "USD/RUB latest forex quote is 1.08 RUB per USD on 2026-07-17. "
+        "Source: https://fx.example/live"
+    )
+
+    assert tools_module._web_answer_financial_synthesis_rejection(
+        answer,
+        question="What is the current USD/RUB exchange rate?",
+        sources=[source],
+    ) == "unsupported_financial_number"

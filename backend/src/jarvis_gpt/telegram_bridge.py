@@ -24,7 +24,9 @@ import logging
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
+import uuid
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
@@ -33,7 +35,7 @@ from urllib.parse import quote
 
 import httpx
 
-from .config import load_local_env_file
+from .config import default_home, load_local_env_file
 from .telegram_format import html_to_plain, render_telegram_html, split_telegram_html
 
 log = logging.getLogger("jarvis.telegram")
@@ -91,17 +93,41 @@ TG_MSG_LIMIT = 4096
 # Telegram bots can send documents up to 50 MB; guard a little under that.
 TG_DOC_CAP = 45 * 1024 * 1024
 TYPING_REFRESH_SEC = 4.0
-_RESET_COMMANDS = {"/start", "/new", "/reset", "/новый", "/сброс"}
+_START_COMMANDS = {"/start"}
+_RESET_COMMANDS = {"/new", "/reset", "/новый", "/сброс"}
 
 # Audio/video attachments are transcribed backend-side; the bridge only relays them and,
 # for a spoken turn, mirrors the modality by replying with a synthesized voice note.
 _AUDIO_MIME_PREFIXES = ("audio/", "video/")
 _AUDIO_EXTENSIONS = frozenset(
     {
-        ".ogg", ".oga", ".opus", ".mp3", ".wav", ".m4a", ".aac", ".flac", ".wma",
-        ".mp4", ".webm", ".mov", ".mkv", ".m4v", ".avi",
+        ".ogg",
+        ".oga",
+        ".opus",
+        ".mp3",
+        ".wav",
+        ".m4a",
+        ".aac",
+        ".flac",
+        ".wma",
+        ".mp4",
+        ".webm",
+        ".mov",
+        ".mkv",
+        ".m4v",
+        ".avi",
     }
 )
+
+
+def _telegram_command(text: str) -> str:
+    tokens = str(text or "").strip().split(maxsplit=1)
+    if not tokens:
+        return ""
+    first_token = tokens[0].casefold()
+    if not first_token.startswith("/"):
+        return ""
+    return first_token.split("@", 1)[0]
 
 
 def _looks_like_audio(attachment: Mapping[str, object]) -> bool:
@@ -124,8 +150,19 @@ def _wav_to_ogg_opus(wav: bytes) -> bytes | None:
     try:
         proc = subprocess.run(
             [
-                ffmpeg, "-hide_banner", "-loglevel", "error",
-                "-i", "pipe:0", "-c:a", "libopus", "-b:a", "48k", "-f", "ogg", "pipe:1",
+                ffmpeg,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                "pipe:0",
+                "-c:a",
+                "libopus",
+                "-b:a",
+                "48k",
+                "-f",
+                "ogg",
+                "pipe:1",
             ],
             input=wav,
             capture_output=True,
@@ -154,6 +191,11 @@ class TelegramConfig:
     # message was itself voice/audio. A text message always gets a text-only reply.
     voice_replies: bool = True
     voice_reply_max_chars: int = 1500
+    # The Telegram chat -> backend conversation binding must outlive the bridge process.
+    # ``load_config`` always supplies a durable path; None is kept only for explicitly
+    # constructed test/embedded configurations.
+    conversation_store_path: Path | None = None
+    legacy_conversation_store_path: Path | None = None
 
 
 def load_config(env: Mapping[str, str] | None = None) -> TelegramConfig:
@@ -169,16 +211,12 @@ def load_config(env: Mapping[str, str] | None = None) -> TelegramConfig:
     try:
         ids = frozenset(
             int(part)
-            for part in re.split(
-                r"[,\s]+", (env.get("TELEGRAM_ALLOWED_CHAT_IDS") or "").strip()
-            )
+            for part in re.split(r"[,\s]+", (env.get("TELEGRAM_ALLOWED_CHAT_IDS") or "").strip())
             if part
         )
         configured_owners = frozenset(
             int(part)
-            for part in re.split(
-                r"[,\s]+", (env.get("TELEGRAM_OWNER_CHAT_IDS") or "").strip()
-            )
+            for part in re.split(r"[,\s]+", (env.get("TELEGRAM_OWNER_CHAT_IDS") or "").strip())
             if part
         )
     except ValueError as exc:
@@ -214,6 +252,8 @@ def load_config(env: Mapping[str, str] | None = None) -> TelegramConfig:
         voice_max = int((env.get("TELEGRAM_VOICE_REPLY_MAX_CHARS") or "").strip())
     except (TypeError, ValueError):
         voice_max = 1500
+    state_dir = default_home() / "data" / "jarvis-gpt" / "state"
+    configured_store = (env.get("TELEGRAM_CONVERSATION_STORE_PATH") or "").strip()
     return TelegramConfig(
         bot_token=token,
         allowed_chat_ids=ids,
@@ -222,6 +262,12 @@ def load_config(env: Mapping[str, str] | None = None) -> TelegramConfig:
         api_token=(env.get("JARVIS_API_TOKEN") or "").strip(),
         voice_replies=voice_replies,
         voice_reply_max_chars=voice_max,
+        conversation_store_path=Path(
+            configured_store or state_dir / "jarvis.sqlite3"
+        ),
+        legacy_conversation_store_path=(
+            None if configured_store else state_dir / "telegram_bridge.sqlite3"
+        ),
     )
 
 
@@ -245,6 +291,177 @@ def _chunks(text: str, limit: int = TG_MSG_LIMIT) -> list[str]:
     if buffer:
         out.append(buffer)
     return out or [" "]
+
+
+class TelegramConversationIsolationError(RuntimeError):
+    """A backend conversation id is already bound to another Telegram principal."""
+
+
+class TelegramConversationStore:
+    """Durable one-to-one Telegram principal -> backend conversation binding.
+
+    The bridge allocates and commits a conversation id *before* the first backend turn.
+    This closes the crash window that existed when the id was learned only from the
+    response and lived in a process-local dict. SQLite transactions plus FULL synchronous
+    mode make the mapping survive process restarts and sudden power loss.
+    """
+
+    def __init__(self, path: Path, *, legacy_path: Path | None = None) -> None:
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self._connect() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS telegram_conversations (
+                    chat_id INTEGER PRIMARY KEY,
+                    conversation_id TEXT NOT NULL UNIQUE,
+                    access_mode TEXT NOT NULL CHECK(access_mode IN ('owner', 'guest')),
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+        self._migrate_legacy_store(legacy_path)
+
+    def _migrate_legacy_store(self, legacy_path: Path | None) -> None:
+        if legacy_path is None or not legacy_path.exists():
+            return
+        if legacy_path.resolve() == self.path.resolve():
+            return
+        try:
+            with sqlite3.connect(legacy_path, timeout=5.0) as legacy:
+                rows = legacy.execute(
+                    """
+                    SELECT chat_id, conversation_id, access_mode, updated_at
+                    FROM telegram_conversations
+                    """
+                ).fetchall()
+        except sqlite3.Error:
+            log.exception("Could not read legacy Telegram conversation bindings")
+            return
+        if not rows:
+            return
+        migrated = 0
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for chat_id, conversation_id, access_mode, updated_at in rows:
+                existing = conn.execute(
+                    "SELECT 1 FROM telegram_conversations WHERE chat_id = ?",
+                    (chat_id,),
+                ).fetchone()
+                if existing is not None:
+                    continue
+                try:
+                    conn.execute(
+                        """
+                        INSERT INTO telegram_conversations(
+                            chat_id, conversation_id, access_mode, updated_at
+                        ) VALUES (?, ?, ?, ?)
+                        """,
+                        (chat_id, conversation_id, access_mode, updated_at),
+                    )
+                except sqlite3.IntegrityError:
+                    log.warning(
+                        "Skipped conflicting legacy Telegram binding for chat_id=%s",
+                        chat_id,
+                    )
+                    continue
+                migrated += 1
+        if migrated:
+            log.info("Migrated %d Telegram conversation binding(s) into main database", migrated)
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.path, timeout=5.0)
+        conn.execute("PRAGMA busy_timeout = 5000")
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = FULL")
+        return conn
+
+    @staticmethod
+    def _new_conversation_id() -> str:
+        return f"tg_{uuid.uuid4().hex}"
+
+    def load_all(self) -> dict[int, str]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT chat_id, conversation_id FROM telegram_conversations"
+            ).fetchall()
+        return {int(chat_id): str(conversation_id) for chat_id, conversation_id in rows}
+
+    def get_or_create(self, chat_id: int, access_mode: str) -> str:
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT conversation_id, access_mode
+                FROM telegram_conversations
+                WHERE chat_id = ?
+                """,
+                (chat_id,),
+            ).fetchone()
+            if row is not None and row[1] == access_mode:
+                return str(row[0])
+
+            conversation_id = self._new_conversation_id()
+            conn.execute(
+                """
+                INSERT INTO telegram_conversations(
+                    chat_id, conversation_id, access_mode, updated_at
+                ) VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    conversation_id = excluded.conversation_id,
+                    access_mode = excluded.access_mode,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (chat_id, conversation_id, access_mode),
+            )
+            return conversation_id
+
+    def rotate(self, chat_id: int, access_mode: str) -> str:
+        conversation_id = self._new_conversation_id()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                INSERT INTO telegram_conversations(
+                    chat_id, conversation_id, access_mode, updated_at
+                ) VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    conversation_id = excluded.conversation_id,
+                    access_mode = excluded.access_mode,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (chat_id, conversation_id, access_mode),
+            )
+        return conversation_id
+
+    def bind(self, chat_id: int, conversation_id: str, access_mode: str) -> None:
+        """Accept a backend-normalized id without allowing cross-chat reuse."""
+
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            owner = conn.execute(
+                """
+                SELECT chat_id FROM telegram_conversations
+                WHERE conversation_id = ? AND chat_id != ?
+                """,
+                (conversation_id, chat_id),
+            ).fetchone()
+            if owner is not None:
+                raise TelegramConversationIsolationError(
+                    "backend conversation id is already bound to another Telegram chat"
+                )
+            conn.execute(
+                """
+                INSERT INTO telegram_conversations(
+                    chat_id, conversation_id, access_mode, updated_at
+                ) VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    conversation_id = excluded.conversation_id,
+                    access_mode = excluded.access_mode,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (chat_id, conversation_id, access_mode),
+            )
 
 
 class TelegramBridge:
@@ -274,11 +491,53 @@ class TelegramBridge:
             if cfg.owner_chat_ids
             else (cfg.allowed_chat_ids if len(cfg.allowed_chat_ids) == 1 else frozenset())
         )
-        self.conversations: dict[int, str] = {}
+        self._conversation_store = (
+            TelegramConversationStore(
+                cfg.conversation_store_path,
+                legacy_path=cfg.legacy_conversation_store_path,
+            )
+            if cfg.conversation_store_path is not None
+            else None
+        )
+        self.conversations: dict[int, str] = (
+            self._conversation_store.load_all() if self._conversation_store else {}
+        )
+        self._conversation_modes: dict[int, str] = {}
         self._offset = 0
 
     async def aclose(self) -> None:
         await asyncio.gather(self.tg.aclose(), self.api.aclose(), return_exceptions=True)
+
+    def _conversation_for(self, chat_id: int, access_mode: str) -> str:
+        if self._conversation_store is not None:
+            conversation_id = self._conversation_store.get_or_create(chat_id, access_mode)
+        else:
+            conversation_id = self.conversations.get(chat_id, "")
+            if not conversation_id or self._conversation_modes.get(chat_id) != access_mode:
+                conversation_id = TelegramConversationStore._new_conversation_id()
+        self.conversations[chat_id] = conversation_id
+        self._conversation_modes[chat_id] = access_mode
+        return conversation_id
+
+    def _rotate_conversation(self, chat_id: int, access_mode: str) -> str:
+        if self._conversation_store is not None:
+            conversation_id = self._conversation_store.rotate(chat_id, access_mode)
+        else:
+            conversation_id = TelegramConversationStore._new_conversation_id()
+        self.conversations[chat_id] = conversation_id
+        self._conversation_modes[chat_id] = access_mode
+        return conversation_id
+
+    def _bind_conversation(self, chat_id: int, conversation_id: str, access_mode: str) -> None:
+        for other_chat_id, bound_id in self.conversations.items():
+            if other_chat_id != chat_id and bound_id == conversation_id:
+                raise TelegramConversationIsolationError(
+                    "backend conversation id is already bound to another Telegram chat"
+                )
+        if self._conversation_store is not None:
+            self._conversation_store.bind(chat_id, conversation_id, access_mode)
+        self.conversations[chat_id] = conversation_id
+        self._conversation_modes[chat_id] = access_mode
 
     # -- Telegram API ---------------------------------------------------------
     async def _tg(self, method: str, **params: object) -> object:
@@ -371,10 +630,14 @@ class TelegramBridge:
             return
 
         text = (message.get("text") or message.get("caption") or "").strip()
-        if text in _RESET_COMMANDS:
-            self.conversations.pop(chat_id, None)
-            ack = "Джарвис на связи." if text in {"/start"} else "Начал новый разговор."
-            await self._send(chat_id, ack)
+        command = _telegram_command(text)
+        if command in _START_COMMANDS:
+            await self._send(chat_id, "Джарвис на связи.")
+            return
+        if command in _RESET_COMMANDS:
+            access_mode = "owner" if chat_id in self._owner_chat_ids else "guest"
+            self._rotate_conversation(chat_id, access_mode)
+            await self._send(chat_id, "Начал новый разговор.")
             return
 
         is_owner = chat_id in self._owner_chat_ids
@@ -443,9 +706,7 @@ class TelegramBridge:
                 attachments.append(record)
         return attachments
 
-    async def _upload_from_telegram(
-        self, file_id: str, name: str, mime: str | None
-    ) -> dict | None:
+    async def _upload_from_telegram(self, file_id: str, name: str, mime: str | None) -> dict | None:
         info = await self._tg("getFile", file_id=file_id)
         file_path = info.get("file_path") if isinstance(info, dict) else None
         if not file_path:
@@ -481,14 +742,14 @@ class TelegramBridge:
         before = await self._file_ids() if is_owner else set()
         typing = asyncio.create_task(self._typing_keepalive(chat_id))
         try:
+            access_mode = "owner" if is_owner else "guest"
+            conversation_id = self._conversation_for(chat_id, access_mode)
             payload: dict[str, object] = {
                 "message": text,
-                "access_mode": "owner" if is_owner else "guest",
+                "access_mode": access_mode,
                 "notification_chat_id": chat_id if is_owner else None,
+                "conversation_id": conversation_id,
             }
-            conversation_id = self.conversations.get(chat_id)
-            if conversation_id:
-                payload["conversation_id"] = conversation_id
             if attachments:
                 payload["attachments"] = attachments
             try:
@@ -504,8 +765,20 @@ class TelegramBridge:
             with suppress(asyncio.CancelledError):
                 await typing
 
-        if body.get("conversation_id"):
-            self.conversations[chat_id] = body["conversation_id"]
+        returned_conversation_id = str(body.get("conversation_id") or "").strip()
+        if returned_conversation_id and returned_conversation_id != conversation_id:
+            try:
+                self._bind_conversation(chat_id, returned_conversation_id, access_mode)
+            except TelegramConversationIsolationError:
+                log.exception(
+                    "refusing cross-chat backend conversation binding for chat_id=%s",
+                    chat_id,
+                )
+                await self._send(
+                    chat_id,
+                    "Не смог безопасно продолжить диалог. Начни новый через /new.",
+                )
+                return
         answer = body.get("answer") or "(пустой ответ)"
         await self._send(chat_id, answer)
         if voice_reply and self.cfg.voice_replies:

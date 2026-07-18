@@ -30,6 +30,13 @@ automatically. ~690 GB free on D: — plenty for the ~25 GB pull.
 ## 2. Serve it
 
 ```powershell
+# Build the digest-pinned vLLM 0.25.1 derivative. It changes only the HTTP API's
+# top-level runner from uvloop.run() to asyncio.run().
+docker build --pull=false `
+  -f D:\jarvis-gpt\docker\vllm-asyncio\Dockerfile `
+  -t jarvis/vllm-openai:v0.25.1-asyncio-e4f88a8 `
+  D:\jarvis-gpt
+
 # stop the current gemma dispatcher, bring the Qwen one up with this profile's env
 py -3.11 D:\jarvis-gpt\jarvis.py dispatcher-down
 py -3.11 D:\jarvis-gpt\jarvis.py --profile qwen36-vl dispatcher-up
@@ -66,10 +73,14 @@ Watch for repeated-token degeneration and OOM in the container logs.
 
 ## Key risks / notes
 
-- **vLLM arch support**: the compose image is `vllm/vllm-openai:v0.23.0`. It must support
-  `Qwen3_5MoeForConditionalGeneration`. If the container fails to load the model, pin a
-  newer image via the `JARVIS_VLLM_IMAGE` env var before `dispatcher-up`.
+- **vLLM runtime**: Qwen uses the local
+  `jarvis/vllm-openai:v0.25.1-asyncio-e4f88a8` derivative. Its base is pinned by digest to
+  vLLM 0.25.1 and its build fails closed unless the upstream `serve.py` SHA256 matches.
+  Rebuild the image explicitly after Docker data loss; do not substitute a floating base.
 - **Using vision**: this profile makes the model *serve* with vision; wiring image/video
   from the chat composer through the agent to the model is a separate follow-up.
-- **Rollback**: `dispatcher-down` then serve `--profile gemma4-turbo` — gemma is untouched
-  and stays the certified default.
+- **Runtime-image rollback**: stop the stack, set
+  `$env:JARVIS_VLLM_IMAGE="vllm/vllm-openai:v0.25.1"`, then start `qwen36-vl` again.
+  The model and all serving arguments stay unchanged while only the event-loop patch is
+  removed. Full profile rollback remains `dispatcher-down` followed by
+  `--profile gemma4-turbo`; gemma is untouched and stays the certified default.

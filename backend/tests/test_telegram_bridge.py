@@ -6,12 +6,15 @@ import asyncio
 import io
 import json
 import logging
+import sqlite3
 
 import httpx
 import pytest
+from jarvis_gpt.storage import JarvisStorage
 from jarvis_gpt.telegram_bridge import (
     TelegramBridge,
     TelegramConfig,
+    TelegramConversationStore,
     _chunks,
     _configure_logging,
     _looks_like_audio,
@@ -61,13 +64,13 @@ def test_load_config_parses_allowlist():
     )
     assert cfg.allowed_chat_ids == frozenset({42, 7, 99})
     assert cfg.owner_chat_ids == frozenset({42})
+    assert cfg.conversation_store_path.name == "jarvis.sqlite3"
+    assert cfg.legacy_conversation_store_path.name == "telegram_bridge.sqlite3"
 
 
 def test_load_config_requires_explicit_owner_for_multiple_users():
     with pytest.raises(SystemExit, match="TELEGRAM_OWNER_CHAT_IDS"):
-        load_config(
-            {"TELEGRAM_BOT_TOKEN": "T", "TELEGRAM_ALLOWED_CHAT_IDS": "42, 99"}
-        )
+        load_config({"TELEGRAM_BOT_TOKEN": "T", "TELEGRAM_ALLOWED_CHAT_IDS": "42, 99"})
 
 
 def test_logging_never_exposes_bot_token(monkeypatch):
@@ -166,9 +169,11 @@ def test_text_turn_relays_to_backend_and_replies():
     assert chat_bodies[0]["message"] == "здравствуй"
     assert chat_bodies[0]["access_mode"] == "owner"
     assert chat_bodies[0]["notification_chat_id"] == 42
-    assert "conversation_id" not in chat_bodies[0]  # first turn has no prior conversation
+    # The bridge allocates the id before the backend call, closing the crash window where
+    # a completed first turn could be orphaned before its returned id was remembered.
+    assert chat_bodies[0]["conversation_id"].startswith("tg_")
     assert any(m.get("text") == "Привет!" for m in sent)
-    # conversation id is remembered for the next turn
+    # A backend-normalized id is remembered for the next turn.
     assert bridge.conversations[42] == "c1"
 
 
@@ -206,9 +211,11 @@ def test_non_owner_allowed_chat_uses_isolated_guest_surface():
 
     asyncio.run(bridge._handle(update))
 
-    assert chat_bodies == [
-        {"message": "привет", "access_mode": "guest", "notification_chat_id": None}
-    ]
+    assert len(chat_bodies) == 1
+    assert chat_bodies[0]["message"] == "привет"
+    assert chat_bodies[0]["access_mode"] == "guest"
+    assert chat_bodies[0]["notification_chat_id"] is None
+    assert chat_bodies[0]["conversation_id"].startswith("tg_")
     assert api_calls == ["/api/chat"]
 
 
@@ -239,7 +246,7 @@ def test_guest_attachment_never_reaches_file_or_agent_api():
     assert api_calls == []
 
 
-def test_reset_command_drops_conversation_without_calling_agent():
+def test_reset_command_rotates_conversation_without_calling_agent():
     api_calls: list[str] = []
 
     def api_handler(request):
@@ -250,7 +257,268 @@ def test_reset_command_drops_conversation_without_calling_agent():
     bridge.conversations[42] = "old"
     update = {"update_id": 1, "message": {"chat": {"id": 42, "type": "private"}, "text": "/new"}}
     asyncio.run(bridge._handle(update))
-    assert 42 not in bridge.conversations
+    assert bridge.conversations[42].startswith("tg_")
+    assert bridge.conversations[42] != "old"
+    assert "/api/chat" not in api_calls
+
+
+def test_start_command_preserves_existing_conversation():
+    api_calls: list[str] = []
+
+    def api_handler(request):
+        api_calls.append(request.url.path)
+        return httpx.Response(200, json={})
+
+    bridge = _bridge(
+        lambda _request: httpx.Response(200, json={"ok": True, "result": {}}),
+        api_handler,
+    )
+    bridge.conversations[42] = "existing"
+    update = {
+        "update_id": 1,
+        "message": {"chat": {"id": 42, "type": "private"}, "text": "/start"},
+    }
+
+    asyncio.run(bridge._handle(update))
+
+    assert bridge.conversations[42] == "existing"
+    assert "/api/chat" not in api_calls
+
+
+def test_conversation_ids_survive_restart_and_stay_isolated_per_chat(tmp_path):
+    chat_bodies: list[dict] = []
+
+    def tg_handler(_request):
+        return httpx.Response(200, json={"ok": True, "result": {}})
+
+    def api_handler(request):
+        if request.url.path == "/api/files":
+            return httpx.Response(200, json=[])
+        if request.url.path == "/api/chat":
+            payload = json.loads(request.content)
+            chat_bodies.append(payload)
+            return httpx.Response(
+                200,
+                json={
+                    "conversation_id": payload["conversation_id"],
+                    "message_id": "m",
+                    "answer": "ok",
+                    "events": [],
+                },
+            )
+        return httpx.Response(404)
+
+    cfg = {
+        "allowed_chat_ids": frozenset({42, 99}),
+        "owner_chat_ids": frozenset({42}),
+        "conversation_store_path": tmp_path / "telegram.sqlite3",
+    }
+    owner_update = {
+        "update_id": 1,
+        "message": {"chat": {"id": 42, "type": "private"}, "text": "owner-1"},
+    }
+    guest_update = {
+        "update_id": 2,
+        "message": {"chat": {"id": 99, "type": "private"}, "text": "guest-1"},
+    }
+
+    first = _bridge(tg_handler, api_handler, **cfg)
+    asyncio.run(first._handle(owner_update))
+    asyncio.run(first._handle(guest_update))
+    owner_id, guest_id = (body["conversation_id"] for body in chat_bodies)
+    assert owner_id != guest_id
+    asyncio.run(first.aclose())
+
+    second = _bridge(tg_handler, api_handler, **cfg)
+    owner_update["message"]["text"] = "owner-2"
+    guest_update["message"]["text"] = "guest-2"
+    asyncio.run(second._handle(owner_update))
+    asyncio.run(second._handle(guest_update))
+    asyncio.run(second.aclose())
+
+    assert chat_bodies[2]["conversation_id"] == owner_id
+    assert chat_bodies[2]["access_mode"] == "owner"
+    assert chat_bodies[3]["conversation_id"] == guest_id
+    assert chat_bodies[3]["access_mode"] == "guest"
+
+
+def test_reset_rotation_is_persisted_before_the_next_turn(tmp_path):
+    chat_bodies: list[dict] = []
+
+    def tg_handler(_request):
+        return httpx.Response(200, json={"ok": True, "result": {}})
+
+    def api_handler(request):
+        if request.url.path == "/api/files":
+            return httpx.Response(200, json=[])
+        if request.url.path == "/api/chat":
+            payload = json.loads(request.content)
+            chat_bodies.append(payload)
+            return httpx.Response(
+                200,
+                json={
+                    "conversation_id": payload["conversation_id"],
+                    "message_id": "m",
+                    "answer": "ok",
+                    "events": [],
+                },
+            )
+        return httpx.Response(404)
+
+    state_path = tmp_path / "telegram.sqlite3"
+    first = _bridge(
+        tg_handler,
+        api_handler,
+        conversation_store_path=state_path,
+    )
+    turn = {
+        "update_id": 1,
+        "message": {"chat": {"id": 42, "type": "private"}, "text": "before"},
+    }
+    asyncio.run(first._handle(turn))
+    previous_id = chat_bodies[-1]["conversation_id"]
+    turn["message"]["text"] = "/reset"
+    asyncio.run(first._handle(turn))
+    reset_id = first.conversations[42]
+    assert reset_id != previous_id
+    asyncio.run(first.aclose())
+
+    second = _bridge(
+        tg_handler,
+        api_handler,
+        conversation_store_path=state_path,
+    )
+    turn["message"]["text"] = "after"
+    asyncio.run(second._handle(turn))
+    asyncio.run(second.aclose())
+
+    assert chat_bodies[-1]["conversation_id"] == reset_id
+
+
+def test_access_mode_change_rotates_persisted_conversation(tmp_path):
+    chat_bodies: list[dict] = []
+
+    def tg_handler(_request):
+        return httpx.Response(200, json={"ok": True, "result": {}})
+
+    def api_handler(request):
+        if request.url.path == "/api/files":
+            return httpx.Response(200, json=[])
+        if request.url.path == "/api/chat":
+            payload = json.loads(request.content)
+            chat_bodies.append(payload)
+            return httpx.Response(
+                200,
+                json={
+                    "conversation_id": payload["conversation_id"],
+                    "message_id": "m",
+                    "answer": "ok",
+                    "events": [],
+                },
+            )
+        return httpx.Response(404)
+
+    state_path = tmp_path / "telegram.sqlite3"
+    guest = _bridge(
+        tg_handler,
+        api_handler,
+        allowed_chat_ids=frozenset({42, 99}),
+        owner_chat_ids=frozenset({42}),
+        conversation_store_path=state_path,
+    )
+    update = {
+        "update_id": 1,
+        "message": {"chat": {"id": 99, "type": "private"}, "text": "guest"},
+    }
+    asyncio.run(guest._handle(update))
+    guest_id = chat_bodies[-1]["conversation_id"]
+    asyncio.run(guest.aclose())
+
+    promoted_owner = _bridge(
+        tg_handler,
+        api_handler,
+        allowed_chat_ids=frozenset({99}),
+        owner_chat_ids=frozenset({99}),
+        conversation_store_path=state_path,
+    )
+    update["message"]["text"] = "owner"
+    asyncio.run(promoted_owner._handle(update))
+    asyncio.run(promoted_owner.aclose())
+
+    assert chat_bodies[-1]["access_mode"] == "owner"
+    assert chat_bodies[-1]["conversation_id"] != guest_id
+
+
+def test_legacy_binding_store_migrates_into_main_database(tmp_path):
+    legacy_path = tmp_path / "telegram_bridge.sqlite3"
+    main_path = tmp_path / "jarvis.sqlite3"
+    legacy = TelegramConversationStore(legacy_path)
+    legacy.bind(42, "tg_existing_owner", "owner")
+
+    main = TelegramConversationStore(main_path, legacy_path=legacy_path)
+
+    assert main.load_all() == {42: "tg_existing_owner"}
+    # Migration is non-destructive and idempotent so rollback remains possible.
+    assert legacy.load_all() == {42: "tg_existing_owner"}
+    assert TelegramConversationStore(main_path, legacy_path=legacy_path).load_all() == {
+        42: "tg_existing_owner"
+    }
+
+
+def test_runtime_database_backup_contains_telegram_bindings(tmp_path):
+    database_path = tmp_path / "state" / "jarvis.sqlite3"
+    storage = JarvisStorage(database_path)
+    storage.initialize()
+    try:
+        conversations = TelegramConversationStore(database_path)
+        conversations.bind(42, "tg_backup_owner", "owner")
+        result = storage.backup_database(tmp_path / "backups")
+    finally:
+        storage.close()
+
+    with sqlite3.connect(result["path"]) as backup:
+        row = backup.execute(
+            """
+            SELECT chat_id, conversation_id, access_mode
+            FROM telegram_conversations
+            """
+        ).fetchone()
+    assert row == (42, "tg_backup_owner", "owner")
+
+
+def test_telegram_command_suffix_and_payload_are_normalized():
+    api_calls: list[str] = []
+
+    def api_handler(request):
+        api_calls.append(request.url.path)
+        return httpx.Response(200, json={})
+
+    bridge = _bridge(
+        lambda _request: httpx.Response(200, json={"ok": True, "result": {}}),
+        api_handler,
+    )
+    bridge.conversations[42] = "existing"
+    start = {
+        "update_id": 1,
+        "message": {
+            "chat": {"id": 42, "type": "private"},
+            "text": "/start payload",
+        },
+    }
+    reset = {
+        "update_id": 2,
+        "message": {
+            "chat": {"id": 42, "type": "private"},
+            "text": "/new@JarvisBot",
+        },
+    }
+
+    asyncio.run(bridge._handle(start))
+    assert bridge.conversations[42] == "existing"
+    asyncio.run(bridge._handle(reset))
+
+    assert bridge.conversations[42].startswith("tg_")
+    assert bridge.conversations[42] != "existing"
     assert "/api/chat" not in api_calls
 
 

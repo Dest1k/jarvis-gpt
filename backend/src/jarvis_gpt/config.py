@@ -300,8 +300,10 @@ PROFILES: dict[str, RuntimeProfile] = {
         kv_offloading_gb=0,
         # Qwen ships only a fast tokenizer.json (no merges.txt) -> slow mode cannot load.
         tokenizer_mode="auto",
-        # NVFP4 needs vLLM >= 0.25 for the fast cutlass/flashinfer kernels.
-        vllm_image="vllm/vllm-openai:v0.25.1",
+        # NVFP4 needs vLLM >= 0.25 for the fast cutlass/flashinfer kernels. The local
+        # derivative keeps that exact runtime and replaces only the unstable uvloop
+        # top-level runner with the standard asyncio loop.
+        vllm_image="jarvis/vllm-openai:v0.25.1-asyncio-e4f88a8",
         # Qwen3.5-VL sees images/video: forward chat image attachments as vision input.
         vision_capable=True,
         # Qwen dumps a free-form thinking trace into the answer with no <think> tags to

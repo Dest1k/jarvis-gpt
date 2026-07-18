@@ -4060,6 +4060,15 @@ def test_web_transcript_reports_local_whisper_unavailable(monkeypatch, tmp_path)
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
     monkeypatch.setattr("jarvis_gpt.tools.shutil.which", lambda _name: None)
+    monkeypatch.setattr(
+        "jarvis_gpt.tools.speech.stt_status",
+        lambda: {
+            "available": False,
+            "engine": None,
+            "faster_whisper": False,
+            "whisper_cli": False,
+        },
+    )
     settings = load_settings()
     ensure_runtime_dirs(settings)
     media_path = settings.home / "clip.mp3"
