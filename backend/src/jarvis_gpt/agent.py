@@ -28,7 +28,7 @@ from . import persona as persona_module
 from . import speech
 from .browser_cdp import DEFAULT_CHROME_DEBUG_URL
 from .cognitive_memory import ExecutionPlaybookStore
-from .config import JarvisSettings
+from .config import PROFILES, JarvisSettings
 from .document_memory import _filenames_mentioned, parse_document_date_scope
 from .embeddings import (
     EmbeddingBackend,
@@ -4214,6 +4214,69 @@ class AgentRuntime:
         )
         return DirectAction(answer=f"{status}: {answer}\n\n{report}", events=[event])
 
+    async def _model_status_summary(self, answer: str) -> DirectAction:
+        """Report the loaded model + profile + dispatcher state + live VRAM (read-only)."""
+
+        disp = await self.tools.run("dispatcher.status", {})
+        health = await self.tools.run("llm.health", {})
+        gpu = await self.tools.run(
+            "system.inspect", {"action": "hardware.gpu", "payload": {}, "timeout_sec": 30}
+        )
+        report = _format_model_status(
+            self.settings,
+            disp.data if isinstance(disp.data, dict) else {},
+            health.data if isinstance(health.data, dict) else {},
+            _native_observation_data(gpu).get("gpus"),
+        )
+        event = ChatEvent(
+            type="tool_call",
+            title="dispatcher.status+llm.health",
+            content=report,
+            payload={"tool": "dispatcher.status", "ok": disp.ok, "action": "model.status"},
+        )
+        return DirectAction(answer=f"{answer}.\n\n{report}", events=[event])
+
+    def _model_switch_profile_answer(self, payload: dict[str, Any]) -> DirectAction:
+        """Cross-profile swap can't be live (frozen settings) — report how to do it."""
+
+        target = str((payload or {}).get("target") or "").strip()
+        current = getattr(getattr(self.settings, "profile", None), "name", "?")
+        target_profile = PROFILES.get(target)
+        if target_profile is None:
+            visible = [n for n, prof in PROFILES.items() if getattr(prof, "menu_visible", False)]
+            menu = ", ".join(sorted(visible))
+            return DirectAction(answer=f"Не знаю профиль «{target}». Доступны: {menu}.", events=[])
+        if target == current:
+            return DirectAction(answer=f"Уже работает профиль {current}.", events=[])
+        image = getattr(target_profile, "vllm_image", "?")
+        model_dir = getattr(target_profile, "model_dir_name", target)
+        msg = (
+            f"Сейчас активен профиль {current}. Горячего переключения на {target} нет — профиль "
+            f"читается один раз при старте, модель грузится заново. Чтобы переключить, перезапусти "
+            f"сервер:\n  py -3.11 jarvis.py --profile {target} serve\n"
+            f"(диспетчер поднимется на образе {image} с моделью {model_dir})."
+        )
+        return DirectAction(answer=msg, events=[])
+
+    async def _dispatcher_control_action(self, native_action: NativeAction) -> DirectAction:
+        """Run a dispatcher restart/stop/start (owner's turn authorizes it, allow_danger)."""
+
+        tool = native_action.action
+        result = await self.tools.run(tool, {}, allow_danger=True)
+        status = "Готово" if result.ok else "Не смог выполнить"
+        note = ""
+        if result.ok and tool in ("dispatcher.restart", "dispatcher.start"):
+            note = " Модель прогреется ещё 1–2 минуты."
+        event = ChatEvent(
+            type="tool_call",
+            title=tool,
+            content=result.summary,
+            payload={"tool": result.tool, "ok": result.ok, "action": tool},
+        )
+        return DirectAction(
+            answer=f"{status}: {native_action.answer}.{note}\n\n{result.summary}", events=[event]
+        )
+
     async def _try_direct_action(
         self,
         message: str,
@@ -4278,6 +4341,24 @@ class AgentRuntime:
             # bridge action for it; gather RAM + CPU + disk + GPU via the read-only
             # system.inspect facade and format one combined summary.
             return await self._machine_health_summary(native_action.answer)
+        if native_action is not None and native_action.action == "model.status":
+            # Read-only "какая модель загружена / статус диспетчера" report.
+            return await self._model_status_summary(native_action.answer)
+        if native_action is not None and native_action.action == "model.switch_profile":
+            # Informational only — cross-profile hot-swap isn't possible live.
+            return self._model_switch_profile_answer(native_action.payload)
+        if native_action is not None and native_action.action in (
+            "dispatcher.restart",
+            "dispatcher.stop",
+            "dispatcher.start",
+        ):
+            # Controlling the model dispatcher is a real side effect. Under owner
+            # full-autonomy the owner's own turn authorizes it (allow_danger); in the
+            # gated posture, clear it so the agentic loop runs the tool through the
+            # operator-approval path instead of mis-dispatching to windows.native.
+            if self._owner_autonomy_active():
+                return await self._dispatcher_control_action(native_action)
+            native_action = None
         if (
             native_action is not None
             and native_action.action == "clipboard.write"
@@ -10828,6 +10909,112 @@ def _format_gpu(value: Any) -> str:
     if not lines:
         return ""
     return "\n\nGPU (nvidia-smi):\n" + "\n".join(lines)
+
+
+# Profile aliases for "переключись на …" — map spoken names to real profile keys.
+_MODEL_PROFILE_ALIASES: tuple[tuple[str, str], ...] = (
+    ("gemma", "gemma4-turbo"),
+    ("гемма", "gemma4-turbo"),
+    ("джемма", "gemma4-turbo"),
+    ("qwen", "qwen36-vl"),
+    ("квен", "qwen36-vl"),
+    ("квэн", "qwen36-vl"),
+    ("куэн", "qwen36-vl"),
+)
+# Nouns that mark a "control the local model/dispatcher" turn (paired with a control verb).
+_MODEL_CONTROL_NOUNS = (
+    "модел", "мозг", "диспетчер", "нейросет", "vllm", "qwen", "gemma", "гемма", "квен",
+)
+
+
+def _model_control_action(normalized: str) -> NativeAction | None:
+    """Detect a model/dispatcher control turn: switch profile, restart/stop/start, or status.
+
+    Precise by construction — a control verb must pair with a model/dispatcher noun, and
+    device-spec/shopping phrasings ("какая модель телефона", "купить") are excluded.
+    """
+
+    if _contains_any(
+        normalized,
+        ("купить", "куплю", "цена", "цены", "дешевл", "дешев", "магазин", "заказ",
+         "телефон", "смартфон", "ноутбук", "стоит", "стоимост"),
+    ):
+        return None
+    has_noun = _contains_any(normalized, _MODEL_CONTROL_NOUNS)
+    # Switch profile (a named target + a switch/launch verb).
+    if _contains_any(
+        normalized,
+        ("переключ", "смени", "смена", "поменяй", "перейди", "активируй", "запусти",
+         "включи", "стартуй", "подними"),
+    ):
+        for alias, profile in _MODEL_PROFILE_ALIASES:
+            if alias in normalized:
+                return NativeAction(
+                    action="model.switch_profile",
+                    payload={"target": profile},
+                    answer=f"переключение профиля модели на {profile}",
+                )
+    if has_noun and _contains_any(
+        normalized, ("перезапусти", "перезагрузи", "рестарт", "restart", "ребутни", "переподними")
+    ):
+        return NativeAction(
+            action="dispatcher.restart", payload={}, answer="перезапуск диспетчера модели"
+        )
+    if has_noun and _contains_any(
+        normalized, ("останови", "выключи", "заглуши", "погаси", "выруби", "вырубь", "stop ")
+    ):
+        return NativeAction(
+            action="dispatcher.stop", payload={}, answer="остановка диспетчера модели"
+        )
+    if has_noun and _contains_any(
+        normalized, ("запусти", "включи", "подними", "стартуй", "start ")
+    ):
+        return NativeAction(
+            action="dispatcher.start", payload={}, answer="запуск диспетчера модели"
+        )
+    if _contains_any(
+        normalized,
+        ("какая модел", "что за модел", "какой мозг", "какая нейросет", "что за нейросет",
+         "статус модел", "статус диспетчер", "состояние модел", "состояние диспетчер",
+         "модель сейчас", "модель загружен", "модель работает", "модель крутится",
+         "какая модель работает", "что за мозг"),
+    ):
+        return NativeAction(
+            action="model.status", payload={}, answer="проверил, какая модель загружена"
+        )
+    return None
+
+
+def _format_model_status(
+    settings: JarvisSettings, disp: dict[str, Any], health: dict[str, Any], gpus: Any
+) -> str:
+    """One Russian report: loaded model + profile + dispatcher state + live VRAM."""
+
+    lines = ["Состояние модели:"]
+    served = health.get("served_models") if isinstance(health, dict) else None
+    served_name = served[0] if isinstance(served, list) and served else None
+    model = (
+        served_name
+        or disp.get("active_model")
+        or disp.get("model")
+        or disp.get("desired_model")
+        or "неизвестно"
+    )
+    lines.append(f"- Модель: {model}")
+    profile = getattr(getattr(settings, "profile", None), "name", None)
+    if profile:
+        lines.append(f"- Профиль: {profile}")
+    port = disp.get("port") or 8001
+    state = "работает" if disp.get("port_open") else "не отвечает"
+    lines.append(f"- Диспетчер: {state} на :{port}")
+    runtime = disp.get("runtime")
+    if runtime and runtime != model:
+        lines.append(f"- vLLM образ: {runtime}")
+    report = "\n".join(lines)
+    gpu_line = _format_gpu(gpus)
+    if gpu_line:
+        report += gpu_line  # already prefixed with "\n\nGPU (nvidia-smi):"
+    return report
 
 
 def _native_observation_data(result: ToolRunResponse) -> dict[str, Any]:
@@ -17645,7 +17832,7 @@ def _operator_requested_tool_names(scopes: frozenset[str]) -> set[str]:
     ):
         names.update({"execution.apply", "execution.transaction"})
     if "dispatcher" in scopes:
-        names.update({"dispatcher.start", "dispatcher.stop"})
+        names.update({"dispatcher.start", "dispatcher.stop", "dispatcher.restart"})
     return names
 
 
@@ -17797,6 +17984,8 @@ def _operator_tool_arguments_match(
         return "dispatcher" in scopes and "execute" in scopes
     if name == "dispatcher.stop":
         return "dispatcher" in scopes and "stop" in scopes
+    if name == "dispatcher.restart":
+        return "dispatcher" in scopes and "execute" in scopes
     return False
 
 
@@ -19081,6 +19270,13 @@ def _native_action_from_message(
             payload={},
             answer="собрал сводку о состоянии машины",
         )
+
+    # Model / dispatcher control: "перезапусти модель", "останови диспетчер",
+    # "переключись на gemma", "какая модель загружена". Placed after GPU/health so a
+    # VRAM/telemetry question still routes to nvidia-smi.
+    model_control = _model_control_action(normalized)
+    if model_control is not None:
+        return model_control
 
     # Read the current clipboard contents ("что в буфере обмена / прочитай буфер").
     # The Russian "буфер" markers are specific; the bare English word "clipboard" is

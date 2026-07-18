@@ -1087,6 +1087,16 @@ class ToolRegistry:
         )
         self.add(
             ToolSpec(
+                name="dispatcher.restart",
+                description="Restart the model dispatcher (Compose down then up) after approval.",
+                category="docker",
+                input_schema={},
+                handler=_dispatcher_restart,
+                danger_level="review",
+            )
+        )
+        self.add(
+            ToolSpec(
                 name="learning.tick",
                 description=(
                     "Mine recent audit/tool/approval history into durable learning memories."
@@ -3892,6 +3902,18 @@ async def _dispatcher_stop(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunRe
         ok=bool(result.get("ok")),
         summary=str(result.get("summary") or "Dispatcher stop requested."),
         data=result,
+    )
+
+
+async def _dispatcher_restart(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunResponse:
+    manager = DispatcherManager(ctx.settings)
+    down = await asyncio.to_thread(manager.run_compose, "down")
+    up = await asyncio.to_thread(manager.run_compose_verified, "up")
+    return ToolRunResponse(
+        tool="dispatcher.restart",
+        ok=bool(up.get("ok")),
+        summary=str(up.get("summary") or "Dispatcher restart requested."),
+        data={"down": down, "up": up},
     )
 
 
