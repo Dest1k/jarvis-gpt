@@ -53,6 +53,7 @@ from .document_memory import DocumentMemory
 from .document_runtime import (
     DocumentRuntimeError,
     apply_document_replacements,
+    build_slides_from_markdown,
     build_workbook_sheets,
     compare_documents,
     copy_document,
@@ -65,8 +66,11 @@ from .document_runtime import (
     is_supported_document,
     resolve_artifact_output_path,
     verify_document_artifact,
+    write_chart_svg,
     write_exact_text_artifact,
     write_markdown_docx,
+    write_pdf,
+    write_presentation_pptx,
     write_workbook_xlsx,
 )
 from .document_surfer import (
@@ -1630,26 +1634,41 @@ class ToolRegistry:
             ToolSpec(
                 name="documents.generate",
                 description=(
-                    "Generate a new document artifact (md/txt/csv/json/html/docx/xlsx) under "
-                    "document-outputs. DOCX renders Markdown natively with heading styles, "
+                    "Generate a new document artifact "
+                    "(md/txt/csv/json/html/docx/xlsx/pptx/pdf/svg) under document-outputs. "
+                    "DOCX renders Markdown natively with heading styles, "
                     "bold/italic/`code`/links, bullet & numbered lists, and bordered tables "
                     "with a shaded header. XLSX builds a real spreadsheet: pass structured "
                     "`sheets`, or Markdown tables / CSV in `body`; numeric cells are typed, "
                     "cells starting with '=' become formulas, and the header row is bold, "
-                    "frozen and auto-filtered. Honors exact output_path/output_name including "
-                    "subdirectories. Never overwrites source files."
+                    "frozen and auto-filtered. PPTX builds a real slide deck: one title+bullets "
+                    "slide per Markdown heading section, or pass structured `slides`. PDF lays "
+                    "flattened Markdown as Helvetica text on US-Letter pages (WinAnsi/Latin-1 "
+                    "only — for Cyrillic/non-Latin text prefer DOCX). SVG renders a bar/line/pie "
+                    "chart from a structured `chart` spec or a Markdown table in `body`. Honors "
+                    "exact output_path/output_name including subdirectories. Never overwrites "
+                    "source files."
                 ),
                 category="documents",
                 input_schema={
                     "title": "Document title (also the workbook title / first sheet name)",
                     "body": (
-                        "Main body: Markdown for docx (headings/lists/tables/inline), exact "
-                        "text for md/txt, or Markdown tables / CSV for xlsx"
+                        "Main body: Markdown for docx/pptx/pdf (headings/lists/tables/inline), "
+                        "exact text for md/txt, Markdown tables / CSV for xlsx, or a Markdown "
+                        "table for an svg chart"
                     ),
-                    "output_format": "md|txt|csv|json|html|docx|xlsx",
+                    "output_format": "md|txt|csv|json|html|docx|xlsx|pptx|pdf|svg",
                     "sheets": (
                         "XLSX only: list of {name, rows} where rows is a list of cell lists. "
                         "Cells may be numbers, strings, or '=FORMULA'. Each list is a sheet."
+                    ),
+                    "slides": (
+                        "PPTX only: list of {title, bullets:[...]}; if omitted the body "
+                        "Markdown headings/lists become slides"
+                    ),
+                    "chart": (
+                        "SVG only: {type:bar|line|pie, title, categories:[...], "
+                        "series:[{name, data:[num]}]}; if omitted a Markdown table in body is used"
                     ),
                     "output_name": "Optional output filename or root-relative path",
                     "output_path": "Optional absolute/relative destination under document-outputs",
@@ -5747,6 +5766,10 @@ def _documents_generate(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
         output_format = "md"
     if output_format == "text":
         output_format = "txt"
+    if output_format in {"chart", "charts", "graph"}:
+        output_format = "svg"
+    if output_format in {"ppt", "presentation", "deck", "slides"}:
+        output_format = "pptx"
     sections = args.get("sections") if isinstance(args.get("sections"), list) else None
     exact_body = args.get("exact_body")
     if exact_body is None:
@@ -5861,6 +5884,67 @@ def _documents_generate(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
                 },
                 "title": title,
                 "structure": written.get("structure") or {},
+                "verification": written["verification"],
+                "warnings": [],
+            }
+            output_path = Path(written["path"])
+        elif output_format == "pptx":
+            slides_arg = args.get("slides") if isinstance(args.get("slides"), list) else None
+            slides = slides_arg or build_slides_from_markdown(body_text, title=title)
+            written = write_presentation_pptx(destination, slides, title=title)
+            result = {
+                "ok": True,
+                "mode": "generate",
+                "output": {
+                    "path": written["path"],
+                    "name": written["name"],
+                    "format": "pptx",
+                    "size": written["size"],
+                    "sha256": written["sha256"],
+                },
+                "title": title,
+                "structure": {"slide_count": written["slide_count"]},
+                "verification": written["verification"],
+                "warnings": [],
+            }
+            output_path = Path(written["path"])
+        elif output_format == "pdf":
+            written = write_pdf(destination, body_text or title, title=title)
+            result = {
+                "ok": True,
+                "mode": "generate",
+                "output": {
+                    "path": written["path"],
+                    "name": written["name"],
+                    "format": "pdf",
+                    "size": written["size"],
+                    "sha256": written["sha256"],
+                },
+                "title": title,
+                "structure": {"page_count": written["page_count"]},
+                "verification": written["verification"],
+                "warnings": [],
+            }
+            output_path = Path(written["path"])
+        elif output_format == "svg":
+            written = write_chart_svg(
+                destination, args.get("chart") or body_text, title=title
+            )
+            result = {
+                "ok": True,
+                "mode": "generate",
+                "output": {
+                    "path": written["path"],
+                    "name": written["name"],
+                    "format": "svg",
+                    "size": written["size"],
+                    "sha256": written["sha256"],
+                },
+                "title": title,
+                "structure": {
+                    "chart_type": written["chart_type"],
+                    "series_count": written["series_count"],
+                },
                 "verification": written["verification"],
                 "warnings": [],
             }

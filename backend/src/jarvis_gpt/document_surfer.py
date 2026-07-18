@@ -61,10 +61,15 @@ from .document_runtime import (
     MAX_DOCUMENT_BYTES,
     DocumentRuntimeError,
     apply_document_replacements,
+    build_chart_spec,
+    build_slides_from_markdown,
     compare_documents,
     document_mime_type,
     extract_document,
     is_supported_document,
+    write_chart_svg,
+    write_pdf,
+    write_presentation_pptx,
 )
 from .file_types import (
     archive_kinds,
@@ -94,7 +99,10 @@ __all__ = [
 # --------------------------------------------------------------------------- #
 _EXTENDED_EXTENSIONS = frozenset({".pptx", ".odt", ".rtf", ".ppt", ".ods"})
 _GENERATABLE_FORMATS = frozenset(
-    {"md", "markdown", "txt", "text", "csv", "json", "html", "htm", "docx", "xlsx"}
+    {
+        "md", "markdown", "txt", "text", "csv", "json", "html", "htm",
+        "docx", "xlsx", "pptx", "pdf", "svg",
+    }
 )
 _TEXTUAL_OUTPUT = frozenset({"md", "markdown", "txt", "text", "csv", "json", "html", "htm"})
 
@@ -1062,6 +1070,20 @@ class JarvisDocumentSurfer:
                 _write_minimal_docx(destination, title_clean, content, meta)
             elif fmt == "xlsx":
                 _write_minimal_xlsx(destination, title_clean, content)
+            elif fmt == "pptx":
+                write_presentation_pptx(
+                    destination,
+                    build_slides_from_markdown(content, title=title_clean),
+                    title=title_clean,
+                )
+            elif fmt == "pdf":
+                write_pdf(destination, content, title=title_clean)
+            elif fmt == "svg":
+                write_chart_svg(
+                    destination,
+                    build_chart_spec(content, (meta or {}).get("chart")),
+                    title=title_clean,
+                )
             else:  # pragma: no cover - guarded above
                 raise DocumentGenerationError(f"Unhandled format: {fmt}")
         except OSError as exc:

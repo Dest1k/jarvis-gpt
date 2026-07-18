@@ -4,9 +4,11 @@ import csv
 import difflib
 import hashlib
 import html
+import math
 import mimetypes
 import re
 import shutil
+import textwrap
 import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -58,6 +60,9 @@ MAX_ZIP_MEMBER_BYTES = 2_000_000
 
 _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _A_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+_P_NS = "http://schemas.openxmlformats.org/presentationml/2006/main"
+_A_DRAW = "http://schemas.openxmlformats.org/drawingml/2006/main"
+_PML = "application/vnd.openxmlformats-officedocument.presentationml"
 _R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 _REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 _CP_NS = "http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
@@ -549,6 +554,765 @@ def write_workbook_xlsx(
         "sheet_count": len(normalized),
         "row_count": sum(len(sheet["rows"]) for sheet in normalized),
     }
+
+
+# --------------------------------------------------------------------------- #
+# PPTX — hand-rolled OpenXML presentation (mirrors the DOCX/XLSX writers).
+# --------------------------------------------------------------------------- #
+
+_PPTX_MASTER_XML = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    f'<p:sldMaster xmlns:a="{_A_DRAW}" xmlns:r="{_R_NS}" xmlns:p="{_P_NS}">'
+    "<p:cSld><p:spTree>"
+    '<p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>'
+    '<p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/>'
+    '<a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>'
+    "</p:spTree></p:cSld>"
+    '<p:clrMap bg1="lt1" tx1="dk1" bg2="lt2" tx2="dk2" accent1="accent1" '
+    'accent2="accent2" accent3="accent3" accent4="accent4" accent5="accent5" '
+    'accent6="accent6" hlink="hlink" folHlink="folHlink"/>'
+    '<p:sldLayoutIdLst><p:sldLayoutId id="2147483649" r:id="rId1"/></p:sldLayoutIdLst>'
+    "<p:txStyles><p:titleStyle/><p:bodyStyle/><p:otherStyle/></p:txStyles>"
+    "</p:sldMaster>"
+)
+
+_PPTX_LAYOUT_XML = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    f'<p:sldLayout xmlns:a="{_A_DRAW}" xmlns:r="{_R_NS}" xmlns:p="{_P_NS}" '
+    'type="blank" preserve="1">'
+    '<p:cSld name="Blank"><p:spTree>'
+    '<p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>'
+    '<p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/>'
+    '<a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>'
+    "</p:spTree></p:cSld>"
+    "<p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr>"
+    "</p:sldLayout>"
+)
+
+_PPTX_THEME_XML = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    f'<a:theme xmlns:a="{_A_DRAW}" name="Office Theme"><a:themeElements>'
+    '<a:clrScheme name="Office">'
+    '<a:dk1><a:sysClr val="windowText" lastClr="000000"/></a:dk1>'
+    '<a:lt1><a:sysClr val="window" lastClr="FFFFFF"/></a:lt1>'
+    '<a:dk2><a:srgbClr val="44546A"/></a:dk2>'
+    '<a:lt2><a:srgbClr val="E7E6E6"/></a:lt2>'
+    '<a:accent1><a:srgbClr val="4472C4"/></a:accent1>'
+    '<a:accent2><a:srgbClr val="ED7D31"/></a:accent2>'
+    '<a:accent3><a:srgbClr val="A5A5A5"/></a:accent3>'
+    '<a:accent4><a:srgbClr val="FFC000"/></a:accent4>'
+    '<a:accent5><a:srgbClr val="5B9BD5"/></a:accent5>'
+    '<a:accent6><a:srgbClr val="70AD47"/></a:accent6>'
+    '<a:hlink><a:srgbClr val="0563C1"/></a:hlink>'
+    '<a:folHlink><a:srgbClr val="954F72"/></a:folHlink>'
+    "</a:clrScheme>"
+    '<a:fontScheme name="Office">'
+    '<a:majorFont><a:latin typeface="Calibri Light"/><a:ea typeface=""/>'
+    '<a:cs typeface=""/></a:majorFont>'
+    '<a:minorFont><a:latin typeface="Calibri"/><a:ea typeface=""/>'
+    '<a:cs typeface=""/></a:minorFont>'
+    "</a:fontScheme>"
+    '<a:fmtScheme name="Office">'
+    "<a:fillStyleLst>"
+    '<a:solidFill><a:schemeClr val="phClr"/></a:solidFill>'
+    '<a:solidFill><a:schemeClr val="phClr"/></a:solidFill>'
+    '<a:solidFill><a:schemeClr val="phClr"/></a:solidFill>'
+    "</a:fillStyleLst>"
+    "<a:lnStyleLst>"
+    '<a:ln w="6350" cap="flat" cmpd="sng" algn="ctr">'
+    '<a:solidFill><a:schemeClr val="phClr"/></a:solidFill>'
+    '<a:prstDash val="solid"/></a:ln>'
+    '<a:ln w="12700" cap="flat" cmpd="sng" algn="ctr">'
+    '<a:solidFill><a:schemeClr val="phClr"/></a:solidFill>'
+    '<a:prstDash val="solid"/></a:ln>'
+    '<a:ln w="19050" cap="flat" cmpd="sng" algn="ctr">'
+    '<a:solidFill><a:schemeClr val="phClr"/></a:solidFill>'
+    '<a:prstDash val="solid"/></a:ln>'
+    "</a:lnStyleLst>"
+    "<a:effectStyleLst>"
+    "<a:effectStyle><a:effectLst/></a:effectStyle>"
+    "<a:effectStyle><a:effectLst/></a:effectStyle>"
+    "<a:effectStyle><a:effectLst/></a:effectStyle>"
+    "</a:effectStyleLst>"
+    "<a:bgFillStyleLst>"
+    '<a:solidFill><a:schemeClr val="phClr"/></a:solidFill>'
+    '<a:solidFill><a:schemeClr val="phClr"/></a:solidFill>'
+    '<a:solidFill><a:schemeClr val="phClr"/></a:solidFill>'
+    "</a:bgFillStyleLst>"
+    "</a:fmtScheme>"
+    "</a:themeElements></a:theme>"
+)
+
+
+def build_slides_from_markdown(
+    markdown_text: str, *, title: str | None = None
+) -> list[dict[str, Any]]:
+    """Split Markdown into slides: each heading starts a new slide whose title is the
+    heading text; list items, paragraphs and table rows become bullet strings."""
+
+    slides: list[dict[str, Any]] = []
+
+    def _current() -> dict[str, Any]:
+        if not slides:
+            slides.append({"title": "", "bullets": []})
+        return slides[-1]
+
+    for block in _parse_markdown_blocks(markdown_text):
+        kind = block.get("type")
+        if kind == "heading":
+            slides.append({"title": str(block.get("text") or ""), "bullets": []})
+        elif kind == "list":
+            _current()["bullets"].extend(
+                str(item) for item in (block.get("items") or []) if str(item).strip()
+            )
+        elif kind == "table":
+            _current()["bullets"].extend(
+                " | ".join(str(cell) for cell in row) for row in (block.get("rows") or [])
+            )
+        elif kind == "paragraph" and str(block.get("text") or "").strip():
+            _current()["bullets"].append(str(block["text"]))
+    if not slides:
+        slides = [{"title": title or "Presentation", "bullets": []}]
+    elif title and not str(slides[0].get("title") or "").strip():
+        slides[0]["title"] = title
+    return _normalize_slides(slides, title=title)
+
+
+def _normalize_slides(
+    slides: Any, *, title: str | None = None
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for slide in slides or []:
+        if not isinstance(slide, dict):
+            slide = {"title": str(slide), "bullets": []}
+        bullets_src = slide.get("bullets")
+        if bullets_src is None:
+            bullets_src = str(slide.get("body") or "").splitlines()
+        bullets = [str(b) for b in bullets_src if str(b).strip()]
+        out.append({"title": str(slide.get("title") or "").strip(), "bullets": bullets})
+    return out or [{"title": title or "Presentation", "bullets": []}]
+
+
+def write_presentation_pptx(
+    output_path: Path,
+    slides: Any,
+    *,
+    title: str | None = None,
+) -> dict[str, Any]:
+    """Write a structurally valid PPTX presentation: one title+bullets slide per entry.
+
+    ``slides`` is a list of ``{"title": str, "bullets": [str, ...]}`` (a bare string
+    becomes a title-only slide), or pass Markdown through
+    :func:`build_slides_from_markdown` first. Every part is wired through the OOXML
+    relationship graph so real parsers (PowerPoint / python-pptx) open and walk it.
+    """
+
+    destination = Path(output_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    normalized = _normalize_slides(slides, title=title)
+    _write_presentation_pptx(destination, normalized, title=title or "Presentation")
+    verification = verify_document_artifact(destination, expected_format="pptx")
+    return {
+        "path": str(destination),
+        "name": destination.name,
+        "size": destination.stat().st_size,
+        "sha256": file_sha256(destination),
+        "format": "pptx",
+        "slide_count": len(normalized),
+        "bullet_count": sum(len(slide["bullets"]) for slide in normalized),
+        "verification": verification,
+    }
+
+
+def _pptx_slide_xml(slide: dict[str, Any]) -> str:
+    def esc(value: Any) -> str:
+        return html.escape(str(value or ""), quote=False)
+
+    title_p = (
+        '<a:p><a:r><a:rPr lang="en-US" dirty="0"/>'
+        f'<a:t>{esc(slide.get("title"))}</a:t></a:r></a:p>'
+    )
+    body_ps = "".join(
+        f'<a:p><a:r><a:rPr lang="en-US" dirty="0"/><a:t>{esc(bullet)}</a:t></a:r></a:p>'
+        for bullet in slide.get("bullets") or []
+    ) or '<a:p><a:endParaRPr lang="en-US"/></a:p>'
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<p:sld xmlns:a="{_A_DRAW}" xmlns:r="{_R_NS}" xmlns:p="{_P_NS}">'
+        "<p:cSld><p:spTree>"
+        '<p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>'
+        '<p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/>'
+        '<a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>'
+        '<p:sp><p:nvSpPr><p:cNvPr id="2" name="Title 1"/>'
+        '<p:cNvSpPr><a:spLocks noGrp="1"/></p:cNvSpPr>'
+        '<p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr>'
+        '<p:spPr><a:xfrm><a:off x="685800" y="457200"/>'
+        '<a:ext cx="7772400" cy="1143000"/></a:xfrm></p:spPr>'
+        f"<p:txBody><a:bodyPr/><a:lstStyle/>{title_p}</p:txBody></p:sp>"
+        '<p:sp><p:nvSpPr><p:cNvPr id="3" name="Content 2"/>'
+        '<p:cNvSpPr><a:spLocks noGrp="1"/></p:cNvSpPr>'
+        '<p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr>'
+        '<p:spPr><a:xfrm><a:off x="685800" y="1600200"/>'
+        '<a:ext cx="7772400" cy="4351338"/></a:xfrm></p:spPr>'
+        f"<p:txBody><a:bodyPr/><a:lstStyle/>{body_ps}</p:txBody></p:sp>"
+        "</p:spTree></p:cSld>"
+        "<p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:sld>"
+    )
+
+
+def _write_presentation_pptx(
+    path: Path,
+    slides: list[dict[str, Any]],
+    *,
+    title: str,
+) -> None:
+    n = len(slides)
+    slide_overrides = "".join(
+        f'<Override PartName="/ppt/slides/slide{i}.xml" ContentType="{_PML}.slide+xml"/>'
+        for i in range(1, n + 1)
+    )
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" '
+        'ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        f'<Override PartName="/ppt/presentation.xml" ContentType="{_PML}.presentation.main+xml"/>'
+        f'<Override PartName="/ppt/slideMasters/slideMaster1.xml" '
+        f'ContentType="{_PML}.slideMaster+xml"/>'
+        f'<Override PartName="/ppt/slideLayouts/slideLayout1.xml" '
+        f'ContentType="{_PML}.slideLayout+xml"/>'
+        '<Override PartName="/ppt/theme/theme1.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.theme+xml"/>'
+        '<Override PartName="/docProps/core.xml" '
+        'ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>'
+        f"{slide_overrides}</Types>"
+    )
+    root_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<Relationships xmlns="{_REL_NS}">'
+        '<Relationship Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/'
+        'relationships/officeDocument" Target="ppt/presentation.xml"/>'
+        '<Relationship Id="rId2" '
+        'Type="http://schemas.openxmlformats.org/package/2006/'
+        'relationships/metadata/core-properties" Target="docProps/core.xml"/>'
+        "</Relationships>"
+    )
+    sld_ids = "".join(
+        f'<p:sldId id="{256 + i - 1}" r:id="rId{i}"/>' for i in range(1, n + 1)
+    )
+    master_rid = f"rId{n + 1}"
+    presentation = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<p:presentation xmlns:a="{_A_DRAW}" xmlns:r="{_R_NS}" xmlns:p="{_P_NS}">'
+        '<p:sldMasterIdLst><p:sldMasterId id="2147483648" '
+        f'r:id="{master_rid}"/></p:sldMasterIdLst>'
+        f"<p:sldIdLst>{sld_ids}</p:sldIdLst>"
+        '<p:sldSz cx="9144000" cy="6858000" type="screen4x3"/>'
+        '<p:notesSz cx="6858000" cy="9144000"/></p:presentation>'
+    )
+    pres_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<Relationships xmlns="{_REL_NS}">'
+        + "".join(
+            f'<Relationship Id="rId{i}" '
+            'Type="http://schemas.openxmlformats.org/officeDocument/'
+            f'2006/relationships/slide" Target="slides/slide{i}.xml"/>'
+            for i in range(1, n + 1)
+        )
+        + f'<Relationship Id="{master_rid}" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/'
+        '2006/relationships/slideMaster" Target="slideMasters/slideMaster1.xml"/>'
+        "</Relationships>"
+    )
+    master_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<Relationships xmlns="{_REL_NS}">'
+        '<Relationship Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/'
+        'relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/>'
+        '<Relationship Id="rId2" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/'
+        'relationships/theme" Target="../theme/theme1.xml"/>'
+        "</Relationships>"
+    )
+    layout_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<Relationships xmlns="{_REL_NS}">'
+        '<Relationship Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/'
+        'relationships/slideMaster" Target="../slideMasters/slideMaster1.xml"/>'
+        "</Relationships>"
+    )
+    slide_rel = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<Relationships xmlns="{_REL_NS}">'
+        '<Relationship Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/'
+        'relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/>'
+        "</Relationships>"
+    )
+    core = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<cp:coreProperties xmlns:cp="{_CP_NS}" xmlns:dc="{_DC_NS}">'
+        f"<dc:title>{html.escape(title)}</dc:title>"
+        "<dc:creator>jarvis</dc:creator>"
+        "<cp:lastModifiedBy>jarvis</cp:lastModifiedBy></cp:coreProperties>"
+    )
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", content_types)
+        archive.writestr("_rels/.rels", root_rels)
+        archive.writestr("docProps/core.xml", core)
+        archive.writestr("ppt/presentation.xml", presentation)
+        archive.writestr("ppt/_rels/presentation.xml.rels", pres_rels)
+        archive.writestr("ppt/slideMasters/slideMaster1.xml", _PPTX_MASTER_XML)
+        archive.writestr("ppt/slideMasters/_rels/slideMaster1.xml.rels", master_rels)
+        archive.writestr("ppt/slideLayouts/slideLayout1.xml", _PPTX_LAYOUT_XML)
+        archive.writestr("ppt/slideLayouts/_rels/slideLayout1.xml.rels", layout_rels)
+        archive.writestr("ppt/theme/theme1.xml", _PPTX_THEME_XML)
+        for index, slide in enumerate(slides, start=1):
+            archive.writestr(f"ppt/slides/slide{index}.xml", _pptx_slide_xml(slide))
+            archive.writestr(f"ppt/slides/_rels/slide{index}.xml.rels", slide_rel)
+
+
+# --------------------------------------------------------------------------- #
+# PDF — minimal single-file writer with a byte-accurate classic xref table.
+# --------------------------------------------------------------------------- #
+
+_PDF_PAGE_W, _PDF_PAGE_H, _PDF_MARGIN = 612, 792, 72
+_PDF_FONT_SIZE, _PDF_LEADING, _PDF_MAX_LINES = 11, 15, 46
+
+
+def write_pdf(
+    output_path: Path,
+    body: Any,
+    *,
+    title: str | None = None,
+) -> dict[str, Any]:
+    """Write a minimal but valid PDF (US-Letter, Helvetica) from Markdown flattened to
+    plain lines. Text is WinAnsi/Latin-1 only — characters outside that range (e.g.
+    Cyrillic) degrade to ``?``; prefer DOCX for non-Latin scripts."""
+
+    destination = Path(output_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    pages = _pdf_paginate(_pdf_flatten_lines(body, title=title))
+    destination.write_bytes(_render_pdf_bytes(pages, title=title or "Document"))
+    verification = verify_document_artifact(destination, expected_format="pdf")
+    return {
+        "path": str(destination),
+        "name": destination.name,
+        "size": destination.stat().st_size,
+        "sha256": file_sha256(destination),
+        "format": "pdf",
+        "page_count": len(pages),
+        "verification": verification,
+    }
+
+
+def _pdf_flatten_lines(body: Any, *, title: str | None) -> list[str]:
+    lines: list[str] = []
+    if title:
+        lines += [str(title), ""]
+    for block in _parse_markdown_blocks(str(body or "")):
+        kind = block.get("type")
+        if kind == "heading":
+            lines += ["", str(block.get("text") or ""), ""]
+        elif kind == "list":
+            ordered = bool(block.get("ordered"))
+            for position, item in enumerate(block.get("items") or [], start=1):
+                prefix = f"{position}. " if ordered else "- "
+                wrapped = textwrap.wrap(prefix + str(item), width=95) or [prefix.rstrip()]
+                lines += wrapped
+        elif kind == "table":
+            lines += [
+                " | ".join(str(cell) for cell in row) for row in block.get("rows") or []
+            ]
+        elif kind == "empty":
+            lines.append("")
+        elif block.get("text"):
+            lines += textwrap.wrap(str(block["text"]), width=95) or [""]
+    return lines or [str(title or "")]
+
+
+def _pdf_paginate(lines: list[str]) -> list[list[str]]:
+    return [
+        lines[i : i + _PDF_MAX_LINES]
+        for i in range(0, max(1, len(lines)), _PDF_MAX_LINES)
+    ]
+
+
+def _pdf_escape(text: str) -> str:
+    winansi = str(text).encode("latin-1", "replace").decode("latin-1")
+    return winansi.replace("\\", r"\\").replace("(", r"\(").replace(")", r"\)")
+
+
+def _pdf_content_stream(lines: list[str]) -> str:
+    parts = [
+        "BT",
+        f"/F1 {_PDF_FONT_SIZE} Tf",
+        f"{_PDF_LEADING} TL",
+        f"{_PDF_MARGIN} {_PDF_PAGE_H - _PDF_MARGIN} Td",
+    ]
+    for index, line in enumerate(lines):
+        if index:
+            parts.append("T*")
+        escaped = _pdf_escape(line)
+        if escaped:
+            parts.append(f"({escaped}) Tj")
+    parts.append("ET")
+    return "\n".join(parts) + "\n"
+
+
+def _render_pdf_bytes(pages: list[list[str]], *, title: str) -> bytes:
+    n = len(pages)
+    font_id = 3
+    page_ids: list[int] = []
+    content_ids: list[int] = []
+    next_id = 4
+    for _ in pages:
+        page_ids.append(next_id)
+        content_ids.append(next_id + 1)
+        next_id += 2
+    total = next_id - 1
+    objs: dict[int, bytes] = {}
+    objs[1] = b"<< /Type /Catalog /Pages 2 0 R >>"
+    kids = " ".join(f"{pid} 0 R" for pid in page_ids)
+    objs[2] = f"<< /Type /Pages /Kids [{kids}] /Count {n} >>".encode("latin-1")
+    objs[font_id] = (
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica "
+        b"/Encoding /WinAnsiEncoding >>"
+    )
+    for index, page_lines in enumerate(pages):
+        stream = _pdf_content_stream(page_lines).encode("latin-1", "replace")
+        objs[content_ids[index]] = (
+            b"<< /Length " + str(len(stream)).encode("latin-1") + b" >>\nstream\n"
+            + stream + b"\nendstream"
+        )
+        objs[page_ids[index]] = (
+            f"<< /Type /Page /Parent 2 0 R "
+            f"/MediaBox [0 0 {_PDF_PAGE_W} {_PDF_PAGE_H}] "
+            f"/Resources << /Font << /F1 {font_id} 0 R >> >> "
+            f"/Contents {content_ids[index]} 0 R >>"
+        ).encode("latin-1")
+    out = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets: dict[int, int] = {}
+    for oid in range(1, total + 1):
+        offsets[oid] = len(out)
+        out += f"{oid} 0 obj\n".encode("latin-1") + objs[oid] + b"\nendobj\n"
+    xref_pos = len(out)
+    out += f"xref\n0 {total + 1}\n".encode("latin-1") + b"0000000000 65535 f \n"
+    for oid in range(1, total + 1):
+        out += f"{offsets[oid]:010d} 00000 n \n".encode("latin-1")
+    out += b"trailer\n" + f"<< /Size {total + 1} /Root 1 0 R >>\n".encode("latin-1")
+    out += f"startxref\n{xref_pos}\n".encode("latin-1") + b"%%EOF\n"
+    return bytes(out)
+
+
+# --------------------------------------------------------------------------- #
+# CHART / SVG — a well-formed standalone SVG bar / line / pie chart.
+# --------------------------------------------------------------------------- #
+
+_CHART_COLORS = ["#4E79A7", "#F28E2B", "#59A14F", "#E15759", "#B07AA1", "#76B7B2"]
+
+
+def _chart_number(value: Any) -> float:
+    if isinstance(value, bool):
+        return 0.0
+    if isinstance(value, int | float):
+        return float(value)
+    coerced = _coerce_scalar(str(value))
+    if isinstance(coerced, int | float) and not isinstance(coerced, bool):
+        return float(coerced)
+    match = re.search(r"-?\d+(?:\.\d+)?", str(value or ""))
+    return float(match.group(0)) if match else 0.0
+
+
+def _normalize_chart(chart: dict[str, Any], *, title: str | None = None) -> dict[str, Any]:
+    ctype = str(chart.get("type") or "bar").lower()
+    if ctype not in ("bar", "line", "pie"):
+        ctype = "bar"
+    series = chart.get("series")
+    if not series and chart.get("data") is not None:
+        series = [{"name": "Series 1", "data": chart["data"]}]
+    norm: list[dict[str, Any]] = []
+    for entry in series or []:
+        if not isinstance(entry, dict):
+            entry = {"name": f"Series {len(norm) + 1}", "data": entry}
+        norm.append(
+            {
+                "name": str(entry.get("name") or f"Series {len(norm) + 1}"),
+                "data": [_chart_number(x) for x in (entry.get("data") or [])],
+            }
+        )
+    return {
+        "type": ctype,
+        "title": str(title or chart.get("title") or "Chart"),
+        "categories": [str(c) for c in (chart.get("categories") or [])],
+        "series": norm,
+    }
+
+
+def build_chart_spec(
+    body: Any,
+    chart: Any = None,
+    *,
+    title: str | None = None,
+) -> dict[str, Any]:
+    """Build a normalized chart spec from a structured ``chart`` dict
+    (``{type, title, categories, series:[{name,data}]}``), a raw ``<svg>`` string, or a
+    Markdown table in ``body`` (first column = categories, remaining columns = series)."""
+
+    if isinstance(chart, dict):
+        if chart.get("raw"):
+            return {"raw": str(chart["raw"])}
+        if any(chart.get(key) for key in ("series", "data", "categories", "type")):
+            return _normalize_chart(chart, title=title or chart.get("title"))
+    text = str(body or "").lstrip()
+    if text.startswith("<svg") or text.startswith("<?xml"):
+        return {"raw": text}
+    categories: list[str] = []
+    series: list[dict[str, Any]] = []
+    for block in _parse_markdown_blocks(text):
+        if block.get("type") == "table" and block.get("rows"):
+            rows = block["rows"]
+            head = rows[0]
+            body_rows = rows[1:]
+            categories = [str(row[0]) for row in body_rows if row]
+            for col in range(1, len(head)):
+                series.append(
+                    {
+                        "name": str(head[col]),
+                        "data": [
+                            _chart_number(row[col]) if col < len(row) else 0.0
+                            for row in body_rows
+                        ],
+                    }
+                )
+            break
+    return _normalize_chart(
+        {"type": "bar", "categories": categories, "series": series}, title=title
+    )
+
+
+def write_chart_svg(
+    output_path: Path,
+    chart: Any = None,
+    *,
+    title: str | None = None,
+    body: Any = None,
+) -> dict[str, Any]:
+    """Write a standalone, well-formed SVG chart (bar/line/pie) from a structured chart
+    spec or a Markdown table. A raw ``<svg>`` string is passed through unchanged."""
+
+    destination = Path(output_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(chart, dict):
+        spec = build_chart_spec(body if body is not None else "", chart, title=title)
+    else:
+        source = chart if isinstance(chart, str) else (body if body is not None else "")
+        spec = build_chart_spec(source, None, title=title)
+    svg = spec["raw"] if spec.get("raw") else _render_chart_svg(spec)
+    if not svg.endswith("\n"):
+        svg += "\n"
+    destination.write_text(svg, encoding="utf-8", newline="\n")
+    verification = verify_document_artifact(destination, expected_format="svg")
+    return {
+        "path": str(destination),
+        "name": destination.name,
+        "size": destination.stat().st_size,
+        "sha256": file_sha256(destination),
+        "format": "svg",
+        "chart_type": spec.get("type", "custom"),
+        "series_count": len(spec.get("series", [])),
+        "verification": verification,
+    }
+
+
+def _svg_num(value: float) -> str:
+    if value == int(value):
+        return str(int(value))
+    return f"{value:.2f}".rstrip("0").rstrip(".")
+
+
+def _svg_text(x: float, y: float, text: Any, *, size: int, anchor: str = "start",
+              color: str = "#333333", weight: str = "normal") -> str:
+    return (
+        f'<text x="{_svg_num(x)}" y="{_svg_num(y)}" font-family="Arial, sans-serif" '
+        f'font-size="{size}" fill="{color}" text-anchor="{anchor}" '
+        f'font-weight="{weight}">{html.escape(str(text), quote=False)}</text>'
+    )
+
+
+def _render_chart_svg(spec: dict[str, Any]) -> str:
+    width, height = 800, 480
+    ctype = spec.get("type", "bar")
+    title = spec.get("title") or "Chart"
+    series = spec.get("series") or []
+    categories = spec.get("categories") or []
+    parts: list[str] = [
+        '<?xml version="1.0" encoding="UTF-8" standalone="no"?>',
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+        f'viewBox="0 0 {width} {height}">',
+        f'<rect x="0" y="0" width="{width}" height="{height}" fill="#ffffff"/>',
+        _svg_text(width / 2, 30, title, size=20, anchor="middle",
+                  color="#1F3864", weight="bold"),
+    ]
+    if ctype == "pie":
+        parts.append(_render_pie_body(spec, width, height))
+    else:
+        parts.append(_render_axes_body(spec, ctype, series, categories, width, height))
+    parts.append(_render_chart_legend(ctype, spec, series, categories, width, height))
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def _render_axes_body(
+    spec: dict[str, Any],
+    ctype: str,
+    series: list[dict[str, Any]],
+    categories: list[str],
+    width: int,
+    height: int,
+) -> str:
+    left, right, top, bottom = 60, width - 40, 50, height - 90
+    plot_w = right - left
+    plot_h = bottom - top
+    values = [v for s in series for v in s.get("data") or []]
+    max_val = max([*values, 0.0]) or 1.0
+    min_val = min([*values, 0.0])
+    span = (max_val - min_val) or 1.0
+    zero_y = bottom - ((0.0 - min_val) / span) * plot_h
+    out: list[str] = ['<g>']
+    # gridlines + y labels
+    for step in range(5):
+        val = min_val + span * step / 4
+        y = bottom - (val - min_val) / span * plot_h
+        out.append(
+            f'<line x1="{left}" y1="{_svg_num(y)}" x2="{right}" y2="{_svg_num(y)}" '
+            'stroke="#E0E0E0" stroke-width="1"/>'
+        )
+        out.append(_svg_text(left - 8, y + 4, _svg_num(val), size=11, anchor="end",
+                             color="#666666"))
+    # axes
+    out.append(
+        f'<line x1="{left}" y1="{top}" x2="{left}" y2="{bottom}" '
+        'stroke="#888888" stroke-width="1.5"/>'
+    )
+    out.append(
+        f'<line x1="{left}" y1="{_svg_num(zero_y)}" x2="{right}" y2="{_svg_num(zero_y)}" '
+        'stroke="#888888" stroke-width="1.5"/>'
+    )
+    n_cats = max(len(categories), max((len(s.get("data") or []) for s in series), default=0), 1)
+    slot = plot_w / n_cats
+    if ctype == "line":
+        for si, s in enumerate(series):
+            color = _CHART_COLORS[si % len(_CHART_COLORS)]
+            points = []
+            for ci, val in enumerate(s.get("data") or []):
+                x = left + slot * (ci + 0.5)
+                y = bottom - (val - min_val) / span * plot_h
+                points.append(f"{_svg_num(x)},{_svg_num(y)}")
+            if points:
+                out.append(
+                    f'<polyline fill="none" stroke="{color}" stroke-width="2.5" '
+                    f'points="{" ".join(points)}"/>'
+                )
+                for pt in points:
+                    px, py = pt.split(",")
+                    out.append(
+                        f'<circle cx="{px}" cy="{py}" r="3" fill="{color}"/>'
+                    )
+    else:  # bar
+        group_w = slot * 0.8
+        n_series = max(len(series), 1)
+        bar_w = group_w / n_series
+        for si, s in enumerate(series):
+            color = _CHART_COLORS[si % len(_CHART_COLORS)]
+            for ci, val in enumerate(s.get("data") or []):
+                x = left + slot * ci + (slot - group_w) / 2 + bar_w * si
+                y = bottom - (max(val, 0.0) - min_val) / span * plot_h
+                bar_h = abs((val - 0.0) / span * plot_h)
+                bar_top = min(y, zero_y)
+                out.append(
+                    f'<rect x="{_svg_num(x)}" y="{_svg_num(bar_top)}" '
+                    f'width="{_svg_num(bar_w)}" height="{_svg_num(bar_h)}" '
+                    f'fill="{color}"/>'
+                )
+    # category labels
+    for ci in range(n_cats):
+        label = categories[ci] if ci < len(categories) else str(ci + 1)
+        x = left + slot * (ci + 0.5)
+        out.append(_svg_text(x, bottom + 18, label, size=11, anchor="middle",
+                             color="#444444"))
+    out.append("</g>")
+    return "".join(out)
+
+
+def _render_pie_body(spec: dict[str, Any], width: int, height: int) -> str:
+    series = spec.get("series") or []
+    categories = spec.get("categories") or []
+    data = series[0].get("data") if series else []
+    data = [abs(v) for v in (data or [])]
+    total = sum(data) or 1.0
+    cx, cy, r = width / 2, height / 2 + 10, 150
+    out: list[str] = ['<g>']
+    angle = -math.pi / 2
+    for index, value in enumerate(data):
+        frac = value / total
+        end = angle + frac * 2 * math.pi
+        color = _CHART_COLORS[index % len(_CHART_COLORS)]
+        if frac >= 0.9999:
+            out.append(f'<circle cx="{_svg_num(cx)}" cy="{_svg_num(cy)}" r="{r}" '
+                       f'fill="{color}"/>')
+        else:
+            x1 = cx + r * math.cos(angle)
+            y1 = cy + r * math.sin(angle)
+            x2 = cx + r * math.cos(end)
+            y2 = cy + r * math.sin(end)
+            large = 1 if (end - angle) > math.pi else 0
+            out.append(
+                f'<path d="M {_svg_num(cx)} {_svg_num(cy)} L {_svg_num(x1)} {_svg_num(y1)} '
+                f'A {r} {r} 0 {large} 1 {_svg_num(x2)} {_svg_num(y2)} Z" '
+                f'fill="{color}"/>'
+            )
+        mid = (angle + end) / 2
+        lx = cx + (r + 20) * math.cos(mid)
+        ly = cy + (r + 20) * math.sin(mid)
+        label = categories[index] if index < len(categories) else f"{value:g}"
+        anchor = "start" if math.cos(mid) >= 0 else "end"
+        out.append(_svg_text(lx, ly, label, size=11, anchor=anchor, color="#444444"))
+        angle = end
+    out.append("</g>")
+    return "".join(out)
+
+
+def _render_chart_legend(
+    ctype: str,
+    spec: dict[str, Any],
+    series: list[dict[str, Any]],
+    categories: list[str],
+    width: int,
+    height: int,
+) -> str:
+    if ctype == "pie":
+        labels = list(categories)
+    else:
+        labels = [s.get("name", f"Series {i + 1}") for i, s in enumerate(series)]
+    if not labels:
+        return ""
+    out: list[str] = ['<g>']
+    y = height - 30
+    x = 60
+    for index, label in enumerate(labels):
+        color = _CHART_COLORS[index % len(_CHART_COLORS)]
+        out.append(
+            f'<rect x="{_svg_num(x)}" y="{y - 10}" width="12" height="12" fill="{color}"/>'
+        )
+        out.append(_svg_text(x + 16, y, label, size=11, anchor="start", color="#444444"))
+        x += 16 + 10 + max(40, len(str(label)) * 7)
+    out.append("</g>")
+    return "".join(out)
 
 
 def read_workbook_grid(
@@ -1312,6 +2076,46 @@ def verify_document_artifact(
                 raise DocumentRuntimeError(f"XLSX XML is not well-formed: {exc}") from exc
             result["zip_members"] = len(names)
             result["worksheet_count"] = len(worksheets)
+    elif fmt == "pptx":
+        if not zipfile.is_zipfile(target):
+            raise DocumentRuntimeError(f"PPTX is not a valid ZIP package: {target}")
+        with zipfile.ZipFile(target) as archive:
+            names = archive.namelist()
+            if len(names) != len(set(names)):
+                raise DocumentRuntimeError(f"PPTX has duplicate ZIP members: {target}")
+            required = {"[Content_Types].xml", "_rels/.rels", "ppt/presentation.xml"}
+            missing = sorted(required - set(names))
+            if missing:
+                raise DocumentRuntimeError(f"PPTX missing required members {missing}: {target}")
+            slides = [
+                n for n in names if n.startswith("ppt/slides/slide") and n.endswith(".xml")
+            ]
+            if not slides:
+                raise DocumentRuntimeError(f"PPTX has no slide parts: {target}")
+            try:
+                ET.fromstring(archive.read("ppt/presentation.xml"))
+                for member in slides:
+                    ET.fromstring(archive.read(member))
+            except ET.ParseError as exc:
+                raise DocumentRuntimeError(f"PPTX XML is not well-formed: {exc}") from exc
+            result["zip_members"] = len(names)
+            result["slide_count"] = len(slides)
+    elif fmt == "pdf":
+        data = target.read_bytes()
+        if not data.lstrip().startswith(b"%PDF"):
+            raise DocumentRuntimeError(f"PDF missing %PDF header: {target}")
+        if b"%%EOF" not in data:
+            raise DocumentRuntimeError(f"PDF missing %%EOF trailer: {target}")
+        if b"/Catalog" not in data or b"xref" not in data:
+            raise DocumentRuntimeError(f"PDF missing catalog/xref: {target}")
+        result["has_eof"] = True
+    elif fmt == "svg":
+        text = target.read_text(encoding="utf-8")
+        root = _parse_xml(text, "SVG")
+        if root.tag.rsplit("}", 1)[-1] != "svg":
+            raise DocumentRuntimeError(f"not an SVG document (root={root.tag}): {target}")
+        result["utf8"] = True
+        result["svg_root"] = True
     elif fmt in {"md", "txt", "text", "csv", "json", "html", "htm"}:
         # Strict UTF-8 decode proves text artifacts are not binary garbage.
         target.read_text(encoding="utf-8")
