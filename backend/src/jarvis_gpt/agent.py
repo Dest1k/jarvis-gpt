@@ -11156,7 +11156,7 @@ def _web_surfer_answer_text(value: Any) -> str:
             candidate = value.get(key)
             if isinstance(candidate, str) and candidate.strip():
                 return candidate.strip()[:20000]
-        for key in ("products", "items", "results", "sources"):
+        for key in ("products", "items", "results", "sources", "snippets"):
             candidate = value.get(key)
             if isinstance(candidate, list) and candidate:
                 rendered = _web_surfer_list_text(candidate)
@@ -11166,11 +11166,8 @@ def _web_surfer_answer_text(value: Any) -> str:
         rendered = _web_surfer_list_text(value)
         if rendered:
             return rendered
-    if isinstance(value, dict | list):
-        try:
-            return json.dumps(value, ensure_ascii=False, indent=2)[:20000]
-        except (TypeError, ValueError):
-            return ""
+    # Never surface the raw tool JSON as the user's answer: an empty result here makes the
+    # caller fall through to web.answer, which SYNTHESIZES from the sources instead.
     return ""
 
 
@@ -11191,7 +11188,10 @@ def _web_surfer_list_text(items: list[Any]) -> str:
             f"Result {index}",
         )
         details: list[str] = []
-        for key in ("price", "currency", "rating", "verdict", "summary", "url"):
+        detail_keys = (
+            "price", "currency", "rating", "verdict", "snippet", "excerpt", "summary", "url",
+        )
+        for key in detail_keys:
             value = item.get(key)
             if value is not None and str(value).strip():
                 details.append(f"{key}: {str(value).strip()[:1000]}")
