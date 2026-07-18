@@ -592,14 +592,22 @@ def _agentic_recovery_answer(
         )
     if executed_tools:
         lines.append("До остановки зафиксированы результаты инструментов:")
+        failed_count = 0
         for item in executed_tools[-6:]:
             uncertain = _tool_result_outcome_unknown(item.result.data)
+            if not item.result.ok and not uncertain:
+                # A failed tool call must NEVER surface its raw error summary or the
+                # internal effect id to chat. A weak model that fumbles a read-only
+                # call — e.g. an invalid WMI class name rejected repeatedly — would
+                # otherwise leak "WMI class name contains unsupported characters." plus
+                # a hash as the operator-facing answer. Count these and report the
+                # failure honestly without echoing the raw tool output.
+                failed_count += 1
+                continue
             state = (
                 "исход неизвестен — нужна сверка состояния"
                 if uncertain
                 else "успешно"
-                if item.result.ok
-                else "ошибка"
             )
             summary = " ".join(item.result.summary.split())[:500]
             try:
@@ -608,6 +616,11 @@ def _agentic_recovery_answer(
                 effect_id = "unavailable"
             lines.append(
                 f"- {item.tool} [effect={effect_id}] — {state}: {summary}"
+            )
+        if failed_count:
+            lines.append(
+                f"Часть вызовов инструментов завершилась ошибкой ({failed_count}); "
+                "итог не подтверждён — сверь состояние."
             )
         if len(executed_tools) > 6:
             lines.append(
@@ -4110,15 +4123,28 @@ class AgentRuntime:
             "attached_file_context",
             "document_memory",
         }
-        if document_task:
-            # Persisted/attached file identity is already resolved by the task
-            # kernel. Weather, shopping, web follow-ups, and other fuzzy direct
-            # routes must not intercept the turn before document evidence loads.
-            return None
         native_action = _native_action_from_message(
             message,
             self.settings,
         )
+        # A strong, deterministic native route (host telemetry, clipboard, screen
+        # vision, window/process inspection) is a high-precision intent match and must
+        # win over a *fuzzy* LLM document_memory label. The weak local model routinely
+        # mislabels host-telemetry turns as document_memory (observed live:
+        # "Сколько оперативной памяти установлено…" → intent=document_memory conf ~0.88),
+        # which would otherwise suppress the hardware.summary route here and force the
+        # model into the agentic loop to invent a WMI class name itself — flaky and
+        # prone to leaking raw tool errors. `_native_action_from_message` only fires on
+        # precise phrasings, so honoring it under a document task is safe; the fuzzy
+        # weather/shopping/web routes (which are NOT native actions) stay suppressed.
+        strong_native = native_action is not None and native_action.action in (
+            SAFE_DIRECT_NATIVE_ACTIONS | {"clipboard.write"}
+        )
+        if document_task and not strong_native:
+            # Persisted/attached file identity is already resolved by the task
+            # kernel. Weather, shopping, web follow-ups, and other fuzzy direct
+            # routes must not intercept the turn before document evidence loads.
+            return None
         # A "посмотри на экран" turn is a single direct vision action; don't let the
         # multi-step orchestrator swallow it just because it also says "и скажи, что…".
         wants_screen_vision = (

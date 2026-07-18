@@ -4607,6 +4607,57 @@ def test_arbiter_gate_opens_for_local_bucket_and_stays_closed_for_chat(monkeypat
     storage.close()
 
 
+def test_hardware_telemetry_beats_document_memory_intent(monkeypatch, tmp_path):
+    """A host-telemetry turn that the weak model mislabels as document_memory must still
+    hit the deterministic hardware.summary direct route, not get suppressed and fall through
+    to the agentic loop where the model invents (and leaks) a WMI class name."""
+    from jarvis_gpt.agent import AgentContext, TaskKernelPlan
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+
+    class _IdleLLM:
+        async def complete(self, *a, **k):
+            return type("R", (), {"ok": True, "content": "", "error": None})()
+
+    agent = AgentRuntime(settings=settings, storage=storage, llm=_IdleLLM(), bus=EventBus())
+    conversation_id = storage.create_conversation("hw test")
+
+    inspects: list[str] = []
+
+    async def fake_run(name, arguments=None, **kwargs):
+        arguments = arguments or {}
+        inspects.append(str(arguments.get("action", "")))
+        return ToolRunResponse(
+            tool=name,
+            ok=True,
+            summary="ok",
+            data={"native": {"result": {"data": {"items": [{"CapacityGB": 128}]}}}},
+        )
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+
+    ctx = AgentContext(conversation_id=conversation_id, memory_hits=[], file_hits=[])
+    # The intent the weak local model actually produced live for this RAM query.
+    ctx.task_plan = TaskKernelPlan(
+        route="reasoning", mode="concise", intent="document_memory", confidence=0.88,
+    )
+    result = asyncio.run(
+        agent._try_direct_action(
+            "Сколько оперативной памяти установлено на этом компьютере?", ctx
+        )
+    )
+
+    assert result is not None  # NOT suppressed by the fuzzy document_memory label
+    assert any(e.payload.get("action") == "hardware.summary" for e in result.events)
+    # the deterministic route ran the whitelisted hardware inspects itself
+    assert "hardware.memory" in inspects
+    storage.close()
+
+
 def test_reasoning_arbiter_can_promote_research_to_mission(monkeypatch, tmp_path):
     # No mission keywords, so the keyword counter never fires; the heuristics
     # send the message to web_research, but the arbiter understands it as a real

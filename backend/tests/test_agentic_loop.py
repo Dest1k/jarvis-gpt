@@ -206,6 +206,53 @@ def test_agentic_stream_reports_completed_tool_when_synthesis_stream_dies(
     storage.close()
 
 
+def test_agentic_recovery_does_not_leak_failed_tool_error(monkeypatch, tmp_path):
+    """A read-only tool rejected by the runtime must never surface its raw error string
+    or internal effect id in the recovery answer. The weak model can fumble a system.inspect
+    call (invalid WMI class) repeatedly; the honest-fallback answer must report a failure
+    without echoing 'WMI class name contains unsupported characters.' + a hash to chat."""
+
+    class ToolThenOutageLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, messages, *, temperature=None, max_tokens=None, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return _result(
+                    '{"tool":"system.inspect","arguments":{"action":"hardware.memory"}}'
+                )
+            return type(
+                "Result",
+                (),
+                {"ok": False, "content": "", "error": "LLM temporarily unavailable", "raw": {}},
+            )()
+
+    agent, storage = _agent(monkeypatch, tmp_path, ToolThenOutageLLM())
+    storage.set_runtime_value("experience.autonomy_policy", {"verify_answers": False})
+
+    async def rejected_tool(name, arguments=None, **kwargs):
+        return ToolRunResponse(
+            tool=name,
+            ok=False,
+            summary="WMI class name contains unsupported characters.",
+            data={},
+        )
+
+    monkeypatch.setattr(agent.tools, "run", rejected_tool)
+
+    response = asyncio.run(agent.chat("собери данные и ответь"))
+
+    assert "effect=" not in response.answer
+    assert "unsupported characters" not in response.answer
+    assert "WMI class name" not in response.answer
+    # still honest about the failure / non-completion
+    assert "завершилась ошибкой" in response.answer
+    assert "автоматически не повторяю" in response.answer
+    assert "offline" not in response.answer.casefold()
+    storage.close()
+
+
 def test_fuzzy_resolve_tool_name(monkeypatch, tmp_path):
     class _IdleLLM:
         async def complete(self, *a, **k):
