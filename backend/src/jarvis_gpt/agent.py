@@ -10993,9 +10993,11 @@ def _format_model_status(
     lines = ["Состояние модели:"]
     served = health.get("served_models") if isinstance(health, dict) else None
     served_name = served[0] if isinstance(served, list) and served else None
+    runtime = disp.get("runtime") if isinstance(disp.get("runtime"), dict) else {}
     model = (
-        served_name
-        or disp.get("active_model")
+        disp.get("active_model")
+        or runtime.get("model_id")
+        or served_name
         or disp.get("model")
         or disp.get("desired_model")
         or "неизвестно"
@@ -11007,9 +11009,9 @@ def _format_model_status(
     port = disp.get("port") or 8001
     state = "работает" if disp.get("port_open") else "не отвечает"
     lines.append(f"- Диспетчер: {state} на :{port}")
-    runtime = disp.get("runtime")
-    if runtime and runtime != model:
-        lines.append(f"- vLLM образ: {runtime}")
+    image = disp.get("actual_image") or disp.get("desired_image")
+    if image:
+        lines.append(f"- Образ vLLM: {image}")
     report = "\n".join(lines)
     gpu_line = _format_gpu(gpus)
     if gpu_line:

@@ -76,14 +76,20 @@ def test_device_spec_and_shopping_are_not_model_control():
 
 def test_format_model_status_combines_sources():
     settings = load_settings("qwen36-vl")
-    disp = {"active_model": "qwen3.6-35b-a3b-nvfp4", "port_open": True, "port": 8001}
+    disp = {
+        "active_model": "qwen3.6-35b-a3b-nvfp4",
+        "port_open": True,
+        "port": 8001,
+        "actual_image": "vllm/vllm-openai:v0.25.1",
+    }
     health = {"served_models": ["dispatcher"]}
     gpus = [{"name": "RTX 5090", "memory_used_mib": 31000, "memory_total_mib": 32607,
              "memory_free_mib": 1607, "utilization_pct": 40}]
     report = _format_model_status(settings, disp, health, gpus)
-    assert "Модель: dispatcher" in report
+    assert "Модель: qwen3.6-35b-a3b-nvfp4" in report  # real model, not the served alias
     assert "qwen36-vl" in report
     assert "работает" in report
+    assert "vllm/vllm-openai:v0.25.1" in report
     assert "VRAM 31000/32607" in report
 
 
@@ -140,7 +146,7 @@ def test_model_status_summary_reports(monkeypatch, tmp_path):
     monkeypatch.setattr(agent.tools, "run", fake_run)
     result = asyncio.run(agent._model_status_summary("проверил"))
     assert "Состояние модели" in result.answer
-    assert "dispatcher" in result.answer
+    assert "Модель: qwen" in result.answer  # active_model wins over the served alias
 
 
 def test_switch_profile_reports_restart_instruction(monkeypatch, tmp_path):
