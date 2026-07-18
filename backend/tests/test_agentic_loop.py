@@ -1664,3 +1664,19 @@ def test_agentic_stream_plain_answer_has_no_regression(monkeypatch, tmp_path):
     deltas = asyncio.run(collect())
     assert deltas == ["Привет", ", чем помочь?"]
     storage.close()
+
+
+def test_looks_like_raw_tool_echo_detects_pasted_observations():
+    from jarvis_gpt.agent import _looks_like_raw_tool_echo
+
+    assert _looks_like_raw_tool_echo('observation[web.answer · error]: {"error":"x"}')
+    assert _looks_like_raw_tool_echo(
+        '{"ok": true, "query": "vLLM version", "answer": "", "snippets": [{"t":"x"}]}'
+    )
+    assert _looks_like_raw_tool_echo(
+        '{"error":"web.answer failed: no provider","code":"NO_PROVIDER"}'
+    )
+    # A real natural-language answer must NOT be flagged.
+    assert not _looks_like_raw_tool_echo("Последняя стабильная версия vLLM — v0.25.1.")
+    assert not _looks_like_raw_tool_echo("")
+    assert not _looks_like_raw_tool_echo("Вот план: 1) сделать X 2) проверить Y.")

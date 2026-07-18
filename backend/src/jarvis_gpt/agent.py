@@ -8840,6 +8840,23 @@ class AgentRuntime:
                 )
             if turn.kind == "answer":
                 answer = turn.text
+                if _looks_like_raw_tool_echo(answer) and used_tools > initial_used_tools:
+                    # The model pasted a raw tool observation/JSON as its answer. Force one
+                    # clean synthesis over the observations instead of showing raw output.
+                    messages.append({"role": "assistant", "content": content})
+                    messages.append({"role": "system", "content": FINAL_ANSWER_PROMPT})
+                    clean = await self._complete_llm(
+                        messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        thinking_enabled=thinking_enabled,
+                    )
+                    if (
+                        clean.ok
+                        and clean.content.strip()
+                        and not _looks_like_raw_tool_echo(clean.content)
+                    ):
+                        answer = clean.content.strip()
                 continuation_count = 0
                 if finish_reason == "length":
                     answer, continuation_count, finish_reason = await self._auto_continue_answer(
@@ -10843,6 +10860,28 @@ def _dict_is_tool_call_envelope(data: dict[str, Any]) -> bool:
         or isinstance(data.get("function"), dict)
         or isinstance(data.get("tool"), str)
     )
+
+
+def _looks_like_raw_tool_echo(text: str) -> bool:
+    """True when an 'answer' is actually a pasted raw tool observation / JSON, not a reply.
+
+    The weak local model sometimes copies a tool's raw observation ("observation[web.answer ·
+    error]: {…}") or a bare result JSON ({"ok":true,"snippets":[…]}) into its final answer
+    instead of writing a natural reply. We detect that to force one clean synthesis pass.
+    """
+
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+    if stripped.startswith("observation[") or stripped.startswith("data:"):
+        return True
+    if stripped.startswith("{") and stripped.endswith("}") and len(stripped) > 20:
+        low = stripped.lower()
+        return any(
+            marker in low
+            for marker in ('"snippets"', '"error"', '"ok":', '"query":', '"code":', '"results"')
+        )
+    return False
 
 
 def _classify_tool_turn(content: str) -> _ToolTurn:
