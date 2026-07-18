@@ -7,6 +7,7 @@
     "build": "next build",
     "start": "next start --hostname 127.0.0.1",
     "typecheck": "tsc --noEmit",
+    "test:memory-graph": "node tests/memory-graph.mjs",
     "test:runtime-identity": "node tests/runtime-identity.mjs",
     "test:stream-placeholder": "node tests/stream-placeholder.mjs"
   },

@@ -1768,6 +1768,11 @@ export default function CommandCenter() {
   const vitalsRequestInFlightRef = useRef(false);
   const telemetryRequestInFlightRef = useRef(false);
   const missionsRef = useRef<Mission[]>([]);
+  const memoryVaultRef = useRef<MemoryVault | null>(null);
+  const memoryVaultRequestRef = useRef<Promise<MemoryVault> | null>(null);
+  const memoryVaultGenerationRef = useRef(0);
+  const memoryVaultRevisionRef = useRef(0);
+  const memoryVaultDirtyRef = useRef(false);
 
   const activeChatWindow = useMemo(
     () => chatWindows.find((window) => window.id === activeChatWindowId) ?? chatWindows[0],
@@ -1905,6 +1910,14 @@ export default function CommandCenter() {
     );
     if (runtimeIdentityRef.current === nextIdentity) return;
     runtimeIdentityRef.current = nextIdentity;
+    // The vault payload is cached per runtime identity. In-flight responses from
+    // an old home/profile are ignored by the generation check in loadMemoryVault.
+    memoryVaultGenerationRef.current += 1;
+    memoryVaultRequestRef.current = null;
+    memoryVaultRef.current = null;
+    memoryVaultRevisionRef.current = 0;
+    memoryVaultDirtyRef.current = false;
+    setMemoryVault(null);
     setRuntimeIdentity(nextIdentity);
     const storedWindows = readStoredChatWindows(nextIdentity);
     setChatWindows(storedWindows.windows);
@@ -1918,7 +1931,51 @@ export default function CommandCenter() {
     setStorageReady(true);
   }, []);
 
-  const refresh = useCallback(async () => {
+  const loadMemoryVault = useCallback((force = false): Promise<MemoryVault> => {
+    const cached = memoryVaultRef.current;
+    if (!force && cached && !memoryVaultDirtyRef.current) {
+      return Promise.resolve(cached);
+    }
+    const inFlight = memoryVaultRequestRef.current;
+    if (inFlight) return inFlight;
+
+    const generation = memoryVaultGenerationRef.current;
+    const revision = memoryVaultRevisionRef.current;
+    const request = api<MemoryVault>("/api/memory/vault")
+      .then((data) => {
+        if (generation === memoryVaultGenerationRef.current) {
+          if (revision !== memoryVaultRevisionRef.current) {
+            memoryVaultDirtyRef.current = true;
+            return data;
+          }
+          memoryVaultRef.current = data;
+          memoryVaultDirtyRef.current = false;
+          setMemoryVault(data);
+        }
+        return data;
+      })
+      .finally(() => {
+        if (memoryVaultRequestRef.current === request) {
+          memoryVaultRequestRef.current = null;
+        }
+      });
+    memoryVaultRequestRef.current = request;
+    return request;
+  }, []);
+
+  const markMemoryVaultDirty = useCallback(() => {
+    memoryVaultRevisionRef.current += 1;
+    memoryVaultDirtyRef.current = true;
+  }, []);
+
+  const refreshMemoryVault = useCallback(async () => {
+    await loadMemoryVault(true);
+    // A forced caller can join an older in-flight request. If a write raced
+    // that request, make one fresh pass instead of presenting its stale payload.
+    if (memoryVaultDirtyRef.current) await loadMemoryVault(true);
+  }, [loadMemoryVault]);
+
+  const refresh = useCallback(async (includeMemoryVault = false) => {
     try {
       setError(null);
       const results = await Promise.allSettled([
@@ -1931,7 +1988,6 @@ export default function CommandCenter() {
         api<Mission[]>("/api/missions").then(setMissions),
         api<ToolInfo[]>("/api/tools").then(setTools),
         api<MemoryItem[]>("/api/memory?limit=8").then(setMemories),
-        api<MemoryVault>("/api/memory/vault").then(setMemoryVault),
         api<FileItem[]>("/api/files?limit=8").then(setFiles),
         api<AuditEntry[]>("/api/audit?limit=8").then(setAudit),
         api<ModelCatalog>("/api/models").then((data) => {
@@ -1969,7 +2025,8 @@ export default function CommandCenter() {
         api<BrowserHandoff | null>("/api/browser/handoff").then(setBrowserHandoff),
         api<InternetObservability>("/api/internet/observability?limit=120").then(
           setInternetObservability
-        )
+        ),
+        ...(includeMemoryVault ? [refreshMemoryVault()] : [])
       ]);
       const failures = results.filter((result) => result.status === "rejected");
       if (failures.length === results.length) {
@@ -1981,7 +2038,7 @@ export default function CommandCenter() {
     } catch (err) {
       setError(err instanceof Error ? err.message : "Backend недоступен");
     }
-  }, [applyRuntimeIdentity]);
+  }, [applyRuntimeIdentity, refreshMemoryVault]);
 
   const refreshVitals = useCallback(async () => {
     if (vitalsRequestInFlightRef.current) return;
@@ -2021,6 +2078,20 @@ export default function CommandCenter() {
   useEffect(() => {
     refresh();
   }, [refresh]);
+
+  // The graph is several megabytes on a real vault. Fetch it only after the
+  // memory tab is opened. Re-entering the tab refreshes the cache so background
+  // learning/agent writes become visible without restoring the old eager startup fetch.
+  useEffect(() => {
+    if (activeTab !== "memory") return;
+    void (async () => {
+      try {
+        await refreshMemoryVault();
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Не удалось загрузить граф памяти");
+      }
+    })();
+  }, [activeTab, refreshMemoryVault, runtimeIdentity]);
 
   // Chat persistence is gated on runtime identity from /api/status so a home
   // switch cannot revive an unscoped transcript (FUNC-FIND-015).
@@ -2432,6 +2503,7 @@ export default function CommandCenter() {
         const withoutDuplicate = current.filter((item) => item.id !== result.file.id);
         return [result.file, ...withoutDuplicate].slice(0, 8);
       });
+      markMemoryVaultDirty();
     }
     return uploaded;
   }
@@ -3221,6 +3293,7 @@ export default function CommandCenter() {
         body: JSON.stringify({ path, max_files: 80 })
       });
       setDirectoryIngest(result);
+      markMemoryVaultDirty();
       setLines((current) => [
         ...current,
         {
@@ -3656,7 +3729,8 @@ export default function CommandCenter() {
       });
       setMemoryDraft("");
       setMemories((current) => [saved, ...current].slice(0, 8));
-      await refresh();
+      markMemoryVaultDirty();
+      await refresh(true);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Не удалось сохранить память");
     } finally {
@@ -3690,6 +3764,7 @@ export default function CommandCenter() {
       setSelectedFile(null);
       form.reset();
       setFiles((current) => [result.file, ...current].slice(0, 8));
+      markMemoryVaultDirty();
       setLines((current) => [
         ...current,
         {
@@ -4515,7 +4590,12 @@ export default function CommandCenter() {
             <h1>Центр управления</h1>
           </div>
           <div className="topActions">
-            <button className="iconText" type="button" onClick={refresh} disabled={busy}>
+            <button
+              className="iconText"
+              type="button"
+              onClick={() => void refresh(activeTab === "memory")}
+              disabled={busy}
+            >
               <RefreshCw size={17} />
               <span>Обновить</span>
             </button>

@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import sqlite3
 import threading
 import uuid
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 from itertools import combinations
@@ -16,12 +17,85 @@ from typing import Any
 from .memory_vault import MemoryVault
 from .redaction import redact_value
 
+LOGGER = logging.getLogger(__name__)
+
 # Document-graph augmentation: fold uploaded documents into the memory link graph.
 DOCUMENT_GRAPH_NODE_CAP = 5000
 _DOC_DERIV_BUCKET_K = 6  # groups larger than this collapse to a hub-and-star, not a clique
 _DOC_DERIV_PER_DOC_DEGREE_CAP = 8  # max derived edges any single document may accrue
+_DOC_MENTION_EDGE_CAP = 10_000  # bound adversarial all-notes x all-documents mentions
+_MEMORY_VAULT_REPAIR_KEY = "memory_vault.repair_required"
 # Mirrors document_memory._FILE_ID_RE; duplicated locally to avoid an import cycle.
 _DOC_FILE_ID_RE = re.compile(r"\bfile_[0-9a-fA-F]{8,}\b")
+
+
+class _FilenameMatcher:
+    """Case-insensitive multi-pattern matcher with filename-aware boundaries."""
+
+    def __init__(self, names: Iterable[str]) -> None:
+        self._transitions: list[dict[str, int]] = [{}]
+        self._failures = [0]
+        self._outputs: list[list[str]] = [[]]
+        for name in sorted(set(names)):
+            state = 0
+            for character in name:
+                next_state = self._transitions[state].get(character)
+                if next_state is None:
+                    next_state = len(self._transitions)
+                    self._transitions[state][character] = next_state
+                    self._transitions.append({})
+                    self._failures.append(0)
+                    self._outputs.append([])
+                state = next_state
+            self._outputs[state].append(name)
+
+        pending = deque(self._transitions[0].values())
+        while pending:
+            state = pending.popleft()
+            for character, next_state in self._transitions[state].items():
+                pending.append(next_state)
+                fallback = self._failures[state]
+                while fallback and character not in self._transitions[fallback]:
+                    fallback = self._failures[fallback]
+                self._failures[next_state] = self._transitions[fallback].get(character, 0)
+                self._outputs[next_state].extend(self._outputs[self._failures[next_state]])
+
+    def find(self, text: str) -> set[str]:
+        folded = text.casefold()
+        state = 0
+        matches: list[tuple[int, int, str]] = []
+        for end, character in enumerate(folded, start=1):
+            while state and character not in self._transitions[state]:
+                state = self._failures[state]
+            state = self._transitions[state].get(character, 0)
+            for name in self._outputs[state]:
+                start = end - len(name)
+                if _is_filename_boundary(folded, start, end):
+                    matches.append((start, end, name))
+
+        # File names may contain spaces and punctuation, so both ``report.pdf``
+        # and ``old report.pdf`` have valid lexical boundaries in the latter
+        # phrase. Keep only maximal spans; a standalone occurrence elsewhere
+        # still keeps the shorter registered name in the returned set.
+        found: set[str] = set()
+        farthest_end = -1
+        for _start, end, name in sorted(matches, key=lambda item: (item[0], -item[1])):
+            if end <= farthest_end:
+                continue
+            found.add(name)
+            farthest_end = end
+        return found
+
+
+def _is_filename_boundary(text: str, start: int, end: int) -> bool:
+    """Reject a basename embedded in a longer filename, e.g. report.pdf in old_report.pdf."""
+
+    def is_filename_character(character: str) -> bool:
+        return character.isalnum() or character in "._-"
+
+    return (start == 0 or not is_filename_character(text[start - 1])) and (
+        end == len(text) or not is_filename_character(text[end])
+    )
 
 _QUERY_STOPWORDS = {
     "a",
@@ -440,11 +514,18 @@ class JarvisStorage:
     def initialize(self) -> None:
         with self._lock:
             conn = self.connect()
-            conn.executescript(SCHEMA)
-            self._memory_fts_available = self._ensure_memory_fts(conn)
-            self._file_fts_available = self._ensure_file_chunks_fts(conn)
-            self._sync_memory_vault(conn)
-            conn.commit()
+            try:
+                conn.executescript(SCHEMA)
+                self._memory_fts_available = self._ensure_memory_fts(conn)
+                self._file_fts_available = self._ensure_file_chunks_fts(conn)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            # SQLite is authoritative. A damaged/unavailable Markdown mirror
+            # must not leave migrations open or prevent the service starting;
+            # the durable repair marker makes the next write retry a full sync.
+            self._sync_memory_vault_after_commit(conn, force_full=True)
 
     def _ensure_memory_fts(self, conn: sqlite3.Connection) -> bool:
         try:
@@ -500,6 +581,96 @@ class JarvisStorage:
 
     def _sync_memory_vault(self, conn: sqlite3.Connection) -> None:
         self.memory_vault.sync(self._load_memories_for_vault(conn))
+
+    def _memory_vault_repair_pending(self, conn: sqlite3.Connection) -> bool:
+        row = conn.execute(
+            "SELECT value FROM runtime_kv WHERE key = ?",
+            (_MEMORY_VAULT_REPAIR_KEY,),
+        ).fetchone()
+        if row is None:
+            return False
+        value = _loads(row["value"], False)
+        if isinstance(value, dict):
+            return bool(value.get("required"))
+        return bool(value)
+
+    def _mark_memory_vault_repair_required(
+        self, conn: sqlite3.Connection, exc: BaseException
+    ) -> None:
+        try:
+            if conn.in_transaction:
+                conn.rollback()
+            now = utc_now()
+            value = {
+                "required": True,
+                "failed_at": now,
+                "error_type": type(exc).__name__,
+            }
+            conn.execute(
+                """
+                INSERT INTO runtime_kv(key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (_MEMORY_VAULT_REPAIR_KEY, _json(value), now),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            LOGGER.exception("Failed to persist memory-vault repair marker")
+
+    def _clear_memory_vault_repair_marker(self, conn: sqlite3.Connection) -> None:
+        try:
+            conn.execute(
+                "DELETE FROM runtime_kv WHERE key = ?",
+                (_MEMORY_VAULT_REPAIR_KEY,),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            LOGGER.exception("Failed to clear memory-vault repair marker")
+
+    def _sync_memory_vault_after_commit(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        upserts: Iterable[dict[str, Any]] = (),
+        removed_ids: Iterable[str] = (),
+        force_full: bool = False,
+        raise_on_error: bool = False,
+    ) -> bool:
+        """Update the derived Markdown mirror only after SQLite is durable.
+
+        A previous mirror failure switches the next write to a full rebuild. The
+        marker itself lives in SQLite, so a process restart cannot lose the need
+        for repair. Filesystem errors never leave an implicit DB transaction open.
+        """
+
+        if conn.in_transaction:
+            raise RuntimeError("memory-vault sync requires a committed DB transaction")
+        repair_pending = self._memory_vault_repair_pending(conn)
+        try:
+            if force_full or repair_pending:
+                self._sync_memory_vault(conn)
+            else:
+                for memory in upserts:
+                    self.memory_vault.upsert_memory(memory)
+                for memory_id in removed_ids:
+                    self.memory_vault.remove_memory(str(memory_id))
+        except Exception as exc:
+            self._mark_memory_vault_repair_required(conn, exc)
+            LOGGER.warning(
+                "Memory-vault mirror update failed; full repair is pending",
+                exc_info=True,
+            )
+            if raise_on_error:
+                raise
+            return False
+        if repair_pending:
+            self._clear_memory_vault_repair_marker(conn)
+        return True
 
     def ping(self) -> bool:
         with self._lock:
@@ -1016,72 +1187,84 @@ class JarvisStorage:
             "created_at": now,
             "updated_at": now,
         }
+        merged_existing = False
         with self._lock:
             conn = self.connect()
-            existing_rows = conn.execute(
-                """
-                SELECT id, namespace, content, tags, importance, created_at, updated_at
-                FROM memories
-                WHERE namespace = ?
-                ORDER BY updated_at DESC
-                LIMIT 250
-                """,
-                (namespace,),
-            ).fetchall()
-            for existing in existing_rows:
-                existing_dict = dict(existing)
-                if _normalize_memory_content(str(existing_dict["content"])) != content_key:
-                    continue
-                merged_tags = _merge_tags(_loads(existing_dict["tags"], []), tags)
-                merged_importance = max(float(existing_dict["importance"] or 0), importance)
-                row = {
-                    **existing_dict,
-                    "tags": merged_tags,
-                    "importance": merged_importance,
-                    "updated_at": now,
-                }
-                conn.execute(
+            if conn.in_transaction:
+                raise RuntimeError("memory mutation requires a clean storage transaction")
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                existing_rows = conn.execute(
                     """
-                    UPDATE memories
-                    SET tags = ?, importance = ?, updated_at = ?
-                    WHERE id = ?
+                    SELECT id, namespace, content, tags, importance, created_at, updated_at
+                    FROM memories
+                    WHERE namespace = ?
+                    ORDER BY updated_at DESC
+                    LIMIT 250
                     """,
-                    (_json(merged_tags), merged_importance, now, row["id"]),
-                )
-                self._replace_memory_fts(conn, row)
-                self.memory_vault.upsert_memory(row)
+                    (namespace,),
+                ).fetchall()
+                for existing in existing_rows:
+                    existing_dict = dict(existing)
+                    if _normalize_memory_content(str(existing_dict["content"])) != content_key:
+                        continue
+                    merged_tags = _merge_tags(_loads(existing_dict["tags"], []), tags)
+                    merged_importance = max(
+                        float(existing_dict["importance"] or 0), importance
+                    )
+                    row = {
+                        **existing_dict,
+                        "tags": merged_tags,
+                        "importance": merged_importance,
+                        "updated_at": now,
+                    }
+                    conn.execute(
+                        """
+                        UPDATE memories
+                        SET tags = ?, importance = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (_json(merged_tags), merged_importance, now, row["id"]),
+                    )
+                    self._replace_memory_fts(conn, row)
+                    merged_existing = True
+                    break
+                if not merged_existing:
+                    conn.execute(
+                        """
+                        INSERT INTO memories(
+                            id, namespace, content, tags, importance, created_at, updated_at
+                        )
+                        VALUES (
+                            :id, :namespace, :content, :tags, :importance, :created_at, :updated_at
+                        )
+                        """,
+                        {**row, "tags": _json(row["tags"])},
+                    )
+                    self._replace_memory_fts(conn, row)
                 conn.commit()
-                self.record_audit(
-                    actor="system",
-                    action="memory.merge",
-                    target_type="memory",
-                    target_id=row["id"],
-                    summary=f"Memory refreshed in namespace {row['namespace']}.",
-                    after=row,
-                )
-                return row
-            conn.execute(
-                """
-                INSERT INTO memories(
-                    id, namespace, content, tags, importance, created_at, updated_at
-                )
-                VALUES (
-                    :id, :namespace, :content, :tags, :importance, :created_at, :updated_at
-                )
-                """,
-                {**row, "tags": _json(row["tags"])},
+            except Exception:
+                conn.rollback()
+                raise
+            self._sync_memory_vault_after_commit(conn, upserts=(row,))
+        if merged_existing:
+            self.record_audit(
+                actor="system",
+                action="memory.merge",
+                target_type="memory",
+                target_id=row["id"],
+                summary=f"Memory refreshed in namespace {row['namespace']}.",
+                after=row,
             )
-            self._replace_memory_fts(conn, row)
-            self.memory_vault.upsert_memory(row)
-            conn.commit()
-        self.record_audit(
-            actor="system",
-            action="memory.create",
-            target_type="memory",
-            target_id=row["id"],
-            summary=f"Memory saved in namespace {row['namespace']}.",
-            after=row,
-        )
+        else:
+            self.record_audit(
+                actor="system",
+                action="memory.create",
+                target_type="memory",
+                target_id=row["id"],
+                summary=f"Memory saved in namespace {row['namespace']}.",
+                after=row,
+            )
         return row
 
     def _replace_memory_fts(self, conn: sqlite3.Connection, row: dict[str, Any]) -> None:
@@ -1215,62 +1398,88 @@ class JarvisStorage:
     def consolidate_memories(self, limit: int = 1000) -> dict[str, int]:
         with self._lock:
             conn = self.connect()
-            rows = conn.execute(
-                """
-                SELECT id, namespace, content, tags, importance, created_at, updated_at
-                FROM memories
-                ORDER BY updated_at DESC
-                LIMIT ?
-                """,
-                (max(1, min(5000, limit)),),
-            ).fetchall()
-            groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
-            for row in rows:
-                item = dict(row)
-                key = (str(item["namespace"]), _normalize_memory_content(str(item["content"])))
-                if not key[1]:
-                    continue
-                groups.setdefault(key, []).append(item)
-
             removed = 0
             merged = 0
-            for items in groups.values():
-                if len(items) < 2:
-                    continue
-                keep = max(
-                    items,
-                    key=lambda item: (
-                        float(item.get("importance") or 0),
-                        str(item.get("updated_at") or ""),
-                    ),
-                )
-                duplicate_ids = [item["id"] for item in items if item["id"] != keep["id"]]
-                merged_tags = _merge_tags(*(_loads(item.get("tags"), []) for item in items))
-                merged_importance = max(float(item.get("importance") or 0) for item in items)
-                now = utc_now()
-                conn.execute(
+            vault_upserts: list[dict[str, Any]] = []
+            removed_ids: list[str] = []
+            if conn.in_transaction:
+                raise RuntimeError("memory mutation requires a clean storage transaction")
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                rows = conn.execute(
                     """
-                    UPDATE memories
-                    SET tags = ?, importance = ?, updated_at = ?
-                    WHERE id = ?
+                    SELECT id, namespace, content, tags, importance, created_at, updated_at
+                    FROM memories
+                    ORDER BY updated_at DESC
+                    LIMIT ?
                     """,
-                    (_json(merged_tags), merged_importance, now, keep["id"]),
-                )
-                keep = {
-                    **keep,
-                    "tags": merged_tags,
-                    "importance": merged_importance,
-                    "updated_at": now,
-                }
-                self._replace_memory_fts(conn, keep)
-                for duplicate_id in duplicate_ids:
-                    if self._memory_fts_available:
-                        conn.execute("DELETE FROM memories_fts WHERE id = ?", (duplicate_id,))
-                    conn.execute("DELETE FROM memories WHERE id = ?", (duplicate_id,))
-                    self.memory_vault.remove_memory(str(duplicate_id))
-                removed += len(duplicate_ids)
-                merged += 1
-            conn.commit()
+                    (max(1, min(5000, limit)),),
+                ).fetchall()
+                groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+                for row in rows:
+                    item = dict(row)
+                    key = (
+                        str(item["namespace"]),
+                        _normalize_memory_content(str(item["content"])),
+                    )
+                    if not key[1]:
+                        continue
+                    groups.setdefault(key, []).append(item)
+
+                for items in groups.values():
+                    if len(items) < 2:
+                        continue
+                    keep = max(
+                        items,
+                        key=lambda item: (
+                            float(item.get("importance") or 0),
+                            str(item.get("updated_at") or ""),
+                        ),
+                    )
+                    duplicate_ids = [
+                        item["id"] for item in items if item["id"] != keep["id"]
+                    ]
+                    merged_tags = _merge_tags(
+                        *(_loads(item.get("tags"), []) for item in items)
+                    )
+                    merged_importance = max(
+                        float(item.get("importance") or 0) for item in items
+                    )
+                    now = utc_now()
+                    conn.execute(
+                        """
+                        UPDATE memories
+                        SET tags = ?, importance = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (_json(merged_tags), merged_importance, now, keep["id"]),
+                    )
+                    keep = {
+                        **keep,
+                        "tags": merged_tags,
+                        "importance": merged_importance,
+                        "updated_at": now,
+                    }
+                    self._replace_memory_fts(conn, keep)
+                    vault_upserts.append(keep)
+                    for duplicate_id in duplicate_ids:
+                        if self._memory_fts_available:
+                            conn.execute(
+                                "DELETE FROM memories_fts WHERE id = ?", (duplicate_id,)
+                            )
+                        conn.execute("DELETE FROM memories WHERE id = ?", (duplicate_id,))
+                        removed_ids.append(str(duplicate_id))
+                    removed += len(duplicate_ids)
+                    merged += 1
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            self._sync_memory_vault_after_commit(
+                conn,
+                upserts=vault_upserts,
+                removed_ids=removed_ids,
+            )
         if removed:
             self.add_event(
                 kind="memory.consolidate",
@@ -1297,7 +1506,11 @@ class JarvisStorage:
     def rebuild_memory_vault(self) -> dict[str, Any]:
         with self._lock:
             conn = self.connect()
-            self._sync_memory_vault(conn)
+            self._sync_memory_vault_after_commit(
+                conn,
+                force_full=True,
+                raise_on_error=True,
+            )
         graph = self.memory_vault.graph()
         self._augment_graph_with_documents(graph)
         return graph
@@ -1349,19 +1562,23 @@ class JarvisStorage:
         for fid, row in docs_by_id.items():
             name = str(row.get("name") or "").strip()
             if len(name) >= 5:  # skip trivially short names that would match everywhere
-                name_to_ids[name].append(fid)
+                name_to_ids[name.casefold()].append(fid)
+        filename_matcher = _FilenameMatcher(name_to_ids)
         mention_edges: list[dict[str, str]] = []
         seen_mentions: set[tuple[str, str]] = set()
         for note in graph.get("notes", []):
+            if len(mention_edges) >= _DOC_MENTION_EDGE_CAP:
+                break
             mem_id = str(note.get("id") or note.get("path") or "")
             content = str(note.get("content") or "")
             if not mem_id or not content:
                 continue
             hits: set[str] = {fid for fid in _DOC_FILE_ID_RE.findall(content) if fid in doc_ids}
-            for name, ids in name_to_ids.items():
-                if name in content:
-                    hits.update(ids)
+            for name in filename_matcher.find(content):
+                hits.update(name_to_ids[name])
             for fid in sorted(hits):
+                if len(mention_edges) >= _DOC_MENTION_EDGE_CAP:
+                    break
                 key = (mem_id, fid)
                 if key in seen_mentions:
                     continue
@@ -1449,8 +1666,8 @@ class JarvisStorage:
             if created:
                 co_day[created].append(fid)
 
-        _process(co_source, "co-source", "folder", "folder")
         _process(same_content, "same-content", None, "document")
+        _process(co_source, "co-source", "folder", "folder")
         _process(co_day, "co-day", "daybucket", "daybucket")
 
         # Merge, then recompute degree + top_nodes + stats over the unified graph.
@@ -1886,6 +2103,8 @@ class JarvisStorage:
         *,
         tz_name: str | None = None,
         limit: int = 20,
+        skip_ids: Iterable[str] = (),
+        excluded_payload_kinds: Iterable[str] = (),
     ) -> list[dict[str, Any]]:
         """Atomically fire every due reminder in a single BEGIN IMMEDIATE transaction.
 
@@ -1902,6 +2121,10 @@ class JarvisStorage:
         now = now_iso or utc_now()
         tz = reminder_zone(tz_name) if tz_name else reminder_zone()
         now_local = datetime.fromisoformat(now).astimezone(tz)
+        skipped = tuple(dict.fromkeys(str(item) for item in skip_ids if str(item)))
+        excluded_kinds = tuple(
+            dict.fromkeys(str(item) for item in excluded_payload_kinds if str(item))
+        )
         fired: list[dict[str, Any]] = []
         with self._lock:
             conn = self.connect()
@@ -1909,16 +2132,36 @@ class JarvisStorage:
                 raise RuntimeError("reminder claim requires a clean storage transaction")
             try:
                 conn.execute("BEGIN IMMEDIATE")
+                clauses = ["status = 'pending'", "due_at <= ?"]
+                params: list[Any] = [now]
+                if skipped:
+                    placeholders = ",".join("?" for _ in skipped)
+                    clauses.append(f"id NOT IN ({placeholders})")
+                    params.extend(skipped)
+                if excluded_kinds:
+                    placeholders = ",".join("?" for _ in excluded_kinds)
+                    clauses.append(
+                        "COALESCE(json_extract(payload, '$.kind'), '') "
+                        f"NOT IN ({placeholders})"
+                    )
+                    params.extend(excluded_kinds)
+                # A persisted notification is an outbox lease: recurring watches do not
+                # capture again until the prior notice has been delivered or retried.
+                clauses.append(
+                    "NOT (COALESCE(json_extract(payload, '$.kind'), '') = 'screen_watch' "
+                    "AND COALESCE(json_extract(payload, '$.notification.state'), '') = 'pending')"
+                )
+                params.append(limit)
                 rows = conn.execute(
-                    """
+                    f"""
                     SELECT id, created_at, updated_at, text, due_at, recurrence, status,
                            conversation_id, source_text, fired_at, fire_count, payload
                     FROM reminders
-                    WHERE status = 'pending' AND due_at <= ?
+                    WHERE {' AND '.join(clauses)}
                     ORDER BY due_at ASC
                     LIMIT ?
                     """,
-                    (now, limit),
+                    tuple(params),
                 ).fetchall()
                 for row in rows:
                     snapshot = self._decode_reminder(row)
@@ -1955,6 +2198,289 @@ class JarvisStorage:
                     conn.rollback()
                 raise
         return fired
+
+    def stage_screen_watch_notification(
+        self,
+        reminder_id: str,
+        *,
+        expected_fire_count: int,
+        terminal_status: str | None,
+        text: str,
+        event_kind: str,
+        level: str,
+        met: bool,
+    ) -> dict[str, Any] | None:
+        """Atomically seal a watcher result into its durable delivery outbox."""
+
+        if terminal_status not in {None, "fired", "cancelled"}:
+            raise ValueError("invalid screen-watch terminal status")
+        now = utc_now()
+        with self._lock:
+            conn = self.connect()
+            if conn.in_transaction:
+                raise RuntimeError("screen-watch transition requires a clean transaction")
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    """
+                    SELECT id, created_at, updated_at, text, due_at, recurrence, status,
+                           conversation_id, source_text, fired_at, fire_count, payload
+                    FROM reminders WHERE id = ?
+                    """,
+                    (reminder_id,),
+                ).fetchone()
+                if row is None:
+                    conn.rollback()
+                    return None
+                current = self._decode_reminder(row)
+                payload = current.get("payload")
+                if (
+                    current.get("status") != "pending"
+                    or int(current.get("fire_count") or 0) != int(expected_fire_count)
+                    or not isinstance(payload, dict)
+                    or payload.get("kind") != "screen_watch"
+                ):
+                    conn.rollback()
+                    return None
+                notification_id = f"{reminder_id}:{expected_fire_count}"
+                payload = {
+                    **payload,
+                    "notification": {
+                        "id": notification_id,
+                        "state": "pending",
+                        "text": str(text)[:3900],
+                        "event_kind": str(event_kind)[:120],
+                        "level": str(level)[:20],
+                        "met": bool(met),
+                        "telegram_delivered": False,
+                        "telegram_delivered_ids": [],
+                        "conversation_delivered": False,
+                        "event_delivered": False,
+                        "local_delivered": False,
+                        "created_at": now,
+                    },
+                }
+                next_status = terminal_status or "pending"
+                updated = conn.execute(
+                    """
+                    UPDATE reminders
+                    SET status = ?, payload = ?, updated_at = ?
+                    WHERE id = ? AND status = 'pending' AND fire_count = ?
+                    """,
+                    (
+                        next_status,
+                        _json(payload),
+                        now,
+                        reminder_id,
+                        expected_fire_count,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    conn.rollback()
+                    return None
+                conn.commit()
+            except BaseException:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
+        return self.get_reminder(reminder_id)
+
+    def list_pending_screen_watch_notifications(self, limit: int = 50) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self.connect().execute(
+                """
+                SELECT id, created_at, updated_at, text, due_at, recurrence, status,
+                       conversation_id, source_text, fired_at, fire_count, payload
+                FROM reminders
+                WHERE COALESCE(json_extract(payload, '$.kind'), '') = 'screen_watch'
+                  AND COALESCE(json_extract(payload, '$.notification.state'), '') = 'pending'
+                ORDER BY updated_at ASC
+                LIMIT ?
+                """,
+                (max(1, min(500, int(limit))),),
+            ).fetchall()
+        return [self._decode_reminder(row) for row in rows]
+
+    def update_screen_watch_notification(
+        self,
+        reminder_id: str,
+        notification_id: str,
+        *,
+        telegram_delivered: bool | None = None,
+        telegram_target_ids: tuple[int, ...] | list[int] | None = None,
+        telegram_delivered_ids: tuple[int, ...] | list[int] | None = None,
+        conversation_delivered: bool | None = None,
+        event_delivered: bool | None = None,
+        local_delivered: bool | None = None,
+        completed: bool = False,
+    ) -> dict[str, Any] | None:
+        """Persist outbox progress without reopening a completed watcher."""
+
+        now = utc_now()
+        with self._lock:
+            conn = self.connect()
+            row = conn.execute(
+                """
+                SELECT id, created_at, updated_at, text, due_at, recurrence, status,
+                       conversation_id, source_text, fired_at, fire_count, payload
+                FROM reminders WHERE id = ?
+                """,
+                (reminder_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            current = self._decode_reminder(row)
+            payload = current.get("payload")
+            notification = payload.get("notification") if isinstance(payload, dict) else None
+            if not isinstance(notification, dict) or notification.get("id") != notification_id:
+                return None
+            notification = dict(notification)
+            if telegram_delivered is not None:
+                notification["telegram_delivered"] = bool(telegram_delivered)
+            if telegram_target_ids is not None:
+                notification["telegram_target_ids"] = list(
+                    dict.fromkeys(int(item) for item in telegram_target_ids)
+                )
+            if telegram_delivered_ids is not None:
+                notification["telegram_delivered_ids"] = list(
+                    dict.fromkeys(int(item) for item in telegram_delivered_ids)
+                )
+            if conversation_delivered is not None:
+                notification["conversation_delivered"] = bool(conversation_delivered)
+            if event_delivered is not None:
+                notification["event_delivered"] = bool(event_delivered)
+            if local_delivered is not None:
+                notification["local_delivered"] = bool(local_delivered)
+            if completed:
+                notification["state"] = "delivered"
+                notification["delivered_at"] = now
+            payload = {**payload, "notification": notification}
+            conn.execute(
+                "UPDATE reminders SET payload = ?, updated_at = ? WHERE id = ?",
+                (_json(payload), now, reminder_id),
+            )
+            conn.commit()
+        return self.get_reminder(reminder_id)
+
+    def deliver_screen_watch_local_notification(
+        self,
+        reminder_id: str,
+        notification_id: str,
+        *,
+        text: str,
+        event_kind: str,
+        level: str,
+        met: bool,
+        event_payload: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Atomically persist the conversation message, event, and outbox receipt.
+
+        The deterministic row ids plus one SQLite transaction make retries idempotent:
+        a crash cannot commit the local artifacts without also sealing local delivery.
+        """
+
+        now = utc_now()
+        digest = hashlib.sha256(notification_id.encode("utf-8")).hexdigest()[:24]
+        message_id = f"msg_swn_{digest}"
+        event_id = f"evt_swn_{digest}"
+        learning_id = f"learn_swn_{digest}"
+        with self._lock:
+            conn = self.connect()
+            if conn.in_transaction:
+                raise RuntimeError("screen-watch local delivery requires a clean transaction")
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    """
+                    SELECT id, created_at, updated_at, text, due_at, recurrence, status,
+                           conversation_id, source_text, fired_at, fire_count, payload
+                    FROM reminders WHERE id = ?
+                    """,
+                    (reminder_id,),
+                ).fetchone()
+                if row is None:
+                    conn.rollback()
+                    return None
+                current = self._decode_reminder(row)
+                payload = current.get("payload")
+                notification = payload.get("notification") if isinstance(payload, dict) else None
+                if (
+                    not isinstance(notification, dict)
+                    or notification.get("id") != notification_id
+                ):
+                    conn.rollback()
+                    return None
+                if notification.get("state") != "pending":
+                    conn.commit()
+                    return current
+                if bool(notification.get("local_delivered")):
+                    conn.commit()
+                    return current
+
+                conversation_id = current.get("conversation_id")
+                if conversation_id:
+                    metadata = {
+                        "kind": "screen_watch",
+                        "reminder_id": reminder_id,
+                        "met": bool(met),
+                        "notification_id": notification_id,
+                    }
+                    conn.execute(
+                        """
+                        INSERT INTO messages(
+                            id, conversation_id, role, content, metadata, created_at
+                        ) VALUES (?, ?, 'assistant', ?, ?, ?)
+                        """,
+                        (message_id, str(conversation_id), text, _json(metadata), now),
+                    )
+                    conn.execute(
+                        "UPDATE conversations SET updated_at = ? WHERE id = ?",
+                        (now, str(conversation_id)),
+                    )
+                    learning_row = self._learning_observation_row(
+                        kind="conversation.message",
+                        source_id=message_id,
+                        conversation_id=str(conversation_id),
+                        role="assistant",
+                        content=text,
+                        summary="assistant message captured for learning",
+                        payload={"metadata": metadata},
+                        ts=now,
+                    )
+                    learning_row["id"] = learning_id
+                    self._insert_learning_observation(conn, **learning_row)
+
+                conn.execute(
+                    """
+                    INSERT INTO runtime_events(id, ts, level, kind, title, payload)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event_id,
+                        now,
+                        str(level)[:20],
+                        str(event_kind)[:120],
+                        text.splitlines()[0][:240],
+                        _json(event_payload),
+                    ),
+                )
+                notification = {
+                    **notification,
+                    "conversation_delivered": bool(conversation_id),
+                    "event_delivered": True,
+                    "local_delivered": True,
+                }
+                payload = {**payload, "notification": notification}
+                conn.execute(
+                    "UPDATE reminders SET payload = ?, updated_at = ? WHERE id = ?",
+                    (_json(payload), now, reminder_id),
+                )
+                conn.commit()
+            except BaseException:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
+        return self.get_reminder(reminder_id)
 
     def update_mission_task(
         self,

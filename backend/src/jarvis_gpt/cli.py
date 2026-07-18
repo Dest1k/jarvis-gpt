@@ -15,7 +15,13 @@ import uvicorn
 from .agent import AgentRuntime
 from .approval_executor import ApprovalExecutor
 from .cognitive_memory import ExecutionPlaybookStore, HostProfileManager
-from .config import PROFILES, ensure_runtime_dirs, load_local_env_file, load_settings
+from .config import (
+    PROFILES,
+    ensure_runtime_dirs,
+    load_local_env_file,
+    load_settings,
+    profile_public_dict,
+)
 from .diagnostics import run_diagnostics
 from .dispatcher import DispatcherManager
 from .event_bus import EventBus
@@ -152,18 +158,10 @@ def cmd_init(args: argparse.Namespace) -> None:
 
 
 def cmd_profiles(_args: argparse.Namespace) -> None:
-    _print_json(
-        {
-            name: {
-                "title": profile.title,
-                "description": profile.description,
-                "model_dir_name": profile.model_dir_name,
-                "eager_mode": profile.eager_mode,
-                "max_steps": profile.max_steps,
-            }
-            for name, profile in PROFILES.items()
-        }
-    )
+    # Machine-readable source of truth for launchers and UI clients. Keeping the full
+    # public profile contract here prevents a newly registered model from silently
+    # diverging from hand-maintained shell menus or readiness policy.
+    _print_json({name: profile_public_dict(profile) for name, profile in PROFILES.items()})
 
 
 def cmd_status(args: argparse.Namespace) -> None:

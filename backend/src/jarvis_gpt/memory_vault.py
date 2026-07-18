@@ -6,6 +6,8 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+_MANAGED_BY = "jarvis-gpt"
+
 
 class MemoryVault:
     def __init__(self, root: Path) -> None:
@@ -21,48 +23,86 @@ class MemoryVault:
         _atomic_write_text(path, _render_memory_note(memory))
         return path
 
-    def remove_memory(self, memory_id: str) -> None:
+    def remove_memory(self, memory_id: str) -> int:
+        removed = 0
+        failures: list[OSError] = []
         for path in self.root.glob(f"**/{_safe_slug(memory_id)}.md"):
             try:
+                note = _parse_note(path, self.root)
+                relative_path = str(path.relative_to(self.root))
+                if not _is_managed_note(note, relative_path):
+                    continue
                 path.unlink()
-            except OSError:
+                removed += 1
+            except FileNotFoundError:
                 continue
+            except OSError as exc:
+                failures.append(exc)
+        if failures:
+            raise failures[0]
+        return removed
 
     def sync(self, memories: list[dict[str, Any]]) -> dict[str, Any]:
         self.ensure()
         known_ids = {str(item.get("id") or "") for item in memories}
+        expected_paths: dict[str, str] = {}
         written = 0
         for memory in memories:
-            self.upsert_memory(memory)
+            path = self.upsert_memory(memory)
+            memory_id = str(memory.get("id") or "")
+            if memory_id:
+                expected_paths[memory_id] = os.path.normcase(str(path.relative_to(self.root)))
             written += 1
         removed = 0
+        failures: list[OSError] = []
         for path in self.root.glob("**/*.md"):
-            note = _parse_note(path, self.root)
+            try:
+                note = _parse_note(path, self.root)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                failures.append(exc)
+                continue
             note_id = str(note.get("id") or "")
-            if note_id and note_id not in known_ids:
+            relative_path = str(path.relative_to(self.root))
+            expected_path = expected_paths.get(note_id)
+            stale_managed_note = _is_managed_note(note, relative_path) and (
+                note_id not in known_ids
+                or expected_path is None
+                or os.path.normcase(relative_path) != expected_path
+            )
+            if stale_managed_note:
                 try:
                     path.unlink()
                     removed += 1
-                except OSError:
+                except FileNotFoundError:
                     continue
+                except OSError as exc:
+                    failures.append(exc)
+        if failures:
+            raise failures[0]
         return {"root": str(self.root), "written": written, "removed": removed}
 
     def graph(self) -> dict[str, Any]:
         self.ensure()
-        notes = [_parse_note(path, self.root) for path in sorted(self.root.glob("**/*.md"))]
+        notes: list[dict[str, Any]] = []
+        for path in sorted(self.root.glob("**/*.md")):
+            try:
+                notes.append(_parse_note(path, self.root))
+            except OSError:
+                # The vault is a live mirror. A concurrent replace/remove or one
+                # unreadable manual note must not take down the complete graph.
+                continue
         return self._build_graph(notes)
 
     def graph_from_memories(self, memories: list[dict[str, Any]]) -> dict[str, Any]:
-        """Build the SAME link graph as :meth:`graph`, but straight from the memory rows —
-        rendering + parsing each note in memory, with no disk read and no disk write.
+        """Build the managed part of the graph from DB rows and retain manual notes.
 
-        The read path (``/api/memory/vault``) used to full-sync the on-disk vault (a
-        per-note ``fsync``-ed rewrite of every memory) and then re-read every ``.md`` file:
-        O(N) fsync + O(N) cold file reads on *every* request (~13s on a 3k-note vault). The
-        markdown vault is already kept fresh incrementally on the write path (``add_memory``
-        / ``consolidate_memories``), so the graph can be derived from the DB rows directly.
-        Notes are rendered + parsed through the exact same helpers as the disk path, so the
-        node/edge/tag/link/backlink output is identical (tags mined from note text and all).
+        Managed notes are rendered and parsed in memory, avoiding a cold disk read for each
+        DB row. Hand-written ``.md`` files are also part of the vault contract: enumerate
+        paths, skip every expected managed path without opening it, and parse only leftovers.
+        A leftover carrying an ID already present in the DB is a moved/stale managed copy,
+        not a second manual note, so it is ignored after parsing.
         """
 
         def _sort_key(memory: dict[str, Any]) -> tuple[str, str]:
@@ -71,17 +111,44 @@ class MemoryVault:
                 _safe_slug(str(memory.get("id") or "memory")),
             )
 
-        notes: list[dict[str, Any]] = []
+        managed_ids = {str(memory.get("id") or "") for memory in memories}
+        managed_ids.discard("")
+        managed_paths: set[str] = set()
+        notes_by_path: list[tuple[str, dict[str, Any]]] = []
         for memory in sorted(memories, key=_sort_key):
             namespace_slug = _safe_slug(str(memory.get("namespace") or "core"))
             id_slug = _safe_slug(str(memory.get("id") or "memory"))
-            notes.append(
-                _parse_note_text(
-                    _render_memory_note(memory),
-                    path_str=f"{namespace_slug}/{id_slug}.md",
-                    stem=id_slug,
+            relative_path = str(Path(namespace_slug) / f"{id_slug}.md")
+            managed_paths.add(os.path.normcase(relative_path))
+            notes_by_path.append(
+                (
+                    relative_path,
+                    _parse_note_text(
+                        _render_memory_note(memory),
+                        path_str=relative_path,
+                        stem=id_slug,
+                    ),
                 )
             )
+
+        for path in sorted(self.root.glob("**/*.md")):
+            relative_path = str(path.relative_to(self.root))
+            if os.path.normcase(relative_path) in managed_paths:
+                continue
+            try:
+                note = _parse_note(path, self.root)
+            except OSError:
+                # Files can disappear between glob() and read_text() in another
+                # process. Managed rows still come from the consistent DB snapshot.
+                continue
+            note_id = str(note.get("id") or "")
+            if _is_managed_note(note, relative_path) or (
+                note_id and note_id in managed_ids
+            ):
+                continue
+            notes_by_path.append((relative_path, note))
+
+        notes = [note for _, note in sorted(notes_by_path, key=lambda item: item[0])]
         return self._build_graph(notes)
 
     def _build_graph(self, notes: list[dict[str, Any]]) -> dict[str, Any]:
@@ -126,11 +193,10 @@ class MemoryVault:
         for edge in edges:
             degree[edge["source"]] = degree.get(edge["source"], 0) + 1
             degree[edge["target"]] = degree.get(edge["target"], 0) + 1
+        for node_id, node in nodes.items():
+            node["degree"] = degree.get(node_id, 0)
         top_nodes = sorted(
-            (
-                {**node, "degree": degree.get(node_id, 0)}
-                for node_id, node in nodes.items()
-            ),
+            ({**node} for node in nodes.values()),
             key=lambda item: (int(item.get("degree") or 0), str(item.get("label") or "")),
             reverse=True,
         )[:12]
@@ -166,6 +232,7 @@ def _render_memory_note(memory: dict[str, Any]) -> str:
     title = _note_title(memory)
     frontmatter = {
         "id": str(memory.get("id") or ""),
+        "managed_by": _MANAGED_BY,
         "namespace": str(memory.get("namespace") or "core"),
         "importance": memory.get("importance", 0.5),
         "created_at": str(memory.get("created_at") or ""),
@@ -215,6 +282,29 @@ def _parse_note_text(text: str, *, path_str: str, stem: str) -> dict[str, Any]:
         "tags": tags,
         "path": path_str,
     }
+
+
+def _is_managed_note(note: dict[str, Any], path_str: str) -> bool:
+    """Identify generated notes without consuming hand-written ID frontmatter.
+
+    New notes carry an explicit marker. The narrow legacy fallback recognizes the
+    historical ``namespace/mem_id.md`` layout so orphaned mirrors from an older
+    release can be repaired without classifying arbitrary manual notes as managed.
+    """
+
+    if str(note.get("managed_by") or "") == _MANAGED_BY:
+        return True
+    note_id = str(note.get("id") or "")
+    if not note_id.startswith("mem_"):
+        return False
+    relative_path = Path(path_str)
+    namespace = _safe_slug(str(note.get("namespace") or "core"))
+    return (
+        relative_path.stem == _safe_slug(note_id)
+        and relative_path.parent.name == namespace
+        and bool(note.get("created_at"))
+        and bool(note.get("updated_at"))
+    )
 
 
 def _parse_frontmatter(raw: str) -> dict[str, Any]:

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+
+from jarvis_gpt.cli import cmd_profiles
 from jarvis_gpt.config import PROFILES, VllmExtraArgs, load_settings, profile_public_dict
 from jarvis_gpt.model_catalog import PROFILE_MODEL_DIR_NAMES, ModelCatalog, _vllm_extra_args
 
@@ -116,3 +119,22 @@ def test_profile_public_dict_exposes_new_vllm_fields():
         "trust_remote_code",
     ):
         assert key in extra
+
+
+def test_qwen_launcher_policy_is_exposed_from_the_canonical_profile():
+    public = profile_public_dict(PROFILES["qwen36-vl"])
+
+    assert public["certification"] == "experimental"
+    assert public["research_only"] is True
+    assert public["readiness_deadline_sec"] == 900.0
+    assert public["menu_visible"] is True
+    assert public["requires_experimental_opt_in"] is False
+    assert public["model_dir_name"] == "qwen3.6-35b-a3b-nvfp4"
+
+
+def test_profiles_cli_exports_the_complete_canonical_public_registry(capsys):
+    cmd_profiles(None)
+
+    exported = json.loads(capsys.readouterr().out)
+    expected = {name: profile_public_dict(profile) for name, profile in PROFILES.items()}
+    assert exported == expected

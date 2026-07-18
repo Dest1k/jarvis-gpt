@@ -143,6 +143,9 @@ class TelegramConfig:
     bot_token: str
     allowed_chat_ids: frozenset[int]
     backend_url: str
+    # Only owners may reach the local-agent surface (screen, files, tools, memory).
+    # Other allowed chats are text-only guests backed by an isolated LLM conversation.
+    owner_chat_ids: frozenset[int] = frozenset()
     api_token: str = ""
     poll_timeout: int = 25
     request_timeout: float = 300.0  # agent turns (missions, web, vision) can be long
@@ -163,15 +166,43 @@ def load_config(env: Mapping[str, str] | None = None) -> TelegramConfig:
             "TELEGRAM_BOT_TOKEN is not set — create a bot with @BotFather and put the "
             "token in backend/.env.local. Refusing to start."
         )
-    ids = frozenset(
-        int(part)
-        for part in re.split(r"[,\s]+", (env.get("TELEGRAM_ALLOWED_CHAT_IDS") or "").strip())
-        if part
-    )
+    try:
+        ids = frozenset(
+            int(part)
+            for part in re.split(
+                r"[,\s]+", (env.get("TELEGRAM_ALLOWED_CHAT_IDS") or "").strip()
+            )
+            if part
+        )
+        configured_owners = frozenset(
+            int(part)
+            for part in re.split(
+                r"[,\s]+", (env.get("TELEGRAM_OWNER_CHAT_IDS") or "").strip()
+            )
+            if part
+        )
+    except ValueError as exc:
+        raise SystemExit("Telegram chat ID lists must contain integers only.") from exc
     if not ids:
         raise SystemExit(
             "TELEGRAM_ALLOWED_CHAT_IDS is empty — set your numeric Telegram chat id in "
             "backend/.env.local. Refusing to start open to the world."
+        )
+    if configured_owners:
+        unknown_owners = configured_owners - ids
+        if unknown_owners:
+            raise SystemExit(
+                "Every TELEGRAM_OWNER_CHAT_IDS entry must also be present in "
+                "TELEGRAM_ALLOWED_CHAT_IDS."
+            )
+        owner_ids = configured_owners
+    elif len(ids) == 1:
+        # Backward-compatible secure default for a single-user installation.
+        owner_ids = ids
+    else:
+        raise SystemExit(
+            "Multiple Telegram users are allowed but TELEGRAM_OWNER_CHAT_IDS is empty. "
+            "Mark the owner explicitly before starting the bridge."
         )
     voice_replies = (env.get("TELEGRAM_VOICE_REPLIES") or "1").strip().lower() not in (
         "0",
@@ -187,6 +218,7 @@ def load_config(env: Mapping[str, str] | None = None) -> TelegramConfig:
         bot_token=token,
         allowed_chat_ids=ids,
         backend_url=(env.get("JARVIS_BACKEND_URL") or "http://127.0.0.1:8000").rstrip("/"),
+        owner_chat_ids=owner_ids,
         api_token=(env.get("JARVIS_API_TOKEN") or "").strip(),
         voice_replies=voice_replies,
         voice_reply_max_chars=voice_max,
@@ -236,6 +268,11 @@ class TelegramBridge:
             headers=headers,
             timeout=cfg.request_timeout,
             trust_env=False,
+        )
+        self._owner_chat_ids = (
+            cfg.owner_chat_ids
+            if cfg.owner_chat_ids
+            else (cfg.allowed_chat_ids if len(cfg.allowed_chat_ids) == 1 else frozenset())
         )
         self.conversations: dict[int, str] = {}
         self._offset = 0
@@ -294,9 +331,10 @@ class TelegramBridge:
         me = await self._tg("getMe")
         username = me.get("username") if isinstance(me, dict) else "?"
         log.info(
-            "Telegram bridge online as @%s; %d allowed chat(s)",
+            "Telegram bridge online as @%s; %d allowed chat(s), %d owner(s)",
             username,
             len(self.cfg.allowed_chat_ids),
+            len(self._owner_chat_ids),
         )
         while True:
             try:
@@ -337,6 +375,17 @@ class TelegramBridge:
             self.conversations.pop(chat_id, None)
             ack = "Джарвис на связи." if text in {"/start"} else "Начал новый разговор."
             await self._send(chat_id, ack)
+            return
+
+        is_owner = chat_id in self._owner_chat_ids
+        if not is_owner and any(
+            message.get(field)
+            for field in ("photo", "document", "audio", "voice", "video", "video_note")
+        ):
+            await self._send(
+                chat_id,
+                "Гостевой режим принимает только текстовые сообщения без вложений.",
+            )
             return
 
         attachments = await self._ingest_inbound(message)
@@ -425,10 +474,18 @@ class TelegramBridge:
     async def _run_turn(
         self, chat_id: int, text: str, attachments: list[dict], *, voice_reply: bool = False
     ) -> None:
-        before = await self._file_ids()
+        is_owner = chat_id in self._owner_chat_ids
+        # Guest mode never snapshots or exports the owner's global file registry. Without
+        # this gate, an unrelated owner/background artifact created during a guest LLM turn
+        # could be mistaken for that guest's output and sent to them.
+        before = await self._file_ids() if is_owner else set()
         typing = asyncio.create_task(self._typing_keepalive(chat_id))
         try:
-            payload: dict[str, object] = {"message": text}
+            payload: dict[str, object] = {
+                "message": text,
+                "access_mode": "owner" if is_owner else "guest",
+                "notification_chat_id": chat_id if is_owner else None,
+            }
             conversation_id = self.conversations.get(chat_id)
             if conversation_id:
                 payload["conversation_id"] = conversation_id
@@ -454,8 +511,9 @@ class TelegramBridge:
         if voice_reply and self.cfg.voice_replies:
             await self._reply_with_voice(chat_id, answer)
 
-        inbound_ids = {a["id"] for a in attachments}
-        await self._deliver_new_files(chat_id, before | inbound_ids)
+        if is_owner:
+            inbound_ids = {a["id"] for a in attachments}
+            await self._deliver_new_files(chat_id, before | inbound_ids)
 
     async def _reply_with_voice(self, chat_id: int, answer: str) -> None:
         """Speak the answer back as a Telegram voice note (spoken input → spoken reply)."""

@@ -5,15 +5,44 @@ import json
 import re
 import time
 from contextlib import suppress
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from .config import JarvisSettings
 from .diagnostics import run_diagnostics
 from .learning import LearningEngine
 from .llm import LLMRouter, background_llm_priority
-from .notify import push_telegram_alert
+from .notify import push_telegram_alert, telegram_targets
 from .storage import JarvisStorage, utc_now
 from .telemetry import TelemetryCollector
+
+
+def _parse_utc_datetime(value: Any) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _notification_chat_ids(value: Any) -> tuple[int, ...]:
+    """Decode a persisted recipient list without accepting bools or junk values."""
+
+    if not isinstance(value, list | tuple):
+        return ()
+    ids: list[int] = []
+    for item in value:
+        if isinstance(item, bool):
+            continue
+        try:
+            chat_id = int(item)
+        except (TypeError, ValueError):
+            continue
+        if chat_id not in ids:
+            ids.append(chat_id)
+    return tuple(ids)
 
 
 def _evaluate_alerts(
@@ -131,6 +160,12 @@ class RuntimeSupervisor:
         self._tasks: list[asyncio.Task[None]] = []
         # Fire-and-forget scheduled-task runs, held so they are not GC'd mid-flight.
         self._scheduled_runs: set[asyncio.Task[None]] = set()
+        # One task per watcher.  The reminder row is advanced before dispatch, so this map
+        # is the in-process lease that prevents a slow VLM poll overlapping its next tick.
+        self._screen_watch_runs: dict[str, asyncio.Task[None]] = {}
+        # One sender per durable notification. A VLM run and the periodic outbox flush can
+        # otherwise overlap while awaiting Telegram and send the same recipient twice.
+        self._screen_watch_delivery_ids: set[str] = set()
         self._started_at: str | None = None
         self._last_telemetry_at: str | None = None
         self._last_health_at: str | None = None
@@ -244,6 +279,14 @@ class RuntimeSupervisor:
             with suppress(asyncio.CancelledError):
                 await task
         self._tasks = []
+        watch_runs = list(self._screen_watch_runs.values())
+        for task in watch_runs:
+            task.cancel()
+        for task in watch_runs:
+            with suppress(asyncio.CancelledError):
+                await task
+        self._screen_watch_runs.clear()
+        self._screen_watch_delivery_ids.clear()
         with suppress(Exception):
             self.storage.add_event(
                 kind="autonomy.stop",
@@ -344,11 +387,19 @@ class RuntimeSupervisor:
         and a live ``reminder.fire`` push so the UI updates immediately.
         """
 
+        # Drain persisted notices before claiming new watches. A transient Telegram
+        # outage therefore retries after restart and a recurring watcher cannot outrun
+        # its previous notification.
+        await self._flush_screen_watch_notifications()
         try:
             due = await asyncio.to_thread(
                 self.storage.claim_due_reminders,
                 utc_now(),
                 tz_name=self.settings.reminder_tz,
+                skip_ids=tuple(self._screen_watch_runs),
+                excluded_payload_kinds=(
+                    ("screen_watch",) if not self.settings.screen_watch_enabled else ()
+                ),
             )
         except Exception as exc:  # noqa: BLE001
             self._last_error = str(exc) or exc.__class__.__name__
@@ -363,6 +414,42 @@ class RuntimeSupervisor:
         for reminder in due:
             recurring = bool(reminder.get("recurrence"))
             payload = reminder.get("payload") if isinstance(reminder.get("payload"), dict) else {}
+            is_screen_watch = payload.get("kind") == "screen_watch"
+            if is_screen_watch:
+                # Never let a disabled watcher degrade into the generic reminder branch:
+                # that would post a misleading "Напоминание" every interval.  Existing
+                # rows remain pending so re-enabling the feature resumes them.
+                if not self.settings.screen_watch_enabled:
+                    continue
+                reminder_id = str(reminder.get("id") or "")
+                if not reminder_id or reminder_id in self._screen_watch_runs:
+                    continue
+                run = asyncio.create_task(
+                    self._run_screen_watch(reminder),
+                    name=f"jarvis-screen-watch-{reminder_id}",
+                )
+                self._screen_watch_runs[reminder_id] = run
+
+                def _discard(done: asyncio.Task[None], *, watched_id: str = reminder_id) -> None:
+                    if self._screen_watch_runs.get(watched_id) is done:
+                        self._screen_watch_runs.pop(watched_id, None)
+                    if done.cancelled():
+                        return
+                    error = done.exception()
+                    if error is not None:
+                        with suppress(Exception):
+                            self.storage.add_event(
+                                kind="screen_watch.error",
+                                title="Screen-watch task failed",
+                                level="warn",
+                                payload={
+                                    "reminder_id": watched_id,
+                                    "error": (str(error) or error.__class__.__name__)[:500],
+                                },
+                            )
+
+                run.add_done_callback(_discard)
+                continue
             is_task = payload.get("kind") == "agent_task" and self.settings.scheduled_tasks_enabled
             with suppress(Exception):
                 self.storage.add_event(
@@ -453,6 +540,318 @@ class RuntimeSupervisor:
                     "chars": len(answer),
                     "error": error,
                 },
+            )
+
+    async def _run_screen_watch(self, reminder: dict[str, Any]) -> None:
+        """Run one bounded screen capture + VLM condition check, fail-soft."""
+
+        payload = reminder.get("payload") if isinstance(reminder.get("payload"), dict) else {}
+        condition = str(payload.get("condition") or "").strip()
+        reminder_id = str(reminder.get("id") or "")
+        expected_fire_count = int(reminder.get("fire_count") or 0) + 1
+        if not condition or not reminder_id:
+            return
+        if not self._screen_watch_claim_is_current(reminder_id, expected_fire_count):
+            return
+
+        expires_at = _parse_utc_datetime(payload.get("expires_at"))
+        if expires_at is None:
+            staged = self.storage.stage_screen_watch_notification(
+                reminder_id,
+                expected_fire_count=expected_fire_count,
+                terminal_status="cancelled",
+                text=(
+                    f"Наблюдение за экраном остановлено: у условия «{condition}» "
+                    "повреждён или отсутствует срок действия."
+                ),
+                event_kind="screen_watch.invalid",
+                level="warn",
+                met=False,
+            )
+            if staged is not None:
+                await self._deliver_screen_watch_notice(staged)
+            return
+        # A poll whose *scheduled* due time is on the expiry boundary must still run.
+        # Compare scheduler lateness to the supervisor cadence instead of using a fixed
+        # grace: a slow cadence can legitimately exceed 30 seconds, while a stale claim
+        # recovered after a long outage must not resurrect an expired watcher.
+        now = datetime.now(UTC)
+        scheduled_due = _parse_utc_datetime(reminder.get("due_at"))
+        max_scheduler_lateness = timedelta(
+            seconds=max(60, 3 * max(5, int(self.settings.reminder_interval_sec)))
+        )
+        boundary_poll_is_timely = bool(
+            scheduled_due is not None
+            and scheduled_due <= expires_at
+            and now <= scheduled_due + max_scheduler_lateness
+        )
+        if now >= expires_at and not boundary_poll_is_timely:
+            await self._expire_screen_watch(reminder_id, expected_fire_count, condition)
+            return
+
+        agent = getattr(self.autonomy_executor, "agent", None)
+        if agent is None or not hasattr(agent, "check_screen_condition"):
+            if datetime.now(UTC) >= expires_at:
+                await self._expire_screen_watch(reminder_id, expected_fire_count, condition)
+            return
+
+        try:
+            check = await agent.check_screen_condition(condition)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - one failed poll must not stop the loop
+            check = None
+            error = str(exc) or exc.__class__.__name__
+        else:
+            error = str(getattr(check, "error", "") or "")
+
+        met: bool | None
+        if isinstance(check, bool):
+            met = check
+        elif check is None:
+            met = None
+        else:
+            raw_met = getattr(check, "met", None)
+            met = raw_met if isinstance(raw_met, bool) else None
+        if met is not True:
+            if met is None and error:
+                with suppress(Exception):
+                    self.storage.add_event(
+                        kind="screen_watch.error",
+                        title=f"Не удалось проверить экран: {condition}",
+                        level="warn",
+                        payload={"reminder_id": reminder_id, "error": error[:500]},
+                    )
+            # The boundary observation was the watcher's last permitted poll. Seal the
+            # bounded task now instead of leaving it pending until one more recurrence.
+            if datetime.now(UTC) >= expires_at:
+                await self._expire_screen_watch(reminder_id, expected_fire_count, condition)
+            return
+
+        # A user cancellation or a newer claim wins over this in-flight observation.
+        if not self._screen_watch_claim_is_current(reminder_id, expected_fire_count):
+            return
+        keep = bool(payload.get("keep"))
+        notice = f"Условие на экране выполнено: «{condition}»."
+        staged = self.storage.stage_screen_watch_notification(
+            reminder_id,
+            expected_fire_count=expected_fire_count,
+            terminal_status=None if keep else "fired",
+            text=notice,
+            event_kind="screen_watch.fire",
+            level="info",
+            met=True,
+        )
+        if staged is not None:
+            await self._deliver_screen_watch_notice(staged)
+
+    async def _expire_screen_watch(
+        self,
+        reminder_id: str,
+        expected_fire_count: int,
+        condition: str,
+    ) -> None:
+        staged = self.storage.stage_screen_watch_notification(
+            reminder_id,
+            expected_fire_count=expected_fire_count,
+            terminal_status="cancelled",
+            text=(
+                f"Наблюдение за экраном завершено: условие «{condition}» "
+                "не было замечено до истечения срока."
+            ),
+            event_kind="screen_watch.expire",
+            level="info",
+            met=False,
+        )
+        if staged is not None:
+            await self._deliver_screen_watch_notice(staged)
+
+    def _screen_watch_claim_is_current(
+        self, reminder_id: str, expected_fire_count: int
+    ) -> bool:
+        with suppress(Exception):
+            current = self.storage.get_reminder(reminder_id)
+            return bool(
+                current
+                and current.get("status") == "pending"
+                and int(current.get("fire_count") or 0) == expected_fire_count
+            )
+        return False
+
+    async def _flush_screen_watch_notifications(self) -> None:
+        with suppress(Exception):
+            pending = self.storage.list_pending_screen_watch_notifications(limit=50)
+            for reminder in pending:
+                await self._deliver_screen_watch_notice(reminder)
+
+    async def _deliver_screen_watch_notice(
+        self,
+        reminder: dict[str, Any],
+    ) -> None:
+        payload = reminder.get("payload") if isinstance(reminder.get("payload"), dict) else {}
+        notification = payload.get("notification")
+        if not isinstance(notification, dict) or notification.get("state") != "pending":
+            return
+        reminder_id = str(reminder.get("id") or "")
+        notification_id = str(notification.get("id") or "")
+        if not reminder_id or not notification_id:
+            return
+        delivery_id = f"{reminder_id}:{notification_id}"
+        if delivery_id in self._screen_watch_delivery_ids:
+            return
+        self._screen_watch_delivery_ids.add(delivery_id)
+        try:
+            # A flush may have listed this row before another delivery completed while
+            # it was waiting on an earlier notice. Re-read under the in-process lease so
+            # a stale pending snapshot can never resend an already sealed notification.
+            current = self.storage.get_reminder(reminder_id)
+            current_payload = (
+                current.get("payload")
+                if isinstance(current, dict) and isinstance(current.get("payload"), dict)
+                else {}
+            )
+            current_notification = current_payload.get("notification")
+            if (
+                not isinstance(current_notification, dict)
+                or current_notification.get("id") != notification_id
+                or current_notification.get("state") != "pending"
+            ):
+                return
+            await self._deliver_screen_watch_notice_claimed(current)
+        finally:
+            self._screen_watch_delivery_ids.discard(delivery_id)
+
+    async def _deliver_screen_watch_notice_claimed(
+        self,
+        reminder: dict[str, Any],
+    ) -> None:
+        payload = reminder.get("payload") if isinstance(reminder.get("payload"), dict) else {}
+        notification = payload.get("notification")
+        if not isinstance(notification, dict) or notification.get("state") != "pending":
+            return
+        reminder_id = str(reminder.get("id") or "")
+        notification_id = str(notification.get("id") or "")
+        text = str(notification.get("text") or "")[:3900]
+        event_kind = str(notification.get("event_kind") or "screen_watch.notice")
+        level = str(notification.get("level") or "info")
+        met = bool(notification.get("met"))
+        if not reminder_id or not notification_id or not text:
+            return
+
+        # A manual cancellation of a persistent watch retracts an unsent match notice.
+        if (
+            reminder.get("status") == "cancelled"
+            and bool(payload.get("keep"))
+            and event_kind == "screen_watch.fire"
+        ):
+            self.storage.update_screen_watch_notification(
+                reminder_id, notification_id, completed=True
+            )
+            return
+
+        telegram_required = str(payload.get("deliver") or "telegram") == "telegram"
+        telegram_target_ids = _notification_chat_ids(notification.get("telegram_target_ids"))
+        telegram_delivered_ids = set(
+            _notification_chat_ids(notification.get("telegram_delivered_ids"))
+        )
+        if telegram_required:
+            if not telegram_target_ids:
+                target_chat_id = payload.get("telegram_chat_id")
+                requested = (target_chat_id,) if isinstance(target_chat_id, int) else None
+                with suppress(Exception):
+                    _, resolved = telegram_targets(requested_chat_ids=requested)
+                    telegram_target_ids = resolved
+                # Freeze a non-empty recipient set into the durable outbox. If Telegram
+                # is not configured yet, leave it unresolved so a later retry can pick up
+                # a corrected configuration instead of silently completing the notice.
+                if telegram_target_ids:
+                    self.storage.update_screen_watch_notification(
+                        reminder_id,
+                        notification_id,
+                        telegram_target_ids=telegram_target_ids,
+                    )
+            if bool(notification.get("telegram_delivered")):
+                # Upgrade compatibility for an outbox written by the old all-or-nothing
+                # sender. New notices persist progress after every individual recipient.
+                telegram_delivered_ids.update(telegram_target_ids)
+            for target_id in telegram_target_ids:
+                if target_id in telegram_delivered_ids:
+                    continue
+                delivered = False
+                with suppress(Exception):
+                    delivered = await push_telegram_alert(
+                        f"👁 {text}"[:3900], target_chat_ids=(target_id,)
+                    )
+                if delivered:
+                    telegram_delivered_ids.add(target_id)
+                    self.storage.update_screen_watch_notification(
+                        reminder_id,
+                        notification_id,
+                        telegram_delivered_ids=tuple(sorted(telegram_delivered_ids)),
+                        telegram_delivered=(
+                            bool(telegram_target_ids)
+                            and telegram_delivered_ids.issuperset(telegram_target_ids)
+                        ),
+                    )
+            telegram_delivered = bool(telegram_target_ids) and telegram_delivered_ids.issuperset(
+                telegram_target_ids
+            )
+        else:
+            telegram_delivered = True
+
+        local_delivered = bool(notification.get("local_delivered"))
+        conversation_id = reminder.get("conversation_id")
+        if not local_delivered:
+            local_event_payload = {
+                "reminder_id": reminder.get("id"),
+                "condition": payload.get("condition"),
+                "met": met,
+                "telegram_delivered": telegram_delivered,
+                "telegram_target_ids": list(telegram_target_ids),
+                "telegram_delivered_ids": sorted(telegram_delivered_ids),
+                "conversation_id": conversation_id,
+                "notification_id": notification_id,
+            }
+            local_result = None
+            try:
+                local_result = self.storage.deliver_screen_watch_local_notification(
+                    reminder_id,
+                    notification_id,
+                    text=text,
+                    event_kind=event_kind,
+                    level=level,
+                    met=met,
+                    event_payload=local_event_payload,
+                )
+            except Exception:  # noqa: BLE001 - durable outbox remains pending for retry
+                local_result = None
+            if local_result is not None:
+                local_payload = (
+                    local_result.get("payload")
+                    if isinstance(local_result.get("payload"), dict)
+                    else {}
+                )
+                local_notification = local_payload.get("notification")
+                local_delivered = bool(
+                    isinstance(local_notification, dict)
+                    and local_notification.get("local_delivered")
+                )
+            if local_delivered and self.bus is not None:
+                with suppress(Exception):
+                    await self.bus.publish(
+                        {
+                            "channel": "reminders",
+                            "action": event_kind,
+                            "reminder_id": reminder.get("id"),
+                            "met": met,
+                        }
+                    )
+
+        if telegram_delivered and local_delivered:
+            self.storage.update_screen_watch_notification(
+                reminder_id,
+                notification_id,
+                completed=True,
             )
 
     async def _record_telemetry(self) -> None:

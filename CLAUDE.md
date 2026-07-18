@@ -20,6 +20,10 @@ Guidance for AI coding agents working in this repository.
 - For runtime-facing changes, verify the relevant behavior on the live machine when it
   is safe to do so, in addition to automated tests. Record any environment limitation
   honestly instead of papering over it.
+- **Automated tests are not sufficient runtime validation.** For changes that affect
+  prompting, routing, tools, memory, vision, or model-facing behavior, exercise the
+  real running stack with its live configured LLM and verify the actual response/path.
+  Mocks and unit tests remain regression coverage, not a substitute for that smoke test.
 
 ## Project layout
 

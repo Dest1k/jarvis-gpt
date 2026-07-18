@@ -18206,7 +18206,10 @@ def _hidden_process_flags() -> int:
 def _timestamp_slug() -> str:
     from datetime import UTC, datetime
 
-    return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    # Screen watches can capture concurrently.  Second-resolution names let two safe
+    # inspections overwrite/read the same PNG, so include microseconds at the common
+    # artifact-name source instead of trying to serialize unrelated captures.
+    return datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
 
 
 async def _read_limited_response_document(

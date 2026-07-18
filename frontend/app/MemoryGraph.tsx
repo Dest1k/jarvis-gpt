@@ -4,6 +4,7 @@ import {
   PointerEvent as ReactPointerEvent,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState
@@ -11,6 +12,12 @@ import {
 import { Download, FileText, Search, X } from "lucide-react";
 
 import type { MemoryGraphNode, MemoryVault } from "./page";
+import {
+  DEFAULT_MEMORY_GRAPH_NODES,
+  MAX_MEMORY_GRAPH_NODES,
+  clampMemoryGraphCap,
+  selectMemoryGraph
+} from "../lib/memory-graph.mjs";
 
 // --- simulation tuning -------------------------------------------------------
 const K_REPEL = 5200; // Coulomb charge (node-node repulsion)
@@ -62,6 +69,11 @@ type SimNode = {
 };
 
 type ViewBox = { x: number; y: number; w: number; h: number };
+type GraphEdge = MemoryVault["edges"][number];
+
+function edgeKey(edge: GraphEdge, index: number): string {
+  return `${edge.source}\u0000${edge.target}\u0000${edge.kind}\u0000${index}`;
+}
 
 function restLength(kind: string): number {
   return REST_BY_KIND[kind] ?? 82;
@@ -89,7 +101,13 @@ function formatSize(bytes?: number | null): string {
 export function MemoryGraph({ vault }: { vault: MemoryVault }) {
   const svgRef = useRef<SVGSVGElement | null>(null);
   const simRef = useRef<Map<string, SimNode>>(new Map());
-  const edgeElsRef = useRef<Array<SVGLineElement | null>>([]);
+  const simCacheRef = useRef<Map<string, SimNode>>(new Map());
+  const nodeElsRef = useRef<Map<string, SVGGElement>>(new Map());
+  const edgeElsRef = useRef<Map<string, SVGLineElement>>(new Map());
+  const topologyRef = useRef<{ edges: GraphEdge[]; edgeKeys: string[] }>({
+    edges: [],
+    edgeKeys: []
+  });
   const alphaRef = useRef<number>(0);
   const rafRef = useRef<number | null>(null);
   const vbRef = useRef<ViewBox>({ x: -WORLD_W / 2, y: -WORLD_H / 2, w: WORLD_W, h: WORLD_H });
@@ -101,7 +119,7 @@ export function MemoryGraph({ vault }: { vault: MemoryVault }) {
   const [hiddenKinds, setHiddenKinds] = useState<Set<string>>(new Set());
   // A real vault can hold thousands of notes; the hand-rolled O(N^2) sim + SVG DOM stay
   // smooth by rendering a budget of the most-connected nodes (hubs + documents first).
-  const [renderCap, setRenderCap] = useState(600);
+  const [renderCap, setRenderCap] = useState(DEFAULT_MEMORY_GRAPH_NODES);
 
   const setViewBox = useCallback((next: ViewBox) => {
     vbRef.current = next;
@@ -114,32 +132,24 @@ export function MemoryGraph({ vault }: { vault: MemoryVault }) {
     return order.filter((k) => present.has(k));
   }, [vault.nodes]);
 
-  // Filtered graph: kind filters REMOVE nodes from the sim; search only highlights.
-  // When the vault is large, keep a budget of the most meaningful nodes: hubs and
-  // documents first, then the highest-degree memories/tags.
-  const { nodes, edges, totalNodes, truncated } = useMemo(() => {
-    const byKind = vault.nodes.filter((n) => !hiddenKinds.has(n.kind));
-    let keep = byKind;
-    let truncated = false;
-    if (byKind.length > renderCap) {
-      truncated = true;
-      const priority = (n: MemoryGraphNode) =>
-        HUB_KINDS.has(n.kind) ? 3 : n.kind === "document" ? 2 : 1;
-      keep = [...byKind]
-        .sort((a, b) => {
-          const pa = priority(a);
-          const pb = priority(b);
-          if (pa !== pb) return pb - pa;
-          return (b.degree ?? 0) - (a.degree ?? 0);
-        })
-        .slice(0, renderCap);
-    }
-    const keepIds = new Set(keep.map((n) => n.id));
-    const keptEdges = vault.edges.filter(
-      (e) => keepIds.has(e.source) && keepIds.has(e.target)
-    );
-    return { nodes: keep, edges: keptEdges, totalNodes: byKind.length, truncated };
-  }, [vault.nodes, vault.edges, hiddenKinds, renderCap]);
+  // Search runs before the render cap, so a low-ranked match is promoted into the
+  // bounded simulation together with a small, balanced sample of its neighbours.
+  const graph = useMemo(
+    () =>
+      selectMemoryGraph({
+        nodes: vault.nodes,
+        edges: vault.edges,
+        hiddenKinds,
+        renderCap,
+        search
+      }),
+    [vault.nodes, vault.edges, hiddenKinds, renderCap, search]
+  );
+  const { nodes, edges, totalNodes, truncated } = graph;
+  const renderedEdgeKeys = useMemo(
+    () => edges.map((edge, index) => edgeKey(edge, index)),
+    [edges]
+  );
 
   const noteById = useMemo(() => {
     const map = new Map<string, MemoryVault["notes"][number]>();
@@ -161,16 +171,7 @@ export function MemoryGraph({ vault }: { vault: MemoryVault }) {
     return map;
   }, [edges]);
 
-  const searchLc = search.trim().toLowerCase();
-  const searchMatch = useMemo(() => {
-    if (!searchLc) return null;
-    const hits = new Set<string>();
-    for (const n of nodes) {
-      const tags = (n.tags || []).join(" ").toLowerCase();
-      if (n.label.toLowerCase().includes(searchLc) || tags.includes(searchLc)) hits.add(n.id);
-    }
-    return hits;
-  }, [nodes, searchLc]);
+  const searchMatch = search.trim() ? graph.searchMatchIds : null;
 
   // Highlight set = hovered/selected node + its direct neighbours.
   const focusId = hoverId ?? selectedId;
@@ -180,50 +181,6 @@ export function MemoryGraph({ vault }: { vault: MemoryVault }) {
     for (const nb of adjacency.get(focusId) ?? []) set.add(nb);
     return set;
   }, [focusId, adjacency]);
-
-  const reheat = useCallback(() => {
-    alphaRef.current = Math.max(alphaRef.current, REHEAT);
-    if (rafRef.current == null) startLoop();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // Rebuild the sim whenever the filtered node/edge set changes, keeping positions.
-  useEffect(() => {
-    const prev = simRef.current;
-    const next = new Map<string, SimNode>();
-    nodes.forEach((node, index) => {
-      const existing = prev.get(node.id);
-      if (existing) {
-        existing.degree = node.degree ?? 0;
-        existing.data = node;
-        existing.label = node.label;
-        next.set(node.id, existing);
-      } else {
-        const angle = hashAngle(node.id);
-        const radius = 40 + (index % 40) * 6;
-        next.set(node.id, {
-          id: node.id,
-          label: node.label,
-          kind: node.kind,
-          degree: node.degree ?? 0,
-          x: Math.cos(angle) * radius,
-          y: Math.sin(angle) * radius,
-          vx: 0,
-          vy: 0,
-          dragging: false,
-          pinned: false,
-          data: node,
-          el: null
-        });
-      }
-    });
-    simRef.current = next;
-    edgeElsRef.current = new Array(edges.length).fill(null);
-    alphaRef.current = 1;
-    startLoop();
-    return stopLoop;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [nodes, edges]);
 
   const stopLoop = useCallback(() => {
     if (rafRef.current != null) {
@@ -236,6 +193,7 @@ export function MemoryGraph({ vault }: { vault: MemoryVault }) {
     if (rafRef.current != null) return;
     const step = () => {
       const sim = simRef.current;
+      const topology = topologyRef.current;
       const arr = Array.from(sim.values());
       const n = arr.length;
       // Coulomb repulsion (all pairs).
@@ -264,7 +222,7 @@ export function MemoryGraph({ vault }: { vault: MemoryVault }) {
         }
       }
       // Link springs.
-      for (const e of edges) {
+      for (const e of topology.edges) {
         const a = sim.get(e.source);
         const b = sim.get(e.target);
         if (!a || !b) continue;
@@ -293,8 +251,8 @@ export function MemoryGraph({ vault }: { vault: MemoryVault }) {
         if (node.el) node.el.setAttribute("transform", `translate(${node.x.toFixed(2)} ${node.y.toFixed(2)})`);
       }
       // Position edges.
-      edges.forEach((e, index) => {
-        const line = edgeElsRef.current[index];
+      topology.edges.forEach((e, index) => {
+        const line = edgeElsRef.current.get(topology.edgeKeys[index]);
         if (!line) return;
         const a = sim.get(e.source);
         const b = sim.get(e.target);
@@ -312,8 +270,73 @@ export function MemoryGraph({ vault }: { vault: MemoryVault }) {
       }
     };
     rafRef.current = requestAnimationFrame(step);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [edges]);
+  }, []);
+
+  const reheat = useCallback(() => {
+    alphaRef.current = Math.max(alphaRef.current, REHEAT);
+    if (rafRef.current == null) startLoop();
+  }, [startLoop]);
+
+  // Callback refs run before layout effects. Reconcile the simulation in a
+  // layout effect so newly admitted nodes receive their DOM element and initial
+  // transform before paint; the persistent cache also restores filtered nodes.
+  useLayoutEffect(() => {
+    stopLoop();
+    const cache = simCacheRef.current;
+    const next = new Map<string, SimNode>();
+    nodes.forEach((node, index) => {
+      let simNode = cache.get(node.id);
+      if (simNode) {
+        simNode.degree = node.degree ?? 0;
+        simNode.data = node;
+        simNode.label = node.label;
+        simNode.kind = node.kind;
+      } else {
+        const angle = hashAngle(node.id);
+        const radius = 40 + (index % 40) * 6;
+        simNode = {
+          id: node.id,
+          label: node.label,
+          kind: node.kind,
+          degree: node.degree ?? 0,
+          x: Math.cos(angle) * radius,
+          y: Math.sin(angle) * radius,
+          vx: 0,
+          vy: 0,
+          dragging: false,
+          pinned: false,
+          data: node,
+          el: null
+        };
+        cache.set(node.id, simNode);
+      }
+      simNode.el = nodeElsRef.current.get(node.id) ?? null;
+      if (simNode.el) {
+        simNode.el.setAttribute(
+          "transform",
+          `translate(${simNode.x.toFixed(2)} ${simNode.y.toFixed(2)})`
+        );
+      }
+      next.set(node.id, simNode);
+    });
+    simRef.current = next;
+    topologyRef.current = { edges, edgeKeys: renderedEdgeKeys };
+
+    edges.forEach((edge, index) => {
+      const line = edgeElsRef.current.get(renderedEdgeKeys[index]);
+      const source = next.get(edge.source);
+      const target = next.get(edge.target);
+      if (!line || !source || !target) return;
+      line.setAttribute("x1", source.x.toFixed(2));
+      line.setAttribute("y1", source.y.toFixed(2));
+      line.setAttribute("x2", target.x.toFixed(2));
+      line.setAttribute("y2", target.y.toFixed(2));
+    });
+
+    alphaRef.current = 1;
+    startLoop();
+    return stopLoop;
+  }, [edges, nodes, renderedEdgeKeys, startLoop, stopLoop]);
 
   // Resume the sim when the tab becomes visible again.
   useEffect(() => {
@@ -325,9 +348,23 @@ export function MemoryGraph({ vault }: { vault: MemoryVault }) {
   }, [startLoop]);
 
   const screenToWorld = useCallback((clientX: number, clientY: number) => {
-    const rect = svgRef.current?.getBoundingClientRect();
+    const svg = svgRef.current;
+    if (!svg) return { x: 0, y: 0 };
+    try {
+      const screenMatrix = svg.getScreenCTM();
+      if (screenMatrix) {
+        const point = svg.createSVGPoint();
+        point.x = clientX;
+        point.y = clientY;
+        const world = point.matrixTransform(screenMatrix.inverse());
+        return { x: world.x, y: world.y };
+      }
+    } catch {
+      // Detached/test SVGs may not expose an invertible CTM; retain a safe fallback.
+    }
+    const rect = svg.getBoundingClientRect();
     const view = vbRef.current;
-    if (!rect || rect.width === 0) return { x: 0, y: 0 };
+    if (rect.width === 0 || rect.height === 0) return { x: 0, y: 0 };
     return {
       x: view.x + ((clientX - rect.left) / rect.width) * view.w,
       y: view.y + ((clientY - rect.top) / rect.height) * view.h
@@ -515,13 +552,12 @@ export function MemoryGraph({ vault }: { vault: MemoryVault }) {
         <select
           className="mg-cap"
           value={renderCap}
-          onChange={(event) => setRenderCap(Number(event.target.value))}
+          onChange={(event) => setRenderCap(clampMemoryGraphCap(event.target.value))}
           title="Сколько узлов показывать"
         >
           <option value={300}>300 узлов</option>
           <option value={600}>600 узлов</option>
-          <option value={1200}>1200 узлов</option>
-          <option value={100000}>все узлы</option>
+          <option value={MAX_MEMORY_GRAPH_NODES}>{MAX_MEMORY_GRAPH_NODES} узлов</option>
         </select>
         <button type="button" className="mg-fit" onClick={fitView}>
           Сброс вида
@@ -538,9 +574,11 @@ export function MemoryGraph({ vault }: { vault: MemoryVault }) {
           <g className="mg-edges">
             {edges.map((edge, index) => (
               <line
-                key={`${edge.source}::${edge.target}::${edge.kind}::${index}`}
+                key={renderedEdgeKeys[index]}
                 ref={(el) => {
-                  edgeElsRef.current[index] = el;
+                  const key = renderedEdgeKeys[index];
+                  if (el) edgeElsRef.current.set(key, el);
+                  else edgeElsRef.current.delete(key);
                 }}
                 className={edgeClass(edge)}
               />
@@ -554,8 +592,18 @@ export function MemoryGraph({ vault }: { vault: MemoryVault }) {
                   key={node.id}
                   className={nodeClass(node)}
                   ref={(el) => {
+                    if (el) nodeElsRef.current.set(node.id, el);
+                    else nodeElsRef.current.delete(node.id);
                     const sim = simRef.current.get(node.id);
-                    if (sim) sim.el = el;
+                    if (sim) {
+                      sim.el = el;
+                      if (el) {
+                        el.setAttribute(
+                          "transform",
+                          `translate(${sim.x.toFixed(2)} ${sim.y.toFixed(2)})`
+                        );
+                      }
+                    }
                   }}
                   onPointerDown={(event) => beginNodeDrag(event, node.id)}
                   onPointerEnter={() => setHoverId(node.id)}

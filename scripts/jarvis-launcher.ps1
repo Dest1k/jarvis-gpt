@@ -3,8 +3,7 @@ param(
   [ValidateSet("menu", "start", "app", "stop", "restart", "status", "llm", "logs", "doctor", "open")]
   [string]$Action = "menu",
 
-  [ValidateSet("gemma4-turbo", "gemma4-mono", "gemma4-mono-perf")]
-  [string]$Profile = "gemma4-turbo",
+  [string]$Profile = "",
 
   # Explicit advanced/CLI opt-in for experimental or unsupported research profiles.
   [switch]$AllowExperimentalProfiles,
@@ -30,6 +29,7 @@ param(
 $ErrorActionPreference = "Stop"
 $script:AllowExperimentalProfiles = [bool]$AllowExperimentalProfiles
 $script:IUnderstandExperimentalProfile = [bool]$IUnderstandExperimentalProfile
+$script:ProfileCatalog = $null
 
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $FrontendRoot = Join-Path $RepoRoot "frontend"
@@ -188,53 +188,55 @@ function Get-BackendEnvironmentSha256 {
   return Get-StringSha256 -Value ($values -join "`n")
 }
 
+function Get-ProfileCatalog {
+  if ($null -ne $script:ProfileCatalog) {
+    return $script:ProfileCatalog
+  }
+
+  Push-Location $RepoRoot
+  try {
+    $output = @(& py.exe -3.11 .\jarvis.py profiles)
+    if ($LASTEXITCODE -ne 0) {
+      throw "jarvis.py profiles exited with code $LASTEXITCODE`: $($output -join ' ')"
+    }
+    $parsed = (($output -join "`n") | ConvertFrom-Json)
+  } finally {
+    Pop-Location
+  }
+
+  $catalog = @{}
+  foreach ($property in $parsed.PSObject.Properties) {
+    $catalog[[string]$property.Name] = $property.Value
+  }
+  if ($catalog.Count -eq 0) {
+    throw "jarvis.py profiles returned an empty profile catalog"
+  }
+  $script:ProfileCatalog = $catalog
+  return $script:ProfileCatalog
+}
+
 function Get-ProfileCertification {
   param([string]$SelectedProfile)
 
-  switch ($SelectedProfile) {
-    "gemma4-turbo" {
-      return @{
-        name = "gemma4-turbo"
-        certification = "certified"
-        interactive_certified = $true
-        default_recommended = $true
-        research_only = $false
-        readiness_deadline_sec = 180
-        menu_visible = $true
-        requires_experimental_opt_in = $false
-        certification_reason = "Certified interactive default on the current host."
-      }
-    }
-    "gemma4-mono-perf" {
-      return @{
-        name = "gemma4-mono-perf"
-        certification = "experimental"
-        interactive_certified = $false
-        default_recommended = $false
-        research_only = $true
-        readiness_deadline_sec = 900
-        menu_visible = $false
-        requires_experimental_opt_in = $true
-        certification_reason = "Experimental/research-only on this host (RESOLVED_BY_PRODUCT_DECISION)."
-      }
-    }
-    "gemma4-mono" {
-      return @{
-        name = "gemma4-mono"
-        certification = "unsupported"
-        interactive_certified = $false
-        default_recommended = $false
-        research_only = $true
-        readiness_deadline_sec = 1200
-        menu_visible = $false
-        requires_experimental_opt_in = $true
-        certification_reason = "Unsupported interactive/research-only on this host (RESOLVED_BY_PRODUCT_DECISION)."
-      }
-    }
-    default {
-      throw "Unknown profile: $SelectedProfile"
-    }
+  $catalog = Get-ProfileCatalog
+  if (-not $catalog.ContainsKey($SelectedProfile)) {
+    $available = @($catalog.Keys | Sort-Object) -join ", "
+    throw "Unknown profile '$SelectedProfile'. Available profiles: $available"
   }
+  return $catalog[$SelectedProfile]
+}
+
+function Get-DefaultProfileName {
+  $catalog = Get-ProfileCatalog
+  $recommended = @(
+    $catalog.Values |
+      Where-Object { [bool]$_.default_recommended } |
+      Sort-Object name
+  ) | Select-Object -First 1
+  if ($recommended) {
+    return [string]$recommended.name
+  }
+  throw "Profile catalog has no default_recommended profile"
 }
 
 function Assert-ProfileAllowed {
@@ -251,7 +253,7 @@ function Assert-ProfileAllowed {
     throw (
       "Profile '$SelectedProfile' is $($cert.certification) " +
       "($($cert.certification_reason)). " +
-      "Normal interactive menu shows only certified gemma4-turbo. " +
+      "This profile requires an explicit research opt-in. " +
       "To opt in for research, re-run with -AllowExperimentalProfiles " +
       "-IUnderstandExperimentalProfile -Profile $SelectedProfile."
     )
@@ -1491,6 +1493,7 @@ function Get-FrontendBuildState {
 
   $sourcePaths = @(
     (Join-Path $FrontendRoot "app"),
+    (Join-Path $FrontendRoot "lib"),
     (Join-Path $FrontendRoot "public"),
     (Join-Path $FrontendRoot "package.json"),
     (Join-Path $FrontendRoot "package-lock.json"),
@@ -2117,41 +2120,48 @@ function Invoke-Menu {
   }
 
   if ($choice.Value -in @("start", "app", "restart")) {
-    # Normal interactive menu shows only certified profile(s).
+    # Render the Python profile registry directly; shell policy must never drift from
+    # config.py when a model is added or re-certified.
+    $catalog = Get-ProfileCatalog
+    $visibleProfiles = @(
+      $catalog.Values |
+        Where-Object {
+          ([bool]$_.menu_visible -and -not [bool]$_.requires_experimental_opt_in) -or
+          [bool]$script:AllowExperimentalProfiles
+        } |
+        Sort-Object @{ Expression = { -[int][bool]$_.default_recommended } }, name
+    )
     $profiles = @(
-      @{
-        Label = "Turbo 26B - certified interactive (recommended)"
-        Value = "gemma4-turbo"
-        Hint  = "certified | gemma4-26b-a4b-nvfp4 | readiness deadline 180s"
+      foreach ($item in $visibleProfiles) {
+        $traits = @([string]$item.certification)
+        if ([bool]$item.vision_capable) { $traits += "vision" }
+        if ([bool]$item.research_only) { $traits += "research-only" }
+        if ([bool]$item.requires_experimental_opt_in) { $traits += "requires confirmation" }
+        $recommended = if ([bool]$item.default_recommended) { " (recommended)" } else { "" }
+        @{
+          Label = "$($item.title) - $(([string]$item.certification).ToUpper())$recommended"
+          Value = [string]$item.name
+          Hint = (
+            "$($traits -join ' | ') | $($item.model_dir_name) | " +
+            "readiness deadline $([int]$item.readiness_deadline_sec)s"
+          )
+        }
       }
     )
-    if ([bool]$script:AllowExperimentalProfiles) {
-      $profiles += @(
-        @{
-          Label = "Mono 31B perf - EXPERIMENTAL research-only"
-          Value = "gemma4-mono-perf"
-          Hint  = "experimental | not interactive-certified | deadline 900s | requires confirmation"
-        },
-        @{
-          Label = "Mono 31B offload - UNSUPPORTED interactive / research-only"
-          Value = "gemma4-mono"
-          Hint  = "unsupported interactive | research-only | deadline 1200s | requires confirmation"
-        }
-      )
-    }
-    $profileChoice = Select-Menu -Title "Select LLM profile (certified interactive only unless advanced opt-in)" -Items $profiles
+    $profileChoice = Select-Menu -Title "Select LLM profile" -Items $profiles
     if (-not $profileChoice) {
       return
     }
     $script:Profile = $profileChoice.Value
-    if ($script:Profile -ne "gemma4-turbo") {
-      if (-not $IUnderstandExperimentalProfile) {
+    $selectedProfile = Get-ProfileCertification -SelectedProfile $script:Profile
+    if ([bool]$selectedProfile.requires_experimental_opt_in) {
+      if (-not $script:IUnderstandExperimentalProfile) {
         $confirm = Select-Menu -Title "Confirm experimental/unsupported profile" -Items @(
-          @{ Label = "Cancel - use certified turbo"; Value = "cancel"; Hint = "recommended" },
+          @{ Label = "Cancel - use recommended profile"; Value = "cancel"; Hint = "recommended" },
           @{ Label = "I understand this profile is experimental/research-only"; Value = "confirm"; Hint = "advanced opt-in" }
         )
         if (-not $confirm -or $confirm.Value -ne "confirm") {
-          $script:Profile = "gemma4-turbo"
+          $script:Profile = Get-DefaultProfileName
         } else {
           $script:IUnderstandExperimentalProfile = $true
           $script:AllowExperimentalProfiles = $true
@@ -2196,6 +2206,10 @@ function Invoke-Menu {
   Write-Host "Press any key to return to menu..." -ForegroundColor DarkGray
   [void]$Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
   Invoke-Menu
+}
+
+if ([string]::IsNullOrWhiteSpace($script:Profile)) {
+  $script:Profile = Get-DefaultProfileName
 }
 
 switch ($Action) {

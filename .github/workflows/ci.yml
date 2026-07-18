@@ -76,6 +76,9 @@ jobs:
       - name: Typecheck frontend
         working-directory: frontend
         run: npm run typecheck
+      - name: Test memory graph
+        working-directory: frontend
+        run: npm run test:memory-graph
       - name: Test runtime identity
         working-directory: frontend
         run: npm run test:runtime-identity

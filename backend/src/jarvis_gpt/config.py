@@ -348,6 +348,7 @@ def profile_public_dict(profile: RuntimeProfile) -> dict[str, object]:
         "name": profile.name,
         "title": profile.title,
         "description": profile.description,
+        "model_dir_name": profile.model_dir_name,
         "eager_mode": profile.eager_mode,
         "max_steps": profile.max_steps,
         "temperature": profile.temperature,
@@ -452,6 +453,15 @@ class JarvisSettings:
     # full agent turn on its wall-clock schedule and delivers the answer to Telegram.
     # Off flips such reminders back to a passive text nudge.
     scheduled_tasks_enabled: bool
+    # ---- Proactive screen watching --------------------------------------------
+    # A screen watch is a bounded interval reminder whose poll captures the desktop and
+    # asks the active vision model whether an operator-supplied condition is visible.
+    # Limits protect GPU time and keep accidental/unbounded monitoring impossible.
+    screen_watch_enabled: bool
+    screen_watch_min_interval_sec: int
+    screen_watch_default_duration_sec: int
+    screen_watch_max_duration_sec: int
+    screen_watch_max_active: int
     # ---- Code/data sandbox ------------------------------------------------------
     # code.run executes operator Python in an isolated child (wall-clock timeout +
     # memory ceiling + kill-on-close job + curated secret-free env). Resource-isolated,
@@ -553,6 +563,13 @@ class JarvisSettings:
                 "interval_sec": self.reminder_interval_sec,
                 "timezone": self.reminder_tz,
             },
+            "screen_watch": {
+                "enabled": self.screen_watch_enabled,
+                "min_interval_sec": self.screen_watch_min_interval_sec,
+                "default_duration_sec": self.screen_watch_default_duration_sec,
+                "max_duration_sec": self.screen_watch_max_duration_sec,
+                "max_active": self.screen_watch_max_active,
+            },
             "health_alerts": {
                 "enabled": self.health_alerts_enabled,
                 "gpu_temp_c": self.health_alert_gpu_temp_c,
@@ -644,6 +661,15 @@ def load_settings(profile_name: str | None = None) -> JarvisSettings:
         reminder_interval_sec=_int_env("JARVIS_REMINDER_INTERVAL_SEC", 30),
         reminder_tz=os.environ.get("JARVIS_REMINDER_TZ", "Europe/Moscow"),
         scheduled_tasks_enabled=_bool_env("JARVIS_SCHEDULED_TASKS_ENABLED", True),
+        screen_watch_enabled=_bool_env("JARVIS_SCREEN_WATCH_ENABLED", True),
+        screen_watch_min_interval_sec=_int_env("JARVIS_SCREEN_WATCH_MIN_INTERVAL_SEC", 120),
+        screen_watch_default_duration_sec=_int_env(
+            "JARVIS_SCREEN_WATCH_DEFAULT_DURATION_SEC", 7200
+        ),
+        screen_watch_max_duration_sec=_int_env(
+            "JARVIS_SCREEN_WATCH_MAX_DURATION_SEC", 21600
+        ),
+        screen_watch_max_active=_int_env("JARVIS_SCREEN_WATCH_MAX_ACTIVE", 3),
         sandbox_enabled=_bool_env("JARVIS_SANDBOX_ENABLED", True),
         sandbox_timeout_sec=_int_env("JARVIS_SANDBOX_TIMEOUT_SEC", 30),
         sandbox_max_output_bytes=_int_env("JARVIS_SANDBOX_MAX_OUTPUT_BYTES", 1_000_000),

@@ -63,7 +63,7 @@ DEFAULT_HTTP_ALLOWLIST = frozenset(
     {
         ("GET", "/health"),
         ("GET", "/api/status"),
-        ("GET", "/api/models/profiles"),
+        ("GET", "/api/model-profiles"),
     }
 )
 

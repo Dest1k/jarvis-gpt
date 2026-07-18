@@ -28,6 +28,10 @@ class ChatRequest(BaseModel):
     max_tokens: int | None = Field(default=None, ge=1, le=8192)
     attachments: list[ChatAttachment] = Field(default_factory=list, max_length=8)
     thinking_enabled: bool = True
+    # Server-side clients such as the Telegram bridge can request the isolated guest
+    # surface. The normal web/API path remains owner mode.
+    access_mode: Literal["owner", "guest"] = "owner"
+    notification_chat_id: int | None = None
 
 
 class VoiceSpeakRequest(BaseModel):

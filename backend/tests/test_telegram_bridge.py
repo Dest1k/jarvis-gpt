@@ -52,8 +52,22 @@ def test_load_config_fails_closed_without_allowlist():
 
 
 def test_load_config_parses_allowlist():
-    cfg = load_config({"TELEGRAM_BOT_TOKEN": "T", "TELEGRAM_ALLOWED_CHAT_IDS": "42, 7 99"})
+    cfg = load_config(
+        {
+            "TELEGRAM_BOT_TOKEN": "T",
+            "TELEGRAM_ALLOWED_CHAT_IDS": "42, 7 99",
+            "TELEGRAM_OWNER_CHAT_IDS": "42",
+        }
+    )
     assert cfg.allowed_chat_ids == frozenset({42, 7, 99})
+    assert cfg.owner_chat_ids == frozenset({42})
+
+
+def test_load_config_requires_explicit_owner_for_multiple_users():
+    with pytest.raises(SystemExit, match="TELEGRAM_OWNER_CHAT_IDS"):
+        load_config(
+            {"TELEGRAM_BOT_TOKEN": "T", "TELEGRAM_ALLOWED_CHAT_IDS": "42, 99"}
+        )
 
 
 def test_logging_never_exposes_bot_token(monkeypatch):
@@ -150,10 +164,79 @@ def test_text_turn_relays_to_backend_and_replies():
     asyncio.run(bridge._handle({"update_id": 1, "message": msg}))
     assert len(chat_bodies) == 1
     assert chat_bodies[0]["message"] == "здравствуй"
+    assert chat_bodies[0]["access_mode"] == "owner"
+    assert chat_bodies[0]["notification_chat_id"] == 42
     assert "conversation_id" not in chat_bodies[0]  # first turn has no prior conversation
     assert any(m.get("text") == "Привет!" for m in sent)
     # conversation id is remembered for the next turn
     assert bridge.conversations[42] == "c1"
+
+
+def test_non_owner_allowed_chat_uses_isolated_guest_surface():
+    chat_bodies: list[dict] = []
+    api_calls: list[str] = []
+
+    def api_handler(request):
+        api_calls.append(request.url.path)
+        if request.url.path == "/api/chat":
+            chat_bodies.append(json.loads(request.content))
+            return httpx.Response(
+                200,
+                json={
+                    "conversation_id": "guest-c1",
+                    "message_id": "m1",
+                    "answer": "гостевой ответ",
+                    "events": [],
+                },
+            )
+        if request.url.path == "/api/files":
+            return httpx.Response(200, json=[])
+        return httpx.Response(404)
+
+    bridge = _bridge(
+        lambda _request: httpx.Response(200, json={"ok": True, "result": {}}),
+        api_handler,
+        allowed_chat_ids=frozenset({42, 99}),
+        owner_chat_ids=frozenset({42}),
+    )
+    update = {
+        "update_id": 2,
+        "message": {"chat": {"id": 99, "type": "private"}, "text": "привет"},
+    }
+
+    asyncio.run(bridge._handle(update))
+
+    assert chat_bodies == [
+        {"message": "привет", "access_mode": "guest", "notification_chat_id": None}
+    ]
+    assert api_calls == ["/api/chat"]
+
+
+def test_guest_attachment_never_reaches_file_or_agent_api():
+    api_calls: list[str] = []
+
+    def api_handler(request):
+        api_calls.append(request.url.path)
+        return httpx.Response(500)
+
+    bridge = _bridge(
+        lambda _request: httpx.Response(200, json={"ok": True, "result": {}}),
+        api_handler,
+        allowed_chat_ids=frozenset({42, 99}),
+        owner_chat_ids=frozenset({42}),
+    )
+    update = {
+        "update_id": 3,
+        "message": {
+            "chat": {"id": 99, "type": "private"},
+            "caption": "посмотри",
+            "photo": [{"file_id": "p1", "width": 100}],
+        },
+    }
+
+    asyncio.run(bridge._handle(update))
+
+    assert api_calls == []
 
 
 def test_reset_command_drops_conversation_without_calling_agent():

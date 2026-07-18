@@ -1237,6 +1237,8 @@ async def chat(request: ChatRequest) -> ChatResponse:
         max_tokens=request.max_tokens,
         attachments=[item.model_dump() for item in request.attachments],
         thinking_enabled=request.thinking_enabled,
+        access_mode=request.access_mode,
+        notification_chat_id=request.notification_chat_id,
     )
 
 
@@ -1330,6 +1332,11 @@ def _persist_interrupted_stream(
 
 @app.post("/api/chat/stream")
 async def chat_stream(request: ChatRequest) -> StreamingResponse:
+    if request.access_mode != "owner":
+        # The bridge uses the bounded non-streaming guest route. Refuse to let a future
+        # client accidentally enter the privileged streaming agent implementation.
+        raise HTTPException(status_code=403, detail="Guest streaming is not available")
+
     async def lines():
         conversation_id = request.conversation_id
         partial: list[str] = []

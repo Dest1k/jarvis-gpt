@@ -117,6 +117,12 @@ def main() -> int:
                     timeout=default_check_timeout,
                 ),
                 run(
+                    "frontend memory graph tests",
+                    [executable("npm"), "run", "test:memory-graph"],
+                    cwd=ROOT / "frontend",
+                    timeout=default_check_timeout,
+                ),
+                run(
                     "frontend stream recovery tests",
                     [executable("npm"), "run", "test:stream-placeholder"],
                     cwd=ROOT / "frontend",

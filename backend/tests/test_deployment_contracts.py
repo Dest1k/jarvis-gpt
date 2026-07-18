@@ -143,6 +143,7 @@ def test_launcher_is_local_only_and_preserves_foreign_listeners() -> None:
     assert "Get-OrCreateApiToken" in launcher
     assert "Protect-ApiTokenFile" in launcher
     assert "Get-FrontendEnvironmentSha256" in launcher
+    assert '(Join-Path $FrontendRoot "lib")' in launcher
     assert "JARVIS_EXECUTION_CAPABILITIES_FILE" in launcher
     assert "JARVIS_BRIDGE_APP_PATHS_JSON" in launcher
     assert '$env:JARVIS_API_HOST = "127.0.0.1"' in launcher
@@ -198,22 +199,29 @@ def test_launcher_repeat_start_is_idempotent_contract() -> None:
     ) == 1
 
 
-def test_launcher_profile_safety_menu_and_opt_in_contract() -> None:
-    """SPARK-0013: normal menu is turbo-only; experimental needs explicit opt-in."""
+def test_launcher_profile_registry_is_not_duplicated_in_powershell() -> None:
+    """Launcher policy comes from config.py, including newly registered profiles."""
 
     launcher = _read("scripts/jarvis-launcher.ps1")
+    assert "function Get-ProfileCatalog" in launcher
     assert "function Get-ProfileCertification" in launcher
     assert "function Assert-ProfileAllowed" in launcher
     assert "function Invoke-ProfileHealthProbe" in launcher
+    assert ".\\jarvis.py profiles" in launcher
+    assert '$script:ProfileCatalog' in launcher
     assert "AllowExperimentalProfiles" in launcher
     assert "IUnderstandExperimentalProfile" in launcher
-    assert "certified interactive (recommended)" in launcher
     assert "readiness_deadline_sec" in launcher or "readiness_deadline" in launcher
-    assert "RESOLVED_BY_PRODUCT_DECISION" in launcher
-    # Certified turbo remains visible; mono profiles require advanced opt-in.
-    assert launcher.count('Value = "gemma4-turbo"') >= 1
-    assert "EXPERIMENTAL research-only" in launcher
-    assert "UNSUPPORTED interactive" in launcher
+    assert "requires_experimental_opt_in" in launcher
+    assert '[ValidateSet("gemma4-turbo"' not in launcher
+    assert 'switch ($SelectedProfile)' not in launcher
+    assert 'Value = "gemma4-turbo"' not in launcher
+    assert '[string]$Profile = ""' in launcher
+    assert ".\\jarvis.py profiles 2>&1" not in launcher
+    assert "-not $script:IUnderstandExperimentalProfile" in launcher
+    assert launcher.rindex("$script:Profile = Get-DefaultProfileName") < launcher.rindex(
+        "switch ($Action)"
+    )
 
 
 def test_frontend_runtime_uses_unprivileged_node_user() -> None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+import jarvis_gpt.storage as storage_module
 import pytest
 from jarvis_gpt.config import PROFILES, ensure_runtime_dirs, load_settings
 from jarvis_gpt.models import MemoryVaultResponse
@@ -486,6 +487,46 @@ def test_memory_graph_links_memory_that_mentions_a_file(tmp_path):
     storage.close()
 
 
+def test_memory_graph_filename_mentions_are_case_insensitive_and_exact(tmp_path):
+    storage = JarvisStorage(tmp_path / "state" / "jarvis.sqlite3")
+    storage.initialize()
+    report = _make_file(storage, "report.pdf", sha="d" * 64)
+    old_report = _make_file(storage, "old report.pdf", sha="e" * 64)
+    report_copy = _make_file(storage, "report.pdf copy", sha="c" * 64)
+    exact = storage.add_memory(content="Open REPORT.PDF for review")
+    longer = storage.add_memory(content="Archive OLD REPORT.PDF after review")
+    suffix = storage.add_memory(content="Move REPORT.PDF COPY into archive")
+
+    graph = storage.memory_graph()
+    mentions = {
+        (edge["source"], edge["target"])
+        for edge in graph["edges"]
+        if edge["kind"] == "mentions"
+    }
+
+    assert (exact["id"], f"document:{report['id']}") in mentions
+    assert (longer["id"], f"document:{old_report['id']}") in mentions
+    assert (longer["id"], f"document:{report['id']}") not in mentions
+    assert (suffix["id"], f"document:{report_copy['id']}") in mentions
+    assert (suffix["id"], f"document:{report['id']}") not in mentions
+    storage.close()
+
+
+def test_memory_graph_caps_document_mentions(monkeypatch, tmp_path):
+    monkeypatch.setattr(storage_module, "_DOC_MENTION_EDGE_CAP", 1)
+    storage = JarvisStorage(tmp_path / "state" / "jarvis.sqlite3")
+    storage.initialize()
+    _make_file(storage, "first.pdf", sha="1" * 64)
+    _make_file(storage, "second.pdf", sha="2" * 64)
+    storage.add_memory(content="Compare first.pdf with second.pdf")
+
+    graph = storage.memory_graph()
+    mentions = [edge for edge in graph["edges"] if edge["kind"] == "mentions"]
+
+    assert len(mentions) == 1
+    storage.close()
+
+
 def test_memory_graph_co_source_edges_skip_uploads(tmp_path):
     storage = JarvisStorage(tmp_path / "state" / "jarvis.sqlite3")
     storage.initialize()
@@ -499,6 +540,25 @@ def test_memory_graph_co_source_edges_skip_uploads(tmp_path):
     assert frozenset((f"document:{a['id']}", f"document:{b['id']}")) in pairs
     # An upload with no source_path is never grouped by folder.
     assert all(f"document:{up['id']}" not in pair for pair in pairs)
+    storage.close()
+
+
+def test_memory_graph_same_content_has_priority_over_co_source(tmp_path):
+    storage = JarvisStorage(tmp_path / "state" / "jarvis.sqlite3")
+    storage.initialize()
+    shared_sha = "f" * 64
+    a = _make_file(storage, "a.pdf", sha=shared_sha, source=Path("C:/docs/a.pdf"))
+    b = _make_file(storage, "b.pdf", sha=shared_sha, source=Path("C:/docs/b.pdf"))
+
+    graph = storage.memory_graph()
+    pair = frozenset((f"document:{a['id']}", f"document:{b['id']}"))
+    pair_edges = [
+        edge
+        for edge in graph["edges"]
+        if frozenset((edge["source"], edge["target"])) == pair
+    ]
+
+    assert [edge["kind"] for edge in pair_edges] == ["same-content"]
     storage.close()
 
 
@@ -546,6 +606,12 @@ def test_memory_graph_backward_compatible_without_documents(tmp_path):
     assert graph["stats"]["documents"] == 0
     assert graph["stats"]["document_edges"] == 0
     assert not any(node["kind"] == "document" for node in graph["nodes"])
+    degree_by_id = {node["id"]: node["degree"] for node in graph["nodes"]}
+    memory_node = next(node for node in graph["nodes"] if node["kind"] == "memory")
+    assert degree_by_id[memory_node["id"]] == 3
+    assert degree_by_id["namespace:core"] == 1
+    assert degree_by_id["link:other"] == 1
+    assert degree_by_id["tag:tag"] == 1
     storage.close()
 
 
@@ -593,6 +659,83 @@ def test_storage_consolidates_existing_duplicate_memories(tmp_path):
     assert result["removed"] == 1
     assert len(hits) == 1
     assert "legacy" in hits[0]["tags"]
+    note_path = storage.memory_vault.root / "instructions" / f"{hits[0]['id']}.md"
+    assert note_path.exists()
+    note = note_path.read_text(encoding="utf-8")
+    assert 'tags: ["legacy"]' in note
+    assert "importance: 0.9" in note
+    assert len(list(storage.memory_vault.root.glob("**/*.md"))) == 1
+    storage.close()
+
+
+def test_memory_db_failure_rolls_back_without_writing_vault(monkeypatch, tmp_path):
+    storage = JarvisStorage(tmp_path / "state" / "jarvis.sqlite3")
+    storage.initialize()
+
+    def fail_fts(*_args, **_kwargs):
+        raise sqlite3.OperationalError("simulated DB failure")
+
+    monkeypatch.setattr(storage, "_replace_memory_fts", fail_fts)
+
+    with pytest.raises(sqlite3.OperationalError, match="simulated DB failure"):
+        storage.add_memory(content="must roll back")
+
+    conn = storage.connect()
+    assert not conn.in_transaction
+    assert conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 0
+    assert not list(storage.memory_vault.root.glob("**/*.md"))
+    storage.close()
+
+
+def test_memory_vault_failure_is_marked_then_repaired(monkeypatch, tmp_path):
+    storage = JarvisStorage(tmp_path / "state" / "jarvis.sqlite3")
+    storage.initialize()
+    original = storage.add_memory(
+        content="Use local launch mode by default.",
+        namespace="instructions",
+    )
+    with storage.connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO memories(id, namespace, content, tags, importance, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "mem_repair_keep",
+                "instructions",
+                "Use local launch mode by default.",
+                '["legacy"]',
+                0.9,
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+        conn.commit()
+    storage.rebuild_memory_vault()
+    original_upsert = storage.memory_vault.upsert_memory
+
+    def fail_upsert(_memory):
+        raise OSError("simulated mirror failure")
+
+    monkeypatch.setattr(storage.memory_vault, "upsert_memory", fail_upsert)
+
+    result = storage.consolidate_memories()
+
+    assert result["removed"] == 1
+    assert not storage.connect().in_transaction
+    assert storage.get_runtime_value("memory_vault.repair_required")["required"] is True
+    graph_ids = {node["id"] for node in storage.memory_graph()["nodes"]}
+    assert original["id"] not in graph_ids
+    assert "mem_repair_keep" in graph_ids
+
+    monkeypatch.setattr(storage.memory_vault, "upsert_memory", original_upsert)
+    storage.add_memory(content="Trigger pending mirror repair", namespace="repair")
+
+    assert storage.get_runtime_value("memory_vault.repair_required") is None
+    assert not (storage.memory_vault.root / "instructions" / f"{original['id']}.md").exists()
+    assert (
+        storage.memory_vault.root / "instructions" / "mem_repair_keep.md"
+    ).exists()
     storage.close()
 
 
