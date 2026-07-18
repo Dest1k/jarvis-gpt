@@ -41,6 +41,8 @@ import {
   X
 } from "lucide-react";
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+import { MemoryGraph } from "./MemoryGraph";
 import type { CSSProperties, KeyboardEvent, PointerEvent as ReactPointerEvent, ReactNode } from "react";
 import {
   runtimeClientIdentity,
@@ -217,7 +219,7 @@ type MemoryItem = {
   matched_terms?: string[];
 };
 
-type MemoryGraphNode = {
+export type MemoryGraphNode = {
   id: string;
   label: string;
   kind: string;
@@ -227,9 +229,15 @@ type MemoryGraphNode = {
   importance?: number | null;
   updated_at?: string | null;
   degree?: number | null;
+  doc_id?: string | null;
+  mime?: string | null;
+  size?: number | null;
+  status?: string | null;
+  chunk_count?: number | null;
+  created_at?: string | null;
 };
 
-type MemoryVault = {
+export type MemoryVault = {
   root: string;
   notes: {
     id?: string | null;
@@ -5881,6 +5889,7 @@ export default function CommandCenter() {
                 </div>
               </div>
             )}
+            {memoryVault && <MemoryGraph vault={memoryVault} />}
             <div className="memoryList">
               {memories.slice(0, 5).map((memory) => (
                 <article className="memoryRow" key={memory.id}>
