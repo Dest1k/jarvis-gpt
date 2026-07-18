@@ -3449,13 +3449,21 @@ class AgentRuntime:
         written-file info, or ``None``.
         """
 
-        if str(finish_reason or "").startswith(
-            ("protocol_error", "synthesis_error", "awaiting_approval")
-        ):
-            return None
-        if blocked_by_approval:
+        finish = str(finish_reason or "")
+        if finish.startswith("awaiting_approval") or blocked_by_approval:
+            # An approval-gated turn must never auto-materialize a file.
             return None
         if any(item.tool in AGENTIC_DURABLE_MUTATORS for item in executed_tools):
+            return None
+        if finish.startswith(("protocol_error", "synthesis_error")) and not any(
+            item.result.ok and item.tool not in AGENTIC_DURABLE_MUTATORS
+            for item in executed_tools
+        ):
+            # The model fumbled its control flow with NO real tool material to salvage — do
+            # not fabricate a file out of nothing. But when successful research/read tools DID
+            # run this turn (e.g. web.search + web.fetch), a claimed file goal is still
+            # materialized from that gathered material (Fix A salvage), because a fumbled
+            # final synthesis is exactly when the model narrates the file without writing it.
             return None
 
         def _material() -> str:

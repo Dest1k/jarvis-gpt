@@ -382,6 +382,34 @@ def test_chat_backstop_ignores_informational_answer(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_chat_backstop_salvages_file_from_tool_material_on_fumble(monkeypatch, tmp_path):
+    # A file goal where the model fumbled the final synthesis (protocol_error) but real
+    # research tools ran must still materialize the file from that gathered material — a
+    # fumbled final turn is exactly when the model narrates a file without writing it.
+    body = "# Отчёт\n\n1. A\n2. B\n\nСодержательный текст, синтезированный из материала."
+    agent, storage, _settings = _autonomy_agent(monkeypatch, tmp_path, _ContentLLM(body))
+    executed = (
+        _ExecutedToolResult(
+            tool="web.search",
+            arguments={},
+            result=ToolRunResponse(tool="web.search", ok=True, summary="found 5", data={}),
+        ),
+    )
+    deliverable = asyncio.run(
+        agent._maybe_backstop_chat_file(
+            _operator_context(),
+            message="Собери отчёт про GPU в файл gpu.md",
+            answer="До остановки зафиксированы результаты инструментов…",
+            finish_reason="protocol_error",
+            blocked_by_approval=False,
+            executed_tools=executed,
+        )
+    )
+    assert deliverable is not None
+    assert Path(deliverable["path"]).is_file()
+    storage.close()
+
+
 def test_chat_backstop_noops_on_blocked_finish(monkeypatch, tmp_path):
     # A protocol/synthesis/approval-blocked finish must never auto-materialize a file.
     agent, storage, _settings = _autonomy_agent(monkeypatch, tmp_path, _ContentLLM("body"))
