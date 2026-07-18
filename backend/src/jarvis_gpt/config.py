@@ -316,6 +316,9 @@ PROFILES: dict[str, RuntimeProfile] = {
             # crashes EngineCore init. Raise it so the constraint holds (also a better
             # prefill chunk).
             max_num_batched_tokens=4096,
+            # Accept several images (and a video) per prompt so multi-image vision works;
+            # vLLM 0.25 parses this as JSON. The VLM default is 1 image/prompt.
+            limit_mm_per_prompt='{"image":4,"video":1}',
             # MTP self-speculation was measured LIVE on this box (5090 + vLLM 0.25.1
             # FLASHINFER_CUTLASS NVFP4) and was a NET LOSS: ~150 vs ~203 tok/s pure decode
             # (400 forced tokens, apples-to-apples) — the already memory-bound NVFP4 decode
