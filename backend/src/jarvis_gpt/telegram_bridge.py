@@ -33,6 +33,7 @@ from pathlib import Path
 import httpx
 
 from .config import load_local_env_file
+from .telegram_format import html_to_plain, render_telegram_html, split_telegram_html
 
 log = logging.getLogger("jarvis.telegram")
 
@@ -204,9 +205,33 @@ class TelegramBridge:
         return body.get("result")
 
     async def _send(self, chat_id: int, text: str) -> None:
-        for piece in _chunks(text):
-            with suppress(httpx.HTTPError, RuntimeError):
-                await self._tg("sendMessage", chat_id=chat_id, text=piece)
+        """Send a reply as Telegram HTML (code blocks, bold, links, tables).
+
+        The model answers in Markdown; we render it to Telegram's HTML subset and
+        split it tag-safely. If Telegram still rejects a piece (malformed HTML), that
+        piece is re-sent as plain text so the message always arrives.
+        """
+
+        html = render_telegram_html(text)
+        for piece in split_telegram_html(html):
+            if await self._send_piece(chat_id, piece, html=True):
+                continue
+            for plain in _chunks(html_to_plain(piece)):
+                await self._send_piece(chat_id, plain, html=False)
+
+    async def _send_piece(self, chat_id: int, text: str, *, html: bool) -> bool:
+        params: dict[str, object] = {
+            "chat_id": chat_id,
+            "text": text,
+            "disable_web_page_preview": True,
+        }
+        if html:
+            params["parse_mode"] = "HTML"
+        try:
+            await self._tg("sendMessage", **params)
+            return True
+        except (httpx.HTTPError, RuntimeError):
+            return False
 
     async def _typing_keepalive(self, chat_id: int) -> None:
         while True:
