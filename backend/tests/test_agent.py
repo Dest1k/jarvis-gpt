@@ -5992,6 +5992,16 @@ def test_machine_health_route_requires_pc_anchor_for_ambiguous_phrases():
     assert _native_action_name("проверь систему, как там процессор и диск") == "hardware.summary"
     assert _native_action_name("какое самочувствие у компьютера") == "hardware.summary"
 
+    # Single-resource host-telemetry queries route to the same combined report (they used
+    # to make the model invent bad system.inspect action names and fail).
+    for phrase in (
+        "Сколько свободного места на диске C?",
+        "сколько оперативной памяти свободно?",
+        "какая загрузка процессора сейчас?",
+        "сколько озу занято",
+    ):
+        assert _native_action_name(phrase) == "hardware.summary", phrase
+
 
 def test_clipboard_read_route_ignores_conceptual_clipboard_questions():
     # Real "read my clipboard" requests route to clipboard.read.

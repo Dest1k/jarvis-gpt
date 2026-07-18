@@ -18456,6 +18456,29 @@ def _native_action_from_message(
             "как там компьютер",
             "как поживает пк",
             "как поживает компьютер",
+            # Single-resource host-telemetry queries route to the SAME combined report
+            # (which already contains disk/RAM/CPU/GPU, with real cross-checked numbers).
+            # This is deterministic, so the weak model can't invent a bad system.inspect
+            # action name ("get_disk_free_space" / "disk_free" / "get_memory") and fail.
+            "места на диске",
+            "места на диск",
+            "свободно на диске",
+            "свободного места на диск",
+            "занято на диске",
+            "места на c",
+            "диске c",
+            "сколько оперативк",
+            "оперативной памяти",
+            "свободной памяти",
+            "свободно памяти",
+            "памяти свободно",
+            "сколько озу",
+            "загрузка памяти",
+            "загрузка процессора",
+            "загрузка cpu",
+            "нагрузка на процессор",
+            "загружен процессор",
+            "сколько ядер",
         ),
     )
     if not machine_health:
