@@ -207,6 +207,55 @@ def test_chat_backstop_materializes_narrated_file(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_goal_file_deliverable_preserves_explicit_directory():
+    from jarvis_gpt.agent import _destination_path_from_message
+
+    spec = _goal_file_deliverable(
+        r"Составь чеклист и сохрани его в файл D:\jarvis-gpt\live_verify_A.md"
+    )
+    assert spec is not None
+    assert spec["filename"] == "live_verify_A.md"
+    assert spec.get("output_path") == r"D:\jarvis-gpt\live_verify_A.md"
+
+    # A bare basename carries no directory → no output_path (default dir preserved).
+    bare = _goal_file_deliverable("Сделай план и сохрани в plan.md")
+    assert bare is not None
+    assert "output_path" not in bare
+    assert _destination_path_from_message("сохрани в plan.md") is None
+    # A relative directory is preserved too (stays under the output root at write time).
+    assert _destination_path_from_message("сохрани в out/report.docx") == "out/report.docx"
+
+
+def test_chat_backstop_honors_explicit_absolute_destination(monkeypatch, tmp_path):
+    # An explicit absolute destination inside an allowed root (JARVIS_HOME) must be
+    # honored verbatim, not silently redirected to the default document-outputs dir.
+    body = (
+        "# Чеклист\n\n1. Один\n2. Два\n3. Три\n4. Четыре\n5. Пять\n\n"
+        "Достаточно содержательный текст, чтобы файл считался не-заглушкой."
+    )
+    agent, storage, settings = _autonomy_agent(monkeypatch, tmp_path, _ContentLLM(body))
+    dest = tmp_path / "reports" / "verify_A.md"  # under JARVIS_HOME → allowed root
+    deliverable = asyncio.run(
+        agent._maybe_backstop_chat_file(
+            _operator_context(),
+            message=f"Составь чеклист из 5 пунктов и сохрани его в файл {dest}",
+            answer="Готово, сохранил чеклист.",
+            finish_reason="stop",
+            blocked_by_approval=False,
+            executed_tools=(),
+        )
+    )
+    assert deliverable is not None
+    written = Path(deliverable["path"])
+    assert written.resolve() == dest.resolve()
+    assert written.is_file()
+    assert "Чеклист" in written.read_text(encoding="utf-8")
+    # Must NOT have fallen back to the default document-outputs directory.
+    default = settings.data_dir / "document-outputs" / "verify_A.md"
+    assert not default.exists()
+    storage.close()
+
+
 def test_chat_backstop_noops_when_writer_ran(monkeypatch, tmp_path):
     # A real durable write already happened this turn → backstop must not double-write.
     agent, storage, _settings = _autonomy_agent(monkeypatch, tmp_path, _ContentLLM("x"))

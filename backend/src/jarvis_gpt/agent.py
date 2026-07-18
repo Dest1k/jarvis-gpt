@@ -290,6 +290,11 @@ AGENTIC_TOOL_DENYLIST = frozenset(
 # ledger merely because it is low-risk.
 AGENTIC_DURABLE_MUTATORS = frozenset(
     {
+        # The typed-mutation applier (fs.write / fs.mkdir / … via jarvis.execution.v1)
+        # is a real durable write; recognizing it here stops the chat file-deliverable
+        # backstop from redundantly re-materializing a file the operator already wrote
+        # through execution.apply.
+        "execution.apply",
         "documents.generate",
         "documents.convert",
         "documents.archive.create",
@@ -3325,8 +3330,17 @@ class AgentRuntime:
                 return None
             output_format = spec["output_format"]
             output_name = spec["output_name"]
-            output_dir = (self.settings.data_dir / _DOCUMENT_OUTPUT_DIR).resolve(strict=False)
-            target = output_dir / f"{output_name}.{output_format}"
+            explicit_path = spec.get("output_path")
+            if explicit_path:
+                target = Path(explicit_path)
+                if not target.is_absolute():
+                    target = self.settings.data_dir / _DOCUMENT_OUTPUT_DIR / target
+                target = target.resolve(strict=False)
+            else:
+                output_dir = (self.settings.data_dir / _DOCUMENT_OUTPUT_DIR).resolve(
+                    strict=False
+                )
+                target = output_dir / f"{output_name}.{output_format}"
             if _existing_file_is_substantive(target, goal=goal_text):
                 return None
             resolved_material = material() if callable(material) else material
@@ -3346,6 +3360,10 @@ class AgentRuntime:
                 "output_name": spec["filename"],
                 "overwrite": True,
             }
+            if explicit_path:
+                # An explicit absolute destination inside an allowed root is honored by
+                # documents.generate's resolver; a bare name keeps the default dir.
+                args["output_path"] = explicit_path
             if output_format in {"md", "txt", "csv", "json", "html", "htm", "xml"}:
                 args["exact_body"] = True
             result = await self._run_claimed_operator_tool(
@@ -14162,6 +14180,33 @@ def _destination_filename_from_message(
     return None
 
 
+_DESTINATION_PATH_EXTS = ("md", "docx", "pdf", "txt", "html", "csv", "json", "xlsx")
+
+
+def _destination_path_from_message(message: str) -> str | None:
+    """Return an explicit directory-qualified / absolute destination path from the
+    message (e.g. ``D:\\jarvis-gpt\\notes.md`` or ``out/report.docx``), or ``None``.
+
+    Only a path that carries a directory component survives here — a bare basename is
+    handled by :func:`_destination_filename_from_message`. Without this the explicit
+    directory is destroyed at parse time (the basename regexes exclude path separators
+    and the drive-letter colon), so "сохрани в <абсолютный путь>" lands in the default
+    document-outputs directory instead of where the operator asked.
+    """
+
+    best: str | None = None
+    for raw in re.split(r"\s+", str(message or "")):
+        token = raw.strip().strip("\"'<>()[]").rstrip(".,;:!?")
+        if "." not in token:
+            continue
+        if "/" not in token and "\\" not in token:
+            # A bare basename carries no directory — not our concern.
+            continue
+        if token.rsplit(".", 1)[-1].casefold() in _DESTINATION_PATH_EXTS:
+            best = token  # last destination wins, matching the basename extractor
+    return best
+
+
 def _artifact_filename_from_message(message: str) -> str | None:
     """Backward-compatible: destination filename when present, else first name."""
 
@@ -14263,12 +14308,19 @@ def _goal_file_deliverable(goal: str) -> dict[str, str] | None:
     if explicit and "." in explicit:
         ext = explicit.rsplit(".", 1)[-1].lower()
         stem = explicit[: -(len(ext) + 1)]
-        return {
+        spec = {
             "output_name": stem or _slugify_filename(text),
             "output_format": ext,
             "filename": explicit,
             "title": _deliverable_title(text),
         }
+        # Preserve an explicit directory-qualified / absolute destination so the
+        # backstop writes where the operator asked, not the default document-outputs
+        # directory (the basename extractor above drops the directory).
+        explicit_path = _destination_path_from_message(text)
+        if explicit_path:
+            spec["output_path"] = explicit_path
+        return spec
     if not any(stem in lowered for stem in _FILE_CREATE_VERB_STEMS):
         return None
     output_format: str | None = None

@@ -12430,6 +12430,45 @@ def _resolve_document_destination(
     output_root = ctx.settings.data_dir / DOCUMENT_OUTPUT_DIRNAME
     raw_path = args.get("output_path") or args.get("destination")
     raw_name = args.get("output_name")
+    # An explicit ABSOLUTE destination inside an allowed operator root (cwd or home)
+    # is honored verbatim instead of being confined under document-outputs — so a
+    # request "сохрани в D:\jarvis-gpt\notes.md" lands where asked. A bare name or a
+    # relative path keeps the default document-outputs behavior below. Absolute paths
+    # OUTSIDE the allowed roots also fall through to the safe default.
+    explicit_abs = next(
+        (
+            str(candidate)
+            for candidate in (raw_path, raw_name)
+            if candidate and Path(str(candidate)).is_absolute()
+        ),
+        None,
+    )
+    if explicit_abs is not None:
+        try:
+            resolved = _resolve_allowed_path(ctx.settings, explicit_abs)
+        except ValueError:
+            resolved = None
+        if resolved is not None and resolved.suffix:
+            require_exact = _truthy_arg(
+                args.get("require_exact_path")
+                if args.get("require_exact_path") is not None
+                else args.get("exact_destination")
+            )
+            allow_overwrite = _truthy_arg(args.get("overwrite") or args.get("allow_overwrite"))
+            if args.get("collision_safe") is not None:
+                collision_safe = _truthy_arg(args.get("collision_safe"))
+            else:
+                collision_safe = not require_exact
+            # Reuse the shared allocator with the explicit directory as its root so the
+            # collision/overwrite semantics are identical to the document-outputs path.
+            return resolve_artifact_output_path(
+                resolved.parent,
+                output_path=None,
+                output_name=resolved.name,
+                default_name=default_name,
+                collision_safe=collision_safe,
+                allow_overwrite=allow_overwrite,
+            )
     # Strip a leading document-outputs/ segment so relative destinations are not
     # double-nested under the output root (RB-4).
     if raw_path is not None and not Path(str(raw_path)).is_absolute():
