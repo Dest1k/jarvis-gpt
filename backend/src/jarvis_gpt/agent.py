@@ -674,6 +674,15 @@ def _chat_message_metadata(
 _VISION_MAX_IMAGES = 4
 _VISION_MAX_IMAGE_BYTES = 16 * 1024 * 1024
 
+# System prompt for the "look at my screen" route: the VLM is shown a desktop screenshot
+# and answers the operator's question about it.
+SCREEN_VISION_PROMPT = (
+    "Ты — Джарвис, и сейчас смотришь на скриншот экрана оператора. Ответь на его вопрос "
+    "по делу и на русском: какие приложения и окна открыты, что происходит, есть ли "
+    "ошибки, уведомления или что-то, требующее внимания. Если оператор спросил что-то "
+    "конкретное — сфокусируйся на этом. Опирайся на то, что реально видишь на изображении."
+)
+
 
 def _message_with_attachments(message: str, attachments: list[dict[str, Any]]) -> str:
     if not attachments:
@@ -3860,25 +3869,35 @@ class AgentRuntime:
             # kernel. Weather, shopping, web follow-ups, and other fuzzy direct
             # routes must not intercept the turn before document evidence loads.
             return None
+        native_action = _native_action_from_message(
+            message,
+            self.settings,
+        )
+        # A "посмотри на экран" turn is a single direct vision action; don't let the
+        # multi-step orchestrator swallow it just because it also says "и скажи, что…".
+        wants_screen_vision = (
+            native_action is not None and native_action.action == "screen.capture"
+        )
         # Multi-step requests (lookup + compute/compare) go to the universal
         # plan-execute-synthesize orchestrator instead of a single shallow pipe.
         if (
             context is not None
             and self._owner_autonomy_active()
+            and not wants_screen_vision
             and _looks_like_multistep(message)
         ):
             orchestrated = await self._run_task_orchestration(message, context)
             if orchestrated is not None:
                 return orchestrated
-        native_action = _native_action_from_message(
-            message,
-            self.settings,
-        )
         if (
             native_action is not None
             and native_action.action == "screen.capture"
             and not _has_current_operator_authority(context)
+            and not self._owner_autonomy_active()
         ):
+            # Screenshotting the desktop is privacy-sensitive, so the gated posture requires
+            # explicit operator authority. Under owner full-autonomy the single admin's own
+            # "посмотри на экран" turn authorizes it — let the screen-vision route run.
             native_action = None
         if native_action is not None:
             arguments = {
@@ -3916,6 +3935,27 @@ class AgentRuntime:
                     "action": native_action.action,
                 },
             )
+            if (
+                result.ok
+                and native_action.action == "screen.capture"
+                and self.settings.profile.vision_capable
+            ):
+                # "Посмотри на экран" on a vision model: feed the captured screenshot to the
+                # VLM so it actually sees the desktop, instead of only returning OCR text.
+                # The path is doubly nested (native -> result -> data -> path), same as
+                # _native_result_excerpt reads it.
+                native = result.data.get("native") if isinstance(result.data, dict) else None
+                shot_path = None
+                if isinstance(native, dict):
+                    parsed = native.get("result")
+                    observation = parsed if isinstance(parsed, dict) else native
+                    native_data = observation.get("data")
+                    if isinstance(native_data, dict):
+                        shot_path = native_data.get("path")
+                if isinstance(shot_path, str) and shot_path:
+                    seen = await self._answer_about_image(message, shot_path)
+                    if seen:
+                        return DirectAction(answer=seen, events=[event])
             status = "Готово" if result.ok else "Не смог выполнить безопасную проверку"
             details = _native_result_excerpt(result)
             return DirectAction(
@@ -8985,6 +9025,44 @@ class AgentRuntime:
                 }
             )
         return parts
+
+    async def _answer_about_image(self, question: str, image_path: str) -> str | None:
+        """Send an image file (e.g. a desktop screenshot) to the VLM and return its answer.
+
+        Powers the "посмотри на экран" route: after screen.capture writes a PNG, feed the
+        pixels to the vision model so it actually SEES the screen rather than only reading
+        OCR text. Returns None (caller falls back to the OCR summary) if the file is
+        unreadable/oversized or the model call fails.
+        """
+
+        try:
+            path = Path(image_path)
+            if not path.is_file() or path.stat().st_size > _VISION_MAX_IMAGE_BYTES:
+                return None
+            raw = path.read_bytes()
+        except OSError:
+            return None
+        if not raw:
+            return None
+        mime = mimetypes.guess_type(path.name)[0] or "image/png"
+        encoded = base64.b64encode(raw).decode("ascii")
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": SCREEN_VISION_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": question.strip() or "Что сейчас на экране?"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime};base64,{encoded}"},
+                    },
+                ],
+            },
+        ]
+        result = await self.llm.complete(messages, thinking_enabled=False)
+        if result.ok and result.content.strip():
+            return result.content.strip()
+        return None
 
     def _build_llm_messages(
         self,
@@ -18056,9 +18134,21 @@ def _screen_capture_action(
             "моими глазами",
             "твоими глазами",
             "посмотри экран",
+            "посмотри на экран",
+            "глянь на экран",
+            "глянь на мой экран",
+            "смотри на экран",
+            "погляди на экран",
             "на экран",
+            "мой экран",
+            "моём экране",
+            "моем экране",
+            "на мониторе",
+            "на дисплее",
             "что на экране",
+            "что у меня на экране",
             "что видишь",
+            "что ты видишь",
             "скриншот",
             "снимок экрана",
             "визуально",
@@ -18066,6 +18156,8 @@ def _screen_capture_action(
             "на картинке",
             "screenshot",
             "screen capture",
+            "look at my screen",
+            "what's on my screen",
         ),
     )
     if not wants_screen:

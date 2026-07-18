@@ -8,6 +8,7 @@ profile so a text-only brain keeps treating images as file metadata.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 
@@ -16,11 +17,12 @@ from jarvis_gpt.agent import (
     _VISION_MAX_IMAGES,
     AgentContext,
     AgentRuntime,
+    _native_action_from_message,
 )
 from jarvis_gpt.config import PROFILES, ensure_runtime_dirs, load_settings
 from jarvis_gpt.event_bus import EventBus
 from jarvis_gpt.ingest import FileIngestor
-from jarvis_gpt.llm import LLMRouter
+from jarvis_gpt.llm import LLMResult, LLMRouter
 from jarvis_gpt.storage import JarvisStorage
 
 # A 1x1 PNG — enough for a valid image/* upload.
@@ -130,6 +132,50 @@ def test_build_llm_messages_emits_multipart_content_with_images(monkeypatch, tmp
     assert isinstance(last["content"], list)
     assert last["content"][0] == {"type": "text", "text": "что на картинке?"}
     assert last["content"][1]["type"] == "image_url"
+
+
+def test_look_at_screen_intent_matches_common_phrasings():
+    for phrase in (
+        "Посмотри на экран и скажи, что открыто.",
+        "Джарвис, глянь на мой экран — что там сейчас?",
+        "Что у меня на экране? Есть что-то важное?",
+        "look at my screen",
+    ):
+        from jarvis_gpt.config import load_settings
+
+        action = _native_action_from_message(phrase, load_settings("qwen36-vl"))
+        assert action is not None and action.action == "screen.capture", phrase
+
+
+def test_answer_about_image_sends_screenshot_to_the_vlm(monkeypatch, tmp_path):
+    agent, _storage, _ = _agent(monkeypatch, tmp_path)
+    shot = tmp_path / "screen.png"
+    shot.write_bytes(_PNG_1x1)
+    captured: dict[str, object] = {}
+
+    async def fake_complete(messages, **kwargs):
+        captured["messages"] = messages
+        captured["thinking"] = kwargs.get("thinking_enabled")
+        return LLMResult(ok=True, content="На экране открыт VS Code.")
+
+    monkeypatch.setattr(agent.llm, "complete", fake_complete)
+    answer = asyncio.run(agent._answer_about_image("что на экране?", str(shot)))
+    assert answer == "На экране открыт VS Code."
+    # The turn carries the screenshot as an image_url part alongside the question.
+    user_msg = captured["messages"][-1]
+    assert user_msg["role"] == "user"
+    assert isinstance(user_msg["content"], list)
+    assert user_msg["content"][0]["text"] == "что на экране?"
+    assert user_msg["content"][1]["image_url"]["url"].startswith("data:image/png;base64,")
+    assert captured["thinking"] is False
+
+
+def test_answer_about_image_skips_missing_or_oversized(monkeypatch, tmp_path):
+    agent, _storage, _ = _agent(monkeypatch, tmp_path)
+    assert asyncio.run(agent._answer_about_image("q", str(tmp_path / "nope.png"))) is None
+    big = tmp_path / "big.png"
+    big.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * (_VISION_MAX_IMAGE_BYTES + 1))
+    assert asyncio.run(agent._answer_about_image("q", str(big))) is None
 
 
 def test_build_llm_messages_plain_string_without_images(monkeypatch, tmp_path):
