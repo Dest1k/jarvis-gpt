@@ -13,7 +13,7 @@ import re
 import time
 import unicodedata
 import uuid
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
@@ -1433,6 +1433,16 @@ class AgentRuntime:
                     f"[ответ остановлен по лимиту {effective_max_tokens} токенов; "
                     "увеличь лимит токенов или попроси продолжить]"
                 )
+            deliverable = await self._maybe_backstop_chat_file(
+                context,
+                message=message,
+                answer=answer,
+                finish_reason=finish_reason,
+                blocked_by_approval=agentic.blocked_by_approval,
+                executed_tools=agentic.executed_tools,
+            )
+            if deliverable is not None:
+                answer = _append_file_deliverable_note(answer, deliverable)
             done_payload: dict[str, Any] = {
                 "source": (
                     "tool_fallback"
@@ -2361,6 +2371,21 @@ class AgentRuntime:
                     addition = verified_answer[len(answer) :]
                     answer = verified_answer
                     yield {"type": "delta", "content": addition}
+            deliverable = await self._maybe_backstop_chat_file(
+                context,
+                message=message,
+                answer=answer,
+                finish_reason=stream_finish_reason,
+                blocked_by_approval=blocked_by_approval,
+                executed_tools=tuple(executed_tools),
+            )
+            if deliverable is not None:
+                # The streamed answer is already on screen, so append the notice as a
+                # delta (the file was materialized because the model narrated it but
+                # never called the writer).
+                extended = _append_file_deliverable_note(answer, deliverable)
+                yield {"type": "delta", "content": extended[len(answer):]}
+                answer = extended
             done_payload: dict[str, Any] = {
                 "source": (
                     "tool_fallback"
@@ -3192,11 +3217,7 @@ class AgentRuntime:
                 lines.append("Скажи «продолжи миссию», чтобы выполнить оставшиеся шаги.")
             answer = "\n".join(lines)
         if deliverable:
-            location = deliverable.get("path") or deliverable.get("filename")
-            answer = (
-                f"{answer}\n\n**Файл готов:** `{location}` "
-                f"({deliverable.get('format', '')})"
-            )
+            answer = _append_file_deliverable_note(answer, deliverable)
         return answer
 
     def _mission_deliverable_material(self, run: MissionRunResponse) -> str:
@@ -3266,35 +3287,38 @@ class AgentRuntime:
             body = material.strip()
         return body.strip()
 
-    async def _ensure_goal_file_deliverable(
+    async def _ensure_file_deliverable(
         self,
-        mission: dict[str, Any],
-        run: MissionRunResponse,
         context: AgentContext,
+        *,
+        goal_text: str,
+        material: str | Callable[[], str],
     ) -> dict[str, Any] | None:
-        """Guarantee a goal's file deliverable exists even if the model only narrated it.
+        """Materialize a claimed file deliverable when the model only narrated it.
 
-        When the mission goal asks for a file but the executor produced the content
-        as chat text without writing the file, synthesize the file deterministically
-        from the work the steps produced. Returns info about the written file, or
-        ``None`` when no file deliverable applies or a real file already exists. This
-        backstop must never raise into the mission answer.
+        Shared core of the mission backstop and the plain-chat backstop (Fix A): if
+        ``goal_text`` asks for a file that does not already exist as substantive content,
+        synthesize the body from ``material`` and write it through the verified
+        operator-effect path (documents.generate). ``material`` may be a callable so the
+        (potentially non-trivial) material is only gathered once a file spec actually
+        matches. Returns info about the written file, or ``None`` when no file deliverable
+        applies or a real file already exists. Must never raise into the answer.
         """
 
         try:
-            spec = _goal_file_deliverable(str(mission.get("goal") or ""))
+            spec = _goal_file_deliverable(goal_text)
             if spec is None or not self.settings.llm_enabled:
                 return None
             output_format = spec["output_format"]
             output_name = spec["output_name"]
             output_dir = (self.settings.data_dir / _DOCUMENT_OUTPUT_DIR).resolve(strict=False)
             target = output_dir / f"{output_name}.{output_format}"
-            if _existing_file_is_substantive(target, goal=str(mission.get("goal") or "")):
+            if _existing_file_is_substantive(target, goal=goal_text):
                 return None
-            material = self._mission_deliverable_material(run)
+            resolved_material = material() if callable(material) else material
             body = await self._synthesize_file_body(
-                goal=str(mission.get("goal") or ""),
-                material=material,
+                goal=goal_text,
+                material=resolved_material,
                 output_format=output_format,
             )
             if not body:
@@ -3325,8 +3349,70 @@ class AgentRuntime:
                 "path": path or str(target),
                 "format": output_format,
             }
-        except Exception:  # noqa: BLE001 - a backstop must never break the mission answer
+        except Exception:  # noqa: BLE001 - a backstop must never break the answer
             return None
+
+    async def _ensure_goal_file_deliverable(
+        self,
+        mission: dict[str, Any],
+        run: MissionRunResponse,
+        context: AgentContext,
+    ) -> dict[str, Any] | None:
+        """Mission wrapper over the shared file-deliverable backstop.
+
+        When the mission goal asks for a file but the executor produced the content as
+        chat text without writing the file, synthesize it from the work the steps
+        produced. Delegates to :meth:`_ensure_file_deliverable`.
+        """
+
+        return await self._ensure_file_deliverable(
+            context,
+            goal_text=str(mission.get("goal") or ""),
+            material=lambda: self._mission_deliverable_material(run),
+        )
+
+    async def _maybe_backstop_chat_file(
+        self,
+        context: AgentContext,
+        *,
+        message: str,
+        answer: str,
+        finish_reason: str | None,
+        blocked_by_approval: bool,
+        executed_tools: tuple[_ExecutedToolResult, ...],
+    ) -> dict[str, Any] | None:
+        """Chat-path file-deliverable backstop (Fix A).
+
+        If a normal-finishing turn CLAIMED a file the operator asked for but no durable
+        write tool actually ran, materialize it — the weak model sometimes narrates
+        "файл создан" without calling the writer. Reuses the shared
+        :meth:`_ensure_file_deliverable` core, which also no-ops when the file already
+        exists, so a genuine write is never clobbered or duplicated. Returns the
+        written-file info, or ``None``.
+        """
+
+        if str(finish_reason or "").startswith(
+            ("protocol_error", "synthesis_error", "awaiting_approval")
+        ):
+            return None
+        if blocked_by_approval:
+            return None
+        if any(item.tool in AGENTIC_DURABLE_MUTATORS for item in executed_tools):
+            return None
+
+        def _material() -> str:
+            parts = [answer]
+            parts.extend(
+                _tool_observation_excerpt(item.result, max_chars=800)
+                for item in executed_tools
+            )
+            return "\n\n".join(part for part in parts if part)
+
+        return await self._ensure_file_deliverable(
+            context,
+            goal_text=message,
+            material=_material,
+        )
 
     async def _maybe_finalize_mission(self, mission_id: str) -> dict[str, Any] | None:
         async with self._mission_report_lock:
@@ -14071,6 +14157,17 @@ def _deliverable_title(text: str) -> str:
     head = re.split(r"[:.\n]", str(text or "").strip(), maxsplit=1)[0].strip()
     head = head or str(text or "").strip()
     return head[:70] or "Документ"
+
+
+def _append_file_deliverable_note(answer: str, deliverable: dict[str, Any]) -> str:
+    """Append the standard '**Файл готов:** `path` (format)' line to an answer.
+
+    Single source of the deliverable-notice phrasing, shared by the mission report and
+    the plain-chat file backstop.
+    """
+
+    location = deliverable.get("path") or deliverable.get("filename")
+    return f"{answer}\n\n**Файл готов:** `{location}` ({deliverable.get('format', '')})"
 
 
 def _goal_file_deliverable(goal: str) -> dict[str, str] | None:

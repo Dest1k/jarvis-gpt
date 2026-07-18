@@ -14,6 +14,7 @@ from pathlib import Path
 from jarvis_gpt.agent import (
     AgentContext,
     AgentRuntime,
+    _ExecutedToolResult,
     _existing_file_is_substantive,
     _goal_file_deliverable,
     _slugify_filename,
@@ -176,6 +177,91 @@ def test_ensure_goal_file_deliverable_noop_without_file_goal(monkeypatch, tmp_pa
     )
     deliverable = asyncio.run(
         agent._ensure_goal_file_deliverable(mission, run, _operator_context())
+    )
+    assert deliverable is None
+    storage.close()
+
+
+# --- Fix A: the same backstop generalized to the plain single-turn chat path ---
+
+
+def test_chat_backstop_materializes_narrated_file(monkeypatch, tmp_path):
+    # The model narrated a file but called no writer — the chat backstop must materialize it.
+    body = "# План\n\n1. Один\n2. Два\n3. Три\n\nРазделы: вступление, основа, итог, ссылки."
+    agent, storage, _settings = _autonomy_agent(monkeypatch, tmp_path, _ContentLLM(body))
+    deliverable = asyncio.run(
+        agent._maybe_backstop_chat_file(
+            _operator_context(),
+            message="Сделай план на неделю и сохрани в plan.md",
+            answer="Готово, сохранил план в plan.md.",
+            finish_reason="stop",
+            blocked_by_approval=False,
+            executed_tools=(),
+        )
+    )
+    assert deliverable is not None
+    assert deliverable["format"] == "md"
+    path = Path(deliverable["path"])
+    assert path.is_file()
+    assert "План" in path.read_text(encoding="utf-8")
+    storage.close()
+
+
+def test_chat_backstop_noops_when_writer_ran(monkeypatch, tmp_path):
+    # A real durable write already happened this turn → backstop must not double-write.
+    agent, storage, _settings = _autonomy_agent(monkeypatch, tmp_path, _ContentLLM("x"))
+    executed = (
+        _ExecutedToolResult(
+            tool="documents.generate",
+            arguments={},
+            result=ToolRunResponse(
+                tool="documents.generate", ok=True, summary="written", data={}
+            ),
+        ),
+    )
+    deliverable = asyncio.run(
+        agent._maybe_backstop_chat_file(
+            _operator_context(),
+            message="Сделай план и сохрани в plan.md",
+            answer="готово",
+            finish_reason="stop",
+            blocked_by_approval=False,
+            executed_tools=executed,
+        )
+    )
+    assert deliverable is None
+    storage.close()
+
+
+def test_chat_backstop_ignores_informational_answer(monkeypatch, tmp_path):
+    # An informational reply that merely mentions a file must not trigger a write.
+    agent, storage, _settings = _autonomy_agent(monkeypatch, tmp_path, _ContentLLM("x"))
+    deliverable = asyncio.run(
+        agent._maybe_backstop_chat_file(
+            _operator_context(),
+            message="Как создать md-файл?",
+            answer="Чтобы создать md-файл, сохрани текст с расширением .md.",
+            finish_reason="stop",
+            blocked_by_approval=False,
+            executed_tools=(),
+        )
+    )
+    assert deliverable is None
+    storage.close()
+
+
+def test_chat_backstop_noops_on_blocked_finish(monkeypatch, tmp_path):
+    # A protocol/synthesis/approval-blocked finish must never auto-materialize a file.
+    agent, storage, _settings = _autonomy_agent(monkeypatch, tmp_path, _ContentLLM("body"))
+    deliverable = asyncio.run(
+        agent._maybe_backstop_chat_file(
+            _operator_context(),
+            message="Сделай план и сохрани в plan.md",
+            answer="готово",
+            finish_reason="protocol_error",
+            blocked_by_approval=False,
+            executed_tools=(),
+        )
     )
     assert deliverable is None
     storage.close()
