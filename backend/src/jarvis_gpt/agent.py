@@ -299,7 +299,14 @@ AGENTIC_DURABLE_MUTATORS = frozenset(
     }
 )
 SAFE_DIRECT_NATIVE_ACTIONS = frozenset(
-    {"capabilities", "process.top", "screen.capture", "window.list", "wmi.query"}
+    {
+        "capabilities",
+        "hardware.gpu",
+        "process.top",
+        "screen.capture",
+        "window.list",
+        "wmi.query",
+    }
 )
 # Under owner full autonomy the live chat is kept to request → analysis → action →
 # result. These event types are internal bookkeeping (reasoning notes, memory saves,
@@ -10104,7 +10111,33 @@ def _native_result_excerpt(result: ToolRunResponse) -> str:
         return _format_native_rows(native_data.get("windows"), title="Видимые окна:")
     if action == "screen.capture":
         return _format_screen_capture(native_data)
+    if action == "hardware.gpu":
+        return _format_gpu(native_data.get("gpus"))
     return ""
+
+
+def _format_gpu(value: Any) -> str:
+    rows = value if isinstance(value, list) else ([value] if value else [])
+    lines = []
+    for gpu in rows[:4]:
+        if not isinstance(gpu, dict):
+            continue
+        parts = [str(gpu.get("name") or "GPU")]
+        total = gpu.get("memory_total_mib")
+        if total is not None:
+            used = gpu.get("memory_used_mib")
+            free = gpu.get("memory_free_mib")
+            parts.append(f"VRAM {used}/{total} МБ (свободно {free})")
+        if gpu.get("utilization_pct") is not None:
+            parts.append(f"загрузка {gpu.get('utilization_pct')}%")
+        if gpu.get("temperature_c") is not None:
+            parts.append(f"{gpu.get('temperature_c')}°C")
+        if gpu.get("power_draw_w"):
+            parts.append(f"{gpu.get('power_draw_w')} Вт")
+        lines.append("- " + "; ".join(parts))
+    if not lines:
+        return ""
+    return "\n\nGPU (nvidia-smi):\n" + "\n".join(lines)
 
 
 def _format_screen_capture(data: dict[str, Any]) -> str:
@@ -17911,6 +17944,34 @@ def _native_action_from_message(
     screen_capture = _screen_capture_action(normalized)
     if screen_capture is not None:
         return screen_capture
+
+    # Live GPU telemetry (nvidia-smi) for "загрузка GPU / сколько VRAM / температура
+    # видеокарты" — WMI's Win32_VideoController reports a wrong 32-bit AdapterRAM for
+    # large-VRAM cards, so route GPU-status questions to the dedicated bridge action.
+    gpu_status = _contains_any(normalized, ("vram", "видеопам")) or (
+        _contains_any(normalized, ("gpu", "видеокарт", "видеочип", "graphics", "5090"))
+        and _contains_any(
+            normalized,
+            (
+                "загруз",
+                "занят",
+                "свободн",
+                "температур",
+                "сколько",
+                "утилиз",
+                "нагруз",
+                "память",
+                "memory",
+                "util",
+            ),
+        )
+    )
+    if gpu_status:
+        return NativeAction(
+            action="hardware.gpu",
+            payload={},
+            answer="снял телеметрию GPU через nvidia-smi",
+        )
 
     if _contains_any(normalized, ("wmi", "cim", "через wmi", "через cim")):
         return _wmi_action_from_message(message)

@@ -39,6 +39,7 @@ ACTION_NAMES = frozenset(
         "chrome.attest_guarded",
         "chrome.launch_guarded",
         "console.show_processes",
+        "hardware.gpu",
         "keyboard.send",
         "process.start",
         "process.top",
@@ -907,6 +908,7 @@ def validate_action_request(request: dict[str, Any]) -> tuple[str, dict[str, Any
         "chrome.attest_guarded": _validate_guarded_chrome_attestation,
         "chrome.launch_guarded": _validate_guarded_chrome_launch,
         "console.show_processes": _validate_process_view,
+        "hardware.gpu": _validate_empty_payload,
         "keyboard.send": _validate_keyboard_send,
         "process.start": _validate_process_start,
         "process.top": _validate_process_view,
@@ -1640,7 +1642,7 @@ try {
   $Payload = $Envelope.payload
   $Allowed = @(
     'app.open_and_type', 'keyboard.send', 'screen.capture',
-    'process.top', 'window.focus', 'window.list', 'wmi.query'
+    'process.top', 'window.focus', 'window.list', 'wmi.query', 'hardware.gpu'
   )
   if ($Allowed -notcontains $Action) { throw 'Unsupported fixed native action.' }
 
@@ -1959,6 +1961,24 @@ public static class JarvisBridgeWinApi {
         className = [string]$Payload.class_name
         namespace = [string]$Payload.namespace
       }
+    }
+    'hardware.gpu' {
+      $raw = & nvidia-smi --query-gpu=name,memory.total,memory.used,memory.free,utilization.gpu,temperature.gpu,power.draw --format=csv,noheader,nounits 2>$null
+      $gpus = @()
+      foreach ($line in @($raw)) {
+        if (-not ([string]$line).Trim()) { continue }
+        $f = ([string]$line) -split '\s*,\s*'
+        $gpus += @{
+          name = $f[0]
+          memory_total_mib = [int]($f[1])
+          memory_used_mib = [int]($f[2])
+          memory_free_mib = [int]($f[3])
+          utilization_pct = [int]($f[4])
+          temperature_c = [int]($f[5])
+          power_draw_w = [string]$f[6]
+        }
+      }
+      Out $true "nvidia-smi reported $(@($gpus).Count) GPU(s)." @{ gpus = @($gpus) }
     }
   }
 } catch {

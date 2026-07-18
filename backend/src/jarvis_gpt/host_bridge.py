@@ -23,6 +23,7 @@ BRIDGE_ACTIONS = (
     "chrome.attest_guarded",
     "chrome.launch_guarded",
     "console.show_processes",
+    "hardware.gpu",
     "keyboard.send",
     "process.start",
     "process.top",
@@ -34,6 +35,7 @@ BRIDGE_ACTIONS = (
 BRIDGE_READ_ONLY_ACTIONS = frozenset(
     {
         "capabilities",
+        "hardware.gpu",
         "process.top",
         "window.list",
         "wmi.query",

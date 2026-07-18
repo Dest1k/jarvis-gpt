@@ -3770,7 +3770,14 @@ def _host_bridge_status(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunRespo
 # enumerates visible windows, screen.capture writes a PNG into Jarvis cache, and
 # capabilities reports what the bridge supports.
 SAFE_INSPECT_ACTIONS = frozenset(
-    {"capabilities", "process.top", "screen.capture", "window.list", "wmi.query"}
+    {
+        "capabilities",
+        "hardware.gpu",
+        "process.top",
+        "screen.capture",
+        "window.list",
+        "wmi.query",
+    }
 )
 # Convenience hardware/telemetry actions that map to a known-good WMI class so the model
 # does not have to guess class names — it kept trying a non-existent "hardware.memory"
@@ -3795,6 +3802,7 @@ MODEL_NATIVE_ACTIONS = frozenset(
         "app.open_and_type",
         "capabilities",
         "console.show_processes",
+        "hardware.gpu",
         "keyboard.send",
         "process.start",
         "process.top",
