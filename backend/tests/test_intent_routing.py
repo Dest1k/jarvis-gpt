@@ -157,3 +157,64 @@ def test_lookup_and_save_is_not_sealed_to_one_shot_generation(monkeypatch, tmp_p
     assert plan.tools != ("documents.generate",)
     assert plan.intent != "new_artifact"
     storage.close()
+
+
+def test_format_filesystem_find_answer_lists_files_not_counts():
+    from jarvis_gpt.agent import _format_filesystem_find_answer
+
+    disp = r"D:\jarvis-gpt\backend\dispatcher.py"
+    ag = r"D:\jarvis-gpt\backend\agent.py"
+    data = {
+        "root": r"D:\jarvis-gpt\backend",
+        "files_scanned": 40,
+        "truncated": True,
+        "matches": [
+            {"path": disp, "line": 5, "text": "class Dispatcher:"},
+            {"path": disp, "line": 9, "text": "dispatcher = X"},
+            {"path": ag, "line": 410, "text": "dispatcher.status"},
+        ],
+    }
+    answer = _format_filesystem_find_answer("dispatcher", data)
+    assert "Найдено 3 совпадений" in answer
+    assert "2 файлах" in answer
+    # names the REAL files (ranked by hit count), not just a bare count
+    assert "dispatcher.py" in answer
+    assert "agent.py" in answer
+    assert answer.index("dispatcher.py") < answer.index("agent.py")  # 2 hits ranked first
+    assert "усечён" in answer  # truncation surfaced
+    # no matches → honest "nothing found"
+    empty = _format_filesystem_find_answer("zzz", {"root": "D:\\x", "matches": []})
+    assert "Ничего не найдено" in empty
+
+
+def test_filesystem_find_answer_only_for_that_intent():
+    from jarvis_gpt.agent import (
+        TaskKernelPlan,
+        _ExecutedToolResult,
+        _filesystem_find_answer,
+    )
+    from jarvis_gpt.models import ToolRunResponse
+
+    find_tool = _ExecutedToolResult(
+        tool="filesystem.find",
+        arguments={"query": "dispatcher", "path": r"D:\jarvis-gpt\backend"},
+        result=ToolRunResponse(
+            tool="filesystem.find",
+            ok=True,
+            summary="Found 1 match(es) across 1 file(s).",
+            data={"root": r"D:\x", "matches": [{"path": r"D:\x\a.py", "line": 1, "text": "d"}]},
+        ),
+    )
+    find_plan = TaskKernelPlan(
+        route="local_action", mode="concise", intent="filesystem.find", confidence=0.82,
+    )
+    answer = _filesystem_find_answer((find_tool,), find_plan)
+    assert answer is not None and "a.py" in answer
+
+    # A different intent must NOT be overridden even if a find happened to run.
+    other_plan = TaskKernelPlan(
+        route="reasoning", mode="concise", intent="document_memory", confidence=0.9,
+    )
+    assert _filesystem_find_answer((find_tool,), other_plan) is None
+    # No successful find in the executed tools → None.
+    assert _filesystem_find_answer((), find_plan) is None

@@ -1416,7 +1416,16 @@ class AgentRuntime:
             answer = agentic.answer
             finish_reason = agentic.finish_reason
             verification_payload: dict[str, Any] | None = None
-            if (
+            fs_find_answer = _filesystem_find_answer(
+                agentic.executed_tools, context.task_plan
+            )
+            if fs_find_answer is not None:
+                # A concrete on-disk search already ran filesystem.find; the weak model
+                # tends to fumble the final synthesis (the recovery-fallback reports only
+                # match counts). Replace it with a deterministic file list grounded in the
+                # real result and skip verification — this answer is authoritative.
+                answer = fs_find_answer
+            elif (
                 finish_reason != "length"
                 and not str(finish_reason or "").startswith(
                     ("protocol_error", "synthesis_error")
@@ -2356,8 +2365,27 @@ class AgentRuntime:
                     answer = f"{answer}{interruption}"
                     yield {"type": "delta", "content": interruption}
             verification_payload: dict[str, Any] | None = None
+            fs_find_answer = _filesystem_find_answer(
+                tuple(executed_tools), context.task_plan
+            )
+            fs_find_applied = False
+            if (
+                fs_find_answer is not None
+                and not stream_error
+                and fs_find_answer.strip()
+                and fs_find_answer.strip() != answer.strip()
+            ):
+                # The scoped filesystem.find loop already streamed a fumbled synthesis
+                # (usually bare match counts). Append the deterministic file list as a
+                # corrective delta so the saved/returned answer carries the real result
+                # (append-only: the earlier text is already on the operator's screen).
+                separator = "\n\n" if answer.strip() else ""
+                yield {"type": "delta", "content": f"{separator}{fs_find_answer}"}
+                answer = f"{answer}{separator}{fs_find_answer}"
+                fs_find_applied = True
             if (
                 not stream_error
+                and not fs_find_applied
                 and stream_finish_reason != "length"
                 and not str(stream_finish_reason or "").startswith(
                     ("protocol_error", "synthesis_error", "awaiting_approval")
@@ -10446,6 +10474,78 @@ def _looks_like_filesystem_search(message: str) -> bool:
     if _stable_windows_paths(message):
         return True
     return any(marker in normalized for marker in _FILESYSTEM_SCOPE_MARKERS)
+
+
+def _format_filesystem_find_answer(query: str, data: dict[str, Any]) -> str:
+    """Deterministically format a filesystem.find result as a readable file list.
+
+    The weak local model reliably builds the find arguments but often fumbles the final
+    synthesis over the large raw result (falling back to bare match counts). Formatting
+    the answer here removes that variance for a concrete on-disk search.
+    """
+
+    matches = data.get("matches") if isinstance(data, dict) else None
+    if not isinstance(matches, list):
+        matches = []
+    root = str(data.get("root") or "") if isinstance(data, dict) else ""
+    truncated = bool(data.get("truncated")) if isinstance(data, dict) else False
+    term = " ".join(str(query or "").split()).strip(" .,:;\"'«»")
+    where = f" в {root}" if root else ""
+    if not matches:
+        base = f"Ничего не найдено по запросу «{term}»" if term else "Ничего не найдено"
+        return f"{base}{where}."
+    by_file: dict[str, list[dict[str, Any]]] = {}
+    for item in matches:
+        if isinstance(item, dict):
+            by_file.setdefault(str(item.get("path") or ""), []).append(item)
+    total = sum(len(items) for items in by_file.values())
+    quoted = f" «{term}»" if term else ""
+    lines = [f"Найдено {total} совпадений{quoted} в {len(by_file)} файлах{where}:"]
+    ranked = sorted(by_file.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+    for path, items in ranked[:15]:
+        first = items[0]
+        sample = " ".join(str(first.get("text") or "").split())[:100]
+        suffix = f" (стр. {first.get('line')}: {sample})" if sample else ""
+        lines.append(f"- `{path}` — {len(items)} совпад.{suffix}")
+    if len(by_file) > 15:
+        lines.append(f"…и ещё {len(by_file) - 15} файлов.")
+    if truncated:
+        lines.append(
+            "(Результат усечён по лимиту — уточни запрос или папку для полного списка.)"
+        )
+    return "\n".join(lines)
+
+
+def _filesystem_find_answer(
+    executed_tools: tuple[_ExecutedToolResult, ...] | list[_ExecutedToolResult],
+    task_plan: TaskKernelPlan | None,
+) -> str | None:
+    """Deterministic answer for the dedicated filesystem.find route, or None if N/A.
+
+    Only fires once the tool actually ran successfully: the weak model builds good find
+    arguments but fumbles the synthesis, so the runtime formats the real result itself.
+    """
+
+    if task_plan is None or task_plan.intent != "filesystem.find":
+        return None
+    hit = next(
+        (
+            item
+            for item in executed_tools
+            if item.tool == "filesystem.find"
+            and item.result.ok
+            and isinstance(item.result.data, dict)
+        ),
+        None,
+    )
+    if hit is None:
+        return None
+    query = str(
+        hit.arguments.get("query")
+        or hit.arguments.get("pattern")
+        or (task_plan.query or "")
+    )
+    return _format_filesystem_find_answer(query, hit.result.data)
 
 
 def _memory_content_from_match(message: str, value: str, namespace: str) -> str:
