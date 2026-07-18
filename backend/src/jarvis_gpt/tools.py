@@ -10,6 +10,7 @@ import inspect
 import ipaddress
 import json
 import math
+import mimetypes
 import os
 import re
 import secrets
@@ -1572,6 +1573,24 @@ class ToolRegistry:
                     "max_chars": "Maximum extracted text characters",
                 },
                 handler=_documents_read,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="documents.ocr",
+                description=(
+                    "Read text from a SCANNED PDF or an image/photo of a document using the "
+                    "vision model (Qwen3.5-VL). Use this when documents.read returns little/no "
+                    "text (a scan) or for a photo/screenshot: 'распознай текст', 'прочитай скан', "
+                    "'извлеки текст из pdf'. Needs the vision profile."
+                ),
+                category="documents",
+                input_schema={
+                    "file_id": "Uploaded/indexed file id (scanned PDF or image)",
+                    "path": "Local path under the workspace, JARVIS_HOME, or user home",
+                    "max_pages": "Max PDF pages to OCR (default 10)",
+                },
+                handler=_documents_ocr,
             )
         )
         self.add(
@@ -5890,6 +5909,160 @@ def _documents_review(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
             "text_preview": _short_text(text, 2000),
             "comparison": comparison,
             "review": review,
+        },
+    )
+
+
+# Vision-OCR: read text from scanned PDFs and photos with the VLM (Qwen3.5-VL) — better
+# than tesseract on scans and needs no external OCR binary. Images go to the model directly;
+# PDF pages are rasterized with pypdfium2 (self-contained wheel, no poppler needed).
+_OCR_MAX_PAGES = 10
+_OCR_RASTER_SCALE = 2.0
+_OCR_MAX_IMAGE_BYTES = 16 * 1024 * 1024
+_OCR_IMAGE_EXTS = frozenset({".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".tif", ".gif"})
+_OCR_PROMPT = (
+    "Ты — точный OCR. Перепиши ДОСЛОВНО весь видимый текст с изображения, сохраняя строки, "
+    "порядок и пунктуацию. Не переводи, не пересказывай, не добавляй комментариев и заголовков — "
+    "только сам текст как есть. Если читаемого текста нет, ответь: [нет текста]."
+)
+
+
+def _pypdfium2_available() -> bool:
+    import importlib.util
+
+    return importlib.util.find_spec("pypdfium2") is not None
+
+
+def _ocr_resolve_path(ctx: ToolContext, args: dict[str, Any]) -> tuple[Path, dict | None]:
+    """Resolve a file_id/path to a real path WITHOUT the document-support guard (images ok)."""
+
+    file_id = str(args.get("file_id") or "").strip()
+    raw_path = str(args.get("path") or "").strip()
+    file_record = None
+    if file_id:
+        file_record = ctx.storage.get_file(file_id)
+        if file_record is None:
+            raise ValueError(f"File not found: {file_id}")
+        path = Path(str(file_record["stored_path"])).resolve(strict=False)
+    elif raw_path:
+        path = _resolve_document_path(ctx.settings, raw_path)
+    else:
+        raise ValueError("file_id or path is required.")
+    if not path.exists() or not path.is_file():
+        raise ValueError(f"File does not exist: {path}")
+    return path, file_record
+
+
+def _rasterize_pdf_pages(path: Path, *, max_pages: int, scale: float) -> list[bytes]:
+    """Render up to ``max_pages`` PDF pages to PNG bytes via pypdfium2 (bundled pdfium)."""
+
+    import io
+
+    import pypdfium2 as pdfium  # lazy — optional dependency
+
+    pages: list[bytes] = []
+    doc = pdfium.PdfDocument(str(path))
+    try:
+        count = min(len(doc), max_pages)
+        for index in range(count):
+            bitmap = doc[index].render(scale=scale)
+            buffer = io.BytesIO()
+            bitmap.to_pil().save(buffer, format="PNG")
+            pages.append(buffer.getvalue())
+    finally:
+        doc.close()
+    return pages
+
+
+async def _vlm_ocr_image(ctx: ToolContext, image_bytes: bytes, mime: str) -> str:
+    encoded = base64.b64encode(image_bytes).decode("ascii")
+    messages = [
+        {"role": "system", "content": _OCR_PROMPT},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Распознай и перепиши весь текст с этого изображения."},
+                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}},
+            ],
+        },
+    ]
+    result = await ctx.llm.complete(messages, thinking_enabled=False)
+    if not getattr(result, "ok", False):
+        raise ValueError(getattr(result, "error", None) or "VLM OCR call failed")
+    return (result.content or "").strip()
+
+
+async def _documents_ocr(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    if not getattr(ctx.settings.profile, "vision_capable", False):
+        return ToolRunResponse(
+            tool="documents.ocr",
+            ok=False,
+            summary="OCR требует vision-модель (запусти профиль qwen36-vl).",
+        )
+    try:
+        path, file_record = _ocr_resolve_path(ctx, args)
+    except ValueError as exc:
+        return ToolRunResponse(tool="documents.ocr", ok=False, summary=str(exc))
+    max_pages = _int_arg(args.get("max_pages"), default=_OCR_MAX_PAGES, minimum=1, maximum=30)
+    suffix = path.suffix.lower()
+    mime = (mimetypes.guess_type(path.name)[0] or "").lower()
+    images: list[tuple[str, bytes, str]] = []
+
+    if suffix == ".pdf" or mime == "application/pdf":
+        if not _pypdfium2_available():
+            return ToolRunResponse(
+                tool="documents.ocr",
+                ok=False,
+                summary="Не могу растеризовать PDF — установи pypdfium2.",
+            )
+        try:
+            page_pngs = await asyncio.to_thread(
+                _rasterize_pdf_pages, path, max_pages=max_pages, scale=_OCR_RASTER_SCALE
+            )
+        except Exception as exc:  # noqa: BLE001
+            return ToolRunResponse(
+                tool="documents.ocr", ok=False, summary=f"Не смог растеризовать PDF: {exc}"
+            )
+        images = [(f"Стр. {i + 1}", png, "image/png") for i, png in enumerate(page_pngs)]
+    elif mime.startswith("image/") or suffix in _OCR_IMAGE_EXTS:
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            return ToolRunResponse(
+                tool="documents.ocr", ok=False, summary=f"Не смог прочитать файл: {exc}"
+            )
+        if len(data) > _OCR_MAX_IMAGE_BYTES:
+            return ToolRunResponse(
+                tool="documents.ocr", ok=False, summary="Изображение больше 16 МБ."
+            )
+        images = [("Изображение", data, mime or "image/png")]
+    else:
+        return ToolRunResponse(
+            tool="documents.ocr",
+            ok=False,
+            summary=f"OCR поддерживает PDF и изображения, не {suffix or 'этот тип'}.",
+        )
+
+    if not images:
+        return ToolRunResponse(tool="documents.ocr", ok=False, summary="Нечего распознавать.")
+
+    parts: list[str] = []
+    for label, data, image_mime in images:
+        try:
+            text = await _vlm_ocr_image(ctx, data, image_mime)
+        except Exception as exc:  # noqa: BLE001 — one bad page must not fail the whole doc
+            text = f"[ошибка распознавания: {exc}]"
+        parts.append(f"--- {label} ---\n{text}" if len(images) > 1 else text)
+    transcript = "\n\n".join(parts).strip()
+    return ToolRunResponse(
+        tool="documents.ocr",
+        ok=bool(transcript),
+        summary=(transcript[:4000] if transcript else "Текст не распознан."),
+        data={
+            "text": transcript,
+            "pages": len(images),
+            "path": str(path),
+            "file_id": (file_record or {}).get("id"),
         },
     )
 
