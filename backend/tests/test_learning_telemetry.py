@@ -9,7 +9,7 @@ from jarvis_gpt.config import ensure_runtime_dirs, load_settings
 from jarvis_gpt.host_bridge import HostBridgeStatus
 from jarvis_gpt.learning import LearningEngine
 from jarvis_gpt.storage import JarvisStorage
-from jarvis_gpt.supervisor import RuntimeSupervisor
+from jarvis_gpt.supervisor import RuntimeSupervisor, _evaluate_alerts
 from jarvis_gpt.telemetry import TelemetryCollector
 
 
@@ -315,4 +315,107 @@ def test_supervisor_background_cognition_persists_pulse(monkeypatch, tmp_path):
     assert pulse["summary"] == "Observed runtime and found one follow-up."
     assert pulse["suggested_jobs"][0]["kind"] == "learning.tick"
     assert any(item["kind"] == "cognition.pulse" for item in observations)
+
+
+class _CaptureBus:
+    def __init__(self) -> None:
+        self.published: list[dict] = []
+
+    async def publish(self, payload: dict) -> None:
+        self.published.append(payload)
+
+
+def _snapshot(
+    *, temp: float = 50.0, vram: float = 0.4, disk: float = 0.3, mem: float = 0.3
+) -> dict:
+    return {
+        "gpu": {"available": True, "gpus": [{"name": "RTX 5090", "temperature_c": temp,
+                                             "memory_used_ratio": vram}]},
+        "disks": [{"path": "D:/", "used_ratio": disk, "free": 100 * 1024**3}],
+        "memory": {"used_ratio": mem},
+    }
+
+
+def test_evaluate_alerts_flags_each_breached_threshold():
+    breaches = _evaluate_alerts(
+        _snapshot(temp=95.0, vram=0.99, disk=0.99, mem=0.99),
+        gpu_temp_c=85.0,
+        gpu_vram_ratio=0.97,
+        disk_ratio=0.95,
+        memory_ratio=0.95,
+    )
+    assert set(breaches) == {"gpu_temp", "gpu_vram", "disk", "memory"}
+    assert breaches["disk"]["level"] == "error"  # >= 0.98 escalates
+    # A calm box trips nothing.
+    assert _evaluate_alerts(
+        _snapshot(),
+        gpu_temp_c=85.0,
+        gpu_vram_ratio=0.97,
+        disk_ratio=0.95,
+        memory_ratio=0.95,
+    ) == {}
+
+
+def test_evaluate_alerts_tolerates_a_partial_snapshot():
+    # nvidia-smi offline, no memory probe — only the disk breach survives.
+    breaches = _evaluate_alerts(
+        {"gpu": {"available": False}, "disks": [{"path": "D:/", "used_ratio": 0.96, "free": 0}]},
+        gpu_temp_c=85.0,
+        gpu_vram_ratio=0.97,
+        disk_ratio=0.95,
+        memory_ratio=0.95,
+    )
+    assert set(breaches) == {"disk"}
+
+
+def test_health_alerts_are_edge_triggered_and_recover(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    bus = _CaptureBus()
+    supervisor = RuntimeSupervisor(settings=settings, storage=storage, bus=bus)
+
+    pushes: list[str] = []
+
+    async def fake_push(text, **_kwargs):
+        pushes.append(text)
+        return True
+
+    monkeypatch.setattr("jarvis_gpt.supervisor.push_telegram_alert", fake_push)
+
+    async def scenario():
+        await supervisor._check_health_alerts(_snapshot(temp=95.0))  # breach
+        await supervisor._check_health_alerts(_snapshot(temp=95.0))  # still hot — no re-alert
+        await supervisor._check_health_alerts(_snapshot(temp=50.0))  # recovered
+
+    asyncio.run(scenario())
+
+    alerts = [p for p in bus.published if p.get("action") == "alert"]
+    fired = [p for p in alerts if not p["alert"]["recovered"]]
+    recovered = [p for p in alerts if p["alert"]["recovered"]]
+    assert len(fired) == 1  # edge-triggered: one alert for a standing breach
+    assert len(recovered) == 1
+    assert fired[0]["alert"]["key"] == "gpu_temp"
+    assert len(pushes) == 2  # one breach push + one recovery push
+    storage.close()
+
+
+def test_health_alerts_can_be_disabled(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    monkeypatch.setenv("JARVIS_HEALTH_ALERTS_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    bus = _CaptureBus()
+    supervisor = RuntimeSupervisor(settings=settings, storage=storage, bus=bus)
+
+    asyncio.run(supervisor._check_health_alerts(_snapshot(temp=99.0)))
+
+    assert [p for p in bus.published if p.get("action") == "alert"] == []
+    storage.close()
     storage.close()

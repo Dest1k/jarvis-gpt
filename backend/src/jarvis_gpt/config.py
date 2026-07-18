@@ -447,6 +447,15 @@ class JarvisSettings:
     autonomy_mission_interval_sec: int
     reminder_interval_sec: int
     reminder_tz: str
+    # ---- Proactive health alerts -----------------------------------------------
+    # The supervisor watches each telemetry snapshot and, on an ok→bad transition,
+    # emits a runtime event, pushes it to the UI bus, and (if Telegram is wired)
+    # to the owner's phone. Edge-triggered — one alert per breach, one recovery.
+    health_alerts_enabled: bool
+    health_alert_gpu_temp_c: float
+    health_alert_gpu_vram_ratio: float
+    health_alert_disk_ratio: float
+    health_alert_memory_ratio: float
     api_host: str
     api_port: int
     api_require_token_on_loopback: bool
@@ -508,6 +517,13 @@ class JarvisSettings:
             "reminders": {
                 "interval_sec": self.reminder_interval_sec,
                 "timezone": self.reminder_tz,
+            },
+            "health_alerts": {
+                "enabled": self.health_alerts_enabled,
+                "gpu_temp_c": self.health_alert_gpu_temp_c,
+                "gpu_vram_ratio": self.health_alert_gpu_vram_ratio,
+                "disk_ratio": self.health_alert_disk_ratio,
+                "memory_ratio": self.health_alert_memory_ratio,
             },
             "api": {
                 "host": self.api_host,
@@ -584,6 +600,11 @@ def load_settings(profile_name: str | None = None) -> JarvisSettings:
         autonomy_mission_interval_sec=_int_env("JARVIS_AUTONOMY_MISSION_INTERVAL_SEC", 120),
         reminder_interval_sec=_int_env("JARVIS_REMINDER_INTERVAL_SEC", 30),
         reminder_tz=os.environ.get("JARVIS_REMINDER_TZ", "Europe/Moscow"),
+        health_alerts_enabled=_bool_env("JARVIS_HEALTH_ALERTS_ENABLED", True),
+        health_alert_gpu_temp_c=_float_env("JARVIS_HEALTH_ALERT_GPU_TEMP_C", 85.0),
+        health_alert_gpu_vram_ratio=_float_env("JARVIS_HEALTH_ALERT_GPU_VRAM_RATIO", 0.97),
+        health_alert_disk_ratio=_float_env("JARVIS_HEALTH_ALERT_DISK_RATIO", 0.95),
+        health_alert_memory_ratio=_float_env("JARVIS_HEALTH_ALERT_MEMORY_RATIO", 0.95),
         api_host=os.environ.get("JARVIS_API_HOST", "0.0.0.0"),
         api_port=_int_env("JARVIS_API_PORT", 8000),
         api_require_token_on_loopback=_bool_env("JARVIS_API_REQUIRE_TOKEN_ON_LOOPBACK", False),

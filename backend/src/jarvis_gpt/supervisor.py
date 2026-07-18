@@ -9,8 +9,99 @@ from .config import JarvisSettings
 from .diagnostics import run_diagnostics
 from .learning import LearningEngine
 from .llm import LLMRouter, background_llm_priority
+from .notify import push_telegram_alert
 from .storage import JarvisStorage, utc_now
 from .telemetry import TelemetryCollector
+
+
+def _evaluate_alerts(
+    snapshot: dict[str, Any],
+    *,
+    gpu_temp_c: float,
+    gpu_vram_ratio: float,
+    disk_ratio: float,
+    memory_ratio: float,
+) -> dict[str, dict[str, Any]]:
+    """Compute the set of *currently breached* health thresholds from a telemetry snapshot.
+
+    Pure and defensive: every field is probed with ``.get`` and skipped when absent
+    (an offline nvidia-smi, a platform without a memory probe) so a partial snapshot
+    only narrows coverage — it never raises. Returns ``{key: alert}`` where each alert
+    carries a human ``title``, ``detail``, ``level`` and the offending ``value``.
+    """
+
+    active: dict[str, dict[str, Any]] = {}
+
+    gpu = snapshot.get("gpu") or {}
+    gpus = gpu.get("gpus") or [] if isinstance(gpu, dict) else []
+    hottest = None
+    fullest = None
+    for card in gpus:
+        if not isinstance(card, dict):
+            continue
+        temp = card.get("temperature_c")
+        if temp is not None and (hottest is None or temp > hottest.get("temperature_c", -1)):
+            hottest = card
+        ratio = card.get("memory_used_ratio")
+        if ratio is not None and (fullest is None or ratio > fullest.get("memory_used_ratio", -1)):
+            fullest = card
+    if hottest is not None and hottest.get("temperature_c", 0) >= gpu_temp_c:
+        temp = hottest["temperature_c"]
+        active["gpu_temp"] = {
+            "level": "error" if temp >= gpu_temp_c + 8 else "warn",
+            "title": f"GPU перегрев: {temp:.0f}°C",
+            "detail": (
+                f"{hottest.get('name', 'GPU')} достигла {temp:.0f}°C "
+                f"(порог {gpu_temp_c:.0f}°C)."
+            ),
+            "value": temp,
+        }
+    if fullest is not None and fullest.get("memory_used_ratio", 0) >= gpu_vram_ratio:
+        ratio = fullest["memory_used_ratio"]
+        active["gpu_vram"] = {
+            "level": "warn",
+            "title": f"VRAM почти заполнена: {ratio * 100:.0f}%",
+            "detail": (
+                f"{fullest.get('name', 'GPU')} использует {ratio * 100:.0f}% видеопамяти "
+                f"(порог {gpu_vram_ratio * 100:.0f}%) — риск OOM."
+            ),
+            "value": ratio,
+        }
+
+    worst_disk = None
+    for disk in snapshot.get("disks") or []:
+        if not isinstance(disk, dict):
+            continue
+        used = disk.get("used_ratio")
+        if used is not None and (worst_disk is None or used > worst_disk.get("used_ratio", -1)):
+            worst_disk = disk
+    if worst_disk is not None and worst_disk.get("used_ratio", 0) >= disk_ratio:
+        used = worst_disk["used_ratio"]
+        free_gb = (worst_disk.get("free") or 0) / (1024**3)
+        active["disk"] = {
+            "level": "error" if used >= 0.98 else "warn",
+            "title": f"Мало места на диске: {used * 100:.0f}% занято",
+            "detail": (
+                f"{worst_disk.get('path', 'диск')} заполнен на {used * 100:.0f}% "
+                f"(свободно {free_gb:.1f} ГБ, порог {disk_ratio * 100:.0f}%)."
+            ),
+            "value": used,
+        }
+
+    memory = snapshot.get("memory") or {}
+    mem_ratio = memory.get("used_ratio") if isinstance(memory, dict) else None
+    if mem_ratio is not None and mem_ratio >= memory_ratio:
+        active["memory"] = {
+            "level": "warn",
+            "title": f"Мало ОЗУ: {mem_ratio * 100:.0f}% занято",
+            "detail": (
+                f"Системная память использована на {mem_ratio * 100:.0f}% "
+                f"(порог {memory_ratio * 100:.0f}%)."
+            ),
+            "value": mem_ratio,
+        }
+
+    return active
 
 
 class RuntimeSupervisor:
@@ -41,6 +132,10 @@ class RuntimeSupervisor:
         self._last_cognition_error: str | None = None
         self._last_background_job_at: str | None = None
         self._last_error: str | None = None
+        # Edge-triggered health-alert state: key -> last-fired alert payload. Kept so a
+        # standing breach alerts once (not every telemetry tick) and clearing it emits a
+        # single recovery notice.
+        self._alert_active: dict[str, dict[str, Any]] = {}
 
     async def start(self) -> None:
         self._started_at = utc_now()
@@ -153,6 +248,8 @@ class RuntimeSupervisor:
             "capabilities": [
                 "telemetry.persist",
                 "health.persist",
+                "health.alert.threshold",
+                "health.alert.telegram",
                 "learning.tick",
                 "learning.observe_dialogues",
                 "learning.observe_web",
@@ -280,6 +377,73 @@ class RuntimeSupervisor:
                     level="warn",
                     payload={"error": self._last_error},
                 )
+            return
+        with suppress(Exception):
+            await self._check_health_alerts(snapshot)
+
+    async def _check_health_alerts(self, snapshot: dict[str, Any]) -> None:
+        """Diff live thresholds against the last-fired set and deliver the transitions.
+
+        Reuses the telemetry snapshot the loop already fetched (no extra probe). Only
+        state *changes* are delivered: a new breach → warn/error event + UI bus + phone
+        push; a cleared breach → an info recovery notice. Delivery is best-effort — each
+        channel is wrapped so a dead bus or unconfigured Telegram never blocks the rest.
+        """
+
+        if not self.settings.health_alerts_enabled:
+            return
+        current = _evaluate_alerts(
+            snapshot,
+            gpu_temp_c=self.settings.health_alert_gpu_temp_c,
+            gpu_vram_ratio=self.settings.health_alert_gpu_vram_ratio,
+            disk_ratio=self.settings.health_alert_disk_ratio,
+            memory_ratio=self.settings.health_alert_memory_ratio,
+        )
+        for key, alert in current.items():
+            if key in self._alert_active:
+                continue
+            await self._deliver_alert(key, alert, recovered=False)
+        for key, alert in list(self._alert_active.items()):
+            if key not in current:
+                await self._deliver_alert(key, alert, recovered=True)
+        self._alert_active = current
+
+    async def _deliver_alert(self, key: str, alert: dict[str, Any], *, recovered: bool) -> None:
+        title = alert.get("title", key)
+        detail = alert.get("detail", "")
+        if recovered:
+            event_title = f"Восстановлено: {title}"
+            level = "info"
+            phone_text = f"✅ Восстановлено: {title}\n{detail}".strip()
+        else:
+            event_title = title
+            level = str(alert.get("level", "warn"))
+            emoji = "🔴" if level == "error" else "🟠"
+            phone_text = f"{emoji} {title}\n{detail}".strip()
+        with suppress(Exception):
+            self.storage.add_event(
+                kind="health.alert",
+                title=event_title,
+                level=level,
+                payload={"alert": key, "recovered": recovered, "detail": detail},
+            )
+        if self.bus is not None:
+            with suppress(Exception):
+                await self.bus.publish(
+                    {
+                        "channel": "health",
+                        "action": "alert",
+                        "alert": {
+                            "key": key,
+                            "title": title,
+                            "detail": detail,
+                            "level": level,
+                            "recovered": recovered,
+                        },
+                    }
+                )
+        with suppress(Exception):
+            await push_telegram_alert(phone_text)
 
     async def _record_health(self) -> None:
         self._last_health_attempt_at = utc_now()
