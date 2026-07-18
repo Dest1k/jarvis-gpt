@@ -11,6 +11,16 @@ Guidance for AI coding agents working in this repository.
 - Keep history linear: prefer fast-forward / rebase over merge commits.
 - Only open a pull request when the owner explicitly asks for one.
 
+## Engineering policy
+
+- **Fix the root cause, not the symptom.** Do not make a failing scenario look green
+  with a catch-all fallback, silent exception swallowing, weakened invariant, bypass,
+  or cosmetic workaround. Trace the failure to its source, repair it there, and add a
+  regression test that proves the actual defect is gone.
+- For runtime-facing changes, verify the relevant behavior on the live machine when it
+  is safe to do so, in addition to automated tests. Record any environment limitation
+  honestly instead of papering over it.
+
 ## Project layout
 
 - `backend/` — Python service (`jarvis_gpt` package), managed with `uv`.
