@@ -452,6 +452,14 @@ class JarvisSettings:
     # full agent turn on its wall-clock schedule and delivers the answer to Telegram.
     # Off flips such reminders back to a passive text nudge.
     scheduled_tasks_enabled: bool
+    # ---- Code/data sandbox ------------------------------------------------------
+    # code.run executes operator Python in an isolated child (wall-clock timeout +
+    # memory ceiling + kill-on-close job + curated secret-free env). Resource-isolated,
+    # NOT security-isolated (see sandbox.py). Off disables the code.run tool.
+    sandbox_enabled: bool
+    sandbox_timeout_sec: int
+    sandbox_max_output_bytes: int
+    sandbox_mem_limit_mb: int
     # ---- Proactive health alerts -----------------------------------------------
     # The supervisor watches each telemetry snapshot and, on an ok→bad transition,
     # emits a runtime event, pushes it to the UI bus, and (if Telegram is wired)
@@ -636,6 +644,10 @@ def load_settings(profile_name: str | None = None) -> JarvisSettings:
         reminder_interval_sec=_int_env("JARVIS_REMINDER_INTERVAL_SEC", 30),
         reminder_tz=os.environ.get("JARVIS_REMINDER_TZ", "Europe/Moscow"),
         scheduled_tasks_enabled=_bool_env("JARVIS_SCHEDULED_TASKS_ENABLED", True),
+        sandbox_enabled=_bool_env("JARVIS_SANDBOX_ENABLED", True),
+        sandbox_timeout_sec=_int_env("JARVIS_SANDBOX_TIMEOUT_SEC", 30),
+        sandbox_max_output_bytes=_int_env("JARVIS_SANDBOX_MAX_OUTPUT_BYTES", 1_000_000),
+        sandbox_mem_limit_mb=_int_env("JARVIS_SANDBOX_MEM_LIMIT_MB", 2048),
         health_alerts_enabled=_bool_env("JARVIS_HEALTH_ALERTS_ENABLED", True),
         health_alert_gpu_temp_c=_float_env("JARVIS_HEALTH_ALERT_GPU_TEMP_C", 85.0),
         health_alert_gpu_vram_ratio=_float_env("JARVIS_HEALTH_ALERT_GPU_VRAM_RATIO", 0.97),

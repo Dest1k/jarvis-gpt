@@ -38,7 +38,7 @@ import httpx
 from httpcore._backends.auto import AutoBackend
 from httpcore._backends.base import SOCKET_OPTION, AsyncNetworkBackend, AsyncNetworkStream
 
-from . import speech
+from . import sandbox, speech
 from .browser_cdp import (
     DEFAULT_CHROME_DEBUG_URL,
     BrowserCdpError,
@@ -1591,6 +1591,22 @@ class ToolRegistry:
                     "max_pages": "Max PDF pages to OCR (default 10)",
                 },
                 handler=_documents_ocr,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="code.run",
+                description=(
+                    "Run Python in an isolated sandbox to COMPUTE, analyze data, or build "
+                    "charts — numpy/scipy/sympy/matplotlib available. Use for 'посчитай', "
+                    "'построй график', 'проанализируй данные', 'запусти код'. Files the code "
+                    "writes (chart PNGs, CSVs) are returned and delivered to the chat/Telegram. "
+                    "Isolated with a timeout + memory cap + private workdir; no network by default."
+                ),
+                category="compute",
+                input_schema={"code": "Python source to execute in the sandbox"},
+                handler=_code_run,
+                danger_level="danger",
             )
         )
         self.add(
@@ -12767,6 +12783,70 @@ def _verify_exact_artifact_path(
         "is_file": True,
         "require_exact": require_exact,
     }
+
+
+async def _code_run(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    """Run operator Python in the isolated sandbox; deliver any produced files."""
+
+    if not getattr(ctx.settings, "sandbox_enabled", True):
+        return ToolRunResponse(
+            tool="code.run", ok=False, summary="Песочница отключена (JARVIS_SANDBOX_ENABLED=0)."
+        )
+    code = str(args.get("code") or args.get("source") or "").strip()
+    if not code:
+        return ToolRunResponse(tool="code.run", ok=False, summary="Нет кода для запуска.")
+    run_id = secrets.token_hex(8)
+    workdir = ctx.settings.data_dir / "sandbox" / run_id
+    result = await asyncio.to_thread(
+        sandbox.run_python,
+        code,
+        workdir=workdir,
+        timeout_sec=ctx.settings.sandbox_timeout_sec,
+        max_output_bytes=ctx.settings.sandbox_max_output_bytes,
+        mem_limit_mb=ctx.settings.sandbox_mem_limit_mb,
+    )
+
+    # Deliver any artifacts the code produced (charts, CSVs, …) via the document-outputs
+    # root so /api/files + the Telegram bridge auto-send them.
+    file_records: list[dict[str, Any]] = []
+    try:
+        produced = sorted(
+            p for p in workdir.iterdir() if p.is_file() and p.name not in {"main.py"}
+        )
+    except OSError:
+        produced = []
+    output_root = ctx.settings.data_dir / DOCUMENT_OUTPUT_DIRNAME
+    for item in produced[:8]:
+        if item.name.startswith(".") or item.stat().st_size == 0:
+            continue
+        try:
+            dest = resolve_artifact_output_path(
+                output_root, output_name=item.name, default_name=item.name
+            )
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(item.read_bytes())
+            file_records.append(_record_generated_document(ctx, dest))
+        except (OSError, ValueError):
+            continue
+    with suppress(OSError):
+        shutil.rmtree(workdir, ignore_errors=True)
+
+    lines: list[str] = []
+    if result.stdout.strip():
+        lines.append(result.stdout.strip())
+    if not result.ok and result.error:
+        lines.append(f"[{result.error}]")
+        if result.stderr.strip():
+            lines.append(result.stderr.strip()[-800:])
+    if file_records:
+        lines.append("Файлы: " + ", ".join(str(record.get("name")) for record in file_records))
+    summary = "\n".join(lines).strip() or ("Готово." if result.ok else "Код не дал вывода.")
+    return ToolRunResponse(
+        tool="code.run",
+        ok=result.ok,
+        summary=summary[:4000],
+        data={**result.as_dict(), "files": file_records, "run_id": run_id},
+    )
 
 
 def _record_generated_document(ctx: ToolContext, path: Path) -> dict[str, Any]:
