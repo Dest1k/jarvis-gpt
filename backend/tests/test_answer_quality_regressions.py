@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import date
+from datetime import UTC, date, datetime
 from types import MethodType, SimpleNamespace
 
 from jarvis_gpt import agent as agent_module
@@ -754,6 +754,72 @@ def test_equity_source_relevance_does_not_accept_a_currency_exchange_page():
         preferred_domains=[],
         vertical="web",
     )
+
+
+def test_financial_identifiers_do_not_allow_class_contract_or_isin_collisions():
+    cases = [
+        ("What is the current BRK.B stock price?", "BRK.A", "BRK.B", "stock"),
+        (
+            "What is the current BRNQ26 futures contract price?",
+            "BRNQ27",
+            "BRNQ26",
+            "futures contract",
+        ),
+        (
+            "What is the current bond price for ISIN US0378331005?",
+            "US0378331006",
+            "US0378331005",
+            "bond ISIN",
+        ),
+    ]
+    for question, wrong_id, requested_id, descriptor in cases:
+        source = {
+            "title": "Current financial instrument quote",
+            "url": "https://market.example/instrument",
+            "excerpt": (
+                f"{descriptor} {wrong_id} market price was 101.25 USD on NYSE OTC ICE "
+                "at 2026-07-19 12:00 UTC."
+            ),
+        }
+        answer = (
+            f"{descriptor} {requested_id} market price was 101.25 USD on NYSE OTC ICE at "
+            "2026-07-19 12:00 UTC. This is the latest available market quote for the "
+            "requested instrument. Source: https://market.example/instrument"
+        )
+        assert tools_module._web_answer_synthesis_rejection(
+            answer, [source], question=question
+        ) == "source_identity_mismatch"
+
+
+def test_crypto_value_requires_source_bound_fresh_timestamp_and_timezone(monkeypatch):
+    fixed_now = datetime(2026, 7, 19, 12, 30, tzinfo=UTC)
+    monkeypatch.setattr(tools_module, "_web_answer_financial_now", lambda: fixed_now)
+    question = "What is the current Bitcoin price?"
+    source = {
+        "title": "Bitcoin BTC/USD spot exchange quote",
+        "url": "https://crypto.example/btcusd",
+        "excerpt": "Bitcoin BTC/USD spot price was 65000 USD at 2026-07-19 12:20 UTC.",
+    }
+    grounded = (
+        "Bitcoin BTC/USD spot exchange price was 65000 USD at 2026-07-19 12:20 UTC. "
+        "This is the current quote. Source: https://crypto.example/btcusd"
+    )
+    assert tools_module._web_answer_synthesis_rejection(
+        grounded, [source], question=question
+    ) == ""
+    assert tools_module._web_answer_synthesis_rejection(
+        grounded.replace(" at 2026-07-19 12:20 UTC", " on 2026-07-19"),
+        [source],
+        question=question,
+    ) == "missing_quote_timestamp"
+    assert tools_module._web_answer_synthesis_rejection(
+        grounded.replace("12:20 UTC", "12:29 UTC"), [source], question=question
+    ) == "unsupported_financial_number"
+    assert tools_module._web_answer_synthesis_rejection(
+        grounded.replace("2026-07-19 12:20 UTC", "2026-07-18 23:59 UTC"),
+        [source],
+        question=question,
+    ) == "stale_financial_quote"
 
 
 class _FailingFinancialTools:

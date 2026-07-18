@@ -15986,6 +15986,8 @@ def _web_answer_looks_like_financial_market(normalized: str) -> bool:
             "wti",
             "облигац",
             "фьючерс",
+            " futures",
+            "future contract",
             "etf",
             "exchange-traded fund",
             " bond",
@@ -16148,6 +16150,38 @@ def _web_answer_terms_match(left: str, right: str) -> bool:
         return False
     prefix = min(len(left), len(right), 5)
     return prefix >= 4 and left[:prefix] == right[:prefix]
+
+
+_WEB_FINANCIAL_IDENTIFIER_STOPWORDS = {
+    "ADR", "ETF", "FX", "NAV", "USD", "RUB", "EUR", "GBP", "CNY", "JPY",
+    "ICE", "CME", "LSE", "MOEX", "NYSE", "NASDAQ", "OTC", "SPOT", "YTM",
+}
+
+
+def _web_answer_financial_exact_identifiers(text: str) -> set[str]:
+    """Extract identifiers that must never use linguistic prefix matching."""
+    repaired = _repair_mojibake(text)
+    identifiers: set[str] = set()
+    patterns = (
+        r"(?<![A-Za-z0-9])[A-Z]{2}[A-Z0-9]{9}[0-9](?![A-Za-z0-9])",
+        r"(?<![A-Za-z0-9])[A-Z]{1,6}\.[A-Z](?![A-Za-z0-9])",
+        r"(?<![A-Za-z0-9])[A-Z]{2,6}[FGHJKMNQUVXZ]\d{1,4}(?![A-Za-z0-9])",
+        r"(?<![A-Za-z0-9])[A-Z]{2,8}(?![A-Za-z0-9])",
+    )
+    for pattern in patterns:
+        for match in re.finditer(pattern, repaired):
+            identifier = match.group(0).upper()
+            if identifier not in _WEB_FINANCIAL_IDENTIFIER_STOPWORDS:
+                identifiers.add(identifier)
+    return identifiers
+
+
+def _web_answer_contains_exact_financial_identifier(text: str, identifier: str) -> bool:
+    return bool(re.search(
+        rf"(?<![A-Za-z0-9]){re.escape(identifier)}(?![A-Za-z0-9])",
+        _repair_mojibake(text),
+        flags=re.IGNORECASE,
+    ))
 
 
 def _web_answer_requested_benchmarks(text: str) -> list[str]:
@@ -16766,6 +16800,61 @@ def _web_answer_financial_date_spans(
         for match in re.finditer(rf"(?<![a-zа-яё]){marker}(?![a-zа-яё])", normalized):
             found.append((value, match.start(), match.end()))
     return found
+
+
+def _web_answer_financial_now() -> datetime:
+    return datetime.now(WEB_NEWS_TIMEZONE)
+
+
+def _web_answer_financial_timestamp_spans(text: str) -> list[tuple[datetime, int, int]]:
+    """Parse complete quote timestamps: date, clock time, and explicit timezone."""
+    repaired = _repair_mojibake(text)
+    found: list[tuple[datetime, int, int]] = []
+    pattern = re.compile(
+        r"(?<!\d)(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})[T\s]+"
+        r"(\d{1,2}):(\d{2})(?::(\d{2}))?\s*"
+        r"(Z|UTC|GMT|MSK|[+-]\d{2}:?\d{2})(?![A-Za-z])",
+        flags=re.IGNORECASE,
+    )
+    for match in pattern.finditer(repaired):
+        zone_token = match.group(7).upper()
+        if zone_token in {"Z", "UTC", "GMT"}:
+            zone = UTC
+        elif zone_token == "MSK":
+            zone = WEB_NEWS_TIMEZONE
+        else:
+            compact = zone_token.replace(":", "")
+            sign = 1 if compact[0] == "+" else -1
+            zone = timezone(sign * timedelta(
+                hours=int(compact[1:3]), minutes=int(compact[3:5])
+            ))
+        with suppress(ValueError):
+            moment = datetime(
+                int(match.group(1)), int(match.group(2)), int(match.group(3)),
+                int(match.group(4)), int(match.group(5)), int(match.group(6) or 0),
+                tzinfo=zone,
+            )
+            found.append((moment.astimezone(UTC), match.start(), match.end()))
+    return found
+
+
+def _web_answer_nearest_timestamps_for_value(text: str, value: str) -> set[datetime]:
+    timestamps = _web_answer_financial_timestamp_spans(text)
+    result: set[datetime] = set()
+    for start, end in _web_answer_number_spans(text, value):
+        left, right = _web_answer_financial_clause_bounds(text, start, end)
+        local = [item for item in timestamps if item[1] >= left and item[2] <= right]
+        if local:
+            center = (start + end) / 2
+            result.add(min(
+                local, key=lambda item: abs((item[1] + item[2]) / 2 - center)
+            )[0])
+    return result
+
+
+def _web_answer_crypto_timestamp_is_fresh(value: datetime) -> bool:
+    age = _web_answer_financial_now().astimezone(UTC) - value.astimezone(UTC)
+    return timedelta(minutes=-5) <= age <= timedelta(hours=2)
 
 
 _WEB_FINANCIAL_NUMBER_RE = re.compile(
@@ -17562,6 +17651,19 @@ def _web_answer_financial_source_supports_value(
                     for item in supported_dates
                 ):
                     continue
+            answer_timestamps = _web_answer_nearest_timestamps_for_value(answer_text, value)
+            fragment_timestamps = _web_answer_nearest_timestamps_for_value(
+                quote_fragment, value
+            )
+            if answer_timestamps and not answer_timestamps.intersection(fragment_timestamps):
+                continue
+            if kind == "crypto" and require_fresh:
+                supported_timestamps = answer_timestamps.intersection(fragment_timestamps)
+                if not supported_timestamps or not any(
+                    _web_answer_crypto_timestamp_is_fresh(item)
+                    for item in supported_timestamps
+                ):
+                    continue
             return True
     return False
 
@@ -18345,6 +18447,13 @@ def _web_answer_financial_synthesis_rejection(
     normalized = _repair_mojibake(answer_without_urls).lower()
     source_texts = [_web_answer_financial_source_text(source) for source in sources]
     all_source_text = " ".join(source_texts)
+    for identifier in _web_answer_financial_exact_identifiers(question):
+        if not _web_answer_contains_exact_financial_identifier(
+            answer_without_urls, identifier
+        ):
+            return "missing_requested_instrument"
+        if not _web_answer_contains_exact_financial_identifier(all_source_text, identifier):
+            return "source_identity_mismatch"
     requested_benchmarks = _web_answer_requested_benchmarks(question)
     for benchmark in requested_benchmarks:
         pattern = rf"(?<![a-z]){benchmark}(?![a-z])"
@@ -18554,6 +18663,15 @@ def _web_answer_financial_synthesis_rejection(
             for item in answer_dates
         ):
             return "stale_financial_quote"
+        if kind == "crypto":
+            answer_timestamps = _web_answer_financial_timestamp_spans(answer_without_urls)
+            if not answer_timestamps:
+                return "missing_quote_timestamp"
+            if not any(
+                _web_answer_crypto_timestamp_is_fresh(moment)
+                for moment, _start, _end in answer_timestamps
+            ):
+                return "stale_financial_quote"
 
     answer_currencies = _web_answer_currency_codes(answer_without_urls)
     source_currencies = _web_answer_currency_codes(all_source_text)
