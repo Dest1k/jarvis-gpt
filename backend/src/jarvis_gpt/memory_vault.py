@@ -50,6 +50,41 @@ class MemoryVault:
     def graph(self) -> dict[str, Any]:
         self.ensure()
         notes = [_parse_note(path, self.root) for path in sorted(self.root.glob("**/*.md"))]
+        return self._build_graph(notes)
+
+    def graph_from_memories(self, memories: list[dict[str, Any]]) -> dict[str, Any]:
+        """Build the SAME link graph as :meth:`graph`, but straight from the memory rows —
+        rendering + parsing each note in memory, with no disk read and no disk write.
+
+        The read path (``/api/memory/vault``) used to full-sync the on-disk vault (a
+        per-note ``fsync``-ed rewrite of every memory) and then re-read every ``.md`` file:
+        O(N) fsync + O(N) cold file reads on *every* request (~13s on a 3k-note vault). The
+        markdown vault is already kept fresh incrementally on the write path (``add_memory``
+        / ``consolidate_memories``), so the graph can be derived from the DB rows directly.
+        Notes are rendered + parsed through the exact same helpers as the disk path, so the
+        node/edge/tag/link/backlink output is identical (tags mined from note text and all).
+        """
+
+        def _sort_key(memory: dict[str, Any]) -> tuple[str, str]:
+            return (
+                _safe_slug(str(memory.get("namespace") or "core")),
+                _safe_slug(str(memory.get("id") or "memory")),
+            )
+
+        notes: list[dict[str, Any]] = []
+        for memory in sorted(memories, key=_sort_key):
+            namespace_slug = _safe_slug(str(memory.get("namespace") or "core"))
+            id_slug = _safe_slug(str(memory.get("id") or "memory"))
+            notes.append(
+                _parse_note_text(
+                    _render_memory_note(memory),
+                    path_str=f"{namespace_slug}/{id_slug}.md",
+                    stem=id_slug,
+                )
+            )
+        return self._build_graph(notes)
+
+    def _build_graph(self, notes: list[dict[str, Any]]) -> dict[str, Any]:
         nodes: dict[str, dict[str, Any]] = {}
         edges: list[dict[str, str]] = []
         backlinks: dict[str, list[str]] = {}
@@ -153,6 +188,16 @@ def _render_memory_note(memory: dict[str, Any]) -> str:
 
 def _parse_note(path: Path, root: Path) -> dict[str, Any]:
     text = path.read_text(encoding="utf-8", errors="replace")
+    return _parse_note_text(text, path_str=str(path.relative_to(root)), stem=path.stem)
+
+
+def _parse_note_text(text: str, *, path_str: str, stem: str) -> dict[str, Any]:
+    """Parse a rendered note from its text alone (no disk).
+
+    Shared by the on-disk :func:`_parse_note` and the in-memory graph builder so both
+    derive title/content/links/tags identically — tags mined from the note body and all.
+    """
+
     frontmatter: dict[str, Any] = {}
     body = text
     if text.startswith("---\n"):
@@ -164,11 +209,11 @@ def _parse_note(path: Path, root: Path) -> dict[str, Any]:
     tags = sorted(set([*_extract_tags(text), *list(frontmatter.get("tags") or [])]))
     return {
         **frontmatter,
-        "title": title_match.group(1).strip() if title_match else path.stem,
+        "title": title_match.group(1).strip() if title_match else stem,
         "content": content,
         "links": links,
         "tags": tags,
-        "path": str(path.relative_to(root)),
+        "path": path_str,
     }
 
 

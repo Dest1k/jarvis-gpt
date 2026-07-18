@@ -488,7 +488,7 @@ class JarvisStorage:
                 return False
             raise
 
-    def _sync_memory_vault(self, conn: sqlite3.Connection) -> None:
+    def _load_memories_for_vault(self, conn: sqlite3.Connection) -> list[dict[str, Any]]:
         rows = conn.execute(
             """
             SELECT id, namespace, content, tags, importance, created_at, updated_at
@@ -496,11 +496,10 @@ class JarvisStorage:
             ORDER BY updated_at DESC
             """
         ).fetchall()
-        memories = [
-            {**dict(row), "tags": _loads(row["tags"], [])}
-            for row in rows
-        ]
-        self.memory_vault.sync(memories)
+        return [{**dict(row), "tags": _loads(row["tags"], [])} for row in rows]
+
+    def _sync_memory_vault(self, conn: sqlite3.Connection) -> None:
+        self.memory_vault.sync(self._load_memories_for_vault(conn))
 
     def ping(self) -> bool:
         with self._lock:
@@ -1284,10 +1283,14 @@ class JarvisStorage:
         return {"examined": len(rows), "merged": merged, "removed": removed}
 
     def memory_graph(self) -> dict[str, Any]:
+        # Build the graph straight from the DB rows — no per-request disk sync/read on the
+        # hot read path. The on-disk markdown vault is kept fresh incrementally on the write
+        # path (add_memory / consolidate_memories); an explicit full resync lives in
+        # rebuild_memory_vault(). See MemoryVault.graph_from_memories for the equivalence.
         with self._lock:
             conn = self.connect()
-            self._sync_memory_vault(conn)
-        graph = self.memory_vault.graph()
+            memories = self._load_memories_for_vault(conn)
+        graph = self.memory_vault.graph_from_memories(memories)
         self._augment_graph_with_documents(graph)
         return graph
 

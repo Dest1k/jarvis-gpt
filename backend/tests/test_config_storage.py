@@ -373,6 +373,64 @@ def test_storage_mirrors_memory_to_obsidian_like_vault(tmp_path):
     storage.close()
 
 
+def test_memory_graph_reads_from_db_not_disk_vault(tmp_path):
+    # The read path builds the graph straight from the DB rows, so it neither depends on
+    # nor rewrites the on-disk markdown vault on every request. Prove it by wiping the
+    # mirrored notes after the write: the graph still carries the memory node (tags mined
+    # from the body included) and the read does NOT re-mirror the files back to disk.
+    storage = JarvisStorage(tmp_path / "state" / "jarvis.sqlite3")
+    storage.initialize()
+    memory = storage.add_memory(
+        content="Route [[LLM runtime]] to #gpu telemetry",
+        namespace="architecture",
+        tags=["jarvis"],
+    )
+    for path in list(storage.memory_vault.root.glob("**/*.md")):
+        path.unlink()
+
+    graph = storage.memory_graph()
+
+    assert graph["stats"]["notes"] == 1
+    assert any(node["id"] == memory["id"] for node in graph["nodes"])
+    assert any(edge["target"] == "tag:gpu" for edge in graph["edges"])  # tag mined from body
+    assert any(edge["target"] == "link:LLM runtime" for edge in graph["edges"])
+    # A read must not resurrect the wiped notes on disk (no fsync-heavy per-request sync).
+    assert not list(storage.memory_vault.root.glob("**/*.md"))
+    storage.close()
+
+
+def test_graph_from_memories_matches_disk_round_trip(tmp_path):
+    # graph_from_memories (in-memory) must equal sync()+graph() (disk round-trip) exactly —
+    # including tags mined from the note body — since that equivalence is what lets the read
+    # path skip the fsync-heavy disk sync + cold re-read of every note.
+    from jarvis_gpt.memory_vault import MemoryVault
+
+    memories = [
+        {
+            "id": "m1", "namespace": "core", "content": "alpha [[beta]] #x", "tags": ["t1"],
+            "importance": 0.5, "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-02T00:00:00Z",
+        },
+        {
+            "id": "m2", "namespace": "ops", "content": "gamma names m1 and [[beta]] #y",
+            "tags": [], "importance": 0.9, "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-03T00:00:00Z",
+        },
+    ]
+    in_mem = MemoryVault(tmp_path / "a").graph_from_memories(memories)
+    disk = MemoryVault(tmp_path / "b")
+    disk.sync(memories)
+    on_disk = disk.graph()
+
+    def shape(graph):
+        nodes = {node["id"]: (node["kind"], node.get("label")) for node in graph["nodes"]}
+        edges = sorted((e["source"], e["target"], e["kind"]) for e in graph["edges"])
+        backlinks = {key: sorted(value) for key, value in graph["backlinks"].items()}
+        return nodes, edges, backlinks, graph["stats"]
+
+    assert shape(in_mem) == shape(on_disk)
+
+
 def _make_file(storage, name, *, sha, source=None, mime="application/pdf"):
     return storage.create_file_record(
         name=name,
