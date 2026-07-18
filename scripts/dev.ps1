@@ -30,5 +30,5 @@ Write-Host "Starting Command Center on http://localhost:3000"
 Start-Process powershell -WindowStyle Hidden -ArgumentList @(
   "-NoExit",
   "-Command",
-  "cd `"$PWD\frontend`"; `$env:JARVIS_BACKEND_URL='http://127.0.0.1:8000'; `$env:JARVIS_API_TOKEN='$apiToken'; npm run dev"
+  "cd `"$PWD\frontend`"; `$env:JARVIS_BACKEND_URL='http://127.0.0.1:8000'; `$env:JARVIS_API_TOKEN='$apiToken'; npm run dev -- --hostname 127.0.0.1"
 )

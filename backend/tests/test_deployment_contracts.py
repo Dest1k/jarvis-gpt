@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -87,8 +88,17 @@ def test_launcher_is_local_only_and_preserves_foreign_listeners() -> None:
     launcher = _read("scripts/jarvis-launcher.ps1")
     dispatcher_script = _read("scripts/dispatcher.ps1")
     dev_script = _read("scripts/dev.ps1")
+    frontend_package = json.loads(_read("frontend/package.json"))
+    frontend_dockerfile = _read("frontend/Dockerfile")
 
     assert "$script:LanMode = $false" in launcher
+    assert frontend_package["scripts"]["dev"] == "next dev --hostname 127.0.0.1"
+    assert frontend_package["scripts"]["start"] == "next start --hostname 127.0.0.1"
+    assert "npm run dev -- --hostname 127.0.0.1" in dev_script
+    assert (
+        'CMD ["node", "node_modules/next/dist/bin/next", "start", '
+        '"--hostname", "0.0.0.0"]'
+    ) in frontend_dockerfile
     assert 'Label = "Start with LAN"' not in launcher
     assert "temporarily disabled" in launcher
     assert 'Label = "Start app without LLM"' in launcher
@@ -110,6 +120,12 @@ def test_launcher_is_local_only_and_preserves_foreign_listeners() -> None:
     assert "function Test-ReusedDispatcherOwnership" in launcher
     assert "function Test-ManagedJarvisPort" in launcher
     assert "function Get-AlreadyRunningStackServices" in launcher
+    assert "function Test-FrontendBindingMatchesMode" in launcher
+    assert '$loopbackAddresses = @("127.0.0.1", "::1")' in launcher
+    assert launcher.count("-not (Test-FrontendBindingMatchesMode -Port 3000)") == 2
+    assert "-not $NoFrontend -and" in launcher
+    assert "$frontendBindingMismatch" in launcher
+    assert '"loopback-only binding is required"' in launcher
     assert "function Test-BridgeActionReady" in launcher
     assert "already-running status without" in launcher
     assert "mutating CLI verification" in launcher

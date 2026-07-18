@@ -375,6 +375,21 @@ function Test-PortExposedForLan {
   )
 }
 
+function Test-FrontendBindingMatchesMode {
+  param([int]$Port)
+
+  if ($script:LanMode) {
+    return (Test-PortExposedForLan -Port $Port)
+  }
+
+  $addresses = @(Get-PortListenAddresses -Port $Port)
+  if ($addresses.Count -eq 0) {
+    return $false
+  }
+  $loopbackAddresses = @("127.0.0.1", "::1")
+  return @($addresses | Where-Object { $_ -notin $loopbackAddresses }).Count -eq 0
+}
+
 function Ensure-LanFirewallRules {
   if (-not $script:LanMode) {
     return
@@ -1565,7 +1580,10 @@ function Get-AlreadyRunningStackServices {
   if ($BackendEnvironmentChanged -or $FrontendEnvironmentChanged) {
     return $null
   }
-  if ($script:LanMode -and -not (Test-PortExposedForLan -Port 3000)) {
+  if (
+    -not $NoFrontend -and
+    -not (Test-FrontendBindingMatchesMode -Port 3000)
+  ) {
     return $null
   }
 
@@ -1880,17 +1898,20 @@ function Start-JarvisStack {
       if (-not (Test-ManagedPortOwner -Port 3000 -Service "frontend")) {
         throw "TCP 3000 is occupied by a process not managed by Jarvis. Stop it or choose another port."
       }
+      $frontendBindingMismatch = -not (Test-FrontendBindingMatchesMode -Port 3000)
       if (
         $frontendRebuilt -or
         $frontendEnvironmentChanged -or
-        ($script:LanMode -and -not (Test-PortExposedForLan -Port 3000))
+        $frontendBindingMismatch
       ) {
         $reason = if ($frontendRebuilt) {
           "the frontend build changed"
         } elseif ($frontendEnvironmentChanged) {
           "the frontend launch environment changed"
-        } else {
+        } elseif ($script:LanMode) {
           "LAN binding is required"
+        } else {
+          "loopback-only binding is required"
         }
         Write-Host ("Restarting Command Center because {0}..." -f $reason) -ForegroundColor Yellow
         Stop-PortOwner -Port 3000 -ManagedOnly -Service "frontend"
