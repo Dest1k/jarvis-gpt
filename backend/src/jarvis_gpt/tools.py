@@ -4169,7 +4169,22 @@ async def _system_inspect(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResp
     """
 
     action = str(args.get("action") or "wmi.query").strip().lower()
-    action = {"query": "wmi.query", "wql": "wmi.query", "wmi": "wmi.query"}.get(action, action)
+    action = {
+        "query": "wmi.query",
+        "wql": "wmi.query",
+        "wmi": "wmi.query",
+        "wmi_query": "wmi.query",  # the local model often emits underscores for dots
+        "hardware_memory": "hardware.memory",
+        "hardware_cpu": "hardware.cpu",
+        "hardware_disk": "hardware.disk",
+        "hardware_gpu": "hardware.gpu",
+        # bare resource words a "сколько памяти / места на диске" query tends to produce
+        "memory": "hardware.memory",
+        "ram": "hardware.memory",
+        "cpu": "hardware.cpu",
+        "disk": "hardware.disk",
+        "gpu": "hardware.gpu",
+    }.get(action, action)
     hardware_class = _HARDWARE_WMI_CLASS.get(action)
     if hardware_class is not None:
         # Reliable hardware telemetry without the model guessing WMI class names.
