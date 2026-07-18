@@ -1816,7 +1816,19 @@ def test_looks_like_raw_tool_echo_detects_pasted_observations():
     assert _looks_like_raw_tool_echo(
         '{"error":"web.answer failed: no provider","code":"NO_PROVIDER"}'
     )
+    # The weak model echoing the injected repair context ("Факты из инструментов:") or
+    # embedding a raw observation line mid-answer must be flagged for re-synthesis.
+    assert _looks_like_raw_tool_echo(
+        "Факты из инструментов:\n- observation[filesystem.find · ok]: Found 100 match(es)\n"
+        '  data: {"truncated": true, "root": "D:\\\\jarvis-gpt"}'
+    )
+    assert _looks_like_raw_tool_echo(
+        "Нашёл файлы:\nobservation[filesystem.find · ok]: Found 12 match(es) across 3 file(s)"
+    )
     # A real natural-language answer must NOT be flagged.
     assert not _looks_like_raw_tool_echo("Последняя стабильная версия vLLM — v0.25.1.")
     assert not _looks_like_raw_tool_echo("")
     assert not _looks_like_raw_tool_echo("Вот план: 1) сделать X 2) проверить Y.")
+    # A coding answer mentioning an array index must NOT trip the observation pattern
+    # (it lacks the "· <state>]:" observation shape).
+    assert not _looks_like_raw_tool_echo("Возьми observation[0]: это первый элемент массива.")

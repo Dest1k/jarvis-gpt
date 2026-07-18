@@ -8433,9 +8433,12 @@ class AgentRuntime:
                     turn = _classify_tool_turn(result.content)
                     if turn.kind == "answer":
                         repaired_text = turn.text.strip()
-                if repaired_text.startswith(("{", "[")):
-                    # A repair that came back as router/data JSON is broken output;
-                    # the draft answer must survive it.
+                if repaired_text.startswith(("{", "[")) or _looks_like_raw_tool_echo(
+                    repaired_text
+                ):
+                    # A repair that came back as router/data JSON, or that just echoed the
+                    # injected "Факты из инструментов:" tool observations, is broken output;
+                    # the draft answer must survive it rather than leak a raw tool dump.
                     repaired_text = ""
             except Exception:  # noqa: BLE001 - timeout or error must keep the draft
                 repaired_text = ""
@@ -11444,6 +11447,16 @@ def _looks_like_raw_tool_echo(text: str) -> bool:
     if not stripped:
         return False
     if stripped.startswith("observation[") or stripped.startswith("data:"):
+        return True
+    # The weak model sometimes echoes the injected repair context verbatim
+    # ("Факты из инструментов:\n- observation[filesystem.find · ok]: …") or embeds a
+    # raw tool-observation line mid-answer instead of only at the very start. Catch
+    # that form too so the synthesis gate re-asks for a clean reply. The "· <state>]:"
+    # shape is specific to the internal observation format, so it will not fire on an
+    # incidental "array[0]:" in a coding answer.
+    if stripped.startswith("Факты из инструментов"):
+        return True
+    if re.search(r"observation\[[^\]]*·[^\]]*\]:", stripped):
         return True
     if stripped.startswith("{") and stripped.endswith("}") and len(stripped) > 20:
         low = stripped.lower()
