@@ -1461,7 +1461,7 @@ class AgentRuntime:
                     f"[ответ остановлен по лимиту {effective_max_tokens} токенов; "
                     "увеличь лимит токенов или попроси продолжить]"
                 )
-            deliverable = await self._maybe_backstop_chat_file(
+            answer, deliverable = await self._finalize_answer(
                 context,
                 message=message,
                 answer=answer,
@@ -1469,8 +1469,6 @@ class AgentRuntime:
                 blocked_by_approval=agentic.blocked_by_approval,
                 executed_tools=agentic.executed_tools,
             )
-            if deliverable is not None:
-                answer = _append_file_deliverable_note(answer, deliverable)
             done_payload: dict[str, Any] = {
                 "source": (
                     "tool_fallback"
@@ -2418,7 +2416,8 @@ class AgentRuntime:
                     addition = verified_answer[len(answer) :]
                     answer = verified_answer
                     yield {"type": "delta", "content": addition}
-            deliverable = await self._maybe_backstop_chat_file(
+            _pre_finalize = answer
+            answer, deliverable = await self._finalize_answer(
                 context,
                 message=message,
                 answer=answer,
@@ -2426,13 +2425,12 @@ class AgentRuntime:
                 blocked_by_approval=blocked_by_approval,
                 executed_tools=tuple(executed_tools),
             )
-            if deliverable is not None:
-                # The streamed answer is already on screen, so append the notice as a
-                # delta (the file was materialized because the model narrated it but
-                # never called the writer).
-                extended = _append_file_deliverable_note(answer, deliverable)
-                yield {"type": "delta", "content": extended[len(answer):]}
-                answer = extended
+            if answer != _pre_finalize:
+                # The streamed answer is already on screen, so append the materialized-file
+                # notice as a delta. The note is a pure append, so the suffix is exactly the
+                # added text (the file was written because the model narrated it but never
+                # called the writer).
+                yield {"type": "delta", "content": answer[len(_pre_finalize):]}
             done_payload: dict[str, Any] = {
                 "source": (
                     "tool_fallback"
@@ -3474,6 +3472,39 @@ class AgentRuntime:
             material=_material,
         )
 
+    async def _finalize_answer(
+        self,
+        context: AgentContext,
+        *,
+        message: str,
+        answer: str,
+        finish_reason: str | None,
+        blocked_by_approval: bool,
+        executed_tools: tuple[_ExecutedToolResult, ...],
+    ) -> tuple[str, dict[str, Any] | None]:
+        """Shared answer-string finalizer — the file-deliverable backstop tail (Fix A).
+
+        Runs :meth:`_maybe_backstop_chat_file` and appends the "Файл готов" note when a
+        claimed-but-unwritten file was materialized. Returns ``(final_answer, deliverable
+        or None)``. Deliberately narrow: it touches NO operator-effect/ledger state, emits
+        NO events, and runs NO C-gate/verification — those are path-specific and stay
+        inline. Every call site keeps calling the ledger itself, on the string returned
+        here, so effect ordering is unchanged. Idempotent: no-ops when a substantive file
+        already exists (the on-disk re-check inside ``_ensure_file_deliverable``).
+        """
+
+        deliverable = await self._maybe_backstop_chat_file(
+            context,
+            message=message,
+            answer=answer,
+            finish_reason=finish_reason,
+            blocked_by_approval=blocked_by_approval,
+            executed_tools=executed_tools,
+        )
+        if deliverable is not None:
+            answer = _append_file_deliverable_note(answer, deliverable)
+        return answer, deliverable
+
     async def _maybe_finalize_mission(self, mission_id: str) -> dict[str, Any] | None:
         async with self._mission_report_lock:
             return await self._finalize_mission_locked(mission_id)
@@ -4124,7 +4155,21 @@ class AgentRuntime:
         result = await orchestrator.run(message)
         if not result.answer:
             return None
-        return DirectAction(answer=result.answer, events=events)
+        # The orchestrator menu excludes durable writers, so a multistep goal that asks for
+        # a file ("собери отчёт в X.docx") can be NARRATED but never written. Run the shared
+        # file-deliverable backstop over the synthesized answer — the one real Fix-A coverage
+        # gap outside the agentic path. executed_tools=() is safe: no durable writer ran, so
+        # there is nothing to double-write (the on-disk substantive re-check inside
+        # _ensure_file_deliverable still prevents clobbering a pre-existing file).
+        final_answer, _deliverable = await self._finalize_answer(
+            context,
+            message=message,
+            answer=result.answer,
+            finish_reason="stop",
+            blocked_by_approval=False,
+            executed_tools=(),
+        )
+        return DirectAction(answer=final_answer, events=events)
 
     async def _machine_health_summary(self, answer: str) -> DirectAction:
         """Gather RAM + CPU + disk + GPU via read-only system.inspect and format one report."""

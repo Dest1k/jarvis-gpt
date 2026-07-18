@@ -256,6 +256,89 @@ def test_chat_backstop_honors_explicit_absolute_destination(monkeypatch, tmp_pat
     storage.close()
 
 
+def test_finalize_answer_appends_note_and_writes(monkeypatch, tmp_path):
+    # The shared _finalize_answer (Fix A tail) must materialize a narrated file and append
+    # the note, returning (answer, deliverable). The note is a pure append (the streaming
+    # seam relies on that suffix property).
+    body = "# План\n\n1. Один\n2. Два\n3. Три\n\nДостаточно содержательный текст для файла."
+    agent, storage, _settings = _autonomy_agent(monkeypatch, tmp_path, _ContentLLM(body))
+    original = "Готово, сохранил план в plan.md."
+    final, deliverable = asyncio.run(
+        agent._finalize_answer(
+            _operator_context(),
+            message="Сделай план на неделю и сохрани в plan.md",
+            answer=original,
+            finish_reason="stop",
+            blocked_by_approval=False,
+            executed_tools=(),
+        )
+    )
+    assert deliverable is not None
+    assert final.startswith(original)  # pure append → streaming delta suffix is valid
+    assert final != original
+    assert "Файл готов" in final
+    assert Path(deliverable["path"]).is_file()
+    storage.close()
+
+
+def test_finalize_answer_noop_leaves_answer_unchanged(monkeypatch, tmp_path):
+    # An informational answer with no file goal must return the answer verbatim + None.
+    agent, storage, _settings = _autonomy_agent(monkeypatch, tmp_path, _ContentLLM("x"))
+    original = "Чтобы создать md-файл, сохрани текст с расширением .md."
+    final, deliverable = asyncio.run(
+        agent._finalize_answer(
+            _operator_context(),
+            message="Как создать md-файл?",
+            answer=original,
+            finish_reason="stop",
+            blocked_by_approval=False,
+            executed_tools=(),
+        )
+    )
+    assert deliverable is None
+    assert final == original
+
+
+def test_orchestration_backstops_narrated_file(monkeypatch, tmp_path):
+    # The one real coverage gain: a multistep orchestration that NARRATES a file (its menu
+    # has no durable writer) must now be backstopped through _finalize_answer.
+    body = "# Отчёт\n\n1. A\n2. B\n3. C\n\nДостаточно содержательный текст отчёта для проверки."
+    agent, storage, settings = _autonomy_agent(monkeypatch, tmp_path, _ContentLLM(body))
+
+    class _FakeResult:
+        answer = "Собрал отчёт и сохранил в report.md."
+
+    class _FakeOrchestrator:
+        def __init__(self, **kwargs):
+            pass
+
+        async def run(self, _message):
+            return _FakeResult()
+
+    monkeypatch.setattr(
+        "jarvis_gpt.task_orchestrator.TaskOrchestrator", _FakeOrchestrator
+    )
+
+    direct = asyncio.run(
+        agent._run_task_orchestration(
+            "сделай A, B и собери отчёт в report.md", _operator_context()
+        )
+    )
+    assert direct is not None
+    assert "Файл готов" in direct.answer
+    assert (settings.data_dir / "document-outputs" / "report.md").is_file()
+
+    # A research-only multistep goal (no file) must pass through unchanged.
+    plain = asyncio.run(
+        agent._run_task_orchestration(
+            "сравни RTX 5090 и 4090 и сделай вывод", _operator_context()
+        )
+    )
+    assert plain is not None
+    assert plain.answer == "Собрал отчёт и сохранил в report.md."
+    storage.close()
+
+
 def test_chat_backstop_noops_when_writer_ran(monkeypatch, tmp_path):
     # A real durable write already happened this turn → backstop must not double-write.
     agent, storage, _settings = _autonomy_agent(monkeypatch, tmp_path, _ContentLLM("x"))
