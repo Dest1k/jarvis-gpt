@@ -58,6 +58,7 @@ from .models import (
     ToolInfo,
     ToolRunResponse,
 )
+from .notify import push_telegram_alert
 from .operator_queue import operator_context
 from .shop_registry import (
     SHOP_SOURCES,
@@ -1299,8 +1300,7 @@ class AgentRuntime:
             # never fails the turn.
             if self._owner_autonomy_active():
                 try:
-                    run = await self.run_mission(mission["id"], max_steps=self._max_tool_steps())
-                    deliverable = await self._ensure_goal_file_deliverable(mission, run, context)
+                    run, deliverable = await self._run_mission_autonomously(mission, context)
                     answer = self._mission_run_answer(mission, run, deliverable=deliverable)
                 except Exception as exc:  # noqa: BLE001 - execution is best-effort
                     answer = (
@@ -1967,10 +1967,7 @@ class AgentRuntime:
             # never fails the turn. Step-level progress streams via the event bus.
             if self._owner_autonomy_active():
                 try:
-                    run = await self.run_mission(
-                        mission["id"], max_steps=self._max_tool_steps()
-                    )
-                    deliverable = await self._ensure_goal_file_deliverable(mission, run, context)
+                    run, deliverable = await self._run_mission_autonomously(mission, context)
                     answer = self._mission_run_answer(mission, run, deliverable=deliverable)
                 except Exception as exc:  # noqa: BLE001 - execution is best-effort
                     answer = (
@@ -3023,6 +3020,96 @@ class AgentRuntime:
             executed_steps=len(steps),
             final_report=final_report,
         )
+
+    async def _run_mission_autonomously(
+        self, mission: dict[str, Any], context: Any
+    ) -> tuple[MissionRunResponse, dict[str, Any] | None]:
+        """Run a mission, self-continue while it only ran out of step budget, then run
+        the file-deliverable backstop, and escalate a genuine block to the owner.
+
+        Self-replanning here means: a mission that stopped merely because it hit the
+        per-run step budget is re-run (bounded by ``mission_self_replan_max_rounds``)
+        so a long chain finishes on its own instead of asking the owner to say
+        "продолжи миссию". Each round must make progress (>=1 executed step) or the loop
+        stops — this prevents an unfinishable mission from looping. A block that survives
+        the deliverable backstop and is not just the verification gate is escalated to
+        the owner's phone. Behavior is identical to the old inline sequence when
+        ``mission_self_replan_enabled`` is off.
+        """
+
+        run = await self.run_mission(mission["id"], max_steps=self._max_tool_steps())
+        if self.settings.mission_self_replan_enabled:
+            rounds = 0
+            while (
+                rounds < max(0, self.settings.mission_self_replan_max_rounds)
+                and not run.completed
+                and str(run.stopped_reason) == "budget"
+                and run.executed_steps > 0
+            ):
+                rounds += 1
+                run = await self.run_mission(mission["id"], max_steps=self._max_tool_steps())
+        deliverable = await self._ensure_goal_file_deliverable(mission, run, context)
+        if self.settings.mission_self_replan_enabled:
+            with suppress(Exception):
+                await self._maybe_escalate_mission(mission, run, deliverable)
+        return run, deliverable
+
+    @staticmethod
+    def _mission_step_produced(outcome: Any) -> bool:
+        # Mirrors ``_mission_run_answer._produced_content``: the tool succeeded, or it
+        # succeeded but only independent verification was unavailable.
+        return bool(outcome.result.ok) or str(outcome.result.summary or "").startswith(
+            _EXECUTIVE_UNVERIFIED_MARKER
+        )
+
+    async def _maybe_escalate_mission(
+        self,
+        mission: dict[str, Any],
+        run: MissionRunResponse,
+        deliverable: dict[str, Any] | None,
+    ) -> None:
+        """Alert the owner on Telegram when a mission is genuinely stuck.
+
+        Uses the same classifier as ``_mission_run_answer``: a "blocked" run whose steps
+        all produced content, or that delivered a file, was blocked only by the
+        verification gate — that is NOT a failure and never escalates. Only a real block
+        (needs owner intervention) does.
+        """
+
+        if run.completed:
+            return
+        all_produced = bool(run.steps) and all(
+            self._mission_step_produced(o) for o in run.steps
+        )
+        verification_only_block = str(run.stopped_reason) == "blocked" and (
+            bool(deliverable) or all_produced
+        )
+        if str(run.stopped_reason) != "blocked" or verification_only_block:
+            return
+        title = str(mission.get("title") or mission.get("goal") or "миссия").strip()
+        blocked = [o for o in run.steps if not self._mission_step_produced(o)]
+        detail = ""
+        if blocked:
+            last = blocked[-1]
+            label = last.task.title if last.task is not None else last.result.tool
+            reason = " ".join(str(last.result.summary or "").split())[:200]
+            detail = f"\nЗастряло на: {label} — {reason}"
+        with suppress(Exception):
+            self.storage.add_event(
+                kind="mission.escalation",
+                title=f"Миссия требует вмешательства: {title}",
+                level="warn",
+                payload={
+                    "mission_id": mission.get("id"),
+                    "stopped_reason": str(run.stopped_reason),
+                    "executed_steps": run.executed_steps,
+                },
+            )
+        with suppress(Exception):
+            await push_telegram_alert(
+                f"⚠️ Миссия «{title}» не смогла завершиться сама "
+                f"(шагов выполнено: {run.executed_steps}). Нужно вмешательство.{detail}"
+            )
 
     def _mission_run_answer(
         self,

@@ -468,6 +468,13 @@ class JarvisSettings:
     self_healing_min_failures: int
     self_healing_max_restarts: int
     self_healing_window_sec: int
+    # ---- Self-replanning missions -----------------------------------------------
+    # After an autonomously-run mission stops on the step budget, the runtime keeps
+    # continuing it (bounded by max_rounds) until it finishes. A mission that stays
+    # genuinely blocked (needs intervention, not just the verification gate) is
+    # escalated to the owner on Telegram so they can step in while away.
+    mission_self_replan_enabled: bool
+    mission_self_replan_max_rounds: int
     api_host: str
     api_port: int
     api_require_token_on_loopback: bool
@@ -525,6 +532,8 @@ class JarvisSettings:
                 "cognition_interval_sec": self.cognition_interval_sec,
                 "cognition_max_tokens": self.cognition_max_tokens,
                 "mission_interval_sec": self.autonomy_mission_interval_sec,
+                "mission_self_replan_enabled": self.mission_self_replan_enabled,
+                "mission_self_replan_max_rounds": self.mission_self_replan_max_rounds,
             },
             "reminders": {
                 "interval_sec": self.reminder_interval_sec,
@@ -629,6 +638,8 @@ def load_settings(profile_name: str | None = None) -> JarvisSettings:
         self_healing_min_failures=_int_env("JARVIS_SELF_HEALING_MIN_FAILURES", 2),
         self_healing_max_restarts=_int_env("JARVIS_SELF_HEALING_MAX_RESTARTS", 3),
         self_healing_window_sec=_int_env("JARVIS_SELF_HEALING_WINDOW_SEC", 1800),
+        mission_self_replan_enabled=_bool_env("JARVIS_MISSION_SELF_REPLAN_ENABLED", True),
+        mission_self_replan_max_rounds=_int_env("JARVIS_MISSION_SELF_REPLAN_MAX_ROUNDS", 2),
         api_host=os.environ.get("JARVIS_API_HOST", "0.0.0.0"),
         api_port=_int_env("JARVIS_API_PORT", 8000),
         api_require_token_on_loopback=_bool_env("JARVIS_API_REQUIRE_TOKEN_ON_LOOPBACK", False),
