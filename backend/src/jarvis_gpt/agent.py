@@ -8734,6 +8734,7 @@ class AgentRuntime:
         executed_tools: list[_ExecutedToolResult] = []
         max_tool_steps = self._max_tool_steps()
         protocol_correction_used = False
+        last_failed_signature: tuple[str, str] | None = None
         while used_tools < max_tool_steps:
             result = await self._complete_llm(
                 messages,
@@ -8839,6 +8840,18 @@ class AgentRuntime:
             used_tools += 1
             messages.append({"role": "assistant", "content": content})
             messages.append({"role": "user", "content": observation})
+            if executed is not None and not executed.result.ok:
+                # The weak local planner often retries the exact same failing tool call
+                # (e.g. a bad WMI class) over and over, burning steps and ending in a raw
+                # error dump. When the identical call fails twice in a row, stop looping and
+                # fall through to the final synthesis pass, which answers from the
+                # observations (honestly noting the tool failure) instead.
+                signature = (executed.tool, _stable_json_sha256(executed.arguments))
+                if signature == last_failed_signature:
+                    break
+                last_failed_signature = signature
+            elif executed is not None:
+                last_failed_signature = None
             if approval_ids:
                 # One durable gate owns the continuation. Creating sibling gates
                 # would make later approvals stale and could repeat side effects.

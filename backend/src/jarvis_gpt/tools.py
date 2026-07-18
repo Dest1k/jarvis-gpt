@@ -1133,7 +1133,10 @@ class ToolRegistry:
                 input_schema={
                     "action": (
                         "wmi.query (default), process.top, window.list, screen.capture, "
-                        "or capabilities"
+                        "capabilities, or the convenience shortcuts hardware.memory / "
+                        "hardware.cpu / hardware.disk / hardware.gpu (RAM/CPU/disk/GPU "
+                        "telemetry with no class name needed — prefer these for "
+                        "'сколько памяти/загрузка GPU' questions)"
                     ),
                     "payload": (
                         "wmi.query: {class_name, properties[], filter?, limit?}; "
@@ -3769,6 +3772,24 @@ def _host_bridge_status(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunRespo
 SAFE_INSPECT_ACTIONS = frozenset(
     {"capabilities", "process.top", "screen.capture", "window.list", "wmi.query"}
 )
+# Convenience hardware/telemetry actions that map to a known-good WMI class so the model
+# does not have to guess class names — it kept trying a non-existent "hardware.memory"
+# action or a malformed WMI class ("WMI class name contains unsupported characters").
+# These are rewritten to wmi.query with the right class before dispatch. GPU is served by
+# a dedicated bridge action (nvidia-smi), not WMI, since Win32_VideoController reports a
+# 32-bit AdapterRAM that is wrong for large-VRAM cards.
+_HARDWARE_WMI_CLASS = {
+    "hardware.memory": "Win32_OperatingSystem",
+    "hardware.ram": "Win32_OperatingSystem",
+    "memory": "Win32_OperatingSystem",
+    "hardware.cpu": "Win32_Processor",
+    "cpu": "Win32_Processor",
+    "hardware.disk": "Win32_LogicalDisk",
+    "hardware.disks": "Win32_LogicalDisk",
+    "disk": "Win32_LogicalDisk",
+    "hardware.os": "Win32_OperatingSystem",
+    "hardware.system": "Win32_ComputerSystem",
+}
 MODEL_NATIVE_ACTIONS = frozenset(
     {
         "app.open_and_type",
@@ -3991,6 +4012,10 @@ async def _system_inspect(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResp
 
     action = str(args.get("action") or "wmi.query").strip().lower()
     action = {"query": "wmi.query", "wql": "wmi.query", "wmi": "wmi.query"}.get(action, action)
+    hardware_class = _HARDWARE_WMI_CLASS.get(action)
+    if hardware_class is not None:
+        # Reliable hardware telemetry without the model guessing WMI class names.
+        action = "wmi.query"
     if action not in SAFE_INSPECT_ACTIONS:
         allowed = ", ".join(sorted(SAFE_INSPECT_ACTIONS))
         return ToolRunResponse(
@@ -4010,6 +4035,8 @@ async def _system_inspect(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResp
         payload = _wmi_payload_from_string(payload)
     if not isinstance(payload, dict):
         payload = {}
+    if hardware_class is not None and not payload.get("class_name"):
+        payload = {**payload, "class_name": hardware_class}
     if action == "wmi.query" and not payload.get("class_name"):
         wql = payload.get("query") or payload.get("wql") or payload.get("sql")
         if isinstance(wql, str) and wql.strip():
@@ -4020,6 +4047,18 @@ async def _system_inspect(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResp
                 if isinstance(top_level, str) and top_level.strip():
                     payload = {**payload, "class_name": top_level.strip()}
                     break
+    if action == "wmi.query":
+        # The model sometimes stuffs a WQL string or a class with a trailing WHERE clause
+        # into class_name; the bridge only accepts a bare Win32_* identifier and otherwise
+        # rejects it as "unsupported characters". Extract the clean class (and any embedded
+        # properties/filter) so a sloppy class_name still resolves instead of looping.
+        raw_class = payload.get("class_name")
+        if isinstance(raw_class, str) and not re.fullmatch(
+            r"[A-Za-z_][A-Za-z0-9_]*", raw_class.strip()
+        ):
+            extracted = _wmi_payload_from_string(raw_class)
+            if extracted.get("class_name"):
+                payload = {**payload, **extracted}
     if action == "screen.capture":
         screen_dir = ctx.settings.cache_dir / "screens"
         payload = {
