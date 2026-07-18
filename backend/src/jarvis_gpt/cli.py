@@ -523,6 +523,12 @@ def cmd_serve(args: argparse.Namespace) -> None:
     )
 
 
+def cmd_telegram_bridge(_args: argparse.Namespace) -> None:
+    from .telegram_bridge import run as run_telegram_bridge
+
+    run_telegram_bridge()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="jarvis", description="Jarvis runtime CLI")
     parser.add_argument("--profile", choices=sorted(PROFILES), default=None)
@@ -708,6 +714,11 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--port", type=int, default=None)
     serve_parser.add_argument("--reload", action="store_true")
     serve_parser.set_defaults(func=cmd_serve)
+
+    telegram_parser = sub.add_parser(
+        "telegram-bridge", help="Run the Telegram bot frontend (owner-allowlisted)"
+    )
+    telegram_parser.set_defaults(func=cmd_telegram_bridge)
 
     return parser
 
