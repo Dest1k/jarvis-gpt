@@ -94,3 +94,61 @@ high for the userbot. Huge synergy with vision (phone photos) and voice (voice n
    makes reports" chain).
 4. **Assistant backbone:** email + calendar/reminders; clipboard as a quick win.
 5. **Voice** and the **Telegram userbot** as deliberate, opt‑in power‑ups.
+
+---
+
+## Progress — delivered 2026-07-18 (Qwen3.5‑VL is the live brain)
+
+Shipped this session (all on `main`, tested): **vision pipeline** (chat image → VLM) +
+**"посмотри на экран"** (VLM sees the desktop) + **multi‑image**; **host telemetry**
+(RAM/CPU/disk + **GPU/VRAM via nvidia‑smi**); **PPTX / PDF / SVG‑chart generation**
+(hand‑rolled, zero deps; **PDF now supports Cyrillic** via embedded system TrueType);
+**Telegram bot frontend** (§0, level 1); agentic‑loop hardening (no more retry‑storms).
+In flight: **reminders/calendar**. Still open from above: code sandbox, email, voice,
+richer filesystem, clipboard, vision‑OCR, Telegram userbot.
+
+## More ideas — brainstorm 2026-07-18 (new features)
+
+**Proactive (Jarvis acts, not only on request):**
+- ⭐ **Scheduled agent tasks** — not just a reminder but "run a full agent turn on a
+  schedule → result to Telegram" ("каждое утро сводка по AI", "каждый вечер проверь систему").
+  Builds on reminders' scheduling.
+- ⭐ **Machine‑health alerts** — background monitor over the new RAM/CPU/GPU/disk telemetry →
+  push to Telegram when VRAM/temp/disk cross thresholds or the dispatcher dies. Direct payoff
+  for a box that runs its own model.
+
+**Vision‑unlocked (max synergy with the new brain):**
+- **Watch my screen** — "скажи, когда сборка закончится / придёт уведомление": periodic
+  screen.capture + VLM diff.
+- **Clipboard / screen as context** — "переведи то, что в буфере / на экране", "объясни эту
+  ошибку со скрина". Pairs with clipboard + vision.
+
+**Classic Jarvis:**
+- **Desktop voice** — "Джарвис" wake word → listen → act → speak (beyond Telegram voice notes).
+- **Quick‑capture inbox (GTD)** — dump a thought (voice/text/Telegram) → Jarvis routes it to
+  task / reminder / note / file.
+
+**Work tools:**
+- **Dev mode** — "объясни проект", "найди баг", run tests, git ops (compounds with code sandbox).
+- **Folder auto‑organize** — watch Downloads, sort/rename by type.
+- **Model control from chat** — "переключись на gemma / перезапусти модель / сколько ест VRAM".
+
+## Autonomy extensions — 2026-07-18
+
+Deepening EXISTING subsystems toward more autonomy (not new surfaces):
+- **Self‑healing runtime** (supervisor + telemetry): auto‑restart the dispatcher on
+  repeated‑token degeneration / OOM; rotate a rate‑limited search provider; propose/act on
+  disk cleanup when low. Alert the owner via Telegram on anything it can't self‑fix.
+- **Proactive cognition** (background cognition loop): surface insights unprompted and PROPOSE
+  or spawn missions ("диск заполняется — почистить?") instead of only passive reflection.
+- **Self‑replanning missions** (executive DAG): retry with a different tool/approach on a
+  failed step, replan, and only escalate to the owner (now reachable via Telegram) when truly
+  stuck; long missions report progress.
+- **Multi‑round, fact‑checked web research** (web.research): search → read → find gaps → search
+  more until confident, with adversarial source triangulation (the deep‑research pattern).
+- **Learned owner‑model** (memory/lessons): learn preferences (verbosity, favourite tools,
+  timing) and auto‑apply; recall relevant past context unprompted.
+- **Tool fallback chains + learning** (agentic loop): on a tool failure, auto‑try a different
+  tool; learn which tool fits which intent over time.
+- **Deeper self‑verification** (verify/repair loop): multi‑perspective checks + source‑grounded
+  fact verification + calibrated "I'm not sure" honesty before answering.
