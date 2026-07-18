@@ -36,6 +36,7 @@ import {
   Trash2,
   Zap,
   Upload,
+  Volume2,
   Wrench,
   X
 } from "lucide-react";
@@ -1744,6 +1745,8 @@ export default function CommandCenter() {
   const [activeOperation, setActiveOperation] = useState<ActiveOperation | null>(null);
   const [storageReady, setStorageReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [speakingMessageId, setSpeakingMessageId] = useState<string | null>(null);
+  const speakAudioRef = useRef<HTMLAudioElement | null>(null);
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const voiceBaseInputRef = useRef("");
   const chatFileInputRef = useRef<HTMLInputElement | null>(null);
@@ -2435,6 +2438,55 @@ export default function CommandCenter() {
     anchor.download = `jarvis-response-${index + 1}.md`;
     anchor.click();
     window.URL.revokeObjectURL(url);
+  }
+
+  function stopSpeaking() {
+    if (speakAudioRef.current) {
+      speakAudioRef.current.pause();
+      speakAudioRef.current = null;
+    }
+    setSpeakingMessageId(null);
+  }
+
+  async function speakChatMessage(line: ChatLine) {
+    if (typeof window === "undefined") return;
+    const text = cleanAssistantText(line.content).trim();
+    const id = line.id ?? "";
+    if (!text) return;
+    // Toggle: clicking the speaking bubble again stops playback.
+    if (speakingMessageId === id) {
+      stopSpeaking();
+      return;
+    }
+    stopSpeaking();
+    setSpeakingMessageId(id);
+    try {
+      const response = await fetch(`${API_PROXY_URL}/api/voice/speak`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text })
+      });
+      if (!response.ok) {
+        throw new Error("Синтез речи недоступен");
+      }
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      speakAudioRef.current = audio;
+      const cleanup = () => {
+        window.URL.revokeObjectURL(url);
+        if (speakAudioRef.current === audio) {
+          speakAudioRef.current = null;
+        }
+        setSpeakingMessageId((current) => (current === id ? null : current));
+      };
+      audio.onended = cleanup;
+      audio.onerror = cleanup;
+      await audio.play();
+    } catch (err) {
+      setSpeakingMessageId((current) => (current === id ? null : current));
+      setError(err instanceof Error ? err.message : "Не удалось озвучить ответ");
+    }
   }
 
   async function submitChat() {
@@ -4678,6 +4730,15 @@ export default function CommandCenter() {
                                 </a>
                               </>
                             )}
+                            <button
+                              className={`bubbleAction ${speakingMessageId === line.id ? "selected" : ""}`}
+                              type="button"
+                              title={speakingMessageId === line.id ? "Остановить озвучку" : "Озвучить ответ"}
+                              aria-label={speakingMessageId === line.id ? "Остановить озвучку" : "Озвучить ответ"}
+                              onClick={() => void speakChatMessage(line)}
+                            >
+                              <Volume2 size={13} />
+                            </button>
                             <button
                               className="bubbleAction"
                               type="button"
