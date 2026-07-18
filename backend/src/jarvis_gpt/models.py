@@ -139,6 +139,13 @@ class MemoryGraphNode(BaseModel):
     importance: float | None = None
     updated_at: str | None = None
     degree: int | None = None
+    # Document nodes (uploaded files folded into the graph alongside memory notes).
+    doc_id: str | None = None
+    mime: str | None = None
+    size: int | None = None
+    status: str | None = None
+    chunk_count: int | None = None
+    created_at: str | None = None
 
 
 class MemoryGraphEdge(BaseModel):

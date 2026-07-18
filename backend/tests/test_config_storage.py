@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 from jarvis_gpt.config import PROFILES, ensure_runtime_dirs, load_settings
+from jarvis_gpt.models import MemoryVaultResponse
 from jarvis_gpt.storage import JarvisStorage, _recoverable_fts_error
 
 
@@ -369,6 +370,124 @@ def test_storage_mirrors_memory_to_obsidian_like_vault(tmp_path):
     assert any(edge["target"] == "link:LLM runtime" for edge in graph["edges"])
     assert any(edge["target"] == "tag:runtime" for edge in graph["edges"])
     assert memory["id"] in graph["backlinks"]["LLM runtime"]
+    storage.close()
+
+
+def _make_file(storage, name, *, sha, source=None, mime="application/pdf"):
+    return storage.create_file_record(
+        name=name,
+        stored_path=Path("/store") / name,
+        sha256=sha,
+        size=len(name),
+        mime_type=mime,
+        status="ready",
+        source_path=source,
+    )
+
+
+def test_memory_graph_includes_document_nodes(tmp_path):
+    storage = JarvisStorage(tmp_path / "state" / "jarvis.sqlite3")
+    storage.initialize()
+    f1 = _make_file(storage, "alpha.pdf", sha="a" * 64)
+    f2 = _make_file(storage, "beta.xlsx", sha="b" * 64, mime="application/vnd.ms-excel")
+
+    graph = storage.memory_graph()
+    MemoryVaultResponse.model_validate(graph)  # extended payload still validates
+
+    docs = [node for node in graph["nodes"] if node["kind"] == "document"]
+    assert {node["id"] for node in docs} == {
+        f"document:{f1['id']}",
+        f"document:{f2['id']}",
+    }
+    alpha = next(node for node in docs if node["doc_id"] == f1["id"])
+    assert alpha["mime"] == "application/pdf"
+    assert alpha["size"] == len("alpha.pdf")
+    assert alpha["status"] == "ready"
+    assert graph["stats"]["documents"] == 2
+    storage.close()
+
+
+def test_memory_graph_links_memory_that_mentions_a_file(tmp_path):
+    storage = JarvisStorage(tmp_path / "state" / "jarvis.sqlite3")
+    storage.initialize()
+    doc = _make_file(storage, "quarterly_report.pdf", sha="c" * 64)
+    by_id = storage.add_memory(content=f"See file {doc['id']} for the numbers")
+    by_name = storage.add_memory(content="Totals live in quarterly_report.pdf now")
+    unrelated = storage.add_memory(content="quarterly numbers looked strong this cycle")
+
+    graph = storage.memory_graph()
+    mentions = {
+        (edge["source"], edge["target"])
+        for edge in graph["edges"]
+        if edge["kind"] == "mentions"
+    }
+    assert (by_id["id"], f"document:{doc['id']}") in mentions
+    assert (by_name["id"], f"document:{doc['id']}") in mentions
+    # A memory that only shares a common word (not the full filename/id) is NOT linked.
+    assert all(source != unrelated["id"] for source, _ in mentions)
+    storage.close()
+
+
+def test_memory_graph_co_source_edges_skip_uploads(tmp_path):
+    storage = JarvisStorage(tmp_path / "state" / "jarvis.sqlite3")
+    storage.initialize()
+    a = _make_file(storage, "a.pdf", sha="a" * 64, source=Path("C:/docs/a.pdf"))
+    b = _make_file(storage, "b.pdf", sha="b" * 64, source=Path("C:/docs/b.pdf"))
+    up = _make_file(storage, "up.pdf", sha="c" * 64, source=None)
+
+    graph = storage.memory_graph()
+    co_source = [edge for edge in graph["edges"] if edge["kind"] == "co-source"]
+    pairs = {frozenset((edge["source"], edge["target"])) for edge in co_source}
+    assert frozenset((f"document:{a['id']}", f"document:{b['id']}")) in pairs
+    # An upload with no source_path is never grouped by folder.
+    assert all(f"document:{up['id']}" not in pair for pair in pairs)
+    storage.close()
+
+
+def test_memory_graph_large_same_day_uses_bucket_star_not_clique(tmp_path):
+    storage = JarvisStorage(tmp_path / "state" / "jarvis.sqlite3")
+    storage.initialize()
+    count = 10  # > _DOC_DERIV_BUCKET_K (6): must collapse to a hub-and-star
+    ids = [
+        _make_file(storage, f"doc{i}.pdf", sha=f"{i:064d}", source=None)["id"]
+        for i in range(count)
+    ]
+
+    graph = storage.memory_graph()
+    hubs = [node for node in graph["nodes"] if node["kind"] == "daybucket"]
+    assert len(hubs) == 1
+    hub_id = hubs[0]["id"]
+
+    co_day = [edge for edge in graph["edges"] if edge["kind"] == "co-day"]
+    assert len(co_day) == count  # star: one edge per member, NOT count*(count-1)/2
+    assert all(edge["target"] == hub_id for edge in co_day)
+    assert {edge["source"] for edge in co_day} == {f"document:{fid}" for fid in ids}
+
+    derived = [
+        edge
+        for edge in graph["edges"]
+        if edge["kind"] in {"co-source", "co-day", "same-content"}
+    ]
+    assert len(derived) <= 3 * count  # global cap
+    degree: dict[str, int] = {}
+    for edge in derived:
+        for endpoint in (edge["source"], edge["target"]):
+            if endpoint.startswith("document:"):
+                degree[endpoint] = degree.get(endpoint, 0) + 1
+    assert all(value <= 8 for value in degree.values())  # per-doc cap
+    storage.close()
+
+
+def test_memory_graph_backward_compatible_without_documents(tmp_path):
+    storage = JarvisStorage(tmp_path / "state" / "jarvis.sqlite3")
+    storage.initialize()
+    storage.add_memory(content="solo note [[other]] #tag", namespace="core")
+
+    graph = storage.memory_graph()
+    MemoryVaultResponse.model_validate(graph)
+    assert graph["stats"]["documents"] == 0
+    assert graph["stats"]["document_edges"] == 0
+    assert not any(node["kind"] == "document" for node in graph["nodes"])
     storage.close()
 
 

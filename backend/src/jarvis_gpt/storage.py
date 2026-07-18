@@ -1,17 +1,27 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
 import threading
 import uuid
+from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
+from itertools import combinations
 from pathlib import Path
 from typing import Any
 
 from .memory_vault import MemoryVault
 from .redaction import redact_value
+
+# Document-graph augmentation: fold uploaded documents into the memory link graph.
+DOCUMENT_GRAPH_NODE_CAP = 5000
+_DOC_DERIV_BUCKET_K = 6  # groups larger than this collapse to a hub-and-star, not a clique
+_DOC_DERIV_PER_DOC_DEGREE_CAP = 8  # max derived edges any single document may accrue
+# Mirrors document_memory._FILE_ID_RE; duplicated locally to avoid an import cycle.
+_DOC_FILE_ID_RE = re.compile(r"\bfile_[0-9a-fA-F]{8,}\b")
 
 _QUERY_STOPWORDS = {
     "a",
@@ -1277,13 +1287,189 @@ class JarvisStorage:
         with self._lock:
             conn = self.connect()
             self._sync_memory_vault(conn)
-        return self.memory_vault.graph()
+        graph = self.memory_vault.graph()
+        self._augment_graph_with_documents(graph)
+        return graph
 
     def rebuild_memory_vault(self) -> dict[str, Any]:
         with self._lock:
             conn = self.connect()
             self._sync_memory_vault(conn)
-        return self.memory_vault.graph()
+        graph = self.memory_vault.graph()
+        self._augment_graph_with_documents(graph)
+        return graph
+
+    def _augment_graph_with_documents(self, graph: dict[str, Any]) -> None:
+        """Fold uploaded documents into the memory link graph, in place.
+
+        Appends ``document`` nodes plus meaningful, capped edges to the dict returned
+        by ``MemoryVault.graph()``: ``mentions`` edges (a memory note that names a file
+        by its exact id or full filename) and derived document<->document links (same
+        source folder / identical content / same upload day). Runs OUTSIDE the storage
+        lock — ``list_files`` acquires ``self._lock`` itself and ``threading.Lock`` is
+        not re-entrant. The ``.md`` vault layer and the API route are untouched.
+        """
+
+        files = self.list_files(limit=DOCUMENT_GRAPH_NODE_CAP)
+        nodes: list[dict[str, Any]] = graph.setdefault("nodes", [])
+        edges: list[dict[str, Any]] = graph.setdefault("edges", [])
+        stats: dict[str, int] = graph.setdefault("stats", {})
+        if not files:
+            stats["documents"] = 0
+            stats["document_edges"] = 0
+            return
+
+        docs_by_id: dict[str, dict[str, Any]] = {}
+        for row in files:
+            fid = str(row.get("id") or "")
+            if not fid:
+                continue
+            docs_by_id[fid] = row
+            nodes.append(
+                {
+                    "id": f"document:{fid}",
+                    "label": row.get("name") or fid,
+                    "kind": "document",
+                    "doc_id": fid,
+                    "mime": row.get("mime_type"),
+                    "size": row.get("size"),
+                    "status": row.get("status"),
+                    "chunk_count": row.get("chunk_count"),
+                    "created_at": row.get("created_at"),
+                    "updated_at": row.get("updated_at"),
+                }
+            )
+        doc_ids = set(docs_by_id)
+
+        # 1) mentions: a memory note that names a file (exact file id or full filename).
+        name_to_ids: dict[str, list[str]] = defaultdict(list)
+        for fid, row in docs_by_id.items():
+            name = str(row.get("name") or "").strip()
+            if len(name) >= 5:  # skip trivially short names that would match everywhere
+                name_to_ids[name].append(fid)
+        mention_edges: list[dict[str, str]] = []
+        seen_mentions: set[tuple[str, str]] = set()
+        for note in graph.get("notes", []):
+            mem_id = str(note.get("id") or note.get("path") or "")
+            content = str(note.get("content") or "")
+            if not mem_id or not content:
+                continue
+            hits: set[str] = {fid for fid in _DOC_FILE_ID_RE.findall(content) if fid in doc_ids}
+            for name, ids in name_to_ids.items():
+                if name in content:
+                    hits.update(ids)
+            for fid in sorted(hits):
+                key = (mem_id, fid)
+                if key in seen_mentions:
+                    continue
+                seen_mentions.add(key)
+                mention_edges.append(
+                    {"source": mem_id, "target": f"document:{fid}", "kind": "mentions"}
+                )
+
+        # 2) derived document<->document links, strongest signal first, hard-capped.
+        derived_edges: list[dict[str, str]] = []
+        hub_nodes: dict[str, dict[str, Any]] = {}
+        per_doc_deg: Counter[str] = Counter()
+        pair_seen: set[frozenset[str]] = set()
+        global_cap = 3 * len(doc_ids)
+
+        def _emit_pair(a: str, b: str, kind: str) -> None:
+            if a == b or len(derived_edges) >= global_cap:
+                return
+            pair = frozenset((a, b))
+            if pair in pair_seen:
+                return
+            if (
+                per_doc_deg[a] >= _DOC_DERIV_PER_DOC_DEGREE_CAP
+                or per_doc_deg[b] >= _DOC_DERIV_PER_DOC_DEGREE_CAP
+            ):
+                return
+            pair_seen.add(pair)
+            per_doc_deg[a] += 1
+            per_doc_deg[b] += 1
+            derived_edges.append(
+                {"source": f"document:{a}", "target": f"document:{b}", "kind": kind}
+            )
+
+        def _emit_star(
+            members: list[str], kind: str, hub_id: str, label: str, hub_kind: str
+        ) -> None:
+            added = False
+            for member in members:
+                if len(derived_edges) >= global_cap:
+                    break
+                if per_doc_deg[member] >= _DOC_DERIV_PER_DOC_DEGREE_CAP:
+                    continue
+                per_doc_deg[member] += 1
+                derived_edges.append(
+                    {"source": f"document:{member}", "target": hub_id, "kind": kind}
+                )
+                added = True
+            if added:
+                hub_nodes.setdefault(hub_id, {"id": hub_id, "label": label, "kind": hub_kind})
+
+        def _process(
+            groups: dict[str, list[str]], kind: str, hub_prefix: str | None, hub_kind: str
+        ) -> None:
+            for key in sorted(groups):
+                members = sorted(set(groups[key]))
+                if len(members) < 2:
+                    continue
+                if hub_prefix is not None and len(members) > _DOC_DERIV_BUCKET_K:
+                    if hub_prefix == "folder":
+                        hub_id = f"folder:{hashlib.sha1(key.encode()).hexdigest()[:12]}"
+                        label = key.rstrip("/").split("/")[-1] or key
+                    else:
+                        hub_id = f"{hub_prefix}:{key}"
+                        label = key
+                    _emit_star(members, kind, hub_id, label, hub_kind)
+                else:
+                    for a, b in combinations(members[:50], 2):
+                        if len(derived_edges) >= global_cap:
+                            break
+                        _emit_pair(a, b, kind)
+
+        co_source: dict[str, list[str]] = defaultdict(list)
+        same_content: dict[str, list[str]] = defaultdict(list)
+        co_day: dict[str, list[str]] = defaultdict(list)
+        for fid, row in docs_by_id.items():
+            source = str(row.get("source_path") or "").strip()
+            if source:
+                parts = re.split(r"[\\/]+", source)
+                if len(parts) > 1:
+                    co_source["/".join(parts[:-1])].append(fid)
+            sha = str(row.get("sha256") or "").strip()
+            if sha:
+                same_content[sha].append(fid)
+            created = str(row.get("created_at") or "")[:10]
+            if created:
+                co_day[created].append(fid)
+
+        _process(co_source, "co-source", "folder", "folder")
+        _process(same_content, "same-content", None, "document")
+        _process(co_day, "co-day", "daybucket", "daybucket")
+
+        # Merge, then recompute degree + top_nodes + stats over the unified graph.
+        edges.extend(mention_edges)
+        edges.extend(derived_edges)
+        nodes.extend(hub_nodes.values())
+
+        degree: dict[str, int] = {}
+        for edge in edges:
+            degree[edge["source"]] = degree.get(edge["source"], 0) + 1
+            degree[edge["target"]] = degree.get(edge["target"], 0) + 1
+        for node in nodes:
+            node["degree"] = degree.get(str(node.get("id") or ""), 0)
+        graph["top_nodes"] = sorted(
+            ({**node} for node in nodes),
+            key=lambda item: (int(item.get("degree") or 0), str(item.get("label") or "")),
+            reverse=True,
+        )[:12]
+        stats["nodes"] = len(nodes)
+        stats["edges"] = len(edges)
+        stats["documents"] = len(doc_ids)
+        stats["document_edges"] = len(mention_edges) + len(derived_edges)
 
     def create_mission(
         self,
