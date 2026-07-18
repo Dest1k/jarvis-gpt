@@ -25,6 +25,7 @@ from urllib.parse import quote, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from . import persona as persona_module
+from . import speech
 from .browser_cdp import DEFAULT_CHROME_DEBUG_URL
 from .cognitive_memory import ExecutionPlaybookStore
 from .config import JarvisSettings
@@ -877,6 +878,7 @@ class AgentRuntime:
     ) -> ChatResponse:
         started_at = time.perf_counter()
         attachments = _normalize_chat_attachments(attachments)
+        message = await self._fold_audio_attachment_transcripts(message, attachments)
         context_message = _message_with_attachments(message, attachments)
         context = self._prepare_context(context_message, conversation_id)
         context.operator_message = message
@@ -1540,6 +1542,7 @@ class AgentRuntime:
     ) -> AsyncIterator[dict[str, Any]]:
         started_at = time.perf_counter()
         attachments = _normalize_chat_attachments(attachments)
+        message = await self._fold_audio_attachment_transcripts(message, attachments)
         context_message = _message_with_attachments(message, attachments)
         context = self._prepare_context(context_message, conversation_id)
         context.operator_message = message
@@ -9494,6 +9497,50 @@ class AgentRuntime:
             blocked_by_approval=False,
             used_tools=used_tools,
         )
+
+    async def _fold_audio_attachment_transcripts(
+        self, message: str, attachments: list[dict[str, Any]]
+    ) -> str:
+        """Transcribe any audio/video attachments and fold the speech into the message.
+
+        A voice note IS the user's turn: when only audio was sent, its transcript becomes
+        the message; when text accompanies it, the transcript is appended. Runs the CPU
+        transcription off the event loop and degrades to a no-op when STT is unavailable
+        or a clip can't be read — the turn proceeds on whatever text was typed.
+        """
+
+        if not attachments:
+            return message
+        transcripts: list[str] = []
+        for item in attachments:
+            mime = str(item.get("mime_type") or "").strip().lower()
+            name = str(item.get("name") or "")
+            suffix = Path(name).suffix.lower()
+            is_media = (
+                mime.startswith("audio/")
+                or mime.startswith("video/")
+                or suffix in speech.TRANSCRIBE_EXTENSIONS
+            )
+            if not is_media:
+                continue
+            record = self.storage.get_file(str(item.get("id") or ""))
+            if not record:
+                continue
+            stored_path = str(record.get("stored_path") or "")
+            if not stored_path or not Path(stored_path).is_file():
+                continue
+            try:
+                result = await asyncio.to_thread(speech.transcribe, stored_path)
+            except Exception:  # noqa: BLE001 — transcription must never break the turn
+                continue
+            if result.ok and result.text.strip():
+                transcripts.append(result.text.strip())
+        if not transcripts:
+            return message
+        joined = "\n\n".join(transcripts)
+        if not message.strip():
+            return joined
+        return f"{message.strip()}\n\n[Расшифровка голосового сообщения]:\n{joined}"
 
     def _image_parts_for_attachments(
         self, attachments: list[dict[str, Any]]
