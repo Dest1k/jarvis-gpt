@@ -102,6 +102,7 @@ from .operations import OperationsManager, _cadence_interval, docker_container_a
 from .persona import INSIGHT_FIELDS, PersonaManager, load_persona
 from .redaction import redact_text, redact_value
 from .reliability import PolicyDecision, ToolFailure
+from .reminders import parse_when, reminder_zone, render_local, to_utc_iso
 from .shop_registry import find_shop_source, get_shop_source, get_shop_source_by_host
 from .state_verification import (
     GateStatus,
@@ -333,6 +334,7 @@ class ToolContext:
     approved: bool = False
     mission_id: str | None = None
     task_id: str | None = None
+    conversation_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -693,6 +695,7 @@ class ToolRegistry:
                 approved=approved,
                 mission_id=mission_id,
                 task_id=task_id,
+                conversation_id=conversation_id,
             )
             try:
                 raw = spec.handler(context, args)
@@ -1409,6 +1412,51 @@ class ToolRegistry:
                     "importance": "0.0 to 1.0",
                 },
                 handler=_memory_save,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="reminders.create",
+                description=(
+                    "Create a reminder or calendar entry from natural language "
+                    "('напомни завтра в 10 …', 'через 2 часа', 'каждый день в 9'). Parses "
+                    "relative/absolute Russian times and recurrence; stores it and fires it later."
+                ),
+                category="reminders",
+                input_schema={
+                    "text": "What to remind about",
+                    "when": "When, in natural language (e.g. 'завтра в 10', 'через 2 часа')",
+                    "phrase": "Optional whole request phrase if text/when are not split out",
+                },
+                handler=_reminders_create,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="reminders.list",
+                description=(
+                    "List upcoming reminders ('что у меня на неделе', 'какие напоминания'). "
+                    "Optional scope (upcoming|today|week|all) or within_days window."
+                ),
+                category="reminders",
+                input_schema={
+                    "scope": "upcoming | today | week | all",
+                    "within_days": "Only reminders due within this many days",
+                    "limit": "Maximum results",
+                },
+                handler=_reminders_list,
+            )
+        )
+        self.add(
+            ToolSpec(
+                name="reminders.cancel",
+                description="Cancel a pending reminder by its id or by matching its text.",
+                category="reminders",
+                input_schema={
+                    "reminder_id": "Reminder id to cancel",
+                    "match": "Text to match against pending reminders",
+                },
+                handler=_reminders_cancel,
             )
         )
         self.add(
@@ -5237,6 +5285,92 @@ def _memory_save(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
         ok=True,
         summary=f"Memory item saved in namespace {namespace}.",
         data={"item": item, "namespace": namespace},
+    )
+
+
+def _reminders_create(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    tz = reminder_zone(ctx.settings.reminder_tz)
+    text = str(args.get("text") or args.get("phrase") or "").strip()
+    when = str(args.get("when") or text).strip()
+    if not when:
+        return ToolRunResponse(
+            tool="reminders.create",
+            ok=False,
+            summary="Что напомнить и когда? Например: 'напомни завтра в 10 про встречу'.",
+        )
+    parsed = parse_when(when, tz=tz)
+    if not parsed.matched or parsed.due_local is None:
+        return ToolRunResponse(
+            tool="reminders.create",
+            ok=False,
+            summary=(
+                "Не понял время напоминания. Примеры: 'завтра в 10', 'через 2 часа', "
+                "'каждый день в 9', 'в понедельник в 14:00'."
+            ),
+        )
+    title = text or when
+    reminder = ctx.storage.create_reminder(
+        text=title,
+        due_at=to_utc_iso(parsed.due_local),
+        recurrence=parsed.recurrence,
+        conversation_id=ctx.conversation_id,
+        source_text=when,
+    )
+    local = render_local(reminder["due_at"], tz=tz)
+    suffix = " (повтор)" if parsed.recurrence else ""
+    return ToolRunResponse(
+        tool="reminders.create",
+        ok=True,
+        summary=f"Напомню: {title} — {local}{suffix}",
+        data={"reminder": reminder, "due_local": local},
+    )
+
+
+def _reminders_list(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    tz = reminder_zone(ctx.settings.reminder_tz)
+    scope = str(args.get("scope") or "").strip().lower()
+    now_local = datetime.now(tz)
+    before: str | None = None
+    within_days = args.get("within_days")
+    if within_days is not None:
+        days = _int_arg(within_days, default=7, minimum=1, maximum=366)
+        before = to_utc_iso(now_local + timedelta(days=days))
+    elif scope in ("today", "сегодня", "день"):
+        before = to_utc_iso(now_local.replace(hour=23, minute=59, second=59))
+    elif scope in ("week", "неделя", "неделе", "на неделе"):
+        before = to_utc_iso(now_local + timedelta(days=7))
+    limit = _int_arg(args.get("limit"), default=20, minimum=1, maximum=100)
+    items = ctx.storage.list_reminders(status="pending", before=before, limit=limit)
+    lines = [f"• {render_local(item['due_at'], tz=tz)} — {item['text']}" for item in items]
+    summary = "\n".join(lines) if lines else "Активных напоминаний нет."
+    return ToolRunResponse(
+        tool="reminders.list",
+        ok=True,
+        summary=summary,
+        data={"items": items, "scope": scope or "upcoming"},
+    )
+
+
+def _reminders_cancel(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    reminder_id = str(args.get("reminder_id") or args.get("id") or "").strip()
+    match = str(args.get("match") or args.get("text") or "").strip().lower()
+    if not reminder_id and match:
+        for item in ctx.storage.list_reminders(status="pending", limit=100):
+            if match in str(item["text"]).lower():
+                reminder_id = str(item["id"])
+                break
+    cancelled = ctx.storage.cancel_reminder(reminder_id) if reminder_id else None
+    if cancelled is None:
+        return ToolRunResponse(
+            tool="reminders.cancel",
+            ok=False,
+            summary="Не нашёл активное напоминание для отмены.",
+        )
+    return ToolRunResponse(
+        tool="reminders.cancel",
+        ok=True,
+        summary=f"Отменил напоминание: {cancelled['text']}",
+        data={"reminder": cancelled},
     )
 
 

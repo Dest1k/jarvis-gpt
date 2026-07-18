@@ -445,6 +445,8 @@ class JarvisSettings:
     cognition_interval_sec: int
     cognition_max_tokens: int
     autonomy_mission_interval_sec: int
+    reminder_interval_sec: int
+    reminder_tz: str
     api_host: str
     api_port: int
     api_require_token_on_loopback: bool
@@ -502,6 +504,10 @@ class JarvisSettings:
                 "cognition_interval_sec": self.cognition_interval_sec,
                 "cognition_max_tokens": self.cognition_max_tokens,
                 "mission_interval_sec": self.autonomy_mission_interval_sec,
+            },
+            "reminders": {
+                "interval_sec": self.reminder_interval_sec,
+                "timezone": self.reminder_tz,
             },
             "api": {
                 "host": self.api_host,
@@ -576,6 +582,8 @@ def load_settings(profile_name: str | None = None) -> JarvisSettings:
         cognition_interval_sec=_int_env("JARVIS_COGNITION_INTERVAL_SEC", 300),
         cognition_max_tokens=_int_env("JARVIS_COGNITION_MAX_TOKENS", 512),
         autonomy_mission_interval_sec=_int_env("JARVIS_AUTONOMY_MISSION_INTERVAL_SEC", 120),
+        reminder_interval_sec=_int_env("JARVIS_REMINDER_INTERVAL_SEC", 30),
+        reminder_tz=os.environ.get("JARVIS_REMINDER_TZ", "Europe/Moscow"),
         api_host=os.environ.get("JARVIS_API_HOST", "0.0.0.0"),
         api_port=_int_env("JARVIS_API_PORT", 8000),
         api_require_token_on_loopback=_bool_env("JARVIS_API_REQUIRE_TOKEN_ON_LOOPBACK", False),

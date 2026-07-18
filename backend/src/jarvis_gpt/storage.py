@@ -546,6 +546,7 @@ class JarvisStorage:
             "memories",
             "missions",
             "mission_tasks",
+            "reminders",
             "files",
             "file_chunks",
             "tool_runs",
@@ -1530,6 +1531,218 @@ class JarvisStorage:
             after=claimed,
         )
         return claimed
+
+    # ---- Reminders -----------------------------------------------------------
+
+    @staticmethod
+    def _decode_reminder(row: Any) -> dict[str, Any]:
+        reminder = dict(row)
+        reminder["recurrence"] = _loads(reminder.get("recurrence"), None)
+        reminder["payload"] = _loads(reminder.get("payload"), {})
+        return reminder
+
+    def create_reminder(
+        self,
+        *,
+        text: str,
+        due_at: str,
+        recurrence: dict[str, Any] | None = None,
+        conversation_id: str | None = None,
+        source_text: str = "",
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Persist a pending reminder. ``due_at`` is a UTC ISO string (see reminders.to_utc_iso)."""
+
+        now = utc_now()
+        row = {
+            "id": new_id("rem"),
+            "created_at": now,
+            "updated_at": now,
+            "text": text.strip()[:500],
+            "due_at": due_at,
+            "recurrence": recurrence or None,
+            "status": "pending",
+            "conversation_id": conversation_id,
+            "source_text": (source_text or "")[:1000],
+            "fired_at": None,
+            "fire_count": 0,
+            "payload": payload or {},
+        }
+        with self._lock:
+            conn = self.connect()
+            conn.execute(
+                """
+                INSERT INTO reminders(
+                    id, created_at, updated_at, text, due_at, recurrence, status,
+                    conversation_id, source_text, fired_at, fire_count, payload
+                )
+                VALUES (
+                    :id, :created_at, :updated_at, :text, :due_at, :recurrence, :status,
+                    :conversation_id, :source_text, :fired_at, :fire_count, :payload
+                )
+                """,
+                {
+                    **row,
+                    "recurrence": _json(row["recurrence"]) if row["recurrence"] else None,
+                    "payload": _json(row["payload"]),
+                },
+            )
+            conn.commit()
+        self.record_audit(
+            actor="operator",
+            action="reminder.create",
+            target_type="reminder",
+            target_id=row["id"],
+            summary=f"Reminder: {row['text']} @ {due_at}",
+            after=row,
+        )
+        return row
+
+    def list_reminders(
+        self,
+        *,
+        status: str | None = "pending",
+        before: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        query = (
+            "SELECT id, created_at, updated_at, text, due_at, recurrence, status, "
+            "conversation_id, source_text, fired_at, fire_count, payload FROM reminders"
+        )
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status and status != "all":
+            clauses.append("status = ?")
+            params.append(status)
+        if before:
+            clauses.append("due_at <= ?")
+            params.append(before)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY due_at ASC LIMIT ?"
+        params.append(limit)
+        with self._lock:
+            rows = self.connect().execute(query, tuple(params)).fetchall()
+        return [self._decode_reminder(row) for row in rows]
+
+    def get_reminder(self, reminder_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self.connect().execute(
+                """
+                SELECT id, created_at, updated_at, text, due_at, recurrence, status,
+                       conversation_id, source_text, fired_at, fire_count, payload
+                FROM reminders
+                WHERE id = ?
+                """,
+                (reminder_id,),
+            ).fetchone()
+        return self._decode_reminder(row) if row is not None else None
+
+    def cancel_reminder(self, reminder_id: str) -> dict[str, Any] | None:
+        """Cancel a still-pending reminder, guarding against a concurrent fire."""
+
+        now = utc_now()
+        with self._lock:
+            conn = self.connect()
+            row = conn.execute(
+                """
+                UPDATE reminders
+                SET status = 'cancelled', updated_at = ?
+                WHERE id = ? AND status = 'pending'
+                RETURNING id, created_at, updated_at, text, due_at, recurrence, status,
+                          conversation_id, source_text, fired_at, fire_count, payload
+                """,
+                (now, reminder_id),
+            ).fetchone()
+            conn.commit()
+        if row is None:
+            return None
+        cancelled = self._decode_reminder(row)
+        self.record_audit(
+            actor="operator",
+            action="reminder.cancel",
+            target_type="reminder",
+            target_id=reminder_id,
+            summary=f"Reminder cancelled: {cancelled['text']}",
+            after=cancelled,
+        )
+        return cancelled
+
+    def claim_due_reminders(
+        self,
+        now_iso: str | None = None,
+        *,
+        tz_name: str | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Atomically fire every due reminder in a single BEGIN IMMEDIATE transaction.
+
+        One-shot rows flip to ``fired``; recurring rows advance ``due_at`` to the first
+        occurrence strictly after ``now`` (rolled past downtime in one shot — no
+        catch-up burst) and stay ``pending``. Mirrors ``create_mission`` /
+        ``claim_next_mission_task``: ``BEGIN IMMEDIATE`` plus a ``status='pending'``
+        guard on every UPDATE prevents a double fire even if a manual run races the loop.
+        Returns one snapshot per fired reminder (its state *before* advancement).
+        """
+
+        from .reminders import compute_next_due, reminder_zone, to_utc_iso
+
+        now = now_iso or utc_now()
+        tz = reminder_zone(tz_name) if tz_name else reminder_zone()
+        now_local = datetime.fromisoformat(now).astimezone(tz)
+        fired: list[dict[str, Any]] = []
+        with self._lock:
+            conn = self.connect()
+            if conn.in_transaction:
+                raise RuntimeError("reminder claim requires a clean storage transaction")
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                rows = conn.execute(
+                    """
+                    SELECT id, created_at, updated_at, text, due_at, recurrence, status,
+                           conversation_id, source_text, fired_at, fire_count, payload
+                    FROM reminders
+                    WHERE status = 'pending' AND due_at <= ?
+                    ORDER BY due_at ASC
+                    LIMIT ?
+                    """,
+                    (now, limit),
+                ).fetchall()
+                for row in rows:
+                    snapshot = self._decode_reminder(row)
+                    recurrence = snapshot["recurrence"]
+                    next_due = (
+                        compute_next_due(recurrence, after=now_local, tz=tz)
+                        if isinstance(recurrence, dict)
+                        else None
+                    )
+                    if next_due is not None:
+                        conn.execute(
+                            """
+                            UPDATE reminders
+                            SET due_at = ?, fired_at = ?, fire_count = fire_count + 1,
+                                updated_at = ?
+                            WHERE id = ? AND status = 'pending'
+                            """,
+                            (to_utc_iso(next_due), now, now, snapshot["id"]),
+                        )
+                    else:
+                        conn.execute(
+                            """
+                            UPDATE reminders
+                            SET status = 'fired', fired_at = ?, fire_count = fire_count + 1,
+                                updated_at = ?
+                            WHERE id = ? AND status = 'pending'
+                            """,
+                            (now, now, snapshot["id"]),
+                        )
+                    fired.append(snapshot)
+                conn.commit()
+            except BaseException:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
+        return fired
 
     def update_mission_task(
         self,
@@ -3245,6 +3458,21 @@ CREATE TABLE IF NOT EXISTS mission_tasks (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS reminders (
+    id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    text TEXT NOT NULL,
+    due_at TEXT NOT NULL,
+    recurrence TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    conversation_id TEXT,
+    source_text TEXT NOT NULL DEFAULT '',
+    fired_at TEXT,
+    fire_count INTEGER NOT NULL DEFAULT 0,
+    payload TEXT NOT NULL DEFAULT '{}'
+);
+
 CREATE TABLE IF NOT EXISTS files (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -3337,6 +3565,8 @@ CREATE INDEX IF NOT EXISTS idx_runtime_kv_updated ON runtime_kv(updated_at);
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_memories_namespace ON memories(namespace, importance);
 CREATE INDEX IF NOT EXISTS idx_mission_tasks_mission ON mission_tasks(mission_id, position);
+CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders(status, due_at);
+CREATE INDEX IF NOT EXISTS idx_reminders_conversation ON reminders(conversation_id, due_at);
 CREATE INDEX IF NOT EXISTS idx_files_sha256 ON files(sha256);
 CREATE INDEX IF NOT EXISTS idx_files_updated ON files(updated_at);
 CREATE INDEX IF NOT EXISTS idx_file_chunks_file ON file_chunks(file_id, position);

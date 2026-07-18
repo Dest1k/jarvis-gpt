@@ -21,11 +21,13 @@ class RuntimeSupervisor:
         storage: JarvisStorage,
         llm: LLMRouter | None = None,
         autonomy_executor: Any | None = None,
+        bus: Any | None = None,
     ) -> None:
         self.settings = settings
         self.storage = storage
         self.llm = llm or LLMRouter(settings)
         self.autonomy_executor = autonomy_executor
+        self.bus = bus
         self.telemetry = TelemetryCollector(settings)
         self.learning = LearningEngine(storage, llm=self.llm)
         self._tasks: list[asyncio.Task[None]] = []
@@ -70,8 +72,12 @@ class RuntimeSupervisor:
         # Keep refreshing diagnostics even when autonomous jobs, learning, and
         # cognition have been disabled, otherwise /health can serve a stale
         # successful snapshot forever after a dependency fails.
+        # Reminders are user-facing, not an autonomy feature: they must fire even when
+        # background autonomy is disabled, so the loop is scheduled next to the health
+        # loop, ahead of the autonomy early-return below.
         self._tasks = [
-            asyncio.create_task(self._health_loop(), name="jarvis-health-loop")
+            asyncio.create_task(self._health_loop(), name="jarvis-health-loop"),
+            asyncio.create_task(self._reminder_loop(), name="jarvis-reminder-loop"),
         ]
         if not self.settings.autonomy_enabled:
             with suppress(Exception):
@@ -158,6 +164,8 @@ class RuntimeSupervisor:
                 "background.mission.scheduler",
                 "background.mission.runner",
                 "background.mission.budgeted",
+                "reminders.scheduler",
+                "reminders.fire",
                 "audit.observe",
                 "approval.respect",
             ],
@@ -188,6 +196,75 @@ class RuntimeSupervisor:
         while True:
             await asyncio.sleep(max(30, self.settings.autonomy_mission_interval_sec))
             await self._run_background_jobs()
+
+    async def _reminder_loop(self) -> None:
+        while True:
+            await asyncio.sleep(max(5, self.settings.reminder_interval_sec))
+            await self._fire_due_reminders()
+
+    async def _fire_due_reminders(self) -> None:
+        """Claim and deliver every due reminder for this tick.
+
+        SQLite is blocking under an RLock, so the atomic claim runs in a worker thread;
+        the async EventBus publish stays on the loop. Delivery per reminder: a runtime
+        event, an assistant message back into the originating conversation (if bound),
+        and a live ``reminder.fire`` push so the UI updates immediately.
+        """
+
+        try:
+            due = await asyncio.to_thread(
+                self.storage.claim_due_reminders,
+                utc_now(),
+                tz_name=self.settings.reminder_tz,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._last_error = str(exc) or exc.__class__.__name__
+            with suppress(Exception):
+                self.storage.add_event(
+                    kind="autonomy.error",
+                    title="Reminder loop failed",
+                    level="warn",
+                    payload={"error": self._last_error},
+                )
+            return
+        for reminder in due:
+            recurring = bool(reminder.get("recurrence"))
+            with suppress(Exception):
+                self.storage.add_event(
+                    kind="reminder.fire",
+                    title=f"Напоминание: {reminder['text']}",
+                    level="info",
+                    payload={
+                        "reminder_id": reminder["id"],
+                        "due_at": reminder["due_at"],
+                        "recurring": recurring,
+                        "conversation_id": reminder.get("conversation_id"),
+                    },
+                )
+            conversation_id = reminder.get("conversation_id")
+            if conversation_id:
+                with suppress(Exception):
+                    self.storage.add_message(
+                        conversation_id=str(conversation_id),
+                        role="assistant",
+                        content=f"Напоминание: {reminder['text']}",
+                        metadata={"kind": "reminder", "reminder_id": reminder["id"]},
+                    )
+            if self.bus is not None:
+                with suppress(Exception):
+                    await self.bus.publish(
+                        {
+                            "channel": "reminders",
+                            "action": "fire",
+                            "reminder": {
+                                "id": reminder["id"],
+                                "text": reminder["text"],
+                                "due_at": reminder["due_at"],
+                                "recurring": recurring,
+                                "conversation_id": conversation_id,
+                            },
+                        }
+                    )
 
     async def _record_telemetry(self) -> None:
         try:

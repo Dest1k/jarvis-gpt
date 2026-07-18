@@ -8672,12 +8672,14 @@ class AgentRuntime:
         run_kwargs: dict[str, Any] = {
             "mission_id": context.mission_id,
             "task_id": context.task_id,
+            # Bind the origin conversation for every tool (not only authorized ones) so a
+            # safe tool such as reminders.create can record where a fired reminder posts back.
+            "conversation_id": context.conversation_id,
         }
         if authorization is not None:
             context.operator_used_effects.add(effect_key or authorization.fingerprint)
             run_kwargs.update(
                 {
-                    "conversation_id": context.conversation_id,
                     "user_message_id": context.operator_message_id,
                     "authorization": authorization,
                 }
