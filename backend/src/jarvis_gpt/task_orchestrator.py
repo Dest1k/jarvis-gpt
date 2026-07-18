@@ -30,6 +30,11 @@ from typing import Any
 
 # A short plan keeps a weak planner honest and bounds latency; raise only with evidence.
 DEFAULT_MAX_STEPS = 6
+# Long/superlong chains are handled by REPLANNING in rounds rather than one giant plan:
+# after each short round the engine asks "done, or what next?" and plans the next batch from
+# the blackboard. Effective depth = max_steps * max_rounds, but each plan stays short (weak
+# planner stays honest) and the blackboard keeps state without a ballooning transcript.
+DEFAULT_MAX_ROUNDS = 4
 # {{s1}} -> the whole text output of step s1; {{s1.field}} / {{s1.a.0.b}} -> a specific
 # value dug out of step s1's structured .data, so a step can pass a discovered URL/price/id
 # to the next tool rather than the entire summary.
@@ -130,6 +135,91 @@ def _planner_messages(
     return [
         {"role": "system", "content": system},
         {"role": "user", "content": f"Цель: {goal}"},
+    ]
+
+
+def _replanner_messages(
+    goal: str,
+    digest: str,
+    tool_specs: Sequence[tuple[str, str]],
+    max_steps: int,
+) -> list[dict[str, str]]:
+    """Ask, mid-task, whether the goal is met — and if not, plan the next short batch."""
+
+    schema = (
+        '{"done":false,"steps":[{"id":"s1","goal":"...","kind":"tool|reason",'
+        '"tool":"<tool-name-or-null>","arguments":{},"depends_on":[]}]}'
+    )
+    tools_block = "\n".join(f"- {name}: {desc}" for name, desc in tool_specs) or "- (нет)"
+    rules = (
+        "Верни ТОЛЬКО валидный JSON. Если цель ПОЛНОСТЬЮ достигнута по накопленным "
+        "результатам — {\"done\": true}. Иначе {\"done\": false, \"steps\":[...]} с "
+        f"1..{max_steps} следующими КОНКРЕТНЫМИ шагами, которые добывают недостающее. "
+        "Планируй ТОЛЬКО то, чего ещё нет; не повторяй уже сделанное. Тот же формат шага, "
+        "что в плане (kind tool|reason, arguments, {{s1}}-ссылки на шаги ЭТОГО батча). "
+        "Если для недостающего нужны свежие данные — добавь шаг-инструмент."
+    )
+    system = "\n".join(
+        [
+            "Ты ведёшь многошаговую задачу и решаешь, что делать дальше. Схема ответа:",
+            schema,
+            rules,
+            "Доступные инструменты:",
+            tools_block,
+        ]
+    )
+    user = f"Цель: {goal}\n\nУже выполнено и найдено:\n{digest}\n\nГотово или следующие шаги?"
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+
+def _results_digest(results: Sequence[StepResult], *, limit: int = 3000) -> str:
+    """A compact, bounded summary of the blackboard so far, for the replanner."""
+
+    lines: list[str] = []
+    for result in results:
+        if result.output:
+            lines.append(f"[{result.step_id}] {result.title}: {result.output.strip()[:400]}")
+    return "\n".join(lines)[:limit]
+
+
+def _renumber_steps(steps: list[TaskStep], offset: int) -> list[TaskStep]:
+    """Shift a round's step ids to a global sequence (s{offset+1}…).
+
+    Keeps ids, depends_on and {{sN}} placeholders unique and consistent across replanning
+    rounds so the blackboard and placeholder resolution keep working unchanged. Placeholder
+    references to ids NOT produced in this round (i.e. a prior round's global id) are left
+    as-is.
+    """
+
+    id_map = {step.id: f"s{offset + i + 1}" for i, step in enumerate(steps)}
+
+    def _remap(value: Any) -> Any:
+        if isinstance(value, str):
+            def _sub(m: re.Match[str]) -> str:
+                new_id = id_map.get(m.group(1), m.group(1))
+                field = m.group(2)
+                return "{{" + new_id + ("." + field if field else "") + "}}"
+
+            return _PLACEHOLDER_RE.sub(_sub, value)
+        if isinstance(value, list):
+            return [_remap(item) for item in value]
+        if isinstance(value, dict):
+            return {key: _remap(item) for key, item in value.items()}
+        return value
+
+    return [
+        TaskStep(
+            id=id_map[step.id],
+            goal=step.goal,
+            kind=step.kind,
+            tool=step.tool,
+            arguments=_remap(step.arguments),
+            depends_on=[id_map.get(dep, dep) for dep in step.depends_on],
+        )
+        for step in steps
     ]
 
 
@@ -338,6 +428,7 @@ class TaskOrchestrator:
         run_tool: RunToolFn,
         tool_specs: Sequence[tuple[str, str]],
         max_steps: int = DEFAULT_MAX_STEPS,
+        max_rounds: int = DEFAULT_MAX_ROUNDS,
         emit: EmitFn | None = None,
         plan_complete: CompleteFn | None = None,
         fallback_query_tool: str | None = None,
@@ -359,6 +450,8 @@ class TaskOrchestrator:
         if fallback_query_tool:
             self._allowed_tools.add(fallback_query_tool)
         self._max_steps = max(1, min(12, int(max_steps)))
+        # 1 round == the old single-plan behaviour; more rounds unlock deep chains.
+        self._max_rounds = max(1, min(8, int(max_rounds)))
         self._emit = emit
 
     async def _plan(self, goal: str) -> TaskPlan:
@@ -470,6 +563,42 @@ class TaskOrchestrator:
             with suppress(Exception):
                 await self._emit(kind, payload)
 
+    async def _replan(
+        self, goal: str, results: list[StepResult], executed: int
+    ) -> TaskPlan | None:
+        """Assess completion and plan the next round from the blackboard, or stop.
+
+        Returns a continuation plan (its step ids renumbered to continue the global
+        sequence) or None when the goal is met, the model can't continue, or nothing new is
+        proposed. Never raises — a bad replan just ends the loop and we synthesize.
+        """
+
+        digest = _results_digest(results)
+        if not digest:
+            return None
+        content = ""
+        try:
+            messages = _replanner_messages(goal, digest, self._tool_specs, self._max_steps)
+            result = await self._plan_complete(messages)
+            content = getattr(result, "content", "") if getattr(result, "ok", False) else ""
+        except Exception:  # noqa: BLE001 - replanning must never crash the task
+            return None
+        match = _JSON_OBJECT_RE.search(content or "")
+        if not match:
+            return None
+        try:
+            payload = json.loads(match.group(0))
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(payload, dict) or payload.get("done") is True:
+            return None
+        steps = _coerce_steps(
+            payload.get("steps"), allowed_tools=self._allowed_tools, max_steps=self._max_steps
+        )
+        if not steps:
+            return None
+        return TaskPlan(goal=goal, steps=_renumber_steps(steps, executed))
+
     async def run(self, goal: str) -> OrchestrationResult:
         goal = " ".join(str(goal or "").split())
         if not goal:
@@ -478,25 +607,46 @@ class TaskOrchestrator:
                 ok=False, answer="", plan=empty, results=[], stopped_reason="empty"
             )
         plan = await self._plan(goal)
-        plan_steps = [{"id": s.id, "goal": s.goal, "kind": s.kind} for s in plan.steps]
-        await self._emit_event("plan", {"goal": goal, "steps": plan_steps})
+        first_plan = plan
         blackboard: dict[str, StepResult] = {}
         results: list[StepResult] = []
-        for step in plan.steps:
-            if step.kind == "tool":
-                result = await self._run_tool_step(step, blackboard)
-            else:
-                context = _curated_context(step, blackboard)
-                result = await self._run_reason_step(step, context, goal)
-            blackboard[step.id] = result
-            results.append(result)
+        tool_step_ids: set[str] = set()
+        executed = 0
+        rounds = 0
+        # Plan -> execute -> replan loop: deep chains are reached by short rounds, not one
+        # giant plan. A simple task's replan returns done after round 1 (old behaviour).
+        for round_num in range(1, self._max_rounds + 1):
+            rounds = round_num
             await self._emit_event(
-                "step",
-                {"id": step.id, "goal": step.goal, "kind": step.kind, "ok": result.ok},
+                "plan" if round_num == 1 else "replan",
+                {
+                    "goal": goal,
+                    "round": round_num,
+                    "steps": [{"id": s.id, "goal": s.goal, "kind": s.kind} for s in plan.steps],
+                },
             )
-        # Reliability backstop: if no tool step produced substantial data, run one
-        # deterministic research pass on the goal so the answer is grounded in evidence.
-        tool_step_ids = {step.id for step in plan.steps if step.kind == "tool"}
+            for step in plan.steps:
+                if step.kind == "tool":
+                    tool_step_ids.add(step.id)
+                    result = await self._run_tool_step(step, blackboard)
+                else:
+                    context = _curated_context(step, blackboard)
+                    result = await self._run_reason_step(step, context, goal)
+                blackboard[step.id] = result
+                results.append(result)
+                executed += 1
+                await self._emit_event(
+                    "step",
+                    {"id": step.id, "goal": step.goal, "kind": step.kind, "ok": result.ok},
+                )
+            if round_num >= self._max_rounds:
+                break
+            next_plan = await self._replan(goal, results, executed)
+            if next_plan is None or not next_plan.steps:
+                break
+            plan = next_plan
+        # Reliability backstop: if NO tool step across all rounds produced substantial data,
+        # run one deterministic research pass on the goal so the answer is grounded.
         grounded = any(
             r.ok and r.step_id in tool_step_ids and len(r.output.strip()) >= 80
             for r in results
@@ -524,7 +674,7 @@ class TaskOrchestrator:
         return OrchestrationResult(
             ok=bool(answer),
             answer=answer,
-            plan=plan,
+            plan=first_plan,
             results=results,
-            stopped_reason="completed" if results else "empty",
+            stopped_reason=f"completed:{rounds}round" if results else "empty",
         )

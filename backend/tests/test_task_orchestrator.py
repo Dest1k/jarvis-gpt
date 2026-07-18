@@ -166,9 +166,91 @@ def test_plan_complete_brain_handles_planning_only():
         plan_complete=plan_complete,
     )
     result = asyncio.run(orch.run("сделай что-то"))
-    assert len(plan_calls) == 1  # exactly one planning call, via the dedicated brain
-    assert len(exec_calls) >= 1  # reason step + synthesis went to the execution brain
+    # All planning — the initial plan AND every replan round — goes to the dedicated
+    # planner brain; steps + synthesis go to the execution brain. (This stub never returns
+    # "done", so replanning runs to the round cap; a real replanner stops when the goal is
+    # met.)
+    assert len(plan_calls) >= 1
+    assert len(exec_calls) >= 1
     assert result.ok
+
+
+def test_replan_runs_multiple_rounds_until_done():
+    # Deep chains via short rounds: round 1 plans a step, the replanner asks for a second
+    # batch, then says done. Ids continue globally so the blackboard stays consistent.
+    plan_responses = [
+        '{"steps":[{"id":"s1","goal":"первый шаг","kind":"reason"}]}',
+        '{"done":false,"steps":[{"id":"s1","goal":"второй шаг","kind":"reason"}]}',
+        '{"done":true}',
+    ]
+    calls = {"n": 0}
+
+    async def plan_complete(messages):
+        idx = min(calls["n"], len(plan_responses) - 1)
+        calls["n"] += 1
+        return _LLM(True, plan_responses[idx])
+
+    async def complete(messages):
+        return _LLM(True, "результат шага")
+
+    async def run_tool(name, arguments):  # pragma: no cover - no tool step here
+        raise AssertionError("no tool step expected")
+
+    orch = TaskOrchestrator(
+        complete=complete,
+        run_tool=run_tool,
+        tool_specs=[],
+        plan_complete=plan_complete,
+        max_rounds=4,
+    )
+    result = asyncio.run(orch.run("многоходовка"))
+    # Two rounds ran (one step each); ids continue s1 -> s2; then the replanner stopped.
+    assert [r.step_id for r in result.results] == ["s1", "s2"]
+    assert result.ok
+    assert result.stopped_reason == "completed:2round"
+
+
+def test_renumber_steps_shifts_ids_placeholders_and_deps():
+    from jarvis_gpt.task_orchestrator import TaskStep, _renumber_steps
+
+    steps = [
+        TaskStep(id="s1", goal="find", kind="tool", tool="web.search", arguments={"q": "x"}),
+        TaskStep(
+            id="s2",
+            goal="open",
+            kind="tool",
+            tool="browser.open",
+            arguments={"url": "{{s1.url}}"},
+            depends_on=["s1"],
+        ),
+    ]
+    out = _renumber_steps(steps, offset=3)
+    assert [s.id for s in out] == ["s4", "s5"]
+    assert out[1].arguments["url"] == "{{s4.url}}"  # within-round ref follows the renumber
+    assert out[1].depends_on == ["s4"]
+
+
+def test_replan_stops_at_round_cap():
+    # A replanner that never says done still terminates at max_rounds.
+    async def plan_complete(messages):
+        return _LLM(True, '{"steps":[{"id":"s1","goal":"ещё","kind":"reason"}]}')
+
+    async def complete(messages):
+        return _LLM(True, "ok")
+
+    async def run_tool(name, arguments):  # pragma: no cover
+        raise AssertionError("no tool step")
+
+    orch = TaskOrchestrator(
+        complete=complete,
+        run_tool=run_tool,
+        tool_specs=[],
+        plan_complete=plan_complete,
+        max_rounds=3,
+    )
+    result = asyncio.run(orch.run("бесконечная"))
+    assert len(result.results) == 3  # exactly max_rounds steps, no runaway
+    assert result.stopped_reason == "completed:3round"
 
 
 def test_research_backstop_runs_when_plan_produced_no_data():
