@@ -2199,6 +2199,7 @@ def test_financial_provider_failure_never_falls_back_to_model_memory():
 
     assert action is not None
     assert "Не удалось подтвердить свежую рыночную котировку" in action.answer
+    assert "Brent/WTI" in action.answer
     assert "нет доступа к данным" not in action.answer.casefold()
     assert runtime.tools.calls == [
         (
@@ -2212,6 +2213,76 @@ def test_financial_provider_failure_never_falls_back_to_model_memory():
             },
         )
     ]
+
+
+def test_fx_provider_failure_does_not_ask_for_brent_or_ticker():
+    runtime = object.__new__(agent_module.AgentRuntime)
+    runtime.tools = _FailingFinancialTools()
+
+    action = asyncio.run(
+        runtime._run_web_answer_engine(
+            message="курс рубля к доллару",
+            query="курс рубля к доллару",
+            conversation_id=None,
+        )
+    )
+
+    assert action is not None
+    assert "валютн" in action.answer.casefold()
+    assert "Brent" not in action.answer
+    assert "WTI" not in action.answer
+    assert "тикер" not in action.answer.casefold()
+    assert "USD/RUB" in action.answer or "валютную пару" in action.answer.casefold()
+
+
+def test_cbr_fx_rate_helpers_and_answer_format():
+    valute = {
+        "USD": {"CharCode": "USD", "Nominal": 1, "Value": 78.5},
+        "EUR": {"CharCode": "EUR", "Nominal": 1, "Value": 85.0},
+    }
+    assert tools_module._web_answer_cbr_pair_rate(valute, base="USD", quote="RUB") == 78.5
+    rub_usd = tools_module._web_answer_cbr_pair_rate(valute, base="RUB", quote="USD")
+    assert rub_usd is not None and abs(rub_usd - (1 / 78.5)) < 1e-9
+    assert tools_module._web_answer_financial_instrument_kind("курс рубля к доллару") == "fx"
+    assert tools_module._web_answer_requested_currency_pairs("курс рубля к доллару") == [
+        ("RUB", "USD")
+    ]
+    source = {
+        "url": "https://www.cbr-xml-daily.ru/daily_json.js",
+        "title": "CBR official FX rate RUB/USD",
+        "excerpt": (
+            "Official Bank of Russia daily FX table: currency pair RUB/USD "
+            "rate is 0.0127 USD per 1 RUB on 2026-07-18."
+        ),
+        "market_quote": {
+            "instrument_type": "FX",
+            "provider": "cbr",
+            "base": "RUB",
+            "quote": "USD",
+            "price": "0.0127",
+            "quote_date": "2026-07-18",
+        },
+    }
+    answer = tools_module._format_fx_provider_answer("курс рубля к доллару", [source])
+    assert "RUB/USD" in answer
+    assert "0.0127" in answer
+    assert "Банка России" in answer
+    # FX uses its own grounding path — oil/futures contract must not reject it.
+    assert tools_module._web_answer_fx_answer_is_grounded(
+        answer,
+        question="курс рубля к доллару",
+        sources=[source],
+    )
+
+
+def test_fx_failure_path_never_mentions_brent_when_web_answer_fails():
+    """Regression: currency questions used the oil fail-closed copy."""
+
+    assert agent_module._financial_failure_instrument_kind("курс рубля к доллару") == "fx"
+    assert agent_module._financial_failure_instrument_kind("цены на нефть Brent") in {
+        "crude",
+        "futures",
+    }
 
 
 def test_financial_web_answer_bypasses_answer_cache_on_every_turn(monkeypatch, tmp_path):

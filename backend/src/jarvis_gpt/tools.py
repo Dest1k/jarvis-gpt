@@ -9867,8 +9867,20 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
         )
         synthesis = {"attempted": False, "used": False, "reason": "deterministic_news"}
     else:
-        if _web_answer_financial_instrument_kind(resolved_question) == "ambiguous_oil_security":
+        financial_kind = _web_answer_financial_instrument_kind(resolved_question)
+        if financial_kind == "ambiguous_oil_security":
             fallback_answer = _format_ambiguous_oil_security_answer(ranked_sources)
+        elif financial_kind == "fx":
+            fallback_answer = _format_fx_provider_answer(
+                resolved_question, ranked_sources
+            ) or _format_web_answer_report(
+                question=resolved_question,
+                queries=queries,
+                sources=ranked_sources,
+                verification=verification_dict,
+                preferred_domains=preferred_domains,
+                direct_links=direct_links,
+            )
         else:
             fallback_answer = _format_web_answer_report(
                 question=resolved_question,
@@ -9911,16 +9923,65 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
         synthesis = {"attempted": False, "used": False, "reason": "weak_shopping_sources"}
     financial_contract_rejection = ""
     if financial_market:
-        financial_contract_rejection = _web_answer_financial_synthesis_rejection(
-            answer,
-            question=resolved_question,
-            sources=ranked_sources,
-        )
+        financial_kind = _web_answer_financial_instrument_kind(resolved_question)
+        # Root cause for «курс рубля»: FX was forced through the oil/futures field
+        # contract. Live CBR/web sources often had the rate, but synthesis rejected
+        # ordinary FX phrasing → ok=False → agent failed closed with Brent/WTI copy.
+        # For FX, accept a typed grounded answer (pair + rate + date + cited URL).
+        if financial_kind == "fx":
+            fx_sources = _web_answer_fx_typed_sources(ranked_sources)
+            fx_answer = _format_fx_provider_answer(resolved_question, fx_sources)
+            if fx_answer and _web_answer_fx_answer_is_grounded(
+                fx_answer,
+                question=resolved_question,
+                sources=fx_sources or ranked_sources,
+            ):
+                answer = fx_answer
+                financial_contract_rejection = ""
+                synthesis = {
+                    **synthesis,
+                    "used": False,
+                    "reason": "deterministic_fx_provider",
+                }
+            else:
+                generic_rejection = _web_answer_financial_synthesis_rejection(
+                    answer,
+                    question=resolved_question,
+                    sources=ranked_sources,
+                )
+                if generic_rejection and _web_answer_fx_answer_is_grounded(
+                    answer,
+                    question=resolved_question,
+                    sources=ranked_sources,
+                ):
+                    # Generic oil/futures contract rejected the wording, but the FX
+                    # rate is still present on a cited live source — accept it.
+                    financial_contract_rejection = ""
+                    synthesis = {
+                        **synthesis,
+                        "used": bool(synthesis.get("used")),
+                        "reason": "fx_grounded_override",
+                        "generic_rejection": generic_rejection,
+                    }
+                else:
+                    financial_contract_rejection = generic_rejection
+        else:
+            financial_contract_rejection = _web_answer_financial_synthesis_rejection(
+                answer,
+                question=resolved_question,
+                sources=ranked_sources,
+            )
         if financial_contract_rejection:
             answer = (
                 "Не удалось подтвердить свежую котировку как цельный рыночный факт: "
                 "инструмент, значение, валюта/единица и время должны находиться в одном "
                 "актуальном источнике. Устаревшие или смешанные данные не выдаю за текущие."
+                if financial_kind != "fx"
+                else (
+                    "Не удалось подтвердить свежий валютный курс: в live-источниках нет "
+                    "согласованной пары, значения и даты. Старые сниппеты и знания модели "
+                    "за текущий курс не выдаю."
+                )
             )
             synthesis = {
                 **synthesis,
@@ -16052,6 +16113,360 @@ def _web_answer_cftc_crude_contract_evidence(
     }
 
 
+_WEB_ANSWER_CBR_DAILY_JSON_URL = "https://www.cbr-xml-daily.ru/daily_json.js"
+_WEB_ANSWER_CBR_OFFICIAL_PAGE = "https://www.cbr.ru/currency_base/daily/"
+
+
+def _web_answer_cbr_rub_per_unit(valute: dict[str, Any], code: str) -> float | None:
+    """Return RUB per 1 unit of ``code`` from a CBR daily payload."""
+
+    if code == "RUB":
+        return 1.0
+    entry = valute.get(code)
+    if not isinstance(entry, dict):
+        return None
+    raw_value = entry.get("Value")
+    raw_nominal = entry.get("Nominal")
+    try:
+        if isinstance(raw_value, str):
+            raw_value = raw_value.replace(",", ".")
+        if isinstance(raw_nominal, str):
+            raw_nominal = raw_nominal.replace(",", ".")
+        value = float(raw_value)
+        nominal = float(raw_nominal)
+    except (TypeError, ValueError):
+        return None
+    if (
+        isinstance(value, bool)
+        or isinstance(nominal, bool)
+        or not math.isfinite(value)
+        or not math.isfinite(nominal)
+        or nominal <= 0
+        or value <= 0
+    ):
+        return None
+    return value / nominal
+
+
+def _web_answer_cbr_pair_rate(
+    valute: dict[str, Any],
+    *,
+    base: str,
+    quote: str,
+) -> float | None:
+    """How many units of ``quote`` for 1 unit of ``base``, via RUB cross rates."""
+
+    rub_per_base = _web_answer_cbr_rub_per_unit(valute, base)
+    rub_per_quote = _web_answer_cbr_rub_per_unit(valute, quote)
+    if rub_per_base is None or rub_per_quote is None or rub_per_quote == 0:
+        return None
+    rate = rub_per_base / rub_per_quote
+    if not math.isfinite(rate) or rate <= 0:
+        return None
+    return rate
+
+
+def _web_answer_parse_cbr_daily_date(raw: str) -> date | None:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    with suppress(ValueError):
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone(timedelta(hours=3)))
+        return parsed.astimezone(timezone(timedelta(hours=3))).date()
+    match = re.search(r"\b(\d{2})\.(\d{2})\.(20\d{2})\b", text)
+    if match:
+        with suppress(ValueError):
+            return date(int(match.group(3)), int(match.group(2)), int(match.group(1)))
+    return None
+
+
+def _format_fx_provider_answer(question: str, sources: list[dict[str, Any]]) -> str:
+    """Deterministic FX answer from typed live FX sources (CBR / extracted web).
+
+    Wording is intentional: keep the quote status as live_current under the
+    financial value-status grammar (avoid genitive forms that trip
+    unknown_modifier) and always emit an explicit BASE/QUOTE pair plus URL so
+    web.answer can accept the fact without the oil/futures contract path.
+    """
+
+    _ = question
+    lines: list[str] = []
+    for source in sources:
+        quote = source.get("market_quote")
+        if not isinstance(quote, dict):
+            continue
+        if str(quote.get("instrument_type") or "").upper() != "FX":
+            continue
+        base = str(quote.get("base") or "").strip().upper()
+        quote_ccy = str(quote.get("quote") or "").strip().upper()
+        price = str(quote.get("price") or "").strip()
+        quote_date = str(quote.get("quote_date") or "").strip()
+        url = str(source.get("url") or "").strip()
+        provider = str(quote.get("provider") or "").strip().lower()
+        if not (base and quote_ccy and price and quote_date and url):
+            continue
+        origin = (
+            "официальный курс Банка России"
+            if provider in {"", "cbr"}
+            else "live web-источник"
+        )
+        lines.append(
+            f"Текущий курс {base}/{quote_ccy}: {price} {quote_ccy} за 1 {base} "
+            f"на {quote_date} ({origin}). Источник: {url}"
+        )
+    if lines:
+        return "\n".join(lines)
+    return ""
+
+
+def _web_answer_fx_typed_sources(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    typed: list[dict[str, Any]] = []
+    for source in sources:
+        quote = source.get("market_quote")
+        if not isinstance(quote, dict):
+            continue
+        if str(quote.get("instrument_type") or "").upper() != "FX":
+            continue
+        typed.append(source)
+    return typed
+
+
+def _web_answer_fx_answer_is_grounded(
+    answer: str,
+    *,
+    question: str,
+    sources: list[dict[str, Any]],
+) -> bool:
+    """FX-specific grounding: pair + rate + date + cited source URL.
+
+    The shared financial synthesis contract was built for oil/futures field
+    binding and rejects ordinary FX phrasing even when every number is on a
+    live CBR/web page. For currency rates we require explicit evidence, not
+    that machinery.
+    """
+
+    answer_text = str(answer or "").strip()
+    if not answer_text or not sources:
+        return False
+    pairs = _web_answer_requested_currency_pairs(question) or [("USD", "RUB")]
+    if not all(_web_answer_contains_currency_pair(answer_text, pair) for pair in pairs):
+        return False
+    answer_dates = _web_answer_financial_explicit_dates(answer_text)
+    if not answer_dates or not any(
+        _web_answer_financial_date_is_fresh(item, kind="fx") for item in answer_dates
+    ):
+        return False
+    cited = _web_answer_cited_urls(answer_text)
+    if not cited:
+        return False
+    answer_numbers = _web_answer_number_forms_from_text(answer_text)
+    if not answer_numbers:
+        return False
+    for source in sources:
+        source_url = _web_answer_canonical_citation_url(str(source.get("url") or ""))
+        if not source_url or source_url not in cited:
+            continue
+        source_text = _web_answer_financial_source_text(source)
+        source_numbers = _web_answer_number_forms_from_text(source_text)
+        if not answer_numbers.intersection(source_numbers):
+            # Typed FX market_quote.price is authoritative even if excerpt formatting
+            # differs slightly (comma vs dot already normalized by number forms).
+            quote = source.get("market_quote")
+            if isinstance(quote, dict):
+                price_forms = _web_answer_number_forms(str(quote.get("price") or ""))
+                if answer_numbers.intersection(price_forms):
+                    return True
+            continue
+        return True
+    return False
+
+
+def _web_answer_number_forms_from_text(text: str) -> set[str]:
+    forms: set[str] = set()
+    for match in _WEB_FINANCIAL_NUMBER_RE.finditer(str(text or "")):
+        forms |= _web_answer_number_forms(match.group(0))
+    return forms
+
+
+async def _web_answer_fx_cbr_provider_sources(
+    ctx: ToolContext,
+    *,
+    question: str,
+    orchestrator: WebOrchestrator,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Live FX rates from the Bank of Russia daily table (via cbr-xml-daily mirror)."""
+
+    pairs = _web_answer_requested_currency_pairs(question)
+    if not pairs:
+        # Unqualified "курс" with a single foreign currency is handled by pair inference;
+        # if still empty, default to the local USD/RUB convention.
+        pairs = [("USD", "RUB")]
+    steps: list[dict[str, Any]] = []
+    url = _WEB_ANSWER_CBR_DAILY_JSON_URL
+
+    async def fetch_cbr() -> ToolRunResponse:
+        return await _web_fetch(
+            ctx,
+            {
+                "url": url,
+                "max_chars": 50_000,
+                "use_cache": False,
+            },
+        )
+
+    try:
+        fetched = await _web_orchestrated_network_call(
+            orchestrator,
+            "fetches",
+            fetch_cbr,
+            max_chars=50_000,
+        )
+    except WebBudgetExceeded as exc:
+        orchestrator.budget.warn(str(exc))
+        steps.append(
+            {
+                "tool": "web.market.fx-cbr",
+                "ok": False,
+                "summary": str(exc),
+                "url": url,
+            }
+        )
+        return [], steps
+    steps.append(
+        {
+            "tool": "web.market.fx-cbr",
+            "ok": bool(fetched.ok),
+            "summary": fetched.summary,
+            "url": url,
+        }
+    )
+    if not fetched.ok:
+        return [], steps
+    raw_text = str((fetched.data or {}).get("text") or "")
+    try:
+        await orchestrator.budget.account_content(raw_text)
+    except WebBudgetExceeded as exc:
+        orchestrator.budget.warn(str(exc))
+        steps.append(
+            {
+                "tool": "web.market.fx-cbr",
+                "ok": False,
+                "summary": str(exc),
+                "url": url,
+            }
+        )
+        return [], steps
+    try:
+        payload = json.loads(raw_text)
+    except json.JSONDecodeError:
+        steps.append(
+            {
+                "tool": "web.market.fx-cbr",
+                "ok": False,
+                "summary": "CBR daily JSON is not valid JSON.",
+                "url": url,
+            }
+        )
+        return [], steps
+    if not isinstance(payload, dict):
+        return [], steps
+    valute = payload.get("Valute")
+    if not isinstance(valute, dict):
+        return [], steps
+    quote_date = _web_answer_parse_cbr_daily_date(str(payload.get("Date") or ""))
+    if quote_date is None or not _web_answer_financial_date_is_fresh(
+        quote_date, kind="fx"
+    ):
+        steps.append(
+            {
+                "tool": "web.market.fx-cbr",
+                "ok": False,
+                "summary": f"CBR quote date is missing or stale: {payload.get('Date')!r}",
+                "url": url,
+            }
+        )
+        return [], steps
+    sources: list[dict[str, Any]] = []
+    for base, quote_ccy in pairs[:4]:
+        rate = _web_answer_cbr_pair_rate(valute, base=base, quote=quote_ccy)
+        if rate is None:
+            steps.append(
+                {
+                    "tool": "web.market.fx-cbr",
+                    "ok": False,
+                    "summary": f"CBR table has no rate for {base}/{quote_ccy}.",
+                    "pair": f"{base}/{quote_ccy}",
+                    "url": url,
+                }
+            )
+            continue
+        # Keep readable precision without scientific notation noise.
+        if rate >= 100:
+            price = f"{rate:.4f}".rstrip("0").rstrip(".")
+        elif rate >= 1:
+            price = f"{rate:.6f}".rstrip("0").rstrip(".")
+        else:
+            price = f"{rate:.8f}".rstrip("0").rstrip(".")
+        date_text = quote_date.isoformat()
+        excerpt = (
+            f"Official Bank of Russia daily FX table: currency pair {base}/{quote_ccy} "
+            f"rate is {price} {quote_ccy} per 1 {base} on {date_text}. "
+            f"Source payload: {url}. Official page: {_WEB_ANSWER_CBR_OFFICIAL_PAGE}."
+        )
+        sources.append(
+            {
+                "rank": 0,
+                "title": f"CBR official FX rate {base}/{quote_ccy}",
+                "url": url,
+                "requested_url": None,
+                "snippet": excerpt,
+                "vertical": "web",
+                "published": date_text,
+                "published_date": date_text,
+                "price": f"{price} {quote_ccy}",
+                "products": None,
+                "rating": None,
+                "fetched": True,
+                "tool": fetched.tool,
+                "evidence_id": str((fetched.data or {}).get("evidence_id") or "") or None,
+                "supporting_evidence_ids": [],
+                "excerpt": excerpt,
+                "quality": "market-data-api",
+                "extraction": {
+                    "kind": "market_quote",
+                    "prices": [f"{price} {quote_ccy}"],
+                    "dates": [date_text],
+                    "availability": [],
+                    "schema_types": [],
+                },
+                "market_quote": {
+                    "instrument_type": "FX",
+                    "provider": "cbr",
+                    "base": base,
+                    "quote": quote_ccy,
+                    "pair": f"{base}/{quote_ccy}",
+                    "currency": quote_ccy,
+                    "unit": f"per 1 {base}",
+                    "price": price,
+                    "quote_date": date_text,
+                    "quote_time_utc": f"{date_text}T00:00:00Z",
+                },
+            }
+        )
+        steps.append(
+            {
+                "tool": "web.market.fx-cbr",
+                "ok": True,
+                "summary": f"Fetched CBR rate for {base}/{quote_ccy}: {price}",
+                "pair": f"{base}/{quote_ccy}",
+                "url": url,
+            }
+        )
+    return sources, steps
+
+
 async def _web_answer_financial_provider_sources(
     ctx: ToolContext,
     *,
@@ -16060,11 +16475,15 @@ async def _web_answer_financial_provider_sources(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Fetch typed live quote tuples before generic financial web search."""
 
+    kind = _web_answer_financial_instrument_kind(question)
+    if kind == "fx":
+        return await _web_answer_fx_cbr_provider_sources(
+            ctx,
+            question=question,
+            orchestrator=orchestrator,
+        )
     benchmarks = _web_answer_requested_benchmarks(question)
-    if (
-        not benchmarks
-        or _web_answer_financial_instrument_kind(question) not in {"crude", "futures"}
-    ):
+    if not benchmarks or kind not in {"crude", "futures"}:
         return [], []
     sources: list[dict[str, Any]] = []
     steps: list[dict[str, Any]] = []
@@ -19490,9 +19909,12 @@ def _web_answer_financial_has_unknown_role_modifier(
         "контракт", "рынок", "рыночная", "котировка", "цена", "курс", "индекс",
         "текущая", "текущий", "текущее", "последняя", "последний", "последнее",
         "актуальная", "актуальный", "официальная", "официальный", "реальная",
-        "реальный", "доступная", "доступный", "биржа", "валютная", "пара",
-        "к", "один", "доллар", "доллара", "долларов", "рубль", "рубля", "рублю",
-        "рублей", "сша", "евро", "фунт", "фунта", "юань", "юаня", "иена", "иены",
+        "реальный", "доступная", "доступный", "биржа", "валютная", "валютной",
+        "валютный", "валютные", "валютных", "пара", "пары", "пару", "паре",
+        "банк", "банка", "россии", "цб", "рф",
+        "к", "один", "доллар", "доллара", "долларов", "доллару", "долларе",
+        "рубль", "рубля", "рублю", "рубле", "рублей", "руб",
+        "сша", "евро", "фунт", "фунта", "юань", "юаня", "иена", "иены",
     }
     for match in re.finditer(r"[A-Za-zА-Яа-яЁё]+", prefix):
         token = match.group(0)
@@ -20588,6 +21010,10 @@ def _web_answer_financial_date_is_fresh(
     today: date | None = None,
 ) -> bool:
     current = today or _web_news_today()
+    if kind == "fx":
+        # CBR publishes one official daily table (often previous business day).
+        # Accept a short calendar window rather than US equity sessions.
+        return current - timedelta(days=5) <= value <= current
     if kind in {
         "equity",
         "index",
@@ -20596,7 +21022,6 @@ def _web_answer_financial_date_is_fresh(
         "crude",
         "futures",
         "commodity",
-        "fx",
     }:
         # Use scheduled exchange sessions, not Moscow calendar weekdays.  This
         # accepts Friday's last quote on Tuesday before the open after a Monday
@@ -21150,9 +21575,49 @@ def _web_answer_financial_instrument_kind(question: str) -> str:
         return "commodity"
     if any(
         marker in normalized
-        for marker in ("валют", "usd", "eur", "рубл", "доллар", "forex", "fx")
-    ) and not re.search(r"\bне\s+(?:доллар|валют|usd|eur|рубл)", normalized):
-        return "fx"
+        for marker in (
+            "валют",
+            "usd",
+            "eur",
+            "gbp",
+            "cny",
+            "jpy",
+            "рубл",
+            "доллар",
+            "евро",
+            "юан",
+            "фунт",
+            "иен",
+            "forex",
+            "fx",
+            "курс",
+        )
+    ) and not re.search(
+        r"\bне\s+(?:доллар|валют|usd|eur|рубл|евро|юан)",
+        normalized,
+    ):
+        # Bare "курс" alone is not FX (could be stock). Require a currency/pair cue
+        # unless "валют"/"forex" already present.
+        if any(
+            marker in normalized
+            for marker in (
+                "валют",
+                "forex",
+                "fx",
+                "usd",
+                "eur",
+                "gbp",
+                "cny",
+                "jpy",
+                "рубл",
+                "доллар",
+                "евро",
+                "юан",
+                "фунт",
+                "иен",
+            )
+        ):
+            return "fx"
     return "market"
 
 

@@ -6678,12 +6678,35 @@ class AgentRuntime:
         )
 
         def financial_failure(detail: str) -> DirectAction:
-            answer = (
-                "Не удалось подтвердить свежую рыночную котировку через live web-поиск. "
-                "Старые сниппеты и знания модели за текущую цену не выдаю. "
-                "Уточни бенчмарк (Brent/WTI), тикер/биржу, ETF или фьючерсный контракт, "
-                "если нужен конкретный инструмент."
-            )
+            # Kind-aware fail-closed copy: FX must never ask for Brent/WTI.
+            kind = _financial_failure_instrument_kind(f"{message} {query}")
+            if kind == "fx":
+                answer = (
+                    "Не удалось подтвердить свежий валютный курс через live-источник "
+                    "(курс Банка России / открытая выдача). "
+                    "Старые сниппеты и знания модели за текущий курс не выдаю. "
+                    "Уточни валютную пару (например USD/RUB, EUR/RUB, EUR/USD), если нужна "
+                    "конкретная пара."
+                )
+            elif kind in {"crude", "futures", "commodity", "ambiguous_oil_security"}:
+                answer = (
+                    "Не удалось подтвердить свежую рыночную котировку через live web-поиск. "
+                    "Старые сниппеты и знания модели за текущую цену не выдаю. "
+                    "Уточни бенчмарк (Brent/WTI), тикер/биржу, ETF или фьючерсный контракт, "
+                    "если нужен конкретный инструмент."
+                )
+            elif kind in {"equity", "etf", "index", "bond"}:
+                answer = (
+                    "Не удалось подтвердить свежую рыночную котировку через live web-поиск. "
+                    "Старые сниппеты и знания модели за текущую цену не выдаю. "
+                    "Уточни тикер, биржу или ISIN, если нужен конкретный инструмент."
+                )
+            else:
+                answer = (
+                    "Не удалось подтвердить свежую рыночную котировку через live web-поиск. "
+                    "Старые сниппеты и знания модели за текущую цену не выдаю. "
+                    "Уточни инструмент (валютная пара, тикер, бенчмарк) и попробуй снова."
+                )
             return DirectAction(
                 answer=answer,
                 events=[
@@ -6696,6 +6719,7 @@ class AgentRuntime:
                             "ok": False,
                             "query": query,
                             "vertical": "financial_market",
+                            "instrument_kind": kind or "market",
                             "freshness": "day",
                         },
                     )
@@ -14292,6 +14316,84 @@ def _web_research_query_from_message(
     return query[:300]
 
 
+def _financial_failure_instrument_kind(text: str) -> str:
+    """Best-effort instrument class for fail-closed financial answers.
+
+    Mirrors tools.web.answer FX/crude/equity cues without importing tools (circular).
+    """
+
+    normalized = " ".join(str(text or "").casefold().split())
+    if any(m in normalized for m in ("нефт", "brent", "wti", "crude", "фьючерс", "futures")):
+        if "акци" in normalized and re.search(r"\bакци\w*\s+(?:на|по)\s+нефт", normalized):
+            return "ambiguous_oil_security"
+        if any(m in normalized for m in ("фьючерс", "futures")):
+            return "futures"
+        return "crude"
+    if any(m in normalized for m in ("etf", "биржевой фонд")):
+        return "etf"
+    if any(m in normalized for m in ("облигац", "bond", "офз", "isin")):
+        return "bond"
+    if any(m in normalized for m in ("индекс", "imoex", "rts", "nasdaq", "dow jones", "s&p")):
+        return "index"
+    if any(m in normalized for m in ("акци", "тикер", " stock", " shares", " equity")):
+        return "equity"
+    if any(m in normalized for m in ("биткоин", "bitcoin", " btc", "ethereum", "эфир", "крипт")):
+        return "crypto"
+    if any(
+        m in normalized
+        for m in (
+            "валют",
+            "форекс",
+            "forex",
+            "доллар",
+            "евро",
+            "юан",
+            "рубл",
+            "usd",
+            "eur",
+            "gbp",
+            "cny",
+            "jpy",
+            "курс",
+        )
+    ) and any(
+        m in normalized
+        for m in (
+            "валют",
+            "forex",
+            "доллар",
+            "евро",
+            "юан",
+            "рубл",
+            "usd",
+            "eur",
+            "gbp",
+            "cny",
+            "jpy",
+            "курс",
+        )
+    ):
+        # Require at least one currency cue (not bare ambiguous "курс" alone for stocks).
+        if any(
+            m in normalized
+            for m in (
+                "валют",
+                "forex",
+                "доллар",
+                "евро",
+                "юан",
+                "рубл",
+                "usd",
+                "eur",
+                "gbp",
+                "cny",
+                "jpy",
+            )
+        ):
+            return "fx"
+    return "market"
+
+
 def _looks_like_financial_market_query(normalized: str) -> bool:
     market_subject = _contains_any(
         normalized,
@@ -14321,6 +14423,7 @@ def _looks_like_financial_market_query(normalized: str) -> bool:
             "доллар",
             "евро",
             "юан",
+            "рубл",
             " usd",
             " eur",
             " gbp",
