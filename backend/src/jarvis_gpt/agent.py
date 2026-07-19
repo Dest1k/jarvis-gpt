@@ -1082,7 +1082,9 @@ class AgentRuntime:
                 notification_chat_id=notification_chat_id,
             )
             if handle.cached_response is not None:
-                return handle.cached_response
+                # Transport-level retry of a completed request must surface the same
+                # idempotent marker as the in-conversation operator-effect replay path.
+                return self._as_idempotent_replay_response(handle.cached_response)
             try:
                 with bind_chat_request_metadata(
                     request_hash=handle.request_hash,
@@ -1975,7 +1977,7 @@ class AgentRuntime:
                 notification_chat_id=None,
             )
             if handle.cached_response is not None:
-                response = handle.cached_response
+                response = self._as_idempotent_replay_response(handle.cached_response)
                 yield {"type": "meta", "conversation_id": response.conversation_id}
                 yield {"type": "delta", "content": response.answer}
                 yield {
@@ -8886,6 +8888,33 @@ class AgentRuntime:
             "answer": str(persisted.get("content") or ""),
         }
         return ChatResponse.model_validate(payload)
+
+    def _as_idempotent_replay_response(self, response: ChatResponse) -> ChatResponse:
+        """Mark a transport-level cached reply as an idempotent replay.
+
+        Completed request ledger reuses the original ChatResponse payload. The
+        in-conversation operator-effect path already emits
+        ``Idempotent response replay``; transport retries must expose the same
+        event so clients and regressions can distinguish a real re-run from a
+        pure answer replay without side effects.
+        """
+
+        if any(event.title == "Idempotent response replay" for event in response.events):
+            return response
+        replay_event = ChatEvent(
+            type="thought",
+            title="Idempotent response replay",
+            content=(
+                "Возвращаю сохранённый итог точного недавнего запроса; "
+                "его действия повторно не отправлялись."
+            ),
+            payload={
+                "replayed": True,
+                "mutation_replayed": False,
+                "source": "idempotent_response_replay",
+            },
+        )
+        return response.model_copy(update={"events": [replay_event, *list(response.events)]})
 
     def _record_chat_request_user_message(
         self,

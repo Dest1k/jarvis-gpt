@@ -1145,6 +1145,8 @@ class RuntimeSupervisor:
             return
         if action == "stable":
             # Owner stopped it / never launched it / no docker — latch until it returns.
+            # This also covers a dead Docker Desktop: we never try to restart the daemon,
+            # only the dispatcher container, so latching avoids a restart storm of no-ops.
             if not self._self_heal_blocked:
                 self._self_heal_blocked = True
                 with suppress(Exception):
@@ -1159,6 +1161,13 @@ class RuntimeSupervisor:
         # recovered between the health probe and the classify.
         if await self._dispatcher_is_live():
             self._self_heal_streak = 0
+            return
+        # Soft "Up but unresponsive" must not thrash during post-restart / warmup grace.
+        # Hard failures (Exited N, Restarting) still heal immediately even inside grace.
+        if (
+            detail == "running-but-unresponsive"
+            and time.monotonic() < self._self_heal_grace_until
+        ):
             return
         if not self._self_heal_budget_ok():
             await self._escalate_budget_exhausted(detail)
@@ -1257,10 +1266,14 @@ class RuntimeSupervisor:
         return len(self._self_heal_history) < max(1, self.settings.self_healing_max_restarts)
 
     def _open_self_heal_grace(self, remaining_seconds: float) -> None:
-        self._self_heal_grace_until = time.monotonic() + max(
-            0.0,
-            float(remaining_seconds),
-        )
+        # Floor with JARVIS_SELF_HEALING_GRACE_SEC so a post-restart probe that
+        # does not yet see health=starting still gets a no-thrash window. Never
+        # shrink an already-open longer warmup deadline (profile readiness).
+        floor = max(0.0, float(self.settings.self_healing_grace_sec))
+        remaining = max(0.0, float(remaining_seconds), floor)
+        deadline = time.monotonic() + remaining
+        if deadline > self._self_heal_grace_until:
+            self._self_heal_grace_until = deadline
 
     def _restart_dispatcher(self, dispatcher: Any) -> dict[str, Any]:
         # Force a fresh container: stop first (clears a hung process), then bring it up
@@ -1328,8 +1341,11 @@ class RuntimeSupervisor:
                 self._classify_dispatcher,
                 dispatcher,
             )
-            if action == "warming":
-                self._open_self_heal_grace(warmup_remaining)
+            # Always open a floor grace after a successful restart; extend to the
+            # remaining profile warmup when Docker reports health=starting.
+            self._open_self_heal_grace(
+                warmup_remaining if action == "warming" else 0.0
+            )
         with suppress(Exception):
             self.storage.add_event(
                 kind="self_heal.result",

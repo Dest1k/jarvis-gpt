@@ -472,6 +472,62 @@ def test_failed_dispatcher_restart_does_not_leave_retry_grace(monkeypatch, tmp_p
     storage.close()
 
 
+def test_grace_suppresses_running_but_unresponsive_not_hard_crash(monkeypatch, tmp_path):
+    # Soft hang during grace must not thrash compose; a real Exited(N) still heals.
+    dispatcher = _FakeDispatcher(
+        _dispatcher_status(port_open=False, state="Up 5 minutes", health="healthy")
+    )
+    supervisor, storage = _supervisor(
+        monkeypatch,
+        tmp_path,
+        llm_ok=False,
+        dispatcher=dispatcher,
+        env={
+            "JARVIS_SELF_HEALING_MIN_FAILURES": "1",
+            "JARVIS_SELF_HEALING_GRACE_SEC": "300",
+        },
+    )
+    _patch_push(monkeypatch)
+    supervisor._self_heal_grace_until = time.monotonic() + 120
+
+    asyncio.run(supervisor._maybe_self_heal())
+    assert dispatcher.calls == []
+    assert supervisor._self_heal_count == 0
+
+    dispatcher._status = _dispatcher_status(state="Exited (137) 1 second ago")
+    asyncio.run(supervisor._maybe_self_heal())
+    assert ("restart", OLD_CONTAINER_ID) in dispatcher.calls
+    assert supervisor._self_heal_count == 1
+    storage.close()
+
+
+def test_successful_restart_opens_configured_grace_floor(monkeypatch, tmp_path):
+    dispatcher = _FakeDispatcher(
+        _dispatcher_status(state="Exited (137) 1 minute ago"),
+        up_status=_dispatcher_status(
+            state="Up 5 seconds",
+            health="healthy",
+            inspect_ok=True,
+        ),
+    )
+    supervisor, storage = _supervisor(
+        monkeypatch,
+        tmp_path,
+        llm_ok=False,
+        dispatcher=dispatcher,
+        env={
+            "JARVIS_SELF_HEALING_MIN_FAILURES": "1",
+            "JARVIS_SELF_HEALING_GRACE_SEC": "90",
+        },
+    )
+    _patch_push(monkeypatch)
+
+    asyncio.run(supervisor._maybe_self_heal())
+    remaining = supervisor._self_heal_grace_until - time.monotonic()
+    assert 85 <= remaining <= 95
+    storage.close()
+
+
 def test_expired_external_warmup_is_treated_as_unresponsive(monkeypatch, tmp_path):
     started_at = (datetime.now(UTC) - timedelta(seconds=901)).isoformat()
     dispatcher = _FakeDispatcher(
