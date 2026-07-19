@@ -910,9 +910,22 @@ def _read_member_bytes(
             try:
                 with archive.open(info, "r", pwd=pwd) as handle:
                     return handle.read(limit)
-            except RuntimeError as exc:
+            except Exception as exc:  # noqa: BLE001 — map cryptic zipfile errors
+                # Note: NotImplementedError is a RuntimeError subclass in CPython,
+                # so AES/WinZip (compress_type=99) must be handled before a bare
+                # RuntimeError re-raise.
                 msg = str(exc).lower()
-                if "password" in msg or "encrypted" in msg:
+                if (
+                    isinstance(exc, NotImplementedError)
+                    or "compression method" in msg
+                    or "not supported" in msg
+                ):
+                    raise ArchiveUnsupportedError(
+                        f"ZIP использует неподдерживаемое шифрование/сжатие "
+                        f"(часто AES/WinZip AES): {path.name}. "
+                        f"Пересоздайте архив с ZipCrypto или используйте 7z+py7zr."
+                    ) from exc
+                if "password" in msg or "encrypted" in msg or "bad password" in msg:
                     raise ArchivePasswordError(
                         f"Неверный или отсутствующий пароль ZIP: {path.name}"
                     ) from exc
