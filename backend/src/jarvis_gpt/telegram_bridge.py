@@ -253,7 +253,17 @@ def load_config(env: Mapping[str, str] | None = None) -> TelegramConfig:
     except (TypeError, ValueError):
         voice_max = 1500
     state_dir = default_home() / "data" / "jarvis-gpt" / "state"
+    main_store = state_dir / "jarvis.sqlite3"
     configured_store = (env.get("TELEGRAM_CONVERSATION_STORE_PATH") or "").strip()
+    default_legacy_store = state_dir / "telegram_bridge.sqlite3"
+    legacy_store = default_legacy_store
+    if configured_store:
+        # Older bridge builds allowed their private database path to be overridden.
+        # Keep accepting that setting only as a migration source: new bindings must live
+        # in the primary runtime database so the normal Jarvis backup includes them.
+        configured_legacy_store = Path(configured_store).expanduser()
+        if configured_legacy_store.resolve() != main_store.resolve():
+            legacy_store = configured_legacy_store
     return TelegramConfig(
         bot_token=token,
         allowed_chat_ids=ids,
@@ -262,12 +272,8 @@ def load_config(env: Mapping[str, str] | None = None) -> TelegramConfig:
         api_token=(env.get("JARVIS_API_TOKEN") or "").strip(),
         voice_replies=voice_replies,
         voice_reply_max_chars=voice_max,
-        conversation_store_path=Path(
-            configured_store or state_dir / "jarvis.sqlite3"
-        ),
-        legacy_conversation_store_path=(
-            None if configured_store else state_dir / "telegram_bridge.sqlite3"
-        ),
+        conversation_store_path=main_store,
+        legacy_conversation_store_path=legacy_store,
     )
 
 
@@ -297,6 +303,10 @@ class TelegramConversationIsolationError(RuntimeError):
     """A backend conversation id is already bound to another Telegram principal."""
 
 
+class TelegramConversationMigrationError(RuntimeError):
+    """Legacy bindings could not be migrated without risking history loss or mixing."""
+
+
 class TelegramConversationStore:
     """Durable one-to-one Telegram principal -> backend conversation binding.
 
@@ -309,48 +319,27 @@ class TelegramConversationStore:
     def __init__(self, path: Path, *, legacy_path: Path | None = None) -> None:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS telegram_conversations (
-                    chat_id INTEGER PRIMARY KEY,
-                    conversation_id TEXT NOT NULL UNIQUE,
-                    access_mode TEXT NOT NULL CHECK(access_mode IN ('owner', 'guest')),
-                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-                )
-                """
-            )
-        self._migrate_legacy_store(legacy_path)
-
-    def _migrate_legacy_store(self, legacy_path: Path | None) -> None:
-        if legacy_path is None or not legacy_path.exists():
-            return
-        if legacy_path.resolve() == self.path.resolve():
-            return
-        try:
-            with sqlite3.connect(legacy_path, timeout=5.0) as legacy:
-                rows = legacy.execute(
-                    """
-                    SELECT chat_id, conversation_id, access_mode, updated_at
-                    FROM telegram_conversations
-                    """
-                ).fetchall()
-        except sqlite3.Error:
-            log.exception("Could not read legacy Telegram conversation bindings")
-            return
-        if not rows:
-            return
+        # Read and validate the legacy database before opening the main database. A
+        # malformed legacy file must not even create a new main database as a side effect.
+        legacy_rows = self._read_legacy_store(legacy_path)
         migrated = 0
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            for chat_id, conversation_id, access_mode, updated_at in rows:
-                existing = conn.execute(
-                    "SELECT 1 FROM telegram_conversations WHERE chat_id = ?",
-                    (chat_id,),
-                ).fetchone()
-                if existing is not None:
-                    continue
-                try:
+        try:
+            # Do not switch journal modes until validation succeeds: even PRAGMA
+            # journal_mode is a persistent database mutation and would violate the
+            # fail-closed rollback contract on a collision.
+            with self._connect(configure_journal=False) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                main_rows, columns, column_info = self._read_main_store(conn)
+                self._check_cross_store_collisions(main_rows, legacy_rows)
+                self._ensure_main_schema(conn, columns, column_info)
+
+                main_by_chat = {row[0]: row for row in main_rows}
+                for chat_id, conversation_id, access_mode, updated_at in legacy_rows:
+                    # The main database is authoritative once a chat has a binding. This
+                    # makes retries idempotent and never overwrites turns accepted after an
+                    # earlier migration. The legacy file remains untouched for rollback.
+                    if chat_id in main_by_chat:
+                        continue
                     conn.execute(
                         """
                         INSERT INTO telegram_conversations(
@@ -359,20 +348,242 @@ class TelegramConversationStore:
                         """,
                         (chat_id, conversation_id, access_mode, updated_at),
                     )
-                except sqlite3.IntegrityError:
-                    log.warning(
-                        "Skipped conflicting legacy Telegram binding for chat_id=%s",
-                        chat_id,
-                    )
-                    continue
-                migrated += 1
+                    migrated += 1
+        except TelegramConversationMigrationError:
+            raise
+        except sqlite3.Error as exc:
+            raise TelegramConversationMigrationError(
+                "could not initialize Telegram conversation bindings safely"
+            ) from exc
         if migrated:
             log.info("Migrated %d Telegram conversation binding(s) into main database", migrated)
 
-    def _connect(self) -> sqlite3.Connection:
+    @staticmethod
+    def _table_info(conn: sqlite3.Connection) -> list[tuple]:
+        return conn.execute("PRAGMA table_info(telegram_conversations)").fetchall()
+
+    @classmethod
+    def _read_rows(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        source: str,
+        columns: set[str],
+        missing_access_mode: str,
+    ) -> list[tuple[int, str, str, str]]:
+        required = {"chat_id", "conversation_id"}
+        if not required.issubset(columns):
+            raise TelegramConversationMigrationError(
+                f"{source} Telegram database has no compatible binding table"
+            )
+        access_mode_sql = (
+            "access_mode"
+            if "access_mode" in columns
+            else f"'{missing_access_mode}' AS access_mode"
+        )
+        updated_at_sql = (
+            "updated_at" if "updated_at" in columns else "CURRENT_TIMESTAMP AS updated_at"
+        )
+        rows = conn.execute(
+            f"""
+            SELECT chat_id, conversation_id, {access_mode_sql}, {updated_at_sql}
+            FROM telegram_conversations
+            ORDER BY chat_id
+            """  # noqa: S608 - fragments are fixed identifiers and an internal literal
+        ).fetchall()
+        migration_time = str(conn.execute("SELECT CURRENT_TIMESTAMP").fetchone()[0])
+
+        normalized_rows: list[tuple[int, str, str, str]] = []
+        seen_chats: dict[int, tuple[str, str]] = {}
+        seen_conversations: dict[str, int] = {}
+        for raw_chat_id, raw_conversation_id, raw_access_mode, raw_updated_at in rows:
+            if isinstance(raw_chat_id, bool) or not isinstance(raw_chat_id, int | str):
+                raise TelegramConversationMigrationError(
+                    f"{source} Telegram binding contains an invalid chat_id"
+                )
+            chat_text = str(raw_chat_id).strip()
+            if not re.fullmatch(r"-?[0-9]+", chat_text):
+                raise TelegramConversationMigrationError(
+                    f"{source} Telegram binding contains an invalid chat_id"
+                )
+            chat_id = int(chat_text)
+            conversation_id = str(raw_conversation_id or "").strip()
+            if not conversation_id:
+                raise TelegramConversationMigrationError(
+                    f"{source} Telegram binding contains an empty conversation_id"
+                )
+            access_mode = str(raw_access_mode or "")
+            if access_mode not in {"owner", "guest"}:
+                raise TelegramConversationMigrationError(
+                    f"{source} Telegram binding contains an invalid access_mode"
+                )
+            updated_at = str(raw_updated_at or "").strip() or migration_time
+            previous = seen_chats.get(chat_id)
+            if previous is not None:
+                if previous != (conversation_id, access_mode):
+                    raise TelegramConversationMigrationError(
+                        f"{source} Telegram store has conflicting rows for one chat_id"
+                    )
+                continue
+            previous_chat = seen_conversations.get(conversation_id)
+            if previous_chat is not None and previous_chat != chat_id:
+                raise TelegramConversationMigrationError(
+                    f"{source} Telegram store binds one conversation_id to multiple chats"
+                )
+            seen_chats[chat_id] = (conversation_id, access_mode)
+            seen_conversations[conversation_id] = chat_id
+            normalized_rows.append((chat_id, conversation_id, access_mode, updated_at))
+        return normalized_rows
+
+    def _read_legacy_store(
+        self, legacy_path: Path | None
+    ) -> list[tuple[int, str, str, str]]:
+        if legacy_path is None or not legacy_path.exists():
+            return []
+        if legacy_path.resolve() == self.path.resolve():
+            return []
+        try:
+            legacy_uri = f"{legacy_path.resolve().as_uri()}?mode=ro"
+            with sqlite3.connect(legacy_uri, uri=True, timeout=5.0) as legacy:
+                columns = {str(row[1]) for row in self._table_info(legacy)}
+                # The schema before access modes existed was an owner-only bridge. Marking
+                # those rows as owner preserves the owner's first post-upgrade turn, while
+                # get_or_create() rotates the history if that chat is now configured guest.
+                return self._read_rows(
+                    legacy,
+                    source="legacy",
+                    columns=columns,
+                    missing_access_mode="owner",
+                )
+        except TelegramConversationMigrationError:
+            raise
+        except (OSError, sqlite3.Error) as exc:
+            raise TelegramConversationMigrationError(
+                "could not read legacy Telegram conversation bindings"
+            ) from exc
+
+    def _read_main_store(
+        self, conn: sqlite3.Connection
+    ) -> tuple[list[tuple[int, str, str, str]], set[str], list[tuple]]:
+        exists = conn.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'telegram_conversations'
+            """
+        ).fetchone()
+        if exists is None:
+            return [], set(), []
+        column_info = self._table_info(conn)
+        columns = {str(row[1]) for row in column_info}
+        rows = self._read_rows(
+            conn,
+            source="main",
+            columns=columns,
+            missing_access_mode="owner",
+        )
+        return rows, columns, column_info
+
+    @staticmethod
+    def _check_cross_store_collisions(
+        main_rows: list[tuple[int, str, str, str]],
+        legacy_rows: list[tuple[int, str, str, str]],
+    ) -> None:
+        main_by_conversation = {row[1]: row for row in main_rows}
+        for legacy_row in legacy_rows:
+            main_row = main_by_conversation.get(legacy_row[1])
+            if main_row is None:
+                continue
+            if main_row[0] != legacy_row[0]:
+                raise TelegramConversationMigrationError(
+                    "legacy and main Telegram stores bind one conversation_id to different chats"
+                )
+            if main_row[2] != legacy_row[2]:
+                raise TelegramConversationMigrationError(
+                    "legacy and main Telegram stores disagree on conversation access_mode"
+                )
+
+    @staticmethod
+    def _unique_index_columns(conn: sqlite3.Connection) -> set[tuple[str, ...]]:
+        unique_columns: set[tuple[str, ...]] = set()
+        for index in conn.execute("PRAGMA index_list(telegram_conversations)").fetchall():
+            if not bool(index[2]):
+                continue
+            columns = conn.execute(
+                "SELECT name FROM pragma_index_info(?) ORDER BY seqno",
+                (str(index[1]),),
+            ).fetchall()
+            unique_columns.add(tuple(str(column[0]) for column in columns))
+        return unique_columns
+
+    @classmethod
+    def _ensure_main_schema(
+        cls,
+        conn: sqlite3.Connection,
+        columns: set[str],
+        column_info: list[tuple],
+    ) -> None:
+        if not columns:
+            conn.execute(
+                """
+                CREATE TABLE telegram_conversations (
+                    chat_id INTEGER PRIMARY KEY,
+                    conversation_id TEXT NOT NULL UNIQUE,
+                    access_mode TEXT NOT NULL CHECK(access_mode IN ('owner', 'guest')),
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            return
+
+        if "access_mode" not in columns:
+            conn.execute(
+                """
+                ALTER TABLE telegram_conversations
+                ADD COLUMN access_mode TEXT NOT NULL DEFAULT 'owner'
+                    CHECK(access_mode IN ('owner', 'guest'))
+                """
+            )
+            columns.add("access_mode")
+        if "updated_at" not in columns:
+            conn.execute(
+                """
+                ALTER TABLE telegram_conversations
+                ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''
+                """
+            )
+            conn.execute(
+                """
+                UPDATE telegram_conversations
+                SET updated_at = CURRENT_TIMESTAMP
+                WHERE updated_at = ''
+                """
+            )
+            columns.add("updated_at")
+
+        unique_columns = cls._unique_index_columns(conn)
+        chat_is_primary = any(
+            str(column[1]) == "chat_id" and int(column[5]) > 0 for column in column_info
+        )
+        if not chat_is_primary and ("chat_id",) not in unique_columns:
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX telegram_conversations_chat_id_uq
+                ON telegram_conversations(chat_id)
+                """
+            )
+        if ("conversation_id",) not in unique_columns:
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX telegram_conversations_conversation_id_uq
+                ON telegram_conversations(conversation_id)
+                """
+            )
+
+    def _connect(self, *, configure_journal: bool = True) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=5.0)
         conn.execute("PRAGMA busy_timeout = 5000")
-        conn.execute("PRAGMA journal_mode = WAL")
+        if configure_journal:
+            conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA synchronous = FULL")
         return conn
 

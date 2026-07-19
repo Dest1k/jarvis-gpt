@@ -4156,6 +4156,13 @@ CREATE TABLE IF NOT EXISTS conversations (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS telegram_conversations (
+    chat_id INTEGER PRIMARY KEY,
+    conversation_id TEXT NOT NULL UNIQUE,
+    access_mode TEXT NOT NULL CHECK(access_mode IN ('owner', 'guest')),
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS messages (
     id TEXT PRIMARY KEY,
     conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,

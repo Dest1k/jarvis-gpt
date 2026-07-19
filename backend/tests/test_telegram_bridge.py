@@ -14,6 +14,7 @@ from jarvis_gpt.storage import JarvisStorage
 from jarvis_gpt.telegram_bridge import (
     TelegramBridge,
     TelegramConfig,
+    TelegramConversationMigrationError,
     TelegramConversationStore,
     _chunks,
     _configure_logging,
@@ -66,6 +67,21 @@ def test_load_config_parses_allowlist():
     assert cfg.owner_chat_ids == frozenset({42})
     assert cfg.conversation_store_path.name == "jarvis.sqlite3"
     assert cfg.legacy_conversation_store_path.name == "telegram_bridge.sqlite3"
+
+
+def test_load_config_treats_old_store_override_as_migration_source(tmp_path):
+    legacy_path = tmp_path / "custom-telegram.sqlite3"
+    cfg = load_config(
+        {
+            "TELEGRAM_BOT_TOKEN": "T",
+            "TELEGRAM_ALLOWED_CHAT_IDS": "42",
+            "TELEGRAM_CONVERSATION_STORE_PATH": str(legacy_path),
+        }
+    )
+
+    assert cfg.conversation_store_path.name == "jarvis.sqlite3"
+    assert cfg.conversation_store_path != legacy_path
+    assert cfg.legacy_conversation_store_path == legacy_path
 
 
 def test_load_config_requires_explicit_owner_for_multiple_users():
@@ -449,6 +465,17 @@ def test_access_mode_change_rotates_persisted_conversation(tmp_path):
     assert chat_bodies[-1]["conversation_id"] != guest_id
 
 
+def test_owner_to_guest_change_rotates_once_and_stays_stable(tmp_path):
+    state_path = tmp_path / "jarvis.sqlite3"
+    store = TelegramConversationStore(state_path)
+    store.bind(42, "tg_owner_history", "owner")
+
+    guest_id = store.get_or_create(42, "guest")
+
+    assert guest_id != "tg_owner_history"
+    assert TelegramConversationStore(state_path).get_or_create(42, "guest") == guest_id
+
+
 def test_legacy_binding_store_migrates_into_main_database(tmp_path):
     legacy_path = tmp_path / "telegram_bridge.sqlite3"
     main_path = tmp_path / "jarvis.sqlite3"
@@ -463,6 +490,322 @@ def test_legacy_binding_store_migrates_into_main_database(tmp_path):
     assert TelegramConversationStore(main_path, legacy_path=legacy_path).load_all() == {
         42: "tg_existing_owner"
     }
+
+
+def test_legacy_migration_preserves_authoritative_main_row_for_same_chat(tmp_path):
+    legacy_path = tmp_path / "telegram_bridge.sqlite3"
+    main_path = tmp_path / "jarvis.sqlite3"
+    main = TelegramConversationStore(main_path)
+    main.bind(42, "tg_main_owner", "owner")
+    legacy = TelegramConversationStore(legacy_path)
+    legacy.bind(42, "tg_stale_legacy", "guest")
+
+    migrated = TelegramConversationStore(main_path, legacy_path=legacy_path).load_all()
+
+    assert migrated == {42: "tg_main_owner"}
+    assert legacy.load_all() == {42: "tg_stale_legacy"}
+    assert TelegramConversationStore(main_path, legacy_path=legacy_path).load_all() == migrated
+
+
+def test_cross_store_conversation_collision_fails_closed_without_mutation(tmp_path):
+    legacy_path = tmp_path / "telegram_bridge.sqlite3"
+    main_path = tmp_path / "jarvis.sqlite3"
+    main = TelegramConversationStore(main_path)
+    main.bind(7, "tg_shared", "guest")
+    legacy = TelegramConversationStore(legacy_path)
+    legacy.bind(99, "tg_shared", "guest")
+    with sqlite3.connect(main_path) as database:
+        main_before = "\n".join(database.iterdump())
+    with sqlite3.connect(legacy_path) as database:
+        legacy_before = "\n".join(database.iterdump())
+
+    with pytest.raises(TelegramConversationMigrationError, match="different chats"):
+        TelegramConversationStore(main_path, legacy_path=legacy_path)
+
+    with sqlite3.connect(main_path) as database:
+        assert "\n".join(database.iterdump()) == main_before
+    with sqlite3.connect(legacy_path) as database:
+        assert "\n".join(database.iterdump()) == legacy_before
+
+
+def test_legacy_duplicate_conversation_ids_fail_closed_before_main_is_created(tmp_path):
+    legacy_path = tmp_path / "telegram_bridge.sqlite3"
+    main_path = tmp_path / "jarvis.sqlite3"
+    with sqlite3.connect(legacy_path) as legacy:
+        legacy.execute(
+            """
+            CREATE TABLE telegram_conversations (
+                chat_id INTEGER PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                access_mode TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        legacy.executemany(
+            """
+            INSERT INTO telegram_conversations(
+                chat_id, conversation_id, access_mode, updated_at
+            ) VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            """,
+            [(7, "tg_legacy_shared", "guest"), (99, "tg_legacy_shared", "guest")],
+        )
+
+    with pytest.raises(TelegramConversationMigrationError, match="multiple chats"):
+        TelegramConversationStore(main_path, legacy_path=legacy_path)
+
+    assert not main_path.exists()
+    with sqlite3.connect(legacy_path) as legacy:
+        assert legacy.execute(
+            "SELECT chat_id, conversation_id FROM telegram_conversations ORDER BY chat_id"
+        ).fetchall() == [(7, "tg_legacy_shared"), (99, "tg_legacy_shared")]
+
+
+def test_two_column_legacy_store_preserves_owner_history_and_is_idempotent(tmp_path):
+    legacy_path = tmp_path / "telegram_bridge.sqlite3"
+    main_path = tmp_path / "jarvis.sqlite3"
+    with sqlite3.connect(legacy_path) as legacy:
+        legacy.execute(
+            """
+            CREATE TABLE telegram_conversations (
+                chat_id INTEGER PRIMARY KEY,
+                conversation_id TEXT NOT NULL
+            )
+            """
+        )
+        legacy.execute(
+            "INSERT INTO telegram_conversations(chat_id, conversation_id) VALUES (?, ?)",
+            (42, "tg_old_schema"),
+        )
+
+    first = TelegramConversationStore(main_path, legacy_path=legacy_path)
+
+    assert first.load_all() == {42: "tg_old_schema"}
+    with sqlite3.connect(main_path) as main:
+        mode = main.execute(
+            "SELECT access_mode FROM telegram_conversations WHERE chat_id = 42"
+        ).fetchone()[0]
+    assert mode == "owner"
+    assert TelegramConversationStore(main_path, legacy_path=legacy_path).load_all() == {
+        42: "tg_old_schema"
+    }
+
+
+def test_two_column_main_store_is_upgraded_without_losing_owner_binding(tmp_path):
+    main_path = tmp_path / "jarvis.sqlite3"
+    with sqlite3.connect(main_path) as main:
+        main.execute(
+            """
+            CREATE TABLE telegram_conversations (
+                chat_id INTEGER PRIMARY KEY,
+                conversation_id TEXT NOT NULL
+            )
+            """
+        )
+        main.execute(
+            "INSERT INTO telegram_conversations(chat_id, conversation_id) VALUES (?, ?)",
+            (42, "tg_existing_owner"),
+        )
+
+    store = TelegramConversationStore(main_path)
+
+    assert store.get_or_create(42, "owner") == "tg_existing_owner"
+    with sqlite3.connect(main_path) as main:
+        columns = {
+            row[1]: row for row in main.execute("PRAGMA table_info(telegram_conversations)")
+        }
+        row = main.execute(
+            """
+            SELECT chat_id, conversation_id, access_mode, updated_at
+            FROM telegram_conversations
+            """
+        ).fetchone()
+    assert {"chat_id", "conversation_id", "access_mode", "updated_at"} <= columns.keys()
+    assert row[:3] == (42, "tg_existing_owner", "owner")
+    assert row[3]
+
+
+def test_two_column_legacy_owner_is_preserved_on_first_owner_turn_but_rotated_for_guest(
+    tmp_path,
+):
+    legacy_path = tmp_path / "telegram_bridge.sqlite3"
+    main_path = tmp_path / "jarvis.sqlite3"
+    with sqlite3.connect(legacy_path) as legacy:
+        legacy.execute(
+            """
+            CREATE TABLE telegram_conversations (
+                chat_id INTEGER PRIMARY KEY,
+                conversation_id TEXT NOT NULL
+            )
+            """
+        )
+        legacy.execute(
+            "INSERT INTO telegram_conversations(chat_id, conversation_id) VALUES (?, ?)",
+            (42, "tg_owner_before_upgrade"),
+        )
+
+    chat_bodies: list[dict] = []
+
+    def tg_handler(_request):
+        return httpx.Response(200, json={"ok": True, "result": {}})
+
+    def api_handler(request):
+        if request.url.path == "/api/files":
+            return httpx.Response(200, json=[])
+        if request.url.path == "/api/chat":
+            payload = json.loads(request.content)
+            chat_bodies.append(payload)
+            return httpx.Response(
+                200,
+                json={
+                    "conversation_id": payload["conversation_id"],
+                    "message_id": "m",
+                    "answer": "ok",
+                    "events": [],
+                },
+            )
+        return httpx.Response(404)
+
+    owner = _bridge(
+        tg_handler,
+        api_handler,
+        owner_chat_ids=frozenset({42}),
+        conversation_store_path=main_path,
+        legacy_conversation_store_path=legacy_path,
+    )
+    update = {
+        "update_id": 1,
+        "message": {"chat": {"id": 42, "type": "private"}, "text": "owner turn"},
+    }
+    asyncio.run(owner._handle(update))
+    asyncio.run(owner.aclose())
+
+    assert chat_bodies[-1]["access_mode"] == "owner"
+    assert chat_bodies[-1]["conversation_id"] == "tg_owner_before_upgrade"
+
+    guest = _bridge(
+        tg_handler,
+        api_handler,
+        allowed_chat_ids=frozenset({42, 99}),
+        owner_chat_ids=frozenset({99}),
+        conversation_store_path=main_path,
+        legacy_conversation_store_path=legacy_path,
+    )
+    update["message"]["text"] = "guest turn"
+    asyncio.run(guest._handle(update))
+    asyncio.run(guest.aclose())
+
+    assert chat_bodies[-1]["access_mode"] == "guest"
+    assert chat_bodies[-1]["conversation_id"] != "tg_owner_before_upgrade"
+
+
+def test_invalid_legacy_access_mode_fails_closed_without_main_mutation(tmp_path):
+    legacy_path = tmp_path / "telegram_bridge.sqlite3"
+    main_path = tmp_path / "jarvis.sqlite3"
+    main = TelegramConversationStore(main_path)
+    main.bind(42, "tg_main_owner", "owner")
+    with sqlite3.connect(main_path) as database:
+        main_before = "\n".join(database.iterdump())
+    with sqlite3.connect(legacy_path) as legacy:
+        legacy.execute(
+            """
+            CREATE TABLE telegram_conversations (
+                chat_id INTEGER PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                access_mode TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        legacy.execute(
+            """
+            INSERT INTO telegram_conversations(
+                chat_id, conversation_id, access_mode, updated_at
+            ) VALUES (99, 'tg_invalid_mode', 'administrator', CURRENT_TIMESTAMP)
+            """
+        )
+
+    with pytest.raises(TelegramConversationMigrationError, match="invalid access_mode"):
+        TelegramConversationStore(main_path, legacy_path=legacy_path)
+
+    with sqlite3.connect(main_path) as database:
+        assert "\n".join(database.iterdump()) == main_before
+    with sqlite3.connect(legacy_path) as legacy:
+        assert legacy.execute(
+            "SELECT access_mode FROM telegram_conversations WHERE chat_id = 99"
+        ).fetchone() == ("administrator",)
+
+
+def test_invalid_main_access_mode_fails_closed_without_guest_fallback(tmp_path):
+    main_path = tmp_path / "jarvis.sqlite3"
+    with sqlite3.connect(main_path) as main:
+        main.execute(
+            """
+            CREATE TABLE telegram_conversations (
+                chat_id INTEGER PRIMARY KEY,
+                conversation_id TEXT NOT NULL UNIQUE,
+                access_mode TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        main.execute(
+            """
+            INSERT INTO telegram_conversations(
+                chat_id, conversation_id, access_mode, updated_at
+            ) VALUES (42, 'tg_bad_main', 'OWNER', CURRENT_TIMESTAMP)
+            """
+        )
+    with sqlite3.connect(main_path) as database:
+        before = "\n".join(database.iterdump())
+
+    with pytest.raises(TelegramConversationMigrationError, match="invalid access_mode"):
+        TelegramConversationStore(main_path)
+
+    with sqlite3.connect(main_path) as database:
+        assert "\n".join(database.iterdump()) == before
+
+
+def test_schema_upgrade_rolls_back_when_legacy_collision_is_detected(tmp_path):
+    main_path = tmp_path / "jarvis.sqlite3"
+    legacy_path = tmp_path / "telegram_bridge.sqlite3"
+    with sqlite3.connect(main_path) as main:
+        main.execute(
+            """
+            CREATE TABLE telegram_conversations (
+                chat_id INTEGER PRIMARY KEY,
+                conversation_id TEXT NOT NULL
+            )
+            """
+        )
+        main.execute(
+            "INSERT INTO telegram_conversations VALUES (7, 'tg_collision')"
+        )
+    legacy = TelegramConversationStore(legacy_path)
+    legacy.bind(99, "tg_collision", "owner")
+    with sqlite3.connect(main_path) as main:
+        before = "\n".join(main.iterdump())
+        journal_mode_before = main.execute("PRAGMA journal_mode").fetchone()[0]
+
+    with pytest.raises(TelegramConversationMigrationError, match="different chats"):
+        TelegramConversationStore(main_path, legacy_path=legacy_path)
+
+    with sqlite3.connect(main_path) as main:
+        assert "\n".join(main.iterdump()) == before
+        assert main.execute("PRAGMA journal_mode").fetchone()[0] == journal_mode_before
+        assert [row[1] for row in main.execute("PRAGMA table_info(telegram_conversations)")] == [
+            "chat_id",
+            "conversation_id",
+        ]
+
+
+def test_unreadable_legacy_schema_fails_closed(tmp_path):
+    legacy_path = tmp_path / "telegram_bridge.sqlite3"
+    with sqlite3.connect(legacy_path) as legacy:
+        legacy.execute("CREATE TABLE unrelated(value TEXT)")
+
+    with pytest.raises(TelegramConversationMigrationError, match="compatible binding table"):
+        TelegramConversationStore(tmp_path / "jarvis.sqlite3", legacy_path=legacy_path)
 
 
 def test_runtime_database_backup_contains_telegram_bindings(tmp_path):
@@ -486,7 +829,16 @@ def test_runtime_database_backup_contains_telegram_bindings(tmp_path):
     assert row == (42, "tg_backup_owner", "owner")
 
 
-def test_telegram_command_suffix_and_payload_are_normalized():
+@pytest.mark.parametrize(
+    ("command", "rotates"),
+    [
+        ("/new@JarvisBot", True),
+        ("/NEW@jarvisbot ignored-payload", True),
+        ("/start payload", False),
+        ("/START@JarvisBot payload", False),
+    ],
+)
+def test_telegram_command_suffix_and_payload_are_normalized(command, rotates):
     api_calls: list[str] = []
 
     def api_handler(request):
@@ -498,27 +850,21 @@ def test_telegram_command_suffix_and_payload_are_normalized():
         api_handler,
     )
     bridge.conversations[42] = "existing"
-    start = {
+    update = {
         "update_id": 1,
         "message": {
             "chat": {"id": 42, "type": "private"},
-            "text": "/start payload",
-        },
-    }
-    reset = {
-        "update_id": 2,
-        "message": {
-            "chat": {"id": 42, "type": "private"},
-            "text": "/new@JarvisBot",
+            "text": command,
         },
     }
 
-    asyncio.run(bridge._handle(start))
-    assert bridge.conversations[42] == "existing"
-    asyncio.run(bridge._handle(reset))
+    asyncio.run(bridge._handle(update))
 
-    assert bridge.conversations[42].startswith("tg_")
-    assert bridge.conversations[42] != "existing"
+    if rotates:
+        assert bridge.conversations[42].startswith("tg_")
+        assert bridge.conversations[42] != "existing"
+    else:
+        assert bridge.conversations[42] == "existing"
     assert "/api/chat" not in api_calls
 
 

@@ -16155,6 +16155,26 @@ def _web_answer_terms_match(left: str, right: str) -> bool:
 _WEB_FINANCIAL_IDENTIFIER_STOPWORDS = {
     "ADR", "ETF", "FX", "NAV", "USD", "RUB", "EUR", "GBP", "CNY", "JPY",
     "ICE", "CME", "LSE", "MOEX", "NYSE", "NASDAQ", "OTC", "SPOT", "YTM",
+    "ISIN", "CUSIP", "SEDOL", "FIGI", "BRENT", "WTI", "UTC", "GMT", "MSK",
+    "CURRENT", "LATEST", "LAST", "MARKET", "PRICE", "PRICES", "QUOTE", "QUOTES",
+    "STOCK", "STOCKS", "SHARE", "SHARES", "EQUITY", "TICKER", "SYMBOL",
+    "WHAT", "WHICH", "THIS", "THAT", "WITH", "FROM", "PAGE", "TODAY",
+    "THE", "AND", "OR", "OF", "FOR", "IS", "WAS", "HAS", "HAVE", "CLASS",
+    "FIND", "SHOW", "GIVE", "BID", "ASK", "OPEN", "CLOSE", "CHANGE", "VOLUME",
+    "CONTRACT", "CONTRACTS", "FUTURE", "FUTURES", "BOND", "BONDS", "INDEX",
+    "CRUDE", "OIL", "GOLD", "SILVER", "CURRENCY", "FOREX", "EXCHANGE", "RATE",
+    "BITCOIN", "ETHEREUM", "APPLE", "MICROSOFT", "TESLA", "NVIDIA", "AMAZON",
+    "GOOGLE", "ALPHABET", "BERKSHIRE",
+    "COMPANY", "COMPANIES", "SECURITY", "SECURITIES", "INSTRUMENT", "INSTRUMENTS",
+    "AVERAGE", "CLOSING", "TARGET", "FAIR", "ADJUSTED", "CONSENSUS",
+    "INDICATIVE", "PREDICTED", "PROJECTED", "FORECAST", "PREMARKET",
+    "DELAYED", "HISTORICAL",
+    "EBITDA", "EBIT", "EPS", "PROFIT", "REVENUE", "DIVIDEND", "YIELD",
+    "COUPON", "SPREAD", "RANK", "HIGH", "LOW",
+    "ACTUAL", "REAL", "OFFICIAL",
+    "LIVE", "AVAILABLE", "PREVIOUS", "PRIOR", "EXPECTED", "ESTIMATED",
+    "INDICATED", "OPENING", "COMMON", "PREFERRED", "DAILY",
+    "WEEKLY", "MONTHLY", "ANNUAL",
 }
 
 
@@ -16163,16 +16183,105 @@ def _web_answer_financial_exact_identifiers(text: str) -> set[str]:
     repaired = _repair_mojibake(text)
     identifiers: set[str] = set()
     patterns = (
-        r"(?<![A-Za-z0-9])[A-Z]{2}[A-Z0-9]{9}[0-9](?![A-Za-z0-9])",
-        r"(?<![A-Za-z0-9])[A-Z]{1,6}\.[A-Z](?![A-Za-z0-9])",
-        r"(?<![A-Za-z0-9])[A-Z]{2,6}[FGHJKMNQUVXZ]\d{1,4}(?![A-Za-z0-9])",
-        r"(?<![A-Za-z0-9])[A-Z]{2,8}(?![A-Za-z0-9])",
+        (
+            r"(?<![A-Za-z0-9])[A-Z]{2}[A-Z0-9]{9}[0-9](?![A-Za-z0-9])",
+            re.IGNORECASE,
+        ),
+        (r"(?<![A-Za-z0-9])[A-Z]{1,6}\.[A-Z](?![A-Za-z0-9])", re.IGNORECASE),
+        (
+            r"(?<![A-Za-z0-9])[A-Z]{2,6}[FGHJKMNQUVXZ]\d{1,4}(?![A-Za-z0-9])",
+            re.IGNORECASE,
+        ),
+        # Do not also extract ``BRK`` from the class ticker ``BRK.B``.  A partial
+        # identifier must never become an alternate identity that can be matched
+        # by prefix or by presence elsewhere in the page.
+        (r"(?<![A-Za-z0-9.])[A-Z]{2,8}(?![A-Za-z0-9.])", 0),
     )
-    for pattern in patterns:
-        for match in re.finditer(pattern, repaired):
+    for pattern, flags in patterns:
+        for match in re.finditer(pattern, repaired, flags=flags):
             identifier = match.group(0).upper()
             if identifier not in _WEB_FINANCIAL_IDENTIFIER_STOPWORDS:
                 identifiers.add(identifier)
+    # Single-letter tickers are real (notably Ford ``F`` and AT&T ``T``), but a
+    # bare letter in ordinary prose is far too ambiguous.  Admit it only when
+    # the surrounding text explicitly declares a market/ticker context.
+    if re.search(
+        r"(?<![a-zа-яё])(?:ticker|stock|share|equity|quote|price|"
+        r"тикер|акци\w*|котиров\w*|цен\w*)(?![a-zа-яё])",
+        repaired,
+        flags=re.IGNORECASE,
+    ):
+        for match in re.finditer(r"(?<![A-Za-z0-9.])[A-Z](?![A-Za-z0-9.])", repaired):
+            identifier = match.group(0).upper()
+            if identifier not in {"A", "I"}:
+                identifiers.add(identifier)
+    # Lowercase ordinary tickers cannot be harvested as arbitrary prose words.
+    # Accept them only in an explicit financial declaration in the request, or
+    # in a machine-like quote assignment (``aapl=473.25``).  Known identifiers
+    # are subsequently matched case-insensitively in answer/source evidence.
+    lowercase_candidates: set[str] = set()
+    subject_patterns = (
+        r"(?<![A-Za-z0-9.])([A-Za-z]{1,8})\s+"
+        r"(?:stock|stocks|share|shares|equity|ticker)(?![a-z])",
+        r"(?<![a-z])(?:stock|share)\s+(?:price|quote)\s+"
+        r"(?:for|of)\s+([A-Za-z]{1,8})(?![A-Za-z0-9.])",
+        r"(?<![a-z])(?:stock|share)\s+([A-Za-z]{1,8})\s+"
+        r"(?:price|quote)(?![a-z])",
+        r"(?<![a-z])(?:price|quote)\s+(?:for|of)\s+([A-Za-z]{1,8})"
+        r"(?![A-Za-z0-9.])",
+        r"(?<![a-z])(?:current|latest|live)\s+([A-Za-z]{1,8})\s+"
+        r"(?:price|quote)(?![a-z])",
+        r"(?<![A-Za-z0-9.])([A-Za-z]{1,8})\s+(?:stock|share)\s+"
+        r"(?:price|quote)(?![a-z])",
+        r"(?<![a-z])(?:price|quote)\s+(?:for|of)\s+([A-Za-z]{1,8})\s+"
+        r"(?:stock|share)(?![a-z])",
+    )
+    for pattern in subject_patterns:
+        for match in re.finditer(pattern, repaired, flags=re.IGNORECASE):
+            candidate = match.group(1)
+            # Title Case words next to a known ticker are usually company names
+            # (``BRK.B Berkshire Hathaway stock price``), not a second ticker.
+            # Lowercase ticker support must not manufacture a competing exact ID.
+            follows_identifier_name = any(
+                identifier_match.end() <= match.start(1)
+                and len(
+                    repaired[identifier_match.end():match.start(1)]
+                ) <= 80
+                and bool(
+                    re.fullmatch(
+                        r"(?:[\s()\[\]]|"
+                        r"[A-ZА-ЯЁ][A-Za-zА-Яа-яЁё]*"
+                        r"(?:['’][A-Za-zА-Яа-яЁё]+)?)*",
+                        repaired[identifier_match.end():match.start(1)],
+                    )
+                )
+                for identifier in identifiers
+                for identifier_match in re.finditer(
+                    rf"(?<![A-Za-z0-9]){re.escape(identifier)}"
+                    r"(?![A-Za-z0-9])",
+                    repaired,
+                    flags=re.IGNORECASE,
+                )
+            )
+            if candidate.islower() or candidate.isupper() or not follows_identifier_name:
+                lowercase_candidates.add(candidate.upper())
+    for match in re.finditer(
+        r"(?<![a-z])(?:ticker|symbol)\s*(?:[:=]|is)?\s*([a-z]{1,8})"
+        r"(?![A-Za-z0-9.])",
+        repaired,
+    ):
+        lowercase_candidates.add(match.group(1).upper())
+    for match in re.finditer(
+        r"(?<![A-Za-z0-9.])([A-Za-z]{1,8})(?=\s*(?:=|:)\s*[+\-−]?\d)",
+        repaired,
+    ):
+        lowercase_candidates.add(match.group(1).upper())
+    identifiers.update(
+        identifier
+        for identifier in lowercase_candidates
+        if identifier not in _WEB_FINANCIAL_IDENTIFIER_STOPWORDS
+        and identifier not in {"A", "I"}
+    )
     return identifiers
 
 
@@ -16182,6 +16291,246 @@ def _web_answer_contains_exact_financial_identifier(text: str, identifier: str) 
         _repair_mojibake(text),
         flags=re.IGNORECASE,
     ))
+
+
+def _web_answer_financial_identifier_spans(
+    text: str,
+    *,
+    known_identifiers: set[str] | None = None,
+) -> list[tuple[str, int, int]]:
+    """Return non-overlapping exact instrument identifiers with source offsets."""
+    repaired = _repair_mojibake(text)
+    spans: list[tuple[str, int, int]] = []
+    identifiers = _web_answer_financial_exact_identifiers(repaired)
+    identifiers.update(item.upper() for item in known_identifiers or set())
+    for identifier in identifiers:
+        for match in re.finditer(
+            rf"(?<![A-Za-z0-9]){re.escape(identifier)}(?![A-Za-z0-9])",
+            repaired,
+            flags=re.IGNORECASE,
+        ):
+            spans.append((identifier, match.start(), match.end()))
+    return sorted(set(spans), key=lambda item: (item[1], item[2], item[0]))
+
+
+def _web_answer_nearest_financial_identifiers_for_value(
+    text: str,
+    value: str,
+    *,
+    known_identifiers: set[str] | None = None,
+) -> set[str]:
+    """Bind a value only to exact identifiers in its own local quote clause."""
+    repaired = _repair_mojibake(text)
+    return _web_answer_bound_labels_for_value(
+        repaired,
+        value,
+        _web_answer_financial_identifier_spans(
+            repaired,
+            known_identifiers=known_identifiers,
+        ),
+        prefer_preceding=True,
+    )
+
+
+def _web_answer_nearest_financial_identifiers_for_span(
+    text: str,
+    start: int,
+    end: int,
+    *,
+    known_identifiers: set[str] | None = None,
+) -> set[str]:
+    repaired = _repair_mojibake(text)
+    identifier_spans = _web_answer_financial_identifier_spans(
+        repaired,
+        known_identifiers=known_identifiers,
+    )
+    left, right = _web_answer_financial_clause_bounds(repaired, start, end)
+    local_identifiers = [
+        item for item in identifier_spans if item[1] >= left and item[2] <= right
+    ]
+    if local_identifiers:
+        scored = [
+            (
+                _web_answer_financial_identifier_binding_score(
+                    repaired,
+                    start,
+                    end,
+                    identifier_start,
+                    identifier_end,
+                    clause_left=left,
+                    clause_right=right,
+                ),
+                identifier,
+            )
+            for identifier, identifier_start, identifier_end in local_identifiers
+            if identifier_end <= start or identifier_start >= end
+        ]
+        if scored:
+            best_score = max(item[0] for item in scored)
+            return {identifier for score, identifier in scored if score == best_score}
+    return _web_answer_bound_labels_for_span(
+        repaired,
+        start,
+        end,
+        identifier_spans,
+        prefer_preceding=True,
+    )
+
+
+def _web_answer_financial_identifier_binding_score(
+    text: str,
+    value_start: int,
+    value_end: int,
+    identifier_start: int,
+    identifier_end: int,
+    *,
+    clause_left: int,
+    clause_right: int,
+) -> int:
+    score = _web_answer_financial_identifier_raw_binding_score(
+        text,
+        value_start,
+        value_end,
+        identifier_start,
+        identifier_end,
+        clause_left=clause_left,
+        clause_right=clause_right,
+    )
+    identifier_precedes_target = identifier_end <= value_start
+    metadata_spans = _web_answer_financial_metadata_spans(text)
+    identifier_spans = _web_answer_financial_identifier_spans(text)
+    alternative_scores: list[int] = []
+    for match in _WEB_FINANCIAL_NUMBER_RE.finditer(text, clause_left, clause_right):
+        if (match.start(), match.end()) == (value_start, value_end):
+            continue
+        if _web_answer_span_overlaps(match.start(), match.end(), metadata_spans):
+            continue
+        if _web_answer_financial_descriptor_number(
+            text, match.start(), match.end()
+        ):
+            continue
+        if identifier_precedes_target:
+            if match.end() > identifier_start:
+                continue
+            crosses_identifier = any(
+                start >= match.end() and end <= identifier_start
+                for _identifier, start, end in identifier_spans
+            )
+        else:
+            if match.start() < identifier_end:
+                continue
+            crosses_identifier = any(
+                start >= identifier_end and end <= match.start()
+                for _identifier, start, end in identifier_spans
+            )
+        if crosses_identifier:
+            continue
+        alternative_scores.append(
+            _web_answer_financial_identifier_raw_binding_score(
+                text,
+                match.start(),
+                match.end(),
+                identifier_start,
+                identifier_end,
+                clause_left=clause_left,
+                clause_right=clause_right,
+            )
+        )
+    if alternative_scores and max(alternative_scores) > score:
+        # This identifier already has a structurally stronger quote value on its
+        # other side; do not let it leak across a comma into the adjacent tuple.
+        score -= 2_000
+    return score
+
+
+def _web_answer_financial_identifier_raw_binding_score(
+    text: str,
+    value_start: int,
+    value_end: int,
+    identifier_start: int,
+    identifier_end: int,
+    *,
+    clause_left: int,
+    clause_right: int,
+) -> int:
+    """Score one local value/identifier pairing without global tuple direction."""
+    preceding = identifier_end <= value_start
+    if preceding:
+        between_start = identifier_end
+        between = text[identifier_end:value_start]
+        distance = value_start - identifier_end
+        after_identifier = between
+    else:
+        between_start = value_end
+        between = text[value_end:identifier_start]
+        distance = identifier_start - value_end
+        after_identifier = text[identifier_end:clause_right]
+    comma_count = between.count(",")
+    score = -distance - (250 * comma_count)
+    normalized_between = _repair_mojibake(between).casefold()
+    metadata_spans = _web_answer_financial_metadata_spans(text)
+    if any(
+        not _web_answer_span_overlaps(
+            match.start(),
+            match.end(),
+            metadata_spans,
+        )
+        and not _web_answer_financial_descriptor_number(
+            text,
+            match.start(),
+            match.end(),
+        )
+        for match in _WEB_FINANCIAL_NUMBER_RE.finditer(
+            text,
+            between_start,
+            between_start + len(between),
+        )
+    ):
+        # Crossing another quote value is stronger evidence of a tuple boundary
+        # than a distant "for <ID>" or header token.
+        score -= 3_000
+
+    if preceding:
+        if re.search(r"^\s*(?:=|:|[-–—])", normalized_between):
+            score += 900
+        if re.search(
+            r"(?<![a-zа-яё])(?:has|was|is|traded|closed|settled|"
+            r"price|quote|stock|share|цена|котиров\w*|стоил\w*|составил\w*)"
+            r"(?![a-zа-яё])",
+            normalized_between,
+        ):
+            score += 500
+        if re.search(
+            r"(?<![a-zа-яё])(?:quotes?|prices?|tickers?|котиров\w*|тикер\w*)"
+            r"\s*:\s*$",
+            normalized_between,
+        ):
+            # Instrument lists in a heading describe the page; they do not bind
+            # the first numeric tuple to whichever header token is nearest.
+            score -= 1_500
+    else:
+        if re.search(
+            r"(?<![a-zа-яё])(?:for|ticker|symbol|contract|isin|для|"
+            r"тикер|контракт)\s*$",
+            normalized_between,
+        ):
+            score += 1_500
+        if re.search(r"^\s*(?:=|:|[-–—])", normalized_between):
+            score += 900
+        if comma_count and re.match(
+            r"\s*(?:stock|share|bond|future|futures|contract|price|quote|has|"
+            r"акци\w*|облигац\w*|фьючер\w*|контракт\w*|цен\w*|котиров\w*)",
+            _repair_mojibake(after_identifier).casefold(),
+        ):
+            # ``473.25 USD, BRK.B stock price`` is an explicit value-first
+            # tuple; the comma is internal rather than a boundary to a new quote.
+            score += 600
+
+    # Stable tie-breaking retains conventional identifier-first prose without
+    # overriding any structural cue above.
+    if preceding:
+        score += 1
+    return score
 
 
 def _web_answer_requested_benchmarks(text: str) -> list[str]:
@@ -16299,8 +16648,18 @@ _WEB_FINANCIAL_GENERIC_ENTITY_PREFIXES = (
 
 
 def _web_answer_financial_entity_terms(question: str) -> list[str]:
+    # Exact identifiers have their own byte-for-byte binding contract.  Feeding
+    # their token fragments into linguistic prefix matching would let BRK.B,
+    # BRNQ26, or an ISIN be "proved" by a related but different identifier.
+    identifier_tokens = {
+        token.casefold()
+        for identifier in _web_answer_financial_exact_identifiers(question)
+        for token in re.findall(r"[A-Za-z0-9]+", identifier)
+    }
     terms: list[str] = []
     for term in _web_answer_terms(question):
+        if term in identifier_tokens:
+            continue
         if any(term.startswith(prefix) for prefix in _WEB_FINANCIAL_GENERIC_ENTITY_PREFIXES):
             continue
         if term not in terms:
@@ -16824,10 +17183,17 @@ def _web_answer_financial_timestamp_spans(text: str) -> list[tuple[datetime, int
             zone = WEB_NEWS_TIMEZONE
         else:
             compact = zone_token.replace(":", "")
+            offset_hours = int(compact[1:3])
+            offset_minutes = int(compact[3:5])
+            # ``datetime.timezone`` raises for offsets outside (-24h, +24h).
+            # Parse hostile/malformed source text fail-closed instead of letting
+            # +24:00, +99:99, or a 60-minute component escape as ValueError.
+            if offset_hours > 23 or offset_minutes > 59:
+                continue
             sign = 1 if compact[0] == "+" else -1
-            zone = timezone(sign * timedelta(
-                hours=int(compact[1:3]), minutes=int(compact[3:5])
-            ))
+            zone = timezone(
+                sign * timedelta(hours=offset_hours, minutes=offset_minutes)
+            )
         with suppress(ValueError):
             moment = datetime(
                 int(match.group(1)), int(match.group(2)), int(match.group(3)),
@@ -16838,22 +17204,139 @@ def _web_answer_financial_timestamp_spans(text: str) -> list[tuple[datetime, int
     return found
 
 
+def _web_answer_financial_metadata_spans(text: str) -> list[tuple[int, int]]:
+    """Return recognized date/time metadata spans, preserving real 20xx prices."""
+    repaired = _repair_mojibake(text)
+    spans = [
+        (start, end)
+        for _value, start, end in _web_answer_financial_date_spans(repaired)
+    ]
+    spans.extend(
+        (match.start(), match.end())
+        for match in re.finditer(
+            r"(?<!\d)\d{1,2}:\d{2}(?::\d{2})?"
+            r"(?:\s*(?:Z|UTC|GMT|MSK|[+-]\d{2}:?\d{2}))?(?!\d)",
+            repaired,
+            flags=re.IGNORECASE,
+        )
+    )
+    # A standalone 20xx token is metadata only when the text labels it as such.
+    # Blanket-masking all years made the perfectly valid quote ``2026 USD``
+    # disappear from both answer and evidence validation.
+    year_context = re.compile(
+        r"(?i)(?:\bas\s+of|\bdated?|\bpublished|\bupdated|\btimestamp|\byear|"
+        r"\bдата|\bобновлен\w*|\bопубликован\w*|\bпо\s+состоянию\s+на)"
+        r"\s*(?:[:=,;-]|\bon\b|\bat\b|\bна\b|\bот\b)?\s*(20\d{2})\b"
+    )
+    spans.extend(match.span(1) for match in year_context.finditer(repaired))
+    return sorted(set(spans))
+
+
+def _web_answer_span_overlaps(
+    start: int,
+    end: int,
+    spans: list[tuple[int, int]],
+) -> bool:
+    return any(start < span_end and span_start < end for span_start, span_end in spans)
+
+
+def _web_answer_non_metadata_number_spans(text: str, value: str) -> list[tuple[int, int]]:
+    metadata_spans = _web_answer_financial_metadata_spans(text)
+    return [
+        (start, end)
+        for start, end in _web_answer_number_spans(text, value)
+        if not _web_answer_span_overlaps(start, end, metadata_spans)
+    ]
+
+
+def _web_answer_metadata_labels_for_value_span(
+    text: str,
+    value: str,
+    start: int,
+    end: int,
+    labels: list[tuple[Any, int, int]],
+) -> set[Any]:
+    """Bind date/timestamp labels to one occurrence of a repeated quote value."""
+    left, right = _web_answer_financial_clause_bounds(text, start, end)
+    local_labels = [item for item in labels if item[1] >= left and item[2] <= right]
+    if not local_labels:
+        return set()
+    same_value_spans = [
+        item
+        for item in _web_answer_non_metadata_number_spans(text, value)
+        if item[0] >= left and item[1] <= right
+    ]
+    target = (start, end)
+    scored: list[tuple[int, Any]] = []
+    for label, label_start, label_end in local_labels:
+        if label_end <= start:
+            between = text[label_end:start]
+            distance = start - label_end
+            prefix = _repair_mojibake(text[max(left, label_start - 40):label_start]).casefold()
+            score = -distance - (250 * between.count(","))
+            if re.search(
+                r"(?<![a-zа-яё])(?:updated|published|page updated|"
+                r"обновлен\w*|опубликован\w*)\s+(?:at|on|в|от)?\s*$",
+                prefix,
+            ):
+                score -= 1_500
+        else:
+            between = text[end:label_start]
+            distance = label_start - end
+            score = -distance - (250 * between.count(","))
+            if re.search(
+                r"(?<![a-zа-яё])(?:at|on|as\s+of|в|на|от)\s*$",
+                _repair_mojibake(between).casefold(),
+            ):
+                score += 1_000
+        interval_start = min(end, label_end)
+        interval_end = max(start, label_start)
+        if any(
+            item != target
+            and item[0] >= interval_start
+            and item[1] <= interval_end
+            for item in same_value_spans
+        ):
+            score -= 3_000
+        scored.append((score, label))
+    best_score = max(item[0] for item in scored)
+    return {label for score, label in scored if score == best_score}
+
+
+def _web_answer_nearest_timestamps_for_span(
+    text: str,
+    value: str,
+    start: int,
+    end: int,
+) -> set[datetime]:
+    return _web_answer_metadata_labels_for_value_span(
+        text,
+        value,
+        start,
+        end,
+        _web_answer_financial_timestamp_spans(text),
+    )
+
+
 def _web_answer_nearest_timestamps_for_value(text: str, value: str) -> set[datetime]:
-    timestamps = _web_answer_financial_timestamp_spans(text)
     result: set[datetime] = set()
-    for start, end in _web_answer_number_spans(text, value):
-        left, right = _web_answer_financial_clause_bounds(text, start, end)
-        local = [item for item in timestamps if item[1] >= left and item[2] <= right]
-        if local:
-            center = (start + end) / 2
-            result.add(min(
-                local, key=lambda item: abs((item[1] + item[2]) / 2 - center)
-            )[0])
+    for start, end in _web_answer_non_metadata_number_spans(text, value):
+        result.update(
+            _web_answer_nearest_timestamps_for_span(text, value, start, end)
+        )
     return result
 
 
 def _web_answer_crypto_timestamp_is_fresh(value: datetime) -> bool:
-    age = _web_answer_financial_now().astimezone(UTC) - value.astimezone(UTC)
+    now = _web_answer_financial_now()
+    # A current crypto quote must belong to today's live date in the product
+    # timezone as well as satisfy the short age window.  Otherwise a quote from
+    # 23:59 yesterday was accepted shortly after midnight as a live quote.
+    if value.astimezone(WEB_NEWS_TIMEZONE).date() != now.astimezone(
+        WEB_NEWS_TIMEZONE
+    ).date():
+        return False
+    age = now.astimezone(UTC) - value.astimezone(UTC)
     return timedelta(minutes=-5) <= age <= timedelta(hours=2)
 
 
@@ -16890,7 +17373,10 @@ def _web_answer_financial_clause_bounds(
 
     boundaries = list(
         re.finditer(
-            r"[;\n]|(?<![a-zа-яё])(?:and|while|whereas|и|а)(?![a-zа-яё])",
+            # A sentence-ending dot is a boundary, while decimal dots and the dot
+            # inside class tickers (BRK.B) are not followed by whitespace/end.
+            r"[;\n]|\.(?=\s|$)|"
+            r"(?<![a-zа-яё])(?:and|while|whereas|и|а)(?![a-zа-яё])",
             text,
             flags=re.IGNORECASE,
         )
@@ -16898,6 +17384,960 @@ def _web_answer_financial_clause_bounds(
     left = max((match.end() for match in boundaries if match.end() <= start), default=0)
     right = min((match.start() for match in boundaries if match.start() >= end), default=len(text))
     return left, right
+
+
+def _web_answer_financial_descriptor_number(
+    text: str,
+    start: int,
+    end: int,
+) -> bool:
+    normalized = _repair_mojibake(text).casefold()
+    before = normalized[max(0, start - 32):start]
+    after = normalized[end:min(len(normalized), end + 40)]
+    if re.search(
+        r"(?<![a-zа-яё])(?:class|series|type|tier|класс|серия|тип)\s*[:=]?\s*$",
+        before,
+    ):
+        return True
+    if re.match(r"\s*[-–—]?\s*(?:day|week|month|year)(?![a-z])", after):
+        return True
+    currency = (
+        r"usd|rub|eur|gbp|cny|jpy|доллар\w*|рубл\w*|евро|"
+        r"фунт\w*|юан\w*|иен\w*"
+    )
+    if re.search(r"(?<![a-zа-яё])(?:per|за)\s*$", before) and re.match(
+        rf"\s*(?:{currency})",
+        after,
+    ):
+        return True
+    raw_value = re.sub(r"[\s\u00a0]", "", normalized[start:end])
+    return bool(
+        re.fullmatch(r"[+\-−]?1(?:[.,]0+)?", raw_value)
+        and re.match(rf"\s*(?:{currency})\s*(?:=|per|за)", after)
+    )
+
+
+def _web_answer_financial_primary_number_spans(text: str) -> list[tuple[int, int]]:
+    metadata_spans = _web_answer_financial_metadata_spans(text)
+    return [
+        (match.start(), match.end())
+        for match in _WEB_FINANCIAL_NUMBER_RE.finditer(text)
+        if not _web_answer_span_overlaps(match.start(), match.end(), metadata_spans)
+        and not _web_answer_financial_descriptor_number(
+            text, match.start(), match.end()
+        )
+    ]
+
+
+def _web_answer_financial_hard_clause_bounds(
+    text: str,
+    start: int,
+    end: int,
+) -> tuple[int, int]:
+    """Bound a quote scope without treating coordination as a new section."""
+    boundaries = list(re.finditer(r"[;!?\n]|\.(?=\s|$)", text))
+    left = max((item.end() for item in boundaries if item.end() <= start), default=0)
+    right = min(
+        (item.start() for item in boundaries if item.start() >= end),
+        default=len(text),
+    )
+    return left, right
+
+
+def _web_answer_financial_field_bounds(
+    text: str,
+    start: int,
+    end: int,
+) -> tuple[int, int]:
+    """Return the structural field around one non-metadata numeric occurrence."""
+    left, right = _web_answer_financial_hard_clause_bounds(text, start, end)
+    values = [
+        item
+        for item in _web_answer_financial_primary_number_spans(text)
+        if item[0] >= left and item[1] <= right and item != (start, end)
+    ]
+    previous = [item for item in values if item[1] <= start]
+    following = [item for item in values if item[0] >= end]
+    if previous:
+        previous_value = max(previous, key=lambda item: item[1])
+        separator = max(
+            (
+                text.rfind(token, previous_value[1], start)
+                for token in (",", "|", "—", "–")
+            ),
+            default=-1,
+        )
+        left = separator + 1 if separator >= 0 else previous_value[1]
+    if following:
+        next_value = min(following, key=lambda item: item[0])
+        separators = [
+            offset
+            for token in (",", "|", "—", "–")
+            if (offset := text.rfind(token, end, next_value[0])) >= 0
+        ]
+        right = max(separators) if separators else next_value[0]
+    return left, right
+
+
+def _web_answer_financial_occurrence_bounds(
+    text: str,
+    start: int,
+    end: int,
+) -> tuple[int, int]:
+    """Bound one typed numeric field, including auxiliary market fields."""
+    return _web_answer_financial_field_bounds(text, start, end)
+
+
+def _web_answer_financial_role_spans(text: str) -> list[tuple[str, int, int]]:
+    """Label numeric market fields; unlabelled fields are handled fail-closed."""
+    normalized = _repair_mojibake(text).casefold()
+    patterns: tuple[tuple[str, str], ...] = (
+        ("shares_outstanding", r"shares?\s+outstanding|акци\w*\s+в\s+обращен\w*"),
+        ("high_52_week", r"52[\s-]*week\s+high|52[\s-]*недел\w*\s+максимум\w*"),
+        ("market_cap", r"market\s+(?:cap|capitalization)|рыночн\w*\s+капитализац\w*"),
+        ("enterprise_value", r"enterprise\s+value|стоимост\w*\s+предприяти\w*"),
+        ("total_assets", r"total\s+assets?|совокупн\w*\s+актив\w*"),
+        ("cash_balance", r"cash\s+balance|остат\w*\s+денежн\w*\s+средств\w*"),
+        ("beta", r"(?<![a-zа-яё])(?:beta|бета)(?![a-zа-яё])"),
+        ("employees", r"(?<![a-zа-яё])(?:employees?|сотрудник\w*)(?![a-zа-яё])"),
+        ("net_debt", r"net\s+debt|чист\w*\s+долг\w*"),
+        ("turnover", r"(?<![a-zа-яё])(?:turnover|оборот\w*)(?![a-zа-яё])"),
+        ("volatility", r"(?<![a-zа-яё])(?:volatility|волатильност\w*)(?![a-zа-яё])"),
+        ("spread", r"(?<![a-zа-яё])(?:spread|спред\w*)(?![a-zа-яё])"),
+        ("page_views", r"page\s+views?|просмотр\w*\s+страниц\w*"),
+        ("open", r"opening\s+price|цена\s+открыти\w*|(?<![a-zа-яё])open(?![a-zа-яё])"),
+        ("high", r"(?<![a-zа-яё])high(?![a-zа-яё])|максимум\w*"),
+        ("low", r"(?<![a-zа-яё])low(?![a-zа-яё])|минимум\w*"),
+        ("bid", r"(?<![a-zа-яё])(?:bid|бид)(?![a-zа-яё])"),
+        ("ask", r"(?<![a-zа-яё])(?:ask|offer|аск)(?![a-zа-яё])"),
+        ("volume", r"trading\s+volume|(?<![a-zа-яё])(?:volume|объ[её]м\w*)(?![a-zа-яё])"),
+        ("dividend", r"(?<![a-zа-яё])(?:dividend|дивиденд\w*)(?![a-zа-яё])"),
+        ("revenue", r"(?<![a-zа-яё])(?:revenue|выручк\w*)(?![a-zа-яё])"),
+        ("fundamental", r"(?<![a-zа-яё])(?:ebitda|ebit|eps|earnings|profit|"
+         r"book\s+value|cash\s+flow|прибыл\w*|денежн\w*\s+поток\w*)"
+         r"(?![a-zа-яё])"),
+        ("rank", r"(?<![a-zа-яё])(?:rank|ranking|рейтинг\w*|ранг\w*)(?![a-zа-яё])"),
+        ("yield", r"(?<![a-zа-яё])(?:yield|ytm|доходност\w*)(?![a-zа-яё])"),
+        ("coupon", r"(?<![a-zа-яё])(?:coupon|купон\w*)(?![a-zа-яё])"),
+        ("change", r"daily\s+change|percent\s+change|(?<![a-zа-яё])change(?![a-zа-яё])|изменен\w*"),
+        ("nav", r"(?<![a-z])nav(?![a-z])|(?<![a-zа-яё])сча(?![a-zа-яё])"),
+        ("dirty_price", r"dirty\s+price|грязн\w*\s+цен\w*"),
+        ("clean_price", r"clean\s+price|чист\w*\s+цен\w*"),
+        ("rate", r"exchange\s+rate|forex\s+quote|fx\s+rate|валютн\w*\s+курс|"
+         r"(?<![a-zа-яё])(?:rate|курс\w*|стоил\w*|составил\w*)(?![a-zа-яё])"),
+        ("index_level", r"index\s+level|current\s+level|actual\s+level|уровен\w*\s+индекс\w*"),
+        ("market_price", r"market\s+price|рыночн\w*\s+(?:цен\w*|стоим\w*)"),
+        ("price", r"(?:stock|share)\s+price|last\s+(?:trad(?:ed|e)|quote)|closed\s+at|"
+         r"(?<![a-zа-яё])(?:stock|shares?|price|quote|settlement|spot|"
+         r"цен\w*|котиров\w*)(?![a-zа-яё])"),
+        ("class", r"(?<![a-zа-яё])(?:class|series|tier|класс|серия)(?![a-zа-яё])"),
+    )
+    spans: list[tuple[str, int, int]] = []
+    for role, pattern in patterns:
+        for match in re.finditer(pattern, normalized):
+            if any(
+                match.start() < existing_end and existing_start < match.end()
+                for _existing, existing_start, existing_end in spans
+            ):
+                continue
+            spans.append((role, match.start(), match.end()))
+    return spans
+
+
+def _web_answer_financial_default_value_role(kind: str) -> str:
+    return {
+        "etf": "market_price",
+        "fx": "rate",
+        "index": "index_level",
+    }.get(kind, "price")
+
+
+def _web_answer_financial_canonical_value_role(role: str, *, kind: str) -> str:
+    if role == "price" and kind in {"etf", "fx", "index"}:
+        return _web_answer_financial_default_value_role(kind)
+    return role
+
+
+def _web_answer_financial_value_first_role_edge(
+    text: str,
+    value_start: int,
+    value_end: int,
+    label_start: int,
+) -> bool:
+    """Allow following labels only in an explicit value-first quote tuple."""
+    prefix = text[:value_start]
+    header = re.search(
+        r"(?<![a-zа-яё])(?:quotes?|prices?|котиров\w*|цен\w*)\s*:\s*$",
+        _repair_mojibake(prefix).casefold(),
+    )
+    if header:
+        prefix = prefix[header.end():]
+    between = text[value_end:label_start]
+    for identifier in _web_answer_financial_exact_identifiers(prefix + between):
+        pattern = rf"(?<![A-Za-z0-9]){re.escape(identifier)}(?![A-Za-z0-9])"
+        prefix = re.sub(pattern, " ", prefix, flags=re.IGNORECASE)
+        between = re.sub(pattern, " ", between, flags=re.IGNORECASE)
+    allowed = {
+        "usd", "rub", "eur", "gbp", "cny", "jpy", "dollar", "dollars",
+        "доллар", "доллара", "долларов", "рубль", "рубля", "рублей", "евро",
+        "barrel", "barrels", "баррель", "барреля", "баррелей", "ounce", "ounces",
+        "shares", "share", "percent", "процент", "per", "за", "is", "was", "the",
+        "for", "of", "on", "at", "nyse", "nasdaq", "lse", "moex", "ice", "cme",
+        "nymex", "otc", "current", "latest", "live", "available", "last",
+    }
+    return all(
+        token in allowed
+        for token in re.findall(r"[a-zа-яё]+", prefix + " " + between)
+    )
+
+
+def _web_answer_financial_preceding_role_edge(
+    text: str,
+    label_end: int,
+    value_start: int,
+) -> bool:
+    """Reject a distant header role when a different named field intervenes."""
+    between = text[label_end:value_start]
+    for identifier in _web_answer_financial_exact_identifiers(between):
+        between = re.sub(
+            rf"(?<![A-Za-z0-9]){re.escape(identifier)}(?![A-Za-z0-9])",
+            " ",
+            between,
+            flags=re.IGNORECASE,
+        )
+    allowed = {
+        "is", "was", "were", "has", "had", "a", "an", "the", "of", "for",
+        "on", "at", "equals", "equal", "to", "current", "latest", "live", "actual",
+        "market", "nyse", "nasdaq", "lse", "moex", "ice", "cme", "nymex", "otc",
+        "currency", "pair", "forex", "fx", "usd", "rub", "eur", "gbp", "cny", "jpy",
+        "price", "prices", "quote", "quotes", "stock", "share", "shares", "traded",
+        "был", "была", "было", "были", "на", "по", "составил", "составила",
+        "равен", "равна", "равно",
+        "валютной", "валютная", "пары", "пара", "курс", "котировка", "акций",
+    }
+    return all(
+        token in allowed for token in re.findall(r"[a-zа-яё]+", between.casefold())
+    )
+
+
+def _web_answer_financial_value_role(
+    text: str,
+    start: int,
+    end: int,
+    *,
+    kind: str,
+) -> str:
+    normalized = _repair_mojibake(text).casefold()
+    left, right = _web_answer_financial_field_bounds(normalized, start, end)
+    fragment = normalized[left:right]
+    local_start, local_end = start - left, end - left
+    before = fragment[max(0, local_start - 24):local_start]
+    after = fragment[local_end:min(len(fragment), local_end + 32)]
+    role_spans = _web_answer_financial_role_spans(fragment)
+    preceding = [
+        item
+        for item in role_spans
+        if item[2] <= local_start
+        and _web_answer_financial_preceding_role_edge(
+            fragment, item[2], local_start
+        )
+    ]
+    following = [item for item in role_spans if item[1] >= local_end]
+    if re.search(r"(?<![a-zа-яё])(?:per|за)\s*$", before) and re.match(
+        r"\s*(?:usd|rub|eur|gbp|cny|jpy|доллар\w*|рубл\w*|евро|"
+        r"фунт\w*|юан\w*|иен\w*)",
+        after,
+    ):
+        return "unit_basis"
+    if _web_answer_financial_descriptor_number(text, start, end):
+        return "unit_basis"
+    if not preceding and re.match(
+        r"\s*(?:[-–—]\s*)?(?:current\s+|live\s+|latest\s+|total\s+)?"
+        r"(?:quotes?|prices?|items?|instruments?|stocks?|shares?)(?![a-z])",
+        after,
+    ):
+        return "count"
+    if re.match(r"\s*[-–—]?\s*(?:day|week|month|year)(?![a-z])", after):
+        return "period"
+    if preceding:
+        distance = min(local_start - item[2] for item in preceding)
+        labels = {
+            item[0] for item in preceding if local_start - item[2] == distance
+        }
+    elif following:
+        distance = min(item[1] - local_end for item in following)
+        labels = {
+            item[0]
+            for item in following
+            if item[1] - local_end == distance
+            and _web_answer_financial_value_first_role_edge(
+                fragment,
+                local_start,
+                local_end,
+                item[1],
+            )
+        }
+    else:
+        labels = {
+            item[0]
+            for item in role_spans
+            if item[1] < local_end and local_start < item[2]
+        }
+    if len(labels) == 1:
+        role = next(iter(labels))
+        return _web_answer_financial_canonical_value_role(role, kind=kind)
+    if labels:
+        return "ambiguous"
+    if re.search(r"(?:^|\s)(?:rank|class|series|tier)\s*[:=]?\s*$", before):
+        return "descriptor"
+    # A machine quote assignment is allowed only when its left-hand token is an
+    # exact instrument identifier. Unknown named fields remain unknown rather
+    # than silently becoming prices.
+    assignment = re.search(
+        r"(?<![A-Za-z0-9.])([A-Za-z0-9.]{1,16})\s*(?:=|:)\s*$",
+        fragment[:local_start],
+    )
+    if assignment and assignment.group(1).upper() in (
+        _web_answer_financial_exact_identifiers(fragment)
+    ):
+        return _web_answer_financial_default_value_role(kind)
+    return "unknown"
+
+
+_WEB_FINANCIAL_QUOTE_STATUS_PATTERNS: tuple[tuple[str, str], ...] = (
+    (
+        "target",
+        r"consensus\s+target|price\s+target|target\s+price|"
+        r"analyst\w*\s+target|целев\w*\s+цен\w*",
+    ),
+    (
+        "forecast",
+        r"forecast|predicted|projected|estimated|expected\s+price|"
+        r"прогноз\w*|ожидаем\w*|оценочн\w*",
+    ),
+    (
+        "indicative",
+        r"indicative|theoretical|reference\s+(?:price|quote)|"
+        r"индикатив\w*|ориентировоч\w*|теоретическ\w*|справочн\w*",
+    ),
+    ("premarket", r"pre[\s-]?market|before\s+market|премаркет\w*"),
+    ("postmarket", r"post[\s-]?market|after[\s-]?hours?|постмаркет\w*"),
+    ("delayed", r"delayed|задерж\w*"),
+    (
+        "historical",
+        r"historical|previous\s+close|prior\s+close|yesterday(?:'s)?\s+closing|"
+        r"архивн\w*|историческ\w*|предыдущ\w*\s+закрыт\w*|вчерашн\w*",
+    ),
+    ("unofficial", r"unofficial|неофициальн\w*"),
+    (
+        "simulated",
+        r"simulated|simulation|hypothetical|synthetic|fictional|"
+        r"моделир\w*|симулир\w*|гипотетическ\w*|вымышленн\w*",
+    ),
+    ("intraday", r"intraday\s+(?:high|low)|внутридневн\w*\s+(?:максимум|минимум)\w*"),
+    (
+        "derived",
+        r"(?:average|adjusted|fair)(?:\s+(?:stock|share))?\s+(?:price|value)|"
+        r"средн\w*\s+цен\w*",
+    ),
+)
+
+
+def _web_answer_financial_adjacent_identifier_entities(
+    text: str,
+    start: int,
+    end: int,
+    *,
+    identifiers: set[str],
+) -> dict[str, set[str]]:
+    """Bind adjacent proper-name terms to one exact identifier/value tuple."""
+    if not identifiers:
+        return {}
+    repaired = _repair_mojibake(text)
+    left, right = _web_answer_financial_occurrence_bounds(repaired, start, end)
+    fragment = repaired[left:right]
+    identifier_spans = [
+        (identifier, item_start - left, item_end - left)
+        for identifier, item_start, item_end in _web_answer_financial_identifier_spans(
+            repaired,
+            known_identifiers=identifiers,
+        )
+        if identifier in identifiers and item_start >= left and item_end <= right
+    ]
+    word_spans = list(re.finditer(r"[A-Za-zА-Яа-яЁё]+(?:['’][A-Za-zА-Яа-яЁё]+)?", fragment))
+
+    def is_proper_name(token: str) -> bool:
+        return token[0].isupper() and (not token.isupper() or len(token) == 1)
+
+    def is_identity_gap(value: str) -> bool:
+        return bool(re.fullmatch(r"[\s()\[\]]*", value))
+
+    result: dict[str, set[str]] = {}
+    for identifier, identifier_start, identifier_end in identifier_spans:
+        terms: set[str] = set()
+        cursor = identifier_start
+        for word in reversed([item for item in word_spans if item.end() <= cursor]):
+            if not is_identity_gap(fragment[word.end():cursor]):
+                break
+            token = word.group(0)
+            if not is_proper_name(token):
+                break
+            terms.add(token.casefold())
+            cursor = word.start()
+        cursor = identifier_end
+        for word in [item for item in word_spans if item.start() >= cursor]:
+            if not is_identity_gap(fragment[cursor:word.start()]):
+                break
+            token = word.group(0)
+            if not is_proper_name(token):
+                break
+            terms.add(token.casefold())
+            cursor = word.end()
+        if terms:
+            result.setdefault(identifier, set()).update(terms)
+    return result
+
+
+def _web_answer_financial_has_unknown_role_modifier(
+    text: str,
+    start: int,
+    end: int,
+    *,
+    allowed_entity_terms: set[str] | None = None,
+) -> bool:
+    left, right = _web_answer_financial_field_bounds(text, start, end)
+    fragment = _repair_mojibake(text[left:right])
+    local_start = start - left
+    preceding_roles = [
+        item
+        for item in _web_answer_financial_role_spans(fragment)
+        if item[2] <= local_start
+    ]
+    if not preceding_roles:
+        return False
+    label_start = max(preceding_roles, key=lambda item: item[2])[1]
+    prefix = fragment[:label_start]
+    prefix_offset = 0
+    coordination_cuts = [
+        match.end()
+        for match in re.finditer(
+            r"(?<![a-zа-яё])(?:and|but|then|versus|и|а|но|затем)"
+            r"(?![a-zа-яё])",
+            prefix,
+            flags=re.IGNORECASE,
+        )
+    ]
+    if (
+        _web_answer_financial_primary_number_spans(prefix)
+        or _web_answer_financial_metadata_spans(prefix)
+    ):
+        cuts = [
+            offset + 1
+            for token in (",", ";", ":", "|", "—", "–", "(")
+            if (offset := prefix.rfind(token)) >= 0
+        ]
+        cuts.extend(coordination_cuts)
+        if cuts:
+            prefix_offset = max(cuts)
+            prefix = prefix[prefix_offset:]
+    elif coordination_cuts:
+        prefix_offset = max(coordination_cuts)
+        prefix = prefix[prefix_offset:]
+    identifier_spans = [
+        (identifier, item_start - prefix_offset, item_end - prefix_offset)
+        for identifier, item_start, item_end in _web_answer_financial_identifier_spans(
+            fragment
+        )
+        if item_start >= prefix_offset and item_end <= prefix_offset + len(prefix)
+    ]
+    first_identifier_start = min(
+        (item[1] for item in identifier_spans),
+        default=None,
+    )
+    masked_prefix = list(prefix)
+    for _identifier, identifier_start, identifier_end in identifier_spans:
+        masked_prefix[identifier_start:identifier_end] = " " * (
+            identifier_end - identifier_start
+        )
+    prefix = "".join(masked_prefix)
+    neutral = {
+        "the", "a", "an", "one", "is", "was", "were", "has", "had", "of", "for",
+        "on", "at", "in", "from", "as",
+        "stock", "share", "shares", "equity", "bond", "futures", "future",
+        "contract", "market", "quote", "price", "spot", "settlement", "index",
+        "current", "live", "latest", "last", "actual", "official", "real",
+        "available", "common", "class", "isin", "ticker", "symbol", "exchange",
+        "nyse", "nasdaq", "lse", "moex", "ice", "cme", "nymex", "otc",
+        "usd", "rub", "eur", "gbp", "cny", "jpy", "brent", "wti", "bitcoin",
+        "ethereum", "btc", "eth", "forex", "fx", "currency", "pair",
+        "акция", "акции", "акций", "облигация", "облигации", "фьючерс",
+        "фьючерсный", "фьючерсная", "фьючерсное",
+        "контракт", "рынок", "рыночная", "котировка", "цена", "курс", "индекс",
+        "текущая", "текущий", "текущее", "последняя", "последний", "последнее",
+        "актуальная", "актуальный", "официальная", "официальный", "реальная",
+        "реальный", "доступная", "доступный", "биржа", "валютная", "пара",
+        "к", "один", "доллар", "доллара", "долларов", "рубль", "рубля", "рублю",
+        "рублей", "сша", "евро", "фунт", "фунта", "юань", "юаня", "иена", "иены",
+    }
+    for match in re.finditer(r"[A-Za-zА-Яа-яЁё]+", prefix):
+        token = match.group(0)
+        normalized_token = token.casefold()
+        if normalized_token in neutral or normalized_token in (allowed_entity_terms or set()):
+            continue
+        if (
+            token[0].isupper()
+            and (not token.isupper() or len(token) == 1)
+            and first_identifier_start is None
+        ):
+            continue
+        return True
+    return False
+
+
+def _web_answer_financial_suffix_status(
+    text: str,
+    start: int,
+    end: int,
+) -> str:
+    left, right = _web_answer_financial_field_bounds(text, start, end)
+    fragment = _repair_mojibake(text[left:right])
+    tail_start = end - left
+    tail = fragment[tail_start:]
+    coordination = re.search(
+        r"(?<![a-zа-яё])(?:and|but|then|versus|и|а|но|затем)(?![a-zа-яё])",
+        tail,
+        flags=re.IGNORECASE,
+    )
+    if coordination:
+        tail = tail[:coordination.start()]
+    if re.search(
+        r"(?<![a-zа-яё])(?:not\s+(?:actual|real|correct|true)|"
+        r"false\s+(?:value|quote|price)|incorrect|неверн\w*|ложн\w*)"
+        r"(?![a-zа-яё])",
+        tail,
+        flags=re.IGNORECASE,
+    ):
+        return "negated"
+    annotations = [
+        match.group(1)
+        for match in re.finditer(r"\(([^()]*)\)", tail)
+    ]
+    annotations.extend(
+        match.group(1)
+        for match in re.finditer(r",\s*([^,;]+)", tail)
+    )
+    if not annotations:
+        return ""
+    neutral = {
+        "usd", "rub", "eur", "gbp", "cny", "jpy", "dollar", "dollars",
+        "доллар", "доллара", "долларов", "рубль", "рубля", "рублей", "евро",
+        "barrel", "barrels", "баррель", "барреля", "баррелей", "ounce", "ounces",
+        "унция", "унции", "tonne", "tonnes", "тонна", "тонны", "point", "points",
+        "пункт", "пункта", "percent", "процент", "процента", "shares", "share",
+        "nyse", "nasdaq", "lse", "moex", "ice", "cme", "nymex", "otc",
+        "utc", "gmt", "msk", "z", "t", "per", "за", "on", "at", "as", "of",
+        "the", "is", "was", "for", "stock", "price", "quote", "market", "contract",
+        "futures", "bond", "isin", "current", "latest", "live", "available", "last",
+        "actual", "official", "real", "this", "на", "по", "в", "от", "акций",
+        "котировка", "цена", "рынок", "биржа", "контракт", "фьючерс",
+    }
+    for annotation in annotations:
+        masked = list(annotation)
+        for metadata_start, metadata_end in _web_answer_financial_metadata_spans(
+            annotation
+        ):
+            masked[metadata_start:metadata_end] = " " * (
+                metadata_end - metadata_start
+            )
+        for _identifier, identifier_start, identifier_end in (
+            _web_answer_financial_identifier_spans(annotation)
+        ):
+            masked[identifier_start:identifier_end] = " " * (
+                identifier_end - identifier_start
+            )
+        if any(
+            token.casefold() not in neutral
+            for token in re.findall(r"[A-Za-zА-Яа-яЁё]+", "".join(masked))
+        ):
+            return "unknown_modifier"
+    return ""
+
+
+def _web_answer_financial_value_status(
+    text: str,
+    start: int,
+    end: int,
+    *,
+    allowed_entity_terms: set[str] | None = None,
+) -> str:
+    left, right = _web_answer_financial_field_bounds(text, start, end)
+    fragment = _repair_mojibake(text[left:right]).casefold()
+    local_start = start - left
+    if re.search(
+        r"(?:(?<![a-zа-яё])(?:not(?:\s+equal\s+to)?|no|never|не(?:\s+равн\w*)?|"
+        r"никогда|rather\s+than|instead\s+of)"
+        r"(?![a-zа-яё])|≠)\s*$",
+        fragment[:local_start],
+    ):
+        return "negated"
+    suffix_status = _web_answer_financial_suffix_status(text, start, end)
+    if suffix_status == "negated":
+        return suffix_status
+    for status, pattern in _WEB_FINANCIAL_QUOTE_STATUS_PATTERNS:
+        if re.search(pattern, fragment):
+            return status
+    if suffix_status:
+        return suffix_status
+    if _web_answer_financial_has_unknown_role_modifier(
+        text,
+        start,
+        end,
+        allowed_entity_terms=allowed_entity_terms,
+    ):
+        return "unknown_modifier"
+    return "live_current"
+
+
+def _web_answer_financial_requested_value_role(question: str, *, kind: str) -> str:
+    explicit = _web_answer_financial_metric_kind(question, kind=kind)
+    if explicit:
+        return explicit
+    roles = _web_answer_financial_role_spans(question)
+    if len({item[0] for item in roles}) == 1:
+        return roles[0][0]
+    return _web_answer_financial_default_value_role(kind)
+
+
+def _web_answer_financial_requested_value_status(question: str) -> str:
+    normalized = _repair_mojibake(question).casefold()
+    for status, pattern in _WEB_FINANCIAL_QUOTE_STATUS_PATTERNS:
+        if re.search(pattern, normalized):
+            return status
+    return (
+        "live_current"
+        if _web_answer_current_financial_quote_requested(question)
+        else "unspecified"
+    )
+
+
+def _web_answer_financial_quote_timestamp_spans(
+    text: str,
+) -> list[tuple[datetime, int, int]]:
+    return _web_answer_financial_timestamp_spans(text)
+
+
+def _web_answer_financial_scope_timestamp_spans(
+    text: str,
+) -> list[tuple[datetime, int, int]]:
+    result: list[tuple[datetime, int, int]] = []
+    for item in _web_answer_financial_quote_timestamp_spans(text):
+        left, _right = _web_answer_financial_hard_clause_bounds(text, item[1], item[2])
+        prefix = _repair_mojibake(text[left:item[1]]).casefold()
+        if re.search(
+            r"(?<![a-zа-яё])(?:quotes?|prices?|котиров\w*|цен\w*)\s+"
+            r"(?:as\s+of|at|на|от)\s*$",
+            prefix,
+        ):
+            result.append(item)
+    return result
+
+
+def _web_answer_financial_scope_applies(
+    text: str,
+    scope_start: int,
+    scope_end: int,
+    value_start: int,
+    value_end: int,
+) -> bool:
+    scope_left, scope_right = _web_answer_financial_hard_clause_bounds(
+        text, scope_start, scope_end
+    )
+    if not (scope_end <= value_start and value_end <= scope_right):
+        return False
+    scoped_identifiers = _web_answer_financial_exact_identifiers(
+        text[scope_left:scope_start]
+    )
+    if not scoped_identifiers:
+        return True
+    value_identifiers = _web_answer_nearest_financial_identifiers_for_span(
+        text,
+        value_start,
+        value_end,
+        known_identifiers=scoped_identifiers,
+    )
+    return bool(scoped_identifiers.intersection(value_identifiers))
+
+
+def _web_answer_financial_direct_suffix(
+    text: str,
+    value_end: int,
+    metadata_start: int,
+) -> bool:
+    """Accept only a value-to-time edge, never arbitrary page prose."""
+    between = _repair_mojibake(text[value_end:metadata_start]).casefold()
+    connector = re.search(
+        r"(?<![a-zа-яё])(?:at|as\s+of|on|в|на|от)\s*$",
+        between,
+    )
+    if not connector:
+        return False
+    prefix = between[:connector.start()]
+    for identifier in _web_answer_financial_exact_identifiers(prefix):
+        prefix = re.sub(
+            rf"(?<![A-Za-z0-9]){re.escape(identifier)}(?![A-Za-z0-9])",
+            " ",
+            prefix,
+            flags=re.IGNORECASE,
+        )
+    tokens = re.findall(r"[a-zа-яё]+", prefix)
+    allowed = {
+        "usd", "rub", "eur", "gbp", "cny", "jpy", "dollar", "dollars",
+        "доллар", "доллара", "долларов", "рубль", "рубля", "рублей", "евро",
+        "barrel", "barrels", "баррель", "барреля", "баррелей", "ounce", "ounces",
+        "унция", "унции", "tonne", "tonnes", "тонна", "тонны", "point", "points",
+        "пункт", "пункта", "percent", "процент", "процента", "shares", "share",
+        "nyse", "nasdaq", "lse", "moex", "ice", "cme", "nymex", "otc",
+        "per", "за", "on", "at", "the", "is", "was", "for", "of", "stock",
+        "price", "quote", "market", "contract", "futures", "bond", "isin",
+        "current", "latest", "live", "available", "last", "traded", "settled",
+        "settlement", "closing", "close",
+    }
+    return all(token in allowed for token in tokens)
+
+
+def _web_answer_financial_reverse_role_edge(
+    text: str,
+    lower_bound: int,
+    metadata_start: int,
+    *,
+    role: str,
+    kind: str,
+) -> bool:
+    """Require ``<same field role> at <time>`` with no publication verb."""
+    for label, label_start, label_end in _web_answer_financial_role_spans(text):
+        if label_start < lower_bound or label_end > metadata_start:
+            continue
+        if _web_answer_financial_canonical_value_role(label, kind=kind) != role:
+            continue
+        tail = _repair_mojibake(text[label_end:metadata_start]).casefold()
+        if re.fullmatch(
+            r"\s*(?:(?:is|was)\s+)?(?:at|as\s+of|on|в|на|от)\s*",
+            tail,
+        ):
+            return True
+    return False
+
+
+def _web_answer_financial_direct_timestamp_spans(
+    text: str,
+    start: int,
+    end: int,
+    *,
+    kind: str,
+) -> list[tuple[datetime, int, int]]:
+    role = _web_answer_financial_value_role(text, start, end, kind=kind)
+    value_spans = [
+        span
+        for span in _web_answer_financial_primary_number_spans(text)
+        if _web_answer_financial_value_role(text, *span, kind=kind) != "unit_basis"
+    ]
+    hard_left, hard_right = _web_answer_financial_hard_clause_bounds(text, start, end)
+    result: list[tuple[datetime, int, int]] = []
+    for item in _web_answer_financial_quote_timestamp_spans(text):
+        moment, timestamp_start, timestamp_end = item
+        if not (timestamp_start >= hard_left and timestamp_end <= hard_right):
+            continue
+        previous_values = [span for span in value_spans if span[1] <= timestamp_start]
+        next_values = [span for span in value_spans if span[0] >= timestamp_end]
+        previous_value = max(previous_values, key=lambda span: span[1], default=None)
+        next_value = min(next_values, key=lambda span: span[0], default=None)
+        if previous_value == (start, end):
+            intervening_roles = {
+                _web_answer_financial_canonical_value_role(label, kind=kind)
+                for label, label_start, label_end in _web_answer_financial_role_spans(text)
+                if label_start >= end and label_end <= timestamp_start
+            }
+            direct_suffix = _web_answer_financial_direct_suffix(
+                text, end, timestamp_start
+            )
+            if direct_suffix and (not intervening_roles or role in intervening_roles):
+                result.append((moment, timestamp_start, timestamp_end))
+                continue
+        if next_value != (start, end):
+            continue
+        previous_end = previous_value[1] if previous_value is not None else hard_left
+        prefix = _repair_mojibake(text[previous_end:timestamp_start]).casefold()
+        prefix_identifiers = _web_answer_financial_exact_identifiers(
+            text[previous_end:timestamp_start]
+        )
+        value_identifiers = _web_answer_nearest_financial_identifiers_for_span(
+            text, start, end
+        )
+        role_edge = _web_answer_financial_reverse_role_edge(
+            text,
+            previous_end,
+            timestamp_start,
+            role=role,
+            kind=kind,
+        ) and (
+            not prefix_identifiers
+            or bool(prefix_identifiers.intersection(value_identifiers))
+        )
+        leading_edge = previous_value is None and bool(
+            re.fullmatch(r"\s*(?:at|as\s+of|on|в|на|от)\s*", prefix)
+        )
+        if role_edge or leading_edge:
+            result.append((moment, timestamp_start, timestamp_end))
+    return result
+
+
+def _web_answer_financial_timestamps_for_occurrence(
+    text: str,
+    value: str,
+    start: int,
+    end: int,
+    *,
+    kind: str = "",
+) -> set[datetime]:
+    scope_spans = _web_answer_financial_scope_timestamp_spans(text)
+    scope_offsets = {(item[1], item[2]) for item in scope_spans}
+    direct = [
+        item
+        for item in _web_answer_financial_direct_timestamp_spans(
+            text, start, end, kind=kind
+        )
+        if (item[1], item[2]) not in scope_offsets
+    ]
+    if direct:
+        return {item[0] for item in direct}
+    scopes = [
+        item
+        for item in scope_spans
+        if _web_answer_financial_scope_applies(
+            text, item[1], item[2], start, end
+        )
+    ]
+    if scopes:
+        latest_offset = max(item[2] for item in scopes)
+        return {item[0] for item in scopes if item[2] == latest_offset}
+    return set()
+
+
+def _web_answer_financial_quote_date_spans(
+    text: str,
+) -> list[tuple[date, int, int]]:
+    timestamp_spans = [
+        (start, end)
+        for _moment, start, end in _web_answer_financial_timestamp_spans(text)
+    ]
+    return [
+        item
+        for item in _web_answer_financial_date_spans(text)
+        if not any(
+            timestamp_start <= item[1] and item[2] <= timestamp_end
+            for timestamp_start, timestamp_end in timestamp_spans
+        )
+        and not re.match(
+            r"[T\s]+\d{1,2}:\d{2}(?::\d{2})?",
+            text[item[2]:],
+            flags=re.IGNORECASE,
+        )
+    ]
+
+
+def _web_answer_financial_scope_date_spans(
+    text: str,
+) -> list[tuple[date, int, int]]:
+    result: list[tuple[date, int, int]] = []
+    for item in _web_answer_financial_quote_date_spans(text):
+        left, _right = _web_answer_financial_hard_clause_bounds(text, item[1], item[2])
+        prefix = _repair_mojibake(text[left:item[1]]).casefold()
+        if re.search(
+            r"^\s*(?:on|as\s+of|на|от)\s*$|"
+            r"(?<![a-zа-яё])(?:quotes?|prices?|котиров\w*|цен\w*)\s+"
+            r"(?:as\s+of|at|на|от)\s*$",
+            prefix,
+        ):
+            result.append(item)
+    return result
+
+
+def _web_answer_financial_dates_for_occurrence(
+    text: str,
+    value: str,
+    start: int,
+    end: int,
+    *,
+    kind: str = "",
+) -> set[date]:
+    timestamps = _web_answer_financial_timestamps_for_occurrence(
+        text, value, start, end, kind=kind
+    )
+    if timestamps:
+        return {
+            item.astimezone(WEB_NEWS_TIMEZONE).date()
+            for item in timestamps
+        }
+    dates = _web_answer_financial_quote_date_spans(text)
+    date_scopes = _web_answer_financial_scope_date_spans(text)
+    scope_offsets = {(item[1], item[2]) for item in date_scopes}
+    role = _web_answer_financial_value_role(text, start, end, kind=kind)
+    hard_left, hard_right = _web_answer_financial_hard_clause_bounds(text, start, end)
+    values = [
+        span
+        for span in _web_answer_financial_primary_number_spans(text)
+        if _web_answer_financial_value_role(text, *span, kind=kind) != "unit_basis"
+    ]
+    direct: set[date] = set()
+    for item in dates:
+        day, date_start, date_end = item
+        if (date_start, date_end) in scope_offsets:
+            continue
+        if not (date_start >= hard_left and date_end <= hard_right):
+            continue
+        previous_values = [span for span in values if span[1] <= date_start]
+        next_values = [span for span in values if span[0] >= date_end]
+        previous_value = max(previous_values, key=lambda span: span[1], default=None)
+        next_value = min(next_values, key=lambda span: span[0], default=None)
+        if previous_value == (start, end):
+            intervening_roles = {
+                _web_answer_financial_canonical_value_role(label, kind=kind)
+                for label, label_start, label_end in _web_answer_financial_role_spans(text)
+                if label_start >= end and label_end <= date_start
+            }
+            if _web_answer_financial_direct_suffix(
+                text, end, date_start
+            ) and (not intervening_roles or role in intervening_roles):
+                direct.add(day)
+                continue
+        if next_value != (start, end):
+            continue
+        previous_end = previous_value[1] if previous_value is not None else hard_left
+        prefix = _repair_mojibake(text[previous_end:date_start]).casefold()
+        if _web_answer_financial_reverse_role_edge(
+            text,
+            previous_end,
+            date_start,
+            role=role,
+            kind=kind,
+        ) or (
+            previous_value is None
+            and re.fullmatch(r"\s*(?:on|as\s+of|at|в|на|от)\s*", prefix)
+        ):
+            direct.add(day)
+    if direct:
+        return direct
+    scope_dates = [
+        item
+        for item in date_scopes
+        if _web_answer_financial_scope_applies(
+            text, item[1], item[2], start, end
+        )
+    ]
+    if scope_dates:
+        latest_offset = max(item[2] for item in scope_dates)
+        return {item[0] for item in scope_dates if item[2] == latest_offset}
+    return set()
 
 
 def _web_answer_bound_labels_for_value(
@@ -16910,59 +18350,106 @@ def _web_answer_bound_labels_for_value(
 ) -> set[str]:
     result: set[str] = set()
     for start, end in _web_answer_number_spans(text, value):
-        left, right = _web_answer_financial_clause_bounds(text, start, end)
-        candidates = [
-            item for item in label_spans if item[1] >= left and item[2] <= right
-        ]
-        if not candidates and fallback_global:
-            candidates = label_spans
-        if not candidates:
-            continue
-        preceding = [item for item in candidates if item[2] <= start]
-        following = [item for item in candidates if item[1] >= end]
-        if prefer_preceding and preceding:
-            selected_offset = max(item[2] for item in preceding)
-            selected = [item for item in preceding if item[2] == selected_offset]
-        elif following and prefer_preceding:
-            selected_offset = min(item[1] for item in following)
-            selected = [item for item in following if item[1] == selected_offset]
-        else:
-            center = (start + end) / 2
-            distance = min(
-                abs(((item[1] + item[2]) / 2) - center) for item in candidates
+        result.update(
+            _web_answer_bound_labels_for_span(
+                text,
+                start,
+                end,
+                label_spans,
+                prefer_preceding=prefer_preceding,
+                fallback_global=fallback_global,
             )
-            selected = [
-                item
-                for item in candidates
-                if abs(abs(((item[1] + item[2]) / 2) - center) - distance) < 1e-9
-            ]
-        result.update(item[0] for item in selected)
+        )
     return result
+
+
+def _web_answer_bound_labels_for_span(
+    text: str,
+    start: int,
+    end: int,
+    label_spans: list[tuple[str, int, int]],
+    *,
+    prefer_preceding: bool,
+    fallback_global: bool = False,
+) -> set[str]:
+    """Bind labels to one numeric occurrence, never to every equal value.
+
+    ``prefer_preceding`` is only a tie-breaker.  Treating it as an unconditional
+    rule made a value-first tuple such as ``710000 USD, BRK.A`` inherit the
+    identifier of a previous quote even when the following identifier was much
+    closer.
+    """
+    left, right = _web_answer_financial_clause_bounds(text, start, end)
+    candidates = [item for item in label_spans if item[1] >= left and item[2] <= right]
+    if not candidates and fallback_global:
+        candidates = label_spans
+    if not candidates:
+        return set()
+    preceding = [item for item in candidates if item[2] <= start]
+    following = [item for item in candidates if item[1] >= end]
+    preceding_distance = min((start - item[2] for item in preceding), default=None)
+    following_distance = min((item[1] - end for item in following), default=None)
+    if preceding_distance is not None and following_distance is not None:
+        use_preceding = preceding_distance < following_distance or (
+            prefer_preceding and preceding_distance == following_distance
+        )
+        selected_distance = preceding_distance if use_preceding else following_distance
+        selected = [
+            item
+            for item in (preceding if use_preceding else following)
+            if (start - item[2] if use_preceding else item[1] - end)
+            == selected_distance
+        ]
+    elif preceding_distance is not None:
+        selected = [
+            item for item in preceding if start - item[2] == preceding_distance
+        ]
+    elif following_distance is not None:
+        selected = [item for item in following if item[1] - end == following_distance]
+    else:
+        center = (start + end) / 2
+        distance = min(abs(((item[1] + item[2]) / 2) - center) for item in candidates)
+        selected = [
+            item
+            for item in candidates
+            if abs(abs(((item[1] + item[2]) / 2) - center) - distance) < 1e-9
+        ]
+    return {item[0] for item in selected}
+
+
+def _web_answer_nearest_dates_for_span(
+    text: str,
+    value: str,
+    start: int,
+    end: int,
+) -> set[date]:
+    normalized = _repair_mojibake(text).casefold()
+    dates = _web_answer_financial_date_spans(normalized)
+    result = _web_answer_metadata_labels_for_value_span(
+        normalized,
+        value,
+        start,
+        end,
+        dates,
+    )
+    if result:
+        return result
+    # A leading "Today"/as-of header may govern several coordinated tuples.
+    # Never borrow a suffix date from a later clause: that relabelled an old
+    # first value with the current date attached to a second "latest" value.
+    preceding = [item for item in dates if item[2] <= start]
+    if preceding:
+        return {max(preceding, key=lambda item: item[2])[0]}
+    return set()
 
 
 def _web_answer_nearest_dates_for_value(text: str, value: str) -> set[date]:
     normalized = _repair_mojibake(text).casefold()
-    dates = _web_answer_financial_date_spans(normalized)
     result: set[date] = set()
-    for start, end in _web_answer_number_spans(normalized, value):
-        left, right = _web_answer_financial_clause_bounds(normalized, start, end)
-        candidates = [
-            item for item in dates if item[1] >= left and item[2] <= right
-        ]
-        if candidates:
-            center = (start + end) / 2
-            nearest = min(
-                candidates,
-                key=lambda item: abs(((item[1] + item[2]) / 2) - center),
-            )
-            result.add(nearest[0])
-            continue
-        # A leading "Today"/as-of header may govern several coordinated tuples.
-        # Never borrow a suffix date from a later clause: that relabelled an old
-        # first value with the current date attached to a second "latest" value.
-        preceding = [item for item in dates if item[2] <= start]
-        if preceding:
-            result.add(max(preceding, key=lambda item: item[2])[0])
+    for start, end in _web_answer_non_metadata_number_spans(normalized, value):
+        result.update(
+            _web_answer_nearest_dates_for_span(normalized, value, start, end)
+        )
     return result
 
 
@@ -17267,6 +18754,17 @@ def _web_answer_financial_metric_spans(
         patterns = (
             ("change", change_pattern),
             (
+                "volume",
+                r"trading\s+volume|(?<![a-zа-яё])(?:volume|объ[её]м\w*)"
+                r"(?![a-zа-яё])",
+            ),
+            (
+                "high_52_week",
+                r"52[\s-]*week\s+high|52[\s-]*недел\w*\s+максимум\w*",
+            ),
+            ("ask", r"(?<![a-zа-яё])(?:ask|offer|аск)(?![a-zа-яё])"),
+            ("bid", r"(?<![a-zа-яё])(?:bid|бид)(?![a-zа-яё])"),
+            (
                 "market_cap",
                 r"market\s+(?:cap|capitalization)|рыночн\w*\s+капитализац\w*",
             ),
@@ -17422,7 +18920,7 @@ def _web_answer_financial_date_is_fresh(
 def _web_answer_financial_local_fragment(text: str, start: int, end: int) -> str:
     # A decimal point is not a sentence boundary. Splitting on every dot made
     # the context for "1 USD" in "7.25 RUB per 1 USD" start at "25".
-    boundaries = list(re.finditer(r"(?<!\d)\.|\.(?!\d)|[!?\n]", text))
+    boundaries = list(re.finditer(r"\.(?=\s|$)|[!?\n]", text))
     left = max((match.end() for match in boundaries if match.end() <= start), default=0)
     right = min((match.start() for match in boundaries if match.start() >= end), default=len(text))
     return text[left:right].strip()
@@ -17434,6 +18932,7 @@ def _web_answer_financial_source_supports_value(
     question: str,
     kind: str,
     answer_text: str,
+    answer_value_span: tuple[int, int],
     source: dict[str, Any],
     require_fresh: bool,
     required_dates: set[date] | None = None,
@@ -17441,8 +18940,42 @@ def _web_answer_financial_source_supports_value(
     source_text = _web_answer_financial_source_text(source)
     if not _web_answer_financial_source_relevant(question, source_text, kind=kind):
         return False
+    requested_identifiers = _web_answer_financial_exact_identifiers(question)
+    answer_value_start, answer_value_end = answer_value_span
+    requested_role = _web_answer_financial_requested_value_role(question, kind=kind)
+    requested_status = _web_answer_financial_requested_value_status(question)
+    status_entity_terms = set(_web_answer_financial_entity_terms(question))
+    answer_role = _web_answer_financial_value_role(
+        answer_text,
+        answer_value_start,
+        answer_value_end,
+        kind=kind,
+    )
+    if answer_role != requested_role:
+        return False
+    answer_left, answer_right = _web_answer_financial_occurrence_bounds(
+        answer_text, answer_value_start, answer_value_end
+    )
+    answer_fragment = answer_text[answer_left:answer_right].strip()
+    answer_value_identifiers = (
+        _web_answer_nearest_financial_identifiers_for_span(
+            answer_text,
+            answer_value_start,
+            answer_value_end,
+            known_identifiers=requested_identifiers,
+        )
+        & requested_identifiers
+    )
+    if requested_identifiers and not answer_value_identifiers:
+        return False
+    answer_identifier_entities = _web_answer_financial_adjacent_identifier_entities(
+        answer_text,
+        answer_value_start,
+        answer_value_end,
+        identifiers=answer_value_identifiers,
+    )
     normalized_values = _web_answer_number_forms(value)
-    answer_currencies = _web_answer_currency_codes(answer_text)
+    answer_currencies = _web_answer_currency_codes(answer_fragment)
     unit_groups = (
         ("barrel", "баррел"),
         ("ounce", "унци"),
@@ -17452,30 +18985,87 @@ def _web_answer_financial_source_supports_value(
         ("point", "пункт"),
         ("percent", "процент", "%"),
     )
-    normalized_answer = _repair_mojibake(answer_text).casefold()
+    normalized_answer = _repair_mojibake(answer_fragment).casefold()
     quote_type_groups = (
         ("settlement", "расчётн", "расчетн"),
         ("spot", "спот"),
         ("futures", "future", "фьючер"),
     )
     for chunk in _web_answer_financial_quote_chunks(source):
+        metadata_spans = _web_answer_financial_metadata_spans(chunk)
         for match in _WEB_FINANCIAL_NUMBER_RE.finditer(chunk):
             if not normalized_values.intersection(
                 _web_answer_number_forms(match.group(0))
             ):
                 continue
-            quote_fragment = _web_answer_financial_local_fragment(
+            if _web_answer_span_overlaps(match.start(), match.end(), metadata_spans):
+                continue
+            source_role = _web_answer_financial_value_role(
+                chunk,
+                match.start(),
+                match.end(),
+                kind=kind,
+            )
+            if source_role != answer_role or source_role != requested_role:
+                continue
+            occurrence_left, occurrence_right = _web_answer_financial_occurrence_bounds(
                 chunk,
                 match.start(),
                 match.end(),
             )
+            quote_fragment = chunk[occurrence_left:occurrence_right].strip()
+            if requested_identifiers:
+                source_value_identifiers = (
+                    _web_answer_nearest_financial_identifiers_for_span(
+                        chunk,
+                        match.start(),
+                        match.end(),
+                        known_identifiers=requested_identifiers,
+                    )
+                    & requested_identifiers
+                )
+                if not answer_value_identifiers.issubset(source_value_identifiers):
+                    continue
+            else:
+                source_value_identifiers = set()
+            source_identifier_entities = (
+                _web_answer_financial_adjacent_identifier_entities(
+                    chunk,
+                    match.start(),
+                    match.end(),
+                    identifiers=source_value_identifiers,
+                )
+            )
+            matched_identifier_entities = {
+                term
+                for identifier in answer_value_identifiers & source_value_identifiers
+                for term in answer_identifier_entities.get(identifier, set())
+                & source_identifier_entities.get(identifier, set())
+            }
+            allowed_status_entities = status_entity_terms | matched_identifier_entities
+            answer_status = _web_answer_financial_value_status(
+                answer_text,
+                answer_value_start,
+                answer_value_end,
+                allowed_entity_terms=allowed_status_entities,
+            )
+            source_status = _web_answer_financial_value_status(
+                chunk,
+                match.start(),
+                match.end(),
+                allowed_entity_terms=allowed_status_entities,
+            )
+            if requested_status != "unspecified" and answer_status != requested_status:
+                continue
+            if source_status != answer_status:
+                continue
             normalized_fragment = _repair_mojibake(quote_fragment).casefold()
-            answer_benchmarks = set(_web_answer_requested_benchmarks(answer_text))
+            answer_benchmarks = set(_web_answer_requested_benchmarks(answer_fragment))
             fragment_benchmarks = set(_web_answer_requested_benchmarks(quote_fragment))
             if answer_benchmarks and not answer_benchmarks.issubset(fragment_benchmarks):
                 continue
             answer_value_benchmarks = _web_answer_nearest_benchmarks_for_value(
-                answer_text,
+                answer_fragment,
                 value,
             )
             fragment_value_benchmarks = _web_answer_nearest_benchmarks_for_value(
@@ -17488,7 +19078,7 @@ def _web_answer_financial_source_supports_value(
                 continue
             requested_asset_groups = _web_answer_requested_asset_groups(question)
             answer_value_assets = _web_answer_nearest_assets_for_value(
-                answer_text,
+                answer_fragment,
                 value,
                 requested_asset_groups,
             )
@@ -17502,7 +19092,7 @@ def _web_answer_financial_source_supports_value(
             ):
                 continue
             question_entities = _web_answer_financial_entity_terms(question)
-            answer_terms = _web_answer_terms(answer_text)
+            answer_terms = _web_answer_terms(answer_fragment)
             answer_entities = [
                 entity
                 for entity in question_entities
@@ -17515,7 +19105,7 @@ def _web_answer_financial_source_supports_value(
             ):
                 continue
             answer_value_entities = _web_answer_nearest_entities_for_value(
-                answer_text,
+                answer_fragment,
                 value,
                 question_entities,
             )
@@ -17528,9 +19118,9 @@ def _web_answer_financial_source_supports_value(
                 fragment_value_entities
             ):
                 continue
-            if kind == "equity":
+            if kind == "equity" and not requested_identifiers:
                 answer_named_labels = _web_answer_nearest_named_labels_for_value(
-                    answer_text,
+                    answer_fragment,
                     value,
                 )
                 fragment_named_labels = _web_answer_nearest_named_labels_for_value(
@@ -17542,7 +19132,7 @@ def _web_answer_financial_source_supports_value(
                 ):
                     continue
             answer_metric_kinds = _web_answer_financial_metric_kinds(
-                answer_text,
+                answer_fragment,
                 kind=kind,
             )
             fragment_metric_kinds = _web_answer_financial_metric_kinds(
@@ -17554,7 +19144,7 @@ def _web_answer_financial_source_supports_value(
             ):
                 continue
             answer_value_metrics = _web_answer_nearest_metrics_for_value(
-                answer_text,
+                answer_fragment,
                 value,
                 kind=kind,
             )
@@ -17569,7 +19159,7 @@ def _web_answer_financial_source_supports_value(
                 continue
             if kind == "fx":
                 answer_value_pairs = _web_answer_nearest_currency_pairs_for_value(
-                    answer_text,
+                    answer_fragment,
                     value,
                 )
                 fragment_value_pairs = _web_answer_nearest_currency_pairs_for_value(
@@ -17581,7 +19171,7 @@ def _web_answer_financial_source_supports_value(
                 ):
                     continue
             answer_value_quote_types = _web_answer_nearest_quote_types_for_value(
-                answer_text,
+                answer_fragment,
                 value,
             )
             fragment_value_quote_types = _web_answer_nearest_quote_types_for_value(
@@ -17593,7 +19183,7 @@ def _web_answer_financial_source_supports_value(
             ):
                 continue
             answer_value_currencies = _web_answer_nearest_currencies_for_value(
-                answer_text,
+                answer_fragment,
                 value,
             )
             fragment_value_currencies = _web_answer_nearest_currencies_for_value(
@@ -17604,14 +19194,20 @@ def _web_answer_financial_source_supports_value(
                 fragment_value_currencies
             ):
                 continue
-            answer_value_units = _web_answer_nearest_units_for_value(answer_text, value)
+            answer_value_units = _web_answer_nearest_units_for_value(
+                answer_fragment,
+                value,
+            )
             fragment_value_units = _web_answer_nearest_units_for_value(
                 quote_fragment,
                 value,
             )
             if answer_value_units and not answer_value_units.issubset(fragment_value_units):
                 continue
-            answer_value_venues = _web_answer_nearest_venues_for_value(answer_text, value)
+            answer_value_venues = _web_answer_nearest_venues_for_value(
+                answer_fragment,
+                value,
+            )
             fragment_value_venues = _web_answer_nearest_venues_for_value(
                 quote_fragment,
                 value,
@@ -17636,10 +19232,19 @@ def _web_answer_financial_source_supports_value(
             ):
                 continue
             if require_fresh or required_dates:
-                answer_value_dates = _web_answer_nearest_dates_for_value(answer_text, value)
-                fragment_value_dates = _web_answer_nearest_dates_for_value(
-                    quote_fragment,
+                answer_value_dates = _web_answer_financial_dates_for_occurrence(
+                    answer_text,
                     value,
+                    answer_value_start,
+                    answer_value_end,
+                    kind=kind,
+                )
+                fragment_value_dates = _web_answer_financial_dates_for_occurrence(
+                    chunk,
+                    value,
+                    match.start(),
+                    match.end(),
+                    kind=kind,
                 )
                 supported_dates = answer_value_dates.intersection(fragment_value_dates)
                 if not supported_dates:
@@ -17651,9 +19256,19 @@ def _web_answer_financial_source_supports_value(
                     for item in supported_dates
                 ):
                     continue
-            answer_timestamps = _web_answer_nearest_timestamps_for_value(answer_text, value)
-            fragment_timestamps = _web_answer_nearest_timestamps_for_value(
-                quote_fragment, value
+            answer_timestamps = _web_answer_financial_timestamps_for_occurrence(
+                answer_text,
+                value,
+                answer_value_start,
+                answer_value_end,
+                kind=kind,
+            )
+            fragment_timestamps = _web_answer_financial_timestamps_for_occurrence(
+                chunk,
+                value,
+                match.start(),
+                match.end(),
+                kind=kind,
             )
             if answer_timestamps and not answer_timestamps.intersection(fragment_timestamps):
                 continue
@@ -17706,13 +19321,18 @@ def _web_answer_source_relevant(
 def _web_answer_financial_instrument_kind(question: str) -> str:
     repaired = _repair_mojibake(question)
     normalized = repaired.lower()
-    if not _web_answer_looks_like_financial_market(normalized):
+    exact_identifiers = _web_answer_financial_exact_identifiers(question)
+    identifier_quote = bool(exact_identifiers) and any(
+        marker in normalized
+        for marker in ("price", "quote", "stock", "share", "ticker", "цена", "котиров")
+    )
+    if not _web_answer_looks_like_financial_market(normalized) and not identifier_quote:
         return ""
     oil = any(marker in normalized for marker in ("нефт", "brent", "wti", "crude"))
     equity = any(
         marker in normalized
         for marker in ("акци", "shares", "stock", "тикер", "компан", "equity")
-    )
+    ) or identifier_quote
     ticker_tokens = {
         token
         for token in re.findall(r"(?<![A-Za-z0-9])[A-Z]{1,5}(?![A-Za-z0-9])", repaired)
@@ -18689,14 +20309,10 @@ def _web_answer_financial_synthesis_rejection(
     # a full ISO date with one space shifted offsets and then stripped the very
     # date required to prove freshness for an otherwise valid quote.
     answer_numeric_chars = list(answer_without_urls)
-    for _date_value, start, end in _web_answer_financial_date_spans(answer_without_urls):
+    for start, end in _web_answer_financial_metadata_spans(answer_without_urls):
         if 0 <= start <= end <= len(answer_numeric_chars):
             answer_numeric_chars[start:end] = " " * (end - start)
-    answer_numeric_text = re.sub(
-        r"\b\d{1,2}:\d{2}(?::\d{2})?\b|\b20\d{2}\b",
-        lambda match: " " * len(match.group(0)),
-        "".join(answer_numeric_chars),
-    )
+    answer_numeric_text = "".join(answer_numeric_chars)
     answer_numeric_text = re.sub(
         r"(?m)^\s*\d+[.)]\s+",
         lambda match: " " * len(match.group(0)),
@@ -18714,16 +20330,22 @@ def _web_answer_financial_synthesis_rejection(
             for match in value_matches
             if not _web_answer_number_forms(match.group(0)).intersection(identity_numbers)
         ]
+    value_matches = [
+        match
+        for match in value_matches
+        if _web_answer_financial_value_role(
+            answer_without_urls,
+            match.start(),
+            match.end(),
+            kind=kind,
+        )
+        not in {"class", "descriptor", "period", "unit_basis"}
+    ]
     if price_sensitive and not value_matches:
         return "missing_financial_value"
     cited_urls = _web_answer_cited_urls(answer)
     for value_match in value_matches:
         value = value_match.group(0)
-        value_context = _web_answer_financial_local_fragment(
-            answer_without_urls,
-            value_match.start(),
-            value_match.end(),
-        )
         supporting_sources = [
             source
             for source in sources
@@ -18731,7 +20353,8 @@ def _web_answer_financial_synthesis_rejection(
                 value,
                 question=question,
                 kind=kind,
-                answer_text=value_context,
+                answer_text=answer_without_urls,
+                answer_value_span=(value_match.start(), value_match.end()),
                 source=source,
                 require_fresh=price_sensitive,
                 required_dates=required_quote_dates or None,
