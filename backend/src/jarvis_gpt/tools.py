@@ -21,6 +21,7 @@ import tempfile
 import threading
 import time
 import zipfile
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -39,6 +40,14 @@ from httpcore._backends.auto import AutoBackend
 from httpcore._backends.base import SOCKET_OPTION, AsyncNetworkBackend, AsyncNetworkStream
 
 from . import sandbox, speech
+from .authorization import (
+    CORE_CAPABILITIES,
+    ActorContext,
+    AuthorizationDecision,
+    AuthorizationService,
+    CapabilityDefinition,
+    current_actor,
+)
 from .browser_cdp import (
     DEFAULT_CHROME_DEBUG_URL,
     BrowserCdpError,
@@ -339,6 +348,8 @@ class ToolContext:
     mission_id: str | None = None
     task_id: str | None = None
     conversation_id: str | None = None
+    actor: ActorContext = field(default_factory=current_actor)
+    authorization_decision: AuthorizationDecision | None = None
 
 
 @dataclass(frozen=True)
@@ -349,6 +360,26 @@ class ToolSpec:
     input_schema: dict[str, Any]
     handler: ToolHandler
     danger_level: DangerLevel = "safe"
+    security_id: str = ""
+
+    def __post_init__(self) -> None:
+        expected = f"tool.{self.name}"
+        if self.security_id and self.security_id != expected:
+            raise ValueError(
+                f"Tool {self.name!r} must use stable security_id {expected!r}."
+            )
+        object.__setattr__(self, "security_id", expected)
+
+    def capability(self) -> CapabilityDefinition:
+        risk_level = {"safe": 0, "review": 2, "danger": 4}[self.danger_level]
+        return CapabilityDefinition(
+            security_id=self.security_id,
+            description=self.description,
+            category=f"tool:{self.category}",
+            risk_level=risk_level,
+            default_requires_hitl=self.danger_level != "safe",
+            source="tool_registry",
+        )
 
     def info(self) -> ToolInfo:
         return ToolInfo(
@@ -357,6 +388,7 @@ class ToolSpec:
             category=self.category,
             input_schema=self.input_schema,
             danger_level=self.danger_level,
+            security_id=self.security_id,
         )
 
 
@@ -540,17 +572,114 @@ class ToolRegistry:
         self.web_surfer = web_surfer or WebSurferAdapter()
         self._shop_search_locks: dict[str, asyncio.Lock] = {}
         self.executive = executive
+        self.permissions = AuthorizationService(storage)
+        # Some tools have action-level privacy capabilities in the core catalog.
+        # ToolRegistry is also constructed without AgentRuntime in CLI/tests, so it
+        # must make those conjunctive handler checks available itself.
+        if not storage.read_only:
+            self.permissions.sync_capabilities(CORE_CAPABILITIES, catalog_key="core.v1")
         self._tools: dict[str, ToolSpec] = {}
+        self._catalog_ready = False
+        self._authorized_tool_cache: OrderedDict[
+            tuple[str, int, str, int], frozenset[str]
+        ] = OrderedDict()
         self._register_defaults()
+        self._catalog_ready = True
+        if not storage.read_only:
+            self._sync_security_catalog()
 
     def list(self) -> list[ToolInfo]:
-        return [tool.info() for tool in sorted(self._tools.values(), key=lambda item: item.name)]
+        actor = current_actor()
+        catalog_revision = self._catalog_revision()
+        # Direct grants may expire without a policy mutation. A short time bucket
+        # prevents discovery from advertising an expired capability indefinitely;
+        # invocation still performs a fresh decision every time.
+        cache_key = (
+            actor.user_id,
+            actor.policy_epoch,
+            catalog_revision,
+            int(time.time() // 5),
+        )
+        allowed = self._authorized_tool_cache.get(cache_key)
+        if allowed is None:
+            try:
+                allowed = frozenset(
+                    item["security_id"]
+                    for item in self.permissions.effective_permissions(actor.user_id)
+                    if item.get("effect") == "allow"
+                )
+            except Exception:  # noqa: BLE001 - capability discovery must fail closed.
+                return []
+            self._authorized_tool_cache[cache_key] = allowed
+            while len(self._authorized_tool_cache) > 512:
+                self._authorized_tool_cache.popitem(last=False)
+        else:
+            self._authorized_tool_cache.move_to_end(cache_key)
+        return [
+            tool.info()
+            for tool in sorted(self._tools.values(), key=lambda item: item.name)
+            if tool.security_id in allowed
+        ]
 
     def get(self, name: str) -> ToolSpec | None:
         return self._tools.get(name)
 
     def add(self, spec: ToolSpec) -> None:
+        existing_by_name = self._tools.get(spec.name)
+        existing_by_security_id = next(
+            (
+                registered
+                for registered in self._tools.values()
+                if registered.security_id == spec.security_id
+            ),
+            None,
+        )
+        if existing_by_name is not None or existing_by_security_id is not None:
+            # Importing the same immutable declaration twice is harmless, but a
+            # different handler/schema/risk level under an existing capability
+            # would silently change what previously granted authority can execute.
+            if (
+                existing_by_name == spec
+                and existing_by_security_id is existing_by_name
+            ):
+                return
+            registered = existing_by_name or existing_by_security_id
+            assert registered is not None
+            raise ValueError(
+                "Conflicting tool registration for "
+                f"name {spec.name!r} / security_id {spec.security_id!r}; "
+                "the capability is already bound to "
+                f"name {registered.name!r} / security_id {registered.security_id!r}."
+            )
         self._tools[spec.name] = spec
+        if self._catalog_ready and not self.storage.read_only:
+            self._sync_security_catalog()
+
+    def _catalog_revision(self) -> str:
+        manifest = "\n".join(
+            f"{spec.security_id}:{spec.danger_level}"
+            for spec in sorted(self._tools.values(), key=lambda item: item.security_id)
+        )
+        return hashlib.sha256(manifest.encode("utf-8")).hexdigest()[:20]
+
+    def _sync_security_catalog(self) -> None:
+        """Synchronize stable tool capabilities and invalidate visibility caches.
+
+        The content-addressed catalog key makes adding a tool an explicit policy
+        migration.  AuthorizationService seeds only the built-in policy defaults;
+        execution still performs a recorded decision for every invocation.
+        """
+
+        definitions = [
+            spec.capability()
+            for spec in sorted(self._tools.values(), key=lambda item: item.security_id)
+        ]
+        self.permissions.sync_capabilities(
+            definitions,
+            catalog_key=f"tools.v1.{self._catalog_revision()}",
+            bootstrap_safe_presets=True,
+        )
+        self._authorized_tool_cache.clear()
 
     def refresh_web_surfer_registration(self) -> None:
         """Publish the optional black-box tool only after an isolated probe."""
@@ -558,7 +687,9 @@ class ToolRegistry:
         if self.web_surfer.available:
             self.add(_web_surfer_tool_spec())
         else:
-            self._tools.pop("web.surfer", None)
+            removed = self._tools.pop("web.surfer", None)
+            if removed is not None and not self.storage.read_only:
+                self._sync_security_catalog()
 
     async def run(
         self,
@@ -579,6 +710,25 @@ class ToolRegistry:
             # Root-cause repair of a model-invented action name, before the digest and
             # operator authorization so both bind the canonical action (Fix B).
             _normalize_tool_action(name, args)
+        actor = current_actor()
+        permission_decision: AuthorizationDecision | None = None
+        permission_error: str | None = None
+        if spec is not None:
+            try:
+                permission_decision = self.permissions.authorize(
+                    actor.user_id,
+                    spec.security_id,
+                    identity_id=actor.identity_id,
+                    resource_type="tool",
+                    resource_ref=name,
+                    context={
+                        "mission_id": mission_id,
+                        "task_id": task_id,
+                        "conversation_id": conversation_id,
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001 - authorization must fail closed.
+                permission_error = str(exc)
         arguments_digest: str | None = None
         arguments_error: str | None = None
         try:
@@ -587,7 +737,12 @@ class ToolRegistry:
             arguments_error = f"Tool arguments are not canonical JSON: {exc}"
         operator_authorized = False
         authorization_error: str | None = None
-        if authorization is not None and arguments_error is None:
+        if (
+            permission_decision is not None
+            and permission_decision.allowed
+            and authorization is not None
+            and arguments_error is None
+        ):
             try:
                 authorization.consume(
                     conversation_id=conversation_id,
@@ -632,6 +787,53 @@ class ToolRegistry:
                 source="tool_registry",
                 reason=response.summary,
                 remediation="Choose a registered tool from the returned availability list.",
+            ).as_dict()
+        elif permission_error is not None:
+            response = ToolRunResponse(
+                tool=name,
+                ok=False,
+                summary=f"Authorization service unavailable for {spec.security_id!r}.",
+                data={
+                    "security_id": spec.security_id,
+                    "authorization_unavailable": True,
+                },
+            )
+            response.data["policy_decision"] = PolicyDecision(
+                effect="deny",
+                code="authorization_unavailable",
+                source="authorization_service",
+                reason=response.summary,
+                remediation="Restore the authorization store before retrying this tool.",
+                retryable=True,
+                missing_capability=spec.security_id,
+            ).as_dict()
+        elif permission_decision is None or not permission_decision.allowed:
+            reason_code = (
+                permission_decision.reason_code
+                if permission_decision is not None
+                else "authorization_missing"
+            )
+            response = ToolRunResponse(
+                tool=name,
+                ok=False,
+                summary=f"Permission {spec.security_id!r} denied ({reason_code}).",
+                data={
+                    "security_id": spec.security_id,
+                    "authorization_denied": True,
+                    "authorization_decision": (
+                        permission_decision.as_dict()
+                        if permission_decision is not None
+                        else None
+                    ),
+                },
+            )
+            response.data["policy_decision"] = PolicyDecision(
+                effect="deny",
+                code="security_id_denied",
+                source="authorization_service",
+                reason=response.summary,
+                remediation="Ask an administrator to grant this exact security_id.",
+                missing_capability=spec.security_id,
             ).as_dict()
         elif arguments_error is not None:
             response = ToolRunResponse(
@@ -704,6 +906,8 @@ class ToolRegistry:
                 mission_id=mission_id,
                 task_id=task_id,
                 conversation_id=conversation_id,
+                actor=actor,
+                authorization_decision=permission_decision,
             )
             try:
                 raw = spec.handler(context, args)
@@ -760,6 +964,12 @@ class ToolRegistry:
                     "authorization_fingerprint": (
                         authorization.fingerprint
                         if operator_authorized and authorization
+                        else None
+                    ),
+                    "security_id": spec.security_id if spec is not None else None,
+                    "authorization_decision_id": (
+                        permission_decision.decision_id
+                        if permission_decision is not None
                         else None
                     ),
                 },
@@ -3995,6 +4205,30 @@ SAFE_INSPECT_ACTIONS = frozenset(
         "wmi.query",
     }
 )
+SYSTEM_INSPECT_ACTION_SECURITY_IDS = {
+    "capabilities": "native.capabilities.read",
+    "clipboard.read": "privacy.clipboard.read",
+    "hardware.gpu": "native.hardware.gpu.read",
+    "process.top": "native.process.top.read",
+    "screen.capture": "privacy.screen.capture",
+    "window.list": "native.window.list.read",
+    "wmi.query": "native.wmi.query",
+}
+WINDOWS_NATIVE_ACTION_SECURITY_IDS = {
+    "app.open_and_type": "native.app.open_and_type",
+    "capabilities": "native.capabilities.read",
+    "clipboard.read": "privacy.clipboard.read",
+    "clipboard.write": "privacy.clipboard.write",
+    "console.show_processes": "native.console.processes.show",
+    "hardware.gpu": "native.hardware.gpu.read",
+    "keyboard.send": "native.keyboard.send",
+    "process.start": "native.process.start",
+    "process.top": "native.process.top.read",
+    "screen.capture": "privacy.screen.capture",
+    "window.focus": "native.window.focus",
+    "window.list": "native.window.list.read",
+    "wmi.query": "native.wmi.query",
+}
 # Convenience hardware/telemetry actions that map to a known-good WMI class so the model
 # does not have to guess class names — it kept trying a non-existent "hardware.memory"
 # action or a malformed WMI class ("WMI class name contains unsupported characters").
@@ -4304,6 +4538,75 @@ def _native_payload_from_args(action: str, args: dict[str, Any]) -> dict[str, An
     return payload
 
 
+def _tool_action_permission_denial(
+    ctx: ToolContext,
+    *,
+    tool_name: str,
+    action: str,
+    security_id: str,
+) -> ToolRunResponse | None:
+    """Apply a second, action-specific PEP behind a multi-action tool."""
+
+    try:
+        decision = AuthorizationService(ctx.storage).authorize(
+            ctx.actor.user_id,
+            security_id,
+            identity_id=ctx.actor.identity_id,
+            resource_type="tool_action",
+            resource_ref=f"{tool_name}:{action}",
+            context={
+                "tool_security_id": (
+                    ctx.authorization_decision.security_id
+                    if ctx.authorization_decision is not None
+                    else f"tool.{tool_name}"
+                ),
+                "action": action,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 - action PEP failures deny execution.
+        response = ToolRunResponse(
+            tool=tool_name,
+            ok=False,
+            summary=f"Authorization unavailable for {security_id!r}.",
+            data={
+                "security_id": security_id,
+                "authorization_unavailable": True,
+                "error": type(exc).__name__,
+            },
+        )
+        response.data["policy_decision"] = PolicyDecision(
+            effect="deny",
+            code="authorization_unavailable",
+            source="authorization_service",
+            reason=response.summary,
+            remediation="Restore the authorization store before retrying this action.",
+            retryable=True,
+            missing_capability=security_id,
+        ).as_dict()
+        return response
+    if decision.allowed:
+        return None
+    response = ToolRunResponse(
+        tool=tool_name,
+        ok=False,
+        summary=f"Permission {security_id!r} denied ({decision.reason_code}).",
+        data={
+            "security_id": security_id,
+            "authorization_denied": True,
+            "authorization_decision": decision.as_dict(),
+        },
+    )
+    response.data["policy_decision"] = PolicyDecision(
+        effect="deny",
+        code="security_id_denied",
+        source="authorization_service",
+        reason=response.summary,
+        remediation="Ask an administrator to grant this exact security_id.",
+        missing_capability=security_id,
+    ).as_dict()
+    return response
+
+
 async def _windows_native(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     action = str(args.get("action") or "capabilities").strip().lower()
     if action not in MODEL_NATIVE_ACTIONS:
@@ -4312,6 +4615,14 @@ async def _windows_native(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResp
             ok=False,
             summary="This host action is reserved for a policy-specific Jarvis tool.",
         )
+    action_denial = _tool_action_permission_denial(
+        ctx,
+        tool_name="windows.native",
+        action=action,
+        security_id=WINDOWS_NATIVE_ACTION_SECURITY_IDS[action],
+    )
+    if action_denial is not None:
+        return action_denial
     payload = _native_payload_from_args(action, args)
     timeout_sec = _int_arg(args.get("timeout_sec"), default=30, minimum=1, maximum=120)
     try:
@@ -4390,6 +4701,16 @@ async def _system_inspect(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResp
                 "must go through the approval-gated windows.native tool."
             ),
         )
+    action_security_id = SYSTEM_INSPECT_ACTION_SECURITY_IDS.get(action)
+    if action_security_id is not None:
+        action_denial = _tool_action_permission_denial(
+            ctx,
+            tool_name="system.inspect",
+            action=action,
+            security_id=action_security_id,
+        )
+        if action_denial is not None:
+            return action_denial
     payload = args.get("payload")
     if isinstance(payload, str) and action == "wmi.query":
         # A model often passes the class name or a WQL string directly.
@@ -5583,6 +5904,7 @@ _SCHEDULED_TASK_VERBS = (
     "проанализир", "мониторь", "монитор", "следи", "подготов", "составь", "составля",
     "оцен", "подведи", "статус", "расскаж", "напиши", "покажи новост",
 )
+MAX_ACTIVE_RECURRING_AGENT_TASKS_PER_USER = 5
 
 
 def _scheduled_task_prompt(text: str) -> str | None:
@@ -5638,6 +5960,65 @@ def _reminders_create(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
     task_prompt = explicit_prompt or _scheduled_task_prompt(title)
     payload = None
     if task_prompt:
+        action_denial = _tool_action_permission_denial(
+            ctx,
+            tool_name="reminders.create",
+            action="agent_task.create",
+            security_id="background.scheduled_task.create",
+        )
+        if action_denial is not None:
+            return action_denial
+        if not ctx.approved:
+            response = ToolRunResponse(
+                tool="reminders.create",
+                ok=False,
+                summary=(
+                    "Creating a scheduled agent task requires approval bound to "
+                    "this exact schedule and prompt."
+                ),
+                data={
+                    "danger_level": "danger",
+                    "approval_action": "tool.run",
+                    "approval_payload": {
+                        "tool": "reminders.create",
+                        "arguments": dict(args),
+                    },
+                },
+            )
+            response.data["policy_decision"] = PolicyDecision(
+                effect="require_approval",
+                code="approval_required",
+                source="action_security_id",
+                reason=response.summary,
+                remediation="Approve this exact scheduled task, then resume it once.",
+                binding={
+                    "tool": "reminders.create",
+                    "arguments_sha256": _operator_arguments_sha256(args),
+                    "security_id": "background.scheduled_task.create",
+                },
+            ).as_dict()
+            return response
+        if parsed.recurrence is not None:
+            active_recurring_tasks = [
+                item
+                for item in ctx.storage.list_reminders(status="pending", limit=1000)
+                if item.get("recurrence")
+                and isinstance(item.get("payload"), dict)
+                and item["payload"].get("kind") == "agent_task"
+            ]
+            if len(active_recurring_tasks) >= MAX_ACTIVE_RECURRING_AGENT_TASKS_PER_USER:
+                return ToolRunResponse(
+                    tool="reminders.create",
+                    ok=False,
+                    summary=(
+                        "Лимит активных повторяющихся плановых задач исчерпан: "
+                        f"{MAX_ACTIVE_RECURRING_AGENT_TASKS_PER_USER}."
+                    ),
+                    data={
+                        "limit": MAX_ACTIVE_RECURRING_AGENT_TASKS_PER_USER,
+                        "active_recurring_agent_tasks": len(active_recurring_tasks),
+                    },
+                )
         payload = {
             "kind": "agent_task",
             "prompt": task_prompt,
@@ -7774,18 +8155,20 @@ async def _web_shop_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRes
 
         cleanup_reserve_sec = cleanup_reserve_target_sec
         live_timeout_sec = max(0.001, remaining_sec - cleanup_reserve_sec)
+        tenant_state_key = hashlib.sha256(
+            ctx.actor.user_id.encode("utf-8", errors="strict")
+        ).hexdigest()
+        tenant_web_root = (
+            ctx.settings.cache_dir / "web-surfer" / "users" / tenant_state_key
+        )
         config = SurferConfig(
             headless=True,
             proxies=_web_surfer_proxies(),
             nav_timeout_ms=8_000,
             default_timeout_ms=5_000,
             shopping_budget_sec=max(0.1, live_timeout_sec),
-            shop_storage_state_dir=str(
-                ctx.settings.cache_dir / "web-surfer" / "shop-state"
-            ),
-            shop_persistent_profile_dir=str(
-                ctx.settings.cache_dir / "web-surfer" / "shop-profile"
-            ),
+            shop_storage_state_dir=str(tenant_web_root / "shop-state"),
+            shop_persistent_profile_dir=str(tenant_web_root / "shop-profile"),
         )
         async def run_live() -> dict[str, Any]:
             surfer = JarvisWebSurfer(config=config)

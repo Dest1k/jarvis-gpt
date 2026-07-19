@@ -11,6 +11,7 @@ from jarvis_gpt.approval_executor import (
     ApprovalExecutor,
     finish_despite_cancellation,
 )
+from jarvis_gpt.authorization import AuthorizationService, bind_actor
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
 from jarvis_gpt.dispatcher import DispatcherManager
 from jarvis_gpt.event_bus import EventBus
@@ -80,7 +81,7 @@ def test_approval_executor_rejects_unknown_action(monkeypatch, tmp_path):
     result = asyncio.run(executor.execute(approval["id"]))
 
     assert result.ok is False
-    assert result.status_code == 400
+    assert result.status_code == 403
     assert result.finalize is False
     assert storage.get_approval(approval["id"])["status"] == "approved"
     storage.close()
@@ -434,6 +435,58 @@ def test_operator_rejection_uses_durable_reconciliation_outbox(monkeypatch, tmp_
         "the original action"
     ]
     assert storage.search_memory("must stay absent", limit=5) == []
+    storage.close()
+
+
+def test_targeted_reconciliation_stays_within_non_owner_tenant(monkeypatch, tmp_path):
+    executor, storage = _runtime(monkeypatch, tmp_path)
+    authorization = AuthorizationService(storage)
+    identity = authorization.upsert_external_identity(
+        provider="test",
+        realm_id="approval-reconciliation",
+        provider_subject_id="ordinary-user",
+        bootstrap_preset="user",
+    )
+    actor = authorization.actor_for_user(
+        str(identity["user_id"]), source="reconciliation-test"
+    )
+    assert actor is not None
+
+    with bind_actor(actor):
+        mission = storage.create_mission(
+            title="Tenant rejection",
+            goal="Reconcile only this tenant",
+            tasks=["Do not execute"],
+        )
+        task = mission["tasks"][0]
+        approval = storage.create_approval(
+            title="Tenant-owned approval",
+            description="Reject without cross-tenant maintenance authority.",
+            requested_action="memory.save",
+            payload={
+                "mission_id": mission["id"],
+                "task_id": task["id"],
+                "content": "must stay absent",
+            },
+        )
+        storage.update_approval(approval["id"], status="rejected")
+
+        async def abort_mission(_approval, _reason):
+            return ToolRunResponse(
+                tool="mission.approval.abort",
+                ok=True,
+                summary="Tenant mission reconciled.",
+            )
+
+        executor.mission_aborter = abort_mission
+        reconciled = asyncio.run(
+            executor.reconcile_pending_approvals(approval_id=approval["id"])
+        )
+        updated = storage.get_approval(approval["id"])
+
+    assert [item["id"] for item in reconciled] == [approval["id"]]
+    assert updated is not None
+    assert updated["result"]["reconciliation"]["status"] == "completed"
     storage.close()
 
 

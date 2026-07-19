@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO
 
+from .authorization import LEGACY_OWNER_USER_ID, current_user_id
 from .config import JarvisSettings
 from .document_runtime import (
     DOCUMENT_EXTENSION_MIME_TYPES,
@@ -81,6 +82,12 @@ class FileIngestor:
         self.storage = storage
         self.files_dir = settings.data_dir / "files"
 
+    def _files_dir_for_actor(self) -> Path:
+        user_id = current_user_id()
+        if user_id == LEGACY_OWNER_USER_ID:
+            return self.files_dir
+        return self.files_dir / "users" / user_id
+
     def ingest_path(self, source_path: str | Path) -> dict[str, Any]:
         path = Path(source_path).expanduser().resolve(strict=False)
         if not path.exists() or not path.is_file():
@@ -141,9 +148,10 @@ class FileIngestor:
         return self._index_stored_file(stored, source_path=None)
 
     def _store_stream(self, filename: str, stream: BinaryIO) -> StoredFile:
-        self.files_dir.mkdir(parents=True, exist_ok=True)
+        files_dir = self._files_dir_for_actor()
+        files_dir.mkdir(parents=True, exist_ok=True)
         safe_name = _safe_filename(filename)
-        temp_path = self.files_dir / f".{new_id('upload')}.tmp"
+        temp_path = files_dir / f".{new_id('upload')}.tmp"
         digest = hashlib.sha256()
         size = 0
         try:
@@ -164,7 +172,7 @@ class FileIngestor:
             raise
 
         sha256 = digest.hexdigest()
-        stored_path = self.files_dir / f"{sha256[:12]}_{safe_name}"
+        stored_path = files_dir / f"{sha256[:12]}_{safe_name}"
         if stored_path.exists():
             temp_path.unlink(missing_ok=True)
         else:

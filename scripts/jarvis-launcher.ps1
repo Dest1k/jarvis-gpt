@@ -165,6 +165,8 @@ function Get-FrontendEnvironmentSha256 {
   $values = @(
     [string]$env:JARVIS_BACKEND_URL
     [string]$env:JARVIS_API_TOKEN
+    [string]$env:JARVIS_UI_SESSION_SECRET
+    [string]$env:JARVIS_TRUST_PROXY_HEADERS
   )
   return Get-StringSha256 -Value ($values -join "`n")
 }
@@ -180,6 +182,12 @@ function Get-BackendEnvironmentSha256 {
     [string]$env:JARVIS_API_PORT
     [string]$env:JARVIS_API_TOKEN
     [string]$env:JARVIS_API_REQUIRE_TOKEN_ON_LOOPBACK
+    [string]$env:JARVIS_TELEGRAM_BRIDGE_SECRET
+    [string]$env:JARVIS_TELEGRAM_REALM_ID
+    [string]$env:JARVIS_TELEGRAM_SESSION_TTL_SECONDS
+    [string]$env:JARVIS_TELEGRAM_USER_RATE_LIMIT_PER_MINUTE
+    [string]$env:JARVIS_TELEGRAM_GLOBAL_RATE_LIMIT_PER_MINUTE
+    [string]$env:JARVIS_API_USER_RATE_LIMIT_PER_MINUTE
     [string]$env:JARVIS_CORS_ORIGINS
     [string]$env:JARVIS_EXECUTION_ROOTS
     [string]$env:JARVIS_EXECUTION_CAPABILITIES_FILE

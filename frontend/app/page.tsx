@@ -837,6 +837,12 @@ type SpeechRecognitionLike = {
 
 type SpeechRecognitionConstructorLike = new () => SpeechRecognitionLike;
 
+function redirectToOwnerLogin(response: Response) {
+  if (response.status !== 401 || typeof window === "undefined") return;
+  const next = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+  window.location.assign(`/login?next=${encodeURIComponent(next)}`);
+}
+
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   if (init?.body != null && !headers.has("Content-Type")) {
@@ -849,6 +855,7 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
     credentials: "same-origin"
   });
   if (!response.ok) {
+    redirectToOwnerLogin(response);
     throw new Error(`${response.status} ${response.statusText}`);
   }
   return response.json() as Promise<T>;
@@ -866,6 +873,7 @@ async function streamApi(
     body: JSON.stringify(body)
   });
   if (!response.ok) {
+    redirectToOwnerLogin(response);
     throw new Error(`${response.status} ${response.statusText}`);
   }
   if (!response.body) {
@@ -4581,6 +4589,9 @@ export default function CommandCenter() {
         <IconButton active={activeTab === "audit"} label="Аудит" tab="audit" onSelect={setActiveTab}>
           <History size={20} />
         </IconButton>
+        <a className="railButton" href="/admin" title="Пользователи" aria-label="Пользователи">
+          <ShieldCheck size={20} />
+        </a>
       </aside>
 
       <section className="workspace">

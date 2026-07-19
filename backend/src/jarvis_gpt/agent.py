@@ -26,6 +26,13 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from . import persona as persona_module
 from . import speech
+from .authorization import (
+    CORE_CAPABILITIES,
+    ActorContext,
+    AuthorizationError,
+    AuthorizationService,
+    current_actor,
+)
 from .browser_cdp import DEFAULT_CHROME_DEBUG_URL
 from .cognitive_memory import ExecutionPlaybookStore
 from .config import PROFILES, JarvisSettings
@@ -61,7 +68,6 @@ from .models import (
     ToolRunResponse,
 )
 from .notify import push_telegram_alert
-from .operator_queue import operator_context
 from .screen_watch import (
     ScreenConditionCheck,
     extract_screen_capture_path,
@@ -515,6 +521,16 @@ class AgentContext:
     # RB-6: typed pending TRANSFORM draft restored on clarification follow-up.
     pending_transform_draft: dict[str, Any] | None = None
     transform_resume_already_completed: bool = False
+    # Snapshot the authenticated principal at context construction.  Authorization
+    # is still re-evaluated at the ToolRegistry PEP immediately before execution.
+    actor: ActorContext = dataclass_field(default_factory=current_actor)
+    # Data-plane capabilities are snapshotted for this turn.  They are independent
+    # of role/preset names, so custom presets and explicit denies remain effective.
+    can_read_memory: bool = True
+    can_write_memory: bool = True
+    can_read_files: bool = True
+    can_read_persona: bool = True
+    can_read_preferences: bool = True
 
 
 @dataclass(frozen=True)
@@ -880,8 +896,78 @@ class AgentRuntime:
             executive=self.executive,
             recover_execution=recover_execution,
         )
+        self.permissions = getattr(self.tools, "permissions", AuthorizationService(storage))
+        # AgentRuntime is also constructed directly by local/CLI callers and tests,
+        # outside the FastAPI lifespan.  Keep the core catalog available wherever
+        # the runtime itself enforces these capabilities.
+        if not storage.read_only:
+            self.permissions.sync_capabilities(CORE_CAPABILITIES, catalog_key="core.v1")
         self.embeddings = EmbeddingBackend(settings)
         self._mission_report_lock = asyncio.Lock()
+
+    def _capability_allowed(self, security_id: str, *, record: bool = False) -> bool:
+        """Fail-closed capability probe for the currently bound principal."""
+
+        actor = current_actor()
+        try:
+            return self.permissions.authorize(
+                actor.user_id,
+                security_id,
+                identity_id=actor.identity_id,
+                resource_type="agent_context",
+                context={"source": actor.source},
+                record=record,
+            ).allowed
+        except Exception:  # noqa: BLE001 - an unavailable PEP must never grant access.
+            return False
+
+    def _require_chat_capability(self) -> None:
+        actor = current_actor()
+        try:
+            decision = self.permissions.authorize(
+                actor.user_id,
+                "chat.use",
+                identity_id=actor.identity_id,
+                resource_type="agent_runtime",
+                context={"source": actor.source},
+            )
+        except Exception as exc:  # noqa: BLE001 - normalize PEP failures to a denial.
+            raise AuthorizationError("chat.use denied: authorization unavailable") from exc
+        if not decision.allowed:
+            raise AuthorizationError(
+                f"chat.use denied for user {actor.user_id}: {decision.reason_code}"
+            )
+
+    def _context_capabilities(self) -> dict[str, bool]:
+        return {
+            "can_read_memory": self._capability_allowed("memory.read.own", record=True),
+            "can_write_memory": self._capability_allowed("memory.write.own", record=True),
+            "can_read_files": self._capability_allowed("files.read.own", record=True),
+            "can_read_persona": self._capability_allowed("persona.read.own", record=True),
+            "can_read_preferences": self._capability_allowed(
+                "preferences.read.own", record=True
+            ),
+        }
+
+    def _full_agent_surface_allowed(self, capabilities: dict[str, bool]) -> bool:
+        """Whether this principal may enter contextual/tool-driven orchestration.
+
+        Preferences or memory-write alone do not unlock the agentic surface.  A
+        principal needs readable context, an executable tool capability, or mission
+        authority; otherwise chat stays on the deterministic text-only surface.
+        """
+
+        if any(
+            capabilities[key]
+            for key in ("can_read_memory", "can_read_files", "can_read_persona")
+        ):
+            return True
+        try:
+            if self.tools.list():
+                return True
+        except Exception:  # noqa: BLE001 - capability discovery fails closed.
+            pass
+        return self._capability_allowed("missions.write.own")
 
     async def chat(
         self,
@@ -894,8 +980,20 @@ class AgentRuntime:
         thinking_enabled: bool = True,
         access_mode: str = "owner",
         notification_chat_id: int | None = None,
+        transport_request_id: str | None = None,
     ) -> ChatResponse:
-        if access_mode != "owner":
+        # ``access_mode`` is caller-controlled and can never elevate authority.  A
+        # narrowly-scoped legacy-local ``guest`` value remains a compatible downgrade
+        # while older trusted bridges migrate to authenticated actor contexts.  Preset
+        # names are never an authorization boundary: every authenticated actor is gated
+        # by the effective security_ids below.
+        actor = current_actor()
+        self._require_chat_capability()
+        context_capabilities = self._context_capabilities()
+        legacy_guest_downgrade = actor.source == "legacy-local" and access_mode == "guest"
+        if legacy_guest_downgrade or not self._full_agent_surface_allowed(
+            context_capabilities
+        ):
             return await self._guest_chat(
                 message,
                 conversation_id=conversation_id,
@@ -904,9 +1002,15 @@ class AgentRuntime:
             )
         started_at = time.perf_counter()
         attachments = _normalize_chat_attachments(attachments)
+        if not context_capabilities["can_read_files"]:
+            attachments = []
         message = await self._fold_audio_attachment_transcripts(message, attachments)
         context_message = _message_with_attachments(message, attachments)
-        context = self._prepare_context(context_message, conversation_id)
+        context = self._prepare_context(
+            context_message,
+            conversation_id,
+            capabilities=context_capabilities,
+        )
         context.notification_chat_id = notification_chat_id
         context.operator_message = message
         context.operator_scopes = _operator_action_scopes(message)
@@ -915,6 +1019,7 @@ class AgentRuntime:
             message=message,
             mode=mode,
             attachments=attachments,
+            transport_request_id=transport_request_id,
         )
         if context.operator_cached_answer is not None:
             context.operator_message_id = self.storage.add_message(
@@ -1649,12 +1754,39 @@ class AgentRuntime:
         max_tokens: int | None = None,
         attachments: list[dict[str, Any]] | None = None,
         thinking_enabled: bool = True,
+        transport_request_id: str | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
+        self._require_chat_capability()
         started_at = time.perf_counter()
+        context_capabilities = self._context_capabilities()
+        if not self._full_agent_surface_allowed(context_capabilities):
+            response = await self._guest_chat(
+                message,
+                conversation_id=conversation_id,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            yield {"type": "meta", "conversation_id": response.conversation_id}
+            yield {"type": "delta", "content": response.answer}
+            yield {
+                "type": "done",
+                "answer": response.answer,
+                "conversation_id": response.conversation_id,
+                "duration_ms": response.duration_ms,
+                "events": [],
+                "message_id": response.message_id,
+            }
+            return
         attachments = _normalize_chat_attachments(attachments)
+        if not context_capabilities["can_read_files"]:
+            attachments = []
         message = await self._fold_audio_attachment_transcripts(message, attachments)
         context_message = _message_with_attachments(message, attachments)
-        context = self._prepare_context(context_message, conversation_id)
+        context = self._prepare_context(
+            context_message,
+            conversation_id,
+            capabilities=context_capabilities,
+        )
         context.operator_message = message
         context.operator_scopes = _operator_action_scopes(message)
         self._bind_operator_request_identity(
@@ -1662,6 +1794,7 @@ class AgentRuntime:
             message=message,
             mode=mode,
             attachments=attachments,
+            transport_request_id=transport_request_id,
         )
         if context.operator_cached_answer is not None:
             yield {"type": "meta", "conversation_id": context.conversation_id}
@@ -2758,6 +2891,12 @@ class AgentRuntime:
         decomposition: MissionDecomposition | None = None,
         mission_id: str | None = None,
     ) -> dict[str, Any]:
+        self.permissions.require_current(
+            "missions.write.own",
+            resource_type="mission",
+            resource_ref=mission_id,
+            context={"operation": "create"},
+        )
         # RB-2: never persist a mission while the deliverable still needs clarification.
         if _requires_side_effect_clarification(goal):
             raise ValueError(
@@ -2822,6 +2961,12 @@ class AgentRuntime:
         malformed is rejected before any mission row is persisted.
         """
 
+        self.permissions.require_current(
+            "missions.write.own",
+            resource_type="mission",
+            resource_ref=mission_id,
+            context={"operation": "plan_create"},
+        )
         if (
             not self.settings.llm_enabled
             or self.executive is None
@@ -2866,6 +3011,12 @@ class AgentRuntime:
         )
 
     async def execute_next_mission_step(self, mission_id: str) -> MissionExecutionResponse:
+        self.permissions.require_current(
+            "missions.write.own",
+            resource_type="mission",
+            resource_ref=mission_id,
+            context={"operation": "execute_next"},
+        )
         mission = self.storage.get_mission(mission_id)
         if mission is None:
             result = ToolRunResponse(
@@ -3111,7 +3262,7 @@ class AgentRuntime:
                 status=final_status,
                 notes=notes,
             )
-        if result.ok:
+        if result.ok and self._capability_allowed("memory.write.own"):
             self.storage.add_memory(
                 content=f"Mission step completed: {task['title']}. {result.summary}",
                 namespace="missions",
@@ -3151,6 +3302,12 @@ class AgentRuntime:
         emitted per step, so the Command Center can render progress live.
         """
 
+        self.permissions.require_current(
+            "missions.write.own",
+            resource_type="mission",
+            resource_ref=mission_id,
+            context={"operation": "run"},
+        )
         mission = self.storage.get_mission(mission_id)
         if mission is None:
             return MissionRunResponse(
@@ -3648,12 +3805,13 @@ class AgentRuntime:
         report = await self._synthesize_mission_report(mission)
         record = {"report": report, "created_at": utc_now(), "mission_id": mission_id}
         self.storage.set_runtime_value(key, record)
-        self.storage.add_memory(
-            content=f"Mission report: {mission.get('title', '')}\n{report}",
-            namespace="missions",
-            tags=["mission", mission_id, "report"],
-            importance=0.7,
-        )
+        if self._capability_allowed("memory.write.own"):
+            self.storage.add_memory(
+                content=f"Mission report: {mission.get('title', '')}\n{report}",
+                namespace="missions",
+                tags=["mission", mission_id, "report"],
+                importance=0.7,
+            )
         await self._emit(
             ChatEvent(
                 type="mission_report",
@@ -3854,6 +4012,26 @@ class AgentRuntime:
         task_id = _optional_text(payload.get("task_id"))
         if not mission_id or not task_id:
             return None
+        try:
+            self.permissions.require_current(
+                "missions.write.own",
+                resource_type="mission",
+                resource_ref=mission_id,
+                context={"operation": "resume_after_approval", "task_id": task_id},
+            )
+        except AuthorizationError as exc:
+            return ToolRunResponse(
+                tool="mission.resume_after_approval",
+                ok=False,
+                summary="Mission resume is not permitted by missions.write.own.",
+                data={
+                    "mission_id": mission_id,
+                    "task_id": task_id,
+                    "security_id": "missions.write.own",
+                    "authorization_denied": True,
+                    "error": str(exc),
+                },
+            )
 
         mission = self.storage.get_mission(mission_id)
         if mission is None:
@@ -4021,7 +4199,7 @@ class AgentRuntime:
                 status=final_status,
                 notes=_task_notes_from_result(result),
             )
-        if result.ok:
+        if result.ok and self._capability_allowed("memory.write.own"):
             self.storage.add_memory(
                 content=f"Mission step completed after approval: {task['title']}. {result.summary}",
                 namespace="missions",
@@ -4060,6 +4238,28 @@ class AgentRuntime:
         task_id = _optional_text(payload.get("task_id"))
         if not mission_id or not task_id:
             return None
+        try:
+            self.permissions.require_current(
+                "missions.write.own",
+                resource_type="mission",
+                resource_ref=mission_id,
+                context={"operation": "abort_after_approval", "task_id": task_id},
+            )
+        except AuthorizationError as exc:
+            # Return a terminal reconciliation result instead of raising: the
+            # ApprovalExecutor must not fall back to an unguarded DAG termination.
+            return ToolRunResponse(
+                tool="mission.approval.abort",
+                ok=False,
+                summary="Mission abort is not permitted by missions.write.own.",
+                data={
+                    "mission_id": mission_id,
+                    "task_id": task_id,
+                    "security_id": "missions.write.own",
+                    "authorization_denied": True,
+                    "error": str(exc),
+                },
+            )
         mission = self.storage.get_mission(mission_id)
         task = next(
             (item for item in (mission or {}).get("tasks", []) if item.get("id") == task_id),
@@ -4402,6 +4602,23 @@ class AgentRuntime:
         )
         if request is None:
             return None
+        self.permissions.require_current(
+            "background.screen_watch.create",
+            resource_type="screen_watch",
+            context={"operation": "create"},
+        )
+        # A watcher necessarily captures the local operator's screen.  Require both
+        # the scheduling capability and the privacy-sensitive data-plane capability.
+        self.permissions.require_current(
+            "privacy.screen.capture",
+            resource_type="screen_watch",
+            context={"operation": "create"},
+        )
+        self.permissions.require_current(
+            "tool.system.inspect",
+            resource_type="screen_watch",
+            context={"operation": "create", "action": "screen.capture"},
+        )
         # The high-confidence watch parser above is the authority grammar for this
         # specific feature. Requiring the generic command grammar as a second gate caused
         # valid supported phrases (notably "смотри" / "keep watching") to drift apart.
@@ -6584,7 +6801,7 @@ class AgentRuntime:
         contracts, verified writes) still apply — those are correctness, not gates.
         """
 
-        return bool(self.settings.operator_full_autonomy)
+        return bool(current_actor().is_owner and self.settings.operator_full_autonomy)
 
     def _admit_side_effects(
         self, message: str, context: AgentContext
@@ -7039,6 +7256,8 @@ class AgentRuntime:
     ) -> dict[str, Any] | None:
         """Bind exact source identity for TRANSFORM_EXISTING_DOCUMENT (pre-tool)."""
 
+        if not context.can_read_files or not self._capability_allowed("files.read.own"):
+            return None
         source_name = str(intent.get("source_filename") or "").strip()
         source_name_cf = source_name.casefold()
         candidates: list[dict[str, Any]] = []
@@ -7505,10 +7724,18 @@ class AgentRuntime:
         attachments: list[dict[str, Any]],
     ) -> TaskKernelPlan:
         normalized = message.lower()
+        preferences = (
+            self.storage.get_runtime_value("experience.preferences", {})
+            if context.can_read_preferences
+            else {}
+        )
+        has_persisted_files = (
+            bool(self.storage.list_files(limit=1)) if context.can_read_files else False
+        )
         task_mode = _task_mode_from_message(
             normalized,
             requested_mode=mode,
-            preferences=self.storage.get_runtime_value("experience.preferences", {}),
+            preferences=preferences,
         )
 
         # Editing an EXISTING persisted document ("исправь дату в отчёте", "добавь строку
@@ -7519,10 +7746,11 @@ class AgentRuntime:
             mode != "mission"
             and not attachments
             and self._owner_autonomy_active()
+            and context.can_read_files
             and not _looks_like_live_web_query(message)
             and _looks_like_document_edit_query(
                 message,
-                has_persisted_files=bool(self.storage.list_files(limit=1)),
+                has_persisted_files=has_persisted_files,
             )
             and self._resolve_document_edit_target(message) is not None
         ):
@@ -7596,7 +7824,7 @@ class AgentRuntime:
             and _looks_like_archive_memory_query(
                 message,
                 has_file_context=bool(context.file_hits),
-                has_persisted_files=bool(self.storage.list_files(limit=1)),
+                has_persisted_files=has_persisted_files,
             )
         ):
             return TaskKernelPlan(
@@ -7657,7 +7885,7 @@ class AgentRuntime:
                 or _looks_like_document_memory_query(
                     message,
                     has_file_context=bool(context.file_hits),
-                    has_persisted_files=bool(self.storage.list_files(limit=1)),
+                    has_persisted_files=has_persisted_files,
                 )
             )
         ):
@@ -7925,6 +8153,7 @@ class AgentRuntime:
         message: str,
         mode: str,
         attachments: list[dict[str, Any]],
+        transport_request_id: str | None = None,
     ) -> None:
         """Load an active byte-equivalent operator-request replay fence.
 
@@ -7937,7 +8166,12 @@ class AgentRuntime:
         cannot turn a client retry into a second mutation.
         """
 
-        digest = _operator_request_digest(message, mode=mode, attachments=attachments)
+        digest = _operator_request_digest(
+            message,
+            mode=mode,
+            attachments=attachments,
+            transport_request_id=transport_request_id,
+        )
         context.operator_request_digest = digest
         state_key = _operator_effect_ledger_key(context.conversation_id)
         existing = self.storage.get_runtime_value(state_key, None)
@@ -8199,7 +8433,14 @@ class AgentRuntime:
 
         self.storage.update_runtime_value_atomic(state_key, update, default=None)
 
-    def _prepare_context(self, message: str, conversation_id: str | None) -> AgentContext:
+    def _prepare_context(
+        self,
+        message: str,
+        conversation_id: str | None,
+        *,
+        capabilities: dict[str, bool] | None = None,
+    ) -> AgentContext:
+        capabilities = capabilities or self._context_capabilities()
         if conversation_id is None:
             conversation_id = self.storage.create_conversation(self._title_from_goal(message))
         else:
@@ -8219,9 +8460,19 @@ class AgentRuntime:
             # guest history into the full-autonomy agent context.
             conversation_id = self.storage.create_conversation(self._title_from_goal(message))
             recent = []
-        memory_hits = self.storage.search_memory(_memory_search_query(message, recent), limit=8)
-        file_hits = self.storage.search_file_chunks(message[:160], limit=5)
-        if _looks_like_document_followup(message) or _looks_like_archive_followup(message):
+        memory_hits = (
+            self.storage.search_memory(_memory_search_query(message, recent), limit=8)
+            if capabilities["can_read_memory"]
+            else []
+        )
+        file_hits = (
+            self.storage.search_file_chunks(message[:160], limit=5)
+            if capabilities["can_read_files"]
+            else []
+        )
+        if capabilities["can_read_files"] and (
+            _looks_like_document_followup(message) or _looks_like_archive_followup(message)
+        ):
             file_hits = _merge_file_hits(
                 self._recent_document_reference_file_hits(recent),
                 file_hits,
@@ -8230,7 +8481,8 @@ class AgentRuntime:
             conversation_id=conversation_id,
             memory_hits=memory_hits,
             file_hits=file_hits,
-            playbook_hits=self._playbook_hits(message),
+            playbook_hits=(self._playbook_hits(message) if capabilities["can_read_memory"] else []),
+            **capabilities,
         )
 
     async def _hybrid_rerank(
@@ -8295,6 +8547,9 @@ class AgentRuntime:
     ) -> None:
         """Hybrid re-rank of durable memory (lexical hits + recent/important pool)."""
 
+        if not context.can_read_memory:
+            context.memory_hits = []
+            return
         query = " ".join(str(message or "").split())
         if not query:
             return
@@ -8322,6 +8577,9 @@ class AgentRuntime:
         right passage.
         """
 
+        if not context.can_read_files:
+            context.file_hits = []
+            return
         query = " ".join(str(message or "").split())
         if not query:
             return
@@ -8445,6 +8703,8 @@ class AgentRuntime:
         message: str,
         context: AgentContext,
     ) -> tuple[str, ChatEvent, ToolRunResponse] | None:
+        if not context.can_read_files or not self._capability_allowed("files.read.own"):
+            return None
         plan = context.task_plan
         if plan is None or plan.intent != "document_memory":
             return None
@@ -8556,6 +8816,8 @@ class AgentRuntime:
         first (exact/stem match), else the most-recently updated editable document.
         Returns the file record or None when nothing suitable is persisted."""
 
+        if not self._capability_allowed("files.read.own"):
+            return None
         mentions = _filenames_mentioned(message)
         for mention in mentions:
             for record in self.storage.search_files(mention, limit=8):
@@ -8580,6 +8842,8 @@ class AgentRuntime:
         a worked documents.edit example, so the model applies the edit without asking for
         a file name. Returns None (fall through to the loop) when nothing resolves."""
 
+        if not context.can_read_files or not self._capability_allowed("files.read.own"):
+            return None
         plan = context.task_plan
         if plan is None or plan.intent != "document_edit":
             return None
@@ -10011,6 +10275,10 @@ class AgentRuntime:
         ``met=None`` so the supervisor retries later without producing a false alert.
         """
 
+        if not self._capability_allowed("background.screen_watch.create", record=True):
+            return ScreenConditionCheck(met=None, error="screen watch permission denied")
+        if not self._capability_allowed("privacy.screen.capture", record=True):
+            return ScreenConditionCheck(met=None, error="screen capture permission denied")
         if not self.settings.profile.vision_capable:
             return ScreenConditionCheck(met=None, error="active profile is not vision-capable")
 
@@ -10126,7 +10394,11 @@ class AgentRuntime:
         image_parts: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         memory_block = ""
-        if context.memory_hits:
+        if (
+            context.can_read_memory
+            and self._capability_allowed("memory.read.own")
+            and context.memory_hits
+        ):
             lines = [
                 (
                     f"- [{_context_relevance(item)} | {item.get('namespace', 'core')}"
@@ -10139,7 +10411,11 @@ class AgentRuntime:
                 "and newer records; ignore unrelated records:\n" + "\n".join(lines)
             )
         file_block = ""
-        if context.file_hits:
+        if (
+            context.can_read_files
+            and self._capability_allowed("files.read.own")
+            and context.file_hits
+        ):
             lines = []
             for item in context.file_hits[:5]:
                 file_id = str(item.get("file_id") or "").strip()
@@ -10366,6 +10642,8 @@ class AgentRuntime:
         message: str,
         context: AgentContext,
     ) -> list[ChatEvent]:
+        if not context.can_write_memory or not self._capability_allowed("memory.write.own"):
+            return []
         candidates = _dedupe_memory_candidates(
             [*_explicit_memory_candidates(message), *_implicit_operator_memory_candidates(message)]
         )
@@ -10400,6 +10678,8 @@ class AgentRuntime:
         ]
 
     async def _compact_conversation_memory(self, conversation_id: str) -> None:
+        if not self._capability_allowed("memory.write.own"):
+            return
         state_key = f"memory.compacted.{conversation_id}"
         last_compacted = int(self.storage.get_runtime_value(state_key, 0) or 0)
         conversation = self.storage.get_conversation(conversation_id) or {}
@@ -10489,6 +10769,8 @@ class AgentRuntime:
         return "LLM-compressed conversation memory:\n" + summary
 
     def _operator_prompt(self) -> str:
+        if not self._capability_allowed("preferences.read.own"):
+            return ""
         preferences = self.storage.get_runtime_value("experience.preferences", {})
         if not isinstance(preferences, dict):
             return ""
@@ -10513,7 +10795,16 @@ class AgentRuntime:
         )
 
     def _operator_profile_context(self) -> str:
-        preferences = self.storage.get_runtime_value("experience.preferences", {})
+        can_read_preferences = self._capability_allowed("preferences.read.own")
+        can_read_persona = self._capability_allowed("persona.read.own")
+        can_read_memory = self._capability_allowed("memory.read.own")
+        can_read_missions = self._capability_allowed("missions.read.own")
+        can_read_approvals = self._capability_allowed("approvals.read.own")
+        preferences = (
+            self.storage.get_runtime_value("experience.preferences", {})
+            if can_read_preferences
+            else {}
+        )
         if not isinstance(preferences, dict):
             preferences = {}
         lines = [
@@ -10523,7 +10814,27 @@ class AgentRuntime:
             f"- model_root: {self.settings.model_root}",
             f"- llm_endpoint: {self.settings.llm_base_url}",
         ]
-        local_context = operator_context(self.settings, self.storage)
+        # Do not call operator_context here: it eagerly reads persona, preferences,
+        # missions and approvals even when the corresponding capability is denied.
+        local_context: dict[str, Any] = {
+            "now": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "pending_approvals": (
+                len(self.storage.list_approvals(limit=50, status="pending"))
+                if can_read_approvals
+                else 0
+            ),
+            "active_missions": (
+                sum(
+                    1
+                    for mission in self.storage.list_missions(limit=10)
+                    if mission.get("status") in {"active", "running"}
+                )
+                if can_read_missions
+                else 0
+            ),
+        }
+        if can_read_persona:
+            local_context["home_location"] = persona_module.home_location(self._persona()) or ""
         lines.extend(
             [
                 f"- local_time: {local_context.get('now')}",
@@ -10541,16 +10852,21 @@ class AgentRuntime:
         default_city = _normalize_search_query(os.environ.get("JARVIS_DEFAULT_CITY", ""))
         if default_city:
             lines.append(f"- default_weather_city: {default_city}")
-        cached_weather = self.storage.get_runtime_value("weather.inferred_location", {})
+        cached_weather = (
+            self.storage.get_runtime_value("weather.inferred_location", {})
+            if can_read_preferences or can_read_persona
+            else {}
+        )
         if isinstance(cached_weather, dict) and cached_weather.get("location"):
             lines.append(f"- cached_weather_location: {cached_weather['location']}")
 
         profile_items: list[str] = []
-        for namespace in ("profile", "preferences", "instructions", "environment"):
-            for item in self.storage.search_memory(None, limit=3, namespaces=[namespace]):
-                content = " ".join(str(item.get("content") or "").split())
-                if content:
-                    profile_items.append(f"- {namespace}: {_short_value(content, 240)}")
+        if can_read_memory:
+            for namespace in ("profile", "preferences", "instructions", "environment"):
+                for item in self.storage.search_memory(None, limit=3, namespaces=[namespace]):
+                    content = " ".join(str(item.get("content") or "").split())
+                    if content:
+                        profile_items.append(f"- {namespace}: {_short_value(content, 240)}")
         if profile_items:
             lines.append("Durable typed notes:")
             lines.extend(profile_items[:10])
@@ -10565,6 +10881,8 @@ class AgentRuntime:
         findings change future behavior deterministically.
         """
 
+        if not self._capability_allowed("memory.read.own"):
+            return ""
         try:
             memories = self.storage.search_memory(None, limit=40)
         except Exception:  # noqa: BLE001 - prompt assembly must never break a turn
@@ -10600,7 +10918,7 @@ class AgentRuntime:
         return "\n".join(lines)
 
     def _playbook_hits(self, query: str) -> list[dict[str, Any]]:
-        if self.playbooks is None:
+        if self.playbooks is None or not self._capability_allowed("memory.read.own"):
             return []
         try:
             return [item.to_dict() for item in self.playbooks.lookup(query, limit=5)]
@@ -10626,10 +10944,18 @@ class AgentRuntime:
         return "\n".join(lines)
 
     def _persona(self) -> dict[str, Any]:
+        if not self._capability_allowed("persona.read.own"):
+            return {}
         return persona_module.load_persona(self.storage)
 
     def _persona_prompt(self) -> str:
-        preferences = self.storage.get_runtime_value("experience.preferences", {})
+        if not self._capability_allowed("persona.read.own"):
+            return ""
+        preferences = (
+            self.storage.get_runtime_value("experience.preferences", {})
+            if self._capability_allowed("preferences.read.own")
+            else {}
+        )
         if not isinstance(preferences, dict):
             preferences = {}
         persona = self._persona()
@@ -18413,6 +18739,7 @@ def _operator_request_digest(
     *,
     mode: str,
     attachments: list[dict[str, Any]],
+    transport_request_id: str | None = None,
 ) -> str:
     attachment_identity = [
         {
@@ -18431,6 +18758,7 @@ def _operator_request_digest(
         "message": " ".join(str(message).split()),
         "mode": str(mode),
         "attachments": attachment_identity,
+        "transport_request_id": str(transport_request_id or ""),
     }
     return hashlib.sha256(
         json.dumps(

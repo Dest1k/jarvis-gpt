@@ -118,6 +118,7 @@ def _storage(tmp_path, monkeypatch):
 
 def test_storage_reminder_roundtrip(tmp_path, monkeypatch):
     _settings, storage = _storage(tmp_path, monkeypatch)
+    storage.ensure_conversation("conv-1")
     r = _p("завтра в 10 про встречу")
     created = storage.create_reminder(
         text="про встречу",

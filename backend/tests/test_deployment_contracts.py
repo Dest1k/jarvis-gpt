@@ -65,6 +65,7 @@ def test_compose_defaults_to_loopback_and_propagates_build_contract() -> None:
     assert "JARVIS_BACKEND_URL: http://backend:8000" in compose
     assert "JARVIS_CORS_ORIGINS:" in compose
     assert "JARVIS_API_REQUIRE_TOKEN_ON_LOOPBACK:" in compose
+    assert compose.count("${JARVIS_API_TOKEN:?") == 2
     assert "${JARVIS_QWEN_MODEL_PATH:?" in compose
     assert "JARVIS_QWEN_MODEL_PATH:-/models/" not in compose
     assert "${JARVIS_QWEN_EXTRA_ARGS:-}" in compose
@@ -160,6 +161,10 @@ def test_launcher_is_local_only_and_preserves_foreign_listeners() -> None:
     assert "Get-OrCreateApiToken" in launcher
     assert "Protect-ApiTokenFile" in launcher
     assert "Get-FrontendEnvironmentSha256" in launcher
+    assert "JARVIS_UI_SESSION_SECRET" in launcher
+    assert "JARVIS_TRUST_PROXY_HEADERS" in launcher
+    assert "JARVIS_TELEGRAM_SESSION_TTL_SECONDS" in launcher
+    assert "JARVIS_TELEGRAM_USER_RATE_LIMIT_PER_MINUTE" in launcher
     assert '(Join-Path $FrontendRoot "lib")' in launcher
     assert "JARVIS_EXECUTION_CAPABILITIES_FILE" in launcher
     assert "JARVIS_BRIDGE_APP_PATHS_JSON" in launcher

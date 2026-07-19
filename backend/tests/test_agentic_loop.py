@@ -1125,15 +1125,33 @@ def test_completed_operator_turn_fences_exact_http_response_retry(
     message = "Click Search at https://example.com"
 
     # Treat the first successful response as lost by the HTTP client.
-    first = asyncio.run(agent.chat(message))
+    first = asyncio.run(agent.chat(message, transport_request_id="telegram:default:1"))
     agent.llm = ToolThenAnswerLLM()
-    retry = asyncio.run(agent.chat(message, conversation_id=first.conversation_id))
+    retry = asyncio.run(
+        agent.chat(
+            message,
+            conversation_id=first.conversation_id,
+            transport_request_id="telegram:default:1",
+        )
+    )
 
     assert runs == ["browser.click"]
     assert retry.answer == first.answer
     assert any(
         event.title == "Idempotent response replay" for event in retry.events
     )
+
+    # The same words in a different Telegram update are a deliberate new turn.
+    agent.llm = ToolThenAnswerLLM()
+    new_update = asyncio.run(
+        agent.chat(
+            message,
+            conversation_id=first.conversation_id,
+            transport_request_id="telegram:default:2",
+        )
+    )
+    assert runs == ["browser.click", "browser.click"]
+    assert not any(event.title == "Idempotent response replay" for event in new_update.events)
 
     # Explicitly restating the intent creates a new digest and is not suppressed.
     agent.llm = ToolThenAnswerLLM()
@@ -1143,7 +1161,7 @@ def test_completed_operator_turn_fences_exact_http_response_retry(
             conversation_id=first.conversation_id,
         )
     )
-    assert runs == ["browser.click", "browser.click"]
+    assert runs == ["browser.click", "browser.click", "browser.click"]
     assert not any(
         event.title == "Durable duplicate effect skipped" for event in repeated.events
     )

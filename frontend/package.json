@@ -9,7 +9,8 @@
     "typecheck": "tsc --noEmit",
     "test:memory-graph": "node tests/memory-graph.mjs",
     "test:runtime-identity": "node tests/runtime-identity.mjs",
-    "test:stream-placeholder": "node tests/stream-placeholder.mjs"
+    "test:stream-placeholder": "node tests/stream-placeholder.mjs",
+    "test:owner-session": "node tests/owner-session.mjs"
   },
   "dependencies": {
     "clsx": "2.1.1",

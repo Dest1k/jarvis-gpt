@@ -21,6 +21,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
+from .authorization import LEGACY_OWNER_USER_ID, current_user_id
 from .redaction import redact_text
 
 HOST_PROFILE_SCHEMA = "jarvis.host-profile.v1"
@@ -563,13 +564,35 @@ class ExecutionPlaybookStore:
             self._initialize()
 
     def _initialize(self) -> None:
-        self._connection.executescript(
-            """
-            BEGIN IMMEDIATE;
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            exists = self._connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'execution_playbooks'"
+            ).fetchone()
+            if exists is not None:
+                columns = {
+                    str(row[1])
+                    for row in self._connection.execute(
+                        "PRAGMA table_info(execution_playbooks)"
+                    ).fetchall()
+                }
+                if "user_id" not in columns:
+                    self._connection.execute(
+                        "ALTER TABLE execution_playbooks RENAME TO execution_playbooks_legacy"
+                    )
+                    # SQLite keeps index names when a table is renamed. Free the legacy
+                    # name so the tenant-leading replacement below is actually created.
+                    self._connection.execute(
+                        "DROP INDEX IF EXISTS idx_execution_playbooks_rank"
+                    )
+            self._connection.execute(
+                """
             CREATE TABLE IF NOT EXISTS execution_playbooks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
                 schema TEXT NOT NULL,
-                fingerprint_sha256 TEXT NOT NULL UNIQUE,
+                fingerprint_sha256 TEXT NOT NULL,
                 symptom TEXT NOT NULL,
                 symptom_normalized TEXT NOT NULL,
                 solution TEXT NOT NULL,
@@ -582,13 +605,46 @@ class ExecutionPlaybookStore:
                 confidence REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),
                 last_outcome TEXT NOT NULL CHECK(last_outcome IN ('success', 'failure')),
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_execution_playbooks_rank
-                ON execution_playbooks(confidence DESC, updated_at DESC);
-            COMMIT;
-            """
-        )
+                updated_at TEXT NOT NULL,
+                UNIQUE(user_id, fingerprint_sha256)
+            )
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_execution_playbooks_rank
+                ON execution_playbooks(user_id, confidence DESC, updated_at DESC)
+                """
+            )
+            legacy = self._connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'execution_playbooks_legacy'"
+            ).fetchone()
+            if legacy is not None:
+                self._connection.execute(
+                    """
+                    INSERT INTO execution_playbooks(
+                        id, user_id, schema, fingerprint_sha256, symptom,
+                        symptom_normalized, solution, solution_normalized,
+                        verification, verification_normalized, success_count,
+                        failure_count, use_count, confidence, last_outcome,
+                        created_at, updated_at
+                    )
+                    SELECT id, ?, schema, fingerprint_sha256, symptom,
+                           symptom_normalized, solution, solution_normalized,
+                           verification, verification_normalized, success_count,
+                           failure_count, use_count, confidence, last_outcome,
+                           created_at, updated_at
+                    FROM execution_playbooks_legacy
+                    """,
+                    (LEGACY_OWNER_USER_ID,),
+                )
+                self._connection.execute("DROP TABLE execution_playbooks_legacy")
+            self._connection.execute("COMMIT")
+        except BaseException:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            raise
 
     def _require_open(self) -> None:
         if self._closed:
@@ -638,6 +694,7 @@ class ExecutionPlaybookStore:
             ).encode("utf-8")
         ).hexdigest()
         now = _utc_now()
+        user_id = current_user_id()
         success_delta = int(outcome == "success")
         failure_delta = int(outcome == "failure")
         with self._lock:
@@ -647,14 +704,14 @@ class ExecutionPlaybookStore:
                 self._connection.execute(
                     """
                     INSERT INTO execution_playbooks (
-                        schema, fingerprint_sha256,
+                        user_id, schema, fingerprint_sha256,
                         symptom, symptom_normalized,
                         solution, solution_normalized,
                         verification, verification_normalized,
                         success_count, failure_count, use_count,
                         confidence, last_outcome, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
-                    ON CONFLICT(fingerprint_sha256) DO UPDATE SET
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+                    ON CONFLICT(user_id, fingerprint_sha256) DO UPDATE SET
                         success_count = success_count + excluded.success_count,
                         failure_count = failure_count + excluded.failure_count,
                         confidence = (
@@ -667,6 +724,7 @@ class ExecutionPlaybookStore:
                         updated_at = excluded.updated_at
                     """,
                     (
+                        user_id,
                         PLAYBOOK_SCHEMA,
                         digest,
                         symptom_text,
@@ -684,7 +742,9 @@ class ExecutionPlaybookStore:
                     ),
                 )
                 row = self._connection.execute(
-                    "SELECT * FROM execution_playbooks WHERE fingerprint_sha256 = ?", (digest,)
+                    "SELECT * FROM execution_playbooks "
+                    "WHERE user_id = ? AND fingerprint_sha256 = ?",
+                    (user_id, digest),
                 ).fetchone()
                 self._connection.execute("COMMIT")
             except BaseException:
@@ -716,6 +776,7 @@ class ExecutionPlaybookStore:
 
         with self._lock:
             self._require_open()
+            user_id = current_user_id()
             if terms:
                 score_parts: list[str] = []
                 score_arguments: list[str] = []
@@ -739,12 +800,12 @@ class ExecutionPlaybookStore:
                     f"""
                     SELECT *, ({score_sql}) AS relevance_score
                     FROM execution_playbooks
-                    WHERE {" OR ".join(where_parts)}
+                    WHERE user_id = ? AND ({" OR ".join(where_parts)})
                     ORDER BY relevance_score DESC, confidence DESC,
                              use_count DESC, updated_at DESC, id ASC
                     LIMIT ?
                     """,  # noqa: S608 - structure is generated only from fixed fragments
-                    (*score_arguments, *where_arguments, bounded_limit),
+                    (*score_arguments, user_id, *where_arguments, bounded_limit),
                 ).fetchall()
             else:  # pragma: no cover - non-empty text always yields a token
                 rows = []
@@ -757,8 +818,8 @@ class ExecutionPlaybookStore:
                     self._connection.execute("BEGIN IMMEDIATE")
                     self._connection.execute(
                         f"UPDATE execution_playbooks SET use_count = use_count + 1 "
-                        f"WHERE id IN ({placeholders})",  # noqa: S608 - placeholders only
-                        ids,
+                        f"WHERE user_id = ? AND id IN ({placeholders})",  # noqa: S608
+                        (user_id, *ids),
                     )
                     self._connection.execute("COMMIT")
                 except BaseException:
@@ -783,7 +844,9 @@ class ExecutionPlaybookStore:
                        COALESCE(SUM(failure_count), 0) AS failures,
                        COALESCE(SUM(use_count), 0) AS uses
                 FROM execution_playbooks
-                """
+                WHERE user_id = ?
+                """,
+                (current_user_id(),),
             ).fetchone()
         assert row is not None
         return {

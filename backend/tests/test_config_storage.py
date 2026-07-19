@@ -5,6 +5,11 @@ from pathlib import Path
 
 import jarvis_gpt.storage as storage_module
 import pytest
+from jarvis_gpt.authorization import (
+    LEGACY_OWNER_USER_ID,
+    ActorContext,
+    bind_actor,
+)
 from jarvis_gpt.config import PROFILES, ensure_runtime_dirs, load_settings
 from jarvis_gpt.models import MemoryVaultResponse
 from jarvis_gpt.storage import JarvisStorage, _recoverable_fts_error
@@ -54,6 +59,98 @@ def test_storage_only_degrades_for_expected_fts_errors(tmp_path):
     assert storage._ensure_memory_fts(_FailingFtsConnection("no such module: fts5")) is False
     with pytest.raises(sqlite3.OperationalError, match="database is locked"):
         storage._ensure_memory_fts(_FailingFtsConnection("database is locked"))
+
+
+def test_legacy_telegram_update_ledger_migrates_replay_lease_columns(tmp_path):
+    database_path = tmp_path / "state" / "jarvis.sqlite3"
+    database_path.parent.mkdir(parents=True)
+    with sqlite3.connect(database_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE telegram_updates (
+                realm_id TEXT NOT NULL,
+                update_id INTEGER NOT NULL,
+                user_id TEXT,
+                payload_sha256 TEXT NOT NULL,
+                status TEXT NOT NULL,
+                received_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(realm_id, update_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO telegram_updates(
+                realm_id, update_id, payload_sha256, status, received_at, updated_at
+            ) VALUES ('legacy', 1, 'digest', 'completed', '2020-01-01', '2020-01-01')
+            """
+        )
+
+    storage = JarvisStorage(database_path)
+    storage.initialize()
+    columns = {
+        str(row[1]) for row in storage.connect().execute("PRAGMA table_info(telegram_updates)")
+    }
+    row = storage.connect().execute(
+        """
+        SELECT attempt_count, lease_token, last_error
+        FROM telegram_updates WHERE realm_id = 'legacy' AND update_id = 1
+        """
+    ).fetchone()
+
+    assert {"attempt_count", "lease_token", "last_error"} <= columns
+    assert dict(row) == {"attempt_count": 1, "lease_token": None, "last_error": None}
+    storage.close()
+
+
+def test_legacy_personal_tables_backfill_owner_before_tenant_indexes(tmp_path):
+    database_path = tmp_path / "state" / "jarvis.sqlite3"
+    database_path.parent.mkdir(parents=True)
+    with sqlite3.connect(database_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE conversations (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO conversations(id, title, created_at, updated_at)
+            VALUES ('legacy-conversation', 'Legacy', '2020-01-01', '2020-01-01')
+            """
+        )
+
+    storage = JarvisStorage(database_path)
+    storage.initialize()
+
+    row = storage.connect().execute(
+        "SELECT user_id FROM conversations WHERE id = 'legacy-conversation'"
+    ).fetchone()
+    indexes = {
+        str(item[1])
+        for item in storage.connect().execute("PRAGMA index_list(conversations)")
+    }
+    assert row["user_id"] == LEGACY_OWNER_USER_ID
+    assert "idx_conversations_user_updated" in indexes
+    storage.close()
+
+
+def test_per_user_memory_vault_handle_cache_is_bounded(monkeypatch, tmp_path):
+    monkeypatch.setattr(storage_module, "_MEMORY_VAULT_CACHE_MAX", 2)
+    storage = JarvisStorage(tmp_path / "state" / "jarvis.sqlite3")
+
+    first = storage._memory_vault_for("usr_first")
+    storage._memory_vault_for("usr_second")
+    storage._memory_vault_for("usr_third")
+
+    assert len(storage._user_memory_vaults) == 2
+    assert "usr_first" not in storage._user_memory_vaults
+    assert first.root.name == "usr_first"
 
 
 def test_storage_persists_mission(tmp_path):
@@ -639,8 +736,9 @@ def test_storage_consolidates_existing_duplicate_memories(tmp_path):
     with storage.connect() as conn:
         conn.execute(
             """
-            INSERT INTO memories(id, namespace, content, tags, importance, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO memories(
+                id, namespace, content, tags, importance, created_at, updated_at, user_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 "mem_duplicate",
@@ -650,6 +748,7 @@ def test_storage_consolidates_existing_duplicate_memories(tmp_path):
                 0.9,
                 "2026-01-01T00:00:00+00:00",
                 "2026-01-01T00:00:00+00:00",
+                LEGACY_OWNER_USER_ID,
             ),
         )
         conn.commit()
@@ -697,8 +796,9 @@ def test_memory_vault_failure_is_marked_then_repaired(monkeypatch, tmp_path):
     with storage.connect() as conn:
         conn.execute(
             """
-            INSERT INTO memories(id, namespace, content, tags, importance, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO memories(
+                id, namespace, content, tags, importance, created_at, updated_at, user_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 "mem_repair_keep",
@@ -708,6 +808,7 @@ def test_memory_vault_failure_is_marked_then_repaired(monkeypatch, tmp_path):
                 0.9,
                 "2026-01-01T00:00:00+00:00",
                 "2026-01-01T00:00:00+00:00",
+                LEGACY_OWNER_USER_ID,
             ),
         )
         conn.commit()
@@ -776,6 +877,46 @@ def test_storage_persists_runtime_values(tmp_path):
     assert loaded == {"operator_name": "Tony"}
     assert rows[0]["value"] == {"operator_name": "Tony"}
     assert storage.counters()["runtime_kv"] == 1
+    storage.close()
+
+
+def test_runtime_values_are_isolated_from_additional_owner(tmp_path):
+    storage = JarvisStorage(tmp_path / "state" / "jarvis.sqlite3")
+    storage.initialize()
+    legacy_actor = ActorContext(
+        user_id=LEGACY_OWNER_USER_ID,
+        preset_key="admin",
+        source="test",
+    )
+    additional_owner = ActorContext(
+        user_id="usr_additional_owner",
+        preset_key="owner",
+        source="test",
+    )
+
+    with bind_actor(legacy_actor):
+        legacy_saved = storage.set_runtime_value(
+            "experience.preferences", {"private": "legacy"}
+        )
+    with bind_actor(additional_owner):
+        assert storage.get_runtime_value("experience.preferences") is None
+        owner_saved = storage.set_runtime_value(
+            "experience.preferences", {"private": "additional-owner"}
+        )
+        assert storage.get_runtime_value("experience.preferences") == {
+            "private": "additional-owner"
+        }
+        assert storage.counters()["runtime_kv"] == 1
+        assert len(storage.list_runtime_values()) == 1
+    with bind_actor(legacy_actor):
+        assert storage.get_runtime_value("experience.preferences") == {
+            "private": "legacy"
+        }
+        assert storage.counters()["runtime_kv"] == 1
+        assert len(storage.list_runtime_values()) == 1
+
+    assert legacy_saved["key"] == "experience.preferences"
+    assert owner_saved["key"] == "user.usr_additional_owner.experience.preferences"
     storage.close()
 
 

@@ -22,6 +22,12 @@ class ChatAttachment(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=20000)
+    request_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=200,
+        pattern=r"^[A-Za-z0-9._:-]+$",
+    )
     conversation_id: str | None = None
     mode: Literal["auto", "chat", "mission"] = "auto"
     temperature: float | None = Field(default=None, ge=0.0, le=2.0)
@@ -426,6 +432,10 @@ class ToolInfo(BaseModel):
     category: str
     input_schema: dict[str, Any]
     danger_level: Literal["safe", "review", "danger"] = "safe"
+    # Stable authorization capability.  The default keeps manually constructed
+    # ToolInfo values (tests/older integrations) source-compatible; registry
+    # responses always populate it as ``tool.<name>``.
+    security_id: str = ""
 
 
 class ToolRunRequest(BaseModel):

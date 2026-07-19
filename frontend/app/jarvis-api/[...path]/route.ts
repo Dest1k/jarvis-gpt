@@ -1,5 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 
+import {
+  OWNER_SESSION_COOKIE,
+  verifyOwnerSession
+} from "../../../lib/owner-session.mjs";
+
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
@@ -10,6 +15,7 @@ const FORWARDED_REQUEST_HEADERS = [
   "if-match",
   "if-none-match",
   "if-modified-since",
+  "x-jarvis-approval-id",
   "range"
 ];
 const FORWARDED_RESPONSE_HEADERS = [
@@ -26,13 +32,39 @@ const UNSAFE_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 
 type RouteContext = { params: Promise<{ path: string[] }> };
 
+function trustsProxyHeaders() {
+  return (process.env.JARVIS_TRUST_PROXY_HEADERS ?? "").trim() === "1";
+}
+
+function requestOrigin(request: NextRequest) {
+  const trusted = trustsProxyHeaders();
+  const protocol = trusted
+    ? request.headers.get("x-forwarded-proto")?.split(",", 1)[0]?.trim()
+    : request.nextUrl.protocol.replace(/:$/, "");
+  const host = trusted
+    ? request.headers.get("x-forwarded-host")?.split(",", 1)[0]?.trim()
+    : request.headers.get("host")?.trim();
+  if (!host || !new Set(["http", "https"]).has(protocol ?? "")) return request.nextUrl.origin;
+  try {
+    return new URL(`${protocol}://${host}`).origin;
+  } catch {
+    return request.nextUrl.origin;
+  }
+}
+
+function isHttps(request: NextRequest) {
+  if (request.nextUrl.protocol === "https:") return true;
+  if (!trustsProxyHeaders()) return false;
+  return request.headers.get("x-forwarded-proto")?.split(",", 1)[0]?.trim() === "https";
+}
+
 function crossSiteMutation(request: NextRequest) {
   if (!UNSAFE_METHODS.has(request.method.toUpperCase())) return false;
   if ((request.headers.get("sec-fetch-site") ?? "").toLowerCase() === "cross-site") return true;
   const origin = request.headers.get("origin");
   if (!origin) return false;
   try {
-    return new URL(origin).origin !== request.nextUrl.origin;
+    return new URL(origin).origin !== requestOrigin(request);
   } catch {
     return true;
   }
@@ -50,6 +82,36 @@ async function forward(request: NextRequest, context: RouteContext) {
       { detail: "Server-side JARVIS_API_TOKEN is required for the API proxy." },
       { status: 503 }
     );
+  }
+  const ownerSession = request.cookies.get(OWNER_SESSION_COOKIE)?.value;
+  if (
+    !verifyOwnerSession(
+      ownerSession,
+      token,
+      (process.env.JARVIS_UI_SESSION_SECRET ?? "").trim()
+    )
+  ) {
+    const response = NextResponse.json(
+      { detail: "Owner UI authentication required.", login_url: "/login" },
+      {
+        status: 401,
+        headers: {
+          "Cache-Control": "no-store",
+          "WWW-Authenticate": "JarvisOwnerSession"
+        }
+      }
+    );
+    response.cookies.set({
+      name: OWNER_SESSION_COOKIE,
+      value: "",
+      httpOnly: true,
+      secure: isHttps(request),
+      sameSite: "strict",
+      path: "/",
+      maxAge: 0,
+      expires: new Date(0)
+    });
+    return response;
   }
   let base: URL;
   try {

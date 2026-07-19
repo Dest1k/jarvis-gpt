@@ -91,6 +91,7 @@ def main() -> int:
             env={
                 **os.environ,
                 "JARVIS_QWEN_MODEL_PATH": "/models/__jarvis_compose_config_check__",
+                "JARVIS_API_TOKEN": "jarvis-smoke-compose-token-32-characters",
             },
             timeout=default_check_timeout,
         ),

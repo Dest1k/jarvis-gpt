@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import hashlib
 import ipaddress
 import json
 import os
@@ -11,7 +12,8 @@ import secrets
 import socket
 import tempfile
 from contextlib import asynccontextmanager, suppress
-from datetime import UTC, datetime
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -29,10 +31,25 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from fastapi.routing import APIRoute
+from starlette.routing import Match
 
 from . import speech
+from .admin_api import ADMIN_API_CAPABILITIES
+from .admin_api import router as admin_router
 from .agent import AgentRuntime
 from .approval_executor import ApprovalExecutor
+from .authorization import (
+    CORE_CAPABILITIES,
+    LEGACY_OWNER_USER_ID,
+    ActorContext,
+    AuthorizationError,
+    AuthorizationService,
+    CapabilityDefinition,
+    ResourceIsolationError,
+    bind_actor,
+    current_actor,
+)
 from .autonomy_executor import AutonomyExecutor
 from .cognitive_memory import ExecutionPlaybookStore, HostProfileManager
 from .config import ensure_runtime_dirs, load_settings
@@ -133,6 +150,13 @@ from .web_surfer_adapter import WebSurferAdapter
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = load_settings()
+    configured_api_token = _api_token()
+    if configured_api_token and len(configured_api_token) < 32:
+        raise RuntimeError("JARVIS_API_TOKEN must contain at least 32 characters")
+    if settings.api_require_token_on_loopback and not configured_api_token:
+        raise RuntimeError(
+            "JARVIS_API_TOKEN is required when loopback authentication is enabled"
+        )
     ensure_runtime_dirs(settings)
     storage = JarvisStorage(settings.database_path)
     playbooks: ExecutionPlaybookStore | None = None
@@ -216,6 +240,17 @@ async def lifespan(app: FastAPI):
     try:
         primary_lease.acquire()
         storage.initialize()
+        authorization = AuthorizationService(storage)
+        authorization.sync_capabilities(CORE_CAPABILITIES, catalog_key="core.v1")
+        authorization.sync_capabilities(
+            ADMIN_API_CAPABILITIES,
+            catalog_key="http.admin.v1",
+        )
+        authorization.sync_capabilities(
+            HTTP_API_CAPABILITIES,
+            catalog_key="http.api.v1",
+        )
+        authorization.prune_ephemeral_security_state(force=True)
         # This is the designated primary runtime.  Fail closed acquired approvals
         # before any mission recovery can consider their interrupted side effects.
         # It is inside the resource guard so a database failure still closes storage.
@@ -307,6 +342,7 @@ async def lifespan(app: FastAPI):
 
         app.state.settings = settings
         app.state.storage = storage
+        app.state.authorization = authorization
         app.state.llm = llm
         app.state.bus = bus
         app.state.agent = agent
@@ -390,6 +426,18 @@ def _api_token() -> str:
     return os.environ.get("JARVIS_API_TOKEN", "").strip()
 
 
+def _authenticated_user_rate_limit() -> int:
+    try:
+        value = int(os.environ.get("JARVIS_API_USER_RATE_LIMIT_PER_MINUTE", "240"))
+    except ValueError:
+        value = 240
+    return max(1, min(value, 100_000))
+
+
+def _bridge_secret() -> str:
+    return os.environ.get("JARVIS_TELEGRAM_BRIDGE_SECRET", "").strip()
+
+
 def _is_loopback_host(host: str | None) -> bool:
     if not host:
         return False
@@ -443,6 +491,11 @@ def _header_token(headers: Any) -> str:
     if auth.lower().startswith("bearer "):
         return auth.split(" ", 1)[1].strip()
     return str(headers.get("x-jarvis-api-token") or "").strip()
+
+
+def _user_session_token(headers: Any) -> str:
+    token = str(headers.get("x-jarvis-user-session") or "").strip()
+    return token if len(token) <= 1024 else ""
 
 
 def _websocket_protocol_token(headers: Any) -> str:
@@ -509,10 +562,444 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(admin_router)
+
+
+_TELEGRAM_SESSION_PATHS = {
+    "/api/integrations/telegram/session",
+    "/api/integrations/telegram/register-session",
+}
+
+
+_HTTP_GUEST_ENDPOINTS = frozenset(
+    {
+        "chat",
+        "chat_stream",
+        "interrupted_stream",
+        "list_conversations",
+        "list_conversation_messages",
+        "set_message_feedback",
+    }
+)
+
+# These handlers operate on resources which are scoped to the authenticated actor.
+# Tool execution still passes through the tool-level PEP; this grant only permits the
+# HTTP transport to reach that second, more specific authorization decision.
+_HTTP_PERSONAL_ENDPOINTS = frozenset(
+    {
+        "agent_trace",
+        "agent_message_trace",
+        "preferences",
+        "update_preferences",
+        "persona",
+        "update_persona",
+        "add_persona_insight",
+        "voice_status",
+        "voice_speak",
+        "delete_conversation",
+        "executive_plan",
+        "web_surfer_capabilities",
+        "list_missions",
+        "create_mission",
+        "get_mission",
+        "execute_next_mission_step",
+        "run_mission",
+        "get_mission_report",
+        "update_mission_task",
+        "search_memory",
+        "add_memory",
+        "memory_vault",
+        "memory_hygiene",
+        "memory_consolidate",
+        "list_files",
+        "upload_file",
+        "search_files",
+        "download_file",
+        "get_file",
+        "list_audit",
+        "list_approvals",
+        "create_approval",
+        "update_approval",
+        "execute_approval",
+        "list_tools",
+        "run_tool",
+        "list_tool_runs",
+    }
+)
+
+# Read-only operational state is useful to administrators, but mutations of the
+# runtime, model inventory, dispatcher, diagnostics and recovery remain owner-only.
+_HTTP_ADMIN_READ_ENDPOINTS = frozenset(
+    {
+        "status",
+        "runtime_security",
+        "operator_queue",
+        "operator_quality",
+        "model_profiles",
+        "models",
+        "model_hub_search",
+        "model_downloads",
+        "dispatcher",
+        "telemetry",
+        "telemetry_live",
+        "learning_journal",
+        "host_bridge",
+        "autonomy",
+        "autonomy_policy",
+        "browser_policy",
+        "browser_handoff",
+        "internet_observability",
+        "docker_policy",
+        "docker_containers",
+        "autonomy_jobs",
+        "autonomy_job_runs",
+        "routines",
+        "briefing",
+        "environment_profile",
+        "execution_playbooks",
+    }
+)
+
+_HTTP_HIGH_RISK_ENDPOINTS = frozenset(
+    {
+        "runtime_backup",
+        "model_download",
+        "model_download_cancel",
+        "model_activate",
+        "model_delete",
+        "dispatcher_action",
+        "learning_tick",
+        "update_autonomy_policy",
+        "update_browser_policy",
+        "update_docker_policy",
+        "cleanup_runtime",
+        "create_autonomy_job",
+        "update_autonomy_job",
+        "cancel_autonomy_job",
+        "run_autonomy_job",
+        "start_autonomy_job",
+        "run_routine",
+        "ingest_directory",
+        "delete_conversation",
+        "memory_consolidate",
+        "diagnostics",
+        "self_heal",
+        "benchmark",
+    }
+)
+_ROUTE_APPROVAL_TTL = timedelta(minutes=10)
+
+
+@dataclass(frozen=True)
+class _HttpRouteCapability:
+    route: APIRoute
+    method: str
+    path_template: str
+    security_id: str
+
+
+HTTP_API_CAPABILITIES: tuple[CapabilityDefinition, ...] = ()
+_HTTP_ROUTE_CAPABILITIES: tuple[_HttpRouteCapability, ...] = ()
+
+
+def _route_security_id(method: str, path_template: str) -> str:
+    segments: list[str] = []
+    for raw_segment in path_template.strip("/").split("/"):
+        parameter = re.fullmatch(r"\{([A-Za-z_][A-Za-z0-9_]*)(?::[^}]+)?\}", raw_segment)
+        if parameter:
+            segment = f"by_{parameter.group(1).lower()}"
+        else:
+            segment = re.sub(r"[^a-z0-9_]+", "_", raw_segment.lower()).strip("_")
+        if not segment:
+            raise RuntimeError(f"Cannot derive security_id from HTTP path {path_template!r}")
+        segments.append(segment)
+    return ".".join(("http", method.lower(), *segments))
+
+
+def _http_default_presets(endpoint_name: str) -> tuple[str, ...]:
+    if endpoint_name in _HTTP_GUEST_ENDPOINTS:
+        return ("guest", "user", "moderator", "admin")
+    if endpoint_name in _HTTP_PERSONAL_ENDPOINTS:
+        return ("user", "moderator", "admin")
+    if endpoint_name in _HTTP_ADMIN_READ_ENDPOINTS:
+        return ("admin",)
+    return ()
+
+
+def _http_risk_level(endpoint_name: str, method: str) -> int:
+    if endpoint_name in _HTTP_HIGH_RISK_ENDPOINTS:
+        return 4
+    if method == "DELETE":
+        return 3
+    if method in {"POST", "PUT", "PATCH"}:
+        return 2
+    if endpoint_name in _HTTP_ADMIN_READ_ENDPOINTS:
+        return 1
+    return 0
+
+
+def _uses_separate_route_authorization(path: str) -> bool:
+    return (
+        path == "/api/admin"
+        or path.startswith("/api/admin/")
+        or path in _TELEGRAM_SESSION_PATHS
+    )
+
+
+def _build_http_api_catalog(
+    application: FastAPI,
+) -> tuple[tuple[CapabilityDefinition, ...], tuple[_HttpRouteCapability, ...]]:
+    definitions: list[CapabilityDefinition] = []
+    policies: list[_HttpRouteCapability] = []
+    security_ids: set[str] = set()
+    route_names: set[str] = set()
+    for route in application.routes:
+        if not isinstance(route, APIRoute):
+            continue
+        path_template = str(route.path)
+        if not path_template.startswith("/api/") or _uses_separate_route_authorization(
+            path_template
+        ):
+            continue
+        route_names.add(route.name)
+        for method in sorted(set(route.methods or ()) - {"HEAD", "OPTIONS"}):
+            security_id = _route_security_id(method, path_template)
+            if security_id in security_ids:
+                raise RuntimeError(f"Duplicate HTTP security_id: {security_id}")
+            security_ids.add(security_id)
+            risk_level = _http_risk_level(route.name, method)
+            category_segment = path_template.split("/", 3)[2]
+            definition = CapabilityDefinition(
+                security_id=security_id,
+                description=f"{method} {path_template}",
+                category=f"http.{category_segment}",
+                risk_level=risk_level,
+                default_requires_hitl=route.name in _HTTP_HIGH_RISK_ENDPOINTS,
+                source="http_api",
+                default_presets=_http_default_presets(route.name),
+            )
+            definitions.append(definition)
+            policies.append(
+                _HttpRouteCapability(
+                    route=route,
+                    method=method,
+                    path_template=path_template,
+                    security_id=security_id,
+                )
+            )
+
+    configured_names = (
+        _HTTP_GUEST_ENDPOINTS
+        | _HTTP_PERSONAL_ENDPOINTS
+        | _HTTP_ADMIN_READ_ENDPOINTS
+        | _HTTP_HIGH_RISK_ENDPOINTS
+    )
+    missing_routes = configured_names - route_names
+    if missing_routes:
+        raise RuntimeError(
+            "HTTP authorization policy references unknown route names: "
+            + ", ".join(sorted(missing_routes))
+        )
+    overlapping_defaults = (
+        (_HTTP_GUEST_ENDPOINTS & _HTTP_PERSONAL_ENDPOINTS)
+        | (_HTTP_GUEST_ENDPOINTS & _HTTP_ADMIN_READ_ENDPOINTS)
+        | (_HTTP_PERSONAL_ENDPOINTS & _HTTP_ADMIN_READ_ENDPOINTS)
+    )
+    if overlapping_defaults:
+        raise RuntimeError(
+            "HTTP routes have ambiguous built-in grants: "
+            + ", ".join(sorted(overlapping_defaults))
+        )
+    return tuple(definitions), tuple(policies)
+
+
+def _resolve_http_route_capability(request: Request) -> _HttpRouteCapability | None:
+    method = request.method.upper()
+    for policy in _HTTP_ROUTE_CAPABILITIES:
+        if policy.method != method:
+            continue
+        match, _ = policy.route.matches(request.scope)
+        if match is Match.FULL:
+            return policy
+    return None
+
+
+async def _http_authorization_denied(
+    request: Request,
+    actor: ActorContext,
+) -> JSONResponse | None:
+    path = request.url.path
+    if not path.startswith("/api/") or _uses_separate_route_authorization(path):
+        return None
+    service = getattr(request.app.state, "authorization", None)
+    if not isinstance(service, AuthorizationService):
+        return JSONResponse(
+            {"detail": "Authorization service is unavailable."},
+            status_code=503,
+        )
+    policy = _resolve_http_route_capability(request)
+    security_id = policy.security_id if policy is not None else "http.unmapped"
+    decision = service.authorize(
+        actor.user_id,
+        security_id,
+        identity_id=actor.identity_id,
+        request_id=request.state.request_id,
+        resource_type="http_route",
+        resource_ref=path,
+        context={
+            "method": request.method.upper(),
+            "path_template": policy.path_template if policy is not None else None,
+        },
+    )
+    request.state.security_id = security_id
+    request.state.authorization_decision = decision
+    if not decision.allowed:
+        return JSONResponse(
+            {
+                "detail": {
+                    "message": "Permission denied.",
+                    "security_id": security_id,
+                    "decision_id": decision.decision_id,
+                    "reason": decision.reason_code,
+                }
+            },
+            status_code=403,
+        )
+    if policy is None or policy.route.name not in _HTTP_HIGH_RISK_ENDPOINTS:
+        return None
+
+    body_sha256 = hashlib.sha256(await request.body()).hexdigest()
+    fingerprint = hashlib.sha256(
+        "\n".join(
+            (
+                request.method.upper(),
+                policy.path_template,
+                request.url.path,
+                request.url.query,
+                body_sha256,
+            )
+        ).encode("utf-8")
+    ).hexdigest()
+    supplied_approval_id = str(
+        request.headers.get("x-jarvis-approval-id") or ""
+    ).strip()
+    storage: JarvisStorage = request.app.state.storage
+    if supplied_approval_id:
+        approval = storage.get_approval(supplied_approval_id)
+        payload = approval.get("payload") if isinstance(approval, dict) else None
+        valid = bool(
+            isinstance(approval, dict)
+            and approval.get("status") == "approved"
+            and approval.get("requested_action") == "http.route.authorize"
+            and isinstance(payload, dict)
+            and payload.get("protocol") == "jarvis.http-route-approval.v1"
+            and payload.get("security_id") == security_id
+            and payload.get("request_fingerprint") == fingerprint
+            and int(payload.get("policy_epoch") or -1) == decision.policy_epoch
+            and _route_approval_is_fresh(approval, payload)
+        )
+        if valid:
+            claimed = storage.claim_approval_execution(supplied_approval_id)
+            if claimed is not None:
+                request.state.http_approval_id = supplied_approval_id
+                return None
+        return JSONResponse(
+            {
+                "detail": {
+                    "message": "The route approval is invalid, stale, or already used.",
+                    "security_id": security_id,
+                }
+            },
+            status_code=409,
+        )
+
+    approval = storage.create_approval(
+        title=f"Confirm {request.method.upper()} {policy.path_template}",
+        description=(
+            "A high-risk HTTP operation requires a separate, one-use human approval."
+        ),
+        requested_action="http.route.authorize",
+        risk="danger",
+        payload={
+            "protocol": "jarvis.http-route-approval.v1",
+            "security_id": security_id,
+            "method": request.method.upper(),
+            "path_template": policy.path_template,
+            "request_fingerprint": fingerprint,
+            "body_sha256": body_sha256,
+            "policy_epoch": decision.policy_epoch,
+            "expires_at": (datetime.now(UTC) + _ROUTE_APPROVAL_TTL).isoformat(
+                timespec="seconds"
+            ),
+        },
+    )
+    return JSONResponse(
+        {
+            "detail": {
+                "message": "Human approval is required before this operation.",
+                "error": "approval_required",
+                "approval_id": approval["id"],
+                "security_id": security_id,
+            }
+        },
+        status_code=428,
+    )
+
+
+def _route_approval_is_fresh(approval: dict[str, Any], payload: dict[str, Any]) -> bool:
+    try:
+        created_at = datetime.fromisoformat(str(approval["created_at"]))
+        expires_at = datetime.fromisoformat(str(payload["expires_at"]))
+    except (KeyError, TypeError, ValueError):
+        return False
+    if created_at.tzinfo is None or expires_at.tzinfo is None:
+        return False
+    now = datetime.now(UTC)
+    return created_at <= now <= expires_at and expires_at - created_at <= _ROUTE_APPROVAL_TTL
+
+
+async def _call_as_actor(
+    request: Request,
+    call_next: Any,
+    actor: ActorContext,
+) -> Response:
+    request.state.actor = actor
+    with bind_actor(actor):
+        denied = await _http_authorization_denied(request, actor)
+        if denied is not None:
+            denied.headers["X-Jarvis-Request-Id"] = request.state.request_id
+            return denied
+        try:
+            response = await call_next(request)
+        except BaseException as exc:
+            approval_id = getattr(request.state, "http_approval_id", None)
+            if approval_id:
+                request.app.state.storage.finalize_approval_execution(
+                    approval_id,
+                    status="failed",
+                    result={"ok": False, "error": type(exc).__name__},
+                )
+            raise
+        approval_id = getattr(request.state, "http_approval_id", None)
+        if approval_id:
+            final_status = "executed" if response.status_code < 400 else "failed"
+            finalized = request.app.state.storage.finalize_approval_execution(
+                approval_id,
+                status=final_status,
+                result={"ok": final_status == "executed", "status_code": response.status_code},
+            )
+            if finalized is None:
+                return JSONResponse(
+                    {"detail": "The operation completed but approval finalization failed."},
+                    status_code=500,
+                )
+    response.headers["X-Jarvis-Request-Id"] = request.state.request_id
+    return response
 
 
 @app.middleware("http")
 async def local_api_guard(request: Request, call_next):
+    request.state.request_id = secrets.token_hex(16)
     if request.method == "OPTIONS" or request.url.path in {"/", "/health"}:
         return await call_next(request)
     host = request.client.host if request.client else ""
@@ -523,14 +1010,88 @@ async def local_api_guard(request: Request, call_next):
             {"detail": "Request Origin is not allowed for the Jarvis API."},
             status_code=403,
         )
+    service = getattr(request.app.state, "authorization", None)
+    if not isinstance(service, AuthorizationService):
+        return JSONResponse(
+            {"detail": "Authorization service is unavailable."}, status_code=503
+        )
+    if request.url.path in _TELEGRAM_SESSION_PATHS:
+        expected = _bridge_secret()
+        supplied = str(request.headers.get("x-jarvis-bridge-secret") or "").strip()
+        reused_secrets = (
+            _api_token(),
+            os.environ.get("TELEGRAM_BOT_TOKEN", "").strip(),
+        )
+        if len(expected) < 32 or any(
+            item and secrets.compare_digest(expected, item) for item in reused_secrets
+        ):
+            return JSONResponse(
+                {"detail": "Telegram bridge authentication is not configured safely."},
+                status_code=503,
+            )
+        if not supplied or not secrets.compare_digest(supplied, expected):
+            return JSONResponse(
+                {"detail": "A valid Telegram bridge credential is required."},
+                status_code=401,
+            )
+        integration_actor = service.actor_for_authorized_owner(
+            "integration.telegram.session.create",
+            source="telegram-bridge",
+        )
+        if integration_actor is None:
+            return JSONResponse(
+                {"detail": "No active owner can authorize Telegram registration."},
+                status_code=503,
+            )
+        return await _call_as_actor(request, call_next, integration_actor)
+
+    actor: ActorContext | None = None
+    raw_session = str(request.headers.get("x-jarvis-user-session") or "").strip()
+    if raw_session:
+        session_token = _user_session_token(request.headers)
+        if not session_token:
+            return JSONResponse({"detail": "Invalid user session."}, status_code=401)
+        actor = service.authenticate_session(session_token)
+        if actor is None:
+            return JSONResponse({"detail": "Invalid or expired user session."}, status_code=401)
     fetch_site = str(request.headers.get("sec-fetch-site") or "").strip().lower()
-    if fetch_site == "cross-site" and not token_ok:
+    if fetch_site == "cross-site" and not (token_ok or actor is not None):
         return JSONResponse(
             {"detail": "Cross-site browser requests require API authentication."},
             status_code=403,
         )
-    if token_ok or (_is_local_machine_host(host) and not _strict_loopback_token_required()):
-        return await call_next(request)
+    if actor is not None:
+        budget = service.consume_rate_limit(
+            scope="api.user",
+            subject=actor.user_id,
+            limit=_authenticated_user_rate_limit(),
+        )
+        if not bool(budget["allowed"]):
+            retry_after = str(int(budget["retry_after"]))
+            return JSONResponse(
+                {"detail": "Authenticated user rate limit exceeded."},
+                status_code=429,
+                headers={"Retry-After": retry_after},
+            )
+        return await _call_as_actor(request, call_next, actor)
+    if token_ok:
+        token_actor = service.actor_for_user(
+            LEGACY_OWNER_USER_ID, source="api-token"
+        )
+        if token_actor is None:
+            return JSONResponse(
+                {"detail": "API token principal is inactive."}, status_code=403
+            )
+        return await _call_as_actor(request, call_next, token_actor)
+    if _is_local_machine_host(host) and not _strict_loopback_token_required():
+        local_actor = service.actor_for_user(
+            LEGACY_OWNER_USER_ID, source="legacy-local"
+        )
+        if local_actor is None:
+            return JSONResponse(
+                {"detail": "Local API principal is inactive."}, status_code=403
+            )
+        return await _call_as_actor(request, call_next, local_actor)
     status_code = 401 if _api_token() else 403
     detail = (
         "API access requires a valid bearer token."
@@ -558,7 +1119,6 @@ async def health() -> dict[str, object] | JSONResponse:
         payload = {
             "ok": False,
             "profile": app.state.settings.profile.name,
-            "home": str(app.state.settings.home),
             "error": f"health storage unavailable: {type(exc).__name__}",
         }
         return JSONResponse(status_code=503, content=payload)
@@ -578,7 +1138,6 @@ async def health() -> dict[str, object] | JSONResponse:
     payload = {
         "ok": readiness["ok"],
         "profile": app.state.settings.profile.name,
-        "home": str(app.state.settings.home),
         "unhealthy_components": readiness["unhealthy_components"],
         "missing_components": readiness["missing_components"],
         "stale_components": readiness["stale_components"],
@@ -1229,17 +1788,26 @@ async def briefing() -> DailyBriefingResponse:
 
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest) -> ChatResponse:
-    return await app.state.agent.chat(
-        request.message,
-        conversation_id=request.conversation_id,
-        mode=request.mode,
-        temperature=request.temperature,
-        max_tokens=request.max_tokens,
-        attachments=[item.model_dump() for item in request.attachments],
-        thinking_enabled=request.thinking_enabled,
-        access_mode=request.access_mode,
-        notification_chat_id=request.notification_chat_id,
-    )
+    try:
+        return await app.state.agent.chat(
+            request.message,
+            conversation_id=request.conversation_id,
+            mode=request.mode,
+            temperature=request.temperature,
+            max_tokens=request.max_tokens,
+            attachments=[item.model_dump() for item in request.attachments],
+            thinking_enabled=request.thinking_enabled,
+            access_mode=request.access_mode,
+            notification_chat_id=(
+                request.notification_chat_id if current_actor().is_owner else None
+            ),
+            transport_request_id=request.request_id,
+        )
+    except ResourceIsolationError as exc:
+        # A foreign id is indistinguishable from a missing conversation at the API.
+        raise HTTPException(status_code=404, detail="Conversation not found") from exc
+    except AuthorizationError as exc:
+        raise HTTPException(status_code=403, detail="Chat permission denied") from exc
 
 
 @app.get("/api/voice/status")
@@ -1332,9 +1900,7 @@ def _persist_interrupted_stream(
 
 @app.post("/api/chat/stream")
 async def chat_stream(request: ChatRequest) -> StreamingResponse:
-    if request.access_mode != "owner":
-        # The bridge uses the bounded non-streaming guest route. Refuse to let a future
-        # client accidentally enter the privileged streaming agent implementation.
+    if current_actor().preset_key == "guest":
         raise HTTPException(status_code=403, detail="Guest streaming is not available")
 
     async def lines():
@@ -1351,6 +1917,7 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
                 max_tokens=request.max_tokens,
                 attachments=[item.model_dump() for item in request.attachments],
                 thinking_enabled=request.thinking_enabled,
+                transport_request_id=request.request_id,
             ):
                 if item.get("type") == "meta":
                     conversation_id = str(item.get("conversation_id") or conversation_id or "")
@@ -1458,6 +2025,9 @@ async def execution_playbooks(
 
 @app.get("/api/executive/plans/{mission_id}")
 async def executive_plan(mission_id: str) -> dict[str, Any]:
+    if app.state.storage.get_mission(mission_id) is None:
+        # Do not disclose whether an in-memory plan exists for another tenant.
+        raise HTTPException(status_code=404, detail="Executive plan not found")
     plan = app.state.executive.snapshot(mission_id)
     if plan is None:
         raise HTTPException(status_code=404, detail="Executive plan not found")
@@ -1523,6 +2093,21 @@ async def update_mission_task(
     task_id: str,
     request: MissionTaskUpdateRequest,
 ) -> MissionTask:
+    try:
+        app.state.authorization.require_current(
+            "missions.write.own",
+            resource_type="mission",
+            resource_ref=mission_id,
+            context={"operation": "update_task", "task_id": task_id},
+        )
+    except AuthorizationError as exc:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "message": "Permission denied.",
+                "security_id": "missions.write.own",
+            },
+        ) from exc
     mission = app.state.storage.get_mission(mission_id)
     if mission is None:
         raise HTTPException(status_code=404, detail="Mission not found")
@@ -1836,18 +2421,50 @@ async def ws_events(websocket: WebSocket) -> None:
     token = _header_token(websocket.headers) or _websocket_protocol_token(websocket.headers)
     origin_ok = not origin or _origin_allowed(origin)
     token_ok = _token_allowed(token)
+    actor: ActorContext | None = None
+    if token and not token_ok:
+        service = getattr(app.state, "authorization", None)
+        if isinstance(service, AuthorizationService):
+            actor = service.authenticate_session(token)
+        if actor is None:
+            await websocket.close(code=1008)
+            return
+    elif token_ok:
+        actor = app.state.authorization.actor_for_user(
+            LEGACY_OWNER_USER_ID, source="api-token-websocket"
+        )
     local_without_strict_token = (
         _is_local_machine_host(host) and not _strict_loopback_token_required()
     )
-    if not origin_ok or not (token_ok or local_without_strict_token):
+    if actor is None and local_without_strict_token:
+        actor = app.state.authorization.actor_for_user(
+            LEGACY_OWNER_USER_ID, source="legacy-local-websocket"
+        )
+    if not origin_ok or actor is None:
         await websocket.close(code=1008)
         return
     bus: EventBus = app.state.bus
-    await bus.connect(websocket)
-    try:
-        while True:
-            await websocket.receive_text()
-    except WebSocketDisconnect:
+    decision = app.state.authorization.authorize(
+        actor.user_id,
+        "events.subscribe",
+        identity_id=actor.identity_id,
+        context={"transport": "websocket"},
+    )
+    if not decision.allowed:
+        await websocket.close(code=1008)
         return
-    finally:
-        await bus.disconnect(websocket)
+    with bind_actor(actor):
+        await bus.connect(websocket, user_id=actor.user_id)
+        try:
+            while True:
+                await websocket.receive_text()
+        except WebSocketDisconnect:
+            return
+        finally:
+            await bus.disconnect(websocket)
+
+
+# Route decorators have all executed at this point.  Freeze one audited catalog for
+# startup synchronization and for pre-handler matching in the HTTP policy-enforcement
+# point.  A later, unregistered /api route is denied as ``http.unmapped``.
+HTTP_API_CAPABILITIES, _HTTP_ROUTE_CAPABILITIES = _build_http_api_catalog(app)

@@ -27,14 +27,19 @@ def test_publish_does_not_serialize_slow_websocket_clients(monkeypatch):
     bus = EventBus()
     slow = _FakeWebSocket(blocked=True)
     healthy = _FakeWebSocket()
+    other_user = _FakeWebSocket()
 
     async def scenario() -> None:
-        await bus.connect(slow)  # type: ignore[arg-type]
-        await bus.connect(healthy)  # type: ignore[arg-type]
-        await asyncio.wait_for(bus.publish({"kind": "heartbeat"}), timeout=0.2)
+        await bus.connect(slow, user_id="user-a")  # type: ignore[arg-type]
+        await bus.connect(healthy, user_id="user-a")  # type: ignore[arg-type]
+        await bus.connect(other_user, user_id="user-b")  # type: ignore[arg-type]
+        await asyncio.wait_for(
+            bus.publish({"kind": "heartbeat"}, user_id="user-a"), timeout=0.2
+        )
 
     asyncio.run(scenario())
 
     assert json.loads(healthy.messages[0]) == {"kind": "heartbeat"}
+    assert other_user.messages == []
     assert slow not in bus._clients
     assert healthy in bus._clients

@@ -1,0 +1,709 @@
+.page {
+  width: min(1560px, 100%);
+  min-height: 100vh;
+  margin: 0 auto;
+  padding: 24px;
+}
+
+.header,
+.titleBlock,
+.headerActions,
+.panelHeader,
+.inlineControl,
+.permissionHeader,
+.permissionText > div,
+.formActions,
+.presetPermissionHeader {
+  display: flex;
+  align-items: center;
+}
+
+.header {
+  justify-content: space-between;
+  gap: 20px;
+  margin-bottom: 18px;
+}
+
+.titleBlock {
+  gap: 12px;
+}
+
+.titleBlock p {
+  color: var(--teal);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.titleBlock h1 {
+  margin-top: 2px;
+  font-size: 24px;
+}
+
+.brandIcon {
+  display: grid;
+  place-items: center;
+  width: 46px;
+  height: 46px;
+  border-radius: var(--radius);
+  color: #fff;
+  background: var(--teal);
+}
+
+.headerActions,
+.formActions {
+  gap: 9px;
+}
+
+.secondaryButton,
+.primaryButton,
+.inlineControl button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 36px;
+  padding: 7px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  color: var(--ink);
+  background: var(--control);
+  text-decoration: none;
+}
+
+.secondaryButton:hover,
+.inlineControl button:hover {
+  border-color: #476159;
+  background: var(--surface-2);
+}
+
+.primaryButton {
+  border-color: var(--teal);
+  color: #07110f;
+  background: var(--teal);
+  font-weight: 700;
+}
+
+.stats {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.stats article {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr) auto;
+  align-items: center;
+  min-height: 62px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.stats svg {
+  color: var(--teal);
+}
+
+.stats span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.stats strong {
+  font-size: 22px;
+}
+
+.stats .warningStat svg,
+.stats .warningStat strong {
+  color: var(--amber);
+}
+
+.errorBanner,
+.noticeBanner {
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--coral) 55%, var(--line));
+  border-radius: var(--radius);
+  color: #ffd7d0;
+  background: color-mix(in srgb, var(--coral) 12%, var(--surface));
+  overflow-wrap: anywhere;
+}
+
+.noticeBanner {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  border-color: color-mix(in srgb, var(--teal) 55%, var(--line));
+  color: #c8fff6;
+  background: color-mix(in srgb, var(--teal) 10%, var(--surface));
+}
+
+.layout {
+  display: grid;
+  grid-template-columns: minmax(310px, 0.78fr) minmax(600px, 1.65fr);
+  gap: 14px;
+  align-items: start;
+}
+
+.panel {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.panelHeader {
+  justify-content: space-between;
+  gap: 14px;
+  min-height: 64px;
+  padding: 13px 15px;
+  border-bottom: 1px solid var(--line);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.018), transparent);
+}
+
+.panelHeader h2 {
+  margin-bottom: 3px;
+  font-size: 15px;
+}
+
+.panelHeader span,
+.permissionHeader span {
+  display: block;
+  max-width: 680px;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.count,
+.presetBadge,
+.stateBadge,
+.category,
+.hitl,
+.effect {
+  display: inline-flex;
+  align-items: center;
+  width: max-content;
+  padding: 3px 7px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  background: var(--control);
+  font-size: 10px;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.searchBox,
+.compactSearch {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  color: var(--muted);
+  background: var(--control);
+}
+
+.searchBox:focus-within,
+.compactSearch:focus-within {
+  border-color: var(--teal);
+}
+
+.searchBox input,
+.compactSearch input,
+.formFields input {
+  width: 100%;
+  min-width: 0;
+  border: 0;
+  outline: none;
+  color: var(--ink);
+  background: transparent;
+}
+
+.userList {
+  max-height: 632px;
+  overflow: auto;
+  padding: 0 8px 8px;
+}
+
+.pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 12px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.pagination button {
+  min-width: 72px;
+  padding: 6px 9px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  color: var(--ink);
+  background: var(--control);
+}
+
+.pagination button:disabled {
+  opacity: 0.45;
+}
+
+.userRow {
+  display: grid;
+  grid-template-columns: 9px minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  width: 100%;
+  padding: 10px 8px;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  color: var(--ink);
+  background: transparent;
+  text-align: left;
+}
+
+.userRow:hover {
+  background: var(--surface-2);
+}
+
+.userRow.selected {
+  border-color: color-mix(in srgb, var(--teal) 65%, var(--line));
+  background: var(--teal-2);
+}
+
+.statusDot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+
+.statusDot.active {
+  background: var(--teal);
+  box-shadow: 0 0 0 3px rgba(40, 199, 183, 0.12);
+}
+
+.statusDot.suspended,
+.statusDot.pending {
+  background: var(--amber);
+}
+
+.statusDot.deleted {
+  background: var(--coral);
+}
+
+.userIdentity {
+  min-width: 0;
+}
+
+.userIdentity strong,
+.userIdentity small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.userIdentity strong {
+  font-size: 12px;
+}
+
+.userIdentity small {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.stateBadge.active {
+  border-color: color-mix(in srgb, var(--teal) 65%, var(--line));
+  color: var(--teal);
+}
+
+.stateBadge.suspended,
+.stateBadge.pending {
+  border-color: color-mix(in srgb, var(--amber) 65%, var(--line));
+  color: var(--amber);
+}
+
+.stateBadge.deleted {
+  border-color: color-mix(in srgb, var(--coral) 65%, var(--line));
+  color: var(--coral);
+}
+
+.controls {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  padding: 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.controls label > span,
+.formFields label > span {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.inlineControl {
+  gap: 7px;
+}
+
+.inlineControl select,
+.permissionRow select {
+  min-width: 0;
+  height: 36px;
+  padding: 6px 9px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  outline: none;
+  color: var(--ink);
+  background: var(--control);
+}
+
+.inlineControl select {
+  flex: 1;
+}
+
+.inlineControl select:focus,
+.permissionRow select:focus {
+  border-color: var(--teal);
+}
+
+.permissionHeader {
+  justify-content: space-between;
+  gap: 14px;
+  padding: 12px 14px;
+}
+
+.permissionHeader h3 {
+  font-size: 13px;
+}
+
+.compactSearch {
+  width: min(310px, 48%);
+  margin: 0;
+  padding: 7px 9px;
+}
+
+.permissionList {
+  max-height: 460px;
+  overflow: auto;
+  border-top: 1px solid var(--line);
+}
+
+.permissionRow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto 130px;
+  gap: 10px;
+  align-items: center;
+  min-height: 58px;
+  padding: 9px 14px;
+  border-bottom: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
+}
+
+.permissionRow:last-child {
+  border-bottom: 0;
+}
+
+.permissionText {
+  min-width: 0;
+}
+
+.permissionText > div {
+  gap: 6px;
+  min-width: 0;
+}
+
+.permissionText code,
+.presetCard code,
+.checkboxGrid code {
+  color: #d8f5ef;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.permissionText p {
+  margin-top: 4px;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.category {
+  border: 0;
+  padding: 2px 5px;
+  background: var(--surface-2);
+}
+
+.hitl {
+  border-color: color-mix(in srgb, var(--amber) 55%, var(--line));
+  color: var(--amber);
+}
+
+.effect.allow {
+  border-color: color-mix(in srgb, var(--teal) 55%, var(--line));
+  color: var(--teal);
+}
+
+.effect.deny {
+  border-color: color-mix(in srgb, var(--coral) 55%, var(--line));
+  color: var(--coral);
+}
+
+.empty,
+.emptyDetail {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 100px;
+  padding: 18px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.emptyDetail {
+  min-height: 400px;
+  flex-direction: column;
+}
+
+.presetPanel {
+  margin-top: 14px;
+}
+
+.auditPanel {
+  margin-top: 14px;
+}
+
+.auditList {
+  max-height: 420px;
+  overflow: auto;
+}
+
+.auditRow {
+  display: grid;
+  grid-template-columns: minmax(230px, 0.9fr) minmax(220px, 1.4fr) auto;
+  gap: 14px;
+  align-items: center;
+  padding: 10px 14px;
+  border-top: 1px solid var(--line);
+}
+
+.auditRow:first-child {
+  border-top: 0;
+}
+
+.auditRow code,
+.auditRow strong,
+.auditRow small {
+  display: block;
+}
+
+.auditRow strong {
+  margin-top: 3px;
+  overflow: hidden;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.auditRow p,
+.auditRow small {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.auditRow small {
+  text-align: right;
+  white-space: nowrap;
+}
+
+.presetGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 10px;
+  padding: 14px;
+}
+
+.presetCard {
+  min-width: 0;
+  padding: 11px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--control);
+}
+
+.presetCard > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.presetCard p {
+  min-height: 34px;
+  margin: 7px 0;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.presetCard > span {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.presetForm {
+  padding: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.formFields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 11px;
+}
+
+.formFields label {
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--control);
+}
+
+.formFields label:focus-within {
+  border-color: var(--teal);
+}
+
+.formFields .fullField {
+  grid-column: 1 / -1;
+}
+
+.presetPermissionHeader {
+  justify-content: space-between;
+  margin: 14px 0 8px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.checkboxGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 7px;
+  max-height: 300px;
+  overflow: auto;
+  padding: 2px;
+}
+
+.checkboxGrid label {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  gap: 7px;
+  align-items: start;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--control);
+  cursor: pointer;
+}
+
+.checkboxGrid input {
+  accent-color: var(--teal);
+}
+
+.checkboxGrid small {
+  display: block;
+  margin-top: 3px;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.formActions {
+  justify-content: flex-end;
+  margin-top: 12px;
+}
+
+.spin {
+  animation: spin 0.85s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (max-width: 980px) {
+  .layout {
+    grid-template-columns: 1fr;
+  }
+
+  .userList {
+    max-height: 360px;
+  }
+}
+
+@media (max-width: 680px) {
+  .page {
+    padding: 14px;
+  }
+
+  .header,
+  .panelHeader,
+  .permissionHeader {
+    align-items: flex-start;
+  }
+
+  .header,
+  .panelHeader,
+  .permissionHeader,
+  .headerActions {
+    flex-wrap: wrap;
+  }
+
+  .stats,
+  .controls,
+  .formFields {
+    grid-template-columns: 1fr;
+  }
+
+  .formFields .fullField {
+    grid-column: auto;
+  }
+
+  .compactSearch {
+    width: 100%;
+  }
+
+  .permissionRow {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .permissionRow select {
+    grid-column: 1 / -1;
+    width: 100%;
+  }
+
+  .auditRow {
+    grid-template-columns: 1fr;
+  }
+
+  .auditRow small {
+    text-align: left;
+  }
+}
