@@ -86,6 +86,13 @@ _RU_VERB_STEMS = (
     "перезапусти",
     "распакуй",
     "распаковать",
+    "напомн",  # напомни / напомнить
+    "скажи",
+    "ответь",
+    "проверь",
+    "поставь",
+    "включи",
+    "выключи",
 )
 _EN_VERB_STEMS = (
     "open",
@@ -105,6 +112,13 @@ _EN_VERB_STEMS = (
     "restart",
     "stop",
     "run",
+    "remind",
+    "check",
+    "set",
+    "enable",
+    "disable",
+    "answer",
+    "tell",
 )
 # Full stem set used to validate that a flipped candidate looks like intent text.
 _RU_COMMAND_STEMS = _RU_VERB_STEMS + (
@@ -119,6 +133,9 @@ _RU_COMMAND_STEMS = _RU_VERB_STEMS + (
     "миссия",
     "документ",
     "архив",
+    "через",
+    "минут",
+    "час",
 )
 _EN_COMMAND_STEMS = _EN_VERB_STEMS + (
     "memory",
@@ -129,7 +146,197 @@ _EN_COMMAND_STEMS = _EN_VERB_STEMS + (
     "mission",
     "document",
     "archive",
+    "minute",
+    "hour",
+    "calculator",
+    "notepad",
+    "browser",
+    "edge",
+    "chrome",
 )
+
+# High-frequency words that signal "this token is real language after flip",
+# including conversational prose (not only imperative commands).
+_RU_WORDS = frozenset(
+    {
+        "если",
+        "вот",
+        "так",
+        "что",
+        "как",
+        "мне",
+        "меня",
+        "тебе",
+        "тебя",
+        "сейчас",
+        "потом",
+        "можно",
+        "нужно",
+        "надо",
+        "пожалуйста",
+        "просто",
+        "внезапно",
+        "писать",
+        "начнет",
+        "начнут",
+        "начнёт",
+        "начать",
+        "начни",
+        "начн",
+        "через",
+        "минут",
+        "минуту",
+        "минуты",
+        "час",
+        "часа",
+        "часов",
+        "день",
+        "дня",
+        "сегодня",
+        "завтра",
+        "вчера",
+        "напомни",
+        "напомнить",
+        "открой",
+        "открыть",
+        "закрой",
+        "запусти",
+        "покажи",
+        "сделай",
+        "скажи",
+        "ответь",
+        "проверь",
+        "файл",
+        "папка",
+        "папку",
+        "статус",
+        "помощь",
+        "документ",
+        "архив",
+        "память",
+        "система",
+        "сервер",
+        "модель",
+        "чат",
+        "сообщение",
+        "задача",
+        "миссия",
+        "калькулятор",
+        "блокнот",
+        "браузер",
+        "и",
+        "в",
+        "на",
+        "не",
+        "да",
+        "нет",
+        "или",
+        "для",
+        "это",
+        "всё",
+        "все",
+        "уже",
+        "ещё",
+        "еще",
+        "только",
+        "когда",
+        "где",
+        "кто",
+        "почему",
+        "потому",
+        "очень",
+        "будет",
+        "была",
+        "было",
+        "были",
+        "есть",
+        "нет",
+    }
+)
+_EN_WORDS = frozenset(
+    {
+        "if",
+        "then",
+        "this",
+        "that",
+        "with",
+        "from",
+        "what",
+        "when",
+        "where",
+        "why",
+        "how",
+        "please",
+        "just",
+        "now",
+        "later",
+        "open",
+        "close",
+        "start",
+        "stop",
+        "run",
+        "show",
+        "make",
+        "create",
+        "delete",
+        "save",
+        "write",
+        "read",
+        "find",
+        "search",
+        "send",
+        "check",
+        "remind",
+        "status",
+        "help",
+        "file",
+        "folder",
+        "memory",
+        "document",
+        "archive",
+        "mission",
+        "calculator",
+        "notepad",
+        "browser",
+        "edge",
+        "chrome",
+        "firefox",
+        "telegram",
+        "minutes",
+        "minute",
+        "hours",
+        "hour",
+        "today",
+        "tomorrow",
+        "yesterday",
+        "the",
+        "and",
+        "or",
+        "not",
+        "yes",
+        "no",
+        "for",
+        "to",
+        "of",
+        "in",
+        "on",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "can",
+        "will",
+        "would",
+        "should",
+        "about",
+        "calc",
+    }
+)
+
+_LAT_WORD = re.compile(r"^[A-Za-z]+$")
+_CYR_WORD = re.compile(r"^[А-Яа-яЁё]+$")
+_TOKEN_PARTS = re.compile(r"[A-Za-zА-Яа-яЁё]+|[^A-Za-zА-Яа-яЁё]+")
 
 
 def _contains_stem(text: str, stems: tuple[str, ...]) -> bool:
@@ -137,16 +344,84 @@ def _contains_stem(text: str, stems: tuple[str, ...]) -> bool:
     return any(stem in folded for stem in stems)
 
 
+def _fold_word(word: str) -> str:
+    return word.casefold().replace("ё", "е")
+
+
+def _looks_russian_word(word: str) -> bool:
+    w = _fold_word(word)
+    if len(w) < 2:
+        return False
+    if w in _RU_WORDS:
+        return True
+    for stem in _RU_COMMAND_STEMS:
+        if w == stem or w.startswith(stem):
+            return True
+        # Accept short prefixes of longer stems ("мину" ≈ "минут") when typing cut off.
+        if len(w) >= 4 and len(stem) >= 4 and stem.startswith(w):
+            return True
+    return False
+
+
+def _looks_english_word(word: str) -> bool:
+    w = word.casefold()
+    if len(w) < 2:
+        return False
+    if w in _EN_WORDS:
+        return True
+    for stem in _EN_COMMAND_STEMS:
+        if w == stem or w.startswith(stem):
+            return True
+        if len(w) >= 4 and len(stem) >= 4 and stem.startswith(w):
+            return True
+    return False
+
+
+def _tokenwise_layout_flip(raw: str) -> str | None:
+    """Flip pure-script tokens that become real words in the other layout.
+
+    Keeps intentional mixed phrases intact: ``jnrhjq Microsoft Edge`` →
+    ``открой Microsoft Edge`` (only the mistyped verb flips).
+    """
+
+    parts = _TOKEN_PARTS.findall(raw)
+    if not parts:
+        return None
+    out: list[str] = []
+    flipped_n = 0
+    signal = False
+    for part in parts:
+        if _LAT_WORD.fullmatch(part):
+            cand = part.translate(_EN_TO_RU)
+            if _looks_russian_word(cand) and not _looks_english_word(part):
+                out.append(cand)
+                flipped_n += 1
+                if _looks_russian_word(cand):
+                    signal = True
+                continue
+        elif _CYR_WORD.fullmatch(part):
+            cand = part.translate(_RU_TO_EN)
+            if _looks_english_word(cand) and not _looks_russian_word(part):
+                out.append(cand)
+                flipped_n += 1
+                signal = True
+                continue
+        out.append(part)
+    if flipped_n == 0 or not signal:
+        return None
+    return "".join(out)
+
+
 def try_layout_flip(text: str) -> str:
     """If the message looks typed in the wrong layout, return the flipped form.
 
-    Only flip when the flipped candidate contains known command stems — pure
-    English or pure Russian operator prose is left alone so legitimate
-    bilingual commands are not destroyed.
+    Handles both directions:
+    - Russian typed on EN keys: ``tckb …`` / ``jnrhjq файл`` / ``yfgjvyb xthtp 5 vbye``
+    - English typed on RU keys: ``щзут`` / ``ыефегы``
 
-    Mixed RU+EN phrases ("открой Microsoft Edge") keep both scripts: the message
-    already carries a real command stem in the original script, so Latin app
-    names / proper nouns must not be whole-message-translated into gibberish.
+    Prefer **per-token** flip so intentional bilingual commands
+    (``открой Microsoft Edge``, ``jnrhjq Microsoft Edge``) keep real English
+    app names instead of whole-message gibberish.
     """
 
     raw = fold_operator_confusables(text)
@@ -155,19 +430,23 @@ def try_layout_flip(text: str) -> str:
     # Do not flip paths / URLs / absolute Windows paths.
     if re.search(r"https?://|\\\\|[A-Za-z]:\\", raw):
         return raw
+
+    tokenwise = _tokenwise_layout_flip(raw)
+    if tokenwise is not None:
+        return tokenwise
+
+    # Whole-message fallback for pure wrong-layout runs that token lexicon missed.
     cyr, lat = _layout_score(raw)
-    if lat >= 3 and lat > cyr:
-        # Already has a Russian command verb → Latin remainder is intentional
-        # (app names / proper nouns), not a wrong-layout mistype.
-        if _contains_stem(raw, _RU_VERB_STEMS):
+    if lat >= 3 and lat > cyr * 2:
+        if _contains_stem(raw, _RU_VERB_STEMS) or _contains_stem(raw, _EN_COMMAND_STEMS):
             return raw
         flipped = raw.translate(_EN_TO_RU)
         if _contains_stem(flipped, _RU_COMMAND_STEMS) and not _contains_stem(
             raw, _EN_COMMAND_STEMS
         ):
             return flipped
-    if cyr >= 3 and cyr > lat:
-        if _contains_stem(raw, _EN_VERB_STEMS):
+    if cyr >= 3 and cyr > lat * 2:
+        if _contains_stem(raw, _EN_VERB_STEMS) or _contains_stem(raw, _RU_COMMAND_STEMS):
             return raw
         flipped = raw.translate(_RU_TO_EN)
         if _contains_stem(flipped, _EN_COMMAND_STEMS) and not _contains_stem(

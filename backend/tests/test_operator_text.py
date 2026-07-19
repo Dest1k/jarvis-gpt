@@ -17,6 +17,36 @@ def test_wrong_en_layout_to_russian_command():
     assert "открой" in normalize_operator_message("jnrhjq файл")
 
 
+def test_conversational_russian_typed_on_english_layout():
+    # "если вот так внезапно писать начнет/начнут" typed while EN layout is active.
+    # yfxyen → "начнут" (keys for н-а-ч-н-у-т); yfxytn → "начнет".
+    assert (
+        try_layout_flip("tckb djn nfr dytpfgyj gbcfnm yfxyen")
+        == "если вот так внезапно писать начнут"
+    )
+    assert (
+        try_layout_flip("tckb djn nfr dytpfgyj gbcfnm yfxytn")
+        == "если вот так внезапно писать начнет"
+    )
+
+
+def test_reminder_russian_typed_on_english_layout():
+    # "напомни через 5 минут"
+    flipped = try_layout_flip("yfgjvyb xthtp 5 vbyen")
+    assert "напомни" in flipped
+    assert "через" in flipped
+    assert "5" in flipped
+    assert "минут" in flipped
+
+
+def test_english_typed_on_russian_layout():
+    assert try_layout_flip("ыефегы") == "status"
+    assert try_layout_flip("щзут") == "open"
+    assert "open" in try_layout_flip("щзут calculator").lower() or try_layout_flip(
+        "щзут calculator"
+    ).startswith("open")
+
+
 def test_layout_does_not_destroy_english_commands():
     assert try_layout_flip("open calculator") == "open calculator"
     assert normalize_operator_message("open the file") == "open the file"
@@ -28,6 +58,8 @@ def test_layout_preserves_russian_command_with_english_app_name():
     assert try_layout_flip("открой Microsoft Edge") == "открой Microsoft Edge"
     assert "microsoft edge" in normalize_operator_message("открой Microsoft Edge").lower()
     assert "открой" in normalize_operator_message("открой Microsoft Edge")
+    # Wrong-layout verb + intentional English product name.
+    assert try_layout_flip("jnrhjq Microsoft Edge") == "открой Microsoft Edge"
 
 
 def test_layout_skips_paths():
