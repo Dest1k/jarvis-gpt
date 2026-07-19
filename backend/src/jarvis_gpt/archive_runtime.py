@@ -86,7 +86,23 @@ class ArchiveUnsupportedError(ArchiveError):
 
 
 class ArchivePasswordError(ArchiveError):
-    """Archive is encrypted and the password is missing or wrong."""
+    """Archive is encrypted and the password is missing or wrong.
+
+    ``reason`` is ``\"missing\"`` when no password was supplied for an encrypted
+    archive, or ``\"wrong\"`` when a password was supplied but decryption failed.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str = "missing",
+        archive_name: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        cleaned = str(reason or "missing").strip().lower()
+        self.reason = "wrong" if cleaned == "wrong" else "missing"
+        self.archive_name = str(archive_name or "").strip() or None
 
 
 @dataclass
@@ -531,6 +547,35 @@ def _pwd_bytes(cfg: ArchiveConfig) -> bytes | None:
     return str(cfg.password).encode("utf-8")
 
 
+def _verify_zip_password(archive: zipfile.ZipFile, pwd: bytes, *, archive_name: str) -> None:
+    """Decrypt a tiny slice of the first encrypted member to validate the password.
+
+    Listing encrypted ZipCrypto members succeeds even with a wrong password; only
+    open/read fails. Without this probe, tools would report a successful list after
+    a bad password and the agent would never re-ask.
+    """
+
+    for info in archive.infolist():
+        if info.is_dir() or info.filename.endswith("/"):
+            continue
+        if not bool(info.flag_bits & 0x1):
+            continue
+        try:
+            with archive.open(info, "r", pwd=pwd) as src:
+                src.read(32)
+        except RuntimeError as exc:
+            msg = str(exc).lower()
+            if "password" in msg or "encrypted" in msg or "bad password" in msg:
+                raise ArchivePasswordError(
+                    f"Неверный пароль для ZIP: {archive_name}. "
+                    "Проверьте пароль и пришлите снова.",
+                    reason="wrong",
+                    archive_name=archive_name,
+                ) from exc
+            raise
+        return
+
+
 def _list_zip(path: Path, cfg: ArchiveConfig) -> list[dict[str, Any]]:
     if not zipfile.is_zipfile(path):
         raise ArchiveError(f"Not a valid ZIP archive: {path}")
@@ -547,9 +592,13 @@ def _list_zip(path: Path, cfg: ArchiveConfig) -> list[dict[str, Any]]:
         encrypted = any(bool(info.flag_bits & 0x1) for info in infos)
         if encrypted and pwd is None:
             raise ArchivePasswordError(
-                f"ZIP archive is password-protected: {path.name}. "
-                "Передайте password для list/extract."
+                f"ZIP-архив «{path.name}» защищён паролем. "
+                "Напишите пароль (например: пароль secret42) — открою.",
+                reason="missing",
+                archive_name=path.name,
             )
+        if encrypted and pwd is not None:
+            _verify_zip_password(archive, pwd, archive_name=path.name)
         for info in infos:
             name = info.filename.replace("\\", "/")
             if name.endswith("/"):
@@ -872,7 +921,10 @@ def _extract_zip(
                 continue
             if bool(info.flag_bits & 0x1) and pwd is None:
                 raise ArchivePasswordError(
-                    f"ZIP member is password-protected: {safe}. Передайте password."
+                    f"ZIP-архив «{path.name}» защищён паролем (файл «{safe}»). "
+                    "Напишите пароль — извлеку.",
+                    reason="missing",
+                    archive_name=path.name,
                 )
             total = _guard_total(total, int(info.file_size or 0), cfg)
             dest = _safe_destination(dest_root, safe)
@@ -884,7 +936,9 @@ def _extract_zip(
                 msg = str(exc).lower()
                 if "password" in msg or "encrypted" in msg or "bad password" in msg:
                     raise ArchivePasswordError(
-                        f"Неверный или отсутствующий пароль ZIP: {path.name}"
+                        f"Неверный пароль для ZIP: {path.name}.",
+                        reason="wrong" if pwd is not None else "missing",
+                        archive_name=path.name,
                     ) from exc
                 raise
             extracted.append({"name": safe, "path": str(dest), "size": dest.stat().st_size})
@@ -1112,7 +1166,10 @@ def _read_member_bytes(
                 )
             if bool(info.flag_bits & 0x1) and pwd is None:
                 raise ArchivePasswordError(
-                    f"ZIP member is password-protected: {member}. Передайте password."
+                    f"ZIP-архив «{path.name}» защищён паролем (файл «{member}»). "
+                    "Напишите пароль — прочитаю.",
+                    reason="missing",
+                    archive_name=path.name,
                 )
             try:
                 with archive.open(info, "r", pwd=pwd) as handle:
@@ -1131,7 +1188,9 @@ def _read_member_bytes(
                     ) from exc
                 if "password" in msg or "encrypted" in msg or "bad password" in msg:
                     raise ArchivePasswordError(
-                        f"Неверный или отсутствующий пароль ZIP: {path.name}"
+                        f"Неверный пароль для ZIP: {path.name}.",
+                        reason="wrong" if pwd is not None else "missing",
+                        archive_name=path.name,
                     ) from exc
                 raise
     if kind.startswith("tar"):

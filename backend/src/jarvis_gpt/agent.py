@@ -1685,10 +1685,52 @@ class AgentRuntime:
         document_prefetch = await self._prefetch_document_memory(message, context)
         if document_prefetch is None:
             document_prefetch = await self._prefetch_document_edit(message, context)
+        if document_prefetch is None:
+            document_prefetch = await self._prefetch_archive_open(
+                message, context, attachments=attachments
+            )
         if document_prefetch is not None:
             observation, event, recall_result = document_prefetch
             events.append(event)
             await self._emit(event)
+            # Password prompts and archive identity clarifications are operator-facing
+            # even under full autonomy — never invent archive contents.
+            if not recall_result.ok:
+                data = recall_result.data if isinstance(recall_result.data, dict) else {}
+                if data.get("archive_auth_required") or data.get("archive_missing"):
+                    answer = str(recall_result.summary or "").strip() or (
+                        "Нужен пароль к архиву или сам архив."
+                    )
+                    events.append(
+                        ChatEvent(
+                            type="assistant_done",
+                            title="Archive needs password or file",
+                            content=recall_result.summary,
+                            payload={
+                                "source": recall_result.tool,
+                                "ok": False,
+                                "archive_auth_gate": data.get("archive_auth_gate"),
+                            },
+                        )
+                    )
+                    await self._emit(events[-1])
+                    duration_ms = _elapsed_ms(started_at)
+                    message_id = self.storage.add_message(
+                        conversation_id=context.conversation_id,
+                        role="assistant",
+                        content=answer,
+                        metadata={
+                            "duration_ms": duration_ms,
+                            "events": [item.model_dump() for item in events],
+                        },
+                    )
+                    return ChatResponse(
+                        conversation_id=context.conversation_id,
+                        message_id=message_id,
+                        answer=answer,
+                        events=events,
+                        duration_ms=duration_ms,
+                    )
             if not recall_result.ok and not self._owner_autonomy_active():
                 answer = _document_memory_failure_answer(recall_result)
                 events.append(
@@ -2637,11 +2679,55 @@ class AgentRuntime:
         document_prefetch = await self._prefetch_document_memory(message, context)
         if document_prefetch is None:
             document_prefetch = await self._prefetch_document_edit(message, context)
+        if document_prefetch is None:
+            document_prefetch = await self._prefetch_archive_open(
+                message, context, attachments=attachments
+            )
         if document_prefetch is not None:
             observation, event, recall_result = document_prefetch
             events.append(event)
             await self._emit(event)
             yield {"type": "event", "event": event.model_dump()}
+            if not recall_result.ok:
+                data = recall_result.data if isinstance(recall_result.data, dict) else {}
+                if data.get("archive_auth_required") or data.get("archive_missing"):
+                    answer = str(recall_result.summary or "").strip() or (
+                        "Нужен пароль к архиву или сам архив."
+                    )
+                    events.append(
+                        ChatEvent(
+                            type="assistant_done",
+                            title="Archive needs password or file",
+                            content=recall_result.summary,
+                            payload={
+                                "source": recall_result.tool,
+                                "ok": False,
+                                "archive_auth_gate": data.get("archive_auth_gate"),
+                            },
+                        )
+                    )
+                    await self._emit(events[-1])
+                    yield {"type": "event", "event": events[-1].model_dump()}
+                    yield {"type": "delta", "content": answer}
+                    duration_ms = _elapsed_ms(started_at)
+                    message_id = self.storage.add_message(
+                        conversation_id=context.conversation_id,
+                        role="assistant",
+                        content=answer,
+                        metadata={
+                            "duration_ms": duration_ms,
+                            "events": [item.model_dump() for item in events],
+                        },
+                    )
+                    yield {
+                        "type": "done",
+                        "answer": answer,
+                        "conversation_id": context.conversation_id,
+                        "duration_ms": duration_ms,
+                        "events": [item.model_dump() for item in events],
+                        "message_id": message_id,
+                    }
+                    return
             if not recall_result.ok and not self._owner_autonomy_active():
                 answer = _document_memory_failure_answer(recall_result)
                 events.append(
@@ -9746,6 +9832,10 @@ class AgentRuntime:
         query = " ".join(str(message or "").split())
         if not query:
             return
+        # Lightweight turns (greetings, PONG, bare archive password reply) must not
+        # pay for embedding over a 60-row memory pool — that was a free latency tax.
+        if _is_lightweight_operator_turn(query):
+            return
         ranked = await self._hybrid_rerank(
             query,
             context.memory_hits,
@@ -9772,6 +9862,8 @@ class AgentRuntime:
 
         if not context.can_read_files:
             context.file_hits = []
+            return
+        if _is_lightweight_operator_turn(message):
             return
         query = " ".join(str(message or "").split())
         if not query:
@@ -9919,6 +10011,232 @@ class AgentRuntime:
         for hit in hits:
             hit["retrieval"] = "recent-attachment"
         return hits
+
+    def _archive_password_pending_key(self, conversation_id: str) -> str:
+        return f"archive.password_pending.{conversation_id}"
+
+    def _set_archive_password_pending(
+        self,
+        conversation_id: str,
+        *,
+        file_id: str,
+        name: str,
+    ) -> None:
+        self.storage.set_runtime_value(
+            self._archive_password_pending_key(conversation_id),
+            {
+                "file_id": file_id,
+                "name": name,
+                "updated_at": datetime.now(UTC).isoformat(timespec="seconds"),
+            },
+        )
+
+    def _clear_archive_password_pending(self, conversation_id: str) -> None:
+        key = self._archive_password_pending_key(conversation_id)
+        try:
+            self.storage.delete_runtime_value(key)
+        except Exception:  # noqa: BLE001 - pending clear is best-effort
+            self.storage.set_runtime_value(key, None)
+
+    def _get_archive_password_pending(
+        self, conversation_id: str
+    ) -> dict[str, Any] | None:
+        value = self.storage.get_runtime_value(
+            self._archive_password_pending_key(conversation_id), None
+        )
+        return value if isinstance(value, dict) else None
+
+    async def _prefetch_archive_open(
+        self,
+        message: str,
+        context: AgentContext,
+        *,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> tuple[str, ChatEvent, ToolRunResponse] | None:
+        """Deterministic open/list for attached or pending passworded archives.
+
+        Handles: silent archive drop, missing password ask, wrong password retry,
+        password-only follow-up after a pending archive, and password claims without
+        an archive in context.
+        """
+
+        if not context.can_read_files or not self._capability_allowed("files.read.own"):
+            return None
+        plan = context.task_plan
+        password = _extract_archive_password(message)
+        pending = self._get_archive_password_pending(context.conversation_id)
+        has_archive_attachments = _has_archive_like_attachments(attachments)
+        password_claim = _looks_like_password_claim_without_archive(message)
+
+        # Password-only follow-up (or bare short token) after we asked for a password.
+        if (
+            pending
+            and not has_archive_attachments
+            and (
+                password
+                or _looks_like_bare_archive_password_reply(message)
+                or password_claim
+            )
+        ):
+            if not password and _looks_like_bare_archive_password_reply(message):
+                password = message.strip().strip("«»\"'")
+            if not password:
+                result = ToolRunResponse(
+                    tool="documents.archive.list",
+                    ok=False,
+                    summary=(
+                        f"Архив «{pending.get('name') or 'файл'}» ждёт пароль. "
+                        "Напишите пароль одной строкой."
+                    ),
+                    data={
+                        "archive_auth_required": True,
+                        "archive_auth_gate": "missing",
+                        "needs_auth": True,
+                        "archive_name": pending.get("name"),
+                        "file_id": pending.get("file_id"),
+                    },
+                )
+                event = ChatEvent(
+                    type="tool_call",
+                    title="documents.archive.list",
+                    content=result.summary,
+                    payload={"tool": result.tool, "ok": False, "archive_auth_gate": "missing"},
+                )
+                return result.summary, event, result
+
+        # User asserts a password but there is no archive in the turn and no pending.
+        if password_claim and not has_archive_attachments and not pending and not password:
+            result = ToolRunResponse(
+                tool="documents.archive.list",
+                ok=False,
+                summary=(
+                    "Пароль есть, но архива в этом сообщении нет. "
+                    "Пришлите zip/7z/rar (можно вместе с паролем) — открою."
+                ),
+                data={"archive_missing": True, "archive_auth_required": False},
+            )
+            event = ChatEvent(
+                type="tool_call",
+                title="documents.archive.list",
+                content=result.summary,
+                payload={"tool": result.tool, "ok": False, "archive_missing": True},
+            )
+            return result.summary, event, result
+
+        # Resolve which archive to open: current attachment → pending → recent hit.
+        file_id: str | None = None
+        archive_name = ""
+        for item in attachments or []:
+            if not isinstance(item, dict) or not _is_archive_like_attachment(item):
+                continue
+            file_id = str(item.get("id") or "").strip() or None
+            archive_name = str(item.get("name") or "")
+            if file_id:
+                break
+        if file_id is None and pending:
+            file_id = str(pending.get("file_id") or "").strip() or None
+            archive_name = str(pending.get("name") or archive_name)
+        if file_id is None:
+            for hit in context.file_hits:
+                if hit.get("retrieval") != "recent-attachment":
+                    continue
+                name = str(hit.get("file_name") or "")
+                if not _is_archive_like_attachment({"name": name}):
+                    continue
+                file_id = str(hit.get("file_id") or "").strip() or None
+                archive_name = name
+                if file_id:
+                    break
+        if file_id is None:
+            # Password alone with no pending/attachment — nothing to open.
+            if password or password_claim:
+                result = ToolRunResponse(
+                    tool="documents.archive.list",
+                    ok=False,
+                    summary=(
+                        "Не вижу архива, к которому применить пароль. "
+                        "Пришлите zip/7z/rar (можно сразу с паролем)."
+                    ),
+                    data={"archive_missing": True},
+                )
+                event = ChatEvent(
+                    type="tool_call",
+                    title="documents.archive.list",
+                    content=result.summary,
+                    payload={"tool": result.tool, "ok": False, "archive_missing": True},
+                )
+                return result.summary, event, result
+            return None
+
+        # Only short-circuit when this is clearly an archive open/list turn
+        # (attachment present, pending password, or archive_memory intent).
+        intent = plan.intent if plan is not None else ""
+        if (
+            not has_archive_attachments
+            and not pending
+            and intent not in {"archive_memory", "file_ops"}
+            and not password
+        ):
+            return None
+
+        arguments: dict[str, Any] = {"file_id": file_id}
+        if password:
+            arguments["password"] = password
+        result = await self.tools.run("documents.archive.list", arguments)
+        data = result.data if isinstance(result.data, dict) else {}
+        if not result.ok and data.get("archive_auth_required"):
+            self._set_archive_password_pending(
+                context.conversation_id,
+                file_id=file_id,
+                name=archive_name or str(data.get("archive_name") or "archive"),
+            )
+            event = ChatEvent(
+                type="tool_call",
+                title="documents.archive.list",
+                content=result.summary,
+                payload={
+                    "tool": result.tool,
+                    "ok": False,
+                    "archive_auth_gate": data.get("archive_auth_gate"),
+                    "file_id": file_id,
+                },
+            )
+            return result.summary, event, result
+        if result.ok:
+            self._clear_archive_password_pending(context.conversation_id)
+            members = data.get("members") if isinstance(data.get("members"), list) else []
+            names = [
+                str(item.get("name") or "")
+                for item in members[:20]
+                if isinstance(item, dict) and item.get("name")
+            ]
+            listing = ", ".join(names) if names else "(пусто)"
+            observation = (
+                f"Archive `{archive_name or file_id}` opened successfully "
+                f"({data.get('member_count', len(names))} member(s)): {listing}.\n"
+                "Answer the operator from this listing. If they asked to extract/read a "
+                "member, use documents.archive.extract / read_member next. "
+                "Do not invent members that are not listed."
+            )
+            event = ChatEvent(
+                type="tool_call",
+                title="documents.archive.list",
+                content=result.summary,
+                payload={
+                    "tool": result.tool,
+                    "ok": True,
+                    "file_id": file_id,
+                    "member_count": data.get("member_count"),
+                },
+            )
+            return observation, event, result
+        event = ChatEvent(
+            type="tool_call",
+            title="documents.archive.list",
+            content=result.summary,
+            payload={"tool": result.tool, "ok": False, "file_id": file_id},
+        )
+        return result.summary, event, result
 
     async def _prefetch_document_memory(
         self,
@@ -15113,6 +15431,91 @@ def _has_archive_like_attachments(attachments: list[dict[str, Any]] | None) -> b
         isinstance(item, dict) and _is_archive_like_attachment(item)
         for item in (attachments or [])
     )
+
+
+_ARCHIVE_PASSWORD_EXPLICIT_RE = re.compile(
+    r"(?is)(?:^|\s)(?:пароль|password|pass(?:word)?|pwd)\s*[:=—-]?\s*"
+    r"[\"'«]?([^\s\"'»,;]+)[\"'»]?"
+)
+_ARCHIVE_PASSWORD_CLAIM_RE = re.compile(
+    r"(?is)\b(?:пароль\s+(?:есть|тот|такой|правильный|верный)|"
+    r"password\s+(?:is|exists|correct)|есть\s+пароль|"
+    r"я\s+знаю\s+пароль|знаю\s+пароль)\b"
+)
+
+
+def _extract_archive_password(message: str) -> str | None:
+    """Pull an explicit archive password from operator text when present."""
+
+    text = str(message or "").strip()
+    if not text:
+        return None
+    match = _ARCHIVE_PASSWORD_EXPLICIT_RE.search(text)
+    if not match:
+        return None
+    password = str(match.group(1) or "").strip()
+    if not password or password.casefold() in {
+        "есть",
+        "нет",
+        "нужен",
+        "нужен?",
+        "?",
+        "is",
+        "yes",
+        "no",
+    }:
+        return None
+    return password
+
+
+def _looks_like_bare_archive_password_reply(message: str) -> bool:
+    """True when the whole message is likely just a password token (follow-up)."""
+
+    text = str(message or "").strip().strip("«»\"'")
+    if not text or any(ch.isspace() for ch in text):
+        return False
+    if len(text) < 2 or len(text) > 64:
+        return False
+    # Avoid treating commands and obvious Russian sentences as passwords.
+    if text.startswith("/"):
+        return False
+    if _ARCHIVE_PASSWORD_EXPLICIT_RE.search(text):
+        return False
+    if re.fullmatch(r"[0-9A-Za-zА-Яа-яЁё_@#$!%^&*+=.\-]{2,64}", text):
+        # Pure Russian words of 2–3 letters are unlikely passwords for this path.
+        if re.fullmatch(r"[А-Яа-яЁё]{1,4}", text):
+            return False
+        return True
+    return False
+
+
+def _looks_like_password_claim_without_archive(message: str) -> bool:
+    """Operator asserts a password exists but may not have attached an archive."""
+
+    text = str(message or "").strip()
+    if not text:
+        return False
+    if _extract_archive_password(text):
+        return False
+    return bool(_ARCHIVE_PASSWORD_CLAIM_RE.search(text))
+
+
+def _is_lightweight_operator_turn(message: str) -> bool:
+    """True for trivial turns that must stay fast (no semantic re-rank / heavy pool)."""
+
+    text = " ".join(str(message or "").split())
+    if not text:
+        return True
+    if _looks_like_bare_archive_password_reply(text):
+        return True
+    if len(text) <= 24 and re.fullmatch(
+        r"(?i)(?:привет|hello|hi|ping|pong|ok|ок|да|нет|стоп|stop|/start|/help|/status|/new)",
+        text.strip(),
+    ):
+        return True
+    if len(text) <= 12 and re.fullmatch(r"[\d\s+\-*/().=]+", text):
+        return True
+    return False
 
 
 def _looks_like_document_followup(message: str) -> bool:

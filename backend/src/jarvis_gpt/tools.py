@@ -7538,16 +7538,108 @@ def _archive_password_arg(args: dict[str, Any]) -> str | None:
     return text if text else None
 
 
+def _archive_password_failure(
+    tool: str,
+    exc: BaseException,
+    *,
+    path: Path | None = None,
+    password_supplied: bool = False,
+) -> ToolRunResponse | None:
+    """Map password-related archive failures to a structured operator-facing response."""
+
+    from .archive_runtime import ArchivePasswordError
+
+    password_exc: ArchivePasswordError | None = None
+    if isinstance(exc, ArchivePasswordError):
+        password_exc = exc
+    else:
+        cause = getattr(exc, "__cause__", None)
+        if isinstance(cause, ArchivePasswordError):
+            password_exc = cause
+    if password_exc is None:
+        low = str(exc).lower()
+        if not any(
+            token in low
+            for token in ("password", "парол", "encrypted", "шифр")
+        ):
+            return None
+        reason = (
+            "wrong"
+            if password_supplied
+            or any(token in low for token in ("неверн", "wrong", "bad password", "incorrect"))
+            else "missing"
+        )
+        name = path.name if path is not None else None
+        # Keys must not match secret-name redaction (password/secret/token), or the
+        # gate status itself is wiped to "[redacted]" before the agent sees it.
+        if reason == "wrong":
+            summary = (
+                f"Неверный пароль к архиву{f' «{name}»' if name else ''}. "
+                "Пришлите правильный пароль — открою снова."
+            )
+        else:
+            summary = (
+                f"Архив{f' «{name}»' if name else ''} защищён паролем. "
+                "Напишите пароль (например: пароль secret42)."
+            )
+        return ToolRunResponse(
+            tool=tool,
+            ok=False,
+            summary=summary,
+            data={
+                "archive_auth_required": True,
+                "archive_auth_gate": reason,
+                "archive_name": name,
+                "needs_auth": reason == "missing",
+                "wrong_auth": reason == "wrong",
+            },
+        )
+    reason = password_exc.reason
+    name = password_exc.archive_name or (path.name if path is not None else None)
+    if reason == "wrong":
+        summary = (
+            f"Неверный пароль к архиву{f' «{name}»' if name else ''}. "
+            "Пришлите правильный — открою снова."
+        )
+    else:
+        summary = (
+            f"Архив{f' «{name}»' if name else ''} защищён паролем. "
+            "Напишите пароль (например: пароль secret42)."
+        )
+    return ToolRunResponse(
+        tool=tool,
+        ok=False,
+        summary=summary,
+        data={
+            "archive_auth_required": True,
+            "archive_auth_gate": reason,
+            "archive_name": name,
+            "needs_auth": reason == "missing",
+            "wrong_auth": reason == "wrong",
+        },
+    )
+
+
 def _documents_archive_list(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    path: Path | None = None
+    password = _archive_password_arg(args)
     try:
         path = _document_path_only(ctx, args)
         surfer = _document_surfer_for(ctx)
         result = surfer.list_archive(
             path,
             prefix=str(args.get("prefix") or ""),
-            password=_archive_password_arg(args),
+            password=password,
         )
-    except (ValueError, DocumentSurferError) as exc:
+    except (ValueError, DocumentSurferError, OSError) as exc:
+        mapped = _archive_password_failure(
+            "documents.archive.list",
+            exc,
+            path=path,
+            password_supplied=password is not None,
+        )
+        if mapped is not None:
+            return mapped
         return ToolRunResponse(tool="documents.archive.list", ok=False, summary=str(exc))
     return ToolRunResponse(
         tool="documents.archive.list",
@@ -7561,6 +7653,8 @@ def _documents_archive_list(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRe
 
 
 def _documents_archive_extract(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    path: Path | None = None
+    password = _archive_password_arg(args)
     try:
         path = _document_path_only(ctx, args)
         members = args.get("members")
@@ -7573,7 +7667,7 @@ def _documents_archive_extract(ctx: ToolContext, args: dict[str, Any]) -> ToolRu
             path,
             members=members,
             output_name=args.get("output_name"),
-            password=_archive_password_arg(args),
+            password=password,
         )
         # index extracted files when possible
         indexed = []
@@ -7586,6 +7680,14 @@ def _documents_archive_extract(ctx: ToolContext, args: dict[str, Any]) -> ToolRu
                     continue
         result["indexed_files"] = indexed
     except (ValueError, DocumentSurferError, OSError) as exc:
+        mapped = _archive_password_failure(
+            "documents.archive.extract",
+            exc,
+            path=path,
+            password_supplied=password is not None,
+        )
+        if mapped is not None:
+            return mapped
         return ToolRunResponse(tool="documents.archive.extract", ok=False, summary=str(exc))
     return ToolRunResponse(
         tool="documents.archive.extract",
@@ -7605,6 +7707,8 @@ def _documents_archive_read_member(ctx: ToolContext, args: dict[str, Any]) -> To
         )
     max_bytes = _int_arg(args.get("max_bytes"), default=2_000_000, minimum=64, maximum=50_000_000)
     max_chars = _int_arg(args.get("max_chars"), default=30000, minimum=500, maximum=150000)
+    path: Path | None = None
+    password = _archive_password_arg(args)
     try:
         path = _document_path_only(ctx, args)
         surfer = _document_surfer_for(ctx)
@@ -7614,9 +7718,17 @@ def _documents_archive_read_member(ctx: ToolContext, args: dict[str, Any]) -> To
             max_bytes=max_bytes,
             as_document=_bool_arg(args.get("as_document"), default=False),
             max_chars=max_chars,
-            password=_archive_password_arg(args),
+            password=password,
         )
     except (ValueError, DocumentSurferError) as exc:
+        mapped = _archive_password_failure(
+            "documents.archive.read_member",
+            exc,
+            path=path,
+            password_supplied=password is not None,
+        )
+        if mapped is not None:
+            return mapped
         return ToolRunResponse(tool="documents.archive.read_member", ok=False, summary=str(exc))
     return ToolRunResponse(
         tool="documents.archive.read_member",
@@ -7657,6 +7769,8 @@ def _documents_archive_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRun
             tool="documents.archive.search", ok=False, summary="query is required."
         )
     max_members = _int_arg(args.get("max_members"), default=40, minimum=1, maximum=200)
+    path: Path | None = None
+    password = _archive_password_arg(args)
     try:
         path = _document_path_only(ctx, args)
         surfer = _document_surfer_for(ctx)
@@ -7666,9 +7780,17 @@ def _documents_archive_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRun
             regex=_bool_arg(args.get("regex"), default=False),
             case_sensitive=_bool_arg(args.get("case_sensitive"), default=False),
             max_members=max_members,
-            password=_archive_password_arg(args),
+            password=password,
         )
     except (ValueError, DocumentSurferError) as exc:
+        mapped = _archive_password_failure(
+            "documents.archive.search",
+            exc,
+            path=path,
+            password_supplied=password is not None,
+        )
+        if mapped is not None:
+            return mapped
         return ToolRunResponse(tool="documents.archive.search", ok=False, summary=str(exc))
     return ToolRunResponse(
         tool="documents.archive.search",
