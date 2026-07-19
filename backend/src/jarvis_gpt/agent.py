@@ -1137,9 +1137,22 @@ class AgentRuntime:
                         )
                     self._complete_chat_request(handle, response)
                     return response
+                except asyncio.CancelledError:
+                    self._release_chat_request(handle)
+                    if self._is_turn_cancelled(cancel_key):
+                        response = self._cancelled_chat_response(handle.conversation_id)
+                        # Do not complete the ledger as success — release already cleared lease.
+                        return response
+                    raise
                 except BaseException:
                     self._release_chat_request(handle)
                     raise
+        except asyncio.CancelledError:
+            # Hard /stop cancels the request task; convert into a clean operator answer
+            # instead of letting FastAPI surface HTTP 500.
+            if self._is_turn_cancelled(cancel_key):
+                return self._cancelled_chat_response(conversation_id)
+            raise
         finally:
             self._unregister_turn_cancel(cancel_key)
 
@@ -10648,6 +10661,23 @@ class AgentRuntime:
             "cancelled": cancelled,
             "detail": "cancelled" if cancelled else "already finished",
         }
+
+    def _cancelled_chat_response(self, conversation_id: str | None) -> ChatResponse:
+        """Stable operator-facing answer when a turn is aborted by /stop or cancel API."""
+
+        return ChatResponse(
+            conversation_id=str(conversation_id or "cancelled"),
+            message_id=new_id("msg"),
+            answer="Остановил по запросу.",
+            events=[
+                ChatEvent(
+                    type="thought",
+                    title="Turn cancelled",
+                    content="Оператор отменил выполнение; backend-turn прерван.",
+                    payload={"finish_reason": "cancelled"},
+                )
+            ],
+        )
 
     def _max_tool_steps(self) -> int:
         # Owner full autonomy: give the operator's turn the active profile's full step
