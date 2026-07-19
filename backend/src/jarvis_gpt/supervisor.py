@@ -24,6 +24,8 @@ from .notify import in_quiet_hours, push_telegram_alert, telegram_targets
 from .storage import JarvisStorage, utc_now
 from .telemetry import TelemetryCollector
 
+_QUIET_DEFERRED_KEY = "telegram.quiet_deferred"
+
 
 def _parse_utc_datetime(value: Any) -> datetime | None:
     try:
@@ -434,6 +436,9 @@ class RuntimeSupervisor:
         # outage therefore retries after restart and a recurring watcher cannot outrun
         # its previous notification.
         await self._flush_screen_watch_notifications()
+        # Outside quiet hours, flush any passive reminders held overnight.
+        with suppress(Exception):
+            await self._flush_quiet_deferred_pushes()
         try:
             due = await asyncio.to_thread(
                 self.storage.claim_due_reminders,
@@ -657,35 +662,152 @@ class RuntimeSupervisor:
             from .notify import reminder_inline_keyboard
 
             reply_markup = reminder_inline_keyboard(reminder_id)
-        silent = self._telegram_quiet_now()
+        # Quiet hours: hold passive nudges and flush as a digest after the window.
+        # Critical health alerts still use silent push elsewhere; reminders wait.
+        if self._telegram_quiet_now():
+            targets = requested
+            if not targets and current_user_id() == LEGACY_OWNER_USER_ID:
+                targets = ()  # resolve at flush via allowlist default
+            self._enqueue_quiet_deferred(
+                text=body,
+                target_chat_ids=targets,
+                reply_markup=reply_markup,
+                kind="reminder",
+                reminder_id=reminder_id or None,
+            )
+            return True  # accepted into hold buffer (not dropped)
         if requested:
             return await push_telegram_alert(
                 body,
                 target_chat_ids=requested,
                 reply_markup=reply_markup,
-                disable_notification=silent,
+                disable_notification=False,
             )
         if current_user_id() == LEGACY_OWNER_USER_ID:
             return await push_telegram_alert(
                 body,
                 target_chat_ids=None,
                 reply_markup=reply_markup,
-                disable_notification=silent,
+                disable_notification=False,
             )
         return False
 
-    def _telegram_quiet_now(self) -> bool:
-        """True when operator preferences put the wall-clock in quiet hours (silent push)."""
-
+    def _telegram_quiet_hours_spec(self) -> str:
         try:
             prefs = self.storage.get_runtime_value("experience.preferences", {})
         except Exception:  # noqa: BLE001 - quiet-hours probe must never break delivery
             prefs = {}
         if not isinstance(prefs, dict):
-            return False
-        quiet = str(prefs.get("quiet_hours") or "")
+            return ""
+        return str(prefs.get("quiet_hours") or "")
+
+    def _telegram_quiet_now(self) -> bool:
+        """True when operator preferences put the wall-clock in quiet hours."""
+
+        quiet = self._telegram_quiet_hours_spec()
         tz_name = str(getattr(self.settings, "reminder_tz", None) or "Europe/Moscow")
         return in_quiet_hours(quiet, tz_name=tz_name)
+
+    def _enqueue_quiet_deferred(
+        self,
+        *,
+        text: str,
+        target_chat_ids: tuple[int, ...],
+        reply_markup: dict[str, Any] | None,
+        kind: str,
+        reminder_id: str | None = None,
+    ) -> None:
+        """Persist one deferred phone push for post-quiet digest delivery."""
+
+        entry = {
+            "ts": utc_now(),
+            "text": str(text or "")[:3900],
+            "target_chat_ids": list(target_chat_ids),
+            "reply_markup": reply_markup,
+            "kind": kind,
+            "reminder_id": reminder_id,
+            "user_id": current_user_id(),
+        }
+        current = self.storage.get_runtime_value(_QUIET_DEFERRED_KEY, [])
+        items: list[Any]
+        if isinstance(current, list):
+            items = list(current)
+        else:
+            items = []
+        items.append(entry)
+        # Cap buffer so a long vacation cannot grow unbounded.
+        items = items[-80:]
+        self.storage.set_runtime_value(_QUIET_DEFERRED_KEY, items)
+
+    async def _flush_quiet_deferred_pushes(self) -> None:
+        """Deliver held quiet-hours pushes once the wall-clock leaves the window."""
+
+        if self._telegram_quiet_now():
+            return
+        current = self.storage.get_runtime_value(_QUIET_DEFERRED_KEY, [])
+        if not isinstance(current, list) or not current:
+            return
+        # Claim by clearing first so a crash mid-flush does not double-send forever;
+        # undelivered items are re-queued below.
+        self.storage.set_runtime_value(_QUIET_DEFERRED_KEY, [])
+        remaining: list[Any] = []
+        # Group by user for a short digest header when multiple items.
+        by_user: dict[str, list[dict[str, Any]]] = {}
+        for raw in current:
+            if not isinstance(raw, dict):
+                continue
+            user_id = str(raw.get("user_id") or "")
+            by_user.setdefault(user_id, []).append(raw)
+        for user_id, entries in by_user.items():
+            if len(entries) == 1:
+                item = entries[0]
+                targets = tuple(
+                    int(x)
+                    for x in (item.get("target_chat_ids") or [])
+                    if not isinstance(x, bool)
+                    and str(x).lstrip("-").isdigit()
+                )
+                markup = (
+                    item.get("reply_markup")
+                    if isinstance(item.get("reply_markup"), dict)
+                    else None
+                )
+                ok = await push_telegram_alert(
+                    str(item.get("text") or ""),
+                    target_chat_ids=targets or None,
+                    reply_markup=markup,
+                )
+                if not ok:
+                    remaining.append(item)
+                continue
+            # Multi-item digest for this user.
+            lines = [f"🌙 За quiet hours накопилось {len(entries)}:"]
+            targets: tuple[int, ...] = ()
+            for item in entries[:15]:
+                text = str(item.get("text") or "").strip()
+                if text.startswith("⏰ "):
+                    text = text[2:].strip()
+                if text.startswith("Напоминание:"):
+                    text = text[len("Напоминание:") :].strip()
+                lines.append(f"• {text[:200]}")
+                raw_targets = item.get("target_chat_ids") or []
+                if not targets and isinstance(raw_targets, list) and raw_targets:
+                    with suppress(TypeError, ValueError):
+                        targets = tuple(
+                            int(x)
+                            for x in raw_targets
+                            if not isinstance(x, bool) and str(x).lstrip("-").isdigit()
+                        )
+            if len(entries) > 15:
+                lines.append(f"…и ещё {len(entries) - 15}")
+            ok = await push_telegram_alert(
+                "\n".join(lines)[:3900],
+                target_chat_ids=targets or None,
+            )
+            if not ok:
+                remaining.extend(entries)
+        if remaining:
+            self.storage.set_runtime_value(_QUIET_DEFERRED_KEY, remaining[-80:])
 
     async def _run_briefing_task(self, reminder: dict[str, Any]) -> None:
         """Build the structured daily briefing and push it to Telegram (no LLM turn)."""

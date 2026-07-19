@@ -112,6 +112,7 @@ _CAPTURE_COMMANDS = {"/note", "/inbox", "/capture", "/заметка", "/зам�
 _HELP_COMMANDS = {"/help", "/помощь", "/commands", "/команды"}
 _STATUS_COMMANDS = {"/status", "/статус"}
 _BRIEFING_COMMANDS = {"/briefing", "/сводка", "/digest"}
+_QUIET_COMMANDS = {"/quiet", "/тишина", "/quiet_hours"}
 # After this many seconds of a still-running agent turn, ping the chat so a long
 # research/document job does not look frozen on the phone.
 _PROGRESS_STATUS_AFTER_SEC = 12.0
@@ -121,7 +122,7 @@ _IMAGE_MIME_TYPES = frozenset(
 _IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".webp", ".gif"})
 # Telegram Bot API hard limit for sendPhoto (use document above this).
 _TG_PHOTO_CAP = 9 * 1024 * 1024
-# Reply-keyboard day console (exact button labels).
+# Reply-keyboard day console (exact button labels) + single-emoji gestures.
 _CONSOLE_LABEL_TO_ACTION: dict[str, str] = {
     "📋 Сводка": "briefing",
     "📊 Статус": "status",
@@ -135,6 +136,16 @@ _CONSOLE_LABEL_TO_ACTION: dict[str, str] = {
     "Стоп": "stop",
     "Новый чат": "new",
     "Помощь": "help",
+    # One-tap emoji gestures (same actions).
+    "📋": "briefing",
+    "📊": "status",
+    "📥": "inbox_list",
+    "📌": "inbox_list",
+    "🛑": "stop",
+    "⏹": "stop",
+    "🆕": "new",
+    "❓": "help",
+    "⏰": "quiet_help",
 }
 _USER_SESSION_HEADER = "X-Jarvis-User-Session"
 _BRIDGE_SECRET_HEADER = "X-Jarvis-Bridge-Secret"
@@ -270,7 +281,28 @@ def _console_action_for_text(text: str) -> str | None:
         return "new"
     if command in _START_COMMANDS:
         return "start"
+    if command in _QUIET_COMMANDS:
+        return "quiet"
     return None
+
+
+def _quiet_command_spec(text: str) -> str | None:
+    """Extract quiet-hours range from ``/quiet 23:00-08:00`` (or bare ``off``/``clear``).
+
+    Returns the raw range string, empty string to clear, or None if not a quiet command.
+    """
+
+    raw = str(text or "").strip()
+    command = _telegram_command(raw)
+    if command not in _QUIET_COMMANDS:
+        return None
+    rest = raw.split(maxsplit=1)
+    if len(rest) < 2:
+        return ""  # show current / help
+    value = rest[1].strip()
+    if value.casefold() in {"off", "clear", "нет", "выкл", "0", "-"}:
+        return "clear"
+    return value
 
 
 def _is_forwarded_message(message: Mapping[str, object] | dict) -> bool:
@@ -344,12 +376,15 @@ def _help_text() -> str:
     return (
         "Джарвис на связи.\n"
         "Пульт внизу: Сводка · Статус · Inbox · Стоп · Новый чат · Помощь.\n"
+        "Жесты: 📋 📊 📥 🛑 📌 · ⏰ — quiet hours.\n"
         "\n"
         "Команды:\n"
         "• /new — новый разговор\n"
         "• /stop — отменить текущий запрос\n"
         "• /status · /briefing — без LLM\n"
         "• /note … или `+ …` — быстрый захват в inbox\n"
+        "• /quiet 23:00-08:00 — тихие часы (hold напоминаний)\n"
+        "• /quiet off — выключить quiet hours\n"
         "• перешли сообщение боту — разберу как задачу\n"
         "• «каждое утро сводка» — ежедневный briefing"
     )
@@ -2929,13 +2964,28 @@ class TelegramBridge:
                 reply_markup=operator_reply_keyboard(),
             )
             return
-        if console_action in {"stop", "new", "help", "status", "briefing", "inbox_list"}:
+        if console_action in {
+            "stop",
+            "new",
+            "help",
+            "status",
+            "briefing",
+            "inbox_list",
+            "quiet",
+            "quiet_help",
+        }:
             await self._handle_console_action(
                 chat_id,
                 console_action,
                 session=session,
                 update_id=update_id,
+                raw_text=text,
             )
+            return
+        # /quiet 23:00-08:00 even when action map only saw the slash form.
+        quiet_spec = _quiet_command_spec(text)
+        if quiet_spec is not None:
+            await self._handle_quiet_command(chat_id, quiet_spec)
             return
         if command in _STOP_COMMANDS:
             # Prefer the lock-bypassing enqueue path; this branch is a fallback when
@@ -3101,6 +3151,7 @@ class TelegramBridge:
         *,
         session: TelegramUserSession,
         update_id: int,
+        raw_text: str = "",
     ) -> None:
         """Day-console buttons and slash shortcuts that skip the full agent loop."""
 
@@ -3141,6 +3192,76 @@ class TelegramBridge:
         if action == "inbox_list":
             await self._send_inbox_preview(chat_id)
             return
+        if action in {"quiet", "quiet_help"}:
+            quiet_spec = _quiet_command_spec(raw_text)
+            if quiet_spec is None:
+                quiet_spec = "" if action == "quiet_help" else ""
+            await self._handle_quiet_command(chat_id, quiet_spec or "")
+            return
+
+    async def _handle_quiet_command(self, chat_id: int, spec: str) -> None:
+        """Show/set/clear operator quiet hours via preferences API."""
+
+        from .notify import parse_quiet_hours
+
+        try:
+            headers = self._session_headers(chat_id)
+        except RuntimeError:
+            await self._send(chat_id, "Нет сессии — /start.")
+            return
+        # Bare /quiet or ⏰ → show current.
+        if not spec or spec == "":
+            try:
+                response = await self.api.get("/api/preferences", headers=headers)
+                response.raise_for_status()
+                prefs = response.json() if response.content else {}
+            except httpx.HTTPError:
+                await self._send(chat_id, "Не смог прочитать preferences.")
+                return
+            current = str(prefs.get("quiet_hours") or "").strip()
+            if current:
+                await self._send(
+                    chat_id,
+                    f"🌙 Quiet hours: `{current}`\n"
+                    "В окне напоминания копятся и уходят пачкой после тишины.\n"
+                    "Сменить: `/quiet 23:00-08:00` · выкл: `/quiet off`",
+                )
+            else:
+                await self._send(
+                    chat_id,
+                    "Quiet hours выключены.\n"
+                    "Включить: `/quiet 23:00-08:00` (можно `23-8`).",
+                )
+            return
+        if spec == "clear":
+            patch = {"quiet_hours": ""}
+        else:
+            if parse_quiet_hours(spec) is None:
+                await self._send(
+                    chat_id,
+                    "Не понял диапазон. Пример: `/quiet 23:00-08:00` или `/quiet off`.",
+                )
+                return
+            patch = {"quiet_hours": spec}
+        try:
+            response = await self.api.patch(
+                "/api/preferences", json=patch, headers=headers
+            )
+            response.raise_for_status()
+            prefs = response.json() if response.content else {}
+        except httpx.HTTPError:
+            log.exception("quiet hours preferences update failed")
+            await self._send(chat_id, "Не смог сохранить quiet hours.")
+            return
+        current = str(prefs.get("quiet_hours") or "").strip()
+        if current:
+            await self._send(
+                chat_id,
+                f"🌙 Quiet hours: `{current}`.\n"
+                "Напоминания в этом окне отложу и пришлю пачкой после.",
+            )
+        else:
+            await self._send(chat_id, "Quiet hours выключены.")
 
     async def _send_status_card(self, chat_id: int) -> None:
         try:

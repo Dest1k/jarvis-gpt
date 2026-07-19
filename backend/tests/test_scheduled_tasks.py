@@ -300,6 +300,32 @@ def test_briefing_reminder_uses_experience_not_agent(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_passive_reminder_defers_during_quiet_hours(monkeypatch, tmp_path):
+    agent = _FakeAgent()
+    supervisor, storage = _supervisor(monkeypatch, tmp_path, agent=agent)
+    pushes = _patch_push(monkeypatch)
+    storage.set_runtime_value(
+        "experience.preferences",
+        {"quiet_hours": "00:00-23:59"},  # always quiet for this smoke
+    )
+    storage.create_reminder(
+        text="тихий hold",
+        due_at="2000-01-01T00:00:00+00:00",
+        payload={"deliver": "telegram", "telegram_chat_id": 42},
+    )
+    asyncio.run(_fire_and_drain(supervisor))
+    assert agent.calls == []
+    assert pushes == []  # held, not pushed
+    deferred = storage.get_runtime_value("telegram.quiet_deferred", [])
+    assert isinstance(deferred, list) and deferred
+    assert any("тихий hold" in str(item.get("text") or "") for item in deferred)
+    # Leave quiet hours and flush.
+    storage.set_runtime_value("experience.preferences", {"quiet_hours": ""})
+    asyncio.run(supervisor._flush_quiet_deferred_pushes())
+    assert any("тихий hold" in text for text in pushes)
+    storage.close()
+
+
 def test_storage_reschedule_snoozes_fired_reminder(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
     settings = load_settings()

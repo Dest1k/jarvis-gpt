@@ -21,6 +21,7 @@ from jarvis_gpt.telegram_bridge import (
     _format_briefing_card,
     _format_status_card,
     _is_forwarded_message,
+    _quiet_command_spec,
 )
 
 from tests.test_telegram_bridge import _bridge
@@ -75,6 +76,11 @@ def test_console_action_mapping():
     assert _console_action_for_text("/status") == "status"
     assert _console_action_for_text("/help") == "help"
     assert _console_action_for_text("🛑 Стоп") == "stop"
+    assert _console_action_for_text("📋") == "briefing"
+    assert _console_action_for_text("📌") == "inbox_list"
+    assert _console_action_for_text("🛑") == "stop"
+    assert _console_action_for_text("⏰") == "quiet_help"
+    assert _console_action_for_text("/quiet") == "quiet"
     assert _console_action_for_text("привет") is None
 
 
@@ -228,6 +234,55 @@ def test_action_callback_inbox_uses_last_answer():
     asyncio.run(bridge._handle(update))
     assert memory_bodies and "GPU" in memory_bodies[0]["content"]
     assert any("inbox" in text.lower() or "📥" in text for text in sent)
+
+
+def test_quiet_command_spec_parser():
+    assert _quiet_command_spec("/quiet") == ""
+    assert _quiet_command_spec("/quiet 23:00-08:00") == "23:00-08:00"
+    assert _quiet_command_spec("/quiet off") == "clear"
+    assert _quiet_command_spec("/quiet clear") == "clear"
+    assert _quiet_command_spec("not quiet") is None
+
+
+def test_quiet_command_patches_preferences():
+    patches: list[dict] = []
+    sent: list[str] = []
+
+    def tg_handler(request):
+        if request.url.path.endswith("/sendMessage"):
+            payload = json.loads(request.content)
+            sent.append(payload.get("text") or "")
+        return httpx.Response(200, json={"ok": True, "result": {}})
+
+    def api_handler(request):
+        if request.url.path == "/api/preferences" and request.method == "PATCH":
+            patches.append(json.loads(request.content))
+            return httpx.Response(
+                200,
+                json={
+                    "operator_name": "Admin",
+                    "communication_style": "concise",
+                    "daily_briefing": True,
+                    "voice_reply": False,
+                    "preferred_profile": "gemma4-turbo",
+                    "quiet_hours": "23:00-08:00",
+                    "working_roots": [],
+                },
+            )
+        return httpx.Response(404)
+
+    bridge = _bridge(tg_handler, api_handler)
+    update = {
+        "update_id": 91,
+        "message": {
+            "chat": {"id": 42, "type": "private"},
+            "from": {"id": 42, "is_bot": False},
+            "text": "/quiet 23:00-08:00",
+        },
+    }
+    asyncio.run(bridge._handle(update))
+    assert patches == [{"quiet_hours": "23:00-08:00"}]
+    assert any("23:00-08:00" in text for text in sent)
 
 
 def test_answer_sends_action_chips():

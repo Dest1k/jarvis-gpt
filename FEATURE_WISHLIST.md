@@ -143,8 +143,9 @@ Shipped on `main` (third wave, phone day rhythm):
 - **Forward-as-task** — any forwarded message becomes an agent task prompt (source + text + URLs).
 - **Reply-keyboard пульт** — Сводка / Статус / Inbox / Стоп / Новый чат / Помощь.
 - **Action chips** under answers — Inbox · +1ч · Ещё (+ Стоп on progress ping).
-- **Quiet hours** — `preferences.quiet_hours` → silent Telegram pushes (`disable_notification`).
+- **Quiet hours** — `preferences.quiet_hours` → hold passive reminders, flush digest after window.
 - **Progress message** with stop chip, deleted when the turn finishes (no chat spam).
+- **Emoji gestures** — 📋 📊 📥 📌 🛑 + `/quiet 23:00-08:00` / `/quiet off`.
 
 ## More ideas — brainstorm 2026-07-18 (new features)
 
