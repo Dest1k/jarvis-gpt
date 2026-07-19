@@ -151,6 +151,10 @@ _EXTENSION_MAP: dict[str, tuple[str, Family, str, bool, bool]] = {
     ".ar": ("ar", "archive", "application/x-archive", True, False),
     ".deb": ("deb", "archive", "application/vnd.debian.binary-package", True, False),
     ".rpm": ("rpm", "archive", "application/x-rpm", True, False),
+    ".squashfs": ("squashfs", "archive", "application/vnd.squashfs", True, False),
+    ".sqfs": ("squashfs", "archive", "application/vnd.squashfs", True, False),
+    ".sfs": ("squashfs", "archive", "application/vnd.squashfs", True, False),
+    ".tzst": ("tar.zst", "archive", "application/zstd", True, False),
     # text / code / data
     ".txt": ("txt", "text", "text/plain", False, True),
     ".log": ("log", "text", "text/plain", False, True),
@@ -248,6 +252,7 @@ def archive_kinds() -> list[str]:
             "tar.gz",
             "tar.bz2",
             "tar.xz",
+            "tar.zst",
             "gz",
             "bz2",
             "xz",
@@ -255,11 +260,13 @@ def archive_kinds() -> list[str]:
             "rar",
             "cab",
             "iso",
+            "img",
             "cpio",
             "ar",
             "deb",
             "rpm",
             "zst",
+            "squashfs",
         }
     )
     return sorted(kinds)
@@ -305,6 +312,13 @@ def is_archive_kind(kind: str) -> bool:
         "xz",
         "7z",
         "rar",
+        "iso",
+        "img",
+        "deb",
+        "rpm",
+        "squashfs",
+        "tar.zst",
+        "zst",
     }
 
 
@@ -319,12 +333,56 @@ def identify_path(path: str | Path, *, peek_bytes: int = 8192) -> FileTypeInfo:
     size = 0
     if path_obj.exists() and path_obj.is_file():
         size = path_obj.stat().st_size
+        lower = name.lower()
+        # ISO9660 primary volume descriptor sits at sector 16 (offset 0x8000).
+        needs_iso_peek = lower.endswith((".iso", ".img", ".udf")) or size >= 0x9000
+        effective_peek = max(peek_bytes, 0x9000 if needs_iso_peek else peek_bytes)
         with path_obj.open("rb") as handle:
             # Read enough of the trailer region for small PDFs so truncated
             # fixtures are not falsely identified as healthy documents.
-            read_limit = max(64, min(max(peek_bytes, size), 1_048_576))
+            read_limit = max(64, min(max(effective_peek, size if size < 1_048_576 else effective_peek), 1_048_576))
             data = handle.read(read_limit)
+            # If still unrecognized and large enough, probe ISO CD001 marker.
+            if len(data) < 0x8006 and size >= 0x8006:
+                handle.seek(0)
+                data = handle.read(min(size, max(read_limit, 0x9000)))
     info = identify_bytes(data, name=name)
+    # Secondary ISO probe when magic window missed CD001 but file is disk-sized.
+    if info.kind in {"bin", "empty", "img"} and size >= 0x8006:
+        marker = data[0x8001:0x8006] if len(data) >= 0x8006 else b""
+        if marker == b"CD001" or (
+            path_obj.exists()
+            and path_obj.is_file()
+            and _read_iso_marker(path_obj) == b"CD001"
+        ):
+            info = FileTypeInfo(
+                kind="iso",
+                family="disk",
+                mime_type="application/x-iso9660-image",
+                extension=_extension_of(name) or ".iso",
+                confidence=0.95,
+                source="magic",
+                is_archive=True,
+                container="iso",
+                description="ISO 9660 disk image",
+                magic_hex=data[:16].hex(" ") if data else "",
+            )
+    # Debian packages are ar archives with debian-binary member.
+    if info.kind == "ar" and (
+        name.lower().endswith(".deb") or b"debian-binary" in data[:256]
+    ):
+        info = FileTypeInfo(
+            kind="deb",
+            family="archive",
+            mime_type="application/vnd.debian.binary-package",
+            extension=_extension_of(name) or ".deb",
+            confidence=0.97,
+            source="magic+extension" if name.lower().endswith(".deb") else "magic",
+            is_archive=True,
+            container="ar",
+            description="Debian package",
+            magic_hex=data[:16].hex(" ") if data else "",
+        )
     details = dict(info.details)
     details["size"] = size
     details["path"] = str(path_obj)
@@ -346,6 +404,15 @@ def identify_path(path: str | Path, *, peek_bytes: int = 8192) -> FileTypeInfo:
         magic_hex=info.magic_hex,
         details=details,
     )
+
+
+def _read_iso_marker(path: Path) -> bytes:
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0x8001)
+            return handle.read(5)
+    except OSError:
+        return b""
 
 
 def identify_bytes(data: bytes, *, name: str = "") -> FileTypeInfo:
@@ -402,6 +469,34 @@ def identify_bytes(data: bytes, *, name: str = "") -> FileTypeInfo:
                 description="xz-compressed tar archive",
                 magic_hex=magic_hex,
             )
+        if magic.kind == "zst" and _name_has_suffix(name, (".tar.zst", ".tzst")):
+            return FileTypeInfo(
+                kind="tar.zst",
+                family="archive",
+                mime_type="application/zstd",
+                extension=_extension_of(name) or ".tar.zst",
+                confidence=0.92,
+                source="magic+extension",
+                is_archive=True,
+                is_compressed=True,
+                container="tar",
+                description="zstd-compressed tar archive",
+                magic_hex=magic_hex,
+            )
+        # ar magic often means .deb when name says so
+        if magic.kind == "ar" and _name_has_suffix(name, (".deb",)):
+            return FileTypeInfo(
+                kind="deb",
+                family="archive",
+                mime_type="application/vnd.debian.binary-package",
+                extension=".deb",
+                confidence=0.97,
+                source="magic+extension",
+                is_archive=True,
+                container="ar",
+                description="Debian package",
+                magic_hex=magic_hex,
+            )
         return FileTypeInfo(
             kind=magic.kind,
             family=magic.family,
@@ -432,7 +527,21 @@ def identify_bytes(data: bytes, *, name: str = "") -> FileTypeInfo:
             is_document=ext_info[4],
             is_text=ext_info[1] in {"text", "code"} or ext_info[4],
             is_compressed=ext_info[0]
-            in {"gz", "bz2", "xz", "lz", "lzma", "zst", "7z", "rar", "tar.gz", "tar.bz2", "tar.xz"},
+            in {
+                "gz",
+                "bz2",
+                "xz",
+                "lz",
+                "lzma",
+                "zst",
+                "7z",
+                "rar",
+                "tar.gz",
+                "tar.bz2",
+                "tar.xz",
+                "tar.zst",
+                "squashfs",
+            },
             description=f"{ext_info[0]} by extension",
             magic_hex=magic_hex,
         )
@@ -703,7 +812,7 @@ def _match_magic(data: bytes) -> _MagicHit | None:
             "mkv", "video", "video/x-matroska", ".mkv", 0.9,
             description="Matroska/WebM container",
         )
-    # ISO9660
+    # ISO9660 (primary volume descriptor at sector 16 / offset 0x8000)
     if len(data) >= 0x8006 and data[0x8001:0x8006] == b"CD001":
         return _MagicHit(
             "iso",
@@ -714,6 +823,18 @@ def _match_magic(data: bytes) -> _MagicHit | None:
             is_archive=True,
             container="iso",
             description="ISO 9660 disk image",
+        )
+    # SquashFS (little/big endian magic variants)
+    if data[:4] in {b"hsqs", b"sqsh", b"shsq", b"qshs"}:
+        return _MagicHit(
+            "squashfs",
+            "archive",
+            "application/vnd.squashfs",
+            ".squashfs",
+            0.98,
+            is_archive=True,
+            container="squashfs",
+            description="SquashFS filesystem image",
         )
     # ELF
     if data.startswith(b"\x7fELF"):

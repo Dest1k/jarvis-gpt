@@ -2090,15 +2090,16 @@ class ToolRegistry:
             ToolSpec(
                 name="documents.archive.list",
                 description=(
-                    "List members of a zip/tar/tar.gz/tar.bz2/tar.xz/gz/bz2/xz archive "
-                    "(7z/rar when optional engines are installed)."
+                    "List members of archives: zip, tar, tar.gz, tar.bz2, tar.xz, tar.zst, "
+                    "gz/bz2/xz/zst, 7z, rar, deb, rpm, iso, img, squashfs, ar/cpio/cab "
+                    "(passworded zip/7z/rar supported; 7-Zip CLI used when needed)."
                 ),
                 category="documents",
                 input_schema={
                     "file_id": "Uploaded/indexed archive file id",
                     "path": "Local archive path",
                     "prefix": "Optional member name prefix filter",
-                    "password": "Password for encrypted zip/7z/rar archives",
+                    "password": "Password for encrypted zip/7z/rar (and other 7z-openable) archives",
                 },
                 handler=_documents_archive_list,
             )
@@ -2108,7 +2109,8 @@ class ToolRegistry:
                 name="documents.archive.extract",
                 description=(
                     "Safely extract archive members into document-outputs "
-                    "(path traversal and size bomb protected). Supports passworded zip/7z/rar."
+                    "(path traversal and size bomb protected). Formats: zip/tar*/7z/rar/"
+                    "deb/rpm/iso/img/squashfs and streams; passworded zip/7z/rar supported."
                 ),
                 category="documents",
                 input_schema={
@@ -2116,7 +2118,7 @@ class ToolRegistry:
                     "path": "Local archive path",
                     "members": "Optional list of member names; default extracts all safe members",
                     "output_name": "Optional output directory name under document-outputs",
-                    "password": "Password for encrypted zip/7z/rar archives",
+                    "password": "Password for encrypted zip/7z/rar (and other 7z-openable) archives",
                 },
                 handler=_documents_archive_extract,
             )
@@ -2126,7 +2128,8 @@ class ToolRegistry:
                 name="documents.archive.read_member",
                 description=(
                     "Read one archive member with type identification and optional "
-                    "document extraction. Supports passworded zip/7z/rar."
+                    "document extraction. Supports passworded zip/7z/rar and extended "
+                    "formats (tar.zst, deb, iso, img, rpm, squashfs, …)."
                 ),
                 category="documents",
                 input_schema={
@@ -2136,7 +2139,7 @@ class ToolRegistry:
                     "max_bytes": "Maximum bytes to read",
                     "as_document": "If true, also parse member as a document when possible",
                     "max_chars": "Max document chars when as_document=true",
-                    "password": "Password for encrypted zip/7z/rar archives",
+                    "password": "Password for encrypted zip/7z/rar (and other 7z-openable) archives",
                 },
                 handler=_documents_archive_read_member,
             )
@@ -2170,7 +2173,7 @@ class ToolRegistry:
                     "regex": "Treat query as regex",
                     "case_sensitive": "Case-sensitive match",
                     "max_members": "Maximum members to scan",
-                    "password": "Password for encrypted zip/7z/rar archives",
+                    "password": "Password for encrypted zip/7z/rar (and other 7z-openable) archives",
                 },
                 handler=_documents_archive_search,
             )
