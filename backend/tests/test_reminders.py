@@ -33,6 +33,26 @@ def test_relative_hours():
     assert r.due_local == NOW + timedelta(hours=2)
 
 
+def test_relative_english_minutes():
+    r = _p("in 5 minutes")
+    assert r.matched and r.recurrence is None
+    assert r.due_local == NOW + timedelta(minutes=5)
+
+
+def test_iso_timestamp_roundtrips_without_hhmm_misfire():
+    # Models often pass absolute ISO for "через 5 минут". The HH:MM heuristic
+    # used to misread …T19:55:00+03:00 as 55:00 → 07:00 next day.
+    r = _p("2026-07-17T19:55:00+03:00")
+    assert r.matched
+    assert r.due_local == datetime(2026, 7, 17, 19, 55, tzinfo=TZ)
+
+
+def test_iso_timestamp_naive_assumes_operator_zone():
+    r = _p("2026-07-17T10:30:00")
+    assert r.matched
+    assert r.due_local == datetime(2026, 7, 17, 10, 30, tzinfo=TZ)
+
+
 def test_tomorrow_at_ten():
     r = _p("напомни завтра в 10 про встречу")
     assert r.matched

@@ -198,7 +198,9 @@ def test_guest_transient_failure_retries_without_duplicate_messages(
     replay = asyncio.run(agent.chat("Повтори безопасно", **kwargs))
     messages = storage.list_messages(conversation_id)
 
-    assert replay == response
+    assert replay.answer == response.answer
+    assert replay.conversation_id == response.conversation_id
+    assert any(event.title == "Idempotent response replay" for event in replay.events)
     assert len(llm.calls) == 2
     assert [(item["role"], item["content"]) for item in messages] == [
         ("user", "Повтори безопасно"),

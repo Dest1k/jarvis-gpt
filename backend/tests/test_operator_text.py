@@ -22,6 +22,14 @@ def test_layout_does_not_destroy_english_commands():
     assert normalize_operator_message("open the file") == "open the file"
 
 
+def test_layout_preserves_russian_command_with_english_app_name():
+    # Whole-message EN→RU flip used to mangle "Microsoft Edge" into gibberish and
+    # break the native open-app route ("открой Ьшскщыщае Увпу").
+    assert try_layout_flip("открой Microsoft Edge") == "открой Microsoft Edge"
+    assert "microsoft edge" in normalize_operator_message("открой Microsoft Edge").lower()
+    assert "открой" in normalize_operator_message("открой Microsoft Edge")
+
+
 def test_layout_skips_paths():
     assert try_layout_flip(r"open C:\Users\Admin\file.txt") == r"open C:\Users\Admin\file.txt"
 

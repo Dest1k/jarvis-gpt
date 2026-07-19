@@ -151,7 +151,8 @@ def test_empty_allowlist_auto_registers_and_scopes_every_user_backend_call():
     ]
     assert chat_payloads[0]["message"] == "привет"
     assert "access_mode" not in chat_payloads[0]
-    assert "notification_chat_id" not in chat_payloads[0]
+    # Telegram-first delivery stamps the chat so reminders/progress fire back here.
+    assert chat_payloads[0].get("notification_chat_id") == 77
 
 
 def test_optional_allowlist_remains_a_restriction_not_a_registration_requirement():

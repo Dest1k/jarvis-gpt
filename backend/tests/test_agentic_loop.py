@@ -140,7 +140,9 @@ def test_owner_service_outage_retries_same_user_turn_without_fake_fallback(
     replay = asyncio.run(agent.chat("Ответь: готов", **kwargs))
 
     assert response.answer == "Готов."
-    assert replay == response
+    assert replay.answer == response.answer
+    assert replay.conversation_id == response.conversation_id
+    assert any(event.title == "Idempotent response replay" for event in replay.events)
     assert storage.list_messages(conversation_id) == rows_after_success
     assert [item["role"] for item in rows_after_success] == ["user", "assistant"]
     assert llm.calls == 2
@@ -1411,7 +1413,12 @@ def test_completed_operator_turn_fences_exact_http_response_retry(
     )
 
     assert runs == ["browser.click"]
-    assert retry == first
+    # Transport replay keeps the original answer and does not re-run tools; it
+    # surfaces an explicit idempotent marker event (may prepend to the original
+    # event list, so full ChatResponse equality is not required).
+    assert retry.answer == first.answer
+    assert retry.conversation_id == first.conversation_id
+    assert any(event.title == "Idempotent response replay" for event in retry.events)
 
     # The same words in a different Telegram update are a deliberate new turn.
     agent.llm = ToolThenAnswerLLM()
@@ -1488,7 +1495,9 @@ def test_safe_reminder_mutation_fences_exact_http_response_retry(
 
     assert runs == ["reminders.create"]
     assert len(storage.list_reminders(status="pending", limit=1000)) == 1
-    assert retry == first
+    assert retry.answer == first.answer
+    assert retry.conversation_id == first.conversation_id
+    assert any(event.title == "Idempotent response replay" for event in retry.events)
 
     asyncio.run(
         agent.chat(

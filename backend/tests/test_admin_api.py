@@ -389,7 +389,7 @@ def test_legacy_history_claim_rolls_back_on_foreign_tenant_owner(client):
     assert store.load_all()[818181] == "foreign-history"
 
 
-def test_telegram_sessions_isolate_memory_preferences_persona_and_files(client):
+def test_telegram_sessions_isolate_memory_preferences_persona_and_files(client, monkeypatch):
     first = _register_telegram_user(
         client, update_id=10_001, telegram_user_id=101_001
     )
@@ -415,6 +415,15 @@ def test_telegram_sessions_isolate_memory_preferences_persona_and_files(client):
     )
     first_headers = {"X-Jarvis-User-Session": first["session_token"]}
     second_headers = {"X-Jarvis-User-Session": second["session_token"]}
+
+    # LLM is disabled in the client fixture; stub completions so isolation
+    # assertions exercise real chat routes without a live model.
+    from jarvis_gpt.llm import LLMResult
+
+    async def _stub_complete(*_args, **_kwargs):
+        return LLMResult(ok=True, content="tenant isolation reply")
+
+    monkeypatch.setattr(app.state.agent.llm, "complete", _stub_complete)
 
     chat = client.post(
         "/api/chat",

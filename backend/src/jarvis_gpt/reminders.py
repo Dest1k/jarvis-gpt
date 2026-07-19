@@ -126,6 +126,34 @@ def _next_weekday_workday(now: datetime, at: dtime) -> datetime:
     return candidate
 
 
+def _parse_iso_when(text: str, *, tz) -> ParsedWhen | None:
+    """Accept model-emitted ISO-8601 timestamps (with or without timezone).
+
+    The weak local model often converts "через 5 минут" into an absolute ISO
+    string before calling reminders.create. That must round-trip exactly — never
+    fall through to the HH:MM heuristic that misreads ``…T19:55:00+03:00`` as
+    ``55:00`` → 07:00.
+    """
+
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    # Require a date-looking prefix so bare "19:55" stays on the time-of-day path.
+    if not re.match(r"^\d{4}-\d{2}-\d{2}[tT\s]", raw):
+        return None
+    candidate = raw.replace("Z", "+00:00").replace("z", "+00:00")
+    # fromisoformat accepts " " or "T" separators; normalize space → T for older Pythons.
+    if " " in candidate[:20] and "T" not in candidate[:20] and "t" not in candidate[:20]:
+        candidate = candidate.replace(" ", "T", 1)
+    try:
+        dt = datetime.fromisoformat(candidate)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=tz)
+    return ParsedWhen(dt.astimezone(tz), None, True)
+
+
 def parse_when(
     text: str,
     *,
@@ -133,10 +161,14 @@ def parse_when(
     tz=None,
     default_time: dtime = DEFAULT_TIME,
 ) -> ParsedWhen:
-    """Parse a Russian time phrase into a local due-time + optional recurrence."""
+    """Parse a Russian (or light English) time phrase into a local due-time + optional recurrence."""
 
     tz = tz or reminder_zone()
     now = now.astimezone(tz) if now else datetime.now(tz)
+    # Absolute ISO first — before any HH:MM / day.month heuristics can misfire on it.
+    iso = _parse_iso_when(text, tz=tz)
+    if iso is not None:
+        return iso
     t = _norm(text)
     tod = _time_of_day(t)
 
@@ -171,12 +203,29 @@ def parse_when(
     if m:
         secs = _UNIT_SECONDS[m.group(2)] * int(m.group(1))
         return ParsedWhen(now + timedelta(seconds=secs), None, True)
+    # English relative ("in 5 minutes") — models emit this under tool protocols.
+    m = re.search(
+        r"\bin\s+(\d+)\s*(minutes?|mins?|hours?|hrs?|days?|weeks?)\b",
+        t,
+    )
+    if m:
+        unit = m.group(2)
+        n = int(m.group(1))
+        if unit.startswith("min"):
+            secs = 60 * n
+        elif unit.startswith("hour") or unit.startswith("hr"):
+            secs = 3600 * n
+        elif unit.startswith("day"):
+            secs = 86400 * n
+        else:
+            secs = 604800 * n
+        return ParsedWhen(now + timedelta(seconds=secs), None, True)
     at = tod or default_time
     if "послезавтра" in t:
         return ParsedWhen(_at_on(now + timedelta(days=2), at), None, True)
-    if "завтра" in t:
+    if "завтра" in t or re.search(r"\btomorrow\b", t):
         return ParsedWhen(_at_on(now + timedelta(days=1), at), None, True)
-    if "сегодня" in t:
+    if "сегодня" in t or re.search(r"\btoday\b", t):
         return ParsedWhen(_at_on(now, at), None, True)
     wd = _weekday_in(t)
     if wd is not None:

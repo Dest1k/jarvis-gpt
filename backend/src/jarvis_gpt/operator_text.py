@@ -63,8 +63,11 @@ def _layout_score(text: str) -> tuple[int, int]:
     return len(_CYR.findall(text)), len(_LAT.findall(text))
 
 
-# Command stems that confirm a wrong-layout flip actually produced intent text.
-_RU_COMMAND_STEMS = (
+# Verb stems: confirm a wrong-layout flip produced a real command, and also
+# protect intentional bilingual phrases ("открой Microsoft Edge") from being
+# whole-message-translated. Nouns like "файл"/"file" alone must NOT block flip
+# of "jnrhjq файл" → "открой файл".
+_RU_VERB_STEMS = (
     "открой",
     "открыть",
     "найди",
@@ -79,24 +82,12 @@ _RU_COMMAND_STEMS = (
     "прочитай",
     "скачай",
     "отправь",
-    "память",
-    "файл",
-    "папку",
-    "папка",
-    "запусти",
     "выключи",
     "перезапусти",
-    "статус",
-    "помощь",
-    "справка",
-    "миссию",
-    "миссия",
-    "документ",
-    "архив",
     "распакуй",
     "распаковать",
 )
-_EN_COMMAND_STEMS = (
+_EN_VERB_STEMS = (
     "open",
     "find",
     "search",
@@ -110,6 +101,26 @@ _EN_COMMAND_STEMS = (
     "read",
     "download",
     "send",
+    "extract",
+    "restart",
+    "stop",
+    "run",
+)
+# Full stem set used to validate that a flipped candidate looks like intent text.
+_RU_COMMAND_STEMS = _RU_VERB_STEMS + (
+    "память",
+    "файл",
+    "папку",
+    "папка",
+    "статус",
+    "помощь",
+    "справка",
+    "миссию",
+    "миссия",
+    "документ",
+    "архив",
+)
+_EN_COMMAND_STEMS = _EN_VERB_STEMS + (
     "memory",
     "file",
     "folder",
@@ -118,10 +129,6 @@ _EN_COMMAND_STEMS = (
     "mission",
     "document",
     "archive",
-    "extract",
-    "restart",
-    "stop",
-    "run",
 )
 
 
@@ -136,6 +143,10 @@ def try_layout_flip(text: str) -> str:
     Only flip when the flipped candidate contains known command stems — pure
     English or pure Russian operator prose is left alone so legitimate
     bilingual commands are not destroyed.
+
+    Mixed RU+EN phrases ("открой Microsoft Edge") keep both scripts: the message
+    already carries a real command stem in the original script, so Latin app
+    names / proper nouns must not be whole-message-translated into gibberish.
     """
 
     raw = fold_operator_confusables(text)
@@ -146,12 +157,18 @@ def try_layout_flip(text: str) -> str:
         return raw
     cyr, lat = _layout_score(raw)
     if lat >= 3 and lat > cyr:
+        # Already has a Russian command verb → Latin remainder is intentional
+        # (app names / proper nouns), not a wrong-layout mistype.
+        if _contains_stem(raw, _RU_VERB_STEMS):
+            return raw
         flipped = raw.translate(_EN_TO_RU)
         if _contains_stem(flipped, _RU_COMMAND_STEMS) and not _contains_stem(
             raw, _EN_COMMAND_STEMS
         ):
             return flipped
     if cyr >= 3 and cyr > lat:
+        if _contains_stem(raw, _EN_VERB_STEMS):
+            return raw
         flipped = raw.translate(_RU_TO_EN)
         if _contains_stem(flipped, _EN_COMMAND_STEMS) and not _contains_stem(
             raw, _RU_COMMAND_STEMS

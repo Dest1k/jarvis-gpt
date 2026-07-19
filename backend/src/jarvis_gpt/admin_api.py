@@ -690,7 +690,16 @@ def create_user(request: Request, payload: UserCreateRequest) -> dict[str, Any]:
     if payload.kind == "telegram":
         if payload.telegram_user_id is None:
             raise HTTPException(status_code=400, detail="telegram_user_id is required")
-        realm_id = (payload.realm_id or "default").strip() or "default"
+        # Prefer explicit realm, else the live bot realm already bound in telegram_realms.
+        # Falling back to bare "default" mixed with telegram:<bot_id> rows blocks the
+        # bridge migration (legacy source + canonical both contain state).
+        realm_id = (payload.realm_id or "").strip()
+        if not realm_id:
+            with service.storage.locked_connection() as conn:
+                row = conn.execute(
+                    "SELECT realm_id FROM telegram_realms ORDER BY last_seen_at DESC LIMIT 1"
+                ).fetchone()
+            realm_id = str(row["realm_id"]) if row is not None else "default"
         try:
             identity = service.upsert_external_identity(
                 provider="telegram",

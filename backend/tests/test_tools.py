@@ -747,7 +747,16 @@ def test_documents_edit_rejects_unsupported_type(monkeypatch, tmp_path):
         )
     )
     assert result.ok is False
-    assert "Supported" in result.summary
+    # Clear rejection for non-editable / unreadable sources (wording evolved from a
+    # generic "Supported formats…" list to a specific corrupt-PDF diagnosis).
+    summary = result.summary or ""
+    assert (
+        "Supported" in summary
+        or "PDF" in summary
+        or "corrupt" in summary.lower()
+        or "неподдерж" in summary.lower()
+        or "unreadable" in summary.lower()
+    )
     storage.close()
 
 

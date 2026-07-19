@@ -149,6 +149,15 @@ def test_emit_streams_only_operator_visible_events(monkeypatch, tmp_path):
 
 def test_chat_turn_emits_no_approval_or_clarify_under_autonomy(monkeypatch, tmp_path):
     agent, storage = _autonomy_agent(monkeypatch, tmp_path, full_autonomy=True)
+
+    # LLM is disabled in the fixture; stub a one-shot complete so the chat turn
+    # exercises the autonomy posture without needing a live model.
+    from jarvis_gpt.llm import LLMResult
+
+    async def _stub_complete(*_args, **_kwargs):
+        return LLMResult(ok=True, content="Черновик отчёта по выручке готов.")
+
+    agent.llm.complete = _stub_complete  # type: ignore[method-assign]
     response = asyncio.run(agent.chat("подготовь отчёт по выручке за квартал"))
     assert all(event.type != "approval" for event in response.events)
     assert all(

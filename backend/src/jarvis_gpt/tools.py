@@ -6023,6 +6023,17 @@ def _reminders_create(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
         )
     parsed = parse_when(when, tz=tz)
     if not parsed.matched or parsed.due_local is None:
+        # Fall back to the free-text phrase when `when` alone is unparsable
+        # (e.g. English-only text that the model put only into `text`).
+        for fuller in (text, str(args.get("phrase") or "")):
+            if not fuller or fuller == when:
+                continue
+            alt = parse_when(fuller, tz=tz)
+            if alt.matched and alt.due_local is not None:
+                parsed = alt
+                when = fuller
+                break
+    if not parsed.matched or parsed.due_local is None:
         return ToolRunResponse(
             tool="reminders.create",
             ok=False,
@@ -6033,14 +6044,26 @@ def _reminders_create(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
         )
     # The model often splits "каждое утро в 9 …" into text + a bare when ("в 9"), losing the
     # recurrence. Recover it from the fuller phrase so a daily task doesn't become one-shot.
+    # Prefer a relative Russian phrase in `text` over a bare clock/`when` when both match:
+    # models frequently emit when=ISO while leaving "через 5 минут" only in text.
     if parsed.recurrence is None:
         for fuller in (text, str(args.get("phrase") or "")):
             if not fuller or fuller == when:
                 continue
             alt = parse_when(fuller, tz=tz)
-            if alt.matched and alt.recurrence is not None and alt.due_local is not None:
+            if not alt.matched or alt.due_local is None:
+                continue
+            if alt.recurrence is not None:
                 parsed = alt
                 break
+            # Relative "через N …" / "in N minutes" is more trustworthy than a
+            # wall-clock the model may have mis-converted.
+            fuller_low = fuller.casefold()
+            if re.search(r"через\s+\d+|in\s+\d+\s*(min|hour|day|week)", fuller_low):
+                when_low = when.casefold()
+                if not re.search(r"через\s+\d+|in\s+\d+\s*(min|hour|day|week)", when_low):
+                    parsed = alt
+                    break
     title = text or when
     # An explicit prompt arg wins; otherwise classify the text as task-or-nudge.
     explicit_prompt = str(args.get("prompt") or "").strip()
