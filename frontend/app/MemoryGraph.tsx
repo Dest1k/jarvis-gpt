@@ -33,15 +33,20 @@ import {
 const DEFAULT_REPEL = 5200;
 const DEFAULT_SPRING = 0.022;
 const DEFAULT_GRAVITY = 0.009;
-const DAMPING = 0.85;
+const DAMPING = 0.86;
 const MIN_D2 = 120;
 const MIN_ALPHA = 0.02;
-const COOL = 0.986;
-const REHEAT = 0.6;
+const COOL = 0.985;
+const REHEAT = 0.55;
 const WORLD_W = 900;
 const WORLD_H = 560;
-const MIN_ZOOM_SCALE = 0.15;
-const MAX_ZOOM_SCALE = 8;
+const MIN_ZOOM_SCALE = 0.12;
+const MAX_ZOOM_SCALE = 10;
+/** Hard cap so O(N^2) repulsion cannot fling nodes into infinity. */
+const MAX_SPEED = 28;
+const MAX_COORD = 2800;
+/** Re-frame the camera this often while the layout is still settling. */
+const FOLLOW_EVERY_FRAMES = 18;
 
 const REST_BY_KIND: Record<string, number> = {
   namespace: 62,
@@ -189,6 +194,10 @@ export function MemoryGraph({
   const contentBoundsRef = useRef({ w: WORLD_W, h: WORLD_H });
   const vbRef = useRef<ViewBox>({ x: -WORLD_W / 2, y: -WORLD_H / 2, w: WORLD_W, h: WORLD_H });
   const physicsRef = useRef({ repel: DEFAULT_REPEL, spring: DEFAULT_SPRING, gravity: DEFAULT_GRAVITY });
+  /** When true, camera tracks content while physics settles. User pan/zoom disables it. */
+  const cameraFollowRef = useRef(true);
+  const followFrameRef = useRef(0);
+  const fitViewRef = useRef<() => void>(() => undefined);
 
   const [vb, setVbState] = useState<ViewBox>(vbRef.current);
   const [hoverId, setHoverId] = useState<string | null>(null);
@@ -206,7 +215,8 @@ export function MemoryGraph({
 
   physicsRef.current = { repel, spring, gravity };
 
-  const setViewBox = useCallback((next: ViewBox) => {
+  const setViewBox = useCallback((next: ViewBox, options?: { fromUser?: boolean }) => {
+    if (options?.fromUser) cameraFollowRef.current = false;
     const clamped = clampViewBox(next, contentBoundsRef.current);
     vbRef.current = clamped;
     setVbState(clamped);
@@ -335,8 +345,18 @@ export function MemoryGraph({
         } else {
           node.vx = (node.vx - node.x * phys.gravity) * DAMPING;
           node.vy = (node.vy - node.y * phys.gravity) * DAMPING;
+          // Velocity / coordinate clamps: without them N² repulsion flings the
+          // graph outside the fitted viewBox ~1–2s after start (nodes "vanish").
+          if (node.vx > MAX_SPEED) node.vx = MAX_SPEED;
+          else if (node.vx < -MAX_SPEED) node.vx = -MAX_SPEED;
+          if (node.vy > MAX_SPEED) node.vy = MAX_SPEED;
+          else if (node.vy < -MAX_SPEED) node.vy = -MAX_SPEED;
           node.x += node.vx * alphaRef.current;
           node.y += node.vy * alphaRef.current;
+          if (node.x > MAX_COORD) node.x = MAX_COORD;
+          else if (node.x < -MAX_COORD) node.x = -MAX_COORD;
+          if (node.y > MAX_COORD) node.y = MAX_COORD;
+          else if (node.y < -MAX_COORD) node.y = -MAX_COORD;
         }
         if (node.el) {
           node.el.setAttribute(
@@ -357,10 +377,19 @@ export function MemoryGraph({
         line.setAttribute("y2", b.y.toFixed(2));
       });
       alphaRef.current *= COOL;
+      followFrameRef.current += 1;
+      // Keep the camera on the moving layout until the user takes over.
+      if (
+        cameraFollowRef.current &&
+        followFrameRef.current % FOLLOW_EVERY_FRAMES === 0
+      ) {
+        fitViewRef.current();
+      }
       if (alphaRef.current > MIN_ALPHA && !document.hidden && physicsRunning) {
         rafRef.current = requestAnimationFrame(step);
       } else {
         rafRef.current = null;
+        if (cameraFollowRef.current) fitViewRef.current();
       }
     };
     rafRef.current = requestAnimationFrame(step);
@@ -455,11 +484,14 @@ export function MemoryGraph({
       const base = { ...vbRef.current };
       const scale = meetScale(svg, base) || 1;
       const onMove = (moveEvent: PointerEvent) => {
-        setViewBox({
-          ...base,
-          x: base.x - (moveEvent.clientX - start.x) / scale,
-          y: base.y - (moveEvent.clientY - start.y) / scale
-        });
+        setViewBox(
+          {
+            ...base,
+            x: base.x - (moveEvent.clientX - start.x) / scale,
+            y: base.y - (moveEvent.clientY - start.y) / scale
+          },
+          { fromUser: true }
+        );
       };
       const onUp = () => {
         window.removeEventListener("pointermove", onMove);
@@ -523,18 +555,21 @@ export function MemoryGraph({
   );
 
   const zoomAt = useCallback(
-    (clientX: number, clientY: number, factor: number) => {
+    (clientX: number, clientY: number, factor: number, fromUser = true) => {
       const view = vbRef.current;
       if (view.w <= 0 || view.h <= 0) return;
       const focus = screenToWorld(clientX, clientY);
       const newW = view.w * factor;
       const newH = view.h * factor;
-      setViewBox({
-        w: newW,
-        h: newH,
-        x: focus.x - (focus.x - view.x) * (newW / view.w),
-        y: focus.y - (focus.y - view.y) * (newH / view.h)
-      });
+      setViewBox(
+        {
+          w: newW,
+          h: newH,
+          x: focus.x - (focus.x - view.x) * (newW / view.w),
+          y: focus.y - (focus.y - view.y) * (newH / view.h)
+        },
+        { fromUser }
+      );
     },
     [screenToWorld, setViewBox]
   );
@@ -552,62 +587,70 @@ export function MemoryGraph({
     return () => svg.removeEventListener("wheel", handler);
   }, [zoomAt]);
 
-  const fitView = useCallback(() => {
-    const arr = Array.from(simRef.current.values());
-    if (!arr.length) {
-      contentBoundsRef.current = { w: WORLD_W, h: WORLD_H };
-      setViewBox({ x: -WORLD_W / 2, y: -WORLD_H / 2, w: WORLD_W, h: WORLD_H });
-      return;
-    }
-    let minX = Infinity;
-    let minY = Infinity;
-    let maxX = -Infinity;
-    let maxY = -Infinity;
-    for (const node of arr) {
-      minX = Math.min(minX, node.x);
-      minY = Math.min(minY, node.y);
-      maxX = Math.max(maxX, node.x);
-      maxY = Math.max(maxY, node.y);
-    }
-    const pad = 80;
-    const rawW = Math.max(maxX - minX + pad * 2, 240);
-    const rawH = Math.max(maxY - minY + pad * 2, 180);
-    contentBoundsRef.current = { w: rawW, h: rawH };
-    // Match canvas aspect so meet-letterboxing stays minimal after fit.
-    const stage = stageRef.current?.getBoundingClientRect();
-    const aspect =
-      stage && stage.width > 0 && stage.height > 0
-        ? stage.height / stage.width
-        : WORLD_H / WORLD_W;
-    let w = rawW;
-    let h = rawW * aspect;
-    if (h < rawH) {
-      h = rawH;
-      w = rawH / aspect;
-    }
-    const cx = (minX + maxX) / 2;
-    const cy = (minY + maxY) / 2;
-    setViewBox({ x: cx - w / 2, y: cy - h / 2, w, h });
-  }, [setViewBox]);
+  const fitView = useCallback(
+    (opts?: { userRequest?: boolean }) => {
+      if (opts?.userRequest) cameraFollowRef.current = true;
+      const arr = Array.from(simRef.current.values());
+      if (!arr.length) {
+        contentBoundsRef.current = { w: WORLD_W, h: WORLD_H };
+        setViewBox({ x: -WORLD_W / 2, y: -WORLD_H / 2, w: WORLD_W, h: WORLD_H });
+        return;
+      }
+      let minX = Infinity;
+      let minY = Infinity;
+      let maxX = -Infinity;
+      let maxY = -Infinity;
+      for (const node of arr) {
+        minX = Math.min(minX, node.x);
+        minY = Math.min(minY, node.y);
+        maxX = Math.max(maxX, node.x);
+        maxY = Math.max(maxY, node.y);
+      }
+      if (!Number.isFinite(minX) || !Number.isFinite(maxX)) return;
+      const pad = 90;
+      const rawW = Math.max(maxX - minX + pad * 2, 280);
+      const rawH = Math.max(maxY - minY + pad * 2, 200);
+      contentBoundsRef.current = { w: rawW, h: rawH };
+      // Match canvas aspect so meet-letterboxing stays minimal after fit.
+      const stage = stageRef.current?.getBoundingClientRect();
+      const aspect =
+        stage && stage.width > 40 && stage.height > 40
+          ? stage.height / stage.width
+          : WORLD_H / WORLD_W;
+      let w = rawW;
+      let h = rawW * aspect;
+      if (h < rawH) {
+        h = rawH;
+        w = rawH / aspect;
+      }
+      const cx = (minX + maxX) / 2;
+      const cy = (minY + maxY) / 2;
+      // fromUser:false — automatic re-frame must not disable camera follow.
+      setViewBox({ x: cx - w / 2, y: cy - h / 2, w, h });
+    },
+    [setViewBox]
+  );
+  fitViewRef.current = () => fitView();
 
+  // Initial frame after topology changes: follow camera + reheat layout.
   useEffect(() => {
-    const timer = window.setTimeout(fitView, 900);
-    return () => window.clearTimeout(timer);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [vault.stats.nodes, nodes.length]);
+    cameraFollowRef.current = true;
+    followFrameRef.current = 0;
+    const kick = window.setTimeout(() => fitView(), 50);
+    return () => window.clearTimeout(kick);
+  }, [vault.stats.nodes, nodes.length, fitView]);
 
-  // Keep canvas full-height when the stage resizes (exclusive graph page).
+  // When the stage size changes, keep content framed if the user hasn't taken over.
   useEffect(() => {
     const stage = stageRef.current;
     if (!stage || typeof ResizeObserver === "undefined") return undefined;
     const observer = new ResizeObserver(() => {
-      // Re-clamp current view against new stage aspect without jumping focus.
-      const view = vbRef.current;
-      setViewBox({ ...view });
+      if (cameraFollowRef.current) fitView();
+      else setViewBox({ ...vbRef.current });
     });
     observer.observe(stage);
     return () => observer.disconnect();
-  }, [setViewBox]);
+  }, [fitView, setViewBox]);
 
   const toggleKind = (kind: string) => {
     setHiddenKinds((current) => {
@@ -871,7 +914,11 @@ export function MemoryGraph({
         <section className="mg-settings-block">
           <h3>Камера</h3>
           <div className="mg-settings-actions">
-            <button type="button" className="mg-settings-action" onClick={fitView}>
+            <button
+              type="button"
+              className="mg-settings-action"
+              onClick={() => fitView({ userRequest: true })}
+            >
               <Focus size={14} /> Вписать граф
             </button>
             <button
@@ -927,7 +974,11 @@ export function MemoryGraph({
             </span>
           </div>
           <div className="mg-main-actions">
-            <button type="button" className="mg-fit" onClick={fitView}>
+            <button
+              type="button"
+              className="mg-fit"
+              onClick={() => fitView({ userRequest: true })}
+            >
               <Focus size={13} /> Вписать
             </button>
           </div>
