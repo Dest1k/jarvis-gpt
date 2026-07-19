@@ -10984,6 +10984,9 @@ class AgentRuntime:
             # Bind the origin conversation for every tool (not only authorized ones) so a
             # safe tool such as reminders.create can record where a fired reminder posts back.
             "conversation_id": context.conversation_id,
+            # Telegram (and similar) surfaces stamp the chat id so scheduled nudges /
+            # agent tasks fire back into the same phone conversation.
+            "notification_chat_id": context.notification_chat_id,
         }
         if effect_key is not None:
             context.operator_used_effects.add(effect_key)

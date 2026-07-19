@@ -446,7 +446,8 @@ def test_text_turn_relays_to_backend_and_replies():
     assert chat_bodies[0]["message"] == "здравствуй"
     assert chat_bodies[0]["request_id"] == "telegram:700001:1"
     assert "access_mode" not in chat_bodies[0]
-    assert "notification_chat_id" not in chat_bodies[0]
+    # Telegram-first: stamp chat id so reminders fire back into this DM.
+    assert chat_bodies[0]["notification_chat_id"] == 42
     # The bridge allocates the id before the backend call, closing the crash window where
     # a completed first turn could be orphaned before its returned id was remembered.
     assert chat_bodies[0]["conversation_id"].startswith("tg_")
@@ -496,7 +497,7 @@ def test_non_owner_allowed_chat_uses_backend_scoped_surface():
     assert len(chat_bodies) == 1
     assert chat_bodies[0]["message"] == "привет"
     assert "access_mode" not in chat_bodies[0]
-    assert "notification_chat_id" not in chat_bodies[0]
+    assert chat_bodies[0]["notification_chat_id"] == 99
     assert chat_bodies[0]["conversation_id"].startswith("tg_")
     assert api_calls == ["/api/files", "/api/chat", "/api/files"]
 

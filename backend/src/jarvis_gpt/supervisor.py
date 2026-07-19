@@ -588,14 +588,20 @@ class RuntimeSupervisor:
                 run = asyncio.create_task(self._run_scheduled_task(reminder))
                 self._scheduled_runs.add(run)
                 run.add_done_callback(self._scheduled_runs.discard)
-            elif conversation_id:
+            else:
+                # PassivePassive nudge** ("напомни через час…"): post into the bound
+                # conversation *and* push Telegram when deliver=telegram. Without the
+                # push, Telegram-first users never see the reminder until they open web.
+                if conversation_id:
+                    with suppress(Exception):
+                        self.storage.add_message(
+                            conversation_id=str(conversation_id),
+                            role="assistant",
+                            content=f"Напоминание: {reminder['text']}",
+                            metadata={"kind": "reminder", "reminder_id": reminder["id"]},
+                        )
                 with suppress(Exception):
-                    self.storage.add_message(
-                        conversation_id=str(conversation_id),
-                        role="assistant",
-                        content=f"Напоминание: {reminder['text']}",
-                        metadata={"kind": "reminder", "reminder_id": reminder["id"]},
-                    )
+                    await self._deliver_passive_reminder(reminder)
             if self.bus is not None:
                 with suppress(Exception):
                     await self.bus.publish(
@@ -611,6 +617,38 @@ class RuntimeSupervisor:
                             },
                         }
                     )
+
+    async def _deliver_passive_reminder(self, reminder: dict[str, Any]) -> bool:
+        """Push a one-shot/recurring *nudge* to the owner's Telegram when configured.
+
+        Returns True when at least one Telegram chat received the text. Fail-soft:
+        missing token/allowlist or transport errors yield False without raising.
+        """
+
+        payload = reminder.get("payload") if isinstance(reminder.get("payload"), dict) else {}
+        deliver = str(payload.get("deliver") or "telegram").strip().lower()
+        if deliver in {"none", "off", "conversation", "web", "0", "false"}:
+            return False
+        text = str(reminder.get("text") or "").strip()
+        if not text:
+            return False
+        body = f"⏰ Напоминание: {text}"[:3900]
+        target_chat_id = payload.get("telegram_chat_id")
+        requested: tuple[int, ...] = ()
+        if isinstance(target_chat_id, bool):
+            target_chat_id = None
+        if target_chat_id is not None:
+            try:
+                requested = (int(target_chat_id),)
+            except (TypeError, ValueError):
+                requested = ()
+        if not requested:
+            requested = _actor_telegram_chat_ids(self.storage)
+        if requested:
+            return await push_telegram_alert(body, target_chat_ids=requested)
+        if current_user_id() == LEGACY_OWNER_USER_ID:
+            return await push_telegram_alert(body, target_chat_ids=None)
+        return False
 
     async def _run_scheduled_task(self, reminder: dict[str, Any]) -> None:
         """Run one scheduled agent task: a full agent turn whose answer is pushed to the owner.
@@ -647,11 +685,17 @@ class RuntimeSupervisor:
         if answer:
             if str(payload.get("deliver") or "telegram") == "telegram":
                 with suppress(Exception):
-                    actor_targets = _actor_telegram_chat_ids(self.storage)
-                    if actor_targets or current_user_id() == LEGACY_OWNER_USER_ID:
+                    target_ids: tuple[int, ...] = ()
+                    raw_chat = payload.get("telegram_chat_id")
+                    if not isinstance(raw_chat, bool) and raw_chat is not None:
+                        with suppress(TypeError, ValueError):
+                            target_ids = (int(raw_chat),)
+                    if not target_ids:
+                        target_ids = _actor_telegram_chat_ids(self.storage)
+                    if target_ids or current_user_id() == LEGACY_OWNER_USER_ID:
                         delivered = await push_telegram_alert(
                             f"🕒 {label}\n\n{answer}"[:3900],
-                            target_chat_ids=actor_targets or None,
+                            target_chat_ids=target_ids or None,
                         )
             conversation_id = reminder.get("conversation_id")
             if conversation_id:

@@ -351,6 +351,10 @@ class ToolContext:
     mission_id: str | None = None
     task_id: str | None = None
     conversation_id: str | None = None
+    # When the turn originated from Telegram (or another push surface), tools that
+    # schedule later notifications (reminders, watches) stamp this chat id so the
+    # supervisor can deliver back to the same phone conversation.
+    notification_chat_id: int | None = None
     actor: ActorContext = field(default_factory=current_actor)
     authorization_decision: AuthorizationDecision | None = None
 
@@ -708,6 +712,7 @@ class ToolRegistry:
         conversation_id: str | None = None,
         user_message_id: str | None = None,
         authorization: OperatorTurnAuthorization | None = None,
+        notification_chat_id: int | None = None,
     ) -> ToolRunResponse:
         # SPARK-0009: canonicalize only filesystem.mkdir → fs.mkdir before lookup/approval.
         name, args = _canonicalize_tool_invocation(name, arguments or {})
@@ -912,6 +917,7 @@ class ToolRegistry:
                 mission_id=mission_id,
                 task_id=task_id,
                 conversation_id=conversation_id,
+                notification_chat_id=notification_chat_id,
                 actor=actor,
                 authorization_decision=permission_decision,
             )
@@ -6059,6 +6065,27 @@ def _reminders_create(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
             "prompt": task_prompt,
             "deliver": str(args.get("deliver") or "telegram"),
         }
+    # Telegram-first: every reminder (passive nudge or scheduled task) stamps where
+    # the fire should land. Without this the supervisor only writes to the web
+    # conversation and the phone never hears about "напомни через час".
+    delivery: dict[str, Any] = {
+        "deliver": str(args.get("deliver") or "telegram"),
+    }
+    chat_id = args.get("telegram_chat_id")
+    if chat_id is None:
+        chat_id = ctx.notification_chat_id
+    if isinstance(chat_id, bool):
+        chat_id = None
+    if chat_id is not None:
+        try:
+            delivery["telegram_chat_id"] = int(chat_id)
+        except (TypeError, ValueError):
+            pass
+    if payload is None:
+        payload = delivery
+    else:
+        payload = {**delivery, **payload}
+        payload.setdefault("deliver", delivery["deliver"])
     reminder = ctx.storage.create_reminder(
         text=title,
         due_at=to_utc_iso(parsed.due_local),
@@ -6069,18 +6096,19 @@ def _reminders_create(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
     )
     local = render_local(reminder["due_at"], tz=tz)
     suffix = " (повтор)" if parsed.recurrence else ""
-    if payload:
+    is_task = bool(payload and payload.get("kind") == "agent_task")
+    if is_task:
         summary = (
             f"Плановая задача — {local}{suffix}: «{task_prompt}». "
-            "Выполню и пришлю результат."
+            "Выполню и пришлю результат в Telegram."
         )
     else:
-        summary = f"Напомню: {title} — {local}{suffix}"
+        summary = f"Напомню в Telegram: {title} — {local}{suffix}"
     return ToolRunResponse(
         tool="reminders.create",
         ok=True,
         summary=summary,
-        data={"reminder": reminder, "due_local": local, "agent_task": bool(payload)},
+        data={"reminder": reminder, "due_local": local, "agent_task": is_task},
     )
 
 

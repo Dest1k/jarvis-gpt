@@ -138,11 +138,20 @@ def test_reminders_create_recovers_recurrence_from_text(monkeypatch, tmp_path):
 def test_reminders_create_plain_nudge_has_no_task_payload(monkeypatch, tmp_path):
     tools, storage = _registry(monkeypatch, tmp_path)
     result = asyncio.run(
-        tools.run("reminders.create", {"text": "напомни завтра в 10 позвонить маме"})
+        tools.run(
+            "reminders.create",
+            {"text": "напомни завтра в 10 позвонить маме"},
+            notification_chat_id=4242,
+        )
     )
     assert result.ok is True
     assert result.data["agent_task"] is False
-    assert not result.data["reminder"]["payload"]
+    payload = result.data["reminder"]["payload"] or {}
+    # PassivePassive nudge** is not an agent_task, but still stamps Telegram delivery so the
+    # phone gets the fire (Telegram-first).
+    assert payload.get("kind") != "agent_task"
+    assert payload.get("deliver") == "telegram"
+    assert payload.get("telegram_chat_id") == 4242
     storage.close()
 
 
@@ -172,6 +181,26 @@ def test_plain_reminder_does_not_run_agent(monkeypatch, tmp_path):
         text="позвонить маме",
         due_at="2000-01-01T00:00:00+00:00",
         source_text="позвонить маме",
+        payload={"deliver": "telegram", "telegram_chat_id": 9001},
+    )
+
+    asyncio.run(_fire_and_drain(supervisor))
+
+    assert agent.calls == []
+    # PassiveNudge** must still push to Telegram (no agent turn).
+    assert any("позвонить маме" in text for text in pushes)
+    assert any(text.startswith("⏰") for text in pushes)
+
+
+def test_plain_reminder_respects_deliver_none(monkeypatch, tmp_path):
+    agent = _FakeAgent()
+    supervisor, storage = _supervisor(monkeypatch, tmp_path, agent=agent)
+    pushes = _patch_push(monkeypatch)
+    storage.create_reminder(
+        text="тихий пинг только в web",
+        due_at="2000-01-01T00:00:00+00:00",
+        source_text="тихий",
+        payload={"deliver": "none"},
     )
 
     asyncio.run(_fire_and_drain(supervisor))

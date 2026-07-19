@@ -119,6 +119,15 @@ Shipped on `main`: **Clipboard + richer FS + PDF edit** (routine speed):
 - PDF `documents.edit` (regenerate-style replace/append/set_text).
 - Clipboard transform requests («переведи что в буфере…») no longer short-circuit to bare read.
 
+## Progress — Telegram-first 2026-07-19
+
+Shipped on `main` (phone as primary UI):
+- **Passive reminders fire to Telegram** (`⏰ …`), not only web conversation.
+- `reminders.create` stamps `deliver=telegram` + `telegram_chat_id` from the turn.
+- Bridge posts `notification_chat_id` on every `/api/chat` so the stamp works.
+- **Progress ping** after ~12s on long turns («Ещё работаю…»).
+- **`/stop`** cancels waiting on the bridge (bypasses chat lock).
+
 ## More ideas — brainstorm 2026-07-18 (new features)
 
 **Proactive (Jarvis acts, not only on request):**

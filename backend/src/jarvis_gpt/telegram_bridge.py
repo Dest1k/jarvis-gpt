@@ -37,6 +37,7 @@ from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from urllib.parse import quote, urlsplit
 
 import httpx
@@ -101,6 +102,10 @@ TG_DOC_CAP = 45 * 1024 * 1024
 TYPING_REFRESH_SEC = 4.0
 _START_COMMANDS = {"/start"}
 _RESET_COMMANDS = {"/new", "/reset", "/новый", "/сброс"}
+_STOP_COMMANDS = {"/stop", "/cancel", "/отмена", "/стоп"}
+# After this many seconds of a still-running agent turn, ping the chat so a long
+# research/document job does not look frozen on the phone.
+_PROGRESS_STATUS_AFTER_SEC = 12.0
 _USER_SESSION_HEADER = "X-Jarvis-User-Session"
 _BRIDGE_SECRET_HEADER = "X-Jarvis-Bridge-Secret"
 _BRIDGE_HOT_CACHE_SIZE = 4_096
@@ -1750,6 +1755,9 @@ class TelegramBridge:
         self._update_tasks: set[asyncio.Task[None]] = set()
         self._intake_windows: OrderedDict[int, tuple[float, int]] = OrderedDict()
         self._closing = False
+        # Active agent-turn tasks per chat (for /stop). Not the queue wrapper — the
+        # work inside the single-flight lock, so cancel can interrupt a long /api/chat.
+        self._active_turn_tasks: dict[int, asyncio.Task[Any]] = {}
 
     def _initialize_bot_identity(self, me: object) -> None:
         actual_bot_id = me.get("id") if isinstance(me, dict) else None
@@ -1856,6 +1864,17 @@ class TelegramBridge:
         if not self._chat_is_allowed(chat_id):
             log.warning("DENIED Telegram user_id=%s by optional allowlist", chat_id)
             return False
+        # /stop must not sit behind a long agent turn on the same chat lock.
+        text = ""
+        if isinstance(message, dict):
+            text = str(message.get("text") or message.get("caption") or "")
+        if _telegram_command(text) in _STOP_COMMANDS:
+            task = asyncio.create_task(
+                self._handle_stop_command(chat_id, lease_token=lease_token, update=update)
+            )
+            self._update_tasks.add(task)
+            task.add_done_callback(self._on_update_task_done)
+            return True
         if not self._consume_bridge_intake(chat_id):
             log.warning("THROTTLED Telegram user_id=%s at bridge intake", chat_id)
             return False
@@ -1875,6 +1894,49 @@ class TelegramBridge:
         task.add_done_callback(self._on_update_task_done)
         return True
 
+    async def _handle_stop_command(
+        self,
+        chat_id: int,
+        *,
+        lease_token: str | None,
+        update: dict,
+    ) -> None:
+        """Cancel an in-flight agent turn for this chat without waiting on the chat lock."""
+
+        terminal_status = "completed"
+        error: str | None = None
+        try:
+            active = self._active_turn_tasks.get(chat_id)
+            if active is not None and not active.done():
+                active.cancel()
+                with suppress(asyncio.CancelledError):
+                    await active
+                await self._send(
+                    chat_id,
+                    "Остановил ожидание ответа. Backend может ещё досчитать в фоне — "
+                    "повторный результат проигнорирую, если придёт после /stop.",
+                )
+            else:
+                await self._send(chat_id, "Сейчас нет активного запроса.")
+        except Exception as exc:  # noqa: BLE001
+            terminal_status = "failed"
+            error = type(exc).__name__
+            log.exception("stop command failed for chat_id=%s", chat_id)
+        finally:
+            update_id = update.get("update_id")
+            if (
+                lease_token
+                and self._conversation_store is not None
+                and isinstance(update_id, int)
+                and not isinstance(update_id, bool)
+            ):
+                self._conversation_store.finalize_update(
+                    update_id,
+                    lease_token,
+                    status=terminal_status,
+                    error=error,
+                )
+
     def _on_update_task_done(self, task: asyncio.Task[None]) -> None:
         self._update_tasks.discard(task)
         self._drain_durable_inbox()
@@ -1893,7 +1955,14 @@ class TelegramBridge:
             # Wait for this user's single-flight lock *before* consuming a global
             # worker slot, otherwise one user's queued turn can block another user.
             async with lock, self._update_slots:
-                outcome = await self._handle(update)
+                current = asyncio.current_task()
+                if current is not None:
+                    self._active_turn_tasks[chat_id] = current
+                try:
+                    outcome = await self._handle(update)
+                finally:
+                    if self._active_turn_tasks.get(chat_id) is current:
+                        self._active_turn_tasks.pop(chat_id, None)
                 if outcome is False:
                     terminal_status = "failed"
                     error = "transient_backend_failure"
@@ -2164,6 +2233,20 @@ class TelegramBridge:
                 await self._tg("sendChatAction", chat_id=chat_id, action="typing")
             await asyncio.sleep(TYPING_REFRESH_SEC)
 
+    async def _progress_status(self, chat_id: int) -> None:
+        """One mid-turn status ping so long Telegram turns do not feel dead."""
+
+        try:
+            await asyncio.sleep(_PROGRESS_STATUS_AFTER_SEC)
+        except asyncio.CancelledError:
+            raise
+        with suppress(httpx.HTTPError, RuntimeError):
+            await self._send_piece(
+                chat_id,
+                "⏳ Ещё работаю… Отвечу, как закончу. `/stop` — отменить ожидание.",
+                html=False,
+            )
+
     # -- main loop ------------------------------------------------------------
     async def run(self) -> None:
         me = await self._tg("getMe")
@@ -2276,7 +2359,16 @@ class TelegramBridge:
         text = (message.get("text") or message.get("caption") or "").strip()
         command = _telegram_command(text)
         if command in _START_COMMANDS:
-            await self._send(chat_id, "Джарвис на связи.")
+            await self._send(
+                chat_id,
+                "Джарвис на связи.\n"
+                "Команды: /new — новый разговор, /stop — отменить ожидание.",
+            )
+            return
+        if command in _STOP_COMMANDS:
+            # Prefer the lock-bypassing enqueue path; this branch is a fallback when
+            # _handle is invoked directly (tests / embedded mode).
+            await self._send(chat_id, "Сейчас нет активного запроса.")
             return
         if command in _RESET_COMMANDS:
             access_mode = "owner" if session.preset_key == "owner" else "guest"
@@ -2400,11 +2492,17 @@ class TelegramBridge:
             payload: dict[str, object] = {
                 "message": text,
                 "conversation_id": conversation_id,
+                # Stamp the Telegram chat so reminders/scheduled tasks fire back here.
+                "notification_chat_id": int(chat_id),
             }
             if request_id:
                 payload["request_id"] = request_id
             if attachments:
                 payload["attachments"] = attachments
+            progress_task = asyncio.create_task(
+                self._progress_status(chat_id),
+                name=f"tg-progress-{chat_id}",
+            )
             try:
                 response = await self.api.post(
                     "/api/chat",
@@ -2420,6 +2518,10 @@ class TelegramBridge:
                 if _retryable_backend_http_error(exc):
                     return False
                 raise
+            finally:
+                progress_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await progress_task
         finally:
             typing.cancel()
             with suppress(asyncio.CancelledError):
