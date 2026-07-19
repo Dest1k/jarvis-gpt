@@ -1,9 +1,46 @@
 from __future__ import annotations
 
+import hashlib
+import importlib.util
 import json
+import re
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
+VLLM_PATCHER_PATH = REPO_ROOT / "docker/vllm-asyncio/patch_serve.py"
+
+
+def _load_vllm_patcher():
+    spec = importlib.util.spec_from_file_location("jarvis_vllm_serve_patcher", VLLM_PATCHER_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+VLLM_PATCHER = _load_vllm_patcher()
+
+_DOTENV_ASSIGNMENT_RE = re.compile(
+    r"^[ \t]*(?:export[ \t]+)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)[ \t]*=",
+    flags=re.MULTILINE,
+)
+
+_VLLM_SERVE_FIXTURE = b"""\
+import argparse
+import uvloop
+
+
+async def run_server(args):
+    return args
+
+
+def main(args):
+    if args:
+        if args.enabled:
+            uvloop.run(run_server(args))
+"""
 
 
 def _read(relative_path: str) -> str:
@@ -79,18 +116,124 @@ def test_compose_defaults_to_loopback_and_propagates_build_contract() -> None:
 def test_qwen_vllm_derivative_is_digest_pinned_and_patches_only_http_loop() -> None:
     dockerfile = _read("docker/vllm-asyncio/Dockerfile")
 
-    assert (
-        "FROM vllm/vllm-openai@sha256:"
-        "e4f88a835143cd22aee2397a26ec6bb80b3a4a6fe0c882bcbc63822904766089"
-        in dockerfile
+    # Keep the derivative mechanically auditable: no continuation/heredoc can hide
+    # commands, parser directives cannot change how the file is read, and every
+    # non-comment line must be one of the three reviewed instructions below.
+    assert "\\\n" not in dockerfile
+    assert not re.search(r"^[ \t]*#[ \t]*(?:escape|syntax)[ \t]*=", dockerfile, re.MULTILINE)
+    instruction_lines = [
+        line.strip()
+        for line in dockerfile.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    instructions = []
+    for line in instruction_lines:
+        match = re.fullmatch(r"(?i)([a-z][a-z0-9]*)[ \t]+(.+)", line)
+        assert match is not None, f"unparsed Dockerfile content: {line!r}"
+        instructions.append((match.group(1).upper(), match.group(2)))
+
+    assert len(instructions) == 3
+    from_instruction, copy_instruction, run_instruction = instructions
+    assert from_instruction == (
+        "FROM",
+        "vllm/vllm-openai:v0.25.1@sha256:"
+        "e4f88a835143cd22aee2397a26ec6bb80b3a4a6fe0c882bcbc63822904766089",
     )
-    assert "abaa0233f6e00ac8acbd528c3cc6a63d6e5ee09e5baedffd922d961eefe91af8" in dockerfile
-    assert "sha256sum -c -" in dockerfile
-    assert "uvloop\\.run(run_server(args))" in dockerfile
-    assert "asyncio.run(run_server(args))" in dockerfile
-    assert "grep -Fxc '            uvloop.run(run_server(args))'" in dockerfile
-    assert "grep -Fxc '            asyncio.run(run_server(args))'" in dockerfile
-    assert "pip install" not in dockerfile
+    assert copy_instruction == (
+        "COPY",
+        "docker/vllm-asyncio/patch_serve.py "
+        "/usr/local/share/jarvis/patch_vllm_serve.py",
+    )
+    assert run_instruction[0] == "RUN"
+    assert json.loads(run_instruction[1]) == [
+        "python3",
+        "/usr/local/share/jarvis/patch_vllm_serve.py",
+        "/usr/local/lib/python3.12/dist-packages/vllm/entrypoints/cli/serve.py",
+    ]
+
+
+def test_vllm_serve_patcher_produces_only_the_reviewed_byte_changes(monkeypatch) -> None:
+    source_sha256 = hashlib.sha256(_VLLM_SERVE_FIXTURE).hexdigest()
+    monkeypatch.setattr(VLLM_PATCHER, "EXPECTED_SOURCE_SHA256", source_sha256)
+
+    patched = VLLM_PATCHER.patch_source(_VLLM_SERVE_FIXTURE)
+
+    expected = _VLLM_SERVE_FIXTURE.replace(
+        b"import argparse\n",
+        b"import argparse\nimport asyncio\n",
+    ).replace(
+        b"            uvloop.run(run_server(args))\n",
+        b"            asyncio.run(run_server(args))\n",
+    )
+    assert patched == expected
+
+
+def test_vllm_serve_patcher_rejects_hash_mismatch_without_writing(tmp_path: Path) -> None:
+    target = tmp_path / "serve.py"
+    target.write_bytes(_VLLM_SERVE_FIXTURE)
+
+    with pytest.raises(VLLM_PATCHER.PatchError, match="unexpected upstream serve.py SHA256"):
+        VLLM_PATCHER.patch_file(target)
+
+    assert target.read_bytes() == _VLLM_SERVE_FIXTURE
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        (
+            _VLLM_SERVE_FIXTURE.replace(
+                b"import uvloop\n",
+                b"import argparse\nimport uvloop\n",
+            ),
+            "expected exactly one argparse import anchor; found 2",
+        ),
+        (
+            _VLLM_SERVE_FIXTURE.replace(
+                b"            uvloop.run(run_server(args))\n",
+                b"            return None\n",
+            ),
+            "expected exactly one uvloop runner; found 0",
+        ),
+        (
+            _VLLM_SERVE_FIXTURE.replace(
+                b"            uvloop.run(run_server(args))\n",
+                b"            uvloop.run(run_server(args))\n"
+                b"            uvloop.run(run_server(args))\n",
+            ),
+            "expected exactly one uvloop runner; found 2",
+        ),
+    ],
+)
+def test_vllm_serve_patcher_rejects_missing_or_ambiguous_anchors(
+    source: bytes,
+    message: str,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(VLLM_PATCHER, "EXPECTED_SOURCE_SHA256", hashlib.sha256(source).hexdigest())
+    with pytest.raises(VLLM_PATCHER.PatchError, match=re.escape(message)):
+        VLLM_PATCHER.patch_source(source)
+
+
+def test_example_environment_does_not_override_profile_specific_vllm_image() -> None:
+    example = _read(".env.example")
+
+    assignments = {match.group("name") for match in _DOTENV_ASSIGNMENT_RE.finditer(example)}
+    assert "JARVIS_VLLM_IMAGE" not in assignments
+
+
+def test_dotenv_assignment_detection_covers_export_and_whitespace_forms() -> None:
+    assignments = """
+JARVIS_VLLM_IMAGE=first
+  JARVIS_VLLM_IMAGE = second
+export JARVIS_VLLM_IMAGE=third
+\texport\tJARVIS_VLLM_IMAGE \t= fourth
+# JARVIS_VLLM_IMAGE=commented
+  # export JARVIS_VLLM_IMAGE=also_commented
+"""
+
+    matches = [match.group("name") for match in _DOTENV_ASSIGNMENT_RE.finditer(assignments)]
+    assert matches == ["JARVIS_VLLM_IMAGE"] * 4
 
 
 def test_chromium_seccomp_profile_keeps_default_deny_and_allows_namespaces() -> None:

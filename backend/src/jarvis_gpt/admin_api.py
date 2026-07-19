@@ -919,8 +919,10 @@ def update_preset(
 
 
 def _telegram_realm_id() -> str:
-    value = os.environ.get("JARVIS_TELEGRAM_REALM_ID", "default").strip()
-    return value[:120] or "default"
+    value = os.environ.get("JARVIS_TELEGRAM_REALM_ID", "default").strip() or "default"
+    if len(value) > 120:
+        raise RuntimeError("JARVIS_TELEGRAM_REALM_ID must not exceed 120 characters")
+    return value
 
 
 def _telegram_session_ttl() -> int:

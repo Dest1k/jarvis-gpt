@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import re
+from pathlib import Path
 
 from jarvis_gpt.cli import cmd_profiles
 from jarvis_gpt.config import PROFILES, VllmExtraArgs, load_settings, profile_public_dict
@@ -102,9 +104,22 @@ def test_qwen_vl_profile_selects_nvfp4_capable_vllm_image(monkeypatch, tmp_path)
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setenv("JARVIS_PROFILE", "qwen36-vl")
     settings = load_settings()
-    assert settings.profile.vllm_image == "jarvis/vllm-openai:v0.25.1-asyncio-e4f88a8"
+    repo_root = Path(__file__).resolve().parents[2]
+    dockerfile = (repo_root / "docker/vllm-asyncio/Dockerfile").read_text(encoding="utf-8")
+    base = re.search(
+        r"^FROM vllm/vllm-openai:(?P<version>[^@\s]+)"
+        r"@sha256:(?P<digest>[0-9a-f]{64})$",
+        dockerfile,
+        flags=re.MULTILINE,
+    )
+    assert base is not None
+    expected_image = (
+        f"jarvis/vllm-openai:{base.group('version')}-asyncio-"
+        f"{base.group('digest')[:7]}"
+    )
+    assert settings.profile.vllm_image == expected_image
     env = DispatcherManager(settings, repo_root=tmp_path).compose_env()
-    assert env["JARVIS_VLLM_IMAGE"] == "jarvis/vllm-openai:v0.25.1-asyncio-e4f88a8"
+    assert env["JARVIS_VLLM_IMAGE"] == expected_image
     assert PROFILES["gemma4-turbo"].vllm_image == "vllm/vllm-openai:v0.23.0"
 
 

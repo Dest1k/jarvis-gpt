@@ -35,6 +35,8 @@ from jarvis_gpt.runtime_lease import PrimaryRuntimeLease, RuntimeLeaseError
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+API_TOKEN = "api-smoke-secret-with-at-least-32-characters"
+
 
 @pytest.fixture()
 def client(monkeypatch, tmp_path):
@@ -43,6 +45,21 @@ def client(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_AUTONOMY_ENABLED", "0")
     with TestClient(app) as test_client:
         yield test_client
+
+
+def _approved_request(client: TestClient, method: str, path: str, **kwargs):
+    """Exercise the real one-use HITL route contract before invoking a danger action."""
+
+    pending = client.request(method, path, **kwargs)
+    assert pending.status_code == 428, pending.text
+    approval_id = pending.json()["detail"]["approval_id"]
+    approved = client.patch(
+        f"/api/approvals/{approval_id}",
+        json={"status": "approved", "result": {"operator": "smoke-test"}},
+    )
+    assert approved.status_code == 200, approved.text
+    headers = {**kwargs.pop("headers", {}), "X-Jarvis-Approval-Id": approval_id}
+    return client.request(method, path, headers=headers, **kwargs)
 
 
 def test_user_visible_answer_helper_blocks_tool_envelopes():
@@ -317,7 +334,11 @@ def test_model_download_can_be_cancelled(client):
     }
     app.state.storage.set_runtime_value(DOWNLOAD_JOBS_KEY, [job])
 
-    response = client.post(f"/api/model-hub/downloads/{job['id']}/cancel")
+    response = _approved_request(
+        client,
+        "POST",
+        f"/api/model-hub/downloads/{job['id']}/cancel",
+    )
 
     assert response.status_code == 200
     assert response.json()["status"] == "cancelled"
@@ -399,11 +420,11 @@ def test_runtime_security_and_backup(client, monkeypatch):
     )
     assert _is_local_machine_host("10.0.0.50") is True
     assert _is_local_machine_host("10.0.0.51") is False
-    monkeypatch.setenv("JARVIS_API_TOKEN", "secret")
-    assert _token_allowed("secret") is True
+    monkeypatch.setenv("JARVIS_API_TOKEN", API_TOKEN)
+    assert _token_allowed(API_TOKEN) is True
     assert _token_allowed("wrong") is False
 
-    backup = client.post("/api/runtime/backup")
+    backup = _approved_request(client, "POST", "/api/runtime/backup")
     assert backup.status_code == 200
     body = backup.json()
     assert body["ok"] is True
@@ -448,7 +469,7 @@ def test_dispatcher_action_api_preserves_independent_verification(client, monkey
         },
     )
 
-    response = client.post("/api/dispatcher/start")
+    response = _approved_request(client, "POST", "/api/dispatcher/start")
 
     assert response.status_code == 200
     assert response.json()["verification"]["ok"] is True
@@ -460,17 +481,17 @@ def test_loopback_api_can_require_token(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
     monkeypatch.setenv("JARVIS_AUTONOMY_ENABLED", "0")
     monkeypatch.setenv("JARVIS_API_REQUIRE_TOKEN_ON_LOOPBACK", "1")
-    monkeypatch.setenv("JARVIS_API_TOKEN", "secret")
+    monkeypatch.setenv("JARVIS_API_TOKEN", API_TOKEN)
 
     with TestClient(app) as test_client:
         denied = test_client.get("/api/status")
         allowed = test_client.get(
             "/api/status",
-            headers={"X-Jarvis-Api-Token": "secret"},
+            headers={"X-Jarvis-Api-Token": API_TOKEN},
         )
         security = test_client.get(
             "/api/runtime/security",
-            headers={"X-Jarvis-Api-Token": "secret"},
+            headers={"X-Jarvis-Api-Token": API_TOKEN},
         )
 
     assert denied.status_code == 401
@@ -507,9 +528,9 @@ def test_websocket_enforces_strict_token_and_origin(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
     monkeypatch.setenv("JARVIS_AUTONOMY_ENABLED", "0")
     monkeypatch.setenv("JARVIS_API_REQUIRE_TOKEN_ON_LOOPBACK", "1")
-    monkeypatch.setenv("JARVIS_API_TOKEN", "secret")
+    monkeypatch.setenv("JARVIS_API_TOKEN", API_TOKEN)
     monkeypatch.setenv("JARVIS_CORS_ORIGINS", "http://192.168.50.4:3000")
-    protocol = _websocket_token_protocol("secret")
+    protocol = _websocket_token_protocol(API_TOKEN)
 
     with TestClient(app) as test_client:
         _assert_websocket_denied(
@@ -520,7 +541,7 @@ def test_websocket_enforces_strict_token_and_origin(monkeypatch, tmp_path):
         # Long-lived secrets are intentionally not accepted in URLs.
         _assert_websocket_denied(
             test_client,
-            "/ws/events?token=secret",
+            f"/ws/events?token={API_TOKEN}",
             headers={"origin": "http://localhost:3000"},
         )
         _assert_websocket_denied(
@@ -547,7 +568,9 @@ def test_operator_quality_and_autonomy_cancel(client):
     assert quality.status_code == 200
     assert "negative_feedback" in quality.json()
 
-    created = client.post(
+    created = _approved_request(
+        client,
+        "POST",
         "/api/autonomy/jobs",
         json={
             "title": "Cancelable diagnostics",
@@ -561,13 +584,19 @@ def test_operator_quality_and_autonomy_cancel(client):
     job = created.json()
     assert job["priority"] == 42
 
-    cancelled = client.post(f"/api/autonomy/jobs/{job['id']}/cancel")
+    cancelled = _approved_request(
+        client,
+        "POST",
+        f"/api/autonomy/jobs/{job['id']}/cancel",
+    )
     assert cancelled.status_code == 200
     assert cancelled.json()["status"] == "cancelled"
 
 
 def test_autonomy_start_runs_detached(client, monkeypatch):
-    created = client.post(
+    created = _approved_request(
+        client,
+        "POST",
         "/api/autonomy/jobs",
         json={
             "title": "Detached diagnostics",
@@ -586,7 +615,11 @@ def test_autonomy_start_runs_detached(client, monkeypatch):
 
     monkeypatch.setattr(app.state.autonomy_executor, "run_job", fake_run_job)
 
-    started = client.post(f"/api/autonomy/jobs/{job['id']}/start")
+    started = _approved_request(
+        client,
+        "POST",
+        f"/api/autonomy/jobs/{job['id']}/start",
+    )
 
     assert started.status_code == 200
     assert started.json()["id"] == job["id"]
