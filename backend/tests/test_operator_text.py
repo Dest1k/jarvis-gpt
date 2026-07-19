@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from jarvis_gpt.operator_text import (
+    correct_operator_typos,
     fuzzy_token_match,
     normalize_operator_message,
     operator_message_candidates,
@@ -75,6 +76,26 @@ def test_keyboard_smash_keeps_word_islands():
 def test_fuzzy_token_match_typo():
     assert fuzzy_token_match("отркой", ["открой", "закрой"]) == "открой"
     assert fuzzy_token_match("откр", ["открой"]) is None  # too short budget/ambiguous
+
+
+def test_correct_operator_typos_against_lexicon():
+    # Same-layout typos (not wrong keyboard layout).
+    assert correct_operator_typos("отркой файл") == "открой файл"
+    assert correct_operator_typos("напонми через 5 минут") == "напомни через 5 минут"
+    assert "напомни" in normalize_operator_message("напонми через 5 минут")
+    # Known words are not rewritten.
+    assert correct_operator_typos("открой Microsoft Edge") == "открой Microsoft Edge"
+    # English same-layout typo.
+    assert correct_operator_typos("opne calculator") == "open calculator"
+
+
+def test_expanded_lexicon_layout_domain_words():
+    # Domain words should flip when typed on the wrong layout.
+    assert try_layout_flip("yfgjvyb") == "напомни"
+    assert try_layout_flip("crhbyijn") == "скриншот"
+    # память on EN keys: g f v z n m
+    assert try_layout_flip("gfvznm") == "память"
+    assert try_layout_flip("ыефегы") == "status"
 
 
 def test_candidates_include_normalized_forms():
