@@ -52,6 +52,17 @@ def _patch_push(monkeypatch) -> list[str]:
     return pushes
 
 
+def _patch_push_rich(monkeypatch) -> list[dict]:
+    pushes: list[dict] = []
+
+    async def fake_push(text, **kwargs):
+        pushes.append({"text": text, **kwargs})
+        return True
+
+    monkeypatch.setattr("jarvis_gpt.supervisor.push_telegram_alert", fake_push)
+    return pushes
+
+
 def _due_task(storage, *, text, prompt, conversation_id=None, deliver="telegram"):
     return storage.create_reminder(
         text=text,
@@ -176,8 +187,8 @@ def test_agent_task_reminder_runs_agent_and_pushes(monkeypatch, tmp_path):
 def test_plain_reminder_does_not_run_agent(monkeypatch, tmp_path):
     agent = _FakeAgent()
     supervisor, storage = _supervisor(monkeypatch, tmp_path, agent=agent)
-    pushes = _patch_push(monkeypatch)
-    storage.create_reminder(
+    pushes = _patch_push_rich(monkeypatch)
+    reminder = storage.create_reminder(
         text="позвонить маме",
         due_at="2000-01-01T00:00:00+00:00",
         source_text="позвонить маме",
@@ -187,9 +198,18 @@ def test_plain_reminder_does_not_run_agent(monkeypatch, tmp_path):
     asyncio.run(_fire_and_drain(supervisor))
 
     assert agent.calls == []
-    # PassiveNudge** must still push to Telegram (no agent turn).
-    assert any("позвонить маме" in text for text in pushes)
-    assert any(text.startswith("⏰") for text in pushes)
+    # Passive nudge must still push to Telegram (no agent turn) with snooze buttons.
+    assert any("позвонить маме" in item["text"] for item in pushes)
+    assert any(item["text"].startswith("⏰") for item in pushes)
+    markup = next(item.get("reply_markup") for item in pushes if item.get("reply_markup"))
+    callback_data = [
+        btn["callback_data"]
+        for row in markup["inline_keyboard"]
+        for btn in row
+    ]
+    assert any(f"r:{reminder['id']}:s10" == item for item in callback_data)
+    assert any(item.endswith(":ok") for item in callback_data)
+    storage.close()
 
 
 def test_plain_reminder_respects_deliver_none(monkeypatch, tmp_path):
@@ -221,4 +241,88 @@ def test_disabled_flag_skips_the_agent_turn(monkeypatch, tmp_path):
     asyncio.run(_fire_and_drain(supervisor))
 
     assert agent.calls == []  # flag off -> the task reminder is a passive nudge
+    storage.close()
+
+
+def test_reminders_create_marks_daily_briefing(monkeypatch, tmp_path):
+    tools, storage = _registry(monkeypatch, tmp_path)
+    result = asyncio.run(
+        tools.run(
+            "reminders.create",
+            {"text": "каждое утро в 9 присылай сводку по системе"},
+            allow_danger=True,
+        )
+    )
+    assert result.ok is True
+    assert result.data["briefing"] is True
+    assert result.data["agent_task"] is False
+    payload = result.data["reminder"]["payload"]
+    assert payload["kind"] == "briefing"
+    storage.close()
+
+
+def test_briefing_reminder_uses_experience_not_agent(monkeypatch, tmp_path):
+    agent = _FakeAgent("should not run")
+    supervisor, storage = _supervisor(monkeypatch, tmp_path, agent=agent)
+    pushes = _patch_push(monkeypatch)
+
+    class _Experience:
+        def daily_briefing(self, dispatcher_status=None):
+            return {
+                "headline": "Runtime is stable",
+                "operator_name": "Owner",
+                "focus": ["Focus: ship Telegram remainder"],
+                "risks": [],
+                "suggestions": ["Check VRAM"],
+                "pending_approvals": 0,
+            }
+
+    supervisor.autonomy_executor = SimpleNamespace(
+        agent=agent, experience=_Experience()
+    )
+    storage.create_reminder(
+        text="Утренняя сводка",
+        due_at="2000-01-01T00:00:00+00:00",
+        source_text="каждое утро сводка",
+        payload={
+            "kind": "briefing",
+            "prompt": "daily_briefing",
+            "deliver": "telegram",
+            "telegram_chat_id": 42,
+        },
+    )
+
+    asyncio.run(_fire_and_drain(supervisor))
+
+    assert agent.calls == []
+    assert any("Runtime is stable" in text for text in pushes)
+    assert any(text.startswith("📋") for text in pushes)
+    storage.close()
+
+
+def test_storage_reschedule_snoozes_fired_reminder(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    reminder = storage.create_reminder(
+        text="позвонить",
+        due_at="2000-01-01T00:00:00+00:00",
+        payload={"deliver": "telegram"},
+    )
+    # Simulate fire.
+    with storage._lock:
+        conn = storage.connect()
+        conn.execute(
+            "UPDATE reminders SET status='fired', fired_at=? WHERE id=?",
+            ("2000-01-01T00:01:00+00:00", reminder["id"]),
+        )
+        conn.commit()
+    updated = storage.reschedule_reminder(
+        reminder["id"], due_at="2000-01-01T01:00:00+00:00"
+    )
+    assert updated is not None
+    assert updated["status"] == "pending"
+    assert updated["due_at"] == "2000-01-01T01:00:00+00:00"
     storage.close()

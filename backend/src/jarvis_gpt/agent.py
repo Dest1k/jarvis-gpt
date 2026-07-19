@@ -555,6 +555,8 @@ class AgentContext:
     operator_retry_source_message_id: str | None = None
     operator_cached_answer: str | None = None
     notification_chat_id: int | None = None
+    # Opaque token for cooperative + hard cancel of this turn (/stop, /api/chat/cancel).
+    cancel_key: str | None = None
     # RB-2: side-effect admission is decided before mission/artifact/tool mutation.
     side_effects_admitted: bool = True
     pending_clarification_goal: str | None = None
@@ -968,6 +970,12 @@ class AgentRuntime:
         self._chat_request_locks: WeakValueDictionary[str, asyncio.Lock] = (
             WeakValueDictionary()
         )
+        # In-flight turn abort registry for Telegram /stop and HTTP cancel.
+        # Keys are opaque cancel tokens; values are asyncio.Event + owning Task.
+        self._turn_cancel_events: dict[str, asyncio.Event] = {}
+        self._turn_tasks: dict[str, asyncio.Task[Any]] = {}
+        self._turn_by_request_id: dict[str, str] = {}
+        self._turn_by_chat_id: dict[int, str] = {}
 
     def _capability_allowed(self, security_id: str, *, record: bool = False) -> bool:
         """Fail-closed capability probe for the currently bound principal."""
@@ -1050,81 +1058,90 @@ class AgentRuntime:
 
         self._require_chat_capability()
         request_id = str(transport_request_id or "").strip()
-        if not request_id:
-            return await self._chat_impl(
-                message,
-                conversation_id=conversation_id,
-                mode=mode,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                attachments=attachments,
-                thinking_enabled=thinking_enabled,
-                access_mode=access_mode,
-                notification_chat_id=notification_chat_id,
-                transport_request_id=None,
-            )
-
-        actor = current_actor()
-        capabilities = self._context_capabilities()
-        legacy_guest_downgrade = actor.source == "legacy-local" and access_mode == "guest"
-        effective_access_mode = (
-            "guest"
-            if legacy_guest_downgrade
-            or not self._full_agent_surface_allowed(capabilities)
-            else "owner"
+        cancel_key = self._register_turn_cancel(
+            request_id=request_id or None,
+            notification_chat_id=notification_chat_id,
         )
-        request_hash = hashlib.sha256(request_id.encode("utf-8")).hexdigest()
-        lock_key = f"{actor.user_id}:{request_hash}"
-        request_lock = self._chat_request_locks.get(lock_key)
-        if request_lock is None:
-            request_lock = asyncio.Lock()
-            self._chat_request_locks[lock_key] = request_lock
+        try:
+            if not request_id:
+                return await self._chat_impl(
+                    message,
+                    conversation_id=conversation_id,
+                    mode=mode,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    attachments=attachments,
+                    thinking_enabled=thinking_enabled,
+                    access_mode=access_mode,
+                    notification_chat_id=notification_chat_id,
+                    transport_request_id=None,
+                    cancel_key=cancel_key,
+                )
 
-        async with request_lock:
-            handle = self._claim_chat_request(
-                request_id=request_id,
-                message=message,
-                requested_conversation_id=conversation_id,
-                conversation_title=(
-                    "Гостевой Telegram-диалог"
-                    if effective_access_mode == "guest"
-                    else self._title_from_goal(message)
-                ),
-                mode=mode,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                attachments=_normalize_chat_attachments(attachments),
-                thinking_enabled=thinking_enabled,
-                access_mode=effective_access_mode,
-                notification_chat_id=notification_chat_id,
+            actor = current_actor()
+            capabilities = self._context_capabilities()
+            legacy_guest_downgrade = actor.source == "legacy-local" and access_mode == "guest"
+            effective_access_mode = (
+                "guest"
+                if legacy_guest_downgrade
+                or not self._full_agent_surface_allowed(capabilities)
+                else "owner"
             )
-            if handle.cached_response is not None:
-                # Transport-level retry of a completed request must surface the same
-                # idempotent marker as the in-conversation operator-effect replay path.
-                return self._as_idempotent_replay_response(handle.cached_response)
-            try:
-                with bind_chat_request_metadata(
-                    request_hash=handle.request_hash,
-                    fingerprint=handle.fingerprint,
-                ):
-                    response = await self._chat_impl(
-                        message,
-                        conversation_id=handle.conversation_id,
-                        mode=mode,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        attachments=attachments,
-                        thinking_enabled=thinking_enabled,
-                        access_mode=access_mode,
-                        notification_chat_id=notification_chat_id,
-                        transport_request_id=request_id,
-                        _request_handle=handle,
-                    )
-                self._complete_chat_request(handle, response)
-                return response
-            except BaseException:
-                self._release_chat_request(handle)
-                raise
+            request_hash = hashlib.sha256(request_id.encode("utf-8")).hexdigest()
+            lock_key = f"{actor.user_id}:{request_hash}"
+            request_lock = self._chat_request_locks.get(lock_key)
+            if request_lock is None:
+                request_lock = asyncio.Lock()
+                self._chat_request_locks[lock_key] = request_lock
+
+            async with request_lock:
+                handle = self._claim_chat_request(
+                    request_id=request_id,
+                    message=message,
+                    requested_conversation_id=conversation_id,
+                    conversation_title=(
+                        "Гостевой Telegram-диалог"
+                        if effective_access_mode == "guest"
+                        else self._title_from_goal(message)
+                    ),
+                    mode=mode,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    attachments=_normalize_chat_attachments(attachments),
+                    thinking_enabled=thinking_enabled,
+                    access_mode=effective_access_mode,
+                    notification_chat_id=notification_chat_id,
+                )
+                if handle.cached_response is not None:
+                    # Transport-level retry of a completed request must surface the same
+                    # idempotent marker as the in-conversation operator-effect replay path.
+                    return self._as_idempotent_replay_response(handle.cached_response)
+                try:
+                    with bind_chat_request_metadata(
+                        request_hash=handle.request_hash,
+                        fingerprint=handle.fingerprint,
+                    ):
+                        response = await self._chat_impl(
+                            message,
+                            conversation_id=handle.conversation_id,
+                            mode=mode,
+                            temperature=temperature,
+                            max_tokens=max_tokens,
+                            attachments=attachments,
+                            thinking_enabled=thinking_enabled,
+                            access_mode=access_mode,
+                            notification_chat_id=notification_chat_id,
+                            transport_request_id=request_id,
+                            _request_handle=handle,
+                            cancel_key=cancel_key,
+                        )
+                    self._complete_chat_request(handle, response)
+                    return response
+                except BaseException:
+                    self._release_chat_request(handle)
+                    raise
+        finally:
+            self._unregister_turn_cancel(cancel_key)
 
     async def _chat_impl(
         self,
@@ -1139,6 +1156,7 @@ class AgentRuntime:
         notification_chat_id: int | None = None,
         transport_request_id: str | None = None,
         _request_handle: _ChatRequestHandle | None = None,
+        cancel_key: str | None = None,
     ) -> ChatResponse:
         # ``access_mode`` is caller-controlled and can never elevate authority.  A
         # narrowly-scoped legacy-local ``guest`` value remains a compatible downgrade
@@ -1175,6 +1193,7 @@ class AgentRuntime:
             capabilities=context_capabilities,
         )
         context.notification_chat_id = notification_chat_id
+        context.cancel_key = cancel_key
         context.operator_message = message
         context.operator_scopes = _operator_action_scopes(message)
         self._bind_operator_request_identity(
@@ -2756,9 +2775,21 @@ class AgentRuntime:
             force_final = False
             blocked_by_approval = False
             while used_tools < max_steps:
+                if self._is_turn_cancelled(context.cancel_key):
+                    recovery = "Остановил по запросу."
+                    answer_parts.append(recovery)
+                    stream_finish_reason = "cancelled"
+                    yield {"type": "delta", "content": recovery}
+                    break
                 round_parts, round_error, round_finish, round_failure_scope = (
                     await collect_round(messages)
                 )
+                if self._is_turn_cancelled(context.cancel_key):
+                    recovery = "Остановил по запросу."
+                    answer_parts.append(recovery)
+                    stream_finish_reason = "cancelled"
+                    yield {"type": "delta", "content": recovery}
+                    break
                 raw = "".join(round_parts)
                 if round_error:
                     if executed_tools or approval_ids:
@@ -10534,6 +10565,90 @@ class AgentRuntime:
                 tools[info.name] = info
         return [tools[name] for name in sorted(tools)]
 
+    def _register_turn_cancel(
+        self,
+        *,
+        request_id: str | None,
+        notification_chat_id: int | None,
+    ) -> str:
+        """Register cooperative+hard cancel handles for the current agent turn."""
+
+        key = uuid.uuid4().hex
+        self._turn_cancel_events[key] = asyncio.Event()
+        task = asyncio.current_task()
+        if task is not None:
+            self._turn_tasks[key] = task
+        clean_request = str(request_id or "").strip()
+        if clean_request:
+            self._turn_by_request_id[clean_request] = key
+        if notification_chat_id is not None and not isinstance(notification_chat_id, bool):
+            try:
+                self._turn_by_chat_id[int(notification_chat_id)] = key
+            except (TypeError, ValueError):
+                pass
+        return key
+
+    def _unregister_turn_cancel(self, key: str | None) -> None:
+        if not key:
+            return
+        self._turn_cancel_events.pop(key, None)
+        self._turn_tasks.pop(key, None)
+        for mapping in (self._turn_by_request_id, self._turn_by_chat_id):
+            stale = [item for item, value in mapping.items() if value == key]
+            for item in stale:
+                mapping.pop(item, None)
+
+    def _is_turn_cancelled(self, key: str | None) -> bool:
+        if not key:
+            return False
+        event = self._turn_cancel_events.get(key)
+        return event is not None and event.is_set()
+
+    def cancel_active_turn(
+        self,
+        *,
+        request_id: str | None = None,
+        notification_chat_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Signal (and hard-cancel) any in-flight turn matching request/chat id.
+
+        Used by Telegram ``/stop`` via ``POST /api/chat/cancel``. Sets the cooperative
+        cancel event and cancels the owning asyncio Task so a blocked LLM call aborts
+        instead of finishing in the background.
+        """
+
+        keys: set[str] = set()
+        clean_request = str(request_id or "").strip()
+        if clean_request:
+            mapped = self._turn_by_request_id.get(clean_request)
+            if mapped:
+                keys.add(mapped)
+        if notification_chat_id is not None and not isinstance(notification_chat_id, bool):
+            try:
+                mapped = self._turn_by_chat_id.get(int(notification_chat_id))
+            except (TypeError, ValueError):
+                mapped = None
+            if mapped:
+                keys.add(mapped)
+        if not keys:
+            return {"ok": True, "cancelled": False, "detail": "no active turn"}
+        cancelled = False
+        current = asyncio.current_task()
+        for key in keys:
+            event = self._turn_cancel_events.get(key)
+            if event is not None and not event.is_set():
+                event.set()
+                cancelled = True
+            task = self._turn_tasks.get(key)
+            if task is not None and not task.done() and task is not current:
+                task.cancel()
+                cancelled = True
+        return {
+            "ok": True,
+            "cancelled": cancelled,
+            "detail": "cancelled" if cancelled else "already finished",
+        }
+
     def _max_tool_steps(self) -> int:
         # Owner full autonomy: give the operator's turn the active profile's full step
         # budget so the model can carry a multi-step task all the way to a concrete
@@ -11143,12 +11258,30 @@ class AgentRuntime:
         protocol_correction_used = False
         last_failed_signature: tuple[str, str] | None = None
         while used_tools < max_tool_steps:
+            if self._is_turn_cancelled(context.cancel_key):
+                return _AgenticResult(
+                    ok=True,
+                    answer="Остановил по запросу.",
+                    events=events,
+                    finish_reason="cancelled",
+                    used_tools=used_tools,
+                    executed_tools=tuple(executed_tools),
+                )
             result = await self._complete_llm(
                 messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 thinking_enabled=thinking_enabled,
             )
+            if self._is_turn_cancelled(context.cancel_key):
+                return _AgenticResult(
+                    ok=True,
+                    answer="Остановил по запросу.",
+                    events=events,
+                    finish_reason="cancelled",
+                    used_tools=used_tools,
+                    executed_tools=tuple(executed_tools),
+                )
             if not result.ok:
                 if used_tools == initial_used_tools:
                     return _AgenticResult(

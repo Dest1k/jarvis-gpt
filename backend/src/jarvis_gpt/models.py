@@ -40,6 +40,35 @@ class ChatRequest(BaseModel):
     notification_chat_id: int | None = None
 
 
+class ChatCancelRequest(BaseModel):
+    """Abort an in-flight agent turn (Telegram /stop → real backend cancel)."""
+
+    request_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=200,
+        pattern=r"^[A-Za-z0-9._:-]+$",
+    )
+    notification_chat_id: int | None = None
+
+
+class ChatCancelResponse(BaseModel):
+    ok: bool = True
+    cancelled: bool = False
+    detail: str | None = None
+
+
+class ReminderSnoozeRequest(BaseModel):
+    minutes: int = Field(default=10, ge=1, le=24 * 60)
+
+
+class ReminderActionResponse(BaseModel):
+    ok: bool = True
+    action: str
+    reminder: dict[str, Any] | None = None
+    detail: str | None = None
+
+
 class VoiceSpeakRequest(BaseModel):
     text: str = Field(min_length=1, max_length=20000)
     voice: str | None = Field(default=None, max_length=100)

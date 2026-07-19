@@ -2634,6 +2634,48 @@ class JarvisStorage:
         )
         return cancelled
 
+    def reschedule_reminder(
+        self,
+        reminder_id: str,
+        *,
+        due_at: str,
+    ) -> dict[str, Any] | None:
+        """Re-open a pending or already-fired reminder at a new UTC due-time (snooze).
+
+        Fired one-shots become pending again so the next supervisor tick can redeliver.
+        Cancelled rows stay cancelled (operator must recreate).
+        """
+
+        now = utc_now()
+        clean_due = str(due_at or "").strip()
+        if not clean_due:
+            return None
+        with self._lock:
+            conn = self.connect()
+            row = conn.execute(
+                """
+                UPDATE reminders
+                SET status = 'pending', due_at = ?, fired_at = NULL, updated_at = ?
+                WHERE id = ? AND status IN ('pending', 'fired') AND user_id = ?
+                RETURNING id, created_at, updated_at, text, due_at, recurrence, status,
+                          conversation_id, source_text, fired_at, fire_count, payload, user_id
+                """,
+                (clean_due, now, reminder_id, current_user_id()),
+            ).fetchone()
+            conn.commit()
+        if row is None:
+            return None
+        updated = self._decode_reminder(row)
+        self.record_audit(
+            actor="operator",
+            action="reminder.reschedule",
+            target_type="reminder",
+            target_id=reminder_id,
+            summary=f"Reminder snoozed to {clean_due}: {updated['text']}",
+            after=updated,
+        )
+        return updated
+
     def claim_due_reminders(
         self,
         now_iso: str | None = None,

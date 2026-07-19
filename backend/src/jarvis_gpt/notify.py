@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import Iterable, Mapping
+from typing import Any
 
 import httpx
 
@@ -59,15 +60,36 @@ def telegram_targets(
     return token, tuple(chat_id for chat_id in candidates if chat_id in allowed_set)
 
 
+def reminder_inline_keyboard(reminder_id: str) -> dict[str, Any]:
+    """Inline snooze/done buttons for a fired passive reminder.
+
+    ``callback_data`` is capped at 64 bytes by Telegram; the compact form
+    ``r:<id>:<action>`` stays well under that for ``rem_<16hex>`` ids.
+    """
+
+    rid = str(reminder_id or "").strip()
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "⏳ 10 мин", "callback_data": f"r:{rid}:s10"},
+                {"text": "⏳ 1 час", "callback_data": f"r:{rid}:s60"},
+                {"text": "✅ Готово", "callback_data": f"r:{rid}:ok"},
+            ]
+        ]
+    }
+
+
 async def push_telegram_alert(
     text: str,
     *,
     target_chat_ids: Iterable[int] | None = None,
     env: Mapping[str, str] | None = None,
     client: httpx.AsyncClient | None = None,
+    reply_markup: Mapping[str, Any] | dict[str, Any] | None = None,
 ) -> bool:
     """Send ``text`` to authorised alert targets. Returns True if it reached ≥1 chat.
 
+    Optional ``reply_markup`` (Telegram InlineKeyboardMarkup) is attached when set.
     Never raises: unconfigured credentials or any transport error resolve to ``False``
     so a health-alert push can never take down the supervisor loop that called it.
     """
@@ -84,10 +106,14 @@ async def push_telegram_alert(
     try:
         for chat_id in chat_ids:
             try:
-                response = await http.post(
-                    "/sendMessage",
-                    json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
-                )
+                payload: dict[str, Any] = {
+                    "chat_id": chat_id,
+                    "text": text,
+                    "disable_web_page_preview": True,
+                }
+                if reply_markup is not None:
+                    payload["reply_markup"] = dict(reply_markup)
+                response = await http.post("/sendMessage", json=payload)
                 if response.status_code == 200:
                     delivered += 1
             except httpx.HTTPError:

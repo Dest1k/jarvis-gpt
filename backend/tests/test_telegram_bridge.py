@@ -23,6 +23,8 @@ from jarvis_gpt.telegram_bridge import (
     _chunks,
     _configure_logging,
     _looks_like_audio,
+    _looks_like_image,
+    _quick_capture_body,
     _retryable_backend_http_error,
     load_config,
 )
@@ -2269,3 +2271,174 @@ def test_text_input_never_triggers_a_voice_reply():
     }
     asyncio.run(bridge._handle(update))
     assert speak_calls == []  # text in -> text out, never voice
+
+
+def test_quick_capture_body_parsers():
+    assert _quick_capture_body("/note купить молоко", "/note") == "купить молоко"
+    assert _quick_capture_body("+ идея", "") == "идея"
+    assert _quick_capture_body("! срочно", "") == "срочно"
+    assert _quick_capture_body("обычный текст", "") is None
+    assert _quick_capture_body("/note", "/note") == ""
+
+
+def test_looks_like_image_detects_png():
+    assert _looks_like_image("chart.png", "image/png") is True
+    assert _looks_like_image("report.docx", "application/vnd.openxmlformats") is False
+
+
+def test_quick_capture_posts_memory_without_chat():
+    memory_bodies: list[dict] = []
+    sent: list[str] = []
+
+    def tg_handler(request):
+        if request.url.path.endswith("/sendMessage"):
+            payload = json.loads(request.content)
+            sent.append(payload.get("text") or "")
+        return httpx.Response(200, json={"ok": True, "result": {}})
+
+    def api_handler(request):
+        if request.url.path == "/api/memory":
+            memory_bodies.append(json.loads(request.content))
+            return httpx.Response(
+                200,
+                json={
+                    "id": "mem_abc",
+                    "namespace": "inbox",
+                    "content": "купить молоко",
+                    "tags": ["capture"],
+                    "importance": 0.6,
+                    "created_at": "t",
+                    "updated_at": "t",
+                },
+            )
+        return httpx.Response(404)
+
+    bridge = _bridge(tg_handler, api_handler)
+    update = {
+        "update_id": 11,
+        "message": {
+            "chat": {"id": 42, "type": "private"},
+            "from": {"id": 42, "is_bot": False},
+            "text": "/note купить молоко",
+        },
+    }
+    asyncio.run(bridge._handle(update))
+    assert len(memory_bodies) == 1
+    assert memory_bodies[0]["namespace"] == "inbox"
+    assert "купить молоко" in memory_bodies[0]["content"]
+    assert any("inbox" in text.lower() or "📥" in text for text in sent)
+
+
+def test_stop_calls_backend_cancel():
+    cancel_bodies: list[dict] = []
+    sent: list[str] = []
+
+    def tg_handler(request):
+        if request.url.path.endswith("/sendMessage"):
+            payload = json.loads(request.content)
+            sent.append(payload.get("text") or "")
+        return httpx.Response(200, json={"ok": True, "result": {}})
+
+    def api_handler(request):
+        if request.url.path == "/api/chat/cancel":
+            cancel_bodies.append(json.loads(request.content))
+            return httpx.Response(200, json={"ok": True, "cancelled": True})
+        return httpx.Response(404)
+
+    bridge = _bridge(tg_handler, api_handler)
+    bridge._active_request_ids[42] = "telegram:700001:99"
+    update = {
+        "update_id": 12,
+        "message": {
+            "chat": {"id": 42, "type": "private"},
+            "from": {"id": 42, "is_bot": False},
+            "text": "/stop",
+        },
+    }
+    asyncio.run(bridge._handle(update))
+    assert cancel_bodies == [
+        {"notification_chat_id": 42, "request_id": "telegram:700001:99"}
+    ]
+    assert any("Остановил" in text for text in sent)
+
+
+def test_reminder_callback_snooze_posts_api():
+    snooze_calls: list[tuple[str, dict]] = []
+    sent: list[str] = []
+    answered: list[str] = []
+
+    def tg_handler(request):
+        payload = json.loads(request.content) if request.content else {}
+        if request.url.path.endswith("/answerCallbackQuery"):
+            answered.append(payload.get("callback_query_id") or "")
+        if request.url.path.endswith("/sendMessage"):
+            sent.append(payload.get("text") or "")
+        return httpx.Response(200, json={"ok": True, "result": {}})
+
+    def api_handler(request):
+        if request.url.path == "/api/reminders/rem_abc123/snooze":
+            snooze_calls.append((request.url.path, json.loads(request.content)))
+            return httpx.Response(
+                200,
+                json={"ok": True, "action": "snooze", "detail": "Отложено на 10 мин"},
+            )
+        return httpx.Response(404)
+
+    bridge = _bridge(tg_handler, api_handler)
+    update = {
+        "update_id": 13,
+        "callback_query": {
+            "id": "cq1",
+            "from": {"id": 42, "is_bot": False},
+            "data": "r:rem_abc123:s10",
+            "message": {
+                "chat": {"id": 42, "type": "private"},
+                "message_id": 7,
+            },
+        },
+    }
+    asyncio.run(bridge._handle(update))
+    assert snooze_calls == [
+        ("/api/reminders/rem_abc123/snooze", {"minutes": 10})
+    ]
+    assert answered == ["cq1"]
+    assert any("Отложено" in text for text in sent)
+
+
+def test_send_document_uses_send_photo_for_images():
+    methods: list[str] = []
+
+    def tg_handler(request):
+        methods.append(request.url.path.rsplit("/", 1)[-1])
+        return httpx.Response(200, json={"ok": True, "result": {}})
+
+    def api_handler(request):
+        if request.url.path.endswith("/download"):
+            return httpx.Response(
+                200,
+                content=b"\x89PNG\r\n\x1a\n",
+                headers={"content-type": "image/png"},
+            )
+        return httpx.Response(404)
+
+    bridge = _bridge(tg_handler, api_handler)
+
+    async def _run():
+        await bridge._open_user_session(
+            update_id=1,
+            chat_id=42,
+            sender={"id": 42, "is_bot": False},
+        )
+        await bridge._send_document(
+            42,
+            {
+                "id": "f1",
+                "name": "chart.png",
+                "mime_type": "image/png",
+                "size": 12,
+            },
+        )
+
+    asyncio.run(_run())
+    assert "sendPhoto" in methods
+    assert "sendDocument" not in methods

@@ -542,10 +542,11 @@ class RuntimeSupervisor:
 
                 run.add_done_callback(_discard)
                 return
+            kind = str(payload.get("kind") or "").strip().lower()
+            is_briefing = kind == "briefing" and self.settings.scheduled_tasks_enabled
             is_task = (
-                payload.get("kind") == "agent_task"
-                and self.settings.scheduled_tasks_enabled
-            )
+                kind == "agent_task" and self.settings.scheduled_tasks_enabled
+            ) or is_briefing
             with suppress(Exception):
                 self.storage.add_event(
                     kind="reminder.fire",
@@ -555,7 +556,8 @@ class RuntimeSupervisor:
                         "reminder_id": reminder["id"],
                         "due_at": reminder["due_at"],
                         "recurring": recurring,
-                        "agent_task": is_task,
+                        "agent_task": is_task and not is_briefing,
+                        "briefing": is_briefing,
                         "conversation_id": reminder.get("conversation_id"),
                     },
                 )
@@ -585,7 +587,10 @@ class RuntimeSupervisor:
                             },
                         )
                     return
-                run = asyncio.create_task(self._run_scheduled_task(reminder))
+                runner = (
+                    self._run_briefing_task if is_briefing else self._run_scheduled_task
+                )
+                run = asyncio.create_task(runner(reminder))
                 self._scheduled_runs.add(run)
                 run.add_done_callback(self._scheduled_runs.discard)
             else:
@@ -623,6 +628,8 @@ class RuntimeSupervisor:
 
         Returns True when at least one Telegram chat received the text. Fail-soft:
         missing token/allowlist or transport errors yield False without raising.
+        Passive fires carry inline snooze/done buttons so the phone can reschedule
+        without opening the web UI.
         """
 
         payload = reminder.get("payload") if isinstance(reminder.get("payload"), dict) else {}
@@ -644,11 +651,95 @@ class RuntimeSupervisor:
                 requested = ()
         if not requested:
             requested = _actor_telegram_chat_ids(self.storage)
+        reply_markup = None
+        reminder_id = str(reminder.get("id") or "").strip()
+        if reminder_id:
+            from .notify import reminder_inline_keyboard
+
+            reply_markup = reminder_inline_keyboard(reminder_id)
         if requested:
-            return await push_telegram_alert(body, target_chat_ids=requested)
+            return await push_telegram_alert(
+                body, target_chat_ids=requested, reply_markup=reply_markup
+            )
         if current_user_id() == LEGACY_OWNER_USER_ID:
-            return await push_telegram_alert(body, target_chat_ids=None)
+            return await push_telegram_alert(
+                body, target_chat_ids=None, reply_markup=reply_markup
+            )
         return False
+
+    async def _run_briefing_task(self, reminder: dict[str, Any]) -> None:
+        """Build the structured daily briefing and push it to Telegram (no LLM turn)."""
+
+        payload = reminder.get("payload") if isinstance(reminder.get("payload"), dict) else {}
+        label = str(reminder.get("text") or "Утренняя сводка").strip()
+        experience = getattr(self.autonomy_executor, "experience", None)
+        answer = ""
+        error: str | None = None
+        try:
+            if experience is None:
+                # Fall back to a full agent turn when experience is not wired (tests/CLI).
+                await self._run_scheduled_task(
+                    {
+                        **reminder,
+                        "payload": {
+                            **payload,
+                            "kind": "agent_task",
+                            "prompt": payload.get("prompt")
+                            or (
+                                "Составь краткую утреннюю сводку: runtime, риски, "
+                                "что сделать сегодня."
+                            ),
+                        },
+                    }
+                )
+                return
+            dispatcher_status = None
+            dispatcher = self._dispatcher_manager()
+            if dispatcher is not None:
+                with suppress(Exception):
+                    dispatcher_status = dispatcher.status()
+            briefing = experience.daily_briefing(dispatcher_status=dispatcher_status)
+            answer = _format_daily_briefing(briefing)
+        except Exception as exc:  # noqa: BLE001 — briefing failure must not touch the loop
+            error = str(exc) or exc.__class__.__name__
+        delivered = False
+        if answer:
+            if str(payload.get("deliver") or "telegram") == "telegram":
+                with suppress(Exception):
+                    target_ids: tuple[int, ...] = ()
+                    raw_chat = payload.get("telegram_chat_id")
+                    if not isinstance(raw_chat, bool) and raw_chat is not None:
+                        with suppress(TypeError, ValueError):
+                            target_ids = (int(raw_chat),)
+                    if not target_ids:
+                        target_ids = _actor_telegram_chat_ids(self.storage)
+                    if target_ids or current_user_id() == LEGACY_OWNER_USER_ID:
+                        delivered = await push_telegram_alert(
+                            f"📋 {label}\n\n{answer}"[:3900],
+                            target_chat_ids=target_ids or None,
+                        )
+            conversation_id = reminder.get("conversation_id")
+            if conversation_id:
+                with suppress(Exception):
+                    self.storage.add_message(
+                        conversation_id=str(conversation_id),
+                        role="assistant",
+                        content=answer,
+                        metadata={"kind": "daily_briefing", "reminder_id": reminder["id"]},
+                    )
+        with suppress(Exception):
+            self.storage.add_event(
+                kind="scheduled_task.run",
+                title=f"Сводка: {label}",
+                level="warn" if error else "info",
+                payload={
+                    "reminder_id": reminder["id"],
+                    "delivered": delivered,
+                    "chars": len(answer),
+                    "error": error,
+                    "kind": "briefing",
+                },
+            )
 
     async def _run_scheduled_task(self, reminder: dict[str, Any]) -> None:
         """Run one scheduled agent task: a full agent turn whose answer is pushed to the owner.
@@ -1767,6 +1858,48 @@ def _compact(value: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _format_daily_briefing(briefing: dict[str, Any]) -> str:
+    """Render experience.daily_briefing() into a compact Telegram-ready body."""
+
+    headline = str(briefing.get("headline") or "Сводка").strip()
+    operator = str(briefing.get("operator_name") or "").strip()
+    lines = [headline]
+    if operator:
+        lines.append(f"Оператор: {operator}")
+    focus = [
+        str(item).strip()
+        for item in (briefing.get("focus") or [])
+        if str(item).strip()
+    ]
+    if focus:
+        lines.append("")
+        lines.append("Фокус:")
+        lines.extend(f"• {item}" for item in focus[:6])
+    risks = [
+        str(item).strip()
+        for item in (briefing.get("risks") or [])
+        if str(item).strip()
+    ]
+    if risks:
+        lines.append("")
+        lines.append("Риски:")
+        lines.extend(f"• {item}" for item in risks[:4])
+    suggestions = [
+        str(item).strip()
+        for item in (briefing.get("suggestions") or [])
+        if str(item).strip()
+    ]
+    if suggestions:
+        lines.append("")
+        lines.append("Что сделать:")
+        lines.extend(f"• {item}" for item in suggestions[:4])
+    pending = briefing.get("pending_approvals")
+    if pending:
+        lines.append("")
+        lines.append(f"Ожидают approval: {pending}")
+    return "\n".join(lines).strip()
 
 
 def _list(value: Any) -> list[Any]:

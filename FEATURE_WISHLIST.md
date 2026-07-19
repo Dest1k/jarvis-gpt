@@ -128,6 +128,15 @@ Shipped on `main` (phone as primary UI):
 - **Progress ping** after ~12s on long turns («Ещё работаю…»).
 - **`/stop`** cancels waiting on the bridge (bypasses chat lock).
 
+## Progress — Telegram-first remainder 2026-07-19
+
+Shipped on `main`:
+- **Inline snooze/done** on passive reminders (`⏳ 10 мин` / `⏳ 1 час` / `✅ Готово`).
+- **Daily briefing schedule** (`payload.kind=briefing`) — structured runtime summary without a full LLM turn.
+- **True `/stop`** → `POST /api/chat/cancel` aborts the backend turn (cooperative + task cancel).
+- **sendPhoto** for image artifacts (inline preview instead of document-only).
+- **Quick-capture GTD** — `/note …`, `/inbox …`, `+ …` → memory namespace `inbox`.
+
 ## More ideas — brainstorm 2026-07-18 (new features)
 
 **Proactive (Jarvis acts, not only on request):**

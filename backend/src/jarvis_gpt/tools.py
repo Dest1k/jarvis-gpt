@@ -5965,6 +5965,52 @@ def _scheduled_task_prompt(text: str) -> str | None:
     return text[min(positions) :].strip(" ,.:;—-") or text.strip()
 
 
+def _looks_like_daily_briefing(text: str) -> bool:
+    """True when the request is a scheduled *runtime* briefing (not a free-form digest).
+
+    ``каждое утро сводку по ИИ`` stays an agent_task (topic digest needs a real turn).
+    ``каждое утро сводка / по системе / briefing`` becomes the structured experience path.
+    """
+
+    low = re.sub(r"\s+", " ", (text or "").replace("ё", "е")).strip().lower()
+    schedule = any(
+        token in low
+        for token in (
+            "кажд",
+            "ежеднев",
+            "каждое утро",
+            "каждый день",
+            "утром",
+            "по утрам",
+            "schedule",
+            "daily",
+        )
+    )
+    if not schedule:
+        return False
+    if any(
+        token in low
+        for token in (
+            "briefing",
+            "статус системы",
+            "runtime",
+            "health",
+            "утренн",
+        )
+    ):
+        return True
+    if "сводк" not in low and "дайджест" not in low:
+        return False
+    # Topic digests ("сводку по ИИ/новостям/…") are agent tasks; system topics stay briefing.
+    topic = re.search(r"(?:сводк\w*|дайджест)\s+по\s+(\S+)", low)
+    if topic:
+        subject = topic.group(1)
+        return subject.startswith(
+            ("систем", "runtime", "сервер", "машин", "джарвис", "jarvis", "health", "статус")
+        )
+    return True
+
+
 def _reminders_create(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     tz = reminder_zone(ctx.settings.reminder_tz)
     text = str(args.get("text") or args.get("phrase") or "").strip()
@@ -5998,7 +6044,12 @@ def _reminders_create(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
     title = text or when
     # An explicit prompt arg wins; otherwise classify the text as task-or-nudge.
     explicit_prompt = str(args.get("prompt") or "").strip()
+    is_briefing = _looks_like_daily_briefing(title) or _looks_like_daily_briefing(
+        explicit_prompt
+    )
     task_prompt = explicit_prompt or _scheduled_task_prompt(title)
+    if is_briefing and not task_prompt:
+        task_prompt = "daily_briefing"
     payload = None
     if task_prompt:
         action_denial = _tool_action_permission_denial(
@@ -6045,7 +6096,7 @@ def _reminders_create(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
                 for item in ctx.storage.list_reminders(status="pending", limit=1000)
                 if item.get("recurrence")
                 and isinstance(item.get("payload"), dict)
-                and item["payload"].get("kind") == "agent_task"
+                and item["payload"].get("kind") in {"agent_task", "briefing"}
             ]
             if len(active_recurring_tasks) >= MAX_ACTIVE_RECURRING_AGENT_TASKS_PER_USER:
                 return ToolRunResponse(
@@ -6060,11 +6111,18 @@ def _reminders_create(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
                         "active_recurring_agent_tasks": len(active_recurring_tasks),
                     },
                 )
-        payload = {
-            "kind": "agent_task",
-            "prompt": task_prompt,
-            "deliver": str(args.get("deliver") or "telegram"),
-        }
+        if is_briefing:
+            payload = {
+                "kind": "briefing",
+                "prompt": task_prompt if task_prompt != "daily_briefing" else "daily_briefing",
+                "deliver": str(args.get("deliver") or "telegram"),
+            }
+        else:
+            payload = {
+                "kind": "agent_task",
+                "prompt": task_prompt,
+                "deliver": str(args.get("deliver") or "telegram"),
+            }
     # Telegram-first: every reminder (passive nudge or scheduled task) stamps where
     # the fire should land. Without this the supervisor only writes to the web
     # conversation and the phone never hears about "напомни через час".
@@ -6096,8 +6154,15 @@ def _reminders_create(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
     )
     local = render_local(reminder["due_at"], tz=tz)
     suffix = " (повтор)" if parsed.recurrence else ""
-    is_task = bool(payload and payload.get("kind") == "agent_task")
-    if is_task:
+    kind = payload.get("kind") if isinstance(payload, dict) else None
+    is_task = kind == "agent_task"
+    is_briefing_task = kind == "briefing"
+    if is_briefing_task:
+        summary = (
+            f"Ежедневная сводка — {local}{suffix}. "
+            "Пришлю статус runtime в Telegram без полного agent-turn."
+        )
+    elif is_task:
         summary = (
             f"Плановая задача — {local}{suffix}: «{task_prompt}». "
             "Выполню и пришлю результат в Telegram."
@@ -6108,7 +6173,12 @@ def _reminders_create(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
         tool="reminders.create",
         ok=True,
         summary=summary,
-        data={"reminder": reminder, "due_local": local, "agent_task": is_task},
+        data={
+            "reminder": reminder,
+            "due_local": local,
+            "agent_task": is_task,
+            "briefing": is_briefing_task,
+        },
     )
 
 

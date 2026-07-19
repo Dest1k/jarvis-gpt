@@ -103,9 +103,16 @@ TYPING_REFRESH_SEC = 4.0
 _START_COMMANDS = {"/start"}
 _RESET_COMMANDS = {"/new", "/reset", "/новый", "/сброс"}
 _STOP_COMMANDS = {"/stop", "/cancel", "/отмена", "/стоп"}
+_CAPTURE_COMMANDS = {"/note", "/inbox", "/capture", "/заметка", "/заметки"}
 # After this many seconds of a still-running agent turn, ping the chat so a long
 # research/document job does not look frozen on the phone.
 _PROGRESS_STATUS_AFTER_SEC = 12.0
+_IMAGE_MIME_TYPES = frozenset(
+    {"image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif"}
+)
+_IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".webp", ".gif"})
+# Telegram Bot API hard limit for sendPhoto (use document above this).
+_TG_PHOTO_CAP = 9 * 1024 * 1024
 _USER_SESSION_HEADER = "X-Jarvis-User-Session"
 _BRIDGE_SECRET_HEADER = "X-Jarvis-Bridge-Secret"
 _BRIDGE_HOT_CACHE_SIZE = 4_096
@@ -191,6 +198,32 @@ def _looks_like_audio(attachment: Mapping[str, object]) -> bool:
         return True
     name = str(attachment.get("name") or "").lower()
     return Path(name).suffix in _AUDIO_EXTENSIONS
+
+
+def _looks_like_image(name: str, mime: str) -> bool:
+    mime_l = str(mime or "").lower().split(";", 1)[0].strip()
+    if mime_l in _IMAGE_MIME_TYPES or mime_l.startswith("image/"):
+        return True
+    return Path(str(name or "")).suffix.lower() in _IMAGE_EXTENSIONS
+
+
+def _quick_capture_body(text: str, command: str) -> str | None:
+    """Extract capture content from /note …, ``+ …`` or ``! …`` prefixes.
+
+    Returns ``""`` when the command is present but empty (caller prompts for text),
+    or ``None`` when the message is not a capture at all.
+    """
+
+    raw = str(text or "").strip()
+    if command in _CAPTURE_COMMANDS:
+        rest = raw.split(maxsplit=1)
+        return rest[1].strip() if len(rest) > 1 else ""
+    if raw.startswith("+ ") or raw.startswith("! "):
+        return raw[2:].strip()
+    if raw.startswith("+") or raw.startswith("!"):
+        body = raw[1:].strip()
+        return body if body else ""
+    return None
 
 
 def _wav_to_ogg_opus(wav: bytes) -> bytes | None:
@@ -1758,6 +1791,8 @@ class TelegramBridge:
         # Active agent-turn tasks per chat (for /stop). Not the queue wrapper — the
         # work inside the single-flight lock, so cancel can interrupt a long /api/chat.
         self._active_turn_tasks: dict[int, asyncio.Task[Any]] = {}
+        # Stable transport request_id for the in-flight /api/chat of each chat.
+        self._active_request_ids: dict[int, str] = {}
 
     def _initialize_bot_identity(self, me: object) -> None:
         actual_bot_id = me.get("id") if isinstance(me, dict) else None
@@ -1855,6 +1890,29 @@ class TelegramBridge:
     def _enqueue_update(self, update: dict, *, lease_token: str | None = None) -> bool:
         """Schedule a fair update turn or reject it before it can grow an unbounded queue."""
 
+        callback = update.get("callback_query")
+        if isinstance(callback, dict):
+            message = callback.get("message") if isinstance(callback.get("message"), dict) else {}
+            chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+            sender = callback.get("from") if isinstance(callback.get("from"), dict) else None
+            chat_id = chat.get("id")
+            if (
+                isinstance(chat_id, bool)
+                or not isinstance(chat_id, int)
+                or not isinstance(sender, dict)
+            ):
+                log.warning("DENIED ambiguous Telegram callback_query before bridge queue")
+                return False
+            if not self._chat_is_allowed(chat_id):
+                log.warning("DENIED Telegram user_id=%s by optional allowlist", chat_id)
+                return False
+            task = asyncio.create_task(
+                self._handle_callback_query(chat_id, lease_token=lease_token, update=update)
+            )
+            self._update_tasks.add(task)
+            task.add_done_callback(self._on_update_task_done)
+            return True
+
         message = update.get("message")
         identity = self._telegram_identity(message) if isinstance(message, dict) else None
         if identity is None:
@@ -1894,6 +1952,30 @@ class TelegramBridge:
         task.add_done_callback(self._on_update_task_done)
         return True
 
+    async def _backend_cancel_turn(self, chat_id: int) -> bool:
+        """Ask the backend to abort the in-flight agent turn for this Telegram chat."""
+
+        payload: dict[str, object] = {"notification_chat_id": int(chat_id)}
+        request_id = self._active_request_ids.get(chat_id)
+        if request_id:
+            payload["request_id"] = request_id
+        try:
+            headers = self._session_headers(chat_id)
+        except RuntimeError:
+            headers = {}
+        try:
+            response = await self.api.post(
+                "/api/chat/cancel",
+                json=payload,
+                headers=headers,
+            )
+            if response.status_code >= 400:
+                return False
+            body = response.json() if response.content else {}
+            return bool(body.get("cancelled"))
+        except (httpx.HTTPError, ValueError, TypeError):
+            return False
+
     async def _handle_stop_command(
         self,
         chat_id: int,
@@ -1907,15 +1989,24 @@ class TelegramBridge:
         error: str | None = None
         try:
             active = self._active_turn_tasks.get(chat_id)
+            backend_cancelled = await self._backend_cancel_turn(chat_id)
             if active is not None and not active.done():
                 active.cancel()
                 with suppress(asyncio.CancelledError):
                     await active
-                await self._send(
-                    chat_id,
-                    "Остановил ожидание ответа. Backend может ещё досчитать в фоне — "
-                    "повторный результат проигнорирую, если придёт после /stop.",
-                )
+                if backend_cancelled:
+                    await self._send(
+                        chat_id,
+                        "Остановил. Backend-turn отменён — повторный результат не придёт.",
+                    )
+                else:
+                    await self._send(
+                        chat_id,
+                        "Остановил ожидание ответа. Backend может ещё досчитать в фоне — "
+                        "повторный результат проигнорирую, если придёт после /stop.",
+                    )
+            elif backend_cancelled:
+                await self._send(chat_id, "Остановил backend-turn.")
             else:
                 await self._send(chat_id, "Сейчас нет активного запроса.")
         except Exception as exc:  # noqa: BLE001
@@ -1936,6 +2027,101 @@ class TelegramBridge:
                     status=terminal_status,
                     error=error,
                 )
+
+    async def _handle_callback_query(
+        self,
+        chat_id: int,
+        *,
+        lease_token: str | None,
+        update: dict,
+    ) -> None:
+        """Handle reminder snooze/done inline buttons without waiting on the chat lock."""
+
+        terminal_status = "completed"
+        error: str | None = None
+        try:
+            callback = update.get("callback_query")
+            if not isinstance(callback, dict):
+                return
+            callback_id = str(callback.get("id") or "")
+            data = str(callback.get("data") or "").strip()
+            sender = callback.get("from") if isinstance(callback.get("from"), dict) else None
+            if callback_id:
+                with suppress(httpx.HTTPError, RuntimeError):
+                    await self._tg("answerCallbackQuery", callback_query_id=callback_id)
+            if sender is None:
+                return
+            try:
+                await self._open_user_session(
+                    update_id=int(update.get("update_id") or 0),
+                    chat_id=chat_id,
+                    sender=sender,
+                )
+            except httpx.HTTPError:
+                log.exception("callback session open failed for chat_id=%s", chat_id)
+                return
+            reply = await self._dispatch_reminder_callback(chat_id, data)
+            if reply:
+                await self._send(chat_id, reply)
+        except Exception as exc:  # noqa: BLE001
+            terminal_status = "failed"
+            error = type(exc).__name__
+            log.exception("callback_query failed for chat_id=%s", chat_id)
+        finally:
+            update_id = update.get("update_id")
+            if (
+                lease_token
+                and self._conversation_store is not None
+                and isinstance(update_id, int)
+                and not isinstance(update_id, bool)
+            ):
+                self._conversation_store.finalize_update(
+                    update_id,
+                    lease_token,
+                    status=terminal_status,
+                    error=error,
+                )
+
+    async def _dispatch_reminder_callback(self, chat_id: int, data: str) -> str | None:
+        """Map ``r:<reminder_id>:<action>`` callback data to backend snooze/ack."""
+
+        parts = data.split(":")
+        if len(parts) != 3 or parts[0] != "r":
+            return None
+        reminder_id, action = parts[1], parts[2]
+        if not reminder_id:
+            return None
+        try:
+            headers = self._session_headers(chat_id)
+        except RuntimeError:
+            return "Нет сессии — напиши /start."
+        try:
+            if action in {"s10", "s60"}:
+                minutes = 10 if action == "s10" else 60
+                response = await self.api.post(
+                    f"/api/reminders/{reminder_id}/snooze",
+                    json={"minutes": minutes},
+                    headers=headers,
+                )
+                if response.status_code == 404:
+                    return "Напоминание уже недоступно."
+                response.raise_for_status()
+                body = response.json() if response.content else {}
+                return str(body.get("detail") or f"Отложено на {minutes} мин.")
+            if action == "ok":
+                response = await self.api.post(
+                    f"/api/reminders/{reminder_id}/ack",
+                    headers=headers,
+                )
+                if response.status_code == 404:
+                    return "Напоминание уже недоступно."
+                response.raise_for_status()
+                body = response.json() if response.content else {}
+                return str(body.get("detail") or "Готово.")
+        except httpx.HTTPError:
+            log.exception("reminder callback API failed for %s", reminder_id)
+            return "Не смог обработать кнопку — попробуй ещё раз."
+        return None
 
     def _on_update_task_done(self, task: asyncio.Task[None]) -> None:
         self._update_tasks.discard(task)
@@ -2266,7 +2452,7 @@ class TelegramBridge:
                         "getUpdates",
                         offset=self._offset,
                         timeout=self.cfg.poll_timeout,
-                        allowed_updates=["message"],
+                        allowed_updates=["message", "callback_query"],
                     )
                     or []
                 )
@@ -2286,6 +2472,26 @@ class TelegramBridge:
                     log.warning("DENIED Telegram update with invalid update_id=%r", update_id)
                     continue
                 next_offset = max(next_offset, update_id + 1)
+                callback = update.get("callback_query")
+                if isinstance(callback, dict):
+                    message = (
+                        callback.get("message")
+                        if isinstance(callback.get("message"), dict)
+                        else {}
+                    )
+                    chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+                    chat_id = chat.get("id")
+                    if isinstance(chat_id, bool) or not isinstance(chat_id, int):
+                        log.warning("DENIED ambiguous Telegram callback update_id=%s", update_id)
+                        continue
+                    if not self._chat_is_allowed(chat_id):
+                        log.warning(
+                            "DENIED Telegram user_id=%s by optional allowlist", chat_id
+                        )
+                        continue
+                    # Callback identity is validated further in enqueue (from + chat).
+                    staged.append((update_id, chat_id, update))
+                    continue
                 message = update.get("message")
                 identity = (
                     self._telegram_identity(message) if isinstance(message, dict) else None
@@ -2320,6 +2526,16 @@ class TelegramBridge:
                 self._offset = next_offset
 
     async def _handle(self, update: dict) -> bool | None:
+        if isinstance(update.get("callback_query"), dict):
+            # Tests / embedded path: callbacks usually bypass the lock via enqueue.
+            callback = update["callback_query"]
+            message = callback.get("message") if isinstance(callback.get("message"), dict) else {}
+            chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+            chat_id = chat.get("id")
+            if isinstance(chat_id, bool) or not isinstance(chat_id, int):
+                return
+            await self._handle_callback_query(chat_id, lease_token=None, update=update)
+            return
         message = update.get("message")
         if not isinstance(message, dict):
             return
@@ -2362,13 +2578,21 @@ class TelegramBridge:
             await self._send(
                 chat_id,
                 "Джарвис на связи.\n"
-                "Команды: /new — новый разговор, /stop — отменить ожидание.",
+                "Команды:\n"
+                "• /new — новый разговор\n"
+                "• /stop — отменить текущий запрос\n"
+                "• /note … или `+ …` — быстрый захват в inbox\n"
+                "• «каждое утро сводка» — ежедневный briefing",
             )
             return
         if command in _STOP_COMMANDS:
             # Prefer the lock-bypassing enqueue path; this branch is a fallback when
             # _handle is invoked directly (tests / embedded mode).
-            await self._send(chat_id, "Сейчас нет активного запроса.")
+            backend_cancelled = await self._backend_cancel_turn(chat_id)
+            if backend_cancelled:
+                await self._send(chat_id, "Остановил backend-turn.")
+            else:
+                await self._send(chat_id, "Сейчас нет активного запроса.")
             return
         if command in _RESET_COMMANDS:
             access_mode = "owner" if session.preset_key == "owner" else "guest"
@@ -2376,6 +2600,11 @@ class TelegramBridge:
                 chat_id, access_mode, user_id=session.user_id
             )
             await self._send(chat_id, "Начал новый разговор.")
+            return
+
+        capture_body = _quick_capture_body(text, command)
+        if capture_body is not None:
+            await self._quick_capture(chat_id, capture_body)
             return
 
         attachments = await self._ingest_inbound(chat_id, message)
@@ -2472,6 +2701,38 @@ class TelegramBridge:
         }
 
     # -- the agent turn -------------------------------------------------------
+    async def _quick_capture(self, chat_id: int, body: str) -> None:
+        """Dump a thought into durable memory without a full agent turn (GTD inbox)."""
+
+        content = " ".join(str(body or "").split()).strip()
+        if not content:
+            await self._send(
+                chat_id,
+                "Что захватить? Пример: `/note купить молоко` или `+ идея про UI`.",
+            )
+            return
+        try:
+            response = await self.api.post(
+                "/api/memory",
+                json={
+                    "content": content[:20000],
+                    "namespace": "inbox",
+                    "tags": ["capture", "telegram", "gtd"],
+                    "importance": 0.6,
+                },
+                headers=self._session_headers(chat_id),
+            )
+            response.raise_for_status()
+            item = response.json() if response.content else {}
+        except httpx.HTTPError:
+            log.exception("quick-capture memory save failed for chat_id=%s", chat_id)
+            await self._send(chat_id, "Не смог сохранить в inbox — попробуй ещё раз.")
+            return
+        preview = content if len(content) <= 200 else content[:197] + "..."
+        mem_id = str(item.get("id") or "").strip()
+        suffix = f" (`{mem_id}`)" if mem_id else ""
+        await self._send(chat_id, f"📥 В inbox{suffix}: {preview}")
+
     async def _run_turn(
         self,
         chat_id: int,
@@ -2484,6 +2745,9 @@ class TelegramBridge:
         session = self._sessions[chat_id]
         before = await self._file_ids(chat_id)
         typing = asyncio.create_task(self._typing_keepalive(chat_id))
+        body: dict = {}
+        if request_id:
+            self._active_request_ids[chat_id] = request_id
         try:
             access_mode = "owner" if session.preset_key == "owner" else "guest"
             conversation_id = self._conversation_for(
@@ -2518,11 +2782,16 @@ class TelegramBridge:
                 if _retryable_backend_http_error(exc):
                     return False
                 raise
+            except asyncio.CancelledError:
+                # /stop cancelled the bridge wait; backend cancel was already requested.
+                raise
             finally:
                 progress_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await progress_task
         finally:
+            if self._active_request_ids.get(chat_id) == request_id:
+                self._active_request_ids.pop(chat_id, None)
             typing.cancel()
             with suppress(asyncio.CancelledError):
                 await typing
@@ -2628,14 +2897,26 @@ class TelegramBridge:
             headers=self._session_headers(chat_id),
         )
         download.raise_for_status()
+        name = str(item.get("name") or "file")
+        mime = str(item.get("mime_type") or "application/octet-stream")
+        content = download.content
+        # Images open inline on the phone; documents require an extra tap.
+        if _looks_like_image(name, mime) and (not size or size <= _TG_PHOTO_CAP):
+            photo_mime = mime if mime.startswith("image/") else "image/jpeg"
+            await self.tg.post(
+                "/sendPhoto",
+                data={"chat_id": chat_id},
+                files={"photo": (name, content, photo_mime)},
+            )
+            return
         await self.tg.post(
             "/sendDocument",
             data={"chat_id": chat_id},
             files={
                 "document": (
-                    item.get("name") or "file",
-                    download.content,
-                    item.get("mime_type") or "application/octet-stream",
+                    name,
+                    content,
+                    mime,
                 )
             },
         )

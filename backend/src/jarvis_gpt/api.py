@@ -86,8 +86,12 @@ from .models import (
     BenchmarkResponse,
     BrowserPolicyResponse,
     BrowserPolicyUpdateRequest,
+    ChatCancelRequest,
+    ChatCancelResponse,
     ChatRequest,
     ChatResponse,
+    ReminderActionResponse,
+    ReminderSnoozeRequest,
     CleanupRequest,
     ConversationItem,
     DailyBriefingResponse,
@@ -583,6 +587,7 @@ _HTTP_GUEST_ENDPOINTS = frozenset(
     {
         "chat",
         "chat_stream",
+        "cancel_chat",
         "interrupted_stream",
         "list_conversations",
         "list_conversation_messages",
@@ -619,6 +624,8 @@ _HTTP_PERSONAL_ENDPOINTS = frozenset(
         "memory_vault",
         "memory_hygiene",
         "memory_consolidate",
+        "snooze_reminder",
+        "ack_reminder",
         "list_files",
         "upload_file",
         "search_files",
@@ -1832,6 +1839,81 @@ async def run_routine(routine_id: str) -> RoutineRunResponse:
 async def briefing() -> DailyBriefingResponse:
     dispatcher_status = await asyncio.to_thread(app.state.dispatcher.status)
     return app.state.experience.daily_briefing(dispatcher_status=dispatcher_status)
+
+
+@app.post("/api/chat/cancel", response_model=ChatCancelResponse)
+async def cancel_chat(request: ChatCancelRequest) -> ChatCancelResponse:
+    """Abort an in-flight agent turn (Telegram /stop and similar clients)."""
+
+    if request.request_id is None and request.notification_chat_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="request_id or notification_chat_id is required",
+        )
+    result = app.state.agent.cancel_active_turn(
+        request_id=request.request_id,
+        notification_chat_id=request.notification_chat_id,
+    )
+    return ChatCancelResponse(
+        ok=bool(result.get("ok", True)),
+        cancelled=bool(result.get("cancelled")),
+        detail=result.get("detail"),
+    )
+
+
+@app.post("/api/reminders/{reminder_id}/snooze", response_model=ReminderActionResponse)
+async def snooze_reminder(
+    reminder_id: str, request: ReminderSnoozeRequest
+) -> ReminderActionResponse:
+    """Reschedule a pending/fired reminder by N minutes (Telegram inline buttons)."""
+
+    from .reminders import reminder_zone, to_utc_iso
+
+    clean_id = str(reminder_id or "").strip()
+    if not clean_id:
+        raise HTTPException(status_code=400, detail="reminder_id is required")
+    existing = app.state.storage.get_reminder(clean_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Reminder not found")
+    tz = reminder_zone(app.state.settings.reminder_tz)
+    due_at = to_utc_iso(datetime.now(tz) + timedelta(minutes=int(request.minutes)))
+    updated = app.state.storage.reschedule_reminder(clean_id, due_at=due_at)
+    if updated is None:
+        raise HTTPException(status_code=409, detail="Reminder cannot be snoozed")
+    return ReminderActionResponse(
+        ok=True,
+        action="snooze",
+        reminder=updated,
+        detail=f"Отложено на {int(request.minutes)} мин",
+    )
+
+
+@app.post("/api/reminders/{reminder_id}/ack", response_model=ReminderActionResponse)
+async def ack_reminder(reminder_id: str) -> ReminderActionResponse:
+    """Acknowledge a reminder: cancel if still pending, no-op if already fired."""
+
+    clean_id = str(reminder_id or "").strip()
+    if not clean_id:
+        raise HTTPException(status_code=400, detail="reminder_id is required")
+    existing = app.state.storage.get_reminder(clean_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Reminder not found")
+    status = str(existing.get("status") or "")
+    if status == "pending":
+        cancelled = app.state.storage.cancel_reminder(clean_id)
+        return ReminderActionResponse(
+            ok=True,
+            action="ack",
+            reminder=cancelled or existing,
+            detail="Готово — напоминание снято",
+        )
+    # Already fired/cancelled: acknowledge without mutating further.
+    return ReminderActionResponse(
+        ok=True,
+        action="ack",
+        reminder=existing,
+        detail="Готово",
+    )
 
 
 @app.post("/api/chat", response_model=ChatResponse)
