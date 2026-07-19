@@ -1918,10 +1918,13 @@ def test_agent_passes_chat_attachments_to_llm_context(monkeypatch, tmp_path):
 
     assert user_message["content"] == "разбери вложение"
     assert user_message["metadata"]["attachments"][0]["id"] == file_record["id"]
-    assert "Attached files already uploaded" in rendered_prompt
-    assert "documents.* tools" in rendered_prompt
+    assert (
+        "Attached files already uploaded" in rendered_prompt
+        or "Attached documents are already uploaded" in rendered_prompt
+    )
     assert "brief.txt" in rendered_prompt
-    assert "alpha attached content from upload" in rendered_prompt
+    assert "alpha attached content" in rendered_prompt
+    assert user_message["metadata"]["task_kernel"]["intent"] == "document_memory"
     storage.close()
 
 
@@ -1982,6 +1985,133 @@ def test_document_memory_route_is_not_intercepted_by_weather(monkeypatch, tmp_pa
     assert response.answer == "Резюме готово."
     assert "Погода в отчете" in rendered
     assert any(event.payload.get("prefetch") is True for event in response.events)
+    storage.close()
+
+
+def test_agent_routes_same_turn_docx_attachment_to_document_memory(monkeypatch, tmp_path):
+    """Telegram caption + docx must recall the file, not open web search."""
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    path = tmp_path / "Лядов Анатолий Аркадьевич.docx"
+    path.write_bytes(
+        # Minimal zip OOXML shell is unnecessary: store plain text under .docx name so
+        # ingest may fail OCR but the file record still exists for recall-by-id.
+        b"PK\x03\x04fake-docx-for-routing"
+    )
+    # Prefer real text via a sibling that surfer can read when path is .txt for content,
+    # while the attachment name stays .docx for mime/extension routing.
+    text_path = tmp_path / "person.docx.txt"
+    text_path.write_text(
+        "Лядов Анатолий Аркадьевич, родился в 1970 году, инженер.",
+        encoding="utf-8",
+    )
+    record = storage.create_file_record(
+        name="Лядов Анатолий Аркадьевич.docx",
+        stored_path=text_path,
+        sha256="d" * 64,
+        size=text_path.stat().st_size,
+        mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        status="stored",
+        chunk_count=0,
+    )
+    captured: dict[str, Any] = {}
+
+    class CapturingLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None):
+            captured["messages"] = messages
+            return type("Result", (), {"ok": True, "content": "done", "error": None})()
+
+    agent = AgentRuntime(settings=settings, storage=storage, llm=CapturingLLM(), bus=EventBus())
+    attachments = [
+        {
+            "id": record["id"],
+            "name": record["name"],
+            "mime_type": record["mime_type"],
+            "size": record["size"],
+        }
+    ]
+    response = asyncio.run(
+        agent.chat(
+            "кратенько расскажи про этого человека",
+            mode="chat",
+            attachments=attachments,
+        )
+    )
+    rendered_prompt = "\n".join(item["content"] for item in captured["messages"])
+    user_message = next(
+        item
+        for item in storage.recent_messages(response.conversation_id, limit=4)
+        if item["role"] == "user"
+    )
+
+    assert user_message["metadata"]["task_kernel"]["intent"] == "document_memory"
+    assert record["id"] in rendered_prompt
+    assert "Answer ONLY from these files" in rendered_prompt or "documents.recall" in rendered_prompt
+    assert any(
+        event.payload.get("tool") == "documents.recall"
+        and event.payload.get("prefetch") is True
+        for event in response.events
+    )
+    # Must not invent an empty-web excuse without reading the attachment.
+    assert "в интернете" not in (response.answer or "").casefold()
+    storage.close()
+
+
+def test_agent_routes_same_turn_xlsx_attachment_to_document_memory(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    path = tmp_path / "budget.xlsx.txt"
+    path.write_text("Статья,Сумма\nАренда,100000\n", encoding="utf-8")
+    record = storage.create_file_record(
+        name="budget.xlsx",
+        stored_path=path,
+        sha256="e" * 64,
+        size=path.stat().st_size,
+        mime_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        status="stored",
+        chunk_count=0,
+    )
+    captured: dict[str, Any] = {}
+
+    class CapturingLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None):
+            captured["messages"] = messages
+            return type("Result", (), {"ok": True, "content": "done", "error": None})()
+
+    agent = AgentRuntime(settings=settings, storage=storage, llm=CapturingLLM(), bus=EventBus())
+    response = asyncio.run(
+        agent.chat(
+            "кратко что в таблице",
+            mode="chat",
+            attachments=[
+                {
+                    "id": record["id"],
+                    "name": record["name"],
+                    "mime_type": record["mime_type"],
+                    "size": record["size"],
+                }
+            ],
+        )
+    )
+    user_message = next(
+        item
+        for item in storage.recent_messages(response.conversation_id, limit=3)
+        if item["role"] == "user"
+    )
+    assert user_message["metadata"]["task_kernel"]["intent"] == "document_memory"
+    assert any(
+        event.payload.get("tool") == "documents.recall" and event.payload.get("prefetch") is True
+        for event in response.events
+    )
     storage.close()
 
 

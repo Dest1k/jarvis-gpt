@@ -798,15 +798,32 @@ SCREEN_VISION_PROMPT = (
 def _message_with_attachments(message: str, attachments: list[dict[str, Any]]) -> str:
     if not attachments:
         return message
-    lines = [
-        message.strip(),
-        "",
-        (
+    has_docs = _has_document_like_attachments(attachments)
+    has_archives = _has_archive_like_attachments(attachments)
+    if has_docs:
+        instruction = (
+            "Attached documents are already uploaded to Jarvis storage. "
+            "Answer ONLY from these files via documents.recall / documents.read / "
+            "documents.inspect — do NOT open web search for «про этого человека» or "
+            "similar deictic questions about the attached content:"
+        )
+    elif has_archives:
+        instruction = (
+            "Attached archives are already uploaded to Jarvis storage. "
+            "Use documents.archive.list/search/read_member (or documents.recall for "
+            "indexed members) — do not invent contents from the web:"
+        )
+    else:
+        instruction = (
             "Attached files already uploaded to Jarvis storage. "
             "Use indexed file context or documents.* tools (document_surfer) "
             "when Word/Excel/PDF/text "
             "content, comparison, or edits are needed:"
-        ),
+        )
+    lines = [
+        message.strip(),
+        "",
+        instruction,
     ]
     for item in attachments:
         details = [f"id={item['id']}", f"name={item['name']}"]
@@ -8322,23 +8339,33 @@ class AgentRuntime:
                 ),
             )
 
+        has_document_attachments = _has_document_like_attachments(attachments)
+        has_archive_attachments = _has_archive_like_attachments(attachments)
+        has_file_context = bool(context.file_hits) or has_document_attachments or has_archive_attachments
+
         if (
             mode != "mission"
-            and not attachments
+            # Current-turn archive uploads (Telegram zip/7z/rar) bind immediately;
+            # pure non-archive attachments still use the no-attachment guard so a
+            # photo caption does not steal the archive route.
+            and (has_archive_attachments or not attachments)
             and not _looks_like_live_web_query(message)
             and _classify_document_artifact_intent(message)
             != NEW_ARTIFACT_REQUEST
-            and _looks_like_archive_memory_query(
-                message,
-                has_file_context=bool(context.file_hits),
-                has_persisted_files=has_persisted_files,
+            and (
+                has_archive_attachments
+                or _looks_like_archive_memory_query(
+                    message,
+                    has_file_context=has_file_context,
+                    has_persisted_files=has_persisted_files,
+                )
             )
         ):
             return TaskKernelPlan(
                 route="reasoning",
                 mode=task_mode,
                 intent="archive_memory",
-                confidence=0.86,
+                confidence=0.9 if has_archive_attachments else 0.86,
                 query=message,
                 tools=(
                     "files.search",
@@ -8354,7 +8381,11 @@ class AgentRuntime:
                     "answer from archive evidence and name the archive used",
                     "ask for archive identity when selection is unclear",
                 ),
-                rationale="The request targets a previously persisted local archive.",
+                rationale=(
+                    "The request targets a current-turn or previously persisted local archive."
+                    if has_archive_attachments
+                    else "The request targets a previously persisted local archive."
+                ),
             )
 
         if mode != "mission" and not attachments and _looks_like_filesystem_search(message):
@@ -8378,20 +8409,27 @@ class AgentRuntime:
 
         if (
             mode != "mission"
-            and not attachments
+            # Same-turn document uploads (Telegram docx/xlsx/pdf/…) must bind to
+            # documents.recall. The old `not attachments` guard forced the model into
+            # open web search for "расскажи про этого человека" with a docx caption.
+            and (has_document_attachments or not attachments)
+            and not has_archive_attachments
             and not _looks_like_live_web_query(message)
             and _classify_document_artifact_intent(message)
             not in {NEW_ARTIFACT_REQUEST, TRANSFORM_EXISTING_DOCUMENT}
             and (
+                # Current-turn readable document: always answer from the file itself
+                # (caption questions, deictic "про этого человека", bare "резюме").
+                has_document_attachments
                 # A date-scoped document question ("какие документы были 15 июля?",
                 # "сделай вывод из документов за вчера") routes here so recall can
                 # select by upload date rather than by relevance.
-                parse_document_date_scope(message) is not None
+                or parse_document_date_scope(message) is not None
                 # A full-text archive search ("в каком документе упоминается X?").
                 or _archive_search_term(message) is not None
                 or _looks_like_document_memory_query(
                     message,
-                    has_file_context=bool(context.file_hits),
+                    has_file_context=has_file_context,
                     has_persisted_files=has_persisted_files,
                 )
             )
@@ -8400,23 +8438,28 @@ class AgentRuntime:
                 route="reasoning",
                 mode=task_mode,
                 intent="document_memory",
-                confidence=0.88,
+                confidence=0.95 if has_document_attachments else 0.88,
                 query=message,
                 tools=(
                     "documents.recall",
                     "files.search",
                     "files.list",
                     "documents.read",
+                    "documents.inspect",
                     "documents.analyze",
                     "documents.corpus.summarize",
                 ),
                 completion_criteria=(
                     "resolve persisted documents to stable file ids",
-                    "read and analyze the stored source rather than only a stale snippet",
+                    "read and analyze the attached/stored source rather than the open web",
                     "answer from document evidence and name every source file used",
                     "ask for clarification instead of guessing when recall is empty or ambiguous",
                 ),
-                rationale="The request targets previously persisted document knowledge.",
+                rationale=(
+                    "The request targets a document attached in this turn."
+                    if has_document_attachments
+                    else "The request targets previously persisted document knowledge."
+                ),
             )
 
         if not self._owner_autonomy_active() and _requires_side_effect_clarification(message):
@@ -9644,12 +9687,41 @@ class AgentRuntime:
         context.file_hits = ranked
 
     def _attached_file_hits(self, attachments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Build file hits for the current-turn attachments.
+
+        Always tag them as ``recent-attachment`` so document/archive prefetch binds
+        ``file_ids`` instead of falling through to open web search. When the file is
+        stored but not yet chunked (common for fresh Telegram uploads of docx/xlsx),
+        still emit a synthetic hit so ``documents.recall`` can open the path.
+        """
+
         hits: list[dict[str, Any]] = []
         for item in attachments[:4]:
             file_id = item.get("id")
             if not isinstance(file_id, str) or not file_id:
                 continue
-            hits.extend(self.storage.list_file_chunks(file_id, limit=3))
+            chunks = self.storage.list_file_chunks(file_id, limit=3)
+            if chunks:
+                for chunk in chunks:
+                    chunk["retrieval"] = "recent-attachment"
+                hits.extend(chunks)
+                continue
+            record = self.storage.get_file(file_id)
+            if record is None:
+                continue
+            hits.append(
+                {
+                    "file_id": file_id,
+                    "file_name": record.get("name") or item.get("name") or "",
+                    "chunk_id": f"attachment:{file_id}",
+                    "position": 0,
+                    "content": "",
+                    "created_at": record.get("created_at"),
+                    "rank": None,
+                    "relevance": 1.0,
+                    "retrieval": "recent-attachment",
+                }
+            )
         return hits
 
     def _recent_document_reference_file_hits(
@@ -14348,19 +14420,42 @@ _DOCUMENT_ACTION_MARKERS = (
     "достан",
     "итоги",
     "кратко",
+    "кратеньк",
     "найди",
     "назови",
     "скажи",
+    "расскаж",
+    "опиши",
+    "описать",
     "верни",
     "прочитай",
+    "прочти",
     "разбер",
     "резюм",
     "сводк",
     "содержан",
+    "кто это",
+    "кто он",
+    "кто она",
+    "про этого",
+    "про него",
+    "про неё",
+    "про нее",
+    "что там",
+    "что внутри",
+    "что в",
+    "о чём",
+    "о чем",
     "analy",
     "recall",
     "remember",
     "summar",
+    "who is",
+    "about this",
+    "about him",
+    "about her",
+    "tell me",
+    "describe",
 )
 _DOCUMENT_NOUN_MARKERS = (
     "agreement",
@@ -14368,6 +14463,8 @@ _DOCUMENT_NOUN_MARKERS = (
     "contract",
     "договор",
     "документ",
+    "челове",
+    "персон",
     "отчёт",
     "отчет",
     "презентац",
@@ -14377,9 +14474,64 @@ _DOCUMENT_NOUN_MARKERS = (
     "document",
     "file",
     "pdf",
+    "person",
     "pptx",
     "report",
     "xlsx",
+)
+_DOCUMENT_LIKE_ATTACHMENT_EXTENSIONS = frozenset(
+    {
+        ".docx",
+        ".doc",
+        ".xlsx",
+        ".xls",
+        ".xlsm",
+        ".pptx",
+        ".ppt",
+        ".pdf",
+        ".txt",
+        ".md",
+        ".markdown",
+        ".csv",
+        ".tsv",
+        ".json",
+        ".html",
+        ".htm",
+        ".xml",
+        ".rtf",
+        ".odt",
+        ".ods",
+        ".odp",
+        ".log",
+        ".epub",
+    }
+)
+_ARCHIVE_LIKE_ATTACHMENT_EXTENSIONS = frozenset(
+    {
+        ".zip",
+        ".zipx",
+        ".7z",
+        ".rar",
+        ".tar",
+        ".tgz",
+        ".tbz",
+        ".tbz2",
+        ".txz",
+        ".tzst",
+        ".gz",
+        ".bz2",
+        ".xz",
+        ".zst",
+        ".iso",
+        ".img",
+        ".deb",
+        ".rpm",
+        ".squashfs",
+        ".sqfs",
+        ".sfs",
+        ".cab",
+        ".cpio",
+    }
 )
 _DOCUMENT_ARCHIVE_MARKERS = (
     "архив",
@@ -14462,6 +14614,79 @@ _DOCUMENT_WEB_MARKERS = (
     "source",
     "website",
 )
+
+
+def _attachment_suffix(name: str) -> str:
+    return Path(str(name or "").replace("\\", "/")).suffix.lower()
+
+
+def _is_document_like_attachment(item: dict[str, Any]) -> bool:
+    """True when a chat attachment is a readable office/text document (not image/audio)."""
+
+    name = str(item.get("name") or "")
+    mime = str(item.get("mime_type") or "").strip().lower()
+    suffix = _attachment_suffix(name)
+    if suffix in _DOCUMENT_LIKE_ATTACHMENT_EXTENSIONS:
+        return True
+    if suffix in _ARCHIVE_LIKE_ATTACHMENT_EXTENSIONS:
+        return False
+    if mime.startswith(("image/", "audio/", "video/")):
+        return False
+    if mime.startswith("text/"):
+        return True
+    if any(
+        token in mime
+        for token in (
+            "pdf",
+            "word",
+            "excel",
+            "spreadsheet",
+            "presentation",
+            "officedocument",
+            "opendocument",
+            "rtf",
+            "msword",
+        )
+    ):
+        return True
+    return False
+
+
+def _is_archive_like_attachment(item: dict[str, Any]) -> bool:
+    name = str(item.get("name") or "")
+    mime = str(item.get("mime_type") or "").strip().lower()
+    suffix = _attachment_suffix(name)
+    if suffix in _ARCHIVE_LIKE_ATTACHMENT_EXTENSIONS:
+        return True
+    if any(token in mime for token in ("zip", "rar", "7z", "tar", "gzip", "x-iso", "squashfs")):
+        return True
+    # Compound multi-suffixes (.tar.gz) lose the middle part via Path.suffix.
+    lower = name.lower()
+    return any(
+        lower.endswith(ext)
+        for ext in (
+            ".tar.gz",
+            ".tar.bz2",
+            ".tar.xz",
+            ".tar.zst",
+            ".tar.lz",
+            ".tar.lzma",
+        )
+    )
+
+
+def _has_document_like_attachments(attachments: list[dict[str, Any]] | None) -> bool:
+    return any(
+        isinstance(item, dict) and _is_document_like_attachment(item)
+        for item in (attachments or [])
+    )
+
+
+def _has_archive_like_attachments(attachments: list[dict[str, Any]] | None) -> bool:
+    return any(
+        isinstance(item, dict) and _is_archive_like_attachment(item)
+        for item in (attachments or [])
+    )
 
 
 def _looks_like_document_followup(message: str) -> bool:
