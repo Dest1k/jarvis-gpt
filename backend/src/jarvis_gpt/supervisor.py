@@ -20,7 +20,7 @@ from .config import JarvisSettings
 from .diagnostics import run_diagnostics
 from .learning import LearningEngine
 from .llm import LLMRouter, background_llm_priority
-from .notify import push_telegram_alert, telegram_targets
+from .notify import in_quiet_hours, push_telegram_alert, telegram_targets
 from .storage import JarvisStorage, utc_now
 from .telemetry import TelemetryCollector
 
@@ -657,15 +657,35 @@ class RuntimeSupervisor:
             from .notify import reminder_inline_keyboard
 
             reply_markup = reminder_inline_keyboard(reminder_id)
+        silent = self._telegram_quiet_now()
         if requested:
             return await push_telegram_alert(
-                body, target_chat_ids=requested, reply_markup=reply_markup
+                body,
+                target_chat_ids=requested,
+                reply_markup=reply_markup,
+                disable_notification=silent,
             )
         if current_user_id() == LEGACY_OWNER_USER_ID:
             return await push_telegram_alert(
-                body, target_chat_ids=None, reply_markup=reply_markup
+                body,
+                target_chat_ids=None,
+                reply_markup=reply_markup,
+                disable_notification=silent,
             )
         return False
+
+    def _telegram_quiet_now(self) -> bool:
+        """True when operator preferences put the wall-clock in quiet hours (silent push)."""
+
+        try:
+            prefs = self.storage.get_runtime_value("experience.preferences", {})
+        except Exception:  # noqa: BLE001 - quiet-hours probe must never break delivery
+            prefs = {}
+        if not isinstance(prefs, dict):
+            return False
+        quiet = str(prefs.get("quiet_hours") or "")
+        tz_name = str(getattr(self.settings, "reminder_tz", None) or "Europe/Moscow")
+        return in_quiet_hours(quiet, tz_name=tz_name)
 
     async def _run_briefing_task(self, reminder: dict[str, Any]) -> None:
         """Build the structured daily briefing and push it to Telegram (no LLM turn)."""
@@ -717,6 +737,7 @@ class RuntimeSupervisor:
                         delivered = await push_telegram_alert(
                             f"📋 {label}\n\n{answer}"[:3900],
                             target_chat_ids=target_ids or None,
+                            disable_notification=self._telegram_quiet_now(),
                         )
             conversation_id = reminder.get("conversation_id")
             if conversation_id:
@@ -787,6 +808,7 @@ class RuntimeSupervisor:
                         delivered = await push_telegram_alert(
                             f"🕒 {label}\n\n{answer}"[:3900],
                             target_chat_ids=target_ids or None,
+                            disable_notification=self._telegram_quiet_now(),
                         )
             conversation_id = reminder.get("conversation_id")
             if conversation_id:

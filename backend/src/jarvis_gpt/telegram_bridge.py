@@ -43,6 +43,11 @@ from urllib.parse import quote, urlsplit
 import httpx
 
 from .config import default_home, load_local_env_file
+from .notify import (
+    answer_action_keyboard,
+    operator_reply_keyboard,
+    progress_stop_keyboard,
+)
 from .telegram_format import html_to_plain, render_telegram_html, split_telegram_html
 
 log = logging.getLogger("jarvis.telegram")
@@ -104,6 +109,9 @@ _START_COMMANDS = {"/start"}
 _RESET_COMMANDS = {"/new", "/reset", "/новый", "/сброс"}
 _STOP_COMMANDS = {"/stop", "/cancel", "/отмена", "/стоп"}
 _CAPTURE_COMMANDS = {"/note", "/inbox", "/capture", "/заметка", "/заметки"}
+_HELP_COMMANDS = {"/help", "/помощь", "/commands", "/команды"}
+_STATUS_COMMANDS = {"/status", "/статус"}
+_BRIEFING_COMMANDS = {"/briefing", "/сводка", "/digest"}
 # After this many seconds of a still-running agent turn, ping the chat so a long
 # research/document job does not look frozen on the phone.
 _PROGRESS_STATUS_AFTER_SEC = 12.0
@@ -113,6 +121,21 @@ _IMAGE_MIME_TYPES = frozenset(
 _IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".webp", ".gif"})
 # Telegram Bot API hard limit for sendPhoto (use document above this).
 _TG_PHOTO_CAP = 9 * 1024 * 1024
+# Reply-keyboard day console (exact button labels).
+_CONSOLE_LABEL_TO_ACTION: dict[str, str] = {
+    "📋 Сводка": "briefing",
+    "📊 Статус": "status",
+    "📥 Inbox": "inbox_list",
+    "🛑 Стоп": "stop",
+    "🆕 Новый чат": "new",
+    "❓ Помощь": "help",
+    "Сводка": "briefing",
+    "Статус": "status",
+    "Inbox": "inbox_list",
+    "Стоп": "stop",
+    "Новый чат": "new",
+    "Помощь": "help",
+}
 _USER_SESSION_HEADER = "X-Jarvis-User-Session"
 _BRIDGE_SECRET_HEADER = "X-Jarvis-Bridge-Secret"
 _BRIDGE_HOT_CACHE_SIZE = 4_096
@@ -224,6 +247,216 @@ def _quick_capture_body(text: str, command: str) -> str | None:
         body = raw[1:].strip()
         return body if body else ""
     return None
+
+
+def _console_action_for_text(text: str) -> str | None:
+    """Map a reply-keyboard label or slash command to a console action name."""
+
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    if raw in _CONSOLE_LABEL_TO_ACTION:
+        return _CONSOLE_LABEL_TO_ACTION[raw]
+    command = _telegram_command(raw)
+    if command in _HELP_COMMANDS:
+        return "help"
+    if command in _STATUS_COMMANDS:
+        return "status"
+    if command in _BRIEFING_COMMANDS:
+        return "briefing"
+    if command in _STOP_COMMANDS:
+        return "stop"
+    if command in _RESET_COMMANDS:
+        return "new"
+    if command in _START_COMMANDS:
+        return "start"
+    return None
+
+
+def _is_forwarded_message(message: Mapping[str, object] | dict) -> bool:
+    """True when Telegram marks the update as a user-forwarded message."""
+
+    if not isinstance(message, Mapping):
+        return False
+    if message.get("forward_date") is not None:
+        return True
+    if message.get("forward_from") or message.get("forward_from_chat"):
+        return True
+    if message.get("forward_sender_name") or message.get("forward_from_message_id"):
+        return True
+    origin = message.get("forward_origin")
+    return isinstance(origin, Mapping) and bool(origin)
+
+
+def _forward_source_label(message: Mapping[str, object] | dict) -> str:
+    """Human-readable source for a forwarded message (best-effort)."""
+
+    if not isinstance(message, Mapping):
+        return "unknown"
+    origin = message.get("forward_origin")
+    if isinstance(origin, Mapping):
+        otype = str(origin.get("type") or "")
+        if otype == "user":
+            sender = origin.get("sender_user")
+            if isinstance(sender, Mapping):
+                name = " ".join(
+                    str(part)
+                    for part in (sender.get("first_name"), sender.get("last_name"))
+                    if part
+                ).strip()
+                username = str(sender.get("username") or "").strip()
+                if name and username:
+                    return f"{name} (@{username})"
+                return name or (f"@{username}" if username else "user")
+        if otype == "hidden_user":
+            return str(origin.get("sender_user_name") or "hidden user")
+        if otype in {"chat", "channel"}:
+            chat = origin.get("sender_chat") or origin.get("chat")
+            if isinstance(chat, Mapping):
+                title = str(chat.get("title") or chat.get("username") or "").strip()
+                if title:
+                    return title
+        if otype == "channel":
+            chat = origin.get("chat")
+            if isinstance(chat, Mapping):
+                return str(chat.get("title") or chat.get("username") or "channel")
+    fwd_from = message.get("forward_from")
+    if isinstance(fwd_from, Mapping):
+        name = " ".join(
+            str(part)
+            for part in (fwd_from.get("first_name"), fwd_from.get("last_name"))
+            if part
+        ).strip()
+        username = str(fwd_from.get("username") or "").strip()
+        if name and username:
+            return f"{name} (@{username})"
+        return name or (f"@{username}" if username else "user")
+    fwd_chat = message.get("forward_from_chat")
+    if isinstance(fwd_chat, Mapping):
+        title = str(fwd_chat.get("title") or fwd_chat.get("username") or "").strip()
+        if title:
+            return title
+    hidden = str(message.get("forward_sender_name") or "").strip()
+    return hidden or "unknown"
+
+
+def _help_text() -> str:
+    return (
+        "Джарвис на связи.\n"
+        "Пульт внизу: Сводка · Статус · Inbox · Стоп · Новый чат · Помощь.\n"
+        "\n"
+        "Команды:\n"
+        "• /new — новый разговор\n"
+        "• /stop — отменить текущий запрос\n"
+        "• /status · /briefing — без LLM\n"
+        "• /note … или `+ …` — быстрый захват в inbox\n"
+        "• перешли сообщение боту — разберу как задачу\n"
+        "• «каждое утро сводка» — ежедневный briefing"
+    )
+
+
+def _format_status_card(body: Mapping[str, object] | dict) -> str:
+    settings = body.get("settings") if isinstance(body.get("settings"), dict) else {}
+    profile = settings.get("profile") if isinstance(settings.get("profile"), dict) else {}
+    profile_name = str(
+        profile.get("name") or settings.get("profile_name") or "?"
+    )
+    counters = body.get("counters") if isinstance(body.get("counters"), dict) else {}
+    health = body.get("health") if isinstance(body.get("health"), list) else []
+    bad = [
+        item
+        for item in health
+        if isinstance(item, dict) and item.get("status") in {"warn", "error"}
+    ]
+    lines = [
+        f"📊 Статус · profile `{profile_name}`",
+        f"missions={counters.get('missions', '?')} "
+        f"memories={counters.get('memories', '?')} "
+        f"files={counters.get('files', '?')}",
+    ]
+    if bad:
+        lines.append("Проблемы:")
+        for item in bad[:5]:
+            name = item.get("name") or item.get("component") or "?"
+            lines.append(f"• {name}: {item.get('message') or item.get('status')}")
+    else:
+        lines.append("Health: ok")
+    notices = body.get("notices") if isinstance(body.get("notices"), list) else []
+    for notice in notices[:2]:
+        if isinstance(notice, dict) and notice.get("message"):
+            lines.append(f"notice: {notice.get('message')}")
+    return "\n".join(lines)
+
+
+def _format_briefing_card(body: Mapping[str, object] | dict) -> str:
+    headline = str(body.get("headline") or "Сводка").strip()
+    lines = [f"📋 {headline}"]
+    focus = [str(x).strip() for x in (body.get("focus") or []) if str(x).strip()]
+    if focus:
+        lines.append("Фокус:")
+        lines.extend(f"• {item}" for item in focus[:5])
+    risks = [str(x).strip() for x in (body.get("risks") or []) if str(x).strip()]
+    if risks:
+        lines.append("Риски:")
+        lines.extend(f"• {item}" for item in risks[:4])
+    suggestions = [
+        str(x).strip() for x in (body.get("suggestions") or []) if str(x).strip()
+    ]
+    if suggestions:
+        lines.append("Что сделать:")
+        lines.extend(f"• {item}" for item in suggestions[:4])
+    pending = body.get("pending_approvals")
+    if pending:
+        lines.append(f"Ожидают approval: {pending}")
+    return "\n".join(lines)
+
+
+def _build_forward_task_prompt(message: Mapping[str, object] | dict, text: str) -> str:
+    """Turn a forwarded Telegram message into an agent task prompt."""
+
+    source = _forward_source_label(message)
+    body = " ".join(str(text or "").split()).strip()
+    entities = message.get("entities") if isinstance(message, Mapping) else None
+    urls: list[str] = []
+    if isinstance(entities, list):
+        for ent in entities:
+            if not isinstance(ent, Mapping):
+                continue
+            if ent.get("type") == "url" and body:
+                try:
+                    offset = int(ent.get("offset") or 0)
+                    length = int(ent.get("length") or 0)
+                except (TypeError, ValueError):
+                    continue
+                urls.append(body[offset : offset + length])
+            if ent.get("type") == "text_link":
+                url = str(ent.get("url") or "").strip()
+                if url:
+                    urls.append(url)
+    # Also harvest bare URLs from text.
+    for match in re.finditer(r"https?://\S+", body):
+        urls.append(match.group(0).rstrip(").,;]}>\""))
+    uniq_urls = list(dict.fromkeys(u for u in urls if u))
+    lines = [
+        "Пересланное сообщение — обработай как задачу (forward-as-task).",
+        f"Источник: {source}",
+    ]
+    if body:
+        lines.append("Текст:")
+        lines.append(body[:8000])
+    else:
+        lines.append("Текст: (без текста — смотри вложения, если есть).")
+    if uniq_urls:
+        lines.append("Ссылки:")
+        lines.extend(f"- {url}" for url in uniq_urls[:8])
+    lines.append(
+        "Сделай полезное на русском, коротко и по делу:\n"
+        "• ссылка/статья — суммируй и предложи действие;\n"
+        "• поручение/мысль — выполни или сложи в inbox/reminder;\n"
+        "• документ/фото — разбери вложение;\n"
+        "• не спрашивай лишнего, если можно действовать."
+    )
+    return "\n".join(lines)
 
 
 def _wav_to_ogg_opus(wav: bytes) -> bytes | None:
@@ -1793,6 +2026,10 @@ class TelegramBridge:
         self._active_turn_tasks: dict[int, asyncio.Task[Any]] = {}
         # Stable transport request_id for the in-flight /api/chat of each chat.
         self._active_request_ids: dict[int, str] = {}
+        # Last assistant answer per chat (for action chips: inbox / remind / more).
+        self._last_answers: dict[int, str] = {}
+        # Mid-turn progress message_id so we can delete/edit instead of spamming.
+        self._progress_message_ids: dict[int, int] = {}
 
     def _initialize_bot_identity(self, me: object) -> None:
         actual_bot_id = me.get("id") if isinstance(me, dict) else None
@@ -2060,7 +2297,9 @@ class TelegramBridge:
             except httpx.HTTPError:
                 log.exception("callback session open failed for chat_id=%s", chat_id)
                 return
-            reply = await self._dispatch_reminder_callback(chat_id, data)
+            reply = await self._dispatch_callback_data(
+                chat_id, data, update_id=int(update.get("update_id") or 0)
+            )
             if reply:
                 await self._send(chat_id, reply)
         except Exception as exc:  # noqa: BLE001
@@ -2081,6 +2320,71 @@ class TelegramBridge:
                     status=terminal_status,
                     error=error,
                 )
+
+    async def _dispatch_callback_data(
+        self,
+        chat_id: int,
+        data: str,
+        *,
+        update_id: int,
+    ) -> str | None:
+        """Route inline callback payloads: reminder snooze or answer-action chips."""
+
+        if data.startswith("r:"):
+            return await self._dispatch_reminder_callback(chat_id, data)
+        if data.startswith("a:"):
+            return await self._dispatch_answer_action(
+                chat_id, data, update_id=update_id
+            )
+        return None
+
+    async def _dispatch_answer_action(
+        self,
+        chat_id: int,
+        data: str,
+        *,
+        update_id: int,
+    ) -> str | None:
+        """Handle ``a:inbox`` / ``a:r60`` / ``a:more`` / ``a:stop`` chips."""
+
+        action = data.split(":", 1)[-1] if ":" in data else data
+        if action == "stop":
+            backend_cancelled = await self._backend_cancel_turn(chat_id)
+            active = self._active_turn_tasks.get(chat_id)
+            if active is not None and not active.done():
+                active.cancel()
+                with suppress(asyncio.CancelledError):
+                    await active
+            if backend_cancelled:
+                return "Остановил backend-turn."
+            return "Сейчас нет активного запроса."
+        last = (self._last_answers.get(chat_id) or "").strip()
+        if action == "inbox":
+            if not last:
+                return "Нет последнего ответа, чтобы положить в inbox."
+            await self._quick_capture(chat_id, f"из ответа: {last[:4000]}")
+            return None  # _quick_capture already replied
+        if action == "r60":
+            if not last:
+                return "Нет последнего ответа для напоминания."
+            preview = last if len(last) <= 400 else last[:397] + "..."
+            prompt = f"напомни через 1 час: {preview}"
+            await self._run_turn(
+                chat_id,
+                prompt,
+                [],
+                request_id=f"{self._realm_id}:cb:{update_id}:r60",
+            )
+            return None
+        if action == "more":
+            await self._run_turn(
+                chat_id,
+                "Продолжи и углуби предыдущий ответ — добавь конкретику, без воды.",
+                [],
+                request_id=f"{self._realm_id}:cb:{update_id}:more",
+            )
+            return None
+        return None
 
     async def _dispatch_reminder_callback(self, chat_id: int, data: str) -> str | None:
         """Map ``r:<reminder_id>:<action>`` callback data to backend snooze/ack."""
@@ -2384,22 +2688,46 @@ class TelegramBridge:
             raise RuntimeError(f"Telegram {method} failed: {body}")
         return body.get("result")
 
-    async def _send(self, chat_id: int, text: str) -> None:
+    async def _send(
+        self,
+        chat_id: int,
+        text: str,
+        *,
+        reply_markup: dict | None = None,
+    ) -> None:
         """Send a reply as Telegram HTML (code blocks, bold, links, tables).
 
         The model answers in Markdown; we render it to Telegram's HTML subset and
         split it tag-safely. If Telegram still rejects a piece (malformed HTML), that
         piece is re-sent as plain text so the message always arrives.
+        ``reply_markup`` (inline or reply keyboard) is attached to the *last* piece.
         """
 
         html = render_telegram_html(text)
-        for piece in split_telegram_html(html):
-            if await self._send_piece(chat_id, piece, html=True):
+        pieces = list(split_telegram_html(html))
+        if not pieces:
+            pieces = [" "]
+        for index, piece in enumerate(pieces):
+            markup = reply_markup if index == len(pieces) - 1 else None
+            if await self._send_piece(chat_id, piece, html=True, reply_markup=markup):
                 continue
-            for plain in _chunks(html_to_plain(piece)):
-                await self._send_piece(chat_id, plain, html=False)
+            plain_parts = list(_chunks(html_to_plain(piece)))
+            for p_index, plain in enumerate(plain_parts):
+                plain_markup = (
+                    markup if p_index == len(plain_parts) - 1 else None
+                )
+                await self._send_piece(
+                    chat_id, plain, html=False, reply_markup=plain_markup
+                )
 
-    async def _send_piece(self, chat_id: int, text: str, *, html: bool) -> bool:
+    async def _send_piece(
+        self,
+        chat_id: int,
+        text: str,
+        *,
+        html: bool,
+        reply_markup: dict | None = None,
+    ) -> bool:
         params: dict[str, object] = {
             "chat_id": chat_id,
             "text": text,
@@ -2407,6 +2735,8 @@ class TelegramBridge:
         }
         if html:
             params["parse_mode"] = "HTML"
+        if reply_markup is not None:
+            params["reply_markup"] = reply_markup
         try:
             await self._tg("sendMessage", **params)
             return True
@@ -2420,18 +2750,35 @@ class TelegramBridge:
             await asyncio.sleep(TYPING_REFRESH_SEC)
 
     async def _progress_status(self, chat_id: int) -> None:
-        """One mid-turn status ping so long Telegram turns do not feel dead."""
+        """One mid-turn status ping so long Telegram turns do not feel dead.
+
+        Sends a single editable message with a Stop chip; cleared when the turn ends
+        so the chat is not permanently polluted with «Ещё работаю…».
+        """
 
         try:
             await asyncio.sleep(_PROGRESS_STATUS_AFTER_SEC)
         except asyncio.CancelledError:
             raise
         with suppress(httpx.HTTPError, RuntimeError):
-            await self._send_piece(
-                chat_id,
-                "⏳ Ещё работаю… Отвечу, как закончу. `/stop` — отменить ожидание.",
-                html=False,
+            result = await self._tg(
+                "sendMessage",
+                chat_id=chat_id,
+                text="⏳ Ещё работаю… Отвечу, как закончу.",
+                reply_markup=progress_stop_keyboard(),
+                disable_web_page_preview=True,
             )
+            if isinstance(result, dict):
+                message_id = result.get("message_id")
+                if isinstance(message_id, int) and not isinstance(message_id, bool):
+                    self._progress_message_ids[chat_id] = message_id
+
+    async def _clear_progress(self, chat_id: int) -> None:
+        message_id = self._progress_message_ids.pop(chat_id, None)
+        if message_id is None:
+            return
+        with suppress(httpx.HTTPError, RuntimeError):
+            await self._tg("deleteMessage", chat_id=chat_id, message_id=message_id)
 
     # -- main loop ------------------------------------------------------------
     async def run(self) -> None:
@@ -2574,15 +2921,20 @@ class TelegramBridge:
 
         text = (message.get("text") or message.get("caption") or "").strip()
         command = _telegram_command(text)
-        if command in _START_COMMANDS:
+        console_action = _console_action_for_text(text)
+        if console_action == "start" or command in _START_COMMANDS:
             await self._send(
                 chat_id,
-                "Джарвис на связи.\n"
-                "Команды:\n"
-                "• /new — новый разговор\n"
-                "• /stop — отменить текущий запрос\n"
-                "• /note … или `+ …` — быстрый захват в inbox\n"
-                "• «каждое утро сводка» — ежедневный briefing",
+                _help_text(),
+                reply_markup=operator_reply_keyboard(),
+            )
+            return
+        if console_action in {"stop", "new", "help", "status", "briefing", "inbox_list"}:
+            await self._handle_console_action(
+                chat_id,
+                console_action,
+                session=session,
+                update_id=update_id,
             )
             return
         if command in _STOP_COMMANDS:
@@ -2599,7 +2951,11 @@ class TelegramBridge:
             self._rotate_conversation(
                 chat_id, access_mode, user_id=session.user_id
             )
-            await self._send(chat_id, "Начал новый разговор.")
+            await self._send(
+                chat_id,
+                "Начал новый разговор.",
+                reply_markup=operator_reply_keyboard(),
+            )
             return
 
         capture_body = _quick_capture_body(text, command)
@@ -2608,11 +2964,15 @@ class TelegramBridge:
             return
 
         attachments = await self._ingest_inbound(chat_id, message)
-        if not text and not attachments:
+        forwarded = _is_forwarded_message(message)
+        if not text and not attachments and not forwarded:
             return
         audio_in = any(_looks_like_audio(a) for a in attachments)
         visual_in = any(not _looks_like_audio(a) for a in attachments)
-        if not text:
+        if forwarded:
+            # Forward-as-task: any share into the bot becomes an actionable request.
+            text = _build_forward_task_prompt(message, text)
+        elif not text:
             # Voice-only note IS the message: a single space passes the API's non-empty gate
             # while the backend folds the audio transcript in as the real query; a
             # visual-only attachment gets a look-at-it nudge instead.
@@ -2622,8 +2982,9 @@ class TelegramBridge:
             chat_id,
             text,
             attachments,
-            voice_reply=audio_in,
+            voice_reply=audio_in and not forwarded,
             request_id=f"{self._realm_id}:{update_id}",
+            action_chips=True,
         )
 
     # -- inbound files (photo/document -> /api/files/upload) ------------------
@@ -2733,6 +3094,126 @@ class TelegramBridge:
         suffix = f" (`{mem_id}`)" if mem_id else ""
         await self._send(chat_id, f"📥 В inbox{suffix}: {preview}")
 
+    async def _handle_console_action(
+        self,
+        chat_id: int,
+        action: str,
+        *,
+        session: TelegramUserSession,
+        update_id: int,
+    ) -> None:
+        """Day-console buttons and slash shortcuts that skip the full agent loop."""
+
+        if action == "stop":
+            backend_cancelled = await self._backend_cancel_turn(chat_id)
+            active = self._active_turn_tasks.get(chat_id)
+            if active is not None and not active.done():
+                active.cancel()
+                with suppress(asyncio.CancelledError):
+                    await active
+            if backend_cancelled:
+                await self._send(chat_id, "Остановил backend-turn.")
+            else:
+                await self._send(chat_id, "Сейчас нет активного запроса.")
+            return
+        if action == "new":
+            access_mode = "owner" if session.preset_key == "owner" else "guest"
+            self._rotate_conversation(
+                chat_id, access_mode, user_id=session.user_id
+            )
+            await self._send(
+                chat_id,
+                "Начал новый разговор.",
+                reply_markup=operator_reply_keyboard(),
+            )
+            return
+        if action == "help":
+            await self._send(
+                chat_id, _help_text(), reply_markup=operator_reply_keyboard()
+            )
+            return
+        if action == "status":
+            await self._send_status_card(chat_id)
+            return
+        if action == "briefing":
+            await self._send_briefing_card(chat_id)
+            return
+        if action == "inbox_list":
+            await self._send_inbox_preview(chat_id)
+            return
+
+    async def _send_status_card(self, chat_id: int) -> None:
+        try:
+            response = await self.api.get(
+                "/api/status", headers=self._session_headers(chat_id)
+            )
+            response.raise_for_status()
+            body = response.json() if response.content else {}
+        except httpx.HTTPError:
+            await self._send(chat_id, "Не смог получить статус runtime.")
+            return
+        await self._send(chat_id, _format_status_card(body))
+
+    async def _send_briefing_card(self, chat_id: int) -> None:
+        try:
+            response = await self.api.get(
+                "/api/briefing", headers=self._session_headers(chat_id)
+            )
+            response.raise_for_status()
+            body = response.json() if response.content else {}
+        except httpx.HTTPError:
+            await self._send(chat_id, "Не смог получить сводку.")
+            return
+        await self._send(chat_id, _format_briefing_card(body))
+
+    async def _send_inbox_preview(self, chat_id: int) -> None:
+        try:
+            response = await self.api.get(
+                "/api/memory",
+                params={"q": "namespace:inbox OR capture", "limit": 8},
+                headers=self._session_headers(chat_id),
+            )
+            # Fallback: unfiltered recent memory if query syntax is unsupported.
+            if response.status_code >= 400:
+                response = await self.api.get(
+                    "/api/memory",
+                    params={"limit": 12},
+                    headers=self._session_headers(chat_id),
+                )
+            response.raise_for_status()
+            items = response.json() if response.content else []
+        except httpx.HTTPError:
+            await self._send(chat_id, "Не смог прочитать inbox.")
+            return
+        if not isinstance(items, list):
+            items = []
+        inbox = [
+            item
+            for item in items
+            if isinstance(item, dict)
+            and (
+                str(item.get("namespace") or "") == "inbox"
+                or "capture" in [str(t) for t in (item.get("tags") or [])]
+                or "gtd" in [str(t) for t in (item.get("tags") or [])]
+            )
+        ][:6]
+        if not inbox:
+            # Prefer anything recent if namespace filter empty.
+            inbox = [item for item in items if isinstance(item, dict)][:5]
+        if not inbox:
+            await self._send(
+                chat_id,
+                "Inbox пуст. Добавь: `/note мысль` или `+ идея`.",
+            )
+            return
+        lines = ["📥 Inbox:"]
+        for item in inbox:
+            content = " ".join(str(item.get("content") or "").split())
+            if len(content) > 120:
+                content = content[:117] + "..."
+            lines.append(f"• {content}")
+        await self._send(chat_id, "\n".join(lines))
+
     async def _run_turn(
         self,
         chat_id: int,
@@ -2741,6 +3222,7 @@ class TelegramBridge:
         *,
         voice_reply: bool = False,
         request_id: str | None = None,
+        action_chips: bool = False,
     ) -> bool | None:
         session = self._sessions[chat_id]
         before = await self._file_ids(chat_id)
@@ -2789,6 +3271,7 @@ class TelegramBridge:
                 progress_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await progress_task
+                await self._clear_progress(chat_id)
         finally:
             if self._active_request_ids.get(chat_id) == request_id:
                 self._active_request_ids.pop(chat_id, None)
@@ -2816,7 +3299,9 @@ class TelegramBridge:
                 )
                 return
         answer = body.get("answer") or "(пустой ответ)"
-        await self._send(chat_id, answer)
+        self._last_answers[chat_id] = str(answer)
+        markup = answer_action_keyboard() if action_chips else None
+        await self._send(chat_id, answer, reply_markup=markup)
         if voice_reply and self.cfg.voice_replies:
             await self._reply_with_voice(chat_id, answer)
 

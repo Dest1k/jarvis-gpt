@@ -16,11 +16,16 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import Iterable, Mapping
+from datetime import datetime, time, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 
 _TIMEOUT_SEC = 8.0
+_QUIET_RANGE_RE = re.compile(
+    r"^\s*(\d{1,2})(?::(\d{2}))?\s*[-–—]\s*(\d{1,2})(?::(\d{2}))?\s*$"
+)
 
 
 def _parse_chat_ids(value: str | None) -> tuple[int, ...]:
@@ -60,6 +65,57 @@ def telegram_targets(
     return token, tuple(chat_id for chat_id in candidates if chat_id in allowed_set)
 
 
+def parse_quiet_hours(spec: str | None) -> tuple[time, time] | None:
+    """Parse ``quiet_hours`` preference into ``(start, end)`` wall-clock times.
+
+    Accepted forms: ``23:00-08:00``, ``23-8``, ``22:30–07:00``. Empty/invalid → None.
+    """
+
+    raw = str(spec or "").strip()
+    if not raw:
+        return None
+    match = _QUIET_RANGE_RE.match(raw)
+    if match is None:
+        return None
+    sh, sm, eh, em = match.groups()
+    start = time(int(sh) % 24, int(sm or 0) % 60)
+    end = time(int(eh) % 24, int(em or 0) % 60)
+    if start == end:
+        return None
+    return start, end
+
+
+def in_quiet_hours(
+    spec: str | None,
+    *,
+    now: datetime | None = None,
+    tz_name: str = "Europe/Moscow",
+) -> bool:
+    """True when local wall-clock is inside the operator's quiet window (may wrap midnight)."""
+
+    bounds = parse_quiet_hours(spec)
+    if bounds is None:
+        return False
+    start, end = bounds
+    try:
+        tz: timezone | ZoneInfo = ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, ValueError):
+        # Windows test hosts may lack tzdata; Moscow is a fixed +03:00 fallback.
+        tz = timezone(timedelta(hours=3), name=tz_name or "Europe/Moscow")
+    current = now
+    if current is None:
+        current = datetime.now(tz)
+    elif current.tzinfo is None:
+        current = current.replace(tzinfo=tz)
+    else:
+        current = current.astimezone(tz)
+    local_t = time(current.hour, current.minute)
+    if start < end:
+        return start <= local_t < end
+    # Wraps midnight: e.g. 23:00-08:00
+    return local_t >= start or local_t < end
+
+
 def reminder_inline_keyboard(reminder_id: str) -> dict[str, Any]:
     """Inline snooze/done buttons for a fired passive reminder.
 
@@ -79,6 +135,42 @@ def reminder_inline_keyboard(reminder_id: str) -> dict[str, Any]:
     }
 
 
+def answer_action_keyboard() -> dict[str, Any]:
+    """Inline chips under a normal agent answer (inbox / remind / more / stop)."""
+
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "📥 Inbox", "callback_data": "a:inbox"},
+                {"text": "⏰ +1ч", "callback_data": "a:r60"},
+                {"text": "➕ Ещё", "callback_data": "a:more"},
+            ]
+        ]
+    }
+
+
+def progress_stop_keyboard() -> dict[str, Any]:
+    """Stop chip on the mid-turn progress message."""
+
+    return {
+        "inline_keyboard": [[{"text": "🛑 Стоп", "callback_data": "a:stop"}]]
+    }
+
+
+def operator_reply_keyboard() -> dict[str, Any]:
+    """Persistent day-console reply keyboard for the phone operator."""
+
+    return {
+        "keyboard": [
+            [{"text": "📋 Сводка"}, {"text": "📊 Статус"}],
+            [{"text": "📥 Inbox"}, {"text": "🛑 Стоп"}],
+            [{"text": "🆕 Новый чат"}, {"text": "❓ Помощь"}],
+        ],
+        "resize_keyboard": True,
+        "is_persistent": True,
+    }
+
+
 async def push_telegram_alert(
     text: str,
     *,
@@ -86,10 +178,12 @@ async def push_telegram_alert(
     env: Mapping[str, str] | None = None,
     client: httpx.AsyncClient | None = None,
     reply_markup: Mapping[str, Any] | dict[str, Any] | None = None,
+    disable_notification: bool = False,
 ) -> bool:
     """Send ``text`` to authorised alert targets. Returns True if it reached ≥1 chat.
 
     Optional ``reply_markup`` (Telegram InlineKeyboardMarkup) is attached when set.
+    ``disable_notification`` silences the phone buzz (used in quiet hours).
     Never raises: unconfigured credentials or any transport error resolve to ``False``
     so a health-alert push can never take down the supervisor loop that called it.
     """
@@ -110,6 +204,7 @@ async def push_telegram_alert(
                     "chat_id": chat_id,
                     "text": text,
                     "disable_web_page_preview": True,
+                    "disable_notification": bool(disable_notification),
                 }
                 if reply_markup is not None:
                     payload["reply_markup"] = dict(reply_markup)

@@ -137,6 +137,15 @@ Shipped on `main`:
 - **sendPhoto** for image artifacts (inline preview instead of document-only).
 - **Quick-capture GTD** — `/note …`, `/inbox …`, `+ …` → memory namespace `inbox`.
 
+## Progress — Telegram day-console batch 2026-07-19
+
+Shipped on `main` (third wave, phone day rhythm):
+- **Forward-as-task** — any forwarded message becomes an agent task prompt (source + text + URLs).
+- **Reply-keyboard пульт** — Сводка / Статус / Inbox / Стоп / Новый чат / Помощь.
+- **Action chips** under answers — Inbox · +1ч · Ещё (+ Стоп on progress ping).
+- **Quiet hours** — `preferences.quiet_hours` → silent Telegram pushes (`disable_notification`).
+- **Progress message** with stop chip, deleted when the turn finishes (no chat spam).
+
 ## More ideas — brainstorm 2026-07-18 (new features)
 
 **Proactive (Jarvis acts, not only on request):**
