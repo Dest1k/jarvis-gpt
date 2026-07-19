@@ -7,14 +7,17 @@ Gemma is excluded from every live, GUI, API, Telegram, recovery, and soak scenar
 
 ## Machine reboot checkpoint
 
-This handoff was written so progress survives a full host reboot.
-After reboot, resume from **Exact next step** below. Do not restart from baseline `c4d7d33`
-if the working-tree commit below already landed on `main`.
+**Saved and pushed:** `6cb383a` on `origin/main`
+(`feat(runtime): crash-safe ownership, durable chat recovery, finance cards`).
+
+This handoff survives a full host reboot. After reboot, resume from **Exact next step**.
+Do not restart from historical baseline `c4d7d33` — pull/use `6cb383a`.
 
 ## Baseline and what was done
 
 - Repository: `D:\jarvis-gpt`, branch `main`.
-- Historical remote baseline when work started: `c4d7d33`.
+- Historical baseline when work started: `c4d7d33`.
+- Checkpoint commit: **`6cb383a`** (pushed).
 - Large Codex unfinished tree was continued: ownership CAS/nonce, finance card binding,
   chat stream recovery, Telegram durability, dispatcher/launcher crash-safety, Qwen-only policy.
 
@@ -39,31 +42,27 @@ if the working-tree commit below already landed on `main`.
      **92 passed**.
    - Full backend suite was started but **not finished** before the reboot save.
    - Frontend: `tsc --noEmit` OK.
-   - Frontend: `node tests/chat-stream-recovery.mjs` **FAILING** — expects upload preflight
-     before WAL persist order in `page.tsx` (`durableWrite > uploadPreflight`). Fix before
-     treating GUI recovery as green.
+   - Frontend node suites all green after fixing recovery test matcher for
+     `uploadChatFiles(filesToSend, signal)`:
+     chat-stream-recovery, memory-graph, runtime-identity, stream-placeholder, owner-session.
 
 ## Open / incomplete
 
-1. Fix `frontend/tests/chat-stream-recovery.mjs` failure (submit/upload/WAL order vs `page.tsx`).
-2. Full backend `pytest tests/` green (was interrupted for reboot save).
-3. Frontend remaining scripts: memory-graph, runtime-identity, stream-placeholder, owner-session, build.
-4. Commit/push of this tree (done if git shows post-checkpoint HEAD ≠ `c4d7d33`; verify after reboot).
-5. Restart full Qwen stack **only** via `scripts/jarvis-launcher.ps1` after integrated tests.
-6. Live smoke: exact completion, Telegram continuity, finance, OpenAPI/GUI recovery.
-7. Exhaustive operator audit: 60 Qwen cases / 151 fresh repeats
+1. Full backend `pytest tests/` green (was interrupted for reboot save).
+2. Frontend production `npm run build`.
+3. Restart full Qwen stack **only** via `scripts/jarvis-launcher.ps1` after integrated tests.
+4. Live smoke: exact completion, Telegram continuity, finance, OpenAPI/GUI recovery.
+5. Exhaustive operator audit: 60 Qwen cases / 151 fresh repeats
    (`docs/audit/11_JARVIS_EXHAUSTIVE_LIVE_AUDIT_PROMPT.md` and this run dir).
-8. Q059 needs real Telegram owner+guest inbound messages (cannot fabricate).
+6. Q059 needs real Telegram owner+guest inbound messages (cannot fabricate).
 
 ## Exact next step after reboot
 
-1. `cd D:\jarvis-gpt` → `git status` / `git log -1` — confirm checkpoint commit is present and pushed.
-2. Fix chat-stream-recovery test vs `frontend/app/page.tsx` order.
-3. `cd backend; uv run --with pytest python -m pytest tests/ -q`
-4. Frontend node tests + production build.
-5. If green: ensure pushed to `origin/main`.
-6. Launcher start full `qwen36-vl` stack; prove live completion `LIVE_OK`.
-7. Begin live audit from this functional run directory.
+1. `cd D:\jarvis-gpt` → `git fetch; git log -1` — expect **`6cb383a`** on `main` / `origin/main`.
+2. `cd backend; uv run --with pytest python -m pytest tests/ -q`
+3. Frontend: node test scripts + `npm run build`.
+4. Launcher start full `qwen36-vl` stack; prove live completion `LIVE_OK`.
+5. Begin live audit from this functional run directory.
 
 ## Protected working-tree items (do not stage)
 
