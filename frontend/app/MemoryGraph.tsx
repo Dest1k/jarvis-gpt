@@ -9,7 +9,17 @@ import {
   useRef,
   useState
 } from "react";
-import { Download, FileText, Search, X } from "lucide-react";
+import {
+  Download,
+  FileText,
+  Focus,
+  RefreshCw,
+  Search,
+  Settings2,
+  X,
+  ZoomIn,
+  ZoomOut
+} from "lucide-react";
 
 import type { MemoryGraphNode, MemoryVault } from "./page";
 import {
@@ -19,17 +29,19 @@ import {
   selectMemoryGraph
 } from "../lib/memory-graph.mjs";
 
-// --- simulation tuning -------------------------------------------------------
-const K_REPEL = 5200; // Coulomb charge (node-node repulsion)
-const K_SPRING = 0.022; // Hooke link stiffness
-const K_GRAVITY = 0.009; // pull toward the world centre so the graph stays framed
+// --- simulation tuning (defaults; operator can tweak in the settings rail) --
+const DEFAULT_REPEL = 5200;
+const DEFAULT_SPRING = 0.022;
+const DEFAULT_GRAVITY = 0.009;
 const DAMPING = 0.85;
-const MIN_D2 = 120; // clamp repulsion at very short range
-const MIN_ALPHA = 0.02; // freeze the sim below this "temperature"
+const MIN_D2 = 120;
+const MIN_ALPHA = 0.02;
 const COOL = 0.986;
 const REHEAT = 0.6;
 const WORLD_W = 900;
 const WORLD_H = 560;
+const MIN_ZOOM_SCALE = 0.15;
+const MAX_ZOOM_SCALE = 8;
 
 const REST_BY_KIND: Record<string, number> = {
   namespace: 62,
@@ -51,6 +63,17 @@ const KIND_LABELS: Record<string, string> = {
   link: "Ссылки",
   folder: "Папки",
   daybucket: "Даты"
+};
+
+const EDGE_KIND_LABELS: Record<string, string> = {
+  namespace: "Раздел",
+  tag: "Тег",
+  link: "Ссылка",
+  mentions: "Упоминание",
+  "co-source": "Общий источник",
+  "co-day": "Один день",
+  "same-content": "Одинаковый текст",
+  folder: "Папка"
 };
 
 type SimNode = {
@@ -88,7 +111,7 @@ function nodeRadius(degree: number, kind: string): number {
 function hashAngle(id: string): number {
   let h = 0;
   for (let i = 0; i < id.length; i += 1) h = (h * 31 + id.charCodeAt(i)) | 0;
-  return ((h >>> 0) % 3600) / 3600 * Math.PI * 2;
+  return (((h >>> 0) % 3600) / 3600) * Math.PI * 2;
 }
 
 function formatSize(bytes?: number | null): string {
@@ -98,8 +121,61 @@ function formatSize(bytes?: number | null): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} МБ`;
 }
 
-export function MemoryGraph({ vault }: { vault: MemoryVault }) {
+/**
+ * Map a screen point into SVG user space under default
+ * preserveAspectRatio="xMidYMid meet". Manual width/height scaling without
+ * letterboxing made zoom/pan jump content off-canvas.
+ */
+function clientToWorld(
+  svg: SVGSVGElement,
+  clientX: number,
+  clientY: number,
+  view: ViewBox
+): { x: number; y: number } {
+  const rect = svg.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0 || view.w <= 0 || view.h <= 0) {
+    return { x: view.x + view.w / 2, y: view.y + view.h / 2 };
+  }
+  const scale = Math.min(rect.width / view.w, rect.height / view.h);
+  const offsetX = (rect.width - view.w * scale) / 2;
+  const offsetY = (rect.height - view.h * scale) / 2;
+  return {
+    x: view.x + (clientX - rect.left - offsetX) / scale,
+    y: view.y + (clientY - rect.top - offsetY) / scale
+  };
+}
+
+function meetScale(svg: SVGSVGElement, view: ViewBox): number {
+  const rect = svg.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0 || view.w <= 0 || view.h <= 0) return 1;
+  return Math.min(rect.width / view.w, rect.height / view.h);
+}
+
+function clampViewBox(view: ViewBox, content?: { w: number; h: number }): ViewBox {
+  const baseW = content?.w && content.w > 0 ? content.w : WORLD_W;
+  const baseH = content?.h && content.h > 0 ? content.h : WORLD_H;
+  const aspect = view.h > 0 && view.w > 0 ? view.h / view.w : baseH / baseW;
+  const minW = Math.max(80, baseW * MIN_ZOOM_SCALE);
+  const maxW = Math.max(minW + 40, baseW * MAX_ZOOM_SCALE);
+  const w = Math.max(minW, Math.min(view.w, maxW));
+  const h = Math.max(60, w * aspect);
+  if (!Number.isFinite(w) || !Number.isFinite(h) || !Number.isFinite(view.x) || !Number.isFinite(view.y)) {
+    return { x: -WORLD_W / 2, y: -WORLD_H / 2, w: WORLD_W, h: WORLD_H };
+  }
+  return { x: view.x, y: view.y, w, h };
+}
+
+export function MemoryGraph({
+  vault,
+  onRefresh,
+  busy = false
+}: {
+  vault: MemoryVault;
+  onRefresh?: () => void;
+  busy?: boolean;
+}) {
   const svgRef = useRef<SVGSVGElement | null>(null);
+  const stageRef = useRef<HTMLDivElement | null>(null);
   const simRef = useRef<Map<string, SimNode>>(new Map());
   const simCacheRef = useRef<Map<string, SimNode>>(new Map());
   const nodeElsRef = useRef<Map<string, SVGGElement>>(new Map());
@@ -110,20 +186,30 @@ export function MemoryGraph({ vault }: { vault: MemoryVault }) {
   });
   const alphaRef = useRef<number>(0);
   const rafRef = useRef<number | null>(null);
+  const contentBoundsRef = useRef({ w: WORLD_W, h: WORLD_H });
   const vbRef = useRef<ViewBox>({ x: -WORLD_W / 2, y: -WORLD_H / 2, w: WORLD_W, h: WORLD_H });
+  const physicsRef = useRef({ repel: DEFAULT_REPEL, spring: DEFAULT_SPRING, gravity: DEFAULT_GRAVITY });
 
   const [vb, setVbState] = useState<ViewBox>(vbRef.current);
   const [hoverId, setHoverId] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [hiddenKinds, setHiddenKinds] = useState<Set<string>>(new Set());
-  // A real vault can hold thousands of notes; the hand-rolled O(N^2) sim + SVG DOM stay
-  // smooth by rendering a budget of the most-connected nodes (hubs + documents first).
+  const [hiddenEdgeKinds, setHiddenEdgeKinds] = useState<Set<string>>(new Set());
   const [renderCap, setRenderCap] = useState(DEFAULT_MEMORY_GRAPH_NODES);
+  const [labelsAlways, setLabelsAlways] = useState(false);
+  const [physicsRunning, setPhysicsRunning] = useState(true);
+  const [repel, setRepel] = useState(DEFAULT_REPEL);
+  const [spring, setSpring] = useState(DEFAULT_SPRING);
+  const [gravity, setGravity] = useState(DEFAULT_GRAVITY);
+  const [settingsOpen, setSettingsOpen] = useState(true);
+
+  physicsRef.current = { repel, spring, gravity };
 
   const setViewBox = useCallback((next: ViewBox) => {
-    vbRef.current = next;
-    setVbState(next);
+    const clamped = clampViewBox(next, contentBoundsRef.current);
+    vbRef.current = clamped;
+    setVbState(clamped);
   }, []);
 
   const kindsPresent = useMemo(() => {
@@ -132,18 +218,21 @@ export function MemoryGraph({ vault }: { vault: MemoryVault }) {
     return order.filter((k) => present.has(k));
   }, [vault.nodes]);
 
-  // Search runs before the render cap, so a low-ranked match is promoted into the
-  // bounded simulation together with a small, balanced sample of its neighbours.
+  const edgeKindsPresent = useMemo(() => {
+    const present = new Set(vault.edges.map((e) => e.kind));
+    return Array.from(present).sort();
+  }, [vault.edges]);
+
   const graph = useMemo(
     () =>
       selectMemoryGraph({
         nodes: vault.nodes,
-        edges: vault.edges,
+        edges: vault.edges.filter((edge) => !hiddenEdgeKinds.has(edge.kind)),
         hiddenKinds,
         renderCap,
         search
       }),
-    [vault.nodes, vault.edges, hiddenKinds, renderCap, search]
+    [vault.nodes, vault.edges, hiddenKinds, hiddenEdgeKinds, renderCap, search]
   );
   const { nodes, edges, totalNodes, truncated } = graph;
   const renderedEdgeKeys = useMemo(
@@ -172,8 +261,6 @@ export function MemoryGraph({ vault }: { vault: MemoryVault }) {
   }, [edges]);
 
   const searchMatch = search.trim() ? graph.searchMatchIds : null;
-
-  // Highlight set = hovered/selected node + its direct neighbours.
   const focusId = hoverId ?? selectedId;
   const highlight = useMemo(() => {
     if (!focusId) return null;
@@ -191,12 +278,17 @@ export function MemoryGraph({ vault }: { vault: MemoryVault }) {
 
   const startLoop = useCallback(() => {
     if (rafRef.current != null) return;
+    if (!physicsRunning) return;
     const step = () => {
+      if (!physicsRunning) {
+        rafRef.current = null;
+        return;
+      }
       const sim = simRef.current;
       const topology = topologyRef.current;
+      const phys = physicsRef.current;
       const arr = Array.from(sim.values());
       const n = arr.length;
-      // Coulomb repulsion (all pairs).
       for (let i = 0; i < n; i += 1) {
         const a = arr[i];
         for (let j = i + 1; j < n; j += 1) {
@@ -211,7 +303,7 @@ export function MemoryGraph({ vault }: { vault: MemoryVault }) {
               dy = (j - i) * 0.5 + 0.1;
             }
           }
-          const f = K_REPEL / d2;
+          const f = phys.repel / d2;
           const dist = Math.sqrt(d2);
           const fx = (dx / dist) * f;
           const fy = (dy / dist) * f;
@@ -221,7 +313,6 @@ export function MemoryGraph({ vault }: { vault: MemoryVault }) {
           b.vy -= fy;
         }
       }
-      // Link springs.
       for (const e of topology.edges) {
         const a = sim.get(e.source);
         const b = sim.get(e.target);
@@ -229,7 +320,7 @@ export function MemoryGraph({ vault }: { vault: MemoryVault }) {
         const dx = b.x - a.x;
         const dy = b.y - a.y;
         const dist = Math.sqrt(dx * dx + dy * dy) || 0.01;
-        const force = (dist - restLength(e.kind)) * K_SPRING;
+        const force = (dist - restLength(e.kind)) * phys.spring;
         const fx = (dx / dist) * force;
         const fy = (dy / dist) * force;
         a.vx += fx;
@@ -237,20 +328,23 @@ export function MemoryGraph({ vault }: { vault: MemoryVault }) {
         b.vx -= fx;
         b.vy -= fy;
       }
-      // Gravity + integrate.
       for (const node of arr) {
         if (node.dragging || node.pinned) {
           node.vx = 0;
           node.vy = 0;
         } else {
-          node.vx = (node.vx - node.x * K_GRAVITY) * DAMPING;
-          node.vy = (node.vy - node.y * K_GRAVITY) * DAMPING;
+          node.vx = (node.vx - node.x * phys.gravity) * DAMPING;
+          node.vy = (node.vy - node.y * phys.gravity) * DAMPING;
           node.x += node.vx * alphaRef.current;
           node.y += node.vy * alphaRef.current;
         }
-        if (node.el) node.el.setAttribute("transform", `translate(${node.x.toFixed(2)} ${node.y.toFixed(2)})`);
+        if (node.el) {
+          node.el.setAttribute(
+            "transform",
+            `translate(${node.x.toFixed(2)} ${node.y.toFixed(2)})`
+          );
+        }
       }
-      // Position edges.
       topology.edges.forEach((e, index) => {
         const line = edgeElsRef.current.get(topology.edgeKeys[index]);
         if (!line) return;
@@ -263,23 +357,21 @@ export function MemoryGraph({ vault }: { vault: MemoryVault }) {
         line.setAttribute("y2", b.y.toFixed(2));
       });
       alphaRef.current *= COOL;
-      if (alphaRef.current > MIN_ALPHA && !document.hidden) {
+      if (alphaRef.current > MIN_ALPHA && !document.hidden && physicsRunning) {
         rafRef.current = requestAnimationFrame(step);
       } else {
         rafRef.current = null;
       }
     };
     rafRef.current = requestAnimationFrame(step);
-  }, []);
+  }, [physicsRunning]);
 
   const reheat = useCallback(() => {
+    if (!physicsRunning) return;
     alphaRef.current = Math.max(alphaRef.current, REHEAT);
     if (rafRef.current == null) startLoop();
-  }, [startLoop]);
+  }, [physicsRunning, startLoop]);
 
-  // Callback refs run before layout effects. Reconcile the simulation in a
-  // layout effect so newly admitted nodes receive their DOM element and initial
-  // transform before paint; the persistent cache also restores filtered nodes.
   useLayoutEffect(() => {
     stopLoop();
     const cache = simCacheRef.current;
@@ -333,58 +425,40 @@ export function MemoryGraph({ vault }: { vault: MemoryVault }) {
       line.setAttribute("y2", target.y.toFixed(2));
     });
 
-    alphaRef.current = 1;
-    startLoop();
+    alphaRef.current = physicsRunning ? 1 : 0;
+    if (physicsRunning) startLoop();
     return stopLoop;
-  }, [edges, nodes, renderedEdgeKeys, startLoop, stopLoop]);
+  }, [edges, nodes, physicsRunning, renderedEdgeKeys, startLoop, stopLoop]);
 
-  // Resume the sim when the tab becomes visible again.
   useEffect(() => {
     const onVisible = () => {
-      if (!document.hidden && alphaRef.current > MIN_ALPHA) startLoop();
+      if (!document.hidden && alphaRef.current > MIN_ALPHA && physicsRunning) startLoop();
     };
     document.addEventListener("visibilitychange", onVisible);
     return () => document.removeEventListener("visibilitychange", onVisible);
-  }, [startLoop]);
+  }, [physicsRunning, startLoop]);
 
   const screenToWorld = useCallback((clientX: number, clientY: number) => {
     const svg = svgRef.current;
     if (!svg) return { x: 0, y: 0 };
-    try {
-      const screenMatrix = svg.getScreenCTM();
-      if (screenMatrix) {
-        const point = svg.createSVGPoint();
-        point.x = clientX;
-        point.y = clientY;
-        const world = point.matrixTransform(screenMatrix.inverse());
-        return { x: world.x, y: world.y };
-      }
-    } catch {
-      // Detached/test SVGs may not expose an invertible CTM; retain a safe fallback.
-    }
-    const rect = svg.getBoundingClientRect();
-    const view = vbRef.current;
-    if (rect.width === 0 || rect.height === 0) return { x: 0, y: 0 };
-    return {
-      x: view.x + ((clientX - rect.left) / rect.width) * view.w,
-      y: view.y + ((clientY - rect.top) / rect.height) * view.h
-    };
+    return clientToWorld(svg, clientX, clientY, vbRef.current);
   }, []);
 
-  // Background pan.
   const beginPan = useCallback(
     (event: ReactPointerEvent<SVGSVGElement>) => {
-      if (event.target !== svgRef.current) return; // only when the empty canvas is grabbed
+      // Allow pan from empty canvas / edge group, not from node groups.
+      const target = event.target as Element | null;
+      if (target?.closest?.(".mg-node")) return;
+      const svg = svgRef.current;
+      if (!svg) return;
       const start = { x: event.clientX, y: event.clientY };
       const base = { ...vbRef.current };
-      const rect = svgRef.current?.getBoundingClientRect();
-      const scaleX = rect ? base.w / rect.width : 1;
-      const scaleY = rect ? base.h / rect.height : 1;
+      const scale = meetScale(svg, base) || 1;
       const onMove = (moveEvent: PointerEvent) => {
         setViewBox({
           ...base,
-          x: base.x - (moveEvent.clientX - start.x) * scaleX,
-          y: base.y - (moveEvent.clientY - start.y) * scaleY
+          x: base.x - (moveEvent.clientX - start.x) / scale,
+          y: base.y - (moveEvent.clientY - start.y) / scale
         });
       };
       const onUp = () => {
@@ -397,7 +471,6 @@ export function MemoryGraph({ vault }: { vault: MemoryVault }) {
     [setViewBox]
   );
 
-  // Node drag.
   const beginNodeDrag = useCallback(
     (event: ReactPointerEvent<SVGGElement>, id: string) => {
       event.stopPropagation();
@@ -413,9 +486,29 @@ export function MemoryGraph({ vault }: { vault: MemoryVault }) {
           target.y = world.y;
           target.vx = 0;
           target.vy = 0;
+          if (target.el) {
+            target.el.setAttribute(
+              "transform",
+              `translate(${target.x.toFixed(2)} ${target.y.toFixed(2)})`
+            );
+          }
         }
-        alphaRef.current = Math.max(alphaRef.current, REHEAT);
-        if (rafRef.current == null) startLoop();
+        // Keep edges attached while dragging even if the sim loop is cold.
+        topologyRef.current.edges.forEach((edge, index) => {
+          if (edge.source !== id && edge.target !== id) return;
+          const line = edgeElsRef.current.get(topologyRef.current.edgeKeys[index]);
+          const a = simRef.current.get(edge.source);
+          const b = simRef.current.get(edge.target);
+          if (!line || !a || !b) return;
+          line.setAttribute("x1", a.x.toFixed(2));
+          line.setAttribute("y1", a.y.toFixed(2));
+          line.setAttribute("x2", b.x.toFixed(2));
+          line.setAttribute("y2", b.y.toFixed(2));
+        });
+        if (physicsRunning) {
+          alphaRef.current = Math.max(alphaRef.current, REHEAT);
+          if (rafRef.current == null) startLoop();
+        }
       };
       const onUp = () => {
         const target = simRef.current.get(id);
@@ -426,35 +519,43 @@ export function MemoryGraph({ vault }: { vault: MemoryVault }) {
       window.addEventListener("pointermove", onMove);
       window.addEventListener("pointerup", onUp, { once: true });
     },
-    [reheat, screenToWorld, startLoop]
+    [physicsRunning, reheat, screenToWorld, startLoop]
   );
 
-  // Native wheel listener (passive: false) so zoom can preventDefault the page scroll —
-  // React's synthetic onWheel is passive and would let the panel scroll under the cursor.
-  useEffect(() => {
-    const svg = svgRef.current;
-    if (!svg) return undefined;
-    const handler = (event: WheelEvent) => {
-      event.preventDefault();
+  const zoomAt = useCallback(
+    (clientX: number, clientY: number, factor: number) => {
       const view = vbRef.current;
-      const factor = event.deltaY > 0 ? 1.12 : 0.89;
-      const newW = Math.max(WORLD_W * 0.2, Math.min(view.w * factor, WORLD_W * 4));
-      const newH = newW * (view.h / view.w);
-      const focus = screenToWorld(event.clientX, event.clientY);
+      if (view.w <= 0 || view.h <= 0) return;
+      const focus = screenToWorld(clientX, clientY);
+      const newW = view.w * factor;
+      const newH = view.h * factor;
       setViewBox({
         w: newW,
         h: newH,
         x: focus.x - (focus.x - view.x) * (newW / view.w),
         y: focus.y - (focus.y - view.y) * (newH / view.h)
       });
+    },
+    [screenToWorld, setViewBox]
+  );
+
+  // Native wheel (passive: false) — React onWheel is passive and cannot prevent page scroll.
+  useEffect(() => {
+    const svg = svgRef.current;
+    if (!svg) return undefined;
+    const handler = (event: WheelEvent) => {
+      event.preventDefault();
+      const factor = event.deltaY > 0 ? 1.12 : 0.89;
+      zoomAt(event.clientX, event.clientY, factor);
     };
     svg.addEventListener("wheel", handler, { passive: false });
     return () => svg.removeEventListener("wheel", handler);
-  }, [screenToWorld, setViewBox]);
+  }, [zoomAt]);
 
   const fitView = useCallback(() => {
     const arr = Array.from(simRef.current.values());
     if (!arr.length) {
+      contentBoundsRef.current = { w: WORLD_W, h: WORLD_H };
       setViewBox({ x: -WORLD_W / 2, y: -WORLD_H / 2, w: WORLD_W, h: WORLD_H });
       return;
     }
@@ -468,18 +569,45 @@ export function MemoryGraph({ vault }: { vault: MemoryVault }) {
       maxX = Math.max(maxX, node.x);
       maxY = Math.max(maxY, node.y);
     }
-    const pad = 60;
-    const w = Math.max(maxX - minX + pad * 2, 200);
-    const h = Math.max(maxY - minY + pad * 2, 160);
-    setViewBox({ x: minX - pad, y: minY - pad, w, h });
+    const pad = 80;
+    const rawW = Math.max(maxX - minX + pad * 2, 240);
+    const rawH = Math.max(maxY - minY + pad * 2, 180);
+    contentBoundsRef.current = { w: rawW, h: rawH };
+    // Match canvas aspect so meet-letterboxing stays minimal after fit.
+    const stage = stageRef.current?.getBoundingClientRect();
+    const aspect =
+      stage && stage.width > 0 && stage.height > 0
+        ? stage.height / stage.width
+        : WORLD_H / WORLD_W;
+    let w = rawW;
+    let h = rawW * aspect;
+    if (h < rawH) {
+      h = rawH;
+      w = rawH / aspect;
+    }
+    const cx = (minX + maxX) / 2;
+    const cy = (minY + maxY) / 2;
+    setViewBox({ x: cx - w / 2, y: cy - h / 2, w, h });
   }, [setViewBox]);
 
-  // Auto-fit once after the initial layout settles.
   useEffect(() => {
     const timer = window.setTimeout(fitView, 900);
     return () => window.clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [vault.stats.nodes]);
+  }, [vault.stats.nodes, nodes.length]);
+
+  // Keep canvas full-height when the stage resizes (exclusive graph page).
+  useEffect(() => {
+    const stage = stageRef.current;
+    if (!stage || typeof ResizeObserver === "undefined") return undefined;
+    const observer = new ResizeObserver(() => {
+      // Re-clamp current view against new stage aspect without jumping focus.
+      const view = vbRef.current;
+      setViewBox({ ...view });
+    });
+    observer.observe(stage);
+    return () => observer.disconnect();
+  }, [setViewBox]);
 
   const toggleKind = (kind: string) => {
     setHiddenKinds((current) => {
@@ -490,11 +618,21 @@ export function MemoryGraph({ vault }: { vault: MemoryVault }) {
     });
   };
 
+  const toggleEdgeKind = (kind: string) => {
+    setHiddenEdgeKinds((current) => {
+      const next = new Set(current);
+      if (next.has(kind)) next.delete(kind);
+      else next.add(kind);
+      return next;
+    });
+  };
+
   const selectedNode = selectedId ? vault.nodes.find((n) => n.id === selectedId) ?? null : null;
 
   const nodeClass = (node: MemoryGraphNode) => {
-    const classes = [`mg-node`, `mg-${node.kind}`];
+    const classes = ["mg-node", `mg-${node.kind}`];
     if (HUB_KINDS.has(node.kind)) classes.push("mg-hub");
+    if (labelsAlways) classes.push("mg-labels-on");
     if (node.id === selectedId) classes.push("mg-selected");
     if (highlight) classes.push(highlight.has(node.id) ? "mg-hi" : "mg-dim");
     if (searchMatch) classes.push(searchMatch.has(node.id) ? "mg-match" : "mg-nomatch");
@@ -512,160 +650,397 @@ export function MemoryGraph({ vault }: { vault: MemoryVault }) {
 
   if (!vault.nodes.length) {
     return (
-      <div className="mg-empty">
-        Граф пуст — пока нет ни записей памяти, ни документов. Сохраните заметку или загрузите файл.
+      <div className="mg-page mg-empty-page">
+        <div className="mg-empty">
+          Граф пуст — пока нет ни записей памяти, ни документов. Сохраните заметку или загрузите
+          файл.
+        </div>
       </div>
     );
   }
 
   return (
-    <div className="mg-wrap">
-      <div className="mg-toolbar">
-        <label className="mg-search">
-          <Search size={14} />
-          <input
-            value={search}
-            placeholder="Поиск по узлам…"
-            onChange={(event) => {
-              setSearch(event.target.value);
-            }}
-          />
-          {search && (
-            <button type="button" onClick={() => setSearch("")} aria-label="Очистить">
-              <X size={13} />
-            </button>
-          )}
-        </label>
-        <div className="mg-chips">
-          {kindsPresent.map((kind) => (
+    <div className={`mg-page ${settingsOpen ? "mg-settings-open" : "mg-settings-closed"}`}>
+      <aside className="mg-settings" aria-label="Настройки графа">
+        <header className="mg-settings-head">
+          <div>
+            <p className="mg-settings-eyebrow">Граф памяти</p>
+            <h2>Настройки</h2>
+          </div>
+          <button
+            type="button"
+            className="mg-icon-btn"
+            onClick={() => setSettingsOpen(false)}
+            aria-label="Скрыть настройки"
+            title="Скрыть"
+          >
+            <X size={16} />
+          </button>
+        </header>
+
+        <section className="mg-settings-block">
+          <h3>Обзор</h3>
+          <dl className="mg-stats">
+            <div>
+              <dt>Узлов в vault</dt>
+              <dd>{vault.stats.nodes ?? vault.nodes.length}</dd>
+            </div>
+            <div>
+              <dt>Связей в vault</dt>
+              <dd>{vault.stats.edges ?? vault.edges.length}</dd>
+            </div>
+            <div>
+              <dt>На экране</dt>
+              <dd>
+                {nodes.length} / {edges.length}
+              </dd>
+            </div>
+            <div>
+              <dt>Документы</dt>
+              <dd>{vault.stats.documents ?? 0}</dd>
+            </div>
+            <div>
+              <dt>Заметки</dt>
+              <dd>{vault.stats.notes ?? 0}</dd>
+            </div>
+          </dl>
+          {onRefresh ? (
             <button
-              key={kind}
               type="button"
-              className={`mg-chip mg-chip-${kind} ${hiddenKinds.has(kind) ? "off" : ""}`}
-              onClick={() => toggleKind(kind)}
+              className="mg-settings-action"
+              onClick={onRefresh}
+              disabled={busy}
             >
-              <span className="mg-chip-dot" />
-              {KIND_LABELS[kind] ?? kind}
+              <RefreshCw size={14} className={busy ? "spin" : undefined} />
+              Обновить vault
             </button>
-          ))}
-        </div>
-        <select
-          className="mg-cap"
-          value={renderCap}
-          onChange={(event) => setRenderCap(clampMemoryGraphCap(event.target.value))}
-          title="Сколько узлов показывать"
-        >
-          <option value={300}>300 узлов</option>
-          <option value={600}>600 узлов</option>
-          <option value={MAX_MEMORY_GRAPH_NODES}>{MAX_MEMORY_GRAPH_NODES} узлов</option>
-        </select>
-        <button type="button" className="mg-fit" onClick={fitView}>
-          Сброс вида
-        </button>
-      </div>
+          ) : null}
+        </section>
 
-      <div className="mg-stage">
-        <svg
-          ref={svgRef}
-          className="mg-canvas"
-          viewBox={`${vb.x} ${vb.y} ${vb.w} ${vb.h}`}
-          onPointerDown={beginPan}
-        >
-          <g className="mg-edges">
-            {edges.map((edge, index) => (
-              <line
-                key={renderedEdgeKeys[index]}
-                ref={(el) => {
-                  const key = renderedEdgeKeys[index];
-                  if (el) edgeElsRef.current.set(key, el);
-                  else edgeElsRef.current.delete(key);
-                }}
-                className={edgeClass(edge)}
-              />
-            ))}
-          </g>
-          <g className="mg-nodes">
-            {nodes.map((node) => {
-              const radius = nodeRadius(node.degree ?? 0, node.kind);
-              return (
-                <g
-                  key={node.id}
-                  className={nodeClass(node)}
-                  ref={(el) => {
-                    if (el) nodeElsRef.current.set(node.id, el);
-                    else nodeElsRef.current.delete(node.id);
-                    const sim = simRef.current.get(node.id);
-                    if (sim) {
-                      sim.el = el;
-                      if (el) {
-                        el.setAttribute(
-                          "transform",
-                          `translate(${sim.x.toFixed(2)} ${sim.y.toFixed(2)})`
-                        );
-                      }
-                    }
-                  }}
-                  onPointerDown={(event) => beginNodeDrag(event, node.id)}
-                  onPointerEnter={() => setHoverId(node.id)}
-                  onPointerLeave={() => setHoverId((current) => (current === node.id ? null : current))}
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    setSelectedId(node.id);
-                  }}
-                >
-                  {node.kind === "document" && (
-                    <rect
-                      className="mg-doc-back"
-                      x={-radius}
-                      y={-radius}
-                      width={radius * 2}
-                      height={radius * 2}
-                      rx={2.5}
-                    />
-                  )}
-                  <circle className="mg-dot" r={radius} />
-                  <text className="mg-label" x={radius + 3} y={3.5}>
-                    {node.label.length > 24 ? `${node.label.slice(0, 23)}…` : node.label}
-                  </text>
-                </g>
-              );
-            })}
-          </g>
-        </svg>
-
-        {selectedNode && (
-          <aside className="mg-detail">
-            <header>
-              <span className={`mg-detail-kind mg-${selectedNode.kind}`}>
-                {selectedNode.kind === "document" ? <FileText size={13} /> : null}
-                {KIND_LABELS[selectedNode.kind] ?? selectedNode.kind}
-              </span>
-              <button type="button" onClick={() => setSelectedId(null)} aria-label="Закрыть">
-                <X size={14} />
-              </button>
-            </header>
-            <h4>{selectedNode.label}</h4>
-            <DetailBody
-              node={selectedNode}
-              note={noteById.get(selectedNode.id)}
-              backlinks={vault.backlinks[selectedNode.label] ?? vault.backlinks[selectedNode.id] ?? []}
-              neighbours={Array.from(adjacency.get(selectedNode.id) ?? []).length}
+        <section className="mg-settings-block">
+          <h3>Поиск</h3>
+          <label className="mg-search mg-search-block">
+            <Search size={14} />
+            <input
+              value={search}
+              placeholder="Метка, путь, тег, id…"
+              onChange={(event) => setSearch(event.target.value)}
             />
-          </aside>
-        )}
-      </div>
+            {search ? (
+              <button type="button" onClick={() => setSearch("")} aria-label="Очистить">
+                <X size={13} />
+              </button>
+            ) : null}
+          </label>
+          {searchMatch ? (
+            <p className="mg-settings-hint">Совпадений: {searchMatch.size}</p>
+          ) : null}
+        </section>
 
-      <div className="mg-footer">
-        {truncated ? (
-          <span className="mg-warn">
-            показано {nodes.length} из {totalNodes} узлов
-          </span>
-        ) : (
-          <span>{nodes.length} узлов</span>
-        )}
-        <span>{edges.length} связей</span>
-        <span>{vault.stats.documents ?? 0} документов</span>
-        <span className="mg-hint">колесо — зум · фон — панорама · узел — детали</span>
+        <section className="mg-settings-block">
+          <h3>Типы узлов</h3>
+          <div className="mg-chips mg-chips-stack">
+            {kindsPresent.map((kind) => (
+              <button
+                key={kind}
+                type="button"
+                className={`mg-chip mg-chip-${kind} ${hiddenKinds.has(kind) ? "off" : ""}`}
+                onClick={() => toggleKind(kind)}
+              >
+                <span className="mg-chip-dot" />
+                {KIND_LABELS[kind] ?? kind}
+              </button>
+            ))}
+          </div>
+        </section>
+
+        {edgeKindsPresent.length > 0 ? (
+          <section className="mg-settings-block">
+            <h3>Типы связей</h3>
+            <div className="mg-chips mg-chips-stack">
+              {edgeKindsPresent.map((kind) => (
+                <button
+                  key={kind}
+                  type="button"
+                  className={`mg-chip ${hiddenEdgeKinds.has(kind) ? "off" : ""}`}
+                  onClick={() => toggleEdgeKind(kind)}
+                >
+                  <span className="mg-chip-dot" />
+                  {EDGE_KIND_LABELS[kind] ?? kind}
+                </button>
+              ))}
+            </div>
+          </section>
+        ) : null}
+
+        <section className="mg-settings-block">
+          <h3>Отображение</h3>
+          <label className="mg-field">
+            <span>Лимит узлов</span>
+            <select
+              value={renderCap}
+              onChange={(event) => setRenderCap(clampMemoryGraphCap(event.target.value))}
+            >
+              <option value={300}>300</option>
+              <option value={600}>600</option>
+              <option value={900}>900</option>
+              <option value={MAX_MEMORY_GRAPH_NODES}>{MAX_MEMORY_GRAPH_NODES}</option>
+            </select>
+          </label>
+          <label className="mg-toggle">
+            <input
+              type="checkbox"
+              checked={labelsAlways}
+              onChange={(event) => setLabelsAlways(event.target.checked)}
+            />
+            <span>Всегда показывать подписи</span>
+          </label>
+          {truncated ? (
+            <p className="mg-settings-hint mg-warn">
+              Показано {nodes.length} из {totalNodes} — поднимите лимит или сузьте фильтры.
+            </p>
+          ) : null}
+        </section>
+
+        <section className="mg-settings-block">
+          <h3>Физика раскладки</h3>
+          <label className="mg-toggle">
+            <input
+              type="checkbox"
+              checked={physicsRunning}
+              onChange={(event) => {
+                const on = event.target.checked;
+                setPhysicsRunning(on);
+                if (on) {
+                  alphaRef.current = REHEAT;
+                  startLoop();
+                } else {
+                  stopLoop();
+                }
+              }}
+            />
+            <span>Симуляция включена</span>
+          </label>
+          <label className="mg-field">
+            <span>Отталкивание · {repel}</span>
+            <input
+              type="range"
+              min={1000}
+              max={12000}
+              step={100}
+              value={repel}
+              onChange={(event) => {
+                setRepel(Number(event.target.value));
+                reheat();
+              }}
+            />
+          </label>
+          <label className="mg-field">
+            <span>Пружины · {spring.toFixed(3)}</span>
+            <input
+              type="range"
+              min={0.005}
+              max={0.08}
+              step={0.001}
+              value={spring}
+              onChange={(event) => {
+                setSpring(Number(event.target.value));
+                reheat();
+              }}
+            />
+          </label>
+          <label className="mg-field">
+            <span>Гравитация · {gravity.toFixed(3)}</span>
+            <input
+              type="range"
+              min={0}
+              max={0.04}
+              step={0.001}
+              value={gravity}
+              onChange={(event) => {
+                setGravity(Number(event.target.value));
+                reheat();
+              }}
+            />
+          </label>
+          <button type="button" className="mg-settings-action" onClick={() => reheat()}>
+            Перезапустить раскладку
+          </button>
+        </section>
+
+        <section className="mg-settings-block">
+          <h3>Камера</h3>
+          <div className="mg-settings-actions">
+            <button type="button" className="mg-settings-action" onClick={fitView}>
+              <Focus size={14} /> Вписать граф
+            </button>
+            <button
+              type="button"
+              className="mg-settings-action"
+              onClick={() => {
+                const svg = svgRef.current;
+                if (!svg) return;
+                const rect = svg.getBoundingClientRect();
+                zoomAt(rect.left + rect.width / 2, rect.top + rect.height / 2, 0.85);
+              }}
+            >
+              <ZoomIn size={14} /> Приблизить
+            </button>
+            <button
+              type="button"
+              className="mg-settings-action"
+              onClick={() => {
+                const svg = svgRef.current;
+                if (!svg) return;
+                const rect = svg.getBoundingClientRect();
+                zoomAt(rect.left + rect.width / 2, rect.top + rect.height / 2, 1.18);
+              }}
+            >
+              <ZoomOut size={14} /> Отдалить
+            </button>
+          </div>
+          <p className="mg-settings-hint">
+            Колесо — зум к курсору · пустой фон — панорама · узел — детали · перетаскивание
+            закрепляет позицию.
+          </p>
+        </section>
+      </aside>
+
+      <div className="mg-main">
+        <div className="mg-main-bar">
+          {!settingsOpen ? (
+            <button
+              type="button"
+              className="mg-icon-btn"
+              onClick={() => setSettingsOpen(true)}
+              aria-label="Показать настройки"
+              title="Настройки"
+            >
+              <Settings2 size={16} />
+            </button>
+          ) : null}
+          <div className="mg-main-title">
+            <h2>Граф связей vault</h2>
+            <span>
+              {nodes.length} узлов · {edges.length} связей
+              {truncated ? ` · из ${totalNodes}` : ""}
+            </span>
+          </div>
+          <div className="mg-main-actions">
+            <button type="button" className="mg-fit" onClick={fitView}>
+              <Focus size={13} /> Вписать
+            </button>
+          </div>
+        </div>
+
+        <div className="mg-stage" ref={stageRef}>
+          <svg
+            ref={svgRef}
+            className="mg-canvas"
+            viewBox={`${vb.x} ${vb.y} ${vb.w} ${vb.h}`}
+            preserveAspectRatio="xMidYMid meet"
+            onPointerDown={beginPan}
+          >
+            <g className="mg-edges">
+              {edges.map((edge, index) => (
+                <line
+                  key={renderedEdgeKeys[index]}
+                  ref={(el) => {
+                    const key = renderedEdgeKeys[index];
+                    if (el) edgeElsRef.current.set(key, el);
+                    else edgeElsRef.current.delete(key);
+                  }}
+                  className={edgeClass(edge)}
+                />
+              ))}
+            </g>
+            <g className="mg-nodes">
+              {nodes.map((node) => {
+                const radius = nodeRadius(node.degree ?? 0, node.kind);
+                return (
+                  <g
+                    key={node.id}
+                    className={nodeClass(node)}
+                    ref={(el) => {
+                      if (el) nodeElsRef.current.set(node.id, el);
+                      else nodeElsRef.current.delete(node.id);
+                      const sim = simRef.current.get(node.id);
+                      if (sim) {
+                        sim.el = el;
+                        if (el) {
+                          el.setAttribute(
+                            "transform",
+                            `translate(${sim.x.toFixed(2)} ${sim.y.toFixed(2)})`
+                          );
+                        }
+                      }
+                    }}
+                    onPointerDown={(event) => beginNodeDrag(event, node.id)}
+                    onPointerEnter={() => setHoverId(node.id)}
+                    onPointerLeave={() =>
+                      setHoverId((current) => (current === node.id ? null : current))
+                    }
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      setSelectedId(node.id);
+                    }}
+                  >
+                    {node.kind === "document" && (
+                      <rect
+                        className="mg-doc-back"
+                        x={-radius}
+                        y={-radius}
+                        width={radius * 2}
+                        height={radius * 2}
+                        rx={2.5}
+                      />
+                    )}
+                    <circle className="mg-dot" r={radius} />
+                    <text className="mg-label" x={radius + 3} y={3.5}>
+                      {node.label.length > 28 ? `${node.label.slice(0, 27)}…` : node.label}
+                    </text>
+                  </g>
+                );
+              })}
+            </g>
+          </svg>
+
+          {selectedNode && (
+            <aside className="mg-detail">
+              <header>
+                <span className={`mg-detail-kind mg-${selectedNode.kind}`}>
+                  {selectedNode.kind === "document" ? <FileText size={13} /> : null}
+                  {KIND_LABELS[selectedNode.kind] ?? selectedNode.kind}
+                </span>
+                <button type="button" onClick={() => setSelectedId(null)} aria-label="Закрыть">
+                  <X size={14} />
+                </button>
+              </header>
+              <h4>{selectedNode.label}</h4>
+              <DetailBody
+                node={selectedNode}
+                note={noteById.get(selectedNode.id)}
+                backlinks={
+                  vault.backlinks[selectedNode.label] ?? vault.backlinks[selectedNode.id] ?? []
+                }
+                neighbours={Array.from(adjacency.get(selectedNode.id) ?? []).length}
+              />
+            </aside>
+          )}
+        </div>
+
+        <div className="mg-footer">
+          {truncated ? (
+            <span className="mg-warn">
+              показано {nodes.length} из {totalNodes} узлов
+            </span>
+          ) : (
+            <span>{nodes.length} узлов</span>
+          )}
+          <span>{edges.length} связей</span>
+          <span>{vault.stats.documents ?? 0} документов</span>
+          <span className="mg-hint">колесо — зум · фон — панорама · узел — детали</span>
+        </div>
       </div>
     </div>
   );

@@ -5364,7 +5364,8 @@ export default function CommandCenter() {
           />
         </section>
 
-        <section className="mainGrid">
+        <section className={`mainGrid ${activeTab === "graph" ? "graph-mode" : ""}`}>
+          {activeTab !== "graph" ? (
           <section
             className="chatPanel"
             id="dialog"
@@ -5682,9 +5683,10 @@ export default function CommandCenter() {
               <GripHorizontal size={16} />
             </div>
           </section>
+          ) : null}
 
           <section
-            className={`opsPanel ${activeTab === "chat" ? "dialogOps" : "sectionOps"}`}
+            className={`opsPanel ${activeTab === "chat" ? "dialogOps" : "sectionOps"} ${activeTab === "graph" ? "graphOps" : ""}`}
             aria-label={activeTabTitle[activeTab]}
           >
             {activeTab === "chat" && (
@@ -6694,25 +6696,19 @@ export default function CommandCenter() {
             )}
 
             {activeTab === "graph" && (
-              <>
-                <div className="panelHeader" id="memory-graph">
-                  <h2>Граф памяти</h2>
-                  <span>
-                    {memoryVault
-                      ? `${memoryVault.stats.nodes ?? 0} узлов · ${memoryVault.stats.edges ?? 0} связей`
-                      : "загрузка…"}
-                  </span>
-                </div>
-                <p className="personaHint">
-                  Obsidian-like карта связей vault: перетаскивание узлов, поиск, фильтры по типам,
-                  просмотр заметки. Данные те же, что в vault памяти.
-                </p>
+              <div className="graphPage" id="memory-graph">
                 {memoryVault ? (
-                  <MemoryGraph vault={memoryVault} />
+                  <MemoryGraph
+                    vault={memoryVault}
+                    busy={busy}
+                    onRefresh={() => {
+                      void refreshMemoryVault();
+                    }}
+                  />
                 ) : (
                   <div className="empty">Загрузка vault…</div>
                 )}
-              </>
+              </div>
             )}
 
             {activeTab === "audit" && (
