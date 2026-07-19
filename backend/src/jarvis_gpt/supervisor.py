@@ -8,6 +8,14 @@ from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from .authorization import (
+    CORE_CAPABILITIES,
+    LEGACY_OWNER_USER_ID,
+    ActorContext,
+    AuthorizationService,
+    bind_actor,
+    current_user_id,
+)
 from .config import JarvisSettings
 from .diagnostics import run_diagnostics
 from .learning import LearningEngine
@@ -43,6 +51,25 @@ def _notification_chat_ids(value: Any) -> tuple[int, ...]:
         if chat_id not in ids:
             ids.append(chat_id)
     return tuple(ids)
+
+
+def _actor_telegram_chat_ids(storage: JarvisStorage) -> tuple[int, ...]:
+    """Resolve only the current user's Telegram private identity."""
+
+    user_id = current_user_id()
+    if user_id == LEGACY_OWNER_USER_ID:
+        return ()
+    with storage.locked_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT provider_subject_id
+            FROM external_identities
+            WHERE user_id = ? AND provider = 'telegram'
+            ORDER BY last_seen_at DESC
+            """,
+            (user_id,),
+        ).fetchall()
+    return _notification_chat_ids([row["provider_subject_id"] for row in rows])
 
 
 def _evaluate_alerts(
@@ -148,6 +175,10 @@ class RuntimeSupervisor:
     ) -> None:
         self.settings = settings
         self.storage = storage
+        self.authorization = AuthorizationService(storage)
+        # Supervisor can run in isolation in CLI/tests; scheduled/background PEPs
+        # must exist even when the FastAPI lifespan was not the initializer.
+        self.authorization.sync_capabilities(CORE_CAPABILITIES, catalog_key="core.v1")
         self.llm = llm or LLMRouter(settings)
         self.autonomy_executor = autonomy_executor
         self.bus = bus
@@ -175,6 +206,7 @@ class RuntimeSupervisor:
         self._last_cognition_at: str | None = None
         self._last_cognition_error: str | None = None
         self._last_background_job_at: str | None = None
+        self._background_user_cursor = ""
         self._last_error: str | None = None
         # Edge-triggered health-alert state: key -> last-fired alert payload. Kept so a
         # standing breach alerts once (not every telemetry tick) and clearing it emits a
@@ -400,6 +432,7 @@ class RuntimeSupervisor:
                 excluded_payload_kinds=(
                     ("screen_watch",) if not self.settings.screen_watch_enabled else ()
                 ),
+                all_users=True,
             )
         except Exception as exc:  # noqa: BLE001
             self._last_error = str(exc) or exc.__class__.__name__
@@ -411,26 +444,74 @@ class RuntimeSupervisor:
                     payload={"error": self._last_error},
                 )
             return
+        authorization = AuthorizationService(self.storage)
         for reminder in due:
+            actor = authorization.actor_for_user(
+                str(reminder.get("user_id") or ""), source="reminder-scheduler"
+            )
+            if actor is None:
+                continue
+            await self._fire_due_reminder_as_actor(reminder, actor)
+
+    async def _fire_due_reminder_as_actor(
+        self, reminder: dict[str, Any], actor: ActorContext
+    ) -> None:
+        with bind_actor(actor):
             recurring = bool(reminder.get("recurrence"))
-            payload = reminder.get("payload") if isinstance(reminder.get("payload"), dict) else {}
+            payload = (
+                reminder.get("payload")
+                if isinstance(reminder.get("payload"), dict)
+                else {}
+            )
             is_screen_watch = payload.get("kind") == "screen_watch"
             if is_screen_watch:
-                # Never let a disabled watcher degrade into the generic reminder branch:
-                # that would post a misleading "Напоминание" every interval.  Existing
-                # rows remain pending so re-enabling the feature resumes them.
                 if not self.settings.screen_watch_enabled:
-                    continue
+                    return
                 reminder_id = str(reminder.get("id") or "")
                 if not reminder_id or reminder_id in self._screen_watch_runs:
-                    continue
+                    return
+                authorization = AuthorizationService(self.storage)
+                required_security_ids = (
+                    "background.screen_watch.create",
+                    "privacy.screen.capture",
+                )
+                denied: list[str] = []
+                for security_id in required_security_ids:
+                    try:
+                        decision = authorization.authorize_current(
+                            security_id,
+                            resource_type="screen_watch",
+                            resource_ref=reminder_id,
+                            context={"operation": "scheduled_capture"},
+                        )
+                    except Exception:  # noqa: BLE001 - scheduler privacy checks fail closed.
+                        denied.append(security_id)
+                    else:
+                        if not decision.allowed:
+                            denied.append(security_id)
+                if denied:
+                    with suppress(Exception):
+                        self.storage.cancel_reminder(reminder_id)
+                    with suppress(Exception):
+                        self.storage.add_event(
+                            kind="screen_watch.permission_denied",
+                            title="Наблюдение за экраном остановлено политикой доступа",
+                            level="warn",
+                            payload={
+                                "reminder_id": reminder_id,
+                                "missing_security_ids": denied,
+                            },
+                        )
+                    return
                 run = asyncio.create_task(
                     self._run_screen_watch(reminder),
                     name=f"jarvis-screen-watch-{reminder_id}",
                 )
                 self._screen_watch_runs[reminder_id] = run
 
-                def _discard(done: asyncio.Task[None], *, watched_id: str = reminder_id) -> None:
+                def _discard(
+                    done: asyncio.Task[None], *, watched_id: str = reminder_id
+                ) -> None:
                     if self._screen_watch_runs.get(watched_id) is done:
                         self._screen_watch_runs.pop(watched_id, None)
                     if done.cancelled():
@@ -449,8 +530,11 @@ class RuntimeSupervisor:
                             )
 
                 run.add_done_callback(_discard)
-                continue
-            is_task = payload.get("kind") == "agent_task" and self.settings.scheduled_tasks_enabled
+                return
+            is_task = (
+                payload.get("kind") == "agent_task"
+                and self.settings.scheduled_tasks_enabled
+            )
             with suppress(Exception):
                 self.storage.add_event(
                     kind="reminder.fire",
@@ -466,8 +550,30 @@ class RuntimeSupervisor:
                 )
             conversation_id = reminder.get("conversation_id")
             if is_task:
-                # A scheduled agent task runs a full turn and delivers its own answer;
-                # spawn it so a long turn never blocks the reminder tick.
+                try:
+                    execute_decision = self.authorization.authorize_current(
+                        "background.scheduled_task.execute",
+                        resource_type="scheduled_task",
+                        resource_ref=str(reminder.get("id") or ""),
+                        context={"operation": "fire"},
+                    )
+                except Exception:  # noqa: BLE001 - scheduled execution fails closed.
+                    execute_decision = None
+                if execute_decision is None or not execute_decision.allowed:
+                    if recurring:
+                        with suppress(Exception):
+                            self.storage.cancel_reminder(str(reminder["id"]))
+                    with suppress(Exception):
+                        self.storage.add_event(
+                            kind="scheduled_task.permission_denied",
+                            title="Плановая задача заблокирована политикой доступа",
+                            level="warn",
+                            payload={
+                                "reminder_id": reminder.get("id"),
+                                "security_id": "background.scheduled_task.execute",
+                            },
+                        )
+                    return
                 run = asyncio.create_task(self._run_scheduled_task(reminder))
                 self._scheduled_runs.add(run)
                 run.add_done_callback(self._scheduled_runs.discard)
@@ -508,6 +614,17 @@ class RuntimeSupervisor:
         agent = getattr(self.autonomy_executor, "agent", None)
         if not prompt or agent is None:
             return
+        try:
+            execute_decision = self.authorization.authorize_current(
+                "background.scheduled_task.execute",
+                resource_type="scheduled_task",
+                resource_ref=str(reminder.get("id") or ""),
+                context={"operation": "execute"},
+            )
+        except Exception:  # noqa: BLE001 - scheduled execution fails closed.
+            return
+        if not execute_decision.allowed:
+            return
         answer = ""
         error: str | None = None
         try:
@@ -519,7 +636,12 @@ class RuntimeSupervisor:
         if answer:
             if str(payload.get("deliver") or "telegram") == "telegram":
                 with suppress(Exception):
-                    delivered = await push_telegram_alert(f"🕒 {label}\n\n{answer}"[:3900])
+                    actor_targets = _actor_telegram_chat_ids(self.storage)
+                    if actor_targets or current_user_id() == LEGACY_OWNER_USER_ID:
+                        delivered = await push_telegram_alert(
+                            f"🕒 {label}\n\n{answer}"[:3900],
+                            target_chat_ids=actor_targets or None,
+                        )
             conversation_id = reminder.get("conversation_id")
             if conversation_id:
                 with suppress(Exception):
@@ -680,9 +802,19 @@ class RuntimeSupervisor:
 
     async def _flush_screen_watch_notifications(self) -> None:
         with suppress(Exception):
-            pending = self.storage.list_pending_screen_watch_notifications(limit=50)
+            pending = self.storage.list_pending_screen_watch_notifications(
+                limit=50, all_users=True
+            )
+            authorization = AuthorizationService(self.storage)
             for reminder in pending:
-                await self._deliver_screen_watch_notice(reminder)
+                actor = authorization.actor_for_user(
+                    str(reminder.get("user_id") or ""),
+                    source="screen-watch-outbox",
+                )
+                if actor is None:
+                    continue
+                with bind_actor(actor):
+                    await self._deliver_screen_watch_notice(reminder)
 
     async def _deliver_screen_watch_notice(
         self,
@@ -757,10 +889,17 @@ class RuntimeSupervisor:
         if telegram_required:
             if not telegram_target_ids:
                 target_chat_id = payload.get("telegram_chat_id")
-                requested = (target_chat_id,) if isinstance(target_chat_id, int) else None
-                with suppress(Exception):
-                    _, resolved = telegram_targets(requested_chat_ids=requested)
-                    telegram_target_ids = resolved
+                requested = (
+                    (target_chat_id,)
+                    if isinstance(target_chat_id, int)
+                    else _actor_telegram_chat_ids(self.storage)
+                )
+                if requested:
+                    telegram_target_ids = requested
+                elif current_user_id() == LEGACY_OWNER_USER_ID:
+                    with suppress(Exception):
+                        _, resolved = telegram_targets(requested_chat_ids=None)
+                        telegram_target_ids = resolved
                 # Freeze a non-empty recipient set into the durable outbox. If Telegram
                 # is not configured yet, leave it unresolved so a later retry can pick up
                 # a corrected configuration instead of silently completing the notice.
@@ -1285,36 +1424,83 @@ class RuntimeSupervisor:
     async def _run_background_jobs(self) -> None:
         if self.autonomy_executor is None:
             return
-        try:
-            with background_llm_priority(self.llm):
-                results = await self.autonomy_executor.run_due_jobs(limit=1)
-            self._last_background_job_at = utc_now()
-            if results:
-                self.storage.add_event(
-                    kind="autonomy.background",
-                    title=f"Background autonomy ran {len(results)} due job(s)",
-                    payload={
-                        "jobs": [
-                            {
-                                "job_id": (item.get("job") or {}).get("id"),
-                                "kind": (item.get("job") or {}).get("kind"),
-                                "ok": item.get("ok"),
-                                "summary": item.get("summary"),
-                            }
-                            for item in results
-                            if isinstance(item, dict)
-                        ]
-                    },
-                )
-        except Exception as exc:  # noqa: BLE001
-            self._last_error = str(exc) or exc.__class__.__name__
-            with suppress(Exception):
-                self.storage.add_event(
-                    kind="autonomy.error",
-                    title="Background job loop failed",
-                    level="warn",
-                    payload={"error": self._last_error},
-                )
+        authorization = AuthorizationService(self.storage)
+        for user_id in self._background_job_user_ids(limit=100):
+            self._background_user_cursor = user_id
+            actor = authorization.actor_for_user(user_id, source="autonomy-scheduler")
+            if actor is None:
+                continue
+            decision = authorization.authorize(
+                user_id,
+                "background.autonomy.execute",
+                context={"scheduler": "runtime-supervisor"},
+            )
+            if not decision.allowed:
+                continue
+            with bind_actor(actor):
+                try:
+                    with background_llm_priority(self.llm):
+                        results = await self.autonomy_executor.run_due_jobs(limit=1)
+                    if not results:
+                        continue
+                    self._last_background_job_at = utc_now()
+                    self.storage.add_event(
+                        kind="autonomy.background",
+                        title=f"Background autonomy ran {len(results)} due job(s)",
+                        payload={
+                            "jobs": [
+                                {
+                                    "job_id": (item.get("job") or {}).get("id"),
+                                    "kind": (item.get("job") or {}).get("kind"),
+                                    "ok": item.get("ok"),
+                                    "summary": item.get("summary"),
+                                }
+                                for item in results
+                                if isinstance(item, dict)
+                            ]
+                        },
+                    )
+                    # One global execution per tick preserves the existing resource budget.
+                    return
+                except Exception as exc:  # noqa: BLE001
+                    self._last_error = str(exc) or exc.__class__.__name__
+                    with suppress(Exception):
+                        self.storage.add_event(
+                            kind="autonomy.error",
+                            title="Background job loop failed",
+                            level="warn",
+                            payload={"error": self._last_error},
+                        )
+
+    def _background_job_user_ids(self, *, limit: int) -> list[str]:
+        """Page fairly through tenants that actually have a persisted job collection."""
+
+        bounded = max(1, min(500, int(limit)))
+
+        def page(after: str) -> list[str]:
+            with self.storage.locked_connection() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT u.id
+                    FROM users u
+                    JOIN runtime_kv kv
+                      ON kv.key = CASE
+                          WHEN u.id = ? THEN 'operations.autonomy.jobs'
+                          ELSE 'user.' || u.id || '.operations.autonomy.jobs'
+                      END
+                    WHERE u.status = 'active' AND u.id > ? AND kv.value != '[]'
+                    ORDER BY u.id
+                    LIMIT ?
+                    """,
+                    (LEGACY_OWNER_USER_ID, after, bounded),
+                ).fetchall()
+            return [str(row["id"]) for row in rows]
+
+        user_ids = page(self._background_user_cursor)
+        if not user_ids and self._background_user_cursor:
+            self._background_user_cursor = ""
+            user_ids = page("")
+        return user_ids
 
 
 def _cognition_messages(storage: JarvisStorage) -> list[dict[str, str]]:

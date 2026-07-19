@@ -7,13 +7,23 @@ import re
 import sqlite3
 import threading
 import uuid
-from collections import Counter, defaultdict, deque
+from collections import Counter, OrderedDict, defaultdict, deque
 from collections.abc import Callable, Iterable
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from itertools import combinations
 from pathlib import Path
 from typing import Any
 
+from .authorization import (
+    LEGACY_OWNER_USER_ID,
+    AuthorizationError,
+    ResourceIsolationError,
+    current_actor,
+    current_user_id,
+    migrate_iam_schema,
+    scoped_runtime_key,
+)
 from .memory_vault import MemoryVault
 from .redaction import redact_value
 
@@ -25,6 +35,7 @@ _DOC_DERIV_BUCKET_K = 6  # groups larger than this collapse to a hub-and-star, n
 _DOC_DERIV_PER_DOC_DEGREE_CAP = 8  # max derived edges any single document may accrue
 _DOC_MENTION_EDGE_CAP = 10_000  # bound adversarial all-notes x all-documents mentions
 _MEMORY_VAULT_REPAIR_KEY = "memory_vault.repair_required"
+_MEMORY_VAULT_CACHE_MAX = 512
 # Mirrors document_memory._FILE_ID_RE; duplicated locally to avoid an import cycle.
 _DOC_FILE_ID_RE = re.compile(r"\bfile_[0-9a-fA-F]{8,}\b")
 
@@ -450,11 +461,15 @@ def _memory_sort_key(item: dict[str, Any]) -> tuple[float, float, str]:
 
 
 def _sqlite_table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    safe_table = str(table).replace("'", "''")
     row = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
-        (table,),
+        f"SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '{safe_table}'",
     ).fetchone()
     return row is not None
+
+
+def _sqlite_table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {str(row[1]) for row in conn.execute(f'PRAGMA table_info("{table}")').fetchall()}
 
 
 class JarvisStorage:
@@ -465,7 +480,13 @@ class JarvisStorage:
         self._read_only = False
         self._memory_fts_available = False
         self._file_fts_available = False
-        self.memory_vault = MemoryVault(database_path.parent.parent / "memory-vault")
+        self._memory_vault_root = database_path.parent.parent / "memory-vault"
+        self.memory_vault = MemoryVault(self._memory_vault_root)
+        self._user_memory_vaults: OrderedDict[str, MemoryVault] = OrderedDict()
+
+    @property
+    def read_only(self) -> bool:
+        return self._read_only
 
     def connect(self) -> sqlite3.Connection:
         if self._conn is None:
@@ -480,6 +501,70 @@ class JarvisStorage:
         if self._conn is not None:
             self._conn.close()
             self._conn = None
+
+    @contextmanager
+    def locked_connection(self):
+        """Expose the shared connection under its process-local serialization lock."""
+
+        with self._lock:
+            yield self.connect()
+
+    @contextmanager
+    def transaction(self, *, immediate: bool = False):
+        """Run one IAM/admin mutation atomically on the shared SQLite connection."""
+
+        with self._lock:
+            conn = self.connect()
+            if conn.in_transaction:
+                raise RuntimeError("nested storage transactions are not supported")
+            try:
+                conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+                yield conn
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+    def _memory_vault_for(self, user_id: str | None = None) -> MemoryVault:
+        owner_id = user_id or current_user_id()
+        if owner_id == LEGACY_OWNER_USER_ID:
+            return self.memory_vault
+        with self._lock:
+            vault = self._user_memory_vaults.pop(owner_id, None)
+            if vault is None:
+                vault = MemoryVault(self._memory_vault_root / "users" / owner_id)
+            self._user_memory_vaults[owner_id] = vault
+            while len(self._user_memory_vaults) > _MEMORY_VAULT_CACHE_MAX:
+                self._user_memory_vaults.popitem(last=False)
+            return vault
+
+    @staticmethod
+    def _require_owned_resource(
+        conn: sqlite3.Connection,
+        *,
+        table: str,
+        resource_id: str,
+        id_column: str = "id",
+        user_id: str | None = None,
+    ) -> None:
+        """Fail closed when a caller references another user's resource."""
+
+        owner_id = user_id or current_user_id()
+        row = conn.execute(
+            f'SELECT user_id FROM "{table}" WHERE "{id_column}" = ?',
+            (resource_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(resource_id)
+        if str(row["user_id"]) != owner_id:
+            raise ResourceIsolationError("resource is not available to this user")
+
+    @staticmethod
+    def _require_system_scope(operation: str) -> None:
+        """Reserve cross-tenant maintenance entrypoints for an owner/system actor."""
+
+        if not current_actor().is_owner:
+            raise AuthorizationError(f"{operation} requires owner system scope")
 
     def open_readonly(self) -> None:
         """Open an existing database without migrations, WAL changes, or vault sync."""
@@ -516,6 +601,7 @@ class JarvisStorage:
             conn = self.connect()
             try:
                 conn.executescript(SCHEMA)
+                migrate_iam_schema(conn)
                 self._memory_fts_available = self._ensure_memory_fts(conn)
                 self._file_fts_available = self._ensure_file_chunks_fts(conn)
                 conn.commit()
@@ -529,17 +615,24 @@ class JarvisStorage:
 
     def _ensure_memory_fts(self, conn: sqlite3.Connection) -> bool:
         try:
+            columns = (
+                _sqlite_table_columns(conn, "memories_fts")
+                if _sqlite_table_exists(conn, "memories_fts")
+                else set()
+            )
+            if columns and "user_id" not in columns:
+                conn.execute("DROP TABLE memories_fts")
             conn.execute(
                 """
                 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts
-                USING fts5(id UNINDEXED, namespace, content, tags)
+                USING fts5(id UNINDEXED, user_id UNINDEXED, namespace, content, tags)
                 """
             )
             conn.execute("DELETE FROM memories_fts")
             conn.execute(
                 """
-                INSERT INTO memories_fts(id, namespace, content, tags)
-                SELECT id, namespace, content, tags FROM memories
+                INSERT INTO memories_fts(id, user_id, namespace, content, tags)
+                SELECT id, user_id, namespace, content, tags FROM memories
                 """
             )
             return True
@@ -550,17 +643,26 @@ class JarvisStorage:
 
     def _ensure_file_chunks_fts(self, conn: sqlite3.Connection) -> bool:
         try:
+            columns = (
+                _sqlite_table_columns(conn, "file_chunks_fts")
+                if _sqlite_table_exists(conn, "file_chunks_fts")
+                else set()
+            )
+            if columns and "user_id" not in columns:
+                conn.execute("DROP TABLE file_chunks_fts")
             conn.execute(
                 """
                 CREATE VIRTUAL TABLE IF NOT EXISTS file_chunks_fts
-                USING fts5(file_id UNINDEXED, chunk_id UNINDEXED, content)
+                USING fts5(
+                    file_id UNINDEXED, chunk_id UNINDEXED, user_id UNINDEXED, content
+                )
                 """
             )
             conn.execute("DELETE FROM file_chunks_fts")
             conn.execute(
                 """
-                INSERT INTO file_chunks_fts(file_id, chunk_id, content)
-                SELECT file_id, id, content FROM file_chunks
+                INSERT INTO file_chunks_fts(file_id, chunk_id, user_id, content)
+                SELECT file_id, id, user_id, content FROM file_chunks
                 """
             )
             return True
@@ -569,23 +671,34 @@ class JarvisStorage:
                 return False
             raise
 
-    def _load_memories_for_vault(self, conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    def _load_memories_for_vault(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        user_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        owner_id = user_id or current_user_id()
         rows = conn.execute(
             """
-            SELECT id, namespace, content, tags, importance, created_at, updated_at
+            SELECT id, user_id, namespace, content, tags, importance, created_at, updated_at
             FROM memories
+            WHERE user_id = ?
             ORDER BY updated_at DESC
-            """
+            """,
+            (owner_id,),
         ).fetchall()
         return [{**dict(row), "tags": _loads(row["tags"], [])} for row in rows]
 
-    def _sync_memory_vault(self, conn: sqlite3.Connection) -> None:
-        self.memory_vault.sync(self._load_memories_for_vault(conn))
+    def _sync_memory_vault(self, conn: sqlite3.Connection, *, user_id: str | None = None) -> None:
+        owner_id = user_id or current_user_id()
+        self._memory_vault_for(owner_id).sync(
+            self._load_memories_for_vault(conn, user_id=owner_id)
+        )
 
     def _memory_vault_repair_pending(self, conn: sqlite3.Connection) -> bool:
         row = conn.execute(
             "SELECT value FROM runtime_kv WHERE key = ?",
-            (_MEMORY_VAULT_REPAIR_KEY,),
+            (scoped_runtime_key(_MEMORY_VAULT_REPAIR_KEY),),
         ).fetchone()
         if row is None:
             return False
@@ -614,7 +727,7 @@ class JarvisStorage:
                     value = excluded.value,
                     updated_at = excluded.updated_at
                 """,
-                (_MEMORY_VAULT_REPAIR_KEY, _json(value), now),
+                (scoped_runtime_key(_MEMORY_VAULT_REPAIR_KEY), _json(value), now),
             )
             conn.commit()
         except Exception:
@@ -625,7 +738,7 @@ class JarvisStorage:
         try:
             conn.execute(
                 "DELETE FROM runtime_kv WHERE key = ?",
-                (_MEMORY_VAULT_REPAIR_KEY,),
+                (scoped_runtime_key(_MEMORY_VAULT_REPAIR_KEY),),
             )
             conn.commit()
         except Exception:
@@ -655,10 +768,11 @@ class JarvisStorage:
             if force_full or repair_pending:
                 self._sync_memory_vault(conn)
             else:
+                vault = self._memory_vault_for()
                 for memory in upserts:
-                    self.memory_vault.upsert_memory(memory)
+                    vault.upsert_memory(memory)
                 for memory_id in removed_ids:
-                    self.memory_vault.remove_memory(str(memory_id))
+                    vault.remove_memory(str(memory_id))
         except Exception as exc:
             self._mark_memory_vault_repair_required(conn, exc)
             LOGGER.warning(
@@ -680,6 +794,7 @@ class JarvisStorage:
     def backup_database(self, target_dir: str | Path | None = None) -> dict[str, Any]:
         """Create a consistent SQLite backup using the SQLite backup API."""
 
+        self._require_system_scope("database backup")
         created_at = utc_now()
         backup_dir = (
             Path(target_dir)
@@ -737,10 +852,28 @@ class JarvisStorage:
         ]
         with self._lock:
             conn = self.connect()
-            return {
-                table: int(conn.execute(f"SELECT COUNT(*) AS c FROM {table}").fetchone()["c"])
-                for table in tables
-            }
+            actor = current_actor()
+            result: dict[str, int] = {}
+            for table in tables:
+                if table == "runtime_kv":
+                    if actor.user_id == LEGACY_OWNER_USER_ID:
+                        row = conn.execute(
+                            "SELECT COUNT(*) AS c FROM runtime_kv WHERE key NOT LIKE 'user.%'"
+                        ).fetchone()
+                    else:
+                        row = conn.execute(
+                            "SELECT COUNT(*) AS c FROM runtime_kv WHERE key LIKE ?",
+                            (f"user.{actor.user_id}.%",),
+                        ).fetchone()
+                elif "user_id" in _sqlite_table_columns(conn, table):
+                    row = conn.execute(
+                        f"SELECT COUNT(*) AS c FROM {table} WHERE user_id = ?",
+                        (actor.user_id,),
+                    ).fetchone()
+                else:
+                    row = conn.execute(f"SELECT COUNT(*) AS c FROM {table}").fetchone()
+                result[table] = int(row["c"])
+            return result
 
     def add_event(
         self,
@@ -757,12 +890,13 @@ class JarvisStorage:
             "kind": kind,
             "title": title,
             "payload": payload or {},
+            "user_id": current_user_id(),
         }
         with self._lock:
             self.connect().execute(
                 """
-                INSERT INTO runtime_events(id, ts, level, kind, title, payload)
-                VALUES (:id, :ts, :level, :kind, :title, :payload)
+                INSERT INTO runtime_events(id, ts, level, kind, title, payload, user_id)
+                VALUES (:id, :ts, :level, :kind, :title, :payload, :user_id)
                 """,
                 {**row, "payload": _json(row["payload"])},
             )
@@ -771,14 +905,16 @@ class JarvisStorage:
 
     def list_events(self, limit: int = 50) -> list[dict[str, Any]]:
         with self._lock:
+            actor = current_actor()
             rows = self.connect().execute(
                 """
-                SELECT id, ts, level, kind, title, payload
+                SELECT id, ts, level, kind, title, payload, user_id
                 FROM runtime_events
+                WHERE user_id = ?
                 ORDER BY ts DESC, rowid DESC
                 LIMIT ?
                 """,
-                (limit,),
+                (actor.user_id, limit),
             )
         return [
             {**dict(row), "payload": _loads(row["payload"], {})}
@@ -786,6 +922,7 @@ class JarvisStorage:
         ]
 
     def get_runtime_value(self, key: str, default: Any = None) -> Any:
+        key = scoped_runtime_key(key)
         with self._lock:
             row = self.connect().execute(
                 """
@@ -800,6 +937,7 @@ class JarvisStorage:
         return _loads(row["value"], default)
 
     def set_runtime_value(self, key: str, value: Any) -> dict[str, Any]:
+        key = scoped_runtime_key(key)
         now = utc_now()
         row = {"key": key[:160], "value": value, "updated_at": now}
         with self._lock:
@@ -834,7 +972,7 @@ class JarvisStorage:
         into storage while this transaction is open.
         """
 
-        safe_key = key[:160]
+        safe_key = scoped_runtime_key(key)[:500]
         with self._lock:
             conn = self.connect()
             try:
@@ -863,8 +1001,13 @@ class JarvisStorage:
         return updated
 
     def list_runtime_values(self, prefix: str | None = None) -> list[dict[str, Any]]:
+        actor = current_actor()
+        legacy_namespace = actor.user_id == LEGACY_OWNER_USER_ID
+        scoped_prefix = (
+            scoped_runtime_key(prefix or "") if (prefix or not legacy_namespace) else None
+        )
         with self._lock:
-            if prefix:
+            if scoped_prefix is not None:
                 rows = self.connect().execute(
                     """
                     SELECT key, value, updated_at
@@ -872,16 +1015,19 @@ class JarvisStorage:
                     WHERE key LIKE ?
                     ORDER BY updated_at DESC
                     """,
-                    (f"{prefix}%",),
+                    (f"{scoped_prefix}%",),
                 ).fetchall()
-            else:
+            elif legacy_namespace:
                 rows = self.connect().execute(
                     """
                     SELECT key, value, updated_at
                     FROM runtime_kv
+                    WHERE key NOT LIKE 'user.%'
                     ORDER BY updated_at DESC
                     """
                 ).fetchall()
+            else:
+                raise AssertionError("non-legacy runtime namespace must be scoped")
         return [
             {
                 "key": row["key"],
@@ -894,13 +1040,14 @@ class JarvisStorage:
     def create_conversation(self, title: str = "Новый диалог") -> str:
         now = utc_now()
         cid = new_id("conv")
+        user_id = current_user_id()
         with self._lock:
             self.connect().execute(
                 """
-                INSERT INTO conversations(id, title, created_at, updated_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO conversations(id, title, created_at, updated_at, user_id)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (cid, title[:200], now, now),
+                (cid, title[:200], now, now, user_id),
             )
             self.connect().commit()
         return cid
@@ -916,16 +1063,29 @@ class JarvisStorage:
         """
 
         now = utc_now()
+        user_id = current_user_id()
         with self._lock:
             conn = self.connect()
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO conversations(id, title, created_at, updated_at)
-                VALUES (?, ?, ?, ?)
-                """,
-                (conversation_id, title[:200], now, now),
-            )
-            conn.commit()
+            try:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO conversations(
+                        id, title, created_at, updated_at, user_id
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (conversation_id, title[:200], now, now, user_id),
+                )
+                self._require_owned_resource(
+                    conn,
+                    table="conversations",
+                    resource_id=conversation_id,
+                    user_id=user_id,
+                )
+                conn.commit()
+            except BaseException:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
         return conversation_id
 
     def add_message(
@@ -938,18 +1098,26 @@ class JarvisStorage:
     ) -> str:
         mid = new_id("msg")
         now = utc_now()
+        user_id = current_user_id()
         with self._lock:
             conn = self.connect()
-            conn.execute(
-                """
-                INSERT INTO messages(id, conversation_id, role, content, metadata, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (mid, conversation_id, role, content, _json(metadata or {}), now),
+            self._require_owned_resource(
+                conn,
+                table="conversations",
+                resource_id=conversation_id,
+                user_id=user_id,
             )
             conn.execute(
-                "UPDATE conversations SET updated_at = ? WHERE id = ?",
-                (now, conversation_id),
+                """
+                INSERT INTO messages(
+                    id, conversation_id, role, content, metadata, created_at, user_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (mid, conversation_id, role, content, _json(metadata or {}), now, user_id),
+            )
+            conn.execute(
+                "UPDATE conversations SET updated_at = ? WHERE id = ? AND user_id = ?",
+                (now, conversation_id, user_id),
             )
             self._insert_learning_observation(
                 conn,
@@ -976,12 +1144,13 @@ class JarvisStorage:
                     c.updated_at,
                     COUNT(m.id) AS message_count
                 FROM conversations c
-                LEFT JOIN messages m ON m.conversation_id = c.id
+                LEFT JOIN messages m ON m.conversation_id = c.id AND m.user_id = c.user_id
+                WHERE c.user_id = ?
                 GROUP BY c.id
                 ORDER BY c.updated_at DESC, c.rowid DESC
                 LIMIT ?
                 """,
-                (limit,),
+                (current_user_id(), limit),
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -996,11 +1165,11 @@ class JarvisStorage:
                     c.updated_at,
                     COUNT(m.id) AS message_count
                 FROM conversations c
-                LEFT JOIN messages m ON m.conversation_id = c.id
-                WHERE c.id = ?
+                LEFT JOIN messages m ON m.conversation_id = c.id AND m.user_id = c.user_id
+                WHERE c.id = ? AND c.user_id = ?
                 GROUP BY c.id
                 """,
-                (conversation_id,),
+                (conversation_id, current_user_id()),
             ).fetchone()
         return dict(row) if row else None
 
@@ -1010,9 +1179,9 @@ class JarvisStorage:
                 """
                 SELECT id, conversation_id, role, content, metadata, created_at
                 FROM messages
-                WHERE id = ?
+                WHERE id = ? AND user_id = ?
                 """,
-                (message_id,),
+                (message_id, current_user_id()),
             ).fetchone()
         if row is None:
             return None
@@ -1043,8 +1212,8 @@ class JarvisStorage:
         with self._lock:
             conn = self.connect()
             conn.execute(
-                "UPDATE messages SET metadata = ? WHERE id = ?",
-                (_json(metadata), message_id),
+                "UPDATE messages SET metadata = ? WHERE id = ? AND user_id = ?",
+                (_json(metadata), message_id, current_user_id()),
             )
             self._insert_learning_observation(
                 conn,
@@ -1085,17 +1254,23 @@ class JarvisStorage:
         with self._lock:
             conn = self.connect()
             existing = conn.execute(
-                "SELECT id FROM conversations WHERE id = ?",
-                (conversation_id,),
+                "SELECT id FROM conversations WHERE id = ? AND user_id = ?",
+                (conversation_id, current_user_id()),
             ).fetchone()
             if existing is None:
                 return False
             message_count = conn.execute(
-                "SELECT COUNT(*) AS c FROM messages WHERE conversation_id = ?",
-                (conversation_id,),
+                "SELECT COUNT(*) AS c FROM messages WHERE conversation_id = ? AND user_id = ?",
+                (conversation_id, current_user_id()),
             ).fetchone()["c"]
-            conn.execute("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
-            conn.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
+            conn.execute(
+                "DELETE FROM messages WHERE conversation_id = ? AND user_id = ?",
+                (conversation_id, current_user_id()),
+            )
+            conn.execute(
+                "DELETE FROM conversations WHERE id = ? AND user_id = ?",
+                (conversation_id, current_user_id()),
+            )
             self._insert_learning_observation(
                 conn,
                 kind="conversation.deleted",
@@ -1113,11 +1288,11 @@ class JarvisStorage:
                 """
                 SELECT id, conversation_id, role, content, metadata, created_at
                 FROM messages
-                WHERE conversation_id = ?
+                WHERE conversation_id = ? AND user_id = ?
                 ORDER BY created_at ASC, rowid ASC
                 LIMIT ?
                 """,
-                (conversation_id, limit),
+                (conversation_id, current_user_id(), limit),
             ).fetchall()
         return [
             {**dict(row), "metadata": _loads(row["metadata"], {})}
@@ -1136,11 +1311,11 @@ class JarvisStorage:
                 """
                 SELECT id, conversation_id, role, content, metadata, created_at
                 FROM messages
-                WHERE conversation_id = ?
+                WHERE conversation_id = ? AND user_id = ?
                 ORDER BY created_at ASC, rowid ASC
                 LIMIT ? OFFSET ?
                 """,
-                (conversation_id, max(1, limit), max(0, offset)),
+                (conversation_id, current_user_id(), max(1, limit), max(0, offset)),
             ).fetchall()
         return [
             {**dict(row), "metadata": _loads(row["metadata"], {})}
@@ -1153,11 +1328,11 @@ class JarvisStorage:
                 """
                 SELECT role, content, metadata, created_at
                 FROM messages
-                WHERE conversation_id = ?
+                WHERE conversation_id = ? AND user_id = ?
                 ORDER BY created_at DESC, rowid DESC
                 LIMIT ?
                 """,
-                (conversation_id, limit),
+                (conversation_id, current_user_id(), limit),
             ).fetchall()
         return [
             {**dict(row), "metadata": _loads(row["metadata"], {})}
@@ -1180,6 +1355,7 @@ class JarvisStorage:
         content_key = _normalize_memory_content(content)
         row = {
             "id": new_id("mem"),
+            "user_id": current_user_id(),
             "namespace": namespace,
             "content": content,
             "tags": tags,
@@ -1196,13 +1372,13 @@ class JarvisStorage:
                 conn.execute("BEGIN IMMEDIATE")
                 existing_rows = conn.execute(
                     """
-                    SELECT id, namespace, content, tags, importance, created_at, updated_at
+                    SELECT id, user_id, namespace, content, tags, importance, created_at, updated_at
                     FROM memories
-                    WHERE namespace = ?
+                    WHERE namespace = ? AND user_id = ?
                     ORDER BY updated_at DESC
                     LIMIT 250
                     """,
-                    (namespace,),
+                    (namespace, row["user_id"]),
                 ).fetchall()
                 for existing in existing_rows:
                     existing_dict = dict(existing)
@@ -1222,9 +1398,15 @@ class JarvisStorage:
                         """
                         UPDATE memories
                         SET tags = ?, importance = ?, updated_at = ?
-                        WHERE id = ?
+                        WHERE id = ? AND user_id = ?
                         """,
-                        (_json(merged_tags), merged_importance, now, row["id"]),
+                        (
+                            _json(merged_tags),
+                            merged_importance,
+                            now,
+                            row["id"],
+                            row["user_id"],
+                        ),
                     )
                     self._replace_memory_fts(conn, row)
                     merged_existing = True
@@ -1233,10 +1415,12 @@ class JarvisStorage:
                     conn.execute(
                         """
                         INSERT INTO memories(
-                            id, namespace, content, tags, importance, created_at, updated_at
+                            id, user_id, namespace, content, tags, importance,
+                            created_at, updated_at
                         )
                         VALUES (
-                            :id, :namespace, :content, :tags, :importance, :created_at, :updated_at
+                            :id, :user_id, :namespace, :content, :tags, :importance,
+                            :created_at, :updated_at
                         )
                         """,
                         {**row, "tags": _json(row["tags"])},
@@ -1270,13 +1454,22 @@ class JarvisStorage:
     def _replace_memory_fts(self, conn: sqlite3.Connection, row: dict[str, Any]) -> None:
         if not self._memory_fts_available:
             return
-        conn.execute("DELETE FROM memories_fts WHERE id = ?", (row["id"],))
+        conn.execute(
+            "DELETE FROM memories_fts WHERE id = ? AND user_id = ?",
+            (row["id"], row["user_id"]),
+        )
         conn.execute(
             """
-            INSERT INTO memories_fts(id, namespace, content, tags)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO memories_fts(id, user_id, namespace, content, tags)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (row["id"], row["namespace"], row["content"], _json(row["tags"])),
+            (
+                row["id"],
+                row["user_id"],
+                row["namespace"],
+                row["content"],
+                _json(row["tags"]),
+            ),
         )
 
     def search_memory(
@@ -1303,7 +1496,8 @@ class JarvisStorage:
             if match:
                 try:
                     namespace_sql = ""
-                    params: list[Any] = [match]
+                    user_id = current_user_id()
+                    params: list[Any] = [match, user_id, user_id]
                     if namespace_filter:
                         placeholders = ",".join("?" for _ in namespace_filter)
                         namespace_sql = f" AND m.namespace IN ({placeholders})"
@@ -1323,8 +1517,12 @@ class JarvisStorage:
                                 m.updated_at,
                                 bm25(memories_fts) AS rank
                             FROM memories_fts
-                            JOIN memories m ON m.id = memories_fts.id
+                            JOIN memories m
+                              ON m.id = memories_fts.id
+                             AND m.user_id = memories_fts.user_id
                             WHERE memories_fts MATCH ?
+                              AND memories_fts.user_id = ?
+                              AND m.user_id = ?
                             {namespace_sql}
                             ORDER BY rank ASC, m.importance DESC, m.updated_at DESC
                             LIMIT ?
@@ -1339,7 +1537,7 @@ class JarvisStorage:
         if query and len(decorated) < limit:
             terms = _query_terms(query, limit=8)
             clauses: list[str] = []
-            params: list[Any] = []
+            params: list[Any] = [current_user_id()]
             for term in terms:
                 like = f"%{term}%"
                 clauses.append("(content LIKE ? OR tags LIKE ? OR namespace LIKE ?)")
@@ -1355,7 +1553,7 @@ class JarvisStorage:
                         id, namespace, content, tags, importance, created_at, updated_at,
                         NULL AS rank
                     FROM memories
-                    WHERE ({" OR ".join(clauses)}){namespace_sql}
+                    WHERE user_id = ? AND ({" OR ".join(clauses)}){namespace_sql}
                     ORDER BY importance DESC, updated_at DESC
                     LIMIT ?
                 """
@@ -1369,25 +1567,25 @@ class JarvisStorage:
             return decorated[:limit]
 
         params: list[Any]
-        where = ""
+        where = "user_id = ?"
         namespace_sql = ""
         if namespace_filter:
             placeholders = ",".join("?" for _ in namespace_filter)
             namespace_sql = f"namespace IN ({placeholders})"
         if query:
-            where = "content LIKE ? OR tags LIKE ? OR namespace LIKE ?"
+            where = f"{where} AND (content LIKE ? OR tags LIKE ? OR namespace LIKE ?)"
             like = f"%{query}%"
-            params = [like, like, like]
+            params = [current_user_id(), like, like, like]
         else:
-            params = []
+            params = [current_user_id()]
         if namespace_sql:
-            where = f"({where}) AND {namespace_sql}" if where else namespace_sql
+            where = f"{where} AND {namespace_sql}"
             params.extend(namespace_filter)
         params.append(limit)
         sql = f"""
             SELECT id, namespace, content, tags, importance, created_at, updated_at, NULL AS rank
             FROM memories
-            {"WHERE " + where if where else ""}
+            WHERE {where}
             ORDER BY importance DESC, updated_at DESC
             LIMIT ?
         """
@@ -1408,12 +1606,13 @@ class JarvisStorage:
                 conn.execute("BEGIN IMMEDIATE")
                 rows = conn.execute(
                     """
-                    SELECT id, namespace, content, tags, importance, created_at, updated_at
+                    SELECT id, user_id, namespace, content, tags, importance, created_at, updated_at
                     FROM memories
+                    WHERE user_id = ?
                     ORDER BY updated_at DESC
                     LIMIT ?
                     """,
-                    (max(1, min(5000, limit)),),
+                    (current_user_id(), max(1, min(5000, limit))),
                 ).fetchall()
                 groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
                 for row in rows:
@@ -1450,9 +1649,15 @@ class JarvisStorage:
                         """
                         UPDATE memories
                         SET tags = ?, importance = ?, updated_at = ?
-                        WHERE id = ?
+                        WHERE id = ? AND user_id = ?
                         """,
-                        (_json(merged_tags), merged_importance, now, keep["id"]),
+                        (
+                            _json(merged_tags),
+                            merged_importance,
+                            now,
+                            keep["id"],
+                            current_user_id(),
+                        ),
                     )
                     keep = {
                         **keep,
@@ -1465,9 +1670,13 @@ class JarvisStorage:
                     for duplicate_id in duplicate_ids:
                         if self._memory_fts_available:
                             conn.execute(
-                                "DELETE FROM memories_fts WHERE id = ?", (duplicate_id,)
+                                "DELETE FROM memories_fts WHERE id = ? AND user_id = ?",
+                                (duplicate_id, current_user_id()),
                             )
-                        conn.execute("DELETE FROM memories WHERE id = ?", (duplicate_id,))
+                        conn.execute(
+                            "DELETE FROM memories WHERE id = ? AND user_id = ?",
+                            (duplicate_id, current_user_id()),
+                        )
                         removed_ids.append(str(duplicate_id))
                     removed += len(duplicate_ids)
                     merged += 1
@@ -1499,7 +1708,7 @@ class JarvisStorage:
         with self._lock:
             conn = self.connect()
             memories = self._load_memories_for_vault(conn)
-        graph = self.memory_vault.graph_from_memories(memories)
+        graph = self._memory_vault_for().graph_from_memories(memories)
         self._augment_graph_with_documents(graph)
         return graph
 
@@ -1511,7 +1720,7 @@ class JarvisStorage:
                 force_full=True,
                 raise_on_error=True,
             )
-        graph = self.memory_vault.graph()
+        graph = self._memory_vault_for().graph()
         self._augment_graph_with_documents(graph)
         return graph
 
@@ -1702,6 +1911,7 @@ class JarvisStorage:
         """Create a mission once, optionally under a caller-reserved durable id."""
 
         now = utc_now()
+        user_id = current_user_id()
         selected_id = str(mission_id or new_id("mis"))
         if not re.fullmatch(r"mis_[A-Za-z0-9_-]{8,80}", selected_id):
             raise ValueError("mission_id must be a bounded Jarvis mission identifier")
@@ -1715,11 +1925,11 @@ class JarvisStorage:
                 cursor = conn.execute(
                     """
                     INSERT OR IGNORE INTO missions(
-                        id, title, goal, status, progress, created_at, updated_at
+                        id, title, goal, status, progress, created_at, updated_at, user_id
                     )
-                    VALUES (?, ?, ?, 'planned', 0, ?, ?)
+                    VALUES (?, ?, ?, 'planned', 0, ?, ?, ?)
                     """,
-                    (selected_id, title[:240], goal, now, now),
+                    (selected_id, title[:240], goal, now, now, user_id),
                 )
                 created = cursor.rowcount == 1
                 if created:
@@ -1728,9 +1938,9 @@ class JarvisStorage:
                             """
                             INSERT INTO mission_tasks(
                                 id, mission_id, title, status, notes, position,
-                                created_at, updated_at
+                                created_at, updated_at, user_id
                             )
-                            VALUES (?, ?, ?, 'pending', NULL, ?, ?, ?)
+                            VALUES (?, ?, ?, 'pending', NULL, ?, ?, ?, ?)
                             """,
                             (
                                 new_id("task"),
@@ -1739,14 +1949,19 @@ class JarvisStorage:
                                 position,
                                 now,
                                 now,
+                                user_id,
                             ),
                         )
                     self._refresh_mission_progress(conn, selected_id, now=now)
                 else:
                     existing = conn.execute(
-                        "SELECT goal FROM missions WHERE id = ?",
+                        "SELECT goal, user_id FROM missions WHERE id = ?",
                         (selected_id,),
                     ).fetchone()
+                    if existing is not None and str(existing["user_id"]) != user_id:
+                        raise ResourceIsolationError(
+                            "mission id is not available to this user"
+                        )
                     if existing is None or str(existing["goal"]) != goal:
                         raise ValueError(
                             "mission_id is already bound to a different goal"
@@ -1776,10 +1991,11 @@ class JarvisStorage:
                 """
                 SELECT id, title, goal, status, progress, created_at, updated_at
                 FROM missions
+                WHERE user_id = ?
                 ORDER BY updated_at DESC
                 LIMIT ?
                 """,
-                (limit,),
+                (current_user_id(), limit),
             ).fetchall()
         missions = [dict(row) for row in rows]
         for mission in missions:
@@ -1792,9 +2008,9 @@ class JarvisStorage:
                 """
                 SELECT id, title, goal, status, progress, created_at, updated_at
                 FROM missions
-                WHERE id = ?
+                WHERE id = ? AND user_id = ?
                 """,
-                (mission_id,),
+                (mission_id, current_user_id()),
             ).fetchone()
         if row is None:
             return None
@@ -1808,11 +2024,11 @@ class JarvisStorage:
                 """
                 SELECT id, mission_id, title, status, notes, position, created_at, updated_at
                 FROM mission_tasks
-                WHERE mission_id = ? AND status = 'pending'
+                WHERE mission_id = ? AND status = 'pending' AND user_id = ?
                 ORDER BY position ASC
                 LIMIT 1
                 """,
-                (mission_id,),
+                (mission_id, current_user_id()),
             ).fetchone()
         return dict(row) if row else None
 
@@ -1832,14 +2048,17 @@ class JarvisStorage:
         task_id = new_id("task")
         with self._lock:
             conn = self.connect()
-            mission = conn.execute("SELECT id FROM missions WHERE id = ?", (mission_id,)).fetchone()
+            mission = conn.execute(
+                "SELECT id FROM missions WHERE id = ? AND user_id = ?",
+                (mission_id, current_user_id()),
+            ).fetchone()
             if mission is None:
                 raise KeyError(f"unknown mission: {mission_id}")
             last_position = int(
                 conn.execute(
                     "SELECT COALESCE(MAX(position), 0) AS value FROM mission_tasks "
-                    "WHERE mission_id = ?",
-                    (mission_id,),
+                    "WHERE mission_id = ? AND user_id = ?",
+                    (mission_id, current_user_id()),
                 ).fetchone()["value"]
             )
             selected = last_position + 1 if position is None else int(position)
@@ -1848,24 +2067,33 @@ class JarvisStorage:
             if selected <= last_position:
                 conn.execute(
                     "UPDATE mission_tasks SET position = position + 1, updated_at = ? "
-                    "WHERE mission_id = ? AND position >= ?",
-                    (now, mission_id, selected),
+                    "WHERE mission_id = ? AND position >= ? AND user_id = ?",
+                    (now, mission_id, selected, current_user_id()),
                 )
             conn.execute(
                 """
                 INSERT INTO mission_tasks(
-                    id, mission_id, title, status, notes, position, created_at, updated_at
+                    id, mission_id, title, status, notes, position, created_at, updated_at,
+                    user_id
                 )
-                VALUES (?, ?, ?, 'pending', NULL, ?, ?, ?)
+                VALUES (?, ?, ?, 'pending', NULL, ?, ?, ?, ?)
                 """,
-                (task_id, mission_id, clean_title[:500], selected, now, now),
+                (
+                    task_id,
+                    mission_id,
+                    clean_title[:500],
+                    selected,
+                    now,
+                    now,
+                    current_user_id(),
+                ),
             )
             self._refresh_mission_progress(conn, mission_id, now=now)
             conn.commit()
             row = conn.execute(
                 "SELECT id, mission_id, title, status, notes, position, created_at, updated_at "
-                "FROM mission_tasks WHERE id = ?",
-                (task_id,),
+                "FROM mission_tasks WHERE id = ? AND user_id = ?",
+                (task_id, current_user_id()),
             ).fetchone()
         if row is None:
             raise RuntimeError("mission task was not persisted")
@@ -1890,14 +2118,22 @@ class JarvisStorage:
                 """
                 UPDATE mission_tasks
                 SET status = 'running', updated_at = ?
-                WHERE id = ? AND mission_id = ? AND status = 'pending'
+                WHERE id = ? AND mission_id = ? AND status = 'pending' AND user_id = ?
                   AND NOT EXISTS (
                       SELECT 1 FROM mission_tasks AS active
                       WHERE active.mission_id = ? AND active.status = 'running'
+                        AND active.user_id = ?
                   )
                 RETURNING id, mission_id, title, status, notes, position, created_at, updated_at
                 """,
-                (now, task_id, mission_id, mission_id),
+                (
+                    now,
+                    task_id,
+                    mission_id,
+                    current_user_id(),
+                    mission_id,
+                    current_user_id(),
+                ),
             ).fetchone()
             if row is None:
                 conn.commit()
@@ -1929,21 +2165,23 @@ class JarvisStorage:
                     SELECT pending.id
                     FROM mission_tasks AS pending
                     WHERE pending.mission_id = ?
+                      AND pending.user_id = ?
                       AND pending.status = 'pending'
                       AND NOT EXISTS (
                           SELECT 1
                           FROM mission_tasks AS active
                           WHERE active.mission_id = pending.mission_id
+                            AND active.user_id = pending.user_id
                             AND active.status IN ('running', 'blocked')
                       )
                     ORDER BY pending.position ASC
                     LIMIT 1
                 )
-                  AND status = 'pending'
+                  AND status = 'pending' AND user_id = ?
                 RETURNING
                     id, mission_id, title, status, notes, position, created_at, updated_at
                 """,
-                (now, mission_id),
+                (now, mission_id, current_user_id(), current_user_id()),
             ).fetchone()
             if row is None:
                 conn.commit()
@@ -1985,6 +2223,7 @@ class JarvisStorage:
         now = utc_now()
         row = {
             "id": new_id("rem"),
+            "user_id": current_user_id(),
             "created_at": now,
             "updated_at": now,
             "text": text.strip()[:500],
@@ -1999,15 +2238,22 @@ class JarvisStorage:
         }
         with self._lock:
             conn = self.connect()
+            if conversation_id:
+                self._require_owned_resource(
+                    conn,
+                    table="conversations",
+                    resource_id=conversation_id,
+                    user_id=row["user_id"],
+                )
             conn.execute(
                 """
                 INSERT INTO reminders(
                     id, created_at, updated_at, text, due_at, recurrence, status,
-                    conversation_id, source_text, fired_at, fire_count, payload
+                    conversation_id, source_text, fired_at, fire_count, payload, user_id
                 )
                 VALUES (
                     :id, :created_at, :updated_at, :text, :due_at, :recurrence, :status,
-                    :conversation_id, :source_text, :fired_at, :fire_count, :payload
+                    :conversation_id, :source_text, :fired_at, :fire_count, :payload, :user_id
                 )
                 """,
                 {
@@ -2036,18 +2282,18 @@ class JarvisStorage:
     ) -> list[dict[str, Any]]:
         query = (
             "SELECT id, created_at, updated_at, text, due_at, recurrence, status, "
-            "conversation_id, source_text, fired_at, fire_count, payload FROM reminders"
+            "conversation_id, source_text, fired_at, fire_count, payload, user_id "
+            "FROM reminders"
         )
-        clauses: list[str] = []
-        params: list[Any] = []
+        clauses: list[str] = ["user_id = ?"]
+        params: list[Any] = [current_user_id()]
         if status and status != "all":
             clauses.append("status = ?")
             params.append(status)
         if before:
             clauses.append("due_at <= ?")
             params.append(before)
-        if clauses:
-            query += " WHERE " + " AND ".join(clauses)
+        query += " WHERE " + " AND ".join(clauses)
         query += " ORDER BY due_at ASC LIMIT ?"
         params.append(limit)
         with self._lock:
@@ -2059,11 +2305,11 @@ class JarvisStorage:
             row = self.connect().execute(
                 """
                 SELECT id, created_at, updated_at, text, due_at, recurrence, status,
-                       conversation_id, source_text, fired_at, fire_count, payload
+                       conversation_id, source_text, fired_at, fire_count, payload, user_id
                 FROM reminders
-                WHERE id = ?
+                WHERE id = ? AND user_id = ?
                 """,
-                (reminder_id,),
+                (reminder_id, current_user_id()),
             ).fetchone()
         return self._decode_reminder(row) if row is not None else None
 
@@ -2077,11 +2323,11 @@ class JarvisStorage:
                 """
                 UPDATE reminders
                 SET status = 'cancelled', updated_at = ?
-                WHERE id = ? AND status = 'pending'
+                WHERE id = ? AND status = 'pending' AND user_id = ?
                 RETURNING id, created_at, updated_at, text, due_at, recurrence, status,
-                          conversation_id, source_text, fired_at, fire_count, payload
+                          conversation_id, source_text, fired_at, fire_count, payload, user_id
                 """,
-                (now, reminder_id),
+                (now, reminder_id, current_user_id()),
             ).fetchone()
             conn.commit()
         if row is None:
@@ -2105,6 +2351,7 @@ class JarvisStorage:
         limit: int = 20,
         skip_ids: Iterable[str] = (),
         excluded_payload_kinds: Iterable[str] = (),
+        all_users: bool = False,
     ) -> list[dict[str, Any]]:
         """Atomically fire every due reminder in a single BEGIN IMMEDIATE transaction.
 
@@ -2116,6 +2363,8 @@ class JarvisStorage:
         Returns one snapshot per fired reminder (its state *before* advancement).
         """
 
+        if all_users:
+            self._require_system_scope("cross-tenant reminder claim")
         from .reminders import compute_next_due, reminder_zone, to_utc_iso
 
         now = now_iso or utc_now()
@@ -2134,6 +2383,9 @@ class JarvisStorage:
                 conn.execute("BEGIN IMMEDIATE")
                 clauses = ["status = 'pending'", "due_at <= ?"]
                 params: list[Any] = [now]
+                if not all_users:
+                    clauses.append("user_id = ?")
+                    params.append(current_user_id())
                 if skipped:
                     placeholders = ",".join("?" for _ in skipped)
                     clauses.append(f"id NOT IN ({placeholders})")
@@ -2155,7 +2407,7 @@ class JarvisStorage:
                 rows = conn.execute(
                     f"""
                     SELECT id, created_at, updated_at, text, due_at, recurrence, status,
-                           conversation_id, source_text, fired_at, fire_count, payload
+                           conversation_id, source_text, fired_at, fire_count, payload, user_id
                     FROM reminders
                     WHERE {' AND '.join(clauses)}
                     ORDER BY due_at ASC
@@ -2177,9 +2429,15 @@ class JarvisStorage:
                             UPDATE reminders
                             SET due_at = ?, fired_at = ?, fire_count = fire_count + 1,
                                 updated_at = ?
-                            WHERE id = ? AND status = 'pending'
+                            WHERE id = ? AND status = 'pending' AND user_id = ?
                             """,
-                            (to_utc_iso(next_due), now, now, snapshot["id"]),
+                            (
+                                to_utc_iso(next_due),
+                                now,
+                                now,
+                                snapshot["id"],
+                                snapshot["user_id"],
+                            ),
                         )
                     else:
                         conn.execute(
@@ -2187,9 +2445,9 @@ class JarvisStorage:
                             UPDATE reminders
                             SET status = 'fired', fired_at = ?, fire_count = fire_count + 1,
                                 updated_at = ?
-                            WHERE id = ? AND status = 'pending'
+                            WHERE id = ? AND status = 'pending' AND user_id = ?
                             """,
-                            (now, now, snapshot["id"]),
+                            (now, now, snapshot["id"], snapshot["user_id"]),
                         )
                     fired.append(snapshot)
                 conn.commit()
@@ -2224,10 +2482,10 @@ class JarvisStorage:
                 row = conn.execute(
                     """
                     SELECT id, created_at, updated_at, text, due_at, recurrence, status,
-                           conversation_id, source_text, fired_at, fire_count, payload
-                    FROM reminders WHERE id = ?
+                           conversation_id, source_text, fired_at, fire_count, payload, user_id
+                    FROM reminders WHERE id = ? AND user_id = ?
                     """,
-                    (reminder_id,),
+                    (reminder_id, current_user_id()),
                 ).fetchone()
                 if row is None:
                     conn.rollback()
@@ -2265,7 +2523,7 @@ class JarvisStorage:
                     """
                     UPDATE reminders
                     SET status = ?, payload = ?, updated_at = ?
-                    WHERE id = ? AND status = 'pending' AND fire_count = ?
+                    WHERE id = ? AND status = 'pending' AND fire_count = ? AND user_id = ?
                     """,
                     (
                         next_status,
@@ -2273,6 +2531,7 @@ class JarvisStorage:
                         now,
                         reminder_id,
                         expected_fire_count,
+                        current_user_id(),
                     ),
                 )
                 if updated.rowcount != 1:
@@ -2285,19 +2544,27 @@ class JarvisStorage:
                 raise
         return self.get_reminder(reminder_id)
 
-    def list_pending_screen_watch_notifications(self, limit: int = 50) -> list[dict[str, Any]]:
+    def list_pending_screen_watch_notifications(
+        self, limit: int = 50, *, all_users: bool = False
+    ) -> list[dict[str, Any]]:
+        if all_users:
+            self._require_system_scope("cross-tenant screen-watch delivery")
         with self._lock:
+            user_clause = "" if all_users else " AND user_id = ?"
+            params: list[Any] = [] if all_users else [current_user_id()]
+            params.append(max(1, min(500, int(limit))))
             rows = self.connect().execute(
-                """
+                f"""
                 SELECT id, created_at, updated_at, text, due_at, recurrence, status,
-                       conversation_id, source_text, fired_at, fire_count, payload
+                       conversation_id, source_text, fired_at, fire_count, payload, user_id
                 FROM reminders
                 WHERE COALESCE(json_extract(payload, '$.kind'), '') = 'screen_watch'
                   AND COALESCE(json_extract(payload, '$.notification.state'), '') = 'pending'
+                  {user_clause}
                 ORDER BY updated_at ASC
                 LIMIT ?
                 """,
-                (max(1, min(500, int(limit))),),
+                tuple(params),
             ).fetchall()
         return [self._decode_reminder(row) for row in rows]
 
@@ -2322,10 +2589,10 @@ class JarvisStorage:
             row = conn.execute(
                 """
                 SELECT id, created_at, updated_at, text, due_at, recurrence, status,
-                       conversation_id, source_text, fired_at, fire_count, payload
-                FROM reminders WHERE id = ?
+                       conversation_id, source_text, fired_at, fire_count, payload, user_id
+                FROM reminders WHERE id = ? AND user_id = ?
                 """,
-                (reminder_id,),
+                (reminder_id, current_user_id()),
             ).fetchone()
             if row is None:
                 return None
@@ -2356,8 +2623,8 @@ class JarvisStorage:
                 notification["delivered_at"] = now
             payload = {**payload, "notification": notification}
             conn.execute(
-                "UPDATE reminders SET payload = ?, updated_at = ? WHERE id = ?",
-                (_json(payload), now, reminder_id),
+                "UPDATE reminders SET payload = ?, updated_at = ? WHERE id = ? AND user_id = ?",
+                (_json(payload), now, reminder_id, current_user_id()),
             )
             conn.commit()
         return self.get_reminder(reminder_id)
@@ -2393,10 +2660,10 @@ class JarvisStorage:
                 row = conn.execute(
                     """
                     SELECT id, created_at, updated_at, text, due_at, recurrence, status,
-                           conversation_id, source_text, fired_at, fire_count, payload
-                    FROM reminders WHERE id = ?
+                           conversation_id, source_text, fired_at, fire_count, payload, user_id
+                    FROM reminders WHERE id = ? AND user_id = ?
                     """,
-                    (reminder_id,),
+                    (reminder_id, current_user_id()),
                 ).fetchone()
                 if row is None:
                     conn.rollback()
@@ -2428,14 +2695,21 @@ class JarvisStorage:
                     conn.execute(
                         """
                         INSERT INTO messages(
-                            id, conversation_id, role, content, metadata, created_at
-                        ) VALUES (?, ?, 'assistant', ?, ?, ?)
+                            id, conversation_id, role, content, metadata, created_at, user_id
+                        ) VALUES (?, ?, 'assistant', ?, ?, ?, ?)
                         """,
-                        (message_id, str(conversation_id), text, _json(metadata), now),
+                        (
+                            message_id,
+                            str(conversation_id),
+                            text,
+                            _json(metadata),
+                            now,
+                            current_user_id(),
+                        ),
                     )
                     conn.execute(
-                        "UPDATE conversations SET updated_at = ? WHERE id = ?",
-                        (now, str(conversation_id)),
+                        "UPDATE conversations SET updated_at = ? WHERE id = ? AND user_id = ?",
+                        (now, str(conversation_id), current_user_id()),
                     )
                     learning_row = self._learning_observation_row(
                         kind="conversation.message",
@@ -2452,8 +2726,8 @@ class JarvisStorage:
 
                 conn.execute(
                     """
-                    INSERT INTO runtime_events(id, ts, level, kind, title, payload)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO runtime_events(id, ts, level, kind, title, payload, user_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         event_id,
@@ -2462,6 +2736,7 @@ class JarvisStorage:
                         str(event_kind)[:120],
                         text.splitlines()[0][:240],
                         _json(event_payload),
+                        current_user_id(),
                     ),
                 )
                 notification = {
@@ -2472,8 +2747,8 @@ class JarvisStorage:
                 }
                 payload = {**payload, "notification": notification}
                 conn.execute(
-                    "UPDATE reminders SET payload = ?, updated_at = ? WHERE id = ?",
-                    (_json(payload), now, reminder_id),
+                    "UPDATE reminders SET payload = ?, updated_at = ? WHERE id = ? AND user_id = ?",
+                    (_json(payload), now, reminder_id, current_user_id()),
                 )
                 conn.commit()
             except BaseException:
@@ -2498,9 +2773,9 @@ class JarvisStorage:
                 """
                 SELECT id, mission_id, title, status, notes, position, created_at, updated_at
                 FROM mission_tasks
-                WHERE id = ? AND (? IS NULL OR mission_id = ?)
+                WHERE id = ? AND (? IS NULL OR mission_id = ?) AND user_id = ?
                 """,
-                (task_id, mission_id, mission_id),
+                (task_id, mission_id, mission_id, current_user_id()),
             ).fetchone()
             if existing is None:
                 return None
@@ -2512,9 +2787,18 @@ class JarvisStorage:
                 """
                 UPDATE mission_tasks
                 SET title = ?, status = ?, notes = ?, updated_at = ?
-                WHERE id = ? AND (? IS NULL OR mission_id = ?)
+                WHERE id = ? AND (? IS NULL OR mission_id = ?) AND user_id = ?
                 """,
-                (next_title, next_status, next_notes, now, task_id, mission_id, mission_id),
+                (
+                    next_title,
+                    next_status,
+                    next_notes,
+                    now,
+                    task_id,
+                    mission_id,
+                    mission_id,
+                    current_user_id(),
+                ),
             )
             self._refresh_mission_progress(conn, existing["mission_id"], now=now)
             conn.commit()
@@ -2522,9 +2806,9 @@ class JarvisStorage:
                 """
                 SELECT id, mission_id, title, status, notes, position, created_at, updated_at
                 FROM mission_tasks
-                WHERE id = ?
+                WHERE id = ? AND user_id = ?
                 """,
-                (task_id,),
+                (task_id, current_user_id()),
             ).fetchone()
         updated = dict(row) if row else None
         if updated:
@@ -2545,10 +2829,10 @@ class JarvisStorage:
                 """
                 SELECT id, mission_id, title, status, notes, position, created_at, updated_at
                 FROM mission_tasks
-                WHERE mission_id = ?
+                WHERE mission_id = ? AND user_id = ?
                 ORDER BY position ASC
                 """,
-                (mission_id,),
+                (mission_id, current_user_id()),
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -2565,6 +2849,7 @@ class JarvisStorage:
     ) -> dict[str, Any]:
         row = {
             "id": new_id("run"),
+            "user_id": current_user_id(),
             "ts": utc_now(),
             "tool": tool,
             "ok": 1 if ok else 0,
@@ -2576,12 +2861,21 @@ class JarvisStorage:
         }
         with self._lock:
             conn = self.connect()
+            if mission_id:
+                self._require_owned_resource(
+                    conn, table="missions", resource_id=mission_id
+                )
+            if task_id:
+                self._require_owned_resource(
+                    conn, table="mission_tasks", resource_id=task_id
+                )
             conn.execute(
                 """
                 INSERT INTO tool_runs(
-                    id, ts, tool, ok, summary, arguments, data, mission_id, task_id
+                    id, ts, tool, ok, summary, arguments, data, mission_id, task_id,
+                    user_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     row["id"],
@@ -2593,6 +2887,7 @@ class JarvisStorage:
                     _json(row["data"]),
                     row["mission_id"],
                     row["task_id"],
+                    row["user_id"],
                 ),
             )
             self._insert_learning_observation(
@@ -2629,10 +2924,11 @@ class JarvisStorage:
                 """
                 SELECT id, ts, tool, ok, summary, arguments, data, mission_id, task_id
                 FROM tool_runs
+                WHERE user_id = ?
                 ORDER BY ts DESC, rowid DESC
                 LIMIT ?
                 """,
-                (limit,),
+                (current_user_id(), limit),
             ).fetchall()
         return [
             {
@@ -2676,10 +2972,10 @@ class JarvisStorage:
         limit: int = 50,
         kind: str | None = None,
     ) -> list[dict[str, Any]]:
-        params: list[Any] = []
-        where = ""
+        params: list[Any] = [current_user_id()]
+        where = "WHERE user_id = ?"
         if kind:
-            where = "WHERE kind = ?"
+            where += " AND kind = ?"
             params.append(kind)
         params.append(limit)
         with self._lock:
@@ -2717,6 +3013,7 @@ class JarvisStorage:
     ) -> dict[str, Any]:
         return {
             "id": new_id("learn"),
+            "user_id": current_user_id(),
             "ts": ts or utc_now(),
             "kind": kind[:120],
             "source_id": source_id,
@@ -2740,9 +3037,10 @@ class JarvisStorage:
         conn.execute(
             """
             INSERT INTO learning_observations(
-                id, ts, kind, source_id, conversation_id, role, content, summary, payload
+                id, ts, kind, source_id, conversation_id, role, content, summary,
+                payload, user_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 row["id"],
@@ -2754,6 +3052,7 @@ class JarvisStorage:
                 row["content"],
                 row["summary"],
                 _json(row["payload"]),
+                row.get("user_id") or current_user_id(),
             ),
         )
         return row
@@ -2768,9 +3067,13 @@ class JarvisStorage:
         target_id: str | None = None,
         before: dict[str, Any] | None = None,
         after: dict[str, Any] | None = None,
+        user_id: str | None = None,
     ) -> dict[str, Any]:
+        if user_id is not None and user_id != current_user_id():
+            self._require_system_scope("cross-tenant audit write")
         row = {
             "id": new_id("aud"),
+            "user_id": user_id or current_user_id(),
             "ts": utc_now(),
             "actor": actor[:80],
             "action": action[:120],
@@ -2784,9 +3087,10 @@ class JarvisStorage:
             self.connect().execute(
                 """
                 INSERT INTO audit_log(
-                    id, ts, actor, action, target_type, target_id, summary, before_json, after_json
+                    id, ts, actor, action, target_type, target_id, summary, before_json,
+                    after_json, user_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     row["id"],
@@ -2798,6 +3102,7 @@ class JarvisStorage:
                     row["summary"],
                     _json(row["before"]),
                     _json(row["after"]),
+                    row["user_id"],
                 ),
             )
             self.connect().commit()
@@ -2810,15 +3115,15 @@ class JarvisStorage:
         target_type: str | None = None,
         target_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        conditions: list[str] = []
-        params: list[Any] = []
+        conditions: list[str] = ["user_id = ?"]
+        params: list[Any] = [current_user_id()]
         if target_type:
             conditions.append("target_type = ?")
             params.append(target_type)
         if target_id:
             conditions.append("target_id = ?")
             params.append(target_id)
-        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        where = f"WHERE {' AND '.join(conditions)}"
         params.append(limit)
         with self._lock:
             rows = self.connect().execute(
@@ -2864,6 +3169,7 @@ class JarvisStorage:
         now = utc_now()
         row = {
             "id": new_id("file"),
+            "user_id": current_user_id(),
             "name": name[:260],
             "source_path": str(source_path) if source_path else None,
             "stored_path": str(stored_path),
@@ -2881,11 +3187,11 @@ class JarvisStorage:
                 """
                 INSERT INTO files(
                     id, name, source_path, stored_path, mime_type, size, sha256,
-                    status, error, chunk_count, created_at, updated_at
+                    status, error, chunk_count, created_at, updated_at, user_id
                 )
                 VALUES (
                     :id, :name, :source_path, :stored_path, :mime_type, :size, :sha256,
-                    :status, :error, :chunk_count, :created_at, :updated_at
+                    :status, :error, :chunk_count, :created_at, :updated_at, :user_id
                 )
                 """,
                 row,
@@ -2904,24 +3210,32 @@ class JarvisStorage:
         now = utc_now()
         with self._lock:
             conn = self.connect()
+            self._require_owned_resource(conn, table="files", resource_id=file_id)
             self._replace_file_chunks(conn, file_id, chunks, now=now)
             if status is None:
                 conn.execute(
                     """
                     UPDATE files
                     SET chunk_count = ?, updated_at = ?
-                    WHERE id = ?
+                    WHERE id = ? AND user_id = ?
                     """,
-                    (len(chunks), now, file_id),
+                    (len(chunks), now, file_id, current_user_id()),
                 )
             else:
                 conn.execute(
                     """
                     UPDATE files
                     SET chunk_count = ?, status = ?, error = ?, updated_at = ?
-                    WHERE id = ?
+                    WHERE id = ? AND user_id = ?
                     """,
-                    (len(chunks), status[:40], error, now, file_id),
+                    (
+                        len(chunks),
+                        status[:40],
+                        error,
+                        now,
+                        file_id,
+                        current_user_id(),
+                    ),
                 )
             conn.commit()
 
@@ -2944,13 +3258,14 @@ class JarvisStorage:
         with self._lock:
             conn = self.connect()
             try:
+                self._require_owned_resource(conn, table="files", resource_id=file_id)
                 self._replace_file_chunks(conn, file_id, chunks, now=now)
                 conn.execute(
                     """
                     UPDATE files
                     SET name = ?, source_path = ?, stored_path = ?, mime_type = ?, size = ?,
                         chunk_count = ?, status = ?, error = ?, updated_at = ?
-                    WHERE id = ?
+                    WHERE id = ? AND user_id = ?
                     """,
                     (
                         name[:260],
@@ -2963,6 +3278,7 @@ class JarvisStorage:
                         error,
                         now,
                         file_id,
+                        current_user_id(),
                     ),
                 )
                 conn.commit()
@@ -2979,25 +3295,36 @@ class JarvisStorage:
         *,
         now: str,
     ) -> None:
-        conn.execute("DELETE FROM file_chunks WHERE file_id = ?", (file_id,))
+        user_id = current_user_id()
+        self._require_owned_resource(
+            conn, table="files", resource_id=file_id, user_id=user_id
+        )
+        conn.execute(
+            "DELETE FROM file_chunks WHERE file_id = ? AND user_id = ?",
+            (file_id, user_id),
+        )
         if self._file_fts_available:
-            conn.execute("DELETE FROM file_chunks_fts WHERE file_id = ?", (file_id,))
+            conn.execute(
+                "DELETE FROM file_chunks_fts WHERE file_id = ? AND user_id = ?",
+                (file_id, user_id),
+            )
         for position, content in enumerate(chunks, start=1):
             chunk_id = new_id("chunk")
             conn.execute(
                 """
-                INSERT INTO file_chunks(id, file_id, position, content, char_count, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO file_chunks(
+                    id, file_id, position, content, char_count, created_at, user_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (chunk_id, file_id, position, content, len(content), now),
+                (chunk_id, file_id, position, content, len(content), now, user_id),
             )
             if self._file_fts_available:
                 conn.execute(
                     """
-                    INSERT INTO file_chunks_fts(file_id, chunk_id, content)
-                    VALUES (?, ?, ?)
+                    INSERT INTO file_chunks_fts(file_id, chunk_id, user_id, content)
+                    VALUES (?, ?, ?, ?)
                     """,
-                    (file_id, chunk_id, content),
+                    (file_id, chunk_id, user_id, content),
                 )
 
     def list_files(self, limit: int = 50, *, offset: int = 0) -> list[dict[str, Any]]:
@@ -3008,10 +3335,11 @@ class JarvisStorage:
                     id, name, source_path, stored_path, mime_type, size, sha256,
                     status, error, chunk_count, created_at, updated_at
                 FROM files
+                WHERE user_id = ?
                 ORDER BY updated_at DESC, rowid DESC
                 LIMIT ? OFFSET ?
                 """,
-                (limit, max(0, offset)),
+                (current_user_id(), limit, max(0, offset)),
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -3032,11 +3360,11 @@ class JarvisStorage:
                     id, name, source_path, stored_path, mime_type, size, sha256,
                     status, error, chunk_count, created_at, updated_at
                 FROM files
-                WHERE created_at >= ? AND created_at < ?
+                WHERE created_at >= ? AND created_at < ? AND user_id = ?
                 ORDER BY created_at ASC, rowid ASC
                 LIMIT ?
                 """,
-                (start, end, max(1, limit)),
+                (start, end, current_user_id(), max(1, limit)),
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -3098,11 +3426,11 @@ class JarvisStorage:
                     id, name, source_path, stored_path, mime_type, size, sha256,
                     status, error, chunk_count, created_at, updated_at
                 FROM files
-                WHERE {name_clauses}
+                WHERE user_id = ? AND ({name_clauses})
                 ORDER BY updated_at DESC, rowid DESC
                 LIMIT ?
                 """,
-                (*name_params, max(100, limit * 20)),
+                (current_user_id(), *name_params, max(100, limit * 20)),
             ).fetchall()
         for row in name_rows:
             record = dict(row)
@@ -3173,9 +3501,9 @@ class JarvisStorage:
                     id, name, source_path, stored_path, mime_type, size, sha256,
                     status, error, chunk_count, created_at, updated_at
                 FROM files
-                WHERE id = ?
+                WHERE id = ? AND user_id = ?
                 """,
-                (file_id,),
+                (file_id, current_user_id()),
             ).fetchone()
         return dict(row) if row else None
 
@@ -3187,7 +3515,7 @@ class JarvisStorage:
                     id, name, source_path, stored_path, mime_type, size, sha256,
                     status, error, chunk_count, created_at, updated_at
                 FROM files
-                WHERE sha256 = ?
+                WHERE sha256 = ? AND user_id = ?
                 ORDER BY
                     CASE WHEN status = 'indexed' THEN 0 ELSE 1 END,
                     CASE WHEN mime_type = 'application/octet-stream' THEN 1 ELSE 0 END,
@@ -3195,7 +3523,7 @@ class JarvisStorage:
                     rowid ASC
                 LIMIT 1
                 """,
-                (sha256,),
+                (sha256, current_user_id()),
             ).fetchone()
         return dict(row) if row else None
 
@@ -3212,12 +3540,12 @@ class JarvisStorage:
                     c.created_at,
                     NULL AS rank
                 FROM file_chunks c
-                JOIN files f ON f.id = c.file_id
-                WHERE c.file_id = ?
+                JOIN files f ON f.id = c.file_id AND f.user_id = c.user_id
+                WHERE c.file_id = ? AND c.user_id = ? AND f.user_id = ?
                 ORDER BY c.position ASC
                 LIMIT ?
                 """,
-                (file_id, limit),
+                (file_id, current_user_id(), current_user_id(), limit),
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -3238,13 +3566,24 @@ class JarvisStorage:
                                 c.created_at,
                                 bm25(file_chunks_fts) AS rank
                             FROM file_chunks_fts
-                            JOIN file_chunks c ON c.id = file_chunks_fts.chunk_id
-                            JOIN files f ON f.id = c.file_id
+                            JOIN file_chunks c
+                              ON c.id = file_chunks_fts.chunk_id
+                             AND c.user_id = file_chunks_fts.user_id
+                            JOIN files f ON f.id = c.file_id AND f.user_id = c.user_id
                             WHERE file_chunks_fts MATCH ?
+                              AND file_chunks_fts.user_id = ?
+                              AND c.user_id = ?
+                              AND f.user_id = ?
                             ORDER BY rank ASC, c.position ASC
                             LIMIT ?
                             """,
-                            (match, limit),
+                            (
+                                match,
+                                current_user_id(),
+                                current_user_id(),
+                                current_user_id(),
+                                limit,
+                            ),
                         ).fetchall()
                     return [_decorate_file_hit(dict(row), query) for row in rows]
                 except sqlite3.OperationalError as exc:
@@ -3264,12 +3603,13 @@ class JarvisStorage:
                     c.created_at,
                     NULL AS rank
                 FROM file_chunks c
-                JOIN files f ON f.id = c.file_id
-                WHERE c.content LIKE ? OR f.name LIKE ?
+                JOIN files f ON f.id = c.file_id AND f.user_id = c.user_id
+                WHERE c.user_id = ? AND f.user_id = ?
+                  AND (c.content LIKE ? OR f.name LIKE ?)
                 ORDER BY f.updated_at DESC, c.position ASC
                 LIMIT ?
                 """,
-                (like, like, limit),
+                (current_user_id(), current_user_id(), like, like, limit),
             ).fetchall()
         return [_decorate_file_hit(dict(row), query) for row in rows]
 
@@ -3293,11 +3633,12 @@ class JarvisStorage:
                     c.created_at,
                     NULL AS rank
                 FROM file_chunks c
-                JOIN files f ON f.id = c.file_id
+                JOIN files f ON f.id = c.file_id AND f.user_id = c.user_id
+                WHERE c.user_id = ? AND f.user_id = ?
                 ORDER BY f.updated_at DESC, f.rowid DESC, c.position ASC
                 LIMIT ?
                 """,
-                (limit,),
+                (current_user_id(), current_user_id(), limit),
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -3313,6 +3654,7 @@ class JarvisStorage:
         now = utc_now()
         row = {
             "id": new_id("apr"),
+            "user_id": current_user_id(),
             "created_at": now,
             "updated_at": now,
             "status": "pending",
@@ -3328,9 +3670,9 @@ class JarvisStorage:
                 """
                 INSERT INTO approvals(
                     id, created_at, updated_at, status, risk, title, description,
-                    requested_action, payload, result
+                    requested_action, payload, result, user_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     row["id"],
@@ -3343,6 +3685,7 @@ class JarvisStorage:
                     row["requested_action"],
                     _json(row["payload"]),
                     _json(row["result"]),
+                    row["user_id"],
                 ),
             )
             self.connect().commit()
@@ -3363,18 +3706,18 @@ class JarvisStorage:
         status: str | None = None,
     ) -> list[dict[str, Any]]:
         params: tuple[Any, ...]
-        where = ""
+        where = "WHERE user_id = ?"
         if status:
-            where = "WHERE status = ?"
-            params = (status, limit)
+            where += " AND status = ?"
+            params = (current_user_id(), status, limit)
         else:
-            params = (limit,)
+            params = (current_user_id(), limit)
         with self._lock:
             rows = self.connect().execute(
                 f"""
                 SELECT
                     id, created_at, updated_at, status, risk, title, description,
-                    requested_action, payload, result
+                    requested_action, payload, result, user_id
                 FROM approvals
                 {where}
                 ORDER BY updated_at DESC, rowid DESC
@@ -3399,9 +3742,9 @@ class JarvisStorage:
                     id, created_at, updated_at, status, risk, title, description,
                     requested_action, payload, result
                 FROM approvals
-                WHERE id = ?
+                WHERE id = ? AND user_id = ?
                 """,
-                (approval_id,),
+                (approval_id, current_user_id()),
             ).fetchone()
         if row is None:
             return None
@@ -3427,9 +3770,9 @@ class JarvisStorage:
                     id, created_at, updated_at, status, risk, title, description,
                     requested_action, payload, result
                 FROM approvals
-                WHERE id = ?
+                WHERE id = ? AND user_id = ?
                 """,
-                (approval_id,),
+                (approval_id, current_user_id()),
             ).fetchone()
             if existing is None:
                 return None
@@ -3468,9 +3811,16 @@ class JarvisStorage:
                 """
                 UPDATE approvals
                 SET status = ?, result = ?, updated_at = ?
-                WHERE id = ? AND status = ?
+                WHERE id = ? AND status = ? AND user_id = ?
                 """,
-                (status, _json(stored_result), now, approval_id, current_status),
+                (
+                    status,
+                    _json(stored_result),
+                    now,
+                    approval_id,
+                    current_status,
+                    current_user_id(),
+                ),
             )
             if cursor.rowcount != 1:
                 conn.rollback()
@@ -3482,9 +3832,9 @@ class JarvisStorage:
                     id, created_at, updated_at, status, risk, title, description,
                     requested_action, payload, result
                 FROM approvals
-                WHERE id = ?
+                WHERE id = ? AND user_id = ?
                 """,
-                (approval_id,),
+                (approval_id, current_user_id()),
             ).fetchone()
         updated = _approval_record(row) if row else None
         if updated:
@@ -3523,9 +3873,9 @@ class JarvisStorage:
                     id, created_at, updated_at, status, risk, title, description,
                     requested_action, payload, result
                 FROM approvals
-                WHERE id = ?
+                WHERE id = ? AND user_id = ?
                 """,
-                (approval_id,),
+                (approval_id, current_user_id()),
             ).fetchone()
             if row is None:
                 return None
@@ -3563,9 +3913,9 @@ class JarvisStorage:
                 """
                 UPDATE approvals
                 SET status = 'cancelled', result = ?, updated_at = ?
-                WHERE id = ? AND status = ?
+                WHERE id = ? AND status = ? AND user_id = ?
                 """,
-                (_json(result), now, approval_id, current_status),
+                (_json(result), now, approval_id, current_status, current_user_id()),
             )
             if cursor.rowcount != 1:
                 conn.rollback()
@@ -3577,9 +3927,9 @@ class JarvisStorage:
                     id, created_at, updated_at, status, risk, title, description,
                     requested_action, payload, result
                 FROM approvals
-                WHERE id = ?
+                WHERE id = ? AND user_id = ?
                 """,
-                (approval_id,),
+                (approval_id, current_user_id()),
             ).fetchone()
         updated = _approval_record(updated_row) if updated_row is not None else None
         if updated is not None:
@@ -3612,9 +3962,9 @@ class JarvisStorage:
                     id, created_at, updated_at, status, risk, title, description,
                     requested_action, payload, result
                 FROM approvals
-                WHERE id = ?
+                WHERE id = ? AND user_id = ?
                 """,
-                (approval_id,),
+                (approval_id, current_user_id()),
             ).fetchone()
             if before_row is None:
                 return None
@@ -3623,9 +3973,9 @@ class JarvisStorage:
                 """
                 UPDATE approvals
                 SET status = 'executing', updated_at = ?
-                WHERE id = ? AND status = 'approved'
+                WHERE id = ? AND status = 'approved' AND user_id = ?
                 """,
-                (now, approval_id),
+                (now, approval_id, current_user_id()),
             )
             conn.commit()
             if cursor.rowcount != 1:
@@ -3636,9 +3986,9 @@ class JarvisStorage:
                     id, created_at, updated_at, status, risk, title, description,
                     requested_action, payload, result
                 FROM approvals
-                WHERE id = ?
+                WHERE id = ? AND user_id = ?
                 """,
-                (approval_id,),
+                (approval_id, current_user_id()),
             ).fetchone()
         claimed = _approval_record(row) if row is not None else None
         if claimed is not None:
@@ -3676,9 +4026,9 @@ class JarvisStorage:
                     id, created_at, updated_at, status, risk, title, description,
                     requested_action, payload, result
                 FROM approvals
-                WHERE id = ?
+                WHERE id = ? AND user_id = ?
                 """,
-                (approval_id,),
+                (approval_id, current_user_id()),
             ).fetchone()
             if before_row is None:
                 return None
@@ -3687,9 +4037,15 @@ class JarvisStorage:
                 """
                 UPDATE approvals
                 SET status = ?, result = ?, updated_at = ?
-                WHERE id = ? AND status = 'executing'
+                WHERE id = ? AND status = 'executing' AND user_id = ?
                 """,
-                (status, _json(sanitized_result), now, approval_id),
+                (
+                    status,
+                    _json(sanitized_result),
+                    now,
+                    approval_id,
+                    current_user_id(),
+                ),
             )
             conn.commit()
             if cursor.rowcount != 1:
@@ -3700,9 +4056,9 @@ class JarvisStorage:
                     id, created_at, updated_at, status, risk, title, description,
                     requested_action, payload, result
                 FROM approvals
-                WHERE id = ?
+                WHERE id = ? AND user_id = ?
                 """,
-                (approval_id,),
+                (approval_id, current_user_id()),
             ).fetchone()
         updated = _approval_record(row) if row is not None else None
         if updated is not None:
@@ -3727,6 +4083,7 @@ class JarvisStorage:
         remains discoverable until the executive branch has been reconciled.
         """
 
+        self._require_system_scope("cross-tenant approval recovery")
         now = utc_now()
         recovered: list[tuple[dict[str, Any], dict[str, Any]]] = []
         with self._lock:
@@ -3735,7 +4092,7 @@ class JarvisStorage:
                 """
                 SELECT
                     id, created_at, updated_at, status, risk, title, description,
-                    requested_action, payload, result
+                    requested_action, payload, result, user_id
                 FROM approvals
                 WHERE status = 'executing'
                 ORDER BY updated_at ASC, rowid ASC
@@ -3770,9 +4127,9 @@ class JarvisStorage:
                     """
                     UPDATE approvals
                     SET status = 'failed', result = ?, updated_at = ?
-                    WHERE id = ? AND status = 'executing'
+                    WHERE id = ? AND status = 'executing' AND user_id = ?
                     """,
-                    (_json(result), now, before["id"]),
+                    (_json(result), now, before["id"], before["user_id"]),
                 )
                 if cursor.rowcount != 1:
                     continue
@@ -3789,6 +4146,7 @@ class JarvisStorage:
                 summary=f"Interrupted approval execution failed closed: {after['title']}",
                 before=before,
                 after=after,
+                user_id=str(after["user_id"]),
             )
         return [after for _before, after in recovered]
 
@@ -3796,19 +4154,26 @@ class JarvisStorage:
         self,
         *,
         limit: int = 200,
+        all_users: bool = False,
     ) -> list[dict[str, Any]]:
         """Return terminal approvals whose mission branch still needs reconciliation."""
 
+        if all_users:
+            self._require_system_scope("cross-tenant approval reconciliation")
         with self._lock:
+            user_clause = "" if all_users else " AND user_id = ?"
+            params: tuple[Any, ...] = () if all_users else (current_user_id(),)
             rows = self.connect().execute(
-                """
+                f"""
                 SELECT
                     id, created_at, updated_at, status, risk, title, description,
-                    requested_action, payload, result
+                    requested_action, payload, result, user_id
                 FROM approvals
                 WHERE status IN ('failed', 'rejected', 'cancelled')
+                  {user_clause}
                 ORDER BY updated_at ASC, rowid ASC
                 """,
+                params,
             ).fetchall()
         approvals = [_approval_record(row) for row in rows]
         pending = [
@@ -3840,8 +4205,9 @@ class JarvisStorage:
                     requested_action, payload, result
                 FROM approvals
                 WHERE id = ? AND status IN ('failed', 'rejected', 'cancelled')
+                  AND user_id = ?
                 """,
-                (approval_id,),
+                (approval_id, current_user_id()),
             ).fetchone()
             if row is None:
                 return None
@@ -3878,8 +4244,15 @@ class JarvisStorage:
                 WHERE id = ?
                   AND status IN ('failed', 'rejected', 'cancelled')
                   AND result = ?
+                  AND user_id = ?
                 """,
-                (_json(updated_result), now, approval_id, raw_result),
+                (
+                    _json(updated_result),
+                    now,
+                    approval_id,
+                    raw_result,
+                    current_user_id(),
+                ),
             )
             if cursor.rowcount != 1:
                 conn.rollback()
@@ -3909,8 +4282,8 @@ class JarvisStorage:
         now: str | None = None,
     ) -> None:
         rows = conn.execute(
-            "SELECT status FROM mission_tasks WHERE mission_id = ?",
-            (mission_id,),
+            "SELECT status FROM mission_tasks WHERE mission_id = ? AND user_id = ?",
+            (mission_id, current_user_id()),
         ).fetchall()
         total = len(rows)
         done = sum(1 for row in rows if row["status"] in {"done", "skipped"})
@@ -3929,9 +4302,9 @@ class JarvisStorage:
             """
             UPDATE missions
             SET status = ?, progress = ?, updated_at = ?
-            WHERE id = ?
+            WHERE id = ? AND user_id = ?
             """,
-            (mission_status, progress, now or utc_now(), mission_id),
+            (mission_status, progress, now or utc_now(), mission_id, current_user_id()),
         )
 
     def record_health(
@@ -4146,14 +4519,16 @@ CREATE TABLE IF NOT EXISTS runtime_events (
     level TEXT NOT NULL,
     kind TEXT NOT NULL,
     title TEXT NOT NULL,
-    payload TEXT NOT NULL DEFAULT '{}'
+    payload TEXT NOT NULL DEFAULT '{}',
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT
 );
 
 CREATE TABLE IF NOT EXISTS conversations (
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -4162,7 +4537,8 @@ CREATE TABLE IF NOT EXISTS messages (
     role TEXT NOT NULL,
     content TEXT NOT NULL,
     metadata TEXT NOT NULL DEFAULT '{}',
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT
 );
 
 CREATE TABLE IF NOT EXISTS memories (
@@ -4172,7 +4548,8 @@ CREATE TABLE IF NOT EXISTS memories (
     tags TEXT NOT NULL DEFAULT '[]',
     importance REAL NOT NULL DEFAULT 0.5,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT
 );
 
 CREATE TABLE IF NOT EXISTS missions (
@@ -4182,7 +4559,8 @@ CREATE TABLE IF NOT EXISTS missions (
     status TEXT NOT NULL,
     progress REAL NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT
 );
 
 CREATE TABLE IF NOT EXISTS mission_tasks (
@@ -4193,7 +4571,8 @@ CREATE TABLE IF NOT EXISTS mission_tasks (
     notes TEXT,
     position INTEGER NOT NULL,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT
 );
 
 CREATE TABLE IF NOT EXISTS reminders (
@@ -4208,7 +4587,8 @@ CREATE TABLE IF NOT EXISTS reminders (
     source_text TEXT NOT NULL DEFAULT '',
     fired_at TEXT,
     fire_count INTEGER NOT NULL DEFAULT 0,
-    payload TEXT NOT NULL DEFAULT '{}'
+    payload TEXT NOT NULL DEFAULT '{}',
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT
 );
 
 CREATE TABLE IF NOT EXISTS files (
@@ -4223,7 +4603,8 @@ CREATE TABLE IF NOT EXISTS files (
     error TEXT,
     chunk_count INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT
 );
 
 CREATE TABLE IF NOT EXISTS file_chunks (
@@ -4232,7 +4613,8 @@ CREATE TABLE IF NOT EXISTS file_chunks (
     position INTEGER NOT NULL,
     content TEXT NOT NULL,
     char_count INTEGER NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT
 );
 
 CREATE TABLE IF NOT EXISTS health_snapshots (
@@ -4253,7 +4635,8 @@ CREATE TABLE IF NOT EXISTS tool_runs (
     arguments TEXT NOT NULL DEFAULT '{}',
     data TEXT NOT NULL DEFAULT '{}',
     mission_id TEXT REFERENCES missions(id) ON DELETE SET NULL,
-    task_id TEXT REFERENCES mission_tasks(id) ON DELETE SET NULL
+    task_id TEXT REFERENCES mission_tasks(id) ON DELETE SET NULL,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT
 );
 
 CREATE TABLE IF NOT EXISTS learning_observations (
@@ -4265,7 +4648,8 @@ CREATE TABLE IF NOT EXISTS learning_observations (
     role TEXT,
     content TEXT NOT NULL DEFAULT '',
     summary TEXT NOT NULL DEFAULT '',
-    payload TEXT NOT NULL DEFAULT '{}'
+    payload TEXT NOT NULL DEFAULT '{}',
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT
 );
 
 CREATE TABLE IF NOT EXISTS approvals (
@@ -4278,7 +4662,8 @@ CREATE TABLE IF NOT EXISTS approvals (
     description TEXT NOT NULL,
     requested_action TEXT NOT NULL,
     payload TEXT NOT NULL DEFAULT '{}',
-    result TEXT NOT NULL DEFAULT '{}'
+    result TEXT NOT NULL DEFAULT '{}',
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT
 );
 
 CREATE TABLE IF NOT EXISTS telemetry_snapshots (
@@ -4296,7 +4681,8 @@ CREATE TABLE IF NOT EXISTS audit_log (
     target_id TEXT,
     summary TEXT NOT NULL,
     before_json TEXT NOT NULL DEFAULT '{}',
-    after_json TEXT NOT NULL DEFAULT '{}'
+    after_json TEXT NOT NULL DEFAULT '{}',
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT
 );
 
 CREATE INDEX IF NOT EXISTS idx_runtime_kv_updated ON runtime_kv(updated_at);

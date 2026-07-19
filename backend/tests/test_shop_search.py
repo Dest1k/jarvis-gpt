@@ -10,6 +10,7 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 from jarvis_gpt import tools as tools_module
+from jarvis_gpt.authorization import bind_actor
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
 from jarvis_gpt.llm import LLMRouter
 from jarvis_gpt.storage import JarvisStorage
@@ -1105,6 +1106,73 @@ def test_web_shop_search_singleflight_populates_exact_fresh_cache(monkeypatch, t
     }
     assert captured_state_dir.startswith(str(tmp_path))
     assert captured_state_dir.endswith("shop-state")
+    storage.close()
+
+
+def test_web_shop_search_persistent_state_is_tenant_scoped(monkeypatch, tmp_path):
+    captured: list[tuple[str, str]] = []
+
+    async def fake_start(self):
+        self._started = True
+
+    async def fake_close(self):
+        self._started = False
+
+    async def fake_shop_search(self, query, **_kwargs):
+        captured.append(
+            (
+                self.config.shop_storage_state_dir,
+                self.config.shop_persistent_profile_dir,
+            )
+        )
+        return _dns_result(query)
+
+    monkeypatch.setattr(ws.JarvisWebSurfer, "start", fake_start)
+    monkeypatch.setattr(ws.JarvisWebSurfer, "close", fake_close)
+    monkeypatch.setattr(ws.JarvisWebSurfer, "shop_search", fake_shop_search)
+    tools, storage = _registry(monkeypatch, tmp_path)
+    identities = [
+        tools.permissions.upsert_external_identity(
+            provider="test",
+            realm_id="shop-state",
+            provider_subject_id=subject,
+            bootstrap_preset="user",
+        )
+        for subject in ("first-user", "second-user")
+    ]
+
+    async def run_for_both_users():
+        results = []
+        for identity in identities:
+            actor = tools.permissions.actor_for_user(
+                str(identity["user_id"]), source="shop-state-test"
+            )
+            assert actor is not None
+            with bind_actor(actor):
+                results.append(
+                    await tools.run(
+                        "web.shop_search",
+                        {"query": "tenant cookies", "shop": "dns"},
+                    )
+                )
+        return results
+
+    results = asyncio.run(run_for_both_users())
+
+    assert all(result.ok for result in results)
+    assert len(captured) == 2
+    assert captured[0] != captured[1]
+    assert all(
+        "web-surfer" in state and state.endswith("shop-state")
+        for state, _ in captured
+    )
+    assert all(profile.endswith("shop-profile") for _, profile in captured)
+    assert all(
+        str(identity["user_id"]) not in path
+        for identity in identities
+        for pair in captured
+        for path in pair
+    )
     storage.close()
 
 

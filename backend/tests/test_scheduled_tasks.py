@@ -104,7 +104,11 @@ def _registry(monkeypatch, tmp_path):
 def test_reminders_create_marks_agent_task(monkeypatch, tmp_path):
     tools, storage = _registry(monkeypatch, tmp_path)
     result = asyncio.run(
-        tools.run("reminders.create", {"text": "каждое утро в 9 присылай сводку по ИИ"})
+        tools.run(
+            "reminders.create",
+            {"text": "каждое утро в 9 присылай сводку по ИИ"},
+            allow_danger=True,
+        )
     )
     assert result.ok is True
     assert result.data["agent_task"] is True
@@ -121,6 +125,7 @@ def test_reminders_create_recovers_recurrence_from_text(monkeypatch, tmp_path):
         tools.run(
             "reminders.create",
             {"text": "каждое утро в 9 присылай сводку по ИИ", "when": "в 9"},
+            allow_danger=True,
         )
     )
     assert result.ok is True

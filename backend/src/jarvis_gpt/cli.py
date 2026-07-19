@@ -714,7 +714,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.set_defaults(func=cmd_serve)
 
     telegram_parser = sub.add_parser(
-        "telegram-bridge", help="Run the Telegram bot frontend (owner-allowlisted)"
+        "telegram-bridge", help="Run the auto-registering Telegram bot frontend"
     )
     telegram_parser.set_defaults(func=cmd_telegram_bridge)
 

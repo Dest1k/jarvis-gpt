@@ -5,6 +5,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, TypeVar
 
+from .authorization import AuthorizationError, AuthorizationService, bind_actor
 from .diagnostics import run_diagnostics
 from .dispatcher import DispatcherManager
 from .learning import LearningEngine
@@ -29,6 +30,14 @@ SUPPORTED_APPROVAL_ACTIONS = (
     "tool.run",
 )
 _EXECUTIVE_MUTATION_TOOLS = frozenset({"execution.apply", "execution.transaction"})
+_APPROVAL_ACTION_SECURITY_IDS = {
+    "dispatcher.start": "tool.dispatcher.start",
+    "dispatcher.stop": "tool.dispatcher.stop",
+    "diagnostics.run": "tool.diagnostics.run",
+    "learning.tick": "tool.learning.tick",
+    "memory.save": "tool.memory.save",
+    "telemetry.snapshot": "tool.telemetry.snapshot",
+}
 
 
 @dataclass(frozen=True)
@@ -78,8 +87,20 @@ class ApprovalExecutor:
         """Drain durable mission-reconciliation outbox rows without action replay."""
 
         reconciled: list[dict[str, Any]] = []
-        for approval in self.storage.pending_approval_reconciliations():
+        authorization = AuthorizationService(self.storage)
+        # Targeted reconciliation stays inside the requesting user's actor scope.
+        # Cross-tenant draining is reserved for cold-start/system recovery.
+        for approval in self.storage.pending_approval_reconciliations(
+            all_users=approval_id is None
+        ):
             if approval_id is not None and approval.get("id") != approval_id:
+                continue
+            actor = authorization.actor_for_user(
+                str(approval.get("user_id") or ""), source="approval-reconciliation"
+            )
+            if actor is None:
+                # Suspended/deleted users keep the durable reconciliation marker;
+                # reactivation can safely resume it without replaying the action.
                 continue
             reconciliation = approval.get("result", {}).get("reconciliation", {})
             mode = reconciliation.get("mode") if isinstance(reconciliation, dict) else None
@@ -111,7 +132,8 @@ class ApprovalExecutor:
                     detail="mission branch reconciled without replay",
                 )
 
-            updated = await finish_despite_cancellation(reconcile_one())
+            with bind_actor(actor):
+                updated = await finish_despite_cancellation(reconcile_one())
             if updated is not None:
                 reconciled.append(updated)
         return reconciled
@@ -158,6 +180,40 @@ class ApprovalExecutor:
                 data={"approval": approval, "stale": True},
                 approval=approval,
                 status_code=409,
+                finalize=False,
+            )
+        security_id = _APPROVAL_ACTION_SECURITY_IDS.get(action)
+        if action == "tool.run":
+            tool_name = str(payload.get("tool") or "").strip()
+            security_id = f"tool.{tool_name}" if tool_name else None
+        if security_id is None:
+            return ApprovalExecution(
+                ok=False,
+                summary="Approval action is not mapped to a security capability.",
+                data={"approval_id": approval_id, "action": action},
+                approval=approval,
+                status_code=403,
+                finalize=False,
+            )
+        try:
+            AuthorizationService(self.storage).require_current(
+                security_id,
+                resource_type="approval",
+                resource_ref=approval_id,
+                context={"requested_action": action},
+            )
+        except AuthorizationError as exc:
+            return ApprovalExecution(
+                ok=False,
+                summary="Approval execution is not permitted for this user.",
+                data={
+                    "approval_id": approval_id,
+                    "action": action,
+                    "security_id": security_id,
+                    "error": str(exc),
+                },
+                approval=approval,
+                status_code=403,
                 finalize=False,
             )
         # Validate before claiming so malformed/unsupported legacy approvals stay

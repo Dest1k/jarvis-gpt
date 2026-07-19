@@ -231,8 +231,9 @@ def test_direct_route_creates_bounded_watch_before_one_shot_capture(monkeypatch,
         env={"JARVIS_OPERATOR_FULL_AUTONOMY": "1"},
     )
     agent = AgentRuntime(settings=settings, storage=storage, llm=_VisionLLM())
+    conversation_id = storage.create_conversation("screen watch")
     context = AgentContext(
-        conversation_id="conv-1",
+        conversation_id=conversation_id,
         memory_hits=[],
         file_hits=[],
         notification_chat_id=42,
@@ -248,7 +249,7 @@ def test_direct_route_creates_bounded_watch_before_one_shot_capture(monkeypatch,
     assert item["payload"]["condition"] == "появится окно Успех"
     assert item["payload"]["telegram_chat_id"] == 42
     assert item["recurrence"] == {"kind": "interval", "seconds": 300}
-    assert item["conversation_id"] == "conv-1"
+    assert item["conversation_id"] == conversation_id
     storage.close()
 
 
@@ -270,8 +271,9 @@ def test_supported_watch_grammar_uses_current_operator_turn_not_generic_scopes(
     )
     agent = AgentRuntime(settings=settings, storage=storage, llm=_VisionLLM())
     message = "keep watching my screen and tell me when Download finished"
+    conversation_id = storage.create_conversation("screen watch")
     context = AgentContext(
-        conversation_id="conv-supported-grammar",
+        conversation_id=conversation_id,
         memory_hits=[],
         file_hits=[],
         operator_message=message,
