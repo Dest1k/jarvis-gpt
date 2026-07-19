@@ -136,7 +136,12 @@ def reminder_inline_keyboard(reminder_id: str) -> dict[str, Any]:
 
 
 def answer_action_keyboard() -> dict[str, Any]:
-    """Inline chips under a normal agent answer (inbox / remind / more / stop)."""
+    """Optional inline chips under an agent answer (inbox / remind / more).
+
+    Disabled by default on every chat turn — the day-console reply keyboard and
+    reminder-specific snooze buttons cover the same actions without cluttering
+    normal answers. Kept for explicit callers / tests.
+    """
 
     return {
         "inline_keyboard": [

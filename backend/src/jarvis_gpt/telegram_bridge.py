@@ -3034,7 +3034,9 @@ class TelegramBridge:
             attachments,
             voice_reply=audio_in and not forwarded,
             request_id=f"{self._realm_id}:{update_id}",
-            action_chips=True,
+            # No per-answer action chips (Inbox / +1ч / Ещё) — they clutter every
+            # reply. Reminder snooze/done buttons still attach only to fired reminders.
+            action_chips=False,
         )
 
     # -- inbound files (photo/document -> /api/files/upload) ------------------

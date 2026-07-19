@@ -9642,6 +9642,22 @@ class AgentRuntime:
             if capabilities["can_read_memory"]
             else []
         )
+        # Past-dialog recall («о чём говорили пару часов назад») must see other
+        # sessions too — a service reboot or /new leaves the current transcript empty
+        # even though the SQLite history is intact.
+        if capabilities["can_read_memory"] and _looks_like_past_dialog_recall(message):
+            cross = self.storage.recent_dialogue_across_conversations(
+                hours=36,
+                max_conversations=8,
+                messages_per_conversation=5,
+                exclude_conversation_id=conversation_id,
+            )
+            if cross:
+                memory_hits = _merge_context_memories(
+                    [_dialogue_snippet_as_memory_hit(item) for item in cross],
+                    memory_hits,
+                    limit=12,
+                )
         file_hits = (
             self.storage.search_file_chunks(message[:160], limit=5)
             if capabilities["can_read_files"]
@@ -12503,6 +12519,90 @@ def _memory_hit_from_saved(item: dict[str, Any]) -> dict[str, Any]:
         "relevance": 1.0,
         "snippet": item.get("content"),
         "matched_terms": [],
+    }
+
+
+def _looks_like_past_dialog_recall(message: str) -> bool:
+    """True when the operator is asking what was discussed earlier / before reboot."""
+
+    normalized = _fold_operator_confusables(message).casefold()
+    if not normalized:
+        return False
+    temporal = _contains_any(
+        normalized,
+        (
+            "раньше",
+            "ранее",
+            "до этого",
+            "до ребут",
+            "до перезапуск",
+            "пару часов",
+            "несколько часов",
+            "вчера",
+            "утром",
+            "сегодня утром",
+            "недавно",
+            "в прошл",
+            "прошлый раз",
+            "до рестарт",
+            "before reboot",
+            "earlier",
+            "a few hours",
+            "hours ago",
+            "last time",
+            "previous",
+        ),
+    )
+    dialog = _contains_any(
+        normalized,
+        (
+            "говорили",
+            "обсуждали",
+            "разговор",
+            "диалог",
+            "беседе",
+            "беседовали",
+            "о чём",
+            "о чем",
+            "что было",
+            "что делали",
+            "помни",
+            "история",
+            "remember",
+            "talked",
+            "discussed",
+            "conversation",
+            "chat history",
+            "session",
+        ),
+    )
+    return temporal and dialog
+
+
+def _dialogue_snippet_as_memory_hit(item: dict[str, Any]) -> dict[str, Any]:
+    """Shape a cross-conversation message as a memory hit for prompt injection."""
+
+    title = str(item.get("title") or "").strip() or "диалог"
+    role = str(item.get("role") or "").strip() or "message"
+    when = str(item.get("created_at") or "").strip()
+    content = str(item.get("content") or "").strip()
+    header = f"[{title}] {role}"
+    if when:
+        header = f"{header} @ {when}"
+    body = f"{header}: {content}"
+    conv_id = str(item.get("conversation_id") or "unknown")
+    stamp = when or "na"
+    return {
+        "id": f"dialogue:{conv_id}:{stamp}:{role}:{hash(content) & 0xFFFF:x}",
+        "content": body[:700],
+        "namespace": "conversation_history",
+        "tags": ["dialogue", "recent"],
+        "importance": 0.7,
+        "rank": None,
+        "relevance": 0.85,
+        "snippet": body[:700],
+        "matched_terms": [],
+        "created_at": when or None,
     }
 
 

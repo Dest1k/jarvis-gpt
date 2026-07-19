@@ -11,7 +11,7 @@ from collections import Counter, OrderedDict, defaultdict, deque
 from collections.abc import Callable, Iterable, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from itertools import combinations
 from pathlib import Path
 from typing import Any
@@ -1444,6 +1444,73 @@ class JarvisStorage:
                 (current_user_id(), limit),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def recent_dialogue_across_conversations(
+        self,
+        *,
+        hours: int = 24,
+        max_conversations: int = 10,
+        messages_per_conversation: int = 6,
+        exclude_conversation_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Recent user/assistant turns across the operator's chats (post-reboot recall).
+
+        Returns newest-first snippets with conversation title so the agent can
+        answer «о чём мы говорили пару часов назад» without only seeing the
+        brand-new empty session after a service restart.
+        """
+
+        hours = max(1, min(int(hours or 24), 168))
+        max_conversations = max(1, min(int(max_conversations or 10), 30))
+        messages_per_conversation = max(1, min(int(messages_per_conversation or 6), 20))
+        # ISO cutoff matches storage.utc_now() strings better than SQLite datetime().
+        cutoff = (datetime.now(UTC) - timedelta(hours=hours)).isoformat()
+        with self._lock:
+            conn = self.connect()
+            conv_rows = conn.execute(
+                """
+                SELECT id, title, updated_at
+                FROM conversations
+                WHERE user_id = ?
+                  AND updated_at >= ?
+                ORDER BY updated_at DESC, rowid DESC
+                LIMIT ?
+                """,
+                (current_user_id(), cutoff, max_conversations + 2),
+            ).fetchall()
+            snippets: list[dict[str, Any]] = []
+            for conv in conv_rows:
+                conv_id = str(conv["id"] or "")
+                if not conv_id or conv_id == exclude_conversation_id:
+                    continue
+                msg_rows = conn.execute(
+                    """
+                    SELECT role, content, created_at
+                    FROM messages
+                    WHERE conversation_id = ? AND user_id = ?
+                      AND role IN ('user', 'assistant')
+                    ORDER BY created_at DESC, rowid DESC
+                    LIMIT ?
+                    """,
+                    (conv_id, current_user_id(), messages_per_conversation),
+                ).fetchall()
+                for row in reversed(list(msg_rows)):
+                    content = str(row["content"] or "").strip()
+                    if not content:
+                        continue
+                    snippets.append(
+                        {
+                            "conversation_id": conv_id,
+                            "title": str(conv["title"] or "")[:120],
+                            "role": str(row["role"] or ""),
+                            "content": content[:500],
+                            "created_at": str(row["created_at"] or ""),
+                            "updated_at": str(conv["updated_at"] or ""),
+                        }
+                    )
+                if len({item["conversation_id"] for item in snippets}) >= max_conversations:
+                    break
+        return snippets
 
     def get_conversation(self, conversation_id: str) -> dict[str, Any] | None:
         with self._lock:

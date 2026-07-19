@@ -285,7 +285,7 @@ def test_quiet_command_patches_preferences():
     assert any("23:00-08:00" in text for text in sent)
 
 
-def test_answer_sends_action_chips():
+def test_answer_does_not_send_action_chips_by_default():
     markups: list[dict] = []
 
     def tg_handler(request):
@@ -320,8 +320,13 @@ def test_answer_sends_action_chips():
         },
     }
     asyncio.run(bridge._handle(update))
-    assert any(
-        any(btn.get("callback_data") == "a:inbox" for row in m.get("inline_keyboard", []) for btn in row)
+    # Normal answers must not attach Inbox/+1ч/Ещё chips under every message.
+    assert not any(
+        any(
+            btn.get("callback_data") in {"a:inbox", "a:r60", "a:more"}
+            for row in m.get("inline_keyboard", [])
+            for btn in row
+        )
         for m in markups
     )
     assert bridge._last_answers.get(42) == "Готово."

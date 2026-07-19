@@ -2244,29 +2244,43 @@ def test_cbr_fx_rate_helpers_and_answer_format():
     rub_usd = tools_module._web_answer_cbr_pair_rate(valute, base="RUB", quote="USD")
     assert rub_usd is not None and abs(rub_usd - (1 / 78.5)) < 1e-9
     assert tools_module._web_answer_financial_instrument_kind("курс рубля к доллару") == "fx"
+    # Local convention: when RUB is one of the legs, foreign is base (USD/RUB),
+    # so "курс рубля к доллару" and "300 долларов в рублях" share the same pair.
     assert tools_module._web_answer_requested_currency_pairs("курс рубля к доллару") == [
-        ("RUB", "USD")
+        ("USD", "RUB")
     ]
+    assert tools_module._web_answer_requested_currency_pairs(
+        "Сколько рублей в 300 долларах?"
+    ) == [("USD", "RUB")]
+    assert tools_module._web_answer_fx_money_amount("Сколько рублей в 300 долларах?") == (
+        300.0,
+        "USD",
+    )
     source = {
         "url": "https://www.cbr-xml-daily.ru/daily_json.js",
-        "title": "CBR official FX rate RUB/USD",
+        "title": "CBR official FX rate USD/RUB",
         "excerpt": (
-            "Official Bank of Russia daily FX table: currency pair RUB/USD "
-            "rate is 0.0127 USD per 1 RUB on 2026-07-18."
+            "Official Bank of Russia daily FX table: currency pair USD/RUB "
+            "rate is 78.5 RUB per 1 USD on 2026-07-18."
         ),
         "market_quote": {
             "instrument_type": "FX",
             "provider": "cbr",
-            "base": "RUB",
-            "quote": "USD",
-            "price": "0.0127",
+            "base": "USD",
+            "quote": "RUB",
+            "price": "78.5",
             "quote_date": "2026-07-18",
         },
     }
     answer = tools_module._format_fx_provider_answer("курс рубля к доллару", [source])
-    assert "RUB/USD" in answer
-    assert "0.0127" in answer
+    assert "USD/RUB" in answer
+    assert "78.5" in answer
     assert "Банка России" in answer
+    converted = tools_module._format_fx_provider_answer(
+        "Сколько рублей в 300 долларах?", [source]
+    )
+    assert "300 USD" in converted
+    assert "23,550.00 RUB" in converted or "23550" in converted.replace(",", "")
     # FX uses its own grounding path — oil/futures contract must not reject it.
     assert tools_module._web_answer_fx_answer_is_grounded(
         answer,

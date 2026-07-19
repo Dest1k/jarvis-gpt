@@ -9771,6 +9771,83 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
                     normalized_id = str(supporting_id or "").strip()
                     if normalized_id and normalized_id not in evidence_ids:
                         evidence_ids.append(normalized_id)
+        # Fast path: typed live FX (CBR) already answers — skip multi-source web
+        # research/synthesis that used to add 10–30s of latency on Telegram and
+        # sometimes fail-closed after a messy snippet synthesis.
+        if (
+            _web_answer_financial_instrument_kind(resolved_question) == "fx"
+            and market_sources
+        ):
+            # Ground on the unit-rate wording only; conversion totals are derived
+            # math and must not fail the number∩source check. Use the *original*
+            # operator question for amount extraction — resolved_question is often
+            # rewritten to "USD to RUB exchange rate today" and loses "300 долларов".
+            fx_question = " ".join(
+                part for part in (question, resolved_question) if str(part or "").strip()
+            )
+            fx_core = _format_fx_provider_answer(
+                fx_question, market_sources, include_conversion=False
+            )
+            fx_answer = _format_fx_provider_answer(
+                fx_question, market_sources, include_conversion=True
+            )
+            if fx_core and _web_answer_fx_answer_is_grounded(
+                fx_core,
+                question=resolved_question or question,
+                sources=market_sources,
+            ):
+                ranked_sources = list(market_sources)
+                record = _store_web_research_record(
+                    ctx.storage,
+                    query=queries[0] if queries else resolved_question,
+                    claim=resolved_question,
+                    sources=ranked_sources,
+                    verification={"ok": True, "reason": "cbr_fx_fast_path"},
+                    report=fx_answer,
+                )
+                data = {
+                    "id": record["id"],
+                    "question": question,
+                    "resolved_question": resolved_question,
+                    "query": queries[0] if queries else resolved_question,
+                    "queries": queries,
+                    "region": region,
+                    "freshness": freshness or "day",
+                    "checked_at": record["created_at"],
+                    "vertical": vertical,
+                    "mode": orchestrator.mode.value,
+                    "preferred_domains": preferred_domains,
+                    "answer": fx_answer or fx_core,
+                    "sources": ranked_sources,
+                    "citations": _research_citations(ranked_sources),
+                    "direct_links": [],
+                    "claim_citations": _web_answer_claim_citations(
+                        fx_answer, ranked_sources
+                    ),
+                    "verification": {"ok": True, "reason": "cbr_fx_fast_path"},
+                    "confidence": 0.92,
+                    "cards": [],
+                    "shopping": None,
+                    "news": None,
+                    "synthesis": {
+                        "attempted": False,
+                        "used": False,
+                        "reason": "deterministic_fx_cbr_fast_path",
+                    },
+                    "financial_contract": {"accepted": True, "rejection": None},
+                    "orchestration": orchestrator.metadata(),
+                    "cache": {"hit": False, "enabled": False},
+                    "steps": steps,
+                }
+                return ToolRunResponse(
+                    tool="web.answer",
+                    ok=True,
+                    summary=(
+                        f"Answer engine used live CBR FX for "
+                        f"{len(ranked_sources)} pair(s)."
+                    ),
+                    data=data,
+                )
 
     active_queries = queries[:1] if orchestrator.mode is WebMode.FAST_FACT else queries[:4]
 
@@ -10067,13 +10144,21 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
         # For FX, accept a typed grounded answer (pair + rate + date + cited URL).
         if financial_kind == "fx":
             fx_sources = _web_answer_fx_typed_sources(ranked_sources)
-            fx_answer = _format_fx_provider_answer(resolved_question, fx_sources)
-            if fx_answer and _web_answer_fx_answer_is_grounded(
-                fx_answer,
-                question=resolved_question,
+            fx_question = " ".join(
+                part for part in (question, resolved_question) if str(part or "").strip()
+            )
+            fx_core = _format_fx_provider_answer(
+                fx_question, fx_sources, include_conversion=False
+            )
+            fx_answer = _format_fx_provider_answer(
+                fx_question, fx_sources, include_conversion=True
+            )
+            if fx_core and _web_answer_fx_answer_is_grounded(
+                fx_core,
+                question=resolved_question or question,
                 sources=fx_sources or ranked_sources,
             ):
-                answer = fx_answer
+                answer = fx_answer or fx_core
                 financial_contract_rejection = ""
                 synthesis = {
                     **synthesis,
@@ -16338,16 +16423,83 @@ def _web_answer_parse_cbr_daily_date(raw: str) -> date | None:
     return None
 
 
-def _format_fx_provider_answer(question: str, sources: list[dict[str, Any]]) -> str:
+def _web_answer_fx_money_amount(question: str) -> tuple[float, str] | None:
+    """Extract an explicit money amount + currency for conversion questions.
+
+    Examples: ``300 долларов``, ``$300``, ``300 USD``, ``30000 руб``.
+    """
+
+    normalized = _repair_mojibake(question)
+    # Prefer amount glued to a currency token.
+    patterns: list[tuple[str, str]] = []
+    for code, aliases in _WEB_FINANCIAL_CURRENCY_ALIASES.items():
+        for alias in aliases:
+            if not alias or alias in {"$", "€", "£", "₽"}:
+                continue
+            escaped = re.escape(alias)
+            patterns.append(
+                (
+                    code,
+                    rf"(?P<amount>\d{{1,3}}(?:[ \u00a0]\d{{3}})*|\d+)(?:[.,]\d+)?\s*{escaped}",
+                )
+            )
+            patterns.append(
+                (
+                    code,
+                    rf"{escaped}\s*(?P<amount>\d{{1,3}}(?:[ \u00a0]\d{{3}})*|\d+)(?:[.,]\d+)?",
+                )
+            )
+        if code == "USD":
+            patterns.append((code, r"\$(?P<amount>\d+(?:[.,]\d+)?)"))
+            patterns.append((code, r"(?P<amount>\d+(?:[.,]\d+)?)\s*\$"))
+        if code == "RUB":
+            patterns.append((code, r"(?P<amount>\d+(?:[.,]\d+)?)\s*₽"))
+            patterns.append((code, r"₽\s*(?P<amount>\d+(?:[.,]\d+)?)"))
+        if code == "EUR":
+            patterns.append((code, r"€\s*(?P<amount>\d+(?:[.,]\d+)?)"))
+            patterns.append((code, r"(?P<amount>\d+(?:[.,]\d+)?)\s*€"))
+    best: tuple[int, float, str] | None = None
+    for code, pattern in patterns:
+        for match in re.finditer(pattern, normalized, flags=re.IGNORECASE):
+            raw = match.group("amount").replace("\u00a0", " ").replace(" ", "").replace(",", ".")
+            try:
+                amount = float(raw)
+            except ValueError:
+                continue
+            if not math.isfinite(amount) or amount <= 0:
+                continue
+            # Prefer the first numeric amount that looks like a conversion size
+            # (skip tiny ones that are just noise like "1 USD").
+            score = match.start()
+            if amount >= 2:
+                score -= 1000
+            if best is None or score < best[0]:
+                best = (score, amount, code)
+    if best is None:
+        return None
+    return best[1], best[2]
+
+
+def _format_fx_provider_answer(
+    question: str,
+    sources: list[dict[str, Any]],
+    *,
+    include_conversion: bool = True,
+) -> str:
     """Deterministic FX answer from typed live FX sources (CBR / extracted web).
 
     Wording is intentional: keep the quote status as live_current under the
     financial value-status grammar (avoid genitive forms that trip
     unknown_modifier) and always emit an explicit BASE/QUOTE pair plus URL so
     web.answer can accept the fact without the oil/futures contract path.
+
+    When the question has an explicit money amount (e.g. «300 долларов»), also
+    compute the converted total so the operator gets a usable number, not only
+    the unit rate. Conversion totals are operator math on the grounded unit rate
+    and may be omitted for grounding checks (``include_conversion=False``).
     """
 
-    _ = question
+    money = _web_answer_fx_money_amount(question) if include_conversion else None
     lines: list[str] = []
     for source in sources:
         quote = source.get("market_quote")
@@ -16372,6 +16524,27 @@ def _format_fx_provider_answer(question: str, sources: list[dict[str, Any]]) -> 
             f"Текущий курс {base}/{quote_ccy}: {price} {quote_ccy} за 1 {base} "
             f"на {quote_date} ({origin}). Источник: {url}"
         )
+        if money is None:
+            continue
+        amount, amount_ccy = money
+        try:
+            rate = float(str(price).replace(",", "."))
+        except ValueError:
+            continue
+        if not math.isfinite(rate) or rate <= 0:
+            continue
+        if amount_ccy == base:
+            converted = amount * rate
+            lines.append(
+                f"{amount:g} {base} ≈ {converted:,.2f} {quote_ccy} "
+                f"по курсу на {quote_date}."
+            )
+        elif amount_ccy == quote_ccy:
+            converted = amount / rate
+            lines.append(
+                f"{amount:g} {quote_ccy} ≈ {converted:,.2f} {base} "
+                f"по курсу на {quote_date}."
+            )
     if lines:
         return "\n".join(lines)
     return ""
@@ -18767,7 +18940,14 @@ def _web_answer_requested_currency_pair(text: str) -> tuple[str, str] | None:
         if matches:
             positions.append((min(matches), code))
     ordered = [code for _position, code in sorted(positions)]
+    # When RUB is one of the currencies, prefer foreign/RUB (USD/RUB, EUR/RUB).
+    # Appearance order in «сколько рублей в 300 долларах» would otherwise yield
+    # RUB/USD and invert conversion math.
     if len(ordered) >= 2:
+        if "RUB" in ordered:
+            foreign = next((code for code in ordered if code != "RUB"), None)
+            if foreign is not None:
+                return foreign, "RUB"
         return ordered[0], ordered[1]
     # In the Russian product locale, an unqualified "курс доллара/евро/юаня"
     # conventionally means the rate against RUB. Make that assumption explicit
