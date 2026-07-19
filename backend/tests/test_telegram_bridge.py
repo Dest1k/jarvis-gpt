@@ -14,6 +14,8 @@ from jarvis_gpt.storage import JarvisStorage
 from jarvis_gpt.telegram_bridge import (
     TelegramBridge,
     TelegramConfig,
+    TelegramConversationIsolationError,
+    TelegramConversationMigrationError,
     TelegramConversationStore,
     _chunks,
     _configure_logging,
@@ -95,6 +97,36 @@ def test_load_config_parses_allowlist():
     assert cfg.owner_chat_ids == frozenset({42})
     assert cfg.conversation_store_path.name == "jarvis.sqlite3"
     assert cfg.legacy_conversation_store_path.name == "telegram_bridge.sqlite3"
+
+
+def test_load_config_treats_old_store_override_as_migration_source(tmp_path):
+    old_store = tmp_path / "old-telegram.sqlite3"
+    cfg = load_config(
+        {
+            "TELEGRAM_BOT_TOKEN": "T",
+            "JARVIS_TELEGRAM_BRIDGE_SECRET": BRIDGE_SECRET,
+            "JARVIS_TELEGRAM_REALM_ID": "bot-a",
+            "JARVIS_TELEGRAM_LEGACY_REALM_ID": "bot-a",
+            "TELEGRAM_CONVERSATION_STORE_PATH": str(old_store),
+        }
+    )
+
+    assert cfg.realm_id == "bot-a"
+    assert cfg.conversation_store_path.name == "jarvis.sqlite3"
+    assert cfg.conversation_store_path.resolve() != old_store.resolve()
+    assert cfg.legacy_conversation_store_path.resolve() == old_store.resolve()
+    assert cfg.legacy_conversation_realm_id == "bot-a"
+
+
+def test_load_config_rejects_truncated_realm_collisions():
+    with pytest.raises(SystemExit, match="must not exceed 120"):
+        load_config(
+            {
+                "TELEGRAM_BOT_TOKEN": "T",
+                "JARVIS_TELEGRAM_BRIDGE_SECRET": BRIDGE_SECRET,
+                "JARVIS_TELEGRAM_REALM_ID": "r" * 121,
+            }
+        )
 
 
 def test_load_config_bounds_bridge_worker_pool():
@@ -641,7 +673,7 @@ def test_legacy_binding_store_migrates_into_main_database(tmp_path):
     legacy_path = tmp_path / "telegram_bridge.sqlite3"
     main_path = tmp_path / "jarvis.sqlite3"
     legacy = TelegramConversationStore(legacy_path)
-    legacy.bind(42, "tg_existing_owner", "owner")
+    legacy.bind(42, "tg_existing_owner", "owner", user_id="user-42")
 
     main = TelegramConversationStore(main_path, legacy_path=legacy_path)
 
@@ -651,6 +683,265 @@ def test_legacy_binding_store_migrates_into_main_database(tmp_path):
     assert TelegramConversationStore(main_path, legacy_path=legacy_path).load_all() == {
         42: "tg_existing_owner"
     }
+
+
+def test_changed_legacy_snapshot_is_imported_on_the_next_start(tmp_path):
+    legacy_path = tmp_path / "telegram_bridge.sqlite3"
+    main_path = tmp_path / "jarvis.sqlite3"
+    with sqlite3.connect(legacy_path) as legacy:
+        legacy.execute(
+            """
+            CREATE TABLE telegram_conversations (
+                chat_id INTEGER PRIMARY KEY,
+                conversation_id TEXT NOT NULL UNIQUE,
+                access_mode TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        legacy.execute(
+            "INSERT INTO telegram_conversations VALUES (42, 'tg_first', 'guest', 'now')"
+        )
+
+    first = TelegramConversationStore(main_path, legacy_path=legacy_path)
+    assert first.load_all() == {42: "tg_first"}
+    with sqlite3.connect(legacy_path) as legacy:
+        legacy.execute(
+            "INSERT INTO telegram_conversations VALUES (99, 'tg_late', 'guest', 'later')"
+        )
+
+    restarted = TelegramConversationStore(main_path, legacy_path=legacy_path)
+    assert restarted.load_all() == {42: "tg_first", 99: "tg_late"}
+
+
+@pytest.mark.parametrize(
+    ("rows", "error"),
+    [
+        (
+            [(7, "tg_duplicate", "guest"), (99, "tg_duplicate", "guest")],
+            "multiple chats",
+        ),
+        ([(7, "tg_invalid_mode", "administrator")], "invalid access_mode"),
+    ],
+)
+def test_invalid_external_legacy_rows_fail_before_primary_store_is_created(
+    tmp_path, rows, error
+):
+    legacy_path = tmp_path / "telegram_bridge.sqlite3"
+    main_path = tmp_path / "jarvis.sqlite3"
+    with sqlite3.connect(legacy_path) as legacy:
+        legacy.execute(
+            """
+            CREATE TABLE telegram_conversations (
+                chat_id INTEGER NOT NULL,
+                conversation_id TEXT NOT NULL,
+                access_mode TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        legacy.executemany(
+            """
+            INSERT INTO telegram_conversations(
+                chat_id, conversation_id, access_mode, updated_at
+            ) VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            """,
+            rows,
+        )
+
+    with pytest.raises(TelegramConversationMigrationError, match=error):
+        TelegramConversationStore(
+            main_path,
+            realm_id="bot-a",
+            legacy_path=legacy_path,
+            legacy_realm_id="bot-a",
+        )
+
+    assert not main_path.exists()
+
+
+def test_realm_aware_collision_rolls_back_inline_schema_upgrade(tmp_path):
+    main_path = tmp_path / "jarvis.sqlite3"
+    legacy_path = tmp_path / "telegram_bridge.sqlite3"
+    with sqlite3.connect(main_path) as main:
+        main.execute(
+            """
+            CREATE TABLE telegram_conversations (
+                chat_id INTEGER PRIMARY KEY,
+                conversation_id TEXT NOT NULL
+            )
+            """
+        )
+        main.execute(
+            "INSERT INTO telegram_conversations VALUES (7, 'tg_collision')"
+        )
+        before = "\n".join(main.iterdump())
+        journal_before = main.execute("PRAGMA journal_mode").fetchone()[0]
+    with sqlite3.connect(legacy_path) as legacy:
+        legacy.execute(
+            """
+            CREATE TABLE telegram_conversations (
+                realm_id TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                conversation_id TEXT NOT NULL,
+                access_mode TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                user_id TEXT
+            )
+            """
+        )
+        legacy.execute(
+            """
+            INSERT INTO telegram_conversations VALUES (
+                'bot-a', 99, 'tg_collision', 'guest', CURRENT_TIMESTAMP, 'user-b'
+            )
+            """
+        )
+
+    with pytest.raises(TelegramConversationMigrationError, match="different chats"):
+        TelegramConversationStore(
+            main_path,
+            realm_id="bot-a",
+            legacy_path=legacy_path,
+            legacy_realm_id="bot-a",
+        )
+
+    with sqlite3.connect(main_path) as main:
+        assert "\n".join(main.iterdump()) == before
+        assert main.execute("PRAGMA journal_mode").fetchone()[0] == journal_before
+        assert [
+            row[1] for row in main.execute("PRAGMA table_info(telegram_conversations)")
+        ] == ["chat_id", "conversation_id"]
+
+
+def test_legacy_binding_is_claimed_once_and_stale_tenant_is_rejected(tmp_path):
+    database_path = tmp_path / "jarvis.sqlite3"
+    store = TelegramConversationStore(database_path, realm_id="bot-a")
+    with sqlite3.connect(database_path) as database:
+        database.execute(
+            """
+            INSERT INTO telegram_conversations(
+                realm_id, chat_id, conversation_id, access_mode, user_id
+            ) VALUES ('bot-a', 42, 'tg_unclaimed_legacy', 'guest', NULL)
+            """
+        )
+
+    user_a = store.get_or_create(42, "guest", user_id="user-a")
+    assert user_a == "tg_unclaimed_legacy"
+    assert store.get_or_create(42, "guest", user_id="user-a") == user_a
+
+    with pytest.raises(TelegramConversationIsolationError, match="another backend user"):
+        store.get_or_create(42, "guest", user_id="user-b")
+    with pytest.raises(TelegramConversationIsolationError, match="another backend user"):
+        store.rotate(42, "guest", user_id="user-b")
+    with pytest.raises(TelegramConversationIsolationError, match="another backend user"):
+        store.bind(42, "tg_rebound", "guest", user_id="user-b")
+    with sqlite3.connect(database_path) as database:
+        row = database.execute(
+            """
+            SELECT conversation_id, user_id
+            FROM telegram_conversations
+            WHERE realm_id = 'bot-a' AND chat_id = 42
+            """
+        ).fetchone()
+    assert row == (user_a, "user-a")
+
+
+def test_custom_realm_refuses_implicit_claim_of_inline_legacy_history(tmp_path):
+    database_path = tmp_path / "jarvis.sqlite3"
+    with sqlite3.connect(database_path) as database:
+        database.execute(
+            """
+            CREATE TABLE telegram_conversations (
+                chat_id INTEGER PRIMARY KEY,
+                conversation_id TEXT NOT NULL UNIQUE
+            )
+            """
+        )
+        database.execute(
+            "INSERT INTO telegram_conversations VALUES (42, 'tg_legacy')"
+        )
+        before = "\n".join(database.iterdump())
+
+    with pytest.raises(TelegramConversationMigrationError, match="explicit matching"):
+        TelegramConversationStore(database_path, realm_id="bot-a")
+
+    with sqlite3.connect(database_path) as database:
+        assert "\n".join(database.iterdump()) == before
+
+
+def test_unfinished_or_cross_realm_schema_fails_closed_without_mutation(tmp_path):
+    unfinished_path = tmp_path / "unfinished.sqlite3"
+    with sqlite3.connect(unfinished_path) as database:
+        database.execute(
+            "CREATE TABLE telegram_conversations_legacy_v1 "
+            "(chat_id INTEGER, conversation_id TEXT)"
+        )
+        unfinished_before = "\n".join(database.iterdump())
+    with pytest.raises(TelegramConversationMigrationError, match="unfinished"):
+        TelegramConversationStore(unfinished_path)
+    with sqlite3.connect(unfinished_path) as database:
+        assert "\n".join(database.iterdump()) == unfinished_before
+
+    global_unique_path = tmp_path / "global-unique.sqlite3"
+    with sqlite3.connect(global_unique_path) as database:
+        database.execute(
+            """
+            CREATE TABLE telegram_conversations (
+                realm_id TEXT NOT NULL,
+                chat_id INTEGER NOT NULL UNIQUE,
+                conversation_id TEXT NOT NULL,
+                access_mode TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                user_id TEXT,
+                PRIMARY KEY(realm_id, chat_id)
+            )
+            """
+        )
+        global_before = "\n".join(database.iterdump())
+    with pytest.raises(TelegramConversationMigrationError, match="cross-realm"):
+        TelegramConversationStore(global_unique_path, realm_id="bot-a")
+    with sqlite3.connect(global_unique_path) as database:
+        assert "\n".join(database.iterdump()) == global_before
+
+
+def test_legacy_migration_rejects_conflicting_tenant_owner_without_mutation(tmp_path):
+    main_path = tmp_path / "jarvis.sqlite3"
+    legacy_path = tmp_path / "telegram_bridge.sqlite3"
+    main = TelegramConversationStore(main_path, realm_id="bot-a")
+    main.bind(42, "tg_shared", "guest", user_id="user-a")
+    with sqlite3.connect(legacy_path) as legacy:
+        legacy.execute(
+            """
+            CREATE TABLE telegram_conversations (
+                realm_id TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                conversation_id TEXT NOT NULL,
+                access_mode TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                user_id TEXT
+            )
+            """
+        )
+        legacy.execute(
+            """
+            INSERT INTO telegram_conversations VALUES (
+                'bot-a', 42, 'tg_shared', 'guest', CURRENT_TIMESTAMP, 'user-b'
+            )
+            """
+        )
+    with sqlite3.connect(main_path) as database:
+        before = "\n".join(database.iterdump())
+
+    with pytest.raises(TelegramConversationMigrationError, match="user ownership"):
+        TelegramConversationStore(
+            main_path,
+            realm_id="bot-a",
+            legacy_path=legacy_path,
+        )
+
+    with sqlite3.connect(main_path) as database:
+        assert "\n".join(database.iterdump()) == before
 
 
 def test_conversation_bindings_are_isolated_by_bot_realm_and_migrate_old_schema(tmp_path):
@@ -670,11 +961,15 @@ def test_conversation_bindings_are_isolated_by_bot_realm_and_migrate_old_schema(
             "INSERT INTO telegram_conversations VALUES (42, 'legacy-conv', 'guest', 'now')"
         )
 
-    realm_a = TelegramConversationStore(database_path, realm_id="bot-a")
+    realm_a = TelegramConversationStore(
+        database_path,
+        realm_id="bot-a",
+        legacy_realm_id="bot-a",
+    )
     assert realm_a.load_all() == {42: "legacy-conv"}
     realm_b = TelegramConversationStore(database_path, realm_id="bot-b")
     assert realm_b.load_all() == {}
-    realm_b.bind(42, "bot-b-conv", "guest")
+    realm_b.bind(42, "bot-b-conv", "guest", user_id="user-b")
 
     assert realm_a.load_all() == {42: "legacy-conv"}
     assert realm_b.load_all() == {42: "bot-b-conv"}
@@ -700,14 +995,19 @@ def test_realm_less_external_legacy_store_is_claimed_by_one_realm(tmp_path):
         )
 
     realm_a = TelegramConversationStore(
-        main_path, realm_id="bot-a", legacy_path=legacy_path
+        main_path,
+        realm_id="bot-a",
+        legacy_path=legacy_path,
+        legacy_realm_id="bot-a",
     )
-    realm_b = TelegramConversationStore(
-        main_path, realm_id="bot-b", legacy_path=legacy_path
-    )
+    with pytest.raises(TelegramConversationMigrationError, match="explicit matching"):
+        TelegramConversationStore(
+            main_path,
+            realm_id="bot-b",
+            legacy_path=legacy_path,
+        )
 
     assert realm_a.load_all() == {42: "legacy-conv"}
-    assert realm_b.load_all() == {}
 
 
 def test_durable_update_inbox_advances_offset_only_after_commit_and_recovers_lease(tmp_path):
@@ -911,7 +1211,12 @@ def test_runtime_database_backup_contains_telegram_bindings(tmp_path):
     storage.initialize()
     try:
         conversations = TelegramConversationStore(database_path)
-        conversations.bind(42, "tg_backup_owner", "owner")
+        conversations.bind(
+            42,
+            "tg_backup_owner",
+            "owner",
+            user_id="user-42",
+        )
         result = storage.backup_database(tmp_path / "backups")
     finally:
         storage.close()

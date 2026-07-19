@@ -4,6 +4,7 @@ import asyncio
 from datetime import UTC, date, datetime
 from types import MethodType, SimpleNamespace
 
+import pytest
 from jarvis_gpt import agent as agent_module
 from jarvis_gpt import tools as tools_module
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
@@ -12,6 +13,14 @@ from jarvis_gpt.llm import LLMRouter
 from jarvis_gpt.models import ToolRunResponse
 from jarvis_gpt.storage import JarvisStorage
 from jarvis_gpt.tools import ToolRegistry
+
+
+@pytest.fixture(autouse=True)
+def _freeze_financial_test_clock(monkeypatch):
+    today = date(2026, 7, 19)
+    now = datetime(2026, 7, 19, 12, 30, tzinfo=UTC)
+    monkeypatch.setattr(tools_module, "_web_news_today", lambda now=None: today)
+    monkeypatch.setattr(tools_module, "_web_answer_financial_now", lambda: now)
 
 
 def test_current_date_is_authoritative_and_last_week_uses_2026_window(monkeypatch):
@@ -791,6 +800,1174 @@ def test_financial_identifiers_do_not_allow_class_contract_or_isin_collisions():
         ) == "source_identity_mismatch"
 
 
+def test_exact_identifier_and_value_must_share_the_same_local_quote(monkeypatch):
+    monkeypatch.setattr(
+        tools_module,
+        "_web_news_today",
+        lambda now=None: date(2026, 7, 20),
+    )
+    cases = (
+        (
+            "What is the current BRK.B stock price?",
+            "BRK.A stock price was 710000 USD on NYSE at 2026-07-17 20:00 UTC",
+            "BRK.B stock price was 473.25 USD on NYSE at 2026-07-17 20:00 UTC",
+            "BRK.B stock price was {value} USD on NYSE at 2026-07-17 20:00 UTC",
+            "710000",
+            "473.25",
+        ),
+        (
+            "What is the current BRNQ26 futures contract price?",
+            "BRNQ27 futures contract price was 90.00 USD per barrel on ICE at "
+            "2026-07-17 20:00 UTC",
+            "BRNQ26 futures contract price was 70.00 USD per barrel on ICE at "
+            "2026-07-17 20:00 UTC",
+            "BRNQ26 futures contract price was {value} USD per barrel on ICE at "
+            "2026-07-17 20:00 UTC",
+            "90.00",
+            "70.00",
+        ),
+        (
+            "What is the current bond price for ISIN US0378331005?",
+            "Bond ISIN US0378331006 price was 101.25 USD OTC at "
+            "2026-07-17 20:00 UTC",
+            "Bond ISIN US0378331005 price was 99.75 USD OTC at "
+            "2026-07-17 20:00 UTC",
+            "Bond ISIN US0378331005 price was {value} USD OTC at "
+            "2026-07-17 20:00 UTC",
+            "101.25",
+            "99.75",
+        ),
+    )
+    separators = (". ", " and ", " и ", "; ", "\n")
+
+    assert tools_module._web_answer_financial_exact_identifiers(
+        "BRK.B BRNQ26 ISIN US0378331005"
+    ) == {"BRK.B", "BRNQ26", "US0378331005"}
+
+    for question, wrong_quote, requested_quote, answer_template, wrong, correct in cases:
+        assert tools_module._web_answer_financial_entity_terms(question) == []
+        for separator in separators:
+            source = {
+                "title": "Current financial instrument quotes",
+                "url": "https://market.example/instruments",
+                "excerpt": f"{wrong_quote}{separator}{requested_quote}.",
+            }
+            grounded = (
+                answer_template.format(value=correct)
+                + ". Source: https://market.example/instruments"
+            )
+            relabelled = (
+                answer_template.format(value=wrong)
+                + ". Source: https://market.example/instruments"
+            )
+
+            assert tools_module._web_answer_financial_synthesis_rejection(
+                grounded,
+                question=question,
+                sources=[source],
+            ) == ""
+            assert tools_module._web_answer_financial_synthesis_rejection(
+                relabelled,
+                question=question,
+                sources=[source],
+            ) == "unsupported_financial_number"
+
+
+def test_repeated_equal_values_keep_identifier_and_timestamp_per_occurrence(
+    monkeypatch,
+):
+    today = date(2026, 7, 20)
+    now = datetime(2026, 7, 20, 12, 30, tzinfo=UTC)
+    monkeypatch.setattr(tools_module, "_web_news_today", lambda now=None: today)
+    monkeypatch.setattr(tools_module, "_web_answer_financial_now", lambda: now)
+    question = "What is the current BRK.B stock price?"
+
+    for separator in (". ", " and ", " и ", "; ", "\n", ", "):
+        source = {
+            "title": "Current BRK.A and BRK.B stock prices",
+            "url": "https://market.example/berkshire",
+            "excerpt": (
+                "BRK.A stock price was 65000 USD on NYSE at 2026-07-20 12:10 UTC"
+                f"{separator}BRK.B stock price was 65000 USD on NYSE at "
+                "2026-07-20 12:20 UTC."
+            ),
+        }
+        grounded = (
+            "BRK.B stock price was 65000 USD on NYSE at 2026-07-20 12:20 UTC. "
+            "This is the current market quote. Source: https://market.example/berkshire"
+        )
+
+        assert tools_module._web_answer_financial_synthesis_rejection(
+            grounded,
+            question=question,
+            sources=[source],
+        ) == "", repr(separator)
+        assert tools_module._web_answer_financial_synthesis_rejection(
+            grounded.replace("12:20 UTC", "12:10 UTC"),
+            question=question,
+            sources=[source],
+        ) == "unsupported_financial_number"
+
+
+def test_financial_metadata_numbers_are_not_quote_candidates(monkeypatch):
+    today = date(2026, 7, 20)
+    now = datetime(2026, 7, 20, 12, 30, tzinfo=UTC)
+    monkeypatch.setattr(tools_module, "_web_news_today", lambda now=None: today)
+    monkeypatch.setattr(tools_module, "_web_answer_financial_now", lambda: now)
+    question = "What is the current BRK.B stock price?"
+    metadata_only = {
+        "title": "Current BRK.B stock price page",
+        "url": "https://market.example/brkb",
+        "excerpt": (
+            "BRK.B USD stock price page updated at 2026-07-20 12:20 UTC; "
+            "the numeric quote is unavailable."
+        ),
+    }
+
+    for injected_value in ("2026", "20", "12"):
+        answer = (
+            f"BRK.B stock price was {injected_value} USD on NYSE at "
+            "2026-07-20 12:20 UTC. This is the current quote. "
+            "Source: https://market.example/brkb"
+        )
+        assert tools_module._web_answer_financial_synthesis_rejection(
+            answer,
+            question=question,
+            sources=[metadata_only],
+        ) == "unsupported_financial_number"
+
+    real_2026_quote = {
+        **metadata_only,
+        "excerpt": (
+            "BRK.B stock price was 2026 USD on NYSE at 2026-07-20 12:20 UTC."
+        ),
+    }
+    real_2026_answer = (
+        "BRK.B stock price was 2026 USD on NYSE at 2026-07-20 12:20 UTC. "
+        "This is the current quote. Source: https://market.example/brkb"
+    )
+    assert tools_module._web_answer_financial_synthesis_rejection(
+        real_2026_answer,
+        question=question,
+        sources=[real_2026_quote],
+    ) == ""
+
+
+def test_exact_identifiers_are_case_insensitive_and_single_letter_tickers_are_bound(
+    monkeypatch,
+):
+    today = date(2026, 7, 20)
+    monkeypatch.setattr(tools_module, "_web_news_today", lambda now=None: today)
+
+    assert tools_module._web_answer_financial_exact_identifiers(
+        "current brk.b price; brnq26 futures; isin us0378331005"
+    ) == {"BRK.B", "BRNQ26", "US0378331005"}
+    assert tools_module._web_answer_financial_exact_identifiers(
+        "What is the current F stock price?"
+    ) == {"F"}
+
+    cases = (
+        (
+            "What is the current brk.b stock price?",
+            "brk.a stock price was 710000 USD on NYSE at 2026-07-20 12:10 UTC and "
+            "brk.b stock price was 473.25 USD on NYSE at 2026-07-20 12:20 UTC.",
+            "brk.b stock price was {value} USD on NYSE at 2026-07-20 12:20 UTC. ",
+            "473.25",
+            "710000",
+        ),
+        (
+            "What is the current F stock price?",
+            "T stock price was 99 USD on NYSE at 2026-07-20 12:10 UTC and "
+            "F stock price was 12.50 USD on NYSE at 2026-07-20 12:20 UTC.",
+            "F stock price was {value} USD on NYSE at 2026-07-20 12:20 UTC. ",
+            "12.50",
+            "99",
+        ),
+    )
+    for question, excerpt, answer_template, correct, wrong in cases:
+        source = {
+            "title": "Current stock prices",
+            "url": "https://market.example/stocks",
+            "excerpt": excerpt,
+        }
+        grounded = (
+            answer_template.format(value=correct)
+            + "This is the current quote. Source: https://market.example/stocks"
+        )
+        assert tools_module._web_answer_financial_synthesis_rejection(
+            grounded,
+            question=question,
+            sources=[source],
+        ) == ""
+        assert tools_module._web_answer_financial_synthesis_rejection(
+            grounded.replace(correct, wrong, 1),
+            question=question,
+            sources=[source],
+        ) == "unsupported_financial_number"
+
+
+def test_value_first_comma_tuple_binds_the_nearest_following_identifier(monkeypatch):
+    today = date(2026, 7, 20)
+    monkeypatch.setattr(tools_module, "_web_news_today", lambda now=None: today)
+    question = "What is the current BRK.B stock price?"
+    source = {
+        "title": "Current Berkshire stock prices",
+        "url": "https://market.example/berkshire",
+        "excerpt": (
+            "710000 USD, BRK.A stock price on NYSE at 2026-07-20 12:20 UTC, "
+            "473.25 USD, BRK.B stock price on NYSE at 2026-07-20 12:20 UTC."
+        ),
+    }
+    grounded = (
+        "473.25 USD, BRK.B stock price on NYSE at 2026-07-20 12:20 UTC. "
+        "This is the current quote. Source: https://market.example/berkshire"
+    )
+
+    assert tools_module._web_answer_financial_synthesis_rejection(
+        grounded,
+        question=question,
+        sources=[source],
+    ) == ""
+    assert tools_module._web_answer_financial_synthesis_rejection(
+        grounded.replace("473.25", "710000", 1),
+        question=question,
+        sources=[source],
+    ) == "unsupported_financial_number"
+    first_tuple_answer = (
+        "710000 USD, BRK.A stock price on NYSE at 2026-07-20 12:20 UTC. "
+        "This is the current quote. Source: https://market.example/berkshire"
+    )
+    assert tools_module._web_answer_financial_synthesis_rejection(
+        first_tuple_answer,
+        question="What is the current BRK.A stock price?",
+        sources=[source],
+    ) == ""
+    assert tools_module._web_answer_financial_synthesis_rejection(
+        first_tuple_answer.replace("710000", "473.25", 1),
+        question="What is the current BRK.A stock price?",
+        sources=[source],
+    ) == "unsupported_financial_number"
+
+
+def test_value_first_prose_tuples_do_not_inherit_the_previous_identifier(monkeypatch):
+    today = date(2026, 7, 20)
+    monkeypatch.setattr(tools_module, "_web_news_today", lambda now=None: today)
+    question = "What is the current BRK.B stock price?"
+    requested = (
+        "473.25 USD is the NYSE stock price for BRK.B at 2026-07-20 12:20 UTC"
+    )
+    other = "710000 USD is the NYSE stock price for BRK.A at 2026-07-20 12:20 UTC"
+    identifier_first_requested = (
+        "BRK.B has an NYSE stock price of 473.25 USD at 2026-07-20 12:20 UTC"
+    )
+    identifier_first_other = (
+        "BRK.A has an NYSE stock price of 710000 USD at 2026-07-20 12:20 UTC"
+    )
+    grounded = (
+        "BRK.B stock price was 473.25 USD on NYSE at 2026-07-20 12:20 UTC. "
+        "This is the current quote. Source: https://market.example/berkshire"
+    )
+    relabelled = grounded.replace("473.25", "710000", 1)
+
+    quote_orders = (
+        (requested, other),
+        (other, requested),
+        (identifier_first_requested, identifier_first_other),
+        (identifier_first_other, identifier_first_requested),
+    )
+    for quote_order in quote_orders:
+        source = {
+            "title": "Current Berkshire stock prices",
+            "url": "https://market.example/berkshire",
+            "excerpt": f"{quote_order[0]}, {quote_order[1]}.",
+        }
+        assert tools_module._web_answer_financial_synthesis_rejection(
+            grounded,
+            question=question,
+            sources=[source],
+        ) == ""
+        assert tools_module._web_answer_financial_synthesis_rejection(
+            relabelled,
+            question=question,
+            sources=[source],
+        ) == "unsupported_financial_number"
+
+
+def test_tuple_binding_ignores_identifier_headers_counts_and_mixed_direction(
+    monkeypatch,
+):
+    today = date(2026, 7, 20)
+    monkeypatch.setattr(tools_module, "_web_news_today", lambda now=None: today)
+    question = "What is the current BRK.B stock price?"
+    grounded = (
+        "BRK.B stock price was 473.25 USD on NYSE at 2026-07-20 12:20 UTC. "
+        "This is the current quote. Source: https://market.example/berkshire"
+    )
+    relabelled = grounded.replace("473.25", "710000", 1)
+    excerpts = (
+        (
+            "BRK.A/BRK.B quotes: 473.25 USD is the NYSE stock price for BRK.B at "
+            "2026-07-20 12:20 UTC, "
+            "710000 USD is the NYSE stock price for BRK.A at 2026-07-20 12:20 UTC."
+        ),
+        (
+            "2 current quotes: BRK.A has an NYSE stock price of 710000 USD at "
+            "2026-07-20 12:20 UTC, "
+            "BRK.B has an NYSE stock price of 473.25 USD at 2026-07-20 12:20 UTC."
+        ),
+        (
+            "BRK.A has an NYSE stock price of 710000 USD at 2026-07-20 12:20 UTC, "
+            "473.25 USD is the "
+            "NYSE stock price for BRK.B at 2026-07-20 12:20 UTC."
+        ),
+    )
+
+    for excerpt in excerpts:
+        source = {
+            "title": "Current Berkshire stock prices",
+            "url": "https://market.example/berkshire",
+            "excerpt": excerpt,
+        }
+        assert tools_module._web_answer_financial_synthesis_rejection(
+            grounded,
+            question=question,
+            sources=[source],
+        ) == ""
+        assert tools_module._web_answer_financial_synthesis_rejection(
+            relabelled,
+            question=question,
+            sources=[source],
+        ) == "unsupported_financial_number"
+
+
+def test_auxiliary_numbers_do_not_split_an_identifier_price_tuple(monkeypatch):
+    today = date(2026, 7, 20)
+    monkeypatch.setattr(tools_module, "_web_news_today", lambda now=None: today)
+    question = "What is the current BRK.B stock price?"
+    grounded = (
+        "BRK.B stock price was 473.25 USD on NYSE at 2026-07-20 12:20 UTC. "
+        "This is the current quote. Source: https://market.example/berkshire"
+    )
+    relabelled = grounded.replace("473.25", "710000", 1)
+    other_quotes = (
+        "BRK.A class 1 stock price was 710000 USD on NYSE",
+        "BRK.A 1-day change, stock price was 710000 USD on NYSE",
+        "BRK.A bid 709500 USD, stock price was 710000 USD on NYSE",
+    )
+
+    for other_quote in other_quotes:
+        source = {
+            "title": "Current Berkshire stock prices",
+            "url": "https://market.example/berkshire",
+            "excerpt": (
+                f"{other_quote}, BRK.B stock price was 473.25 USD on NYSE at "
+                "2026-07-20 12:20 UTC."
+            ),
+        }
+        assert tools_module._web_answer_financial_synthesis_rejection(
+            grounded,
+            question=question,
+            sources=[source],
+        ) == ""
+        assert tools_module._web_answer_financial_synthesis_rejection(
+            relabelled,
+            question=question,
+            sources=[source],
+        ) == "unsupported_financial_number"
+
+
+def test_equity_price_cannot_be_grounded_by_volume_high_or_ask_occurrence(monkeypatch):
+    today = date(2026, 7, 20)
+    monkeypatch.setattr(tools_module, "_web_news_today", lambda now=None: today)
+    question = "What is the current BRK.B stock price?"
+    grounded = (
+        "BRK.B stock price was 473.25 USD on NYSE at 2026-07-20 12:20 UTC. "
+        "This is the current quote. Source: https://market.example/berkshire"
+    )
+    relabelled = grounded.replace("473.25", "710000", 1)
+    role_quotes = (
+        "BRK.B trading volume was 710000 shares",
+        "BRK.B 52-week high was 710000 USD",
+        "BRK.B ask was 710000 USD",
+    )
+
+    for role_quote in role_quotes:
+        source = {
+            "title": "Current BRK.B stock price and market data",
+            "url": "https://market.example/brkb",
+            "excerpt": (
+                "BRK.B stock price was 473.25 USD on NYSE at "
+                f"2026-07-20 12:20 UTC, {role_quote} on NYSE at "
+                "2026-07-20 12:20 UTC."
+            ),
+        }
+        assert tools_module._web_answer_financial_synthesis_rejection(
+            grounded.replace("berkshire", "brkb"),
+            question=question,
+            sources=[source],
+        ) == ""
+        assert tools_module._web_answer_financial_synthesis_rejection(
+            relabelled.replace("berkshire", "brkb"),
+            question=question,
+            sources=[source],
+        ) == "unsupported_financial_number"
+
+    exact_bypass_source = {
+        "title": "Current BRK.B stock price and market data",
+        "url": "https://market.example/brkb",
+        "excerpt": (
+            "BRK.B stock price was 473.25 USD, trading volume was 710000 shares "
+            "on NYSE at 2026-07-20 12:20 UTC."
+        ),
+    }
+    assert tools_module._web_answer_financial_synthesis_rejection(
+        relabelled.replace("berkshire", "brkb"),
+        question=question,
+        sources=[exact_bypass_source],
+    ) == "unsupported_financial_number"
+
+
+def test_lowercase_plain_tickers_are_exact_only_in_financial_context(monkeypatch):
+    today = date(2026, 7, 20)
+    monkeypatch.setattr(tools_module, "_web_news_today", lambda now=None: today)
+
+    assert tools_module._web_answer_financial_exact_identifiers(
+        "current aapl stock price"
+    ) == {"AAPL"}
+    assert tools_module._web_answer_financial_exact_identifiers(
+        "current f stock price"
+    ) == {"F"}
+    for question in (
+        "current stock price for aapl",
+        "current stock aapl price",
+        "what is the stock price of aapl",
+        "price of aapl",
+        "Aapl stock price",
+    ):
+        assert tools_module._web_answer_financial_exact_identifiers(question) == {"AAPL"}
+    assert tools_module._web_answer_financial_exact_identifiers(
+        "current msft quote"
+    ) == {"MSFT"}
+    assert tools_module._web_answer_financial_exact_identifiers(
+        "current stock price for f"
+    ) == {"F"}
+    for prose in (
+        "This stock price page has current market data",
+        "Find current stock price and share quote",
+        "and stock price was 10",
+        "class stock price",
+    ):
+        assert tools_module._web_answer_financial_exact_identifiers(prose) == set()
+
+    cases = (
+        (
+            "current aapl stock price",
+            "Current NYSE USD stock price quotes: aaplx=710000 and "
+            "aapl=473.25 USD stock price on NYSE at 2026-07-20 12:20 UTC.",
+            "aapl stock price was {value} USD on NYSE at 2026-07-20 12:20 UTC. ",
+            "473.25",
+            "710000",
+        ),
+        (
+            "current f stock price",
+            "Current NYSE USD stock price quotes: t=99 and "
+            "f=12.50 USD stock price on NYSE at 2026-07-20 12:20 UTC.",
+            "f stock price was {value} USD on NYSE at 2026-07-20 12:20 UTC. ",
+            "12.50",
+            "99",
+        ),
+        (
+            "current stock price for aapl",
+            "Current NYSE USD stock price quotes: aaplx=710000 and "
+            "aapl=473.25 USD stock price on NYSE at 2026-07-20 12:20 UTC.",
+            "aapl stock price was {value} USD on NYSE at 2026-07-20 12:20 UTC. ",
+            "473.25",
+            "710000",
+        ),
+        (
+            "current stock aapl price",
+            "Current NYSE USD stock price quotes: aaplx=710000 and "
+            "aapl=473.25 USD stock price on NYSE at 2026-07-20 12:20 UTC.",
+            "aapl stock price was {value} USD on NYSE at 2026-07-20 12:20 UTC. ",
+            "473.25",
+            "710000",
+        ),
+        (
+            "current stock price for f",
+            "Current NYSE USD stock price quotes: t=99 and "
+            "f=12.50 USD stock price on NYSE at 2026-07-20 12:20 UTC.",
+            "f stock price was {value} USD on NYSE at 2026-07-20 12:20 UTC. ",
+            "12.50",
+            "99",
+        ),
+        (
+            "current msft quote",
+            "Current NYSE USD stock price quotes: msftx=710000 and "
+            "msft=473.25 USD stock price on NYSE at 2026-07-20 12:20 UTC.",
+            "msft stock price was {value} USD on NYSE at 2026-07-20 12:20 UTC. ",
+            "473.25",
+            "710000",
+        ),
+        (
+            "price of aapl",
+            "Current NYSE USD stock price quotes: aaplx=710000 and "
+            "aapl=473.25 USD stock price on NYSE at 2026-07-20 12:20 UTC.",
+            "aapl stock price was {value} USD on NYSE at 2026-07-20 12:20 UTC. ",
+            "473.25",
+            "710000",
+        ),
+        (
+            "Aapl stock price",
+            "Current NYSE USD stock price quotes: aaplx=710000 and "
+            "aapl=473.25 USD stock price on NYSE at 2026-07-20 12:20 UTC.",
+            "aapl stock price was {value} USD on NYSE at 2026-07-20 12:20 UTC. ",
+            "473.25",
+            "710000",
+        ),
+    )
+    for question, excerpt, answer_template, correct, wrong in cases:
+        source = {
+            "title": "Current stock price quotes on NYSE",
+            "url": "https://market.example/stocks",
+            "excerpt": excerpt,
+        }
+        grounded = (
+            answer_template.format(value=correct)
+            + "This is the current quote. Source: https://market.example/stocks"
+        )
+        assert tools_module._web_answer_financial_synthesis_rejection(
+            grounded,
+            question=question,
+            sources=[source],
+        ) == ""
+        assert tools_module._web_answer_financial_synthesis_rejection(
+            grounded.replace(correct, wrong, 1),
+            question=question,
+            sources=[source],
+        ) == "unsupported_financial_number"
+
+
+def test_equal_quote_timestamps_ignore_page_update_metadata(monkeypatch):
+    today = date(2026, 7, 20)
+    now = datetime(2026, 7, 20, 12, 30, tzinfo=UTC)
+    monkeypatch.setattr(tools_module, "_web_news_today", lambda now=None: today)
+    monkeypatch.setattr(tools_module, "_web_answer_financial_now", lambda: now)
+    question = "What is the current BRK.B stock price?"
+    source = {
+        "title": "Current BRK.A and BRK.B stock prices",
+        "url": "https://market.example/berkshire",
+        "excerpt": (
+            "Page updated at 2026-07-20 12:00 UTC, BRK.A stock price was "
+            "65000 USD on NYSE at 2026-07-20 12:10 UTC, BRK.B stock price was "
+            "65000 USD on NYSE at 2026-07-20 12:20 UTC."
+        ),
+    }
+    grounded = (
+        "BRK.B stock price was 65000 USD on NYSE at 2026-07-20 12:20 UTC. "
+        "This is the current quote. Source: https://market.example/berkshire"
+    )
+
+    assert tools_module._web_answer_financial_synthesis_rejection(
+        grounded,
+        question=question,
+        sources=[source],
+    ) == ""
+    for borrowed_time in ("12:10 UTC", "12:00 UTC"):
+        assert tools_module._web_answer_financial_synthesis_rejection(
+            grounded.replace("12:20 UTC", borrowed_time, 1),
+            question=question,
+            sources=[source],
+        ) == "unsupported_financial_number"
+
+
+def test_publication_and_other_instrument_time_cannot_ground_quote_timestamp(
+    monkeypatch,
+):
+    today = date(2026, 7, 20)
+    monkeypatch.setattr(tools_module, "_web_news_today", lambda now=None: today)
+    question = "What is the current BRK.B stock price?"
+    grounded = (
+        "BRK.B stock price was 473.25 USD on NYSE at 2026-07-20 12:20 UTC. "
+        "This is the current quote. Source: https://market.example/berkshire"
+    )
+    publication_only = {
+        "title": "Current BRK.B stock price",
+        "url": "https://market.example/berkshire",
+        "excerpt": (
+            "Page updated at 2026-07-20 12:00 UTC, BRK.B stock price was "
+            "473.25 USD on NYSE."
+        ),
+    }
+    other_instrument_only = {
+        "title": "Current BRK.A and BRK.B stock prices",
+        "url": "https://market.example/berkshire",
+        "excerpt": (
+            "BRK.A stock price was 710000 USD on NYSE at 2026-07-20 12:10 UTC, "
+            "BRK.B stock price was 473.25 USD on NYSE."
+        ),
+    }
+
+    assert tools_module._web_answer_financial_synthesis_rejection(
+        grounded.replace("12:20 UTC", "12:00 UTC", 1),
+        question=question,
+        sources=[publication_only],
+    ) == "unsupported_financial_number"
+    assert tools_module._web_answer_financial_synthesis_rejection(
+        grounded.replace("12:20 UTC", "12:10 UTC", 1),
+        question=question,
+        sources=[other_instrument_only],
+    ) == "unsupported_financial_number"
+
+    direct_quote = {
+        **publication_only,
+        "excerpt": (
+            "Page updated at 2026-07-20 12:00 UTC, BRK.B stock price was "
+            "473.25 USD on NYSE at 2026-07-20 12:20 UTC."
+        ),
+    }
+    assert tools_module._web_answer_financial_synthesis_rejection(
+        grounded,
+        question=question,
+        sources=[direct_quote],
+    ) == ""
+
+
+def test_count_header_is_not_a_quote_value(monkeypatch):
+    today = date(2026, 7, 20)
+    monkeypatch.setattr(tools_module, "_web_news_today", lambda now=None: today)
+    question = "What is the current BRK.B stock price?"
+    source = {
+        "title": "Current BRK.A and BRK.B stock prices",
+        "url": "https://market.example/berkshire",
+        "excerpt": (
+            "Page updated at 2026-07-20 12:00 UTC, BRK.B: 2 current quotes, "
+            "BRK.A stock price was 710000 USD on NYSE at 2026-07-20 12:10 UTC, "
+            "BRK.B stock price was 473.25 USD on NYSE at 2026-07-20 12:20 UTC."
+        ),
+    }
+    grounded = (
+        "BRK.B stock price was 473.25 USD on NYSE at 2026-07-20 12:20 UTC. "
+        "This is the current quote. Source: https://market.example/berkshire"
+    )
+
+    assert tools_module._web_answer_financial_synthesis_rejection(
+        grounded,
+        question=question,
+        sources=[source],
+    ) == ""
+    assert tools_module._web_answer_financial_synthesis_rejection(
+        grounded.replace("473.25", "2", 1),
+        question=question,
+        sources=[source],
+    ) == "unsupported_financial_number"
+
+
+def test_explicit_quote_timestamp_scope_can_govern_multiple_tuples(monkeypatch):
+    today = date(2026, 7, 20)
+    monkeypatch.setattr(tools_module, "_web_news_today", lambda now=None: today)
+    question = "What is the current BRK.B stock price?"
+    source = {
+        "title": "Current BRK.A and BRK.B stock prices",
+        "url": "https://market.example/berkshire",
+        "excerpt": (
+            "Stock prices as of 2026-07-20 12:20 UTC: BRK.A stock price was "
+            "710000 USD on NYSE, BRK.B stock price was 473.25 USD on NYSE."
+        ),
+    }
+    grounded = (
+        "BRK.B stock price was 473.25 USD on NYSE at 2026-07-20 12:20 UTC. "
+        "This is the current quote. Source: https://market.example/berkshire"
+    )
+
+    assert tools_module._web_answer_financial_synthesis_rejection(
+        grounded,
+        question=question,
+        sources=[source],
+    ) == ""
+    assert tools_module._web_answer_financial_synthesis_rejection(
+        grounded.replace("473.25", "710000", 1),
+        question=question,
+        sources=[source],
+    ) == "unsupported_financial_number"
+
+
+def test_quote_timestamp_scope_is_hard_bounded_and_subject_bound(monkeypatch):
+    today = date(2026, 7, 20)
+    now = datetime(2026, 7, 20, 12, 30, tzinfo=UTC)
+    monkeypatch.setattr(tools_module, "_web_news_today", lambda now=None: today)
+    monkeypatch.setattr(tools_module, "_web_answer_financial_now", lambda: now)
+    question = "What is the current BRK.B stock price?"
+    answer = (
+        "BRK.B stock price was 473.25 USD on NYSE at 2026-07-20 12:10 UTC. "
+        "Source: https://market.example/berkshire"
+    )
+    leaking_excerpts = (
+        "BRK.A prices as of 2026-07-20 12:10 UTC: BRK.A stock price was "
+        "710000 USD on NYSE. BRK.B stock price was 473.25 USD on NYSE.",
+        "BRK.A prices as of 2026-07-20 12:10 UTC: BRK.A stock price was "
+        "710000 USD on NYSE; BRK.B stock price was 473.25 USD on NYSE.",
+        "BRK.A prices as of 2026-07-20 12:10 UTC: BRK.A stock price was "
+        "710000 USD on NYSE, BRK.B stock price was 473.25 USD on NYSE.",
+    )
+    for excerpt in leaking_excerpts:
+        source = {
+            "title": "BRK.A and BRK.B stock prices",
+            "url": "https://market.example/berkshire",
+            "excerpt": excerpt,
+        }
+        assert tools_module._web_answer_financial_synthesis_rejection(
+            answer,
+            question=question,
+            sources=[source],
+        ) == "unsupported_financial_number"
+
+    generic_scope = {
+        "title": "BRK.A and BRK.B stock prices",
+        "url": "https://market.example/berkshire",
+        "excerpt": (
+            "Stock prices as of 2026-07-20 12:10 UTC: BRK.A stock price was "
+            "710000 USD on NYSE, BRK.B stock price was 473.25 USD on NYSE."
+        ),
+    }
+    assert tools_module._web_answer_financial_synthesis_rejection(
+        answer,
+        question=question,
+        sources=[generic_scope],
+    ) == ""
+
+
+def test_current_price_rejects_non_live_quote_statuses(monkeypatch):
+    today = date(2026, 7, 20)
+    monkeypatch.setattr(tools_module, "_web_news_today", lambda now=None: today)
+    question = "What is the current BRK.B stock price?"
+    answer = (
+        "BRK.B stock price was 710000 USD on NYSE at 2026-07-20 12:10 UTC. "
+        "Source: https://market.example/berkshire"
+    )
+    statuses = (
+        "predicted",
+        "consensus target",
+        "indicative",
+        "pre-market",
+        "delayed",
+        "historical",
+        "average",
+        "adjusted",
+        "fair",
+        "estimated",
+        "post-market",
+        "previous close",
+        "prior close",
+        "yesterday closing",
+        "theoretical",
+        "reference",
+        "unofficial",
+        "simulated",
+        "intraday high",
+        "Hypothetical",
+        "hypothetical",
+        "Synthetic",
+        "synthetic",
+        "Fictional",
+        "fictional",
+    )
+    for status in statuses:
+        source = {
+            "title": "BRK.B stock market data",
+            "url": "https://market.example/berkshire",
+            "excerpt": (
+                f"BRK.B {status} stock price was 710000 USD on NYSE at "
+                "2026-07-20 12:10 UTC."
+            ),
+        }
+        assert tools_module._web_answer_financial_synthesis_rejection(
+            answer,
+            question=question,
+            sources=[source],
+        ) == "unsupported_financial_number", status
+
+    qualifier_layouts = (
+        "Hypothetical: BRK.B stock price",
+        "hypothetical: BRK.B stock price",
+        "synthetic — BRK.B stock price",
+        "BRK.B: Hypothetical stock price",
+        "For BRK.B, Hypothetical stock price",
+        "BRK.B (Hypothetical stock price)",
+    )
+    for qualified_role in qualifier_layouts:
+        source = {
+            "title": "BRK.B stock market data",
+            "url": "https://market.example/berkshire",
+            "excerpt": (
+                f"{qualified_role} was 710000 USD on NYSE at "
+                "2026-07-20 12:10 UTC."
+            ),
+        }
+        assert tools_module._web_answer_financial_synthesis_rejection(
+            answer,
+            question=question,
+            sources=[source],
+        ) == "unsupported_financial_number", qualified_role
+
+    suffix_qualifiers = (
+        "(hypothetical)",
+        ", hypothetical only",
+        ", not actual",
+        ", false value",
+    )
+    for qualifier in suffix_qualifiers:
+        source = {
+            "title": "BRK.B stock market data",
+            "url": "https://market.example/berkshire",
+            "excerpt": (
+                "BRK.B stock price was 710000 USD on NYSE at "
+                f"2026-07-20 12:10 UTC {qualifier}."
+            ),
+        }
+        assert tools_module._web_answer_financial_synthesis_rejection(
+            answer,
+            question=question,
+            sources=[source],
+        ) == "unsupported_financial_number", qualifier
+
+    live_source = {
+        "title": "BRK.B live stock price",
+        "url": "https://market.example/berkshire",
+        "excerpt": (
+            "BRK.B stock price was 473.25 USD on NYSE at "
+            "2026-07-20 12:10 UTC."
+        ),
+    }
+    assert tools_module._web_answer_financial_synthesis_rejection(
+        answer.replace("710000", "473.25"),
+        question=question,
+        sources=[live_source],
+    ) == ""
+    for modifier in ("current", "live", "latest", "actual", "official", "real"):
+        neutral_source = {
+            "title": "BRK.B stock market data",
+            "url": "https://market.example/berkshire",
+            "excerpt": (
+                f"BRK.B {modifier} stock price was 473.25 USD on NYSE at "
+                "2026-07-20 12:10 UTC."
+            ),
+        }
+        assert tools_module._web_answer_financial_synthesis_rejection(
+            answer.replace("710000", "473.25"),
+            question=question,
+            sources=[neutral_source],
+        ) == "", modifier
+
+
+def test_ticker_only_question_binds_adjacent_company_name_to_exact_id(monkeypatch):
+    today = date(2026, 7, 20)
+    monkeypatch.setattr(tools_module, "_web_news_today", lambda now=None: today)
+    cases = (
+        ("AAPL", "Apple AAPL", "225.25", "Hypothetical"),
+        ("AAPL", "Apple (AAPL)", "225.25", "Synthetic"),
+        ("AAPL", "AAPL Apple", "225.25", "Fictional"),
+        ("BRK.B", "Berkshire Hathaway BRK.B", "473.25", "Hypothetical"),
+        ("BRK.B", "BRK.B Berkshire Hathaway", "473.25", "Synthetic"),
+    )
+    for ticker, identity, value, non_live_status in cases:
+        question = f"What is the current {ticker} stock price?"
+        url = f"https://market.example/{ticker.casefold()}"
+        quote = (
+            f"{identity} stock price was {value} USD on NYSE at "
+            "2026-07-20 12:10 UTC."
+        )
+        source = {
+            "title": f"{ticker} stock quote",
+            "url": url,
+            "excerpt": quote,
+        }
+        answer = f"{quote} Source: {url}"
+        assert tools_module._web_answer_financial_synthesis_rejection(
+            answer,
+            question=question,
+            sources=[source],
+        ) == "", identity
+
+        non_live_quote = quote.replace(
+            " stock price", f" {non_live_status} stock price", 1
+        )
+        non_live_source = {**source, "excerpt": non_live_quote}
+        assert tools_module._web_answer_financial_synthesis_rejection(
+            f"{non_live_quote} Source: {url}",
+            question=question,
+            sources=[non_live_source],
+        ) == "unsupported_financial_number", (identity, non_live_status)
+
+
+def test_negated_quote_value_cannot_ground_a_positive_answer(monkeypatch):
+    today = date(2026, 7, 20)
+    monkeypatch.setattr(tools_module, "_web_news_today", lambda now=None: today)
+    question = "What is the current BRK.B stock price?"
+    wrong_answer = (
+        "BRK.B stock price was 710000 USD on NYSE at 2026-07-20 12:20 UTC. "
+        "Source: https://market.example/berkshire"
+    )
+    correct_answer = wrong_answer.replace("710000", "473.25", 1)
+    excerpts = (
+        "BRK.B stock price was not 710000 USD on NYSE at "
+        "2026-07-20 12:20 UTC; actual stock price was 473.25 USD on NYSE at "
+        "2026-07-20 12:20 UTC.",
+        "BRK.B stock price: not 710000 USD on NYSE at "
+        "2026-07-20 12:20 UTC, but actual stock price was 473.25 USD on NYSE at "
+        "2026-07-20 12:20 UTC.",
+        "BRK.B stock price was ≠ 710000 USD on NYSE at "
+        "2026-07-20 12:20 UTC; actual stock price was 473.25 USD on NYSE at "
+        "2026-07-20 12:20 UTC.",
+        "BRK.B stock price was 473.25 rather than 710000 USD on NYSE at "
+        "2026-07-20 12:20 UTC.",
+        "BRK.B stock price was never 710000 USD on NYSE at "
+        "2026-07-20 12:20 UTC; BRK.B actual stock price was 473.25 USD on NYSE at "
+        "2026-07-20 12:20 UTC.",
+        "BRK.B stock price was no 710000 USD on NYSE at "
+        "2026-07-20 12:20 UTC; BRK.B actual stock price was 473.25 USD on NYSE at "
+        "2026-07-20 12:20 UTC.",
+        "BRK.B stock price was not equal to 710000 USD on NYSE at "
+        "2026-07-20 12:20 UTC; BRK.B actual stock price was 473.25 USD on NYSE at "
+        "2026-07-20 12:20 UTC.",
+        "Цена акций BRK.B никогда не 710000 USD на NYSE at "
+        "2026-07-20 12:20 UTC; BRK.B actual stock price was 473.25 USD on NYSE at "
+        "2026-07-20 12:20 UTC.",
+    )
+    for excerpt in excerpts:
+        source = {
+            "title": "BRK.B current stock price",
+            "url": "https://market.example/berkshire",
+            "excerpt": excerpt,
+        }
+        assert tools_module._web_answer_financial_synthesis_rejection(
+            wrong_answer,
+            question=question,
+            sources=[source],
+        ) == "unsupported_financial_number", excerpt
+
+    positive_source = {
+        "title": "BRK.B current stock price",
+        "url": "https://market.example/berkshire",
+        "excerpt": (
+            "BRK.B actual stock price was 473.25 USD on NYSE at "
+            "2026-07-20 12:20 UTC."
+        ),
+    }
+    assert tools_module._web_answer_financial_synthesis_rejection(
+        correct_answer,
+        question=question,
+        sources=[positive_source],
+    ) == ""
+
+
+def test_every_numeric_market_field_is_a_typed_occurrence(monkeypatch):
+    today = date(2026, 7, 20)
+    monkeypatch.setattr(tools_module, "_web_news_today", lambda now=None: today)
+    question = "What is the current BRK.B stock price?"
+    correct = (
+        "BRK.B stock price was 473.25 USD on NYSE at 2026-07-20 12:10 UTC. "
+        "Source: https://market.example/berkshire"
+    )
+    excerpts = (
+        "BRK.B open was 710000 USD — stock price was 473.25 USD on NYSE at "
+        "2026-07-20 12:10 UTC.",
+        "BRK.B dividend was 710000 USD, stock price was 473.25 USD on NYSE at "
+        "2026-07-20 12:10 UTC.",
+        "BRK.B revenue was 710000 USD | stock price was 473.25 USD on NYSE at "
+        "2026-07-20 12:10 UTC.",
+        "BRK.B EBITDA was 710000 USD / stock price was 473.25 USD on NYSE at "
+        "2026-07-20 12:10 UTC.",
+        "BRK.B shares outstanding were 710000 shares (stock price was 473.25 USD "
+        "on NYSE at 2026-07-20 12:10 UTC).",
+        "BRK.B rank was (710000), stock price was 473.25 USD on NYSE at "
+        "2026-07-20 12:10 UTC.",
+        "BRK.B class 1 stock price was 473.25 USD on NYSE at "
+        "2026-07-20 12:10 UTC.",
+    )
+    for excerpt in excerpts:
+        source = {
+            "title": "BRK.B stock price and market data",
+            "url": "https://market.example/berkshire",
+            "excerpt": excerpt,
+        }
+        assert tools_module._web_answer_financial_synthesis_rejection(
+            correct,
+            question=question,
+            sources=[source],
+        ) == "", excerpt
+        assert tools_module._web_answer_financial_synthesis_rejection(
+            correct.replace("473.25", "710000", 1),
+            question=question,
+            sources=[source],
+        ) == "unsupported_financial_number", excerpt
+
+    unavailable_price_fields = (
+        "enterprise value",
+        "turnover",
+        "volatility",
+        "spread",
+        "net debt",
+        "page views",
+    )
+    for field in unavailable_price_fields:
+        source = {
+            "title": "BRK.B stock market data",
+            "url": "https://market.example/berkshire",
+            "excerpt": (
+                f"BRK.B {field} was 710000 USD on NYSE at "
+                "2026-07-20 12:10 UTC — stock price unavailable."
+            ),
+        }
+        assert tools_module._web_answer_financial_synthesis_rejection(
+            correct.replace("473.25", "710000", 1),
+            question=question,
+            sources=[source],
+        ) == "unsupported_financial_number", field
+
+    header_fields = ("total assets", "beta", "cash balance", "employees")
+    for field in header_fields:
+        source = {
+            "title": "BRK.B stock market data",
+            "url": "https://market.example/berkshire",
+            "excerpt": (
+                f"Stock prices: BRK.B {field} was 710000 USD on NYSE at "
+                "2026-07-20 12:10 UTC; current stock price unavailable."
+            ),
+        }
+        assert tools_module._web_answer_financial_synthesis_rejection(
+            correct.replace("473.25", "710000", 1),
+            question=question,
+            sources=[source],
+        ) == "unsupported_financial_number", field
+
+
+def test_quote_timestamp_requires_a_direct_field_edge(monkeypatch):
+    today = date(2026, 7, 20)
+    now = datetime(2026, 7, 20, 12, 30, tzinfo=UTC)
+    monkeypatch.setattr(tools_module, "_web_news_today", lambda now=None: today)
+    monkeypatch.setattr(tools_module, "_web_answer_financial_now", lambda: now)
+    equity_question = "What is the current BRK.B stock price?"
+    equity_answer = (
+        "BRK.B stock price was 473.25 USD on NYSE at 2026-07-20 12:10 UTC. "
+        "Source: https://market.example/quote"
+    )
+    borrowed_sources = (
+        "BRK.B stock price was 473.25 USD, trading volume at "
+        "2026-07-20 12:10 UTC was 710000 shares on NYSE.",
+        "BRK.A stock price was 710000 USD on NYSE at 2026-07-20 12:10 UTC then "
+        "BRK.B stock price was 473.25 USD on NYSE.",
+        "BRK.A stock price was 710000 USD on NYSE at 2026-07-20 12:10 UTC | "
+        "BRK.B stock price was 473.25 USD on NYSE.",
+    )
+    for excerpt in borrowed_sources:
+        source = {
+            "title": "BRK.A and BRK.B stock quotes",
+            "url": "https://market.example/quote",
+            "excerpt": excerpt,
+        }
+        assert tools_module._web_answer_financial_synthesis_rejection(
+            equity_answer,
+            question=equity_question,
+            sources=[source],
+        ) == "unsupported_financial_number", excerpt
+
+    crypto_question = "What is the current Bitcoin price?"
+    crypto_answer = (
+        "Bitcoin spot price was 65000 USD on exchange at 2026-07-20 12:10 UTC. "
+        "Source: https://market.example/quote"
+    )
+    for metadata_prefix in (
+        "Feed timestamp",
+        "Snapshot generated at",
+        "Page last refreshed at",
+    ):
+        source = {
+            "title": "Bitcoin spot price",
+            "url": "https://market.example/quote",
+            "excerpt": (
+                f"{metadata_prefix} 2026-07-20 12:10 UTC, Bitcoin spot price was "
+                "65000 USD on exchange."
+            ),
+        }
+        assert tools_module._web_answer_financial_synthesis_rejection(
+            crypto_answer,
+            question=crypto_question,
+            sources=[source],
+        ) == "unsupported_financial_number", metadata_prefix
+
+
+def test_bond_yield_and_coupon_percent_are_primary_typed_values(monkeypatch):
+    today = date(2026, 7, 20)
+    monkeypatch.setattr(tools_module, "_web_news_today", lambda now=None: today)
+    isin = "US0378331005"
+    for metric, value in (("yield", "4.25"), ("coupon", "5")):
+        question = f"What is the current {metric} for bond ISIN {isin}?"
+        source = {
+            "title": f"Bond {metric} for ISIN {isin}",
+            "url": "https://market.example/bond",
+            "excerpt": (
+                f"Bond ISIN {isin} current {metric} was {value} percent OTC on "
+                "2026-07-20."
+            ),
+        }
+        answer = (
+            f"Bond ISIN {isin} current {metric} was {value} percent OTC on "
+            "2026-07-20. Source: https://market.example/bond"
+        )
+        assert tools_module._web_answer_financial_synthesis_rejection(
+            answer,
+            question=question,
+            sources=[source],
+        ) == ""
+
+
+def test_generic_metric_adjectives_are_not_lowercase_ticker_subjects():
+    assert tools_module._web_answer_financial_exact_identifiers(
+        "average price, closing price, target price, fair price, adjusted price"
+    ) == set()
+    assert tools_module._web_answer_financial_exact_identifiers(
+        "Stock prices: BRK.A stock price"
+    ) == {"BRK.A"}
+    assert tools_module._web_answer_financial_exact_identifiers(
+        "BRK.B live stock price"
+    ) == {"BRK.B"}
+
+
+def test_invalid_financial_timezone_offsets_fail_closed(monkeypatch):
+    today = date(2026, 7, 20)
+    now = datetime(2026, 7, 20, 12, 30, tzinfo=UTC)
+    monkeypatch.setattr(tools_module, "_web_news_today", lambda now=None: today)
+    monkeypatch.setattr(tools_module, "_web_answer_financial_now", lambda: now)
+
+    assert len(
+        tools_module._web_answer_financial_timestamp_spans(
+            "Bitcoin price 65000 USD at 2026-07-20 12:20 +03:00"
+        )
+    ) == 1
+    for offset in ("+24:00", "+99:99", "+01:60"):
+        assert tools_module._web_answer_financial_timestamp_spans(
+            f"Bitcoin price 65000 USD at 2026-07-20 12:20 {offset}"
+        ) == []
+        source = {
+            "title": "Bitcoin BTC/USD live spot quote",
+            "url": "https://crypto.example/btcusd",
+            "excerpt": (
+                "Bitcoin BTC/USD spot price was 65000 USD at "
+                "2026-07-20 12:20 UTC."
+            ),
+        }
+        answer = (
+            "Bitcoin BTC/USD spot exchange price was 65000 USD at "
+            f"2026-07-20 12:20 {offset}. This is the current quote. "
+            "Source: https://crypto.example/btcusd"
+        )
+        assert tools_module._web_answer_financial_synthesis_rejection(
+            answer,
+            question="What is the current Bitcoin price?",
+            sources=[source],
+        ) == "missing_quote_timestamp"
+
+
 def test_crypto_value_requires_source_bound_fresh_timestamp_and_timezone(monkeypatch):
     fixed_now = datetime(2026, 7, 19, 12, 30, tzinfo=UTC)
     monkeypatch.setattr(tools_module, "_web_answer_financial_now", lambda: fixed_now)
@@ -819,6 +1996,76 @@ def test_crypto_value_requires_source_bound_fresh_timestamp_and_timezone(monkeyp
         grounded.replace("2026-07-19 12:20 UTC", "2026-07-18 23:59 UTC"),
         [source],
         question=question,
+    ) == "stale_financial_quote"
+    assert tools_module._web_answer_synthesis_rejection(
+        grounded.replace("12:20 UTC", "12:20"),
+        [source],
+        question=question,
+    ) == "missing_quote_timestamp"
+
+
+def test_crypto_value_and_timestamp_must_share_the_same_quote(monkeypatch):
+    fixed_now = datetime(2026, 7, 19, 12, 30, tzinfo=UTC)
+    monkeypatch.setattr(tools_module, "_web_answer_financial_now", lambda: fixed_now)
+    question = "What is the current Bitcoin price?"
+    separators = (". ", " and ", " и ", "; ", "\n")
+
+    for separator in separators:
+        source = {
+            "title": "Bitcoin BTC/USD live spot quotes",
+            "url": "https://crypto.example/btcusd",
+            "excerpt": (
+                "Bitcoin BTC/USD spot price was 65000 USD at 2026-07-19 12:20 UTC"
+                f"{separator}Bitcoin BTC/USD spot price was 66000 USD at "
+                "2026-07-19 12:25 UTC."
+            ),
+        }
+        grounded = (
+            "Bitcoin BTC/USD spot exchange price was 65000 USD at "
+            "2026-07-19 12:20 UTC. Source: https://crypto.example/btcusd"
+        )
+        borrowed_timestamp = grounded.replace("12:20 UTC", "12:25 UTC")
+
+        assert tools_module._web_answer_financial_synthesis_rejection(
+            grounded,
+            question=question,
+            sources=[source],
+        ) == ""
+        assert tools_module._web_answer_financial_synthesis_rejection(
+            borrowed_timestamp,
+            question=question,
+            sources=[source],
+        ) == "unsupported_financial_number"
+
+
+def test_crypto_previous_calendar_day_is_not_live_even_within_two_hours(monkeypatch):
+    fixed_now = datetime(
+        2026,
+        7,
+        19,
+        0,
+        30,
+        tzinfo=tools_module.WEB_NEWS_TIMEZONE,
+    )
+    monkeypatch.setattr(tools_module, "_web_answer_financial_now", lambda: fixed_now)
+    question = "What is the current Bitcoin price?"
+    source = {
+        "title": "Bitcoin BTC/USD live spot quote",
+        "url": "https://crypto.example/btcusd",
+        "excerpt": (
+            "Bitcoin BTC/USD spot price was 65000 USD at "
+            "2026-07-18 23:59 MSK."
+        ),
+    }
+    answer = (
+        "Bitcoin BTC/USD spot exchange price was 65000 USD at "
+        "2026-07-18 23:59 MSK. Source: https://crypto.example/btcusd"
+    )
+
+    assert tools_module._web_answer_financial_synthesis_rejection(
+        answer,
+        question=question,
+        sources=[source],
     ) == "stale_financial_quote"
 
 

@@ -215,6 +215,10 @@ class TelegramConfig:
     # constructed test/embedded configurations.
     conversation_store_path: Path | None = None
     legacy_conversation_store_path: Path | None = None
+    # Realm-less databases predate multi-bot isolation. Importing one into a custom
+    # realm requires an explicit operator mapping; the historical ``default`` realm is
+    # the only backward-compatible implicit mapping.
+    legacy_conversation_realm_id: str | None = None
 
 
 def load_config(env: Mapping[str, str] | None = None) -> TelegramConfig:
@@ -299,15 +303,29 @@ def load_config(env: Mapping[str, str] | None = None) -> TelegramConfig:
             value = default
         return max(minimum, min(value, maximum))
 
+    realm_id = (env.get("JARVIS_TELEGRAM_REALM_ID") or "default").strip() or "default"
+    if len(realm_id) > 120:
+        raise SystemExit("JARVIS_TELEGRAM_REALM_ID must not exceed 120 characters.")
+    legacy_realm_id = (env.get("JARVIS_TELEGRAM_LEGACY_REALM_ID") or "").strip()
+    if legacy_realm_id and len(legacy_realm_id) > 120:
+        raise SystemExit("JARVIS_TELEGRAM_LEGACY_REALM_ID must not exceed 120 characters.")
+    if not legacy_realm_id and realm_id == "default":
+        legacy_realm_id = "default"
+
     state_dir = default_home() / "data" / "jarvis-gpt" / "state"
+    main_store = state_dir / "jarvis.sqlite3"
     configured_store = (env.get("TELEGRAM_CONVERSATION_STORE_PATH") or "").strip()
+    legacy_store = state_dir / "telegram_bridge.sqlite3"
+    if configured_store:
+        configured_legacy_store = Path(configured_store).expanduser()
+        if configured_legacy_store.resolve() != main_store.resolve():
+            legacy_store = configured_legacy_store
     return TelegramConfig(
         bot_token=token,
         allowed_chat_ids=ids,
         backend_url=backend_url,
         bridge_secret=bridge_secret,
-        realm_id=(env.get("JARVIS_TELEGRAM_REALM_ID") or "default").strip()[:120]
-        or "default",
+        realm_id=realm_id,
         owner_chat_ids=owner_ids,
         api_token=api_token,
         voice_replies=voice_replies,
@@ -324,12 +342,11 @@ def load_config(env: Mapping[str, str] | None = None) -> TelegramConfig:
         intake_rate_per_minute=bounded_int(
             "JARVIS_TELEGRAM_BRIDGE_RATE_LIMIT_PER_MINUTE", 12, 1, 10_000
         ),
-        conversation_store_path=Path(
-            configured_store or state_dir / "jarvis.sqlite3"
-        ),
-        legacy_conversation_store_path=(
-            None if configured_store else state_dir / "telegram_bridge.sqlite3"
-        ),
+        # New bindings always live in the primary database and are therefore covered by
+        # Jarvis backup/restore. The old override remains a migration source only.
+        conversation_store_path=main_store,
+        legacy_conversation_store_path=legacy_store,
+        legacy_conversation_realm_id=legacy_realm_id or None,
     )
 
 
@@ -359,6 +376,10 @@ class TelegramConversationIsolationError(RuntimeError):
     """A backend conversation id is already bound to another Telegram principal."""
 
 
+class TelegramConversationMigrationError(RuntimeError):
+    """Legacy bindings could not be migrated without risking history loss or mixing."""
+
+
 @dataclass(frozen=True)
 class TelegramUserSession:
     """Short-lived backend session established from one authenticated Telegram update."""
@@ -383,199 +404,600 @@ class TelegramConversationStore:
         *,
         realm_id: str = "default",
         legacy_path: Path | None = None,
+        legacy_realm_id: str | None = None,
     ) -> None:
         self.path = path
-        self.realm_id = str(realm_id).strip()[:120] or "default"
+        self.realm_id = str(realm_id).strip() or "default"
+        if len(self.realm_id) > 120:
+            raise ValueError("Telegram realm_id must not exceed 120 characters")
+        normalized_legacy_realm = (
+            str(legacy_realm_id).strip() if legacy_realm_id is not None else ""
+        )
+        if len(normalized_legacy_realm) > 120:
+            raise ValueError("Telegram legacy_realm_id must not exceed 120 characters")
+        self.legacy_realm_id = normalized_legacy_realm or (
+            "default" if self.realm_id == "default" else None
+        )
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as conn:
-            columns = {
-                str(row[1])
-                for row in conn.execute(
-                    "PRAGMA table_info(telegram_conversations)"
-                ).fetchall()
-            }
-            if columns and "realm_id" not in columns:
-                conn.execute(
-                    "ALTER TABLE telegram_conversations "
-                    "RENAME TO telegram_conversations_legacy_v1"
-                )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS telegram_conversations (
-                    realm_id TEXT NOT NULL,
-                    chat_id INTEGER NOT NULL,
-                    conversation_id TEXT NOT NULL,
-                    access_mode TEXT NOT NULL CHECK(access_mode IN ('owner', 'guest')),
-                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY(realm_id, chat_id),
-                    UNIQUE(realm_id, conversation_id)
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS telegram_update_inbox (
-                    realm_id TEXT NOT NULL,
-                    update_id INTEGER NOT NULL,
-                    chat_id INTEGER NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    status TEXT NOT NULL
-                        CHECK(status IN ('pending','processing','completed','rejected','failed')),
-                    attempt_count INTEGER NOT NULL DEFAULT 0,
-                    lease_token TEXT,
-                    lease_expires_at REAL,
-                    last_error TEXT,
-                    received_at REAL NOT NULL,
-                    updated_at REAL NOT NULL,
-                    PRIMARY KEY(realm_id, update_id)
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_telegram_update_inbox_claim
-                ON telegram_update_inbox(realm_id, status, update_id)
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS telegram_store_migrations (
-                    source_key TEXT PRIMARY KEY,
-                    realm_id TEXT NOT NULL,
-                    migrated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-                )
-                """
-            )
-            legacy_columns = {
-                str(row[1])
-                for row in conn.execute(
-                    "PRAGMA table_info(telegram_conversations_legacy_v1)"
-                ).fetchall()
-            }
-            if legacy_columns:
-                source_key = "inline:telegram_conversations_legacy_v1"
-                claimed = conn.execute(
-                    "SELECT 1 FROM telegram_store_migrations WHERE source_key = ?",
-                    (source_key,),
-                ).fetchone()
-                if claimed is None:
-                    conn.execute(
-                        """
-                        INSERT OR IGNORE INTO telegram_conversations(
-                            realm_id, chat_id, conversation_id, access_mode, updated_at
-                        )
-                        SELECT ?, chat_id, conversation_id, access_mode, updated_at
-                        FROM telegram_conversations_legacy_v1
-                        """,
-                        (self.realm_id,),
-                    )
-                    conn.execute(
-                        """
-                        INSERT INTO telegram_store_migrations(source_key, realm_id)
-                        VALUES (?, ?)
-                        """,
-                        (source_key, self.realm_id),
-                    )
-                # The renamed table has no realm information. Keeping it would let a
-                # later bot realm import the same principal/conversation bindings.
-                conn.execute("DROP TABLE telegram_conversations_legacy_v1")
-        self._migrate_legacy_store(legacy_path)
-
-    def _migrate_legacy_store(self, legacy_path: Path | None) -> None:
-        if legacy_path is None or not legacy_path.exists():
-            return
-        if legacy_path.resolve() == self.path.resolve():
-            return
-        path_key = hashlib.sha256(
-            str(legacy_path.resolve()).encode("utf-8")
-        ).hexdigest()
+        external_migration = self._read_legacy_store(legacy_path)
         try:
-            with sqlite3.connect(legacy_path, timeout=5.0) as legacy:
-                legacy_columns = {
-                    str(row[1])
-                    for row in legacy.execute(
-                        "PRAGMA table_info(telegram_conversations)"
-                    ).fetchall()
-                }
-                if "realm_id" in legacy_columns:
-                    source_key = f"legacy-file:{path_key}:realm:{self.realm_id}"
-                    rows = legacy.execute(
-                        """
-                        SELECT chat_id, conversation_id, access_mode, updated_at
-                        FROM telegram_conversations WHERE realm_id = ?
-                        """,
-                        (self.realm_id,),
-                    ).fetchall()
-                else:
-                    source_key = f"legacy-file:{path_key}:realm-less"
-                    rows = legacy.execute(
-                        """
-                        SELECT chat_id, conversation_id, access_mode, updated_at
-                        FROM telegram_conversations
-                        """
-                    ).fetchall()
-        except sqlite3.Error:
-            log.exception("Could not read legacy Telegram conversation bindings")
-            return
-        migrated = 0
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            claimed = conn.execute(
-                "SELECT 1 FROM telegram_store_migrations WHERE source_key = ?",
-                (source_key,),
-            ).fetchone()
-            if claimed is not None:
-                return
-            for chat_id, conversation_id, access_mode, updated_at in rows:
-                existing = conn.execute(
-                    "SELECT 1 FROM telegram_conversations "
-                    "WHERE realm_id = ? AND chat_id = ?",
-                    (self.realm_id, chat_id),
-                ).fetchone()
-                if existing is not None:
-                    continue
-                try:
+            with self._connect(configure_journal=False) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                self._initialize_primary_store(conn, external_migration)
+        except TelegramConversationMigrationError:
+            raise
+        except sqlite3.Error as exc:
+            raise TelegramConversationMigrationError(
+                "could not initialize Telegram conversation bindings safely"
+            ) from exc
+        # Switch journal mode only after every validation and migration transaction
+        # succeeded. A rejected migration leaves both schema and journal mode unchanged.
+        with self._connect():
+            pass
+
+    @staticmethod
+    def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+        if table not in {
+            "telegram_conversations",
+            "telegram_conversations_legacy_v1",
+            "telegram_update_inbox",
+            "telegram_store_migrations",
+        }:
+            raise ValueError("Unsupported Telegram binding table")
+        return {
+            str(row[1])
+            for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+
+    @staticmethod
+    def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+        row = conn.execute(
+            "SELECT type FROM sqlite_schema WHERE name = ?",
+            (table,),
+        ).fetchone()
+        if row is None:
+            return False
+        if row[0] != "table":
+            raise TelegramConversationMigrationError(
+                f"Telegram schema object {table!r} is not a table"
+            )
+        return True
+
+    @classmethod
+    def _read_binding_rows(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        table: str,
+        source: str,
+        realm_id: str | None,
+    ) -> list[tuple[int, str, str, str, str | None]]:
+        columns = cls._table_columns(conn, table)
+        if not {"chat_id", "conversation_id"}.issubset(columns):
+            raise TelegramConversationMigrationError(
+                f"{source} Telegram database has no compatible binding table"
+            )
+        if "realm_id" in columns and realm_id is None:
+            raise TelegramConversationMigrationError(
+                f"{source} Telegram database requires an explicit realm"
+            )
+        access_mode_sql = (
+            "access_mode" if "access_mode" in columns else "'owner' AS access_mode"
+        )
+        updated_at_sql = (
+            "updated_at"
+            if "updated_at" in columns
+            else "CURRENT_TIMESTAMP AS updated_at"
+        )
+        user_id_sql = "user_id" if "user_id" in columns else "NULL AS user_id"
+        where_sql = " WHERE realm_id = ?" if "realm_id" in columns else ""
+        parameters = (realm_id,) if where_sql else ()
+        raw_rows = conn.execute(
+            f"""
+            SELECT chat_id, conversation_id, {access_mode_sql}, {updated_at_sql},
+                   {user_id_sql}
+            FROM {table}{where_sql}
+            ORDER BY chat_id
+            """,  # noqa: S608 - table/fragments are fixed internal identifiers
+            parameters,
+        ).fetchall()
+        migration_time = str(conn.execute("SELECT CURRENT_TIMESTAMP").fetchone()[0])
+        normalized: list[tuple[int, str, str, str, str | None]] = []
+        seen_chats: dict[int, tuple[str, str, str | None]] = {}
+        seen_conversations: dict[str, int] = {}
+        for raw_chat, raw_conversation, raw_mode, raw_updated, raw_user in raw_rows:
+            if isinstance(raw_chat, bool) or not isinstance(raw_chat, int | str):
+                raise TelegramConversationMigrationError(
+                    f"{source} Telegram binding contains an invalid chat_id"
+                )
+            chat_text = str(raw_chat).strip()
+            if not re.fullmatch(r"-?[0-9]+", chat_text):
+                raise TelegramConversationMigrationError(
+                    f"{source} Telegram binding contains an invalid chat_id"
+                )
+            try:
+                chat_id = int(chat_text)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise TelegramConversationMigrationError(
+                    f"{source} Telegram binding contains an invalid chat_id"
+                ) from exc
+            if chat_id <= 0 or chat_id > 2**63 - 1:
+                raise TelegramConversationMigrationError(
+                    f"{source} Telegram binding contains an out-of-range chat_id"
+                )
+            conversation_id = str(raw_conversation or "").strip()
+            if not conversation_id or len(conversation_id) > 512:
+                raise TelegramConversationMigrationError(
+                    f"{source} Telegram binding contains an invalid conversation_id"
+                )
+            access_mode = str(raw_mode or "")
+            if access_mode not in {"owner", "guest"}:
+                raise TelegramConversationMigrationError(
+                    f"{source} Telegram binding contains an invalid access_mode"
+                )
+            updated_at = str(raw_updated or "").strip() or migration_time
+            if len(updated_at) > 128:
+                raise TelegramConversationMigrationError(
+                    f"{source} Telegram binding contains an invalid updated_at"
+                )
+            user_id = str(raw_user).strip() if raw_user is not None else None
+            if user_id == "":
+                user_id = None
+            if user_id is not None and len(user_id) > 160:
+                raise TelegramConversationMigrationError(
+                    f"{source} Telegram binding contains an invalid user_id"
+                )
+            previous = seen_chats.get(chat_id)
+            identity = (conversation_id, access_mode, user_id)
+            if previous is not None:
+                if previous != identity:
+                    raise TelegramConversationMigrationError(
+                        f"{source} Telegram store has conflicting rows for one chat_id"
+                    )
+                continue
+            previous_chat = seen_conversations.get(conversation_id)
+            if previous_chat is not None and previous_chat != chat_id:
+                raise TelegramConversationMigrationError(
+                    f"{source} Telegram store binds one conversation_id to multiple chats"
+                )
+            seen_chats[chat_id] = identity
+            seen_conversations[conversation_id] = chat_id
+            normalized.append(
+                (chat_id, conversation_id, access_mode, updated_at, user_id)
+            )
+        return normalized
+
+    def _read_legacy_store(
+        self, legacy_path: Path | None
+    ) -> tuple[str, list[tuple[int, str, str, str, str | None]]] | None:
+        if legacy_path is None or not legacy_path.exists():
+            return None
+        resolved = legacy_path.resolve()
+        if resolved == self.path.resolve():
+            return None
+        path_key = hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()
+        try:
+            legacy_uri = f"{resolved.as_uri()}?mode=ro"
+            with sqlite3.connect(legacy_uri, uri=True, timeout=5.0) as legacy:
+                # Pin all schema and row reads to one SQLite snapshot. A content hash in
+                # the migration key makes later legacy writes eligible on the next start
+                # instead of being hidden forever behind a path-only marker.
+                legacy.execute("BEGIN")
+                columns = self._table_columns(legacy, "telegram_conversations")
+                if not columns:
+                    raise TelegramConversationMigrationError(
+                        "legacy Telegram database has no compatible binding table"
+                    )
+                realm_aware = "realm_id" in columns
+                if not realm_aware and self.legacy_realm_id != self.realm_id:
+                    raise TelegramConversationMigrationError(
+                        "realm-less Telegram history requires an explicit matching "
+                        "JARVIS_TELEGRAM_LEGACY_REALM_ID"
+                    )
+                rows = self._read_binding_rows(
+                    legacy,
+                    table="telegram_conversations",
+                    source="legacy",
+                    realm_id=self.realm_id if realm_aware else None,
+                )
+                snapshot_sha256 = hashlib.sha256(
+                    json.dumps(
+                        rows,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                source_scope = (
+                    f"realm:{self.realm_id}" if realm_aware else "realm-less"
+                )
+                source_key = (
+                    f"legacy-file:{path_key}:{source_scope}:snapshot:{snapshot_sha256}"
+                )
+                return source_key, rows
+        except TelegramConversationMigrationError:
+            raise
+        except (OSError, sqlite3.Error) as exc:
+            raise TelegramConversationMigrationError(
+                "could not read legacy Telegram conversation bindings"
+            ) from exc
+
+    @staticmethod
+    def _create_primary_schema(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS telegram_conversations (
+                realm_id TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                conversation_id TEXT NOT NULL,
+                access_mode TEXT NOT NULL CHECK(access_mode IN ('owner', 'guest')),
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                user_id TEXT,
+                PRIMARY KEY(realm_id, chat_id),
+                UNIQUE(realm_id, conversation_id)
+            )
+            """
+        )
+        columns = {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(telegram_conversations)")
+        }
+        if "user_id" not in columns:
+            conn.execute("ALTER TABLE telegram_conversations ADD COLUMN user_id TEXT")
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_telegram_conversations_realm_chat
+            ON telegram_conversations(realm_id, chat_id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_telegram_conversations_realm_conversation
+            ON telegram_conversations(realm_id, conversation_id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS telegram_update_inbox (
+                realm_id TEXT NOT NULL,
+                update_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                payload_json TEXT NOT NULL,
+                status TEXT NOT NULL
+                    CHECK(status IN ('pending','processing','completed','rejected','failed')),
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                lease_token TEXT,
+                lease_expires_at REAL,
+                last_error TEXT,
+                received_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY(realm_id, update_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_telegram_update_inbox_claim
+            ON telegram_update_inbox(realm_id, status, update_id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS telegram_store_migrations (
+                source_key TEXT PRIMARY KEY,
+                realm_id TEXT NOT NULL,
+                migrated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
+    @staticmethod
+    def _primary_key_columns(conn: sqlite3.Connection, table: str) -> tuple[str, ...]:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return tuple(
+            str(row[1])
+            for row in sorted((row for row in rows if int(row[5]) > 0), key=lambda row: row[5])
+        )
+
+    @staticmethod
+    def _unique_indexes(
+        conn: sqlite3.Connection, table: str
+    ) -> set[tuple[str, ...]]:
+        indexes: set[tuple[str, ...]] = set()
+        for index_name, is_unique in conn.execute(
+            'SELECT name, "unique" FROM pragma_index_list(?)',
+            (table,),
+        ).fetchall():
+            if not is_unique:
+                continue
+            columns = tuple(
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT name FROM pragma_index_info(?) ORDER BY seqno",
+                    (str(index_name),),
+                ).fetchall()
+            )
+            indexes.add(columns)
+        return indexes
+
+    @classmethod
+    def _validate_primary_schema(cls, conn: sqlite3.Connection) -> None:
+        required_conversation_columns = {
+            "realm_id",
+            "chat_id",
+            "conversation_id",
+            "access_mode",
+            "updated_at",
+            "user_id",
+        }
+        if not required_conversation_columns.issubset(
+            cls._table_columns(conn, "telegram_conversations")
+        ):
+            raise TelegramConversationMigrationError(
+                "main Telegram database has an incompatible conversation schema"
+            )
+        if cls._primary_key_columns(conn, "telegram_conversations") != (
+            "realm_id",
+            "chat_id",
+        ):
+            raise TelegramConversationMigrationError(
+                "main Telegram conversation primary key is not realm-scoped"
+            )
+        unique_indexes = cls._unique_indexes(conn, "telegram_conversations")
+        required_unique = {
+            ("realm_id", "chat_id"),
+            ("realm_id", "conversation_id"),
+        }
+        if not required_unique.issubset(unique_indexes):
+            raise TelegramConversationMigrationError(
+                "main Telegram conversation uniqueness is not realm-scoped"
+            )
+        for columns in unique_indexes:
+            principal_columns = {"chat_id", "conversation_id"}.intersection(columns)
+            if principal_columns and "realm_id" not in columns:
+                raise TelegramConversationMigrationError(
+                    "main Telegram database contains cross-realm unique constraints"
+                )
+
+        required_inbox_columns = {
+            "realm_id",
+            "update_id",
+            "chat_id",
+            "payload_json",
+            "status",
+            "attempt_count",
+            "lease_token",
+            "lease_expires_at",
+            "last_error",
+            "received_at",
+            "updated_at",
+        }
+        if not required_inbox_columns.issubset(
+            cls._table_columns(conn, "telegram_update_inbox")
+        ) or cls._primary_key_columns(conn, "telegram_update_inbox") != (
+            "realm_id",
+            "update_id",
+        ):
+            raise TelegramConversationMigrationError(
+                "main Telegram inbox schema is not realm-scoped"
+            )
+
+        if not {"source_key", "realm_id", "migrated_at"}.issubset(
+            cls._table_columns(conn, "telegram_store_migrations")
+        ) or cls._primary_key_columns(conn, "telegram_store_migrations") != (
+            "source_key",
+        ):
+            raise TelegramConversationMigrationError(
+                "main Telegram migration ledger has an incompatible schema"
+            )
+
+    @classmethod
+    def _validate_all_realm_rows(cls, conn: sqlite3.Connection) -> None:
+        realm_rows = conn.execute(
+            "SELECT DISTINCT realm_id FROM telegram_conversations ORDER BY realm_id"
+        ).fetchall()
+        for (raw_realm_id,) in realm_rows:
+            realm_id = str(raw_realm_id or "").strip()
+            if not realm_id or len(realm_id) > 120:
+                raise TelegramConversationMigrationError(
+                    "main Telegram database contains an invalid realm_id"
+                )
+            cls._read_binding_rows(
+                conn,
+                table="telegram_conversations",
+                source="main",
+                realm_id=realm_id,
+            )
+
+    def _apply_migration(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        source_key: str,
+        rows: list[tuple[int, str, str, str, str | None]],
+    ) -> int:
+        claimed = conn.execute(
+            "SELECT realm_id FROM telegram_store_migrations WHERE source_key = ?",
+            (source_key,),
+        ).fetchone()
+        if claimed is not None:
+            return 0
+        current_rows = self._read_binding_rows(
+            conn,
+            table="telegram_conversations",
+            source="main",
+            realm_id=self.realm_id,
+        )
+        main_by_chat = {row[0]: row for row in current_rows}
+        main_by_conversation = {row[1]: row for row in current_rows}
+        for row in rows:
+            existing_conversation = main_by_conversation.get(row[1])
+            if existing_conversation is not None:
+                if existing_conversation[0] != row[0]:
+                    raise TelegramConversationMigrationError(
+                        "legacy and main Telegram stores bind one conversation_id "
+                        "to different chats"
+                    )
+                if existing_conversation[2] != row[2]:
+                    raise TelegramConversationMigrationError(
+                        "legacy and main Telegram stores disagree on access_mode"
+                    )
+                if (
+                    existing_conversation[4] is not None
+                    and row[4] is not None
+                    and existing_conversation[4] != row[4]
+                ):
+                    raise TelegramConversationMigrationError(
+                        "legacy and main Telegram stores disagree on user ownership"
+                    )
+                if existing_conversation[4] is None and row[4] is not None:
                     conn.execute(
                         """
-                        INSERT INTO telegram_conversations(
-                            realm_id, chat_id, conversation_id, access_mode, updated_at
-                        ) VALUES (?, ?, ?, ?, ?)
+                        UPDATE telegram_conversations SET user_id = ?
+                        WHERE realm_id = ? AND chat_id = ? AND user_id IS NULL
                         """,
-                        (
-                            self.realm_id,
-                            chat_id,
-                            conversation_id,
-                            access_mode,
-                            updated_at,
-                        ),
+                        (row[4], self.realm_id, row[0]),
                     )
-                except sqlite3.IntegrityError:
-                    log.warning(
-                        "Skipped conflicting legacy Telegram binding for chat_id=%s",
-                        chat_id,
-                    )
-                    continue
-                migrated += 1
+        migrated = 0
+        for chat_id, conversation_id, access_mode, updated_at, user_id in rows:
+            if chat_id in main_by_chat:
+                continue
             conn.execute(
                 """
-                INSERT INTO telegram_store_migrations(source_key, realm_id)
-                VALUES (?, ?)
+                INSERT INTO telegram_conversations(
+                    realm_id, chat_id, conversation_id, access_mode, updated_at, user_id
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (source_key, self.realm_id),
+                (
+                    self.realm_id,
+                    chat_id,
+                    conversation_id,
+                    access_mode,
+                    updated_at,
+                    user_id,
+                ),
             )
+            migrated += 1
+        conn.execute(
+            """
+            INSERT INTO telegram_store_migrations(source_key, realm_id)
+            VALUES (?, ?)
+            """,
+            (source_key, self.realm_id),
+        )
         if migrated:
-            log.info("Migrated %d Telegram conversation binding(s) into main database", migrated)
+            log.info(
+                "Migrated %d Telegram conversation binding(s) into main database",
+                migrated,
+            )
+        return migrated
 
-    def _connect(self) -> sqlite3.Connection:
+    def _initialize_primary_store(
+        self,
+        conn: sqlite3.Connection,
+        external_migration: (
+            tuple[str, list[tuple[int, str, str, str, str | None]]] | None
+        ),
+    ) -> None:
+        if self._table_exists(conn, "telegram_conversations_legacy_v1"):
+            raise TelegramConversationMigrationError(
+                "an unfinished Telegram schema migration already exists"
+            )
+        columns = self._table_columns(conn, "telegram_conversations")
+        inline_rows: list[tuple[int, str, str, str, str | None]] | None = None
+        if columns and "realm_id" not in columns:
+            if self.legacy_realm_id != self.realm_id:
+                raise TelegramConversationMigrationError(
+                    "realm-less Telegram history requires an explicit matching "
+                    "JARVIS_TELEGRAM_LEGACY_REALM_ID"
+                )
+            if self._table_exists(conn, "telegram_store_migrations"):
+                claimed_inline = conn.execute(
+                    "SELECT 1 FROM telegram_store_migrations WHERE source_key = ?",
+                    ("inline:telegram_conversations_legacy_v1",),
+                ).fetchone()
+                if claimed_inline is not None:
+                    raise TelegramConversationMigrationError(
+                        "realm-less Telegram history conflicts with its migration marker"
+                    )
+            inline_rows = self._read_binding_rows(
+                conn,
+                table="telegram_conversations",
+                source="main legacy",
+                realm_id=None,
+            )
+            conn.execute(
+                "ALTER TABLE telegram_conversations "
+                "RENAME TO telegram_conversations_legacy_v1"
+            )
+        elif columns:
+            required = {
+                "realm_id",
+                "chat_id",
+                "conversation_id",
+                "access_mode",
+                "updated_at",
+            }
+            if not required.issubset(columns):
+                raise TelegramConversationMigrationError(
+                    "main Telegram database has an incompatible realm-aware schema"
+                )
+            self._read_binding_rows(
+                conn,
+                table="telegram_conversations",
+                source="main",
+                realm_id=self.realm_id,
+            )
+
+        self._create_primary_schema(conn)
+        self._validate_primary_schema(conn)
+        self._validate_all_realm_rows(conn)
+        if inline_rows is not None:
+            self._apply_migration(
+                conn,
+                source_key="inline:telegram_conversations_legacy_v1",
+                rows=inline_rows,
+            )
+            # A realm-less source may be claimed by exactly one bot realm.
+            conn.execute("DROP TABLE telegram_conversations_legacy_v1")
+        if external_migration is not None:
+            source_key, rows = external_migration
+            self._apply_migration(conn, source_key=source_key, rows=rows)
+        self._validate_all_realm_rows(conn)
+
+    def _connect(self, *, configure_journal: bool = True) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=5.0)
         conn.execute("PRAGMA busy_timeout = 5000")
-        conn.execute("PRAGMA journal_mode = WAL")
+        if configure_journal:
+            conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA synchronous = FULL")
         return conn
 
     @staticmethod
     def _new_conversation_id() -> str:
         return f"tg_{uuid.uuid4().hex}"
+
+    @staticmethod
+    def _validate_principal(chat_id: int, access_mode: str, user_id: str) -> str:
+        if isinstance(chat_id, bool) or not isinstance(chat_id, int):
+            raise ValueError("Telegram chat_id must be an integer")
+        if chat_id <= 0 or chat_id > 2**63 - 1:
+            raise ValueError("Telegram chat_id is out of range")
+        if access_mode not in {"owner", "guest"}:
+            raise ValueError("Telegram access_mode must be owner or guest")
+        normalized_user_id = str(user_id).strip()
+        if not normalized_user_id or len(normalized_user_id) > 160:
+            raise ValueError("Telegram user_id must contain 1 to 160 characters")
+        return normalized_user_id
+
+    def _raise_ownership_mismatch(self, chat_id: int) -> None:
+        log.error(
+            "Telegram conversation ownership mismatch realm=%s chat_id=%s",
+            self.realm_id,
+            chat_id,
+        )
+        raise TelegramConversationIsolationError(
+            "Telegram chat binding belongs to another backend user"
+        )
 
     def next_update_offset(self) -> int:
         with self._connect() as conn:
@@ -790,58 +1212,122 @@ class TelegramConversationStore:
             ).fetchall()
         return {int(chat_id): str(conversation_id) for chat_id, conversation_id in rows}
 
-    def get_or_create(self, chat_id: int, access_mode: str) -> str:
+    def get_or_create(
+        self,
+        chat_id: int,
+        access_mode: str,
+        *,
+        user_id: str,
+    ) -> str:
+        user_id = self._validate_principal(chat_id, access_mode, user_id)
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 """
-                SELECT conversation_id, access_mode
+                SELECT conversation_id, access_mode, user_id
                 FROM telegram_conversations
                 WHERE realm_id = ? AND chat_id = ?
                 """,
                 (self.realm_id, chat_id),
             ).fetchone()
-            if row is not None and row[1] == access_mode:
-                return str(row[0])
+            if row is not None:
+                stored_user_id = str(row[2]) if row[2] is not None else None
+                if stored_user_id is None:
+                    # The authenticated private Telegram identity is immutable. Claim a
+                    # pre-user_id row exactly once so upgrades preserve history.
+                    conn.execute(
+                        """
+                        UPDATE telegram_conversations
+                        SET user_id = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE realm_id = ? AND chat_id = ? AND user_id IS NULL
+                        """,
+                        (user_id, self.realm_id, chat_id),
+                    )
+                elif stored_user_id != user_id:
+                    self._raise_ownership_mismatch(chat_id)
+                if row[1] == access_mode:
+                    return str(row[0])
 
             conversation_id = self._new_conversation_id()
             conn.execute(
                 """
                 INSERT INTO telegram_conversations(
-                    realm_id, chat_id, conversation_id, access_mode, updated_at
-                ) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    realm_id, chat_id, conversation_id, access_mode, updated_at, user_id
+                ) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
                 ON CONFLICT(realm_id, chat_id) DO UPDATE SET
                     conversation_id = excluded.conversation_id,
                     access_mode = excluded.access_mode,
+                    user_id = excluded.user_id,
                     updated_at = CURRENT_TIMESTAMP
                 """,
-                (self.realm_id, chat_id, conversation_id, access_mode),
+                (self.realm_id, chat_id, conversation_id, access_mode, user_id),
             )
             return conversation_id
 
-    def rotate(self, chat_id: int, access_mode: str) -> str:
+    def rotate(
+        self,
+        chat_id: int,
+        access_mode: str,
+        *,
+        user_id: str,
+    ) -> str:
+        user_id = self._validate_principal(chat_id, access_mode, user_id)
         conversation_id = self._new_conversation_id()
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT user_id FROM telegram_conversations
+                WHERE realm_id = ? AND chat_id = ?
+                """,
+                (self.realm_id, chat_id),
+            ).fetchone()
+            if row is not None and row[0] is not None and str(row[0]) != user_id:
+                self._raise_ownership_mismatch(chat_id)
             conn.execute(
                 """
                 INSERT INTO telegram_conversations(
-                    realm_id, chat_id, conversation_id, access_mode, updated_at
-                ) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    realm_id, chat_id, conversation_id, access_mode, updated_at, user_id
+                ) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
                 ON CONFLICT(realm_id, chat_id) DO UPDATE SET
                     conversation_id = excluded.conversation_id,
                     access_mode = excluded.access_mode,
+                    user_id = excluded.user_id,
                     updated_at = CURRENT_TIMESTAMP
                 """,
-                (self.realm_id, chat_id, conversation_id, access_mode),
+                (self.realm_id, chat_id, conversation_id, access_mode, user_id),
             )
         return conversation_id
 
-    def bind(self, chat_id: int, conversation_id: str, access_mode: str) -> None:
+    def bind(
+        self,
+        chat_id: int,
+        conversation_id: str,
+        access_mode: str,
+        *,
+        user_id: str,
+    ) -> None:
         """Accept a backend-normalized id without allowing cross-chat reuse."""
 
+        user_id = self._validate_principal(chat_id, access_mode, user_id)
+        conversation_id = str(conversation_id).strip()
+        if not conversation_id or len(conversation_id) > 512:
+            raise ValueError("Telegram conversation_id must contain 1 to 512 characters")
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                """
+                SELECT user_id FROM telegram_conversations
+                WHERE realm_id = ? AND chat_id = ?
+                """,
+                (self.realm_id, chat_id),
+            ).fetchone()
+            if (
+                current is not None
+                and current[0] is not None
+                and str(current[0]) != user_id
+            ):
+                self._raise_ownership_mismatch(chat_id)
             owner = conn.execute(
                 """
                 SELECT chat_id FROM telegram_conversations
@@ -856,14 +1342,15 @@ class TelegramConversationStore:
             conn.execute(
                 """
                 INSERT INTO telegram_conversations(
-                    realm_id, chat_id, conversation_id, access_mode, updated_at
-                ) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    realm_id, chat_id, conversation_id, access_mode, updated_at, user_id
+                ) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
                 ON CONFLICT(realm_id, chat_id) DO UPDATE SET
                     conversation_id = excluded.conversation_id,
                     access_mode = excluded.access_mode,
+                    user_id = excluded.user_id,
                     updated_at = CURRENT_TIMESTAMP
                 """,
-                (self.realm_id, chat_id, conversation_id, access_mode),
+                (self.realm_id, chat_id, conversation_id, access_mode, user_id),
             )
 
 
@@ -894,6 +1381,7 @@ class TelegramBridge:
                 cfg.conversation_store_path,
                 realm_id=cfg.realm_id,
                 legacy_path=cfg.legacy_conversation_store_path,
+                legacy_realm_id=cfg.legacy_conversation_realm_id,
             )
             if cfg.conversation_store_path is not None
             else None
@@ -1043,9 +1531,13 @@ class TelegramBridge:
                     error="bridge_admission_denied",
                 )
 
-    def _conversation_for(self, chat_id: int, access_mode: str) -> str:
+    def _conversation_for(
+        self, chat_id: int, access_mode: str, *, user_id: str
+    ) -> str:
         if self._conversation_store is not None:
-            conversation_id = self._conversation_store.get_or_create(chat_id, access_mode)
+            conversation_id = self._conversation_store.get_or_create(
+                chat_id, access_mode, user_id=user_id
+            )
         else:
             conversation_id = self.conversations.get(chat_id, "")
             if not conversation_id or self._conversation_modes.get(chat_id) != access_mode:
@@ -1053,22 +1545,35 @@ class TelegramBridge:
         self._cache_conversation(chat_id, conversation_id, access_mode)
         return conversation_id
 
-    def _rotate_conversation(self, chat_id: int, access_mode: str) -> str:
+    def _rotate_conversation(
+        self, chat_id: int, access_mode: str, *, user_id: str
+    ) -> str:
         if self._conversation_store is not None:
-            conversation_id = self._conversation_store.rotate(chat_id, access_mode)
+            conversation_id = self._conversation_store.rotate(
+                chat_id, access_mode, user_id=user_id
+            )
         else:
             conversation_id = TelegramConversationStore._new_conversation_id()
         self._cache_conversation(chat_id, conversation_id, access_mode)
         return conversation_id
 
-    def _bind_conversation(self, chat_id: int, conversation_id: str, access_mode: str) -> None:
+    def _bind_conversation(
+        self,
+        chat_id: int,
+        conversation_id: str,
+        access_mode: str,
+        *,
+        user_id: str,
+    ) -> None:
         for other_chat_id, bound_id in self.conversations.items():
             if other_chat_id != chat_id and bound_id == conversation_id:
                 raise TelegramConversationIsolationError(
                     "backend conversation id is already bound to another Telegram chat"
                 )
         if self._conversation_store is not None:
-            self._conversation_store.bind(chat_id, conversation_id, access_mode)
+            self._conversation_store.bind(
+                chat_id, conversation_id, access_mode, user_id=user_id
+            )
         self._cache_conversation(chat_id, conversation_id, access_mode)
 
     def _cache_conversation(
@@ -1338,7 +1843,9 @@ class TelegramBridge:
             return
         if command in _RESET_COMMANDS:
             access_mode = "owner" if session.preset_key == "owner" else "guest"
-            self._rotate_conversation(chat_id, access_mode)
+            self._rotate_conversation(
+                chat_id, access_mode, user_id=session.user_id
+            )
             await self._send(chat_id, "Начал новый разговор.")
             return
 
@@ -1450,7 +1957,9 @@ class TelegramBridge:
         typing = asyncio.create_task(self._typing_keepalive(chat_id))
         try:
             access_mode = "owner" if session.preset_key == "owner" else "guest"
-            conversation_id = self._conversation_for(chat_id, access_mode)
+            conversation_id = self._conversation_for(
+                chat_id, access_mode, user_id=session.user_id
+            )
             payload: dict[str, object] = {
                 "message": text,
                 "conversation_id": conversation_id,
@@ -1480,7 +1989,12 @@ class TelegramBridge:
         returned_conversation_id = str(body.get("conversation_id") or "").strip()
         if returned_conversation_id and returned_conversation_id != conversation_id:
             try:
-                self._bind_conversation(chat_id, returned_conversation_id, access_mode)
+                self._bind_conversation(
+                    chat_id,
+                    returned_conversation_id,
+                    access_mode,
+                    user_id=session.user_id,
+                )
             except TelegramConversationIsolationError:
                 log.exception(
                     "refusing cross-chat backend conversation binding for chat_id=%s",
