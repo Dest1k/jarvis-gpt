@@ -883,31 +883,45 @@ function Get-DispatcherContainerSnapshot {
       }
     }
     $container = $line | ConvertFrom-Json
-    $containerId = [string](
-      & $docker.Source inspect jarvis-gpt-dispatcher --format "{{.Id}}" 2>$null |
-        Select-Object -First 1
-    )
+    # Wrap docker inspect outputs in @() so a scalar string is never char-enumerated
+    # by Select-Object, and never use nested-quoted Go templates: Windows PowerShell
+    # strips the inner quotes when calling native docker.exe, which turns
+    # {{ index .Config.Labels "com.jarvis-gpt..." }} into a template parse error and
+    # (with $ErrorActionPreference=Stop) a terminating exception that falsely marks
+    # identity_known=false after power loss. Python dispatcher already uses JSON labels.
+    $containerId = [string]((@(
+      & $docker.Source inspect jarvis-gpt-dispatcher --format "{{.Id}}" 2>$null
+    ) | Select-Object -First 1))
     $containerId = $containerId.Trim()
     if ($containerId -notmatch '^[0-9a-fA-F]{64}$') {
       throw "docker inspect did not return a valid full 64-hex dispatcher container ID"
     }
     $containerId = $containerId.ToLowerInvariant()
-    $operationNonceOutput = @(
-      & $docker.Source inspect jarvis-gpt-dispatcher --format `
-        '{{ index .Config.Labels "com.jarvis-gpt.dispatcher.operation-nonce" }}' `
-        2>$null
-    )
-    $operationNonceExitCode = $LASTEXITCODE
-    $operationNonce = [string]($operationNonceOutput | Select-Object -First 1)
-    $operationNonce = $operationNonce.Trim().ToLowerInvariant()
-    $operationNonceKnown = [bool](
-      $operationNonceExitCode -eq 0 -and
-      $operationNonce -match '^[0-9a-f]{32}$'
-    )
+    $operationNonce = ""
+    $operationNonceKnown = $false
+    try {
+      $labelsJson = [string]((@(
+        & $docker.Source inspect jarvis-gpt-dispatcher --format "{{json .Config.Labels}}" 2>$null
+      ) | Select-Object -First 1))
+      $labelsExitCode = $LASTEXITCODE
+      if ($labelsExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($labelsJson)) {
+        $labels = $labelsJson | ConvertFrom-Json
+        $operationNonce = [string](
+          $labels.PSObject.Properties["com.jarvis-gpt.dispatcher.operation-nonce"].Value
+        )
+        $operationNonce = $operationNonce.Trim().ToLowerInvariant()
+        $operationNonceKnown = [bool]($operationNonce -match '^[0-9a-f]{32}$')
+      }
+    } catch {
+      $operationNonce = ""
+      $operationNonceKnown = $false
+    }
     $state = [string]$container.State
     $command = @()
     try {
-      $commandJson = & $docker.Source inspect jarvis-gpt-dispatcher --format "{{json .Config.Cmd}}" 2>$null
+      $commandJson = [string]((@(
+        & $docker.Source inspect jarvis-gpt-dispatcher --format "{{json .Config.Cmd}}" 2>$null
+      ) | Select-Object -First 1))
       if ($commandJson) {
         $parsedCommand = $commandJson | ConvertFrom-Json
         $command = @($parsedCommand | ForEach-Object { [string]$_ })

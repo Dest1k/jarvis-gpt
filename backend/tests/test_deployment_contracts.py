@@ -435,6 +435,17 @@ def test_launcher_serializes_state_writes_with_backend_sync() -> None:
     assert "^[0-9a-fA-F]{64}$" in ownership_body
     assert "^[0-9a-fA-F]{32}$" in ownership_body or "operation_nonce" in ownership_body
 
+    # PowerShell mangles nested quotes in native docker --format templates, so the
+    # snapshot must read the operation nonce via JSON labels (same as dispatcher.py).
+    snapshot_start = launcher.index("function Get-DispatcherContainerSnapshot")
+    snapshot_end = launcher.index("function Get-DispatcherLogSignals", snapshot_start)
+    snapshot_body = launcher[snapshot_start:snapshot_end]
+    assert "{{json .Config.Labels}}" in snapshot_body
+    assert 'com.jarvis-gpt.dispatcher.operation-nonce' in snapshot_body
+    assert 'index .Config.Labels "com.jarvis-gpt.dispatcher.operation-nonce"' not in (
+        snapshot_body
+    )
+
     stop_stack = launcher[launcher.index("function Stop-JarvisStack") :]
     assert "Get-LauncherControlFileFingerprint" in stop_stack
     assert "DispatcherOperationLockHeld" in stop_stack
@@ -600,11 +611,18 @@ function Invoke-FakeDocker {
       $global:LASTEXITCODE = 0
       return $script:FullId
     }
-    if ($joined -match 'operation-nonce') {
+    # Launcher must read the nonce via JSON labels (not nested-quoted index templates).
+    if ($joined -match 'json \.Config\.Labels') {
       $global:LASTEXITCODE = 0
-      return $script:Nonce
+      return (
+        @{ "com.jarvis-gpt.dispatcher.operation-nonce" = $script:Nonce } |
+          ConvertTo-Json -Compress
+      )
     }
-    if ($joined -match 'Config\.Cmd') {
+    if ($joined -match 'operation-nonce') {
+      throw "legacy nested-quoted operation-nonce docker format must not be used"
+    }
+    if ($joined -match 'Config\.Cmd' -or $joined -match 'json \.Config\.Cmd') {
       $global:LASTEXITCODE = 0
       return '["--model","/models/test"]'
     }
@@ -622,6 +640,13 @@ if ($snapshot.id -ne $script:FullId) {
     "snapshot did not use the full immutable docker inspect ID: id={0}; calls={1}" -f
     [string]$snapshot.id,
     (($script:DockerCalls | ForEach-Object { $_ -join "," }) -join ";")
+  )
+}
+if (-not $snapshot.ownership_provenance_known -or $snapshot.operation_nonce -ne $script:Nonce) {
+  throw (
+    "snapshot did not parse operation nonce from JSON labels: known={0}; nonce={1}" -f
+    [bool]$snapshot.ownership_provenance_known,
+    [string]$snapshot.operation_nonce
   )
 }
 
