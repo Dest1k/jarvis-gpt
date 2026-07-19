@@ -247,6 +247,8 @@ class TelegramConfig:
     max_pending_updates: int = 64
     max_pending_per_user: int = 2
     intake_rate_per_minute: int = 12
+    # Admin-pre-provisioned Telegram chat ids (guest until first message), JSON file.
+    pre_provisioned_path: Path | None = None
     max_files_out: int = 6
     # Voice-out mirrors the input modality: a spoken reply is sent ONLY when the incoming
     # message was itself voice/audio. A text message always gets a text-only reply.
@@ -397,6 +399,7 @@ def load_config(env: Mapping[str, str] | None = None) -> TelegramConfig:
         bot_id=bot_id,
         owner_chat_ids=owner_ids,
         api_token=api_token,
+        pre_provisioned_path=state_dir / "telegram_pre_provisioned.json",
         voice_replies=voice_replies,
         voice_reply_max_chars=voice_max,
         max_concurrent_updates=bounded_int(
@@ -1717,6 +1720,8 @@ class TelegramBridge:
         self.cfg = cfg
         self._realm_id = cfg.realm_id
         self._bot_id = cfg.bot_id
+        self._pre_provisioned_cache: frozenset[int] = frozenset()
+        self._pre_provisioned_mtime: float | None = None
         self.tg = tg_client or httpx.AsyncClient(
             base_url=f"https://api.telegram.org/bot{cfg.bot_token}",
             timeout=cfg.poll_timeout + 15,
@@ -1805,6 +1810,40 @@ class TelegramBridge:
             self._intake_windows.popitem(last=False)
         return count <= max(1, self.cfg.intake_rate_per_minute)
 
+    def _pre_provisioned_chat_ids(self) -> frozenset[int]:
+        path = self.cfg.pre_provisioned_path
+        if path is None:
+            return frozenset()
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            self._pre_provisioned_cache = frozenset()
+            self._pre_provisioned_mtime = None
+            return frozenset()
+        if self._pre_provisioned_mtime == mtime:
+            return self._pre_provisioned_cache
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            ids = frozenset(
+                int(item)
+                for item in (raw.get("chat_ids") or [])
+                if str(item).lstrip("-").isdigit()
+            )
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            ids = frozenset()
+        self._pre_provisioned_cache = ids
+        self._pre_provisioned_mtime = mtime
+        return ids
+
+    def _chat_is_allowed(self, chat_id: int) -> bool:
+        """Env allowlist (if set) OR admin pre-provisioned TG identity."""
+
+        if not self.cfg.allowed_chat_ids:
+            return True
+        if chat_id in self.cfg.allowed_chat_ids:
+            return True
+        return chat_id in self._pre_provisioned_chat_ids()
+
     def _enqueue_update(self, update: dict, *, lease_token: str | None = None) -> bool:
         """Schedule a fair update turn or reject it before it can grow an unbounded queue."""
 
@@ -1814,7 +1853,7 @@ class TelegramBridge:
             log.warning("DENIED ambiguous Telegram update before bridge queue")
             return False
         chat_id = identity[0]
-        if self.cfg.allowed_chat_ids and chat_id not in self.cfg.allowed_chat_ids:
+        if not self._chat_is_allowed(chat_id):
             log.warning("DENIED Telegram user_id=%s by optional allowlist", chat_id)
             return False
         if not self._consume_bridge_intake(chat_id):
@@ -2172,7 +2211,7 @@ class TelegramBridge:
                     log.warning("DENIED ambiguous Telegram update_id=%s", update_id)
                     continue
                 chat_id = identity[0]
-                if self.cfg.allowed_chat_ids and chat_id not in self.cfg.allowed_chat_ids:
+                if not self._chat_is_allowed(chat_id):
                     log.warning("DENIED Telegram user_id=%s by optional allowlist", chat_id)
                     continue
                 staged.append((update_id, chat_id, update))
@@ -2211,7 +2250,7 @@ class TelegramBridge:
             )
             return
         chat_id, sender = identity
-        if self.cfg.allowed_chat_ids and chat_id not in self.cfg.allowed_chat_ids:
+        if not self._chat_is_allowed(chat_id):
             log.warning("DENIED Telegram user_id=%s by optional allowlist", chat_id)
             return
         update_id = update.get("update_id")

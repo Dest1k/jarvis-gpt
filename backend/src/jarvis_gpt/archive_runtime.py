@@ -34,6 +34,7 @@ __all__ = [
     "ArchiveError",
     "ArchiveSafetyError",
     "ArchiveUnsupportedError",
+    "ArchivePasswordError",
     "ArchiveConfig",
     "list_archive",
     "extract_archive",
@@ -56,6 +57,10 @@ class ArchiveUnsupportedError(ArchiveError):
     """Format not supported in this runtime."""
 
 
+class ArchivePasswordError(ArchiveError):
+    """Archive is encrypted and the password is missing or wrong."""
+
+
 @dataclass
 class ArchiveConfig:
     max_members: int = 5_000
@@ -63,6 +68,7 @@ class ArchiveConfig:
     max_total_uncompressed_bytes: int = 200_000_000
     max_list_members: int = 500
     allow_symlinks: bool = False
+    password: str | None = None
 
 
 def archive_capabilities() -> dict[str, Any]:
@@ -128,8 +134,18 @@ def list_archive(
     *,
     config: ArchiveConfig | None = None,
     prefix: str = "",
+    password: str | None = None,
 ) -> dict[str, Any]:
     cfg = config or ArchiveConfig()
+    if password is not None:
+        cfg = ArchiveConfig(
+            max_members=cfg.max_members,
+            max_member_bytes=cfg.max_member_bytes,
+            max_total_uncompressed_bytes=cfg.max_total_uncompressed_bytes,
+            max_list_members=cfg.max_list_members,
+            allow_symlinks=cfg.allow_symlinks,
+            password=password,
+        )
     path_obj = Path(path).resolve(strict=False)
     _assert_file(path_obj)
     info = identify_path(path_obj)
@@ -161,8 +177,18 @@ def extract_archive(
     output_dir: str | Path,
     members: Sequence[str] | None = None,
     config: ArchiveConfig | None = None,
+    password: str | None = None,
 ) -> dict[str, Any]:
     cfg = config or ArchiveConfig()
+    if password is not None:
+        cfg = ArchiveConfig(
+            max_members=cfg.max_members,
+            max_member_bytes=cfg.max_member_bytes,
+            max_total_uncompressed_bytes=cfg.max_total_uncompressed_bytes,
+            max_list_members=cfg.max_list_members,
+            allow_symlinks=cfg.allow_symlinks,
+            password=password,
+        )
     path_obj = Path(path).resolve(strict=False)
     _assert_file(path_obj)
     dest_root = Path(output_dir).resolve(strict=False)
@@ -193,8 +219,18 @@ def read_archive_member(
     *,
     max_bytes: int | None = None,
     config: ArchiveConfig | None = None,
+    password: str | None = None,
 ) -> dict[str, Any]:
     cfg = config or ArchiveConfig()
+    if password is not None:
+        cfg = ArchiveConfig(
+            max_members=cfg.max_members,
+            max_member_bytes=cfg.max_member_bytes,
+            max_total_uncompressed_bytes=cfg.max_total_uncompressed_bytes,
+            max_list_members=cfg.max_list_members,
+            allow_symlinks=cfg.allow_symlinks,
+            password=password,
+        )
     path_obj = Path(path).resolve(strict=False)
     _assert_file(path_obj)
     member_name = _safe_member_name(member)
@@ -393,15 +429,30 @@ def _list_members(path: Path, kind: str, cfg: ArchiveConfig) -> list[dict[str, A
     )
 
 
+def _pwd_bytes(cfg: ArchiveConfig) -> bytes | None:
+    if not cfg.password:
+        return None
+    return str(cfg.password).encode("utf-8")
+
+
 def _list_zip(path: Path, cfg: ArchiveConfig) -> list[dict[str, Any]]:
     if not zipfile.is_zipfile(path):
         raise ArchiveError(f"Not a valid ZIP archive: {path}")
     members: list[dict[str, Any]] = []
     with zipfile.ZipFile(path) as archive:
+        pwd = _pwd_bytes(cfg)
+        if pwd is not None:
+            archive.setpassword(pwd)
         infos = archive.infolist()
         if len(infos) > cfg.max_members:
             raise ArchiveSafetyError(
                 f"Archive has too many members ({len(infos)} > {cfg.max_members})"
+            )
+        encrypted = any(bool(info.flag_bits & 0x1) for info in infos)
+        if encrypted and pwd is None:
+            raise ArchivePasswordError(
+                f"ZIP archive is password-protected: {path.name}. "
+                "Передайте password для list/extract."
             )
         for info in infos:
             name = info.filename.replace("\\", "/")
@@ -412,6 +463,7 @@ def _list_zip(path: Path, cfg: ArchiveConfig) -> list[dict[str, Any]]:
                         "is_dir": True,
                         "size": 0,
                         "compressed_size": info.compress_size,
+                        "encrypted": bool(info.flag_bits & 0x1),
                     }
                 )
                 continue
@@ -425,6 +477,7 @@ def _list_zip(path: Path, cfg: ArchiveConfig) -> list[dict[str, Any]]:
                         "size": info.file_size,
                         "compressed_size": info.compress_size,
                         "unsafe": True,
+                        "encrypted": bool(info.flag_bits & 0x1),
                     }
                 )
                 continue
@@ -435,6 +488,7 @@ def _list_zip(path: Path, cfg: ArchiveConfig) -> list[dict[str, Any]]:
                     "size": info.file_size,
                     "compressed_size": info.compress_size,
                     "crc": info.CRC,
+                    "encrypted": bool(info.flag_bits & 0x1),
                 }
             )
     return members
@@ -500,7 +554,21 @@ def _list_7z(path: Path, cfg: ArchiveConfig) -> list[dict[str, Any]]:
             "7z listing requires optional dependency py7zr (pip install py7zr)"
         ) from exc
     members: list[dict[str, Any]] = []
-    with py7zr.SevenZipFile(path, mode="r") as archive:
+    password = cfg.password or None
+    try:
+        archive_cm = py7zr.SevenZipFile(path, mode="r", password=password)
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc).lower()
+        if "password" in msg or "encrypted" in msg:
+            raise ArchivePasswordError(
+                f"7z архив защищён паролем: {path.name}. Передайте password."
+            ) from exc
+        raise
+    with archive_cm as archive:
+        if getattr(archive, "needs_password", lambda: False)() and not password:
+            raise ArchivePasswordError(
+                f"7z архив защищён паролем: {path.name}. Передайте password."
+            )
         infos = archive.list()
         if len(infos) > cfg.max_members:
             raise ArchiveSafetyError(
@@ -531,10 +599,19 @@ def _list_rar(path: Path, cfg: ArchiveConfig) -> list[dict[str, Any]]:
         ) from exc
     members: list[dict[str, Any]] = []
     with rarfile.RarFile(path) as archive:
+        if cfg.password:
+            archive.setpassword(cfg.password)
         infos = archive.infolist()
         if len(infos) > cfg.max_members:
             raise ArchiveSafetyError(
                 f"Archive has too many members ({len(infos)} > {cfg.max_members})"
+            )
+        needs_pwd = any(
+            getattr(info, "needs_password", lambda: False)() for info in infos
+        )
+        if needs_pwd and not cfg.password:
+            raise ArchivePasswordError(
+                f"RAR архив защищён паролем: {path.name}. Передайте password."
             )
         for info in infos:
             name = str(info.filename).replace("\\", "/")
@@ -596,7 +673,10 @@ def _extract_zip(
 ) -> list[dict[str, Any]]:
     extracted: list[dict[str, Any]] = []
     total = 0
+    pwd = _pwd_bytes(cfg)
     with zipfile.ZipFile(path) as archive:
+        if pwd is not None:
+            archive.setpassword(pwd)
         for info in archive.infolist():
             name = info.filename.replace("\\", "/")
             if name.endswith("/"):
@@ -604,11 +684,24 @@ def _extract_zip(
             safe = _safe_member_name(name)
             if wanted is not None and safe not in wanted and name not in wanted:
                 continue
+            if bool(info.flag_bits & 0x1) and pwd is None:
+                raise ArchivePasswordError(
+                    f"ZIP member is password-protected: {safe}. Передайте password."
+                )
             total = _guard_total(total, int(info.file_size or 0), cfg)
             dest = _safe_destination(dest_root, safe)
             dest.parent.mkdir(parents=True, exist_ok=True)
-            with archive.open(info, "r") as src, dest.open("wb") as out:
-                _copy_limited(src, out, limit=cfg.max_member_bytes)
+            try:
+                with archive.open(info, "r", pwd=pwd) as src, dest.open("wb") as out:
+                    _copy_limited(src, out, limit=cfg.max_member_bytes)
+            except RuntimeError as exc:
+                # zipfile raises RuntimeError on bad password.
+                msg = str(exc).lower()
+                if "password" in msg or "encrypted" in msg or "bad password" in msg:
+                    raise ArchivePasswordError(
+                        f"Неверный или отсутствующий пароль ZIP: {path.name}"
+                    ) from exc
+                raise
             extracted.append({"name": safe, "path": str(dest), "size": dest.stat().st_size})
             if len(extracted) >= cfg.max_members:
                 break
@@ -692,7 +785,17 @@ def _extract_7z(
             "7z extraction requires optional dependency py7zr"
         ) from exc
     targets = list(wanted) if wanted else None
-    with py7zr.SevenZipFile(path, mode="r") as archive:
+    password = cfg.password or None
+    try:
+        archive_cm = py7zr.SevenZipFile(path, mode="r", password=password)
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc).lower()
+        if "password" in msg or "encrypted" in msg:
+            raise ArchivePasswordError(
+                f"Неверный или отсутствующий пароль 7z: {path.name}"
+            ) from exc
+        raise
+    with archive_cm as archive:
         # py7zr extracts with its own path checks; still re-validate listed names.
         all_names = [
             str(i.filename).replace("\\", "/")
@@ -701,7 +804,15 @@ def _extract_7z(
         ]
         for name in all_names:
             _safe_member_name(name)
-        archive.extract(path=dest_root, targets=targets)
+        try:
+            archive.extract(path=dest_root, targets=targets)
+        except Exception as exc:  # noqa: BLE001
+            msg = str(exc).lower()
+            if "password" in msg or "encrypted" in msg:
+                raise ArchivePasswordError(
+                    f"Неверный или отсутствующий пароль 7z: {path.name}"
+                ) from exc
+            raise
     extracted: list[dict[str, Any]] = []
     total = 0
     for name in all_names:
@@ -732,6 +843,8 @@ def _extract_rar(
     extracted: list[dict[str, Any]] = []
     total = 0
     with rarfile.RarFile(path) as archive:
+        if cfg.password:
+            archive.setpassword(cfg.password)
         for info in archive.infolist():
             if info.is_dir():
                 continue
@@ -739,11 +852,20 @@ def _extract_rar(
             safe = _safe_member_name(name)
             if wanted is not None and safe not in wanted and name not in wanted:
                 continue
+            if getattr(info, "needs_password", lambda: False)() and not cfg.password:
+                raise ArchivePasswordError(
+                    f"RAR member is password-protected: {safe}. Передайте password."
+                )
             total = _guard_total(total, int(info.file_size or 0), cfg)
             dest = _safe_destination(dest_root, safe)
             dest.parent.mkdir(parents=True, exist_ok=True)
-            with archive.open(info) as src, dest.open("wb") as out:
-                _copy_limited(src, out, limit=cfg.max_member_bytes)
+            try:
+                with archive.open(info) as src, dest.open("wb") as out:
+                    _copy_limited(src, out, limit=cfg.max_member_bytes)
+            except rarfile.BadRarFile as exc:
+                raise ArchivePasswordError(
+                    f"Неверный или отсутствующий пароль RAR: {path.name}"
+                ) from exc
             extracted.append({"name": safe, "path": str(dest), "size": dest.stat().st_size})
     return extracted
 
@@ -757,7 +879,10 @@ def _read_member_bytes(
     cfg: ArchiveConfig,
 ) -> bytes:
     if kind == "zip":
+        pwd = _pwd_bytes(cfg)
         with zipfile.ZipFile(path) as archive:
+            if pwd is not None:
+                archive.setpassword(pwd)
             # try exact and raw
             try:
                 info = archive.getinfo(member)
@@ -778,8 +903,20 @@ def _read_member_bytes(
                 raise ArchiveSafetyError(
                     f"Member too large ({info.file_size} > {cfg.max_member_bytes})"
                 )
-            with archive.open(info) as handle:
-                return handle.read(limit)
+            if bool(info.flag_bits & 0x1) and pwd is None:
+                raise ArchivePasswordError(
+                    f"ZIP member is password-protected: {member}. Передайте password."
+                )
+            try:
+                with archive.open(info, "r", pwd=pwd) as handle:
+                    return handle.read(limit)
+            except RuntimeError as exc:
+                msg = str(exc).lower()
+                if "password" in msg or "encrypted" in msg:
+                    raise ArchivePasswordError(
+                        f"Неверный или отсутствующий пароль ZIP: {path.name}"
+                    ) from exc
+                raise
     if kind.startswith("tar"):
         mode = {
             "tar": "r:",

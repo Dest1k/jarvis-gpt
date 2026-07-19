@@ -195,99 +195,172 @@ class AuthorizationDecision:
 
 
 CORE_CAPABILITIES: tuple[CapabilityDefinition, ...] = (
-    CapabilityDefinition("chat.use", "Use conversational Jarvis", "chat"),
-    CapabilityDefinition("events.subscribe", "Subscribe to own live events", "events"),
-    CapabilityDefinition("memory.read.own", "Read own memory", "memory"),
-    CapabilityDefinition("memory.write.own", "Write own memory", "memory", 1),
-    CapabilityDefinition("preferences.read.own", "Read own preferences", "preferences"),
-    CapabilityDefinition("persona.read.own", "Read own persona and personalization", "persona"),
-    CapabilityDefinition("files.read.own", "Read own files", "files"),
-    CapabilityDefinition("missions.read.own", "Read own missions", "missions"),
-    CapabilityDefinition("missions.write.own", "Create and update own missions", "missions", 1),
+    CapabilityDefinition(
+        "chat.use",
+        "Общение с Jarvis в чате: отправка сообщений и получение ответов",
+        "chat",
+    ),
+    CapabilityDefinition(
+        "events.subscribe",
+        "Подписка на свои live-события runtime (WebSocket/лента)",
+        "events",
+    ),
+    CapabilityDefinition(
+        "memory.read.own",
+        "Чтение собственной памяти и vault-записей",
+        "memory",
+    ),
+    CapabilityDefinition(
+        "memory.write.own",
+        "Запись и изменение собственной памяти",
+        "memory",
+        1,
+    ),
+    CapabilityDefinition(
+        "preferences.read.own",
+        "Чтение личных настроек оператора (стиль, тихие часы и т.п.)",
+        "preferences",
+    ),
+    CapabilityDefinition(
+        "persona.read.own",
+        "Чтение профиля оператора (роль, стек, постоянные инструкции)",
+        "persona",
+    ),
+    CapabilityDefinition(
+        "files.read.own",
+        "Чтение и просмотр собственных загруженных/индексированных файлов",
+        "files",
+    ),
+    CapabilityDefinition(
+        "missions.read.own",
+        "Просмотр собственных миссий и их шагов",
+        "missions",
+    ),
+    CapabilityDefinition(
+        "missions.write.own",
+        "Создание и обновление собственных миссий",
+        "missions",
+        1,
+    ),
     CapabilityDefinition(
         "background.screen_watch.create",
-        "Create bounded recurring screen observations",
+        "Создание ограниченных фоновых наблюдений экрана",
         "background",
         3,
         True,
     ),
     CapabilityDefinition(
         "background.scheduled_task.create",
-        "Create a scheduled autonomous agent task",
+        "Создание отложенной/периодической автономной задачи агента",
         "background",
         4,
         True,
     ),
     CapabilityDefinition(
         "background.scheduled_task.execute",
-        "Execute a previously scheduled autonomous agent task",
+        "Запуск ранее запланированной автономной задачи агента",
         "background",
         4,
         True,
     ),
     CapabilityDefinition(
         "privacy.screen.capture",
-        "Capture the local operator screen",
+        "Захват снимка локального экрана оператора",
         "privacy",
         3,
     ),
     CapabilityDefinition(
         "privacy.clipboard.read",
-        "Read the local operator clipboard",
+        "Чтение локального буфера обмена",
         "privacy",
         3,
     ),
     CapabilityDefinition(
         "privacy.clipboard.write",
-        "Write the local operator clipboard",
+        "Запись в локальный буфер обмена",
         "privacy",
         3,
         True,
     ),
     CapabilityDefinition(
-        "native.capabilities.read", "Inspect native bridge capabilities", "native", 2
+        "native.capabilities.read",
+        "Просмотр возможностей native host-bridge",
+        "native",
+        2,
     ),
     CapabilityDefinition(
-        "native.process.top.read", "Read the local process ranking", "native", 3
+        "native.process.top.read",
+        "Чтение рейтинга локальных процессов",
+        "native",
+        3,
     ),
     CapabilityDefinition(
         "native.console.processes.show",
-        "Show a process ranking in a local console",
+        "Показать рейтинг процессов в локальной консоли",
         "native",
         3,
         True,
     ),
     CapabilityDefinition(
-        "native.process.start", "Start a local process", "native", 4, True
+        "native.process.start",
+        "Запуск локального процесса на машине оператора",
+        "native",
+        4,
+        True,
     ),
     CapabilityDefinition(
-        "native.app.open_and_type", "Open a local app and type text", "native", 4, True
+        "native.app.open_and_type",
+        "Открыть локальное приложение и ввести текст",
+        "native",
+        4,
+        True,
     ),
     CapabilityDefinition(
-        "native.window.focus", "Focus a local desktop window", "native", 3, True
+        "native.window.focus",
+        "Сфокусировать окно рабочего стола",
+        "native",
+        3,
+        True,
     ),
     CapabilityDefinition(
-        "native.window.list.read", "List visible local desktop windows", "native", 3
+        "native.window.list.read",
+        "Список видимых окон рабочего стола",
+        "native",
+        3,
     ),
     CapabilityDefinition(
-        "native.keyboard.send", "Send keys to the local desktop", "native", 4, True
+        "native.keyboard.send",
+        "Отправка нажатий клавиш на локальный рабочий стол",
+        "native",
+        4,
+        True,
     ),
     CapabilityDefinition(
-        "native.wmi.query", "Query local WMI/CIM state", "native", 3
+        "native.wmi.query",
+        "Запросы к локальному WMI/CIM",
+        "native",
+        3,
     ),
     CapabilityDefinition(
-        "native.hardware.gpu.read", "Read local GPU telemetry", "native", 3
+        "native.hardware.gpu.read",
+        "Чтение телеметрии локального GPU",
+        "native",
+        3,
     ),
-    CapabilityDefinition("approvals.read.own", "Read own approvals", "safety"),
+    CapabilityDefinition(
+        "approvals.read.own",
+        "Просмотр собственных запросов на подтверждение (HITL)",
+        "safety",
+    ),
     CapabilityDefinition(
         "background.autonomy.execute",
-        "Execute the user's persisted autonomy jobs in the background",
+        "Фоновое выполнение сохранённых autonomy-задач пользователя",
         "background",
         4,
     ),
     CapabilityDefinition(
         "integration.telegram.session.create",
-        "Register Telegram identities and create scoped sessions",
+        "Регистрация Telegram-идентичностей и выпуск ограниченных сессий",
         "integration",
         2,
     ),

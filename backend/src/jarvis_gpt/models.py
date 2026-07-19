@@ -757,6 +757,8 @@ class StatusResponse(BaseModel):
     counters: dict[str, int]
     health: list[DiagnosticCheck]
     recent_events: list[dict[str, Any]]
+    notices: list[dict[str, Any]] = Field(default_factory=list)
+    service_mode: dict[str, Any] = Field(default_factory=dict)
 
 
 class OperatorPersonaResponse(BaseModel):

@@ -724,6 +724,35 @@ def _route_security_id(method: str, path_template: str) -> str:
     return ".".join(("http", method.lower(), *segments))
 
 
+_HTTP_METHOD_RU = {
+    "GET": "Чтение",
+    "POST": "Создание/действие",
+    "PUT": "Полная замена",
+    "PATCH": "Частичное обновление",
+    "DELETE": "Удаление",
+}
+
+
+def _http_capability_description(
+    method: str, path_template: str, endpoint_name: str
+) -> str:
+    """Human-readable Russian description for an auto-derived HTTP security_id."""
+
+    verb = _HTTP_METHOD_RU.get(method.upper(), method.upper())
+    # Prefer the FastAPI endpoint name when it is descriptive; fall back to path.
+    name = (endpoint_name or "").replace("_", " ").strip()
+    path = path_template
+    if name and name not in {"", path}:
+        return (
+            f"{verb} через API `{path}` "
+            f"(эндпоинт `{endpoint_name}`). Нужен для авторизации этого HTTP-маршрута."
+        )
+    return (
+        f"{verb} через API `{path}`. "
+        f"Право на вызов этого HTTP-маршрута (security_id автогенерируется из метода и пути)."
+    )
+
+
 def _http_default_presets(endpoint_name: str) -> tuple[str, ...]:
     if endpoint_name in _HTTP_GUEST_ENDPOINTS:
         return ("guest", "user", "moderator", "admin")
@@ -779,7 +808,9 @@ def _build_http_api_catalog(
             category_segment = path_template.split("/", 3)[2]
             definition = CapabilityDefinition(
                 security_id=security_id,
-                description=f"{method} {path_template}",
+                description=_http_capability_description(
+                    method, path_template, route.name
+                ),
                 category=f"http.{category_segment}",
                 risk_level=risk_level,
                 default_requires_hitl=route.name in _HTTP_HIGH_RISK_ENDPOINTS,
@@ -1225,6 +1256,8 @@ def _health_snapshot_readiness(
 
 @app.get("/api/status", response_model=StatusResponse)
 async def status() -> StatusResponse:
+    from .runtime_notices import collect_notices, get_service_mode
+
     health_rows = app.state.storage.latest_health(limit=20)
     health_checks = [
         {
@@ -1235,11 +1268,14 @@ async def status() -> StatusResponse:
         }
         for row in health_rows
     ]
+    state_dir = Path(app.state.settings.state_dir)
     return StatusResponse(
         settings=app.state.settings.public_dict(),
         counters=app.state.storage.counters(),
         health=health_checks,
         recent_events=app.state.storage.list_events(limit=25),
+        notices=collect_notices(state_dir),
+        service_mode=get_service_mode(state_dir),
     )
 
 
@@ -1800,6 +1836,34 @@ async def briefing() -> DailyBriefingResponse:
 
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest) -> ChatResponse:
+    from .runtime_notices import blocking_notice, user_facing_reply
+
+    notice = blocking_notice(Path(app.state.settings.state_dir))
+    if notice and notice.get("kind") == "service_mode":
+        # Maintenance fully blocks the agent turn for everyone.
+        return ChatResponse(
+            conversation_id=request.conversation_id or "service-mode",
+            message_id=f"svc-{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}",
+            answer=user_facing_reply(notice),
+            events=[],
+            mission_id=None,
+            duration_ms=0,
+        )
+    if (
+        notice
+        and notice.get("kind") == "model_overload"
+        and not current_actor().is_owner
+    ):
+        # Guests/TG users get an immediate overload reply; the owner keeps
+        # probing the model so the detector can clear when latency recovers.
+        return ChatResponse(
+            conversation_id=request.conversation_id or "model-overload",
+            message_id=f"ovl-{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}",
+            answer=user_facing_reply(notice),
+            events=[],
+            mission_id=None,
+            duration_ms=0,
+        )
     try:
         return await app.state.agent.chat(
             request.message,
@@ -2020,8 +2084,51 @@ def _stream_error_envelope(exc: Exception) -> dict[str, Any]:
 
 @app.post("/api/chat/stream")
 async def chat_stream(request: ChatRequest) -> StreamingResponse:
+    from .runtime_notices import blocking_notice, user_facing_reply
+
     if current_actor().preset_key == "guest":
         raise HTTPException(status_code=403, detail="Guest streaming is not available")
+
+    notice = blocking_notice(Path(app.state.settings.state_dir))
+    if notice and (
+        notice.get("kind") == "service_mode"
+        or (notice.get("kind") == "model_overload" and not current_actor().is_owner)
+    ):
+        answer = user_facing_reply(notice)
+        kind = str(notice.get("kind") or "notice")
+        conversation_id = request.conversation_id or kind
+        message_id = f"{kind[:3]}-{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}"
+
+        async def _notice_mode_lines():
+            yield (
+                json.dumps(
+                    {
+                        "type": "meta",
+                        "conversation_id": conversation_id,
+                        "message_id": message_id,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            ).encode()
+            yield (
+                json.dumps({"type": "delta", "content": answer}, ensure_ascii=False) + "\n"
+            ).encode()
+            yield (
+                json.dumps(
+                    {
+                        "type": "done",
+                        "conversation_id": conversation_id,
+                        "message_id": message_id,
+                        "answer": answer,
+                        "events": [],
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            ).encode()
+
+        return StreamingResponse(_notice_mode_lines(), media_type="application/x-ndjson")
 
     stream: Any = None
     try:

@@ -2098,6 +2098,7 @@ class ToolRegistry:
                     "file_id": "Uploaded/indexed archive file id",
                     "path": "Local archive path",
                     "prefix": "Optional member name prefix filter",
+                    "password": "Password for encrypted zip/7z/rar archives",
                 },
                 handler=_documents_archive_list,
             )
@@ -2107,7 +2108,7 @@ class ToolRegistry:
                 name="documents.archive.extract",
                 description=(
                     "Safely extract archive members into document-outputs "
-                    "(path traversal and size bomb protected)."
+                    "(path traversal and size bomb protected). Supports passworded zip/7z/rar."
                 ),
                 category="documents",
                 input_schema={
@@ -2115,6 +2116,7 @@ class ToolRegistry:
                     "path": "Local archive path",
                     "members": "Optional list of member names; default extracts all safe members",
                     "output_name": "Optional output directory name under document-outputs",
+                    "password": "Password for encrypted zip/7z/rar archives",
                 },
                 handler=_documents_archive_extract,
             )
@@ -2124,7 +2126,7 @@ class ToolRegistry:
                 name="documents.archive.read_member",
                 description=(
                     "Read one archive member with type identification and optional "
-                    "document extraction."
+                    "document extraction. Supports passworded zip/7z/rar."
                 ),
                 category="documents",
                 input_schema={
@@ -2134,6 +2136,7 @@ class ToolRegistry:
                     "max_bytes": "Maximum bytes to read",
                     "as_document": "If true, also parse member as a document when possible",
                     "max_chars": "Max document chars when as_document=true",
+                    "password": "Password for encrypted zip/7z/rar archives",
                 },
                 handler=_documents_archive_read_member,
             )
@@ -2167,6 +2170,7 @@ class ToolRegistry:
                     "regex": "Treat query as regex",
                     "case_sensitive": "Case-sensitive match",
                     "max_members": "Maximum members to scan",
+                    "password": "Password for encrypted zip/7z/rar archives",
                 },
                 handler=_documents_archive_search,
             )
@@ -7386,11 +7390,23 @@ def _documents_file_probe(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResp
     )
 
 
+def _archive_password_arg(args: dict[str, Any]) -> str | None:
+    raw = args.get("password")
+    if raw is None:
+        return None
+    text = str(raw)
+    return text if text else None
+
+
 def _documents_archive_list(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     try:
         path = _document_path_only(ctx, args)
         surfer = _document_surfer_for(ctx)
-        result = surfer.list_archive(path, prefix=str(args.get("prefix") or ""))
+        result = surfer.list_archive(
+            path,
+            prefix=str(args.get("prefix") or ""),
+            password=_archive_password_arg(args),
+        )
     except (ValueError, DocumentSurferError) as exc:
         return ToolRunResponse(tool="documents.archive.list", ok=False, summary=str(exc))
     return ToolRunResponse(
@@ -7417,6 +7433,7 @@ def _documents_archive_extract(ctx: ToolContext, args: dict[str, Any]) -> ToolRu
             path,
             members=members,
             output_name=args.get("output_name"),
+            password=_archive_password_arg(args),
         )
         # index extracted files when possible
         indexed = []
@@ -7457,6 +7474,7 @@ def _documents_archive_read_member(ctx: ToolContext, args: dict[str, Any]) -> To
             max_bytes=max_bytes,
             as_document=_bool_arg(args.get("as_document"), default=False),
             max_chars=max_chars,
+            password=_archive_password_arg(args),
         )
     except (ValueError, DocumentSurferError) as exc:
         return ToolRunResponse(tool="documents.archive.read_member", ok=False, summary=str(exc))
@@ -7508,6 +7526,7 @@ def _documents_archive_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRun
             regex=_bool_arg(args.get("regex"), default=False),
             case_sensitive=_bool_arg(args.get("case_sensitive"), default=False),
             max_members=max_members,
+            password=_archive_password_arg(args),
         )
     except (ValueError, DocumentSurferError) as exc:
         return ToolRunResponse(tool="documents.archive.search", ok=False, summary=str(exc))

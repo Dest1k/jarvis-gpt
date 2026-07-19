@@ -186,7 +186,18 @@ export default function AdminPage() {
   const [presetName, setPresetName] = useState("");
   const [presetDescription, setPresetDescription] = useState("");
   const [presetPermissions, setPresetPermissions] = useState<string[]>([]);
+  const [basePresetKey, setBasePresetKey] = useState("");
+  const [expandedPreset, setExpandedPreset] = useState<string>("");
   const [showPresetForm, setShowPresetForm] = useState(false);
+  const [showUserForm, setShowUserForm] = useState(false);
+  const [userKind, setUserKind] = useState<"local" | "telegram">("local");
+  const [userDisplayName, setUserDisplayName] = useState("");
+  const [userPreset, setUserPreset] = useState("guest");
+  const [userTelegramId, setUserTelegramId] = useState("");
+  const [userUsername, setUserUsername] = useState("");
+  const [serviceEnabled, setServiceEnabled] = useState(false);
+  const [serviceMessage, setServiceMessage] = useState("");
+  const [serviceUntil, setServiceUntil] = useState("");
   const deferredQuery = useDeferredValue(query);
 
   const loadCatalog = useCallback(async () => {
@@ -356,16 +367,102 @@ export default function AdminPage() {
           key: presetKey.trim(),
           name: presetName.trim(),
           description: presetDescription.trim(),
-          security_ids: presetPermissions
+          security_ids: presetPermissions,
+          base_preset_key: basePresetKey.trim() || null
         })
       });
       setPresetKey("");
       setPresetName("");
       setPresetDescription("");
       setPresetPermissions([]);
+      setBasePresetKey("");
       setShowPresetForm(false);
     });
   }
+
+  function applyBasePreset(key: string) {
+    setBasePresetKey(key);
+    const base = presets.find((item) => item.preset_key === key);
+    if (!base?.security_ids?.length) return;
+    setPresetPermissions((current) =>
+      Array.from(new Set([...(base.security_ids || []), ...current]))
+    );
+  }
+
+  async function createUserAccount() {
+    await mutate("create-user", async () => {
+      const body: Record<string, unknown> = {
+        kind: userKind,
+        display_name: userDisplayName.trim(),
+        preset_key: userPreset || "guest",
+        reason: CHANGE_REASON
+      };
+      if (userKind === "telegram") {
+        const id = Number(userTelegramId.trim());
+        if (!Number.isFinite(id) || id <= 0) {
+          throw new Error("Укажите корректный Telegram user/chat id");
+        }
+        body.telegram_user_id = id;
+        body.username = userUsername.trim() || null;
+        body.first_name = userDisplayName.trim() || null;
+      }
+      await requestJson("/api/admin/users", {
+        method: "POST",
+        body: JSON.stringify(body)
+      });
+      setShowUserForm(false);
+      setUserDisplayName("");
+      setUserTelegramId("");
+      setUserUsername("");
+      setUserKind("local");
+      setUserPreset("guest");
+    });
+  }
+
+  async function deleteSelectedUser() {
+    if (!selected) return;
+    if (!window.confirm(`Удалить пользователя ${userTitle(selected)}?`)) return;
+    await mutate("delete-user", async () => {
+      await requestJson(`/api/admin/users/${selected.id}`, {
+        method: "DELETE",
+        body: JSON.stringify({ reason: CHANGE_REASON })
+      });
+      setSelectedId("");
+    });
+  }
+
+  async function saveServiceMode() {
+    await mutate("service-mode", async () => {
+      await requestJson("/api/admin/runtime/service-mode", {
+        method: "PUT",
+        body: JSON.stringify({
+          enabled: serviceEnabled,
+          message: serviceMessage.trim(),
+          until: serviceUntil.trim() || null,
+          reason: CHANGE_REASON
+        })
+      });
+    });
+  }
+
+  useEffect(() => {
+    void (async () => {
+      try {
+        const payload = await requestJson("/api/admin/runtime/notices");
+        if (payload && typeof payload === "object") {
+          const mode = (payload as Record<string, unknown>).service_mode;
+          if (mode && typeof mode === "object") {
+            const m = mode as Record<string, unknown>;
+            setServiceEnabled(Boolean(m.enabled));
+            setServiceMessage(String(m.message || ""));
+            setServiceUntil(String(m.until || ""));
+          }
+        }
+      } catch {
+        // Owner may not have loaded admin.runtime.service_mode yet on first paint.
+      }
+    })();
+  }, []);
 
   return (
     <main className={styles.page}>
@@ -397,12 +494,114 @@ export default function AdminPage() {
       {error ? <div className={styles.errorBanner}>{error}</div> : null}
       {notice ? <div className={styles.noticeBanner}><Check size={15} /> {notice}</div> : null}
 
+      <section className={`${styles.panel} ${styles.presetPanel}`}>
+        <div className={styles.panelHeader}>
+          <div>
+            <h2>Режим техработ</h2>
+            <span>Баннер в UI и ответ бота в Telegram / чате</span>
+          </div>
+        </div>
+        <div className={styles.formFields}>
+          <label>
+            <span>Состояние</span>
+            <select
+              value={serviceEnabled ? "on" : "off"}
+              onChange={(event) => setServiceEnabled(event.target.value === "on")}
+            >
+              <option value="off">Выключен</option>
+              <option value="on">Включён (техработы)</option>
+            </select>
+          </label>
+          <label>
+            <span>До (ISO, опционально)</span>
+            <input
+              value={serviceUntil}
+              onChange={(event) => setServiceUntil(event.target.value)}
+              placeholder="2026-07-19T18:00:00+03:00"
+            />
+          </label>
+          <label className={styles.fullField}>
+            <span>Сообщение пользователям</span>
+            <input
+              value={serviceMessage}
+              onChange={(event) => setServiceMessage(event.target.value)}
+              placeholder="Ведутся технические работы…"
+            />
+          </label>
+        </div>
+        <div className={styles.formActions}>
+          <button
+            className={styles.primaryButton}
+            disabled={working !== ""}
+            onClick={() => void saveServiceMode()}
+          >
+            {working === "service-mode" ? <Loader2 className={styles.spin} size={15} /> : <Check size={15} />}
+            Сохранить режим
+          </button>
+        </div>
+      </section>
+
       <div className={styles.layout}>
         <section className={styles.panel}>
           <div className={styles.panelHeader}>
-            <div><h2>Учётные записи</h2><span>Все, кто когда-либо написал боту</span></div>
-            <span className={styles.count}>{matchingUsers}</span>
+            <div><h2>Учётные записи</h2><span>Локальные и Telegram, в т.ч. заранее добавленные</span></div>
+            <div className={styles.headerActions}>
+              <button className={styles.primaryButton} onClick={() => setShowUserForm((v) => !v)}>
+                <Plus size={15} /> Добавить
+              </button>
+              <span className={styles.count}>{matchingUsers}</span>
+            </div>
           </div>
+          {showUserForm ? (
+            <div className={styles.presetForm}>
+              <div className={styles.formFields}>
+                <label>
+                  <span>Тип</span>
+                  <select value={userKind} onChange={(event) => setUserKind(event.target.value as "local" | "telegram")}>
+                    <option value="local">Локальная</option>
+                    <option value="telegram">Telegram</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Пресет</span>
+                  <select value={userPreset} onChange={(event) => setUserPreset(event.target.value)}>
+                    {presets.map((preset) => (
+                      <option key={preset.preset_key} value={preset.preset_key}>
+                        {preset.display_name} ({preset.preset_key})
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className={styles.fullField}>
+                  <span>Имя / display name</span>
+                  <input value={userDisplayName} onChange={(event) => setUserDisplayName(event.target.value)} placeholder="Иван" />
+                </label>
+                {userKind === "telegram" ? (
+                  <>
+                    <label>
+                      <span>Telegram ID</span>
+                      <input value={userTelegramId} onChange={(event) => setUserTelegramId(event.target.value)} placeholder="123456789" />
+                    </label>
+                    <label>
+                      <span>@username</span>
+                      <input value={userUsername} onChange={(event) => setUserUsername(event.target.value)} placeholder="ivan" />
+                    </label>
+                  </>
+                ) : null}
+              </div>
+              <div className={styles.formActions}>
+                <button className={styles.secondaryButton} onClick={() => setShowUserForm(false)}>Отмена</button>
+                <button
+                  className={styles.primaryButton}
+                  disabled={working !== "" || (userKind === "telegram" && !userTelegramId.trim())}
+                  onClick={() => void createUserAccount()}
+                >
+                  {working === "create-user" ? <Loader2 className={styles.spin} size={15} /> : <Plus size={15} />}
+                  Создать (guest по умолчанию)
+                </button>
+              </div>
+            </div>
+          ) : null}
           <label className={styles.searchBox}>
             <Search size={15} />
             <input
@@ -479,6 +678,15 @@ export default function AdminPage() {
                     <button onClick={() => void savePreset()} disabled={working !== "" || presetDraft === selected.preset_key}>Назначить</button>
                   </div>
                 </label>
+                <div className={styles.formActions}>
+                  <button
+                    className={styles.secondaryButton}
+                    disabled={working !== "" || selected.preset_key === "owner"}
+                    onClick={() => void deleteSelectedUser()}
+                  >
+                    <Ban size={15} /> Удалить пользователя
+                  </button>
+                </div>
               </div>
 
               <div className={styles.permissionHeader}>
@@ -526,13 +734,53 @@ export default function AdminPage() {
           <button className={styles.primaryButton} onClick={() => setShowPresetForm((value) => !value)}><Plus size={15} /> Новый пресет</button>
         </div>
         <div className={styles.presetGrid}>
-          {presets.map((preset) => (
-            <article key={preset.preset_key} className={styles.presetCard}>
-              <div><strong>{preset.display_name}</strong><code>{preset.preset_key}</code></div>
-              <p>{preset.description || (preset.kind === "builtin" ? "Стандартный пресет Jarvis" : "Пользовательский пресет")}</p>
-              <span>{preset.security_ids?.length || 0} прав · v{preset.version || 1} · {preset.kind}</span>
-            </article>
-          ))}
+          {presets.map((preset) => {
+            const expanded = expandedPreset === preset.preset_key;
+            const ids = preset.security_ids || [];
+            return (
+              <article key={preset.preset_key} className={styles.presetCard}>
+                <div>
+                  <strong>{preset.display_name}</strong>
+                  <code>{preset.preset_key}</code>
+                </div>
+                <p>
+                  {preset.description ||
+                    (preset.kind === "builtin" ? "Стандартный пресет Jarvis" : "Пользовательский пресет")}
+                </p>
+                <span>
+                  {ids.length} прав · v{preset.version || 1} · {preset.kind}
+                </span>
+                <button
+                  className={styles.secondaryButton}
+                  type="button"
+                  onClick={() =>
+                    setExpandedPreset((current) =>
+                      current === preset.preset_key ? "" : preset.preset_key
+                    )
+                  }
+                >
+                  {expanded ? "Скрыть права" : "Показать набор прав"}
+                </button>
+                {expanded ? (
+                  <ul className={styles.presetIdList}>
+                    {ids.length ? (
+                      ids.map((securityId) => {
+                        const meta = securityIds.find((item) => item.security_id === securityId);
+                        return (
+                          <li key={securityId}>
+                            <code>{securityId}</code>
+                            <small>{meta?.description || "—"}</small>
+                          </li>
+                        );
+                      })
+                    ) : (
+                      <li><small>В пресете нет явных grant (owner имеет полный доступ отдельно).</small></li>
+                    )}
+                  </ul>
+                ) : null}
+              </article>
+            );
+          })}
         </div>
 
         {showPresetForm ? (
@@ -540,9 +788,26 @@ export default function AdminPage() {
             <div className={styles.formFields}>
               <label><span>Ключ</span><input value={presetKey} onChange={(event) => setPresetKey(event.target.value.toLowerCase().replace(/[^a-z0-9_-]/g, ""))} placeholder="researcher" /></label>
               <label><span>Название</span><input value={presetName} onChange={(event) => setPresetName(event.target.value)} placeholder="Исследователь" /></label>
+              <label>
+                <span>Базовый built-in / пресет</span>
+                <select
+                  value={basePresetKey}
+                  onChange={(event) => applyBasePreset(event.target.value)}
+                >
+                  <option value="">— вручную, без базы —</option>
+                  {presets.map((preset) => (
+                    <option key={preset.preset_key} value={preset.preset_key}>
+                      {preset.display_name} ({preset.preset_key}) · {preset.security_ids?.length || 0} прав
+                    </option>
+                  ))}
+                </select>
+              </label>
               <label className={styles.fullField}><span>Описание изменения</span><input value={presetDescription} onChange={(event) => setPresetDescription(event.target.value)} placeholder="Для безопасного поиска и работы с памятью" /></label>
             </div>
-            <div className={styles.presetPermissionHeader}><strong>Security ID</strong><span>Выбрано: {presetPermissions.length}</span></div>
+            <div className={styles.presetPermissionHeader}>
+              <strong>Security ID</strong>
+              <span>Выбрано: {presetPermissions.length}{basePresetKey ? ` · база: ${basePresetKey}` : ""}</span>
+            </div>
             <div className={styles.checkboxGrid}>
               {securityIds.filter((item) => item.status === "active").map((item) => (
                 <label key={item.security_id}>

@@ -19545,14 +19545,16 @@ _OPERATOR_CONFUSABLE_TRANSLATION: dict[int, str | None] = {
 
 
 def _fold_operator_confusables(text: str) -> str:
-    """Fold same-meaning character variants so phrasing quirks don't defeat command
-    recognition. Copy-pasted requests routinely carry non-breaking or zero-width
-    spaces, and ``ё``/``е`` are used interchangeably. This only changes the byte
-    shape of characters — never which words are present — so intent detection sees
-    the plain forms the matchers are written against."""
+    """Normalize operator text for intent detection.
 
-    folded = unicodedata.normalize("NFC", str(text or ""))
-    return folded.translate(_OPERATOR_CONFUSABLE_TRANSLATION)
+    Pipeline (see ``operator_text``): confusable fold (NBSP/ZW*/ё→е), scrub of
+    keyboard-smash noise, and wrong-layout flip when the flipped form contains
+    known command stems. Paths/URLs are left intact.
+    """
+
+    from .operator_text import normalize_operator_message
+
+    return normalize_operator_message(text)
 
 
 def _operator_structural_text(message: str) -> str:

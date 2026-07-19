@@ -6,7 +6,9 @@ import os
 import sqlite3
 import uuid
 from collections.abc import Callable
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -14,13 +16,18 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from .admin_models import (
     PermissionPresetCreateRequest,
     PermissionPresetUpdateRequest,
+    ServiceModeUpdateRequest,
     TelegramSessionRequest,
     TelegramSessionResponse,
+    UserCreateRequest,
+    UserDeleteRequest,
     UserPermissionUpdateRequest,
     UserPresetAssignmentRequest,
     UserStatusUpdateRequest,
 )
 from .authorization import (
+    BUILTIN_PRESET_KEYS,
+    DEFAULT_PRESET_KEY,
     OWNER_RECOVERY_SECURITY_IDS,
     AuthorizationDecision,
     AuthorizationError,
@@ -29,11 +36,88 @@ from .authorization import (
     ConcurrentPolicyUpdateError,
     current_actor,
 )
+from .runtime_notices import (
+    collect_notices,
+    get_service_mode,
+    set_service_mode,
+)
+
+
+def _telegram_pre_provision_path(request: Request) -> Path:
+    return Path(request.app.state.settings.state_dir) / "telegram_pre_provisioned.json"
+
+
+def _remember_telegram_pre_provision(
+    request: Request, *, telegram_user_id: int, user_id: str
+) -> None:
+    """Persist pre-provisioned TG ids so the bridge allowlist can admit them."""
+
+    path = _telegram_pre_provision_path(request)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    except (OSError, json.JSONDecodeError):
+        raw = {}
+    items = raw.get("chat_ids") if isinstance(raw, dict) else None
+    chat_ids = {
+        int(item)
+        for item in (items or [])
+        if str(item).lstrip("-").isdigit()
+    }
+    chat_ids.add(int(telegram_user_id))
+    users = dict(raw.get("users") or {}) if isinstance(raw, dict) else {}
+    users[str(telegram_user_id)] = {
+        "user_id": user_id,
+        "updated_at": _now(),
+    }
+    path.write_text(
+        json.dumps(
+            {
+                "chat_ids": sorted(chat_ids),
+                "users": users,
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _forget_telegram_pre_provision(request: Request, *, telegram_user_id: int | None) -> None:
+    if telegram_user_id is None:
+        return
+    path = _telegram_pre_provision_path(request)
+    if not path.is_file():
+        return
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    chat_ids = {
+        int(item)
+        for item in (raw.get("chat_ids") or [])
+        if str(item).lstrip("-").isdigit()
+    }
+    chat_ids.discard(int(telegram_user_id))
+    users = dict(raw.get("users") or {})
+    users.pop(str(telegram_user_id), None)
+    path.write_text(
+        json.dumps(
+            {"chat_ids": sorted(chat_ids), "users": users},
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
 ADMIN_API_CAPABILITIES: tuple[CapabilityDefinition, ...] = (
     CapabilityDefinition(
         "admin.users.list",
-        "List registered users",
+        "Список учётных записей (локальных и Telegram)",
         "admin",
         2,
         source="admin_api",
@@ -41,14 +125,14 @@ ADMIN_API_CAPABILITIES: tuple[CapabilityDefinition, ...] = (
     ),
     CapabilityDefinition(
         "admin.users.permissions.list",
-        "Inspect a user's effective permissions",
+        "Просмотр эффективных прав конкретного пользователя",
         "admin",
         3,
         source="admin_api",
     ),
     CapabilityDefinition(
         "admin.users.status.update",
-        "Suspend, reactivate, or delete a user",
+        "Приостановка, реактивация или удаление пользователя",
         "admin",
         3,
         True,
@@ -56,7 +140,7 @@ ADMIN_API_CAPABILITIES: tuple[CapabilityDefinition, ...] = (
     ),
     CapabilityDefinition(
         "admin.users.preset.assign",
-        "Assign a permission preset to a user",
+        "Назначение пресета прав пользователю",
         "admin",
         4,
         True,
@@ -64,7 +148,7 @@ ADMIN_API_CAPABILITIES: tuple[CapabilityDefinition, ...] = (
     ),
     CapabilityDefinition(
         "admin.users.permission.set",
-        "Set a direct user permission",
+        "Прямое разрешение (grant) security_id пользователю",
         "admin",
         4,
         True,
@@ -72,7 +156,23 @@ ADMIN_API_CAPABILITIES: tuple[CapabilityDefinition, ...] = (
     ),
     CapabilityDefinition(
         "admin.users.permission.revoke",
-        "Revoke a direct user permission",
+        "Снятие прямого override права у пользователя",
+        "admin",
+        4,
+        True,
+        source="admin_api",
+    ),
+    CapabilityDefinition(
+        "admin.users.create",
+        "Создание локальной или Telegram-учётной записи (в т.ч. заранее, до первого сообщения)",
+        "admin",
+        4,
+        True,
+        source="admin_api",
+    ),
+    CapabilityDefinition(
+        "admin.users.delete",
+        "Полное удаление учётной записи и её внешних identity",
         "admin",
         4,
         True,
@@ -80,7 +180,7 @@ ADMIN_API_CAPABILITIES: tuple[CapabilityDefinition, ...] = (
     ),
     CapabilityDefinition(
         "admin.security_ids.list",
-        "List registered security identifiers",
+        "Каталог всех security_id: id, русское описание, категория, риск",
         "admin",
         2,
         source="admin_api",
@@ -88,7 +188,7 @@ ADMIN_API_CAPABILITIES: tuple[CapabilityDefinition, ...] = (
     ),
     CapabilityDefinition(
         "admin.presets.list",
-        "List permission presets",
+        "Список пресетов прав (built-in и пользовательские) с полным набором security_id",
         "admin",
         2,
         source="admin_api",
@@ -96,14 +196,14 @@ ADMIN_API_CAPABILITIES: tuple[CapabilityDefinition, ...] = (
     ),
     CapabilityDefinition(
         "admin.audit.list",
-        "Read security administration audit",
+        "Журнал аудита изменений IAM (роли, права, статусы)",
         "admin",
         3,
         source="admin_api",
     ),
     CapabilityDefinition(
         "admin.presets.create",
-        "Create a custom permission preset",
+        "Создание пользовательского пресета прав (вручную или на базе built-in)",
         "admin",
         4,
         True,
@@ -111,9 +211,17 @@ ADMIN_API_CAPABILITIES: tuple[CapabilityDefinition, ...] = (
     ),
     CapabilityDefinition(
         "admin.presets.update",
-        "Publish a new custom preset version",
+        "Публикация новой версии пользовательского пресета",
         "admin",
         4,
+        True,
+        source="admin_api",
+    ),
+    CapabilityDefinition(
+        "admin.runtime.service_mode",
+        "Включение/выключение режима техработ и просмотр runtime-уведомлений",
+        "admin",
+        3,
         True,
         source="admin_api",
     ),
@@ -559,6 +667,235 @@ def update_user_status(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+@router.post(
+    "/api/admin/users",
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_security_id("admin.users.create"))],
+)
+def create_user(request: Request, payload: UserCreateRequest) -> dict[str, Any]:
+    """Create a local account or pre-provision a Telegram identity (default guest)."""
+
+    service = _authorization(request)
+    preset_key = (payload.preset_key or DEFAULT_PRESET_KEY).strip()
+    if preset_key == "owner":
+        raise HTTPException(status_code=400, detail="Cannot assign owner via user create")
+    # Ensure the preset exists.
+    try:
+        _preset_payload(service, preset_key)
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            raise HTTPException(status_code=400, detail=f"Unknown preset: {preset_key}") from exc
+        raise
+    reason = payload.reason or "Создано через web-панель администратора"
+    if payload.kind == "telegram":
+        if payload.telegram_user_id is None:
+            raise HTTPException(status_code=400, detail="telegram_user_id is required")
+        realm_id = (payload.realm_id or "default").strip() or "default"
+        try:
+            identity = service.upsert_external_identity(
+                provider="telegram",
+                realm_id=realm_id,
+                provider_subject_id=payload.telegram_user_id,
+                username=payload.username,
+                first_name=payload.first_name or payload.display_name or None,
+                last_name=payload.last_name,
+                bootstrap_preset=preset_key if preset_key in BUILTIN_PRESET_KEYS else "guest",
+            )
+        except (AuthorizationError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        user_id = str(identity["user_id"])
+        if not identity.get("created") and preset_key:
+            # Already existed — still allow re-pointing the preset unless owner.
+            with suppress(AuthorizationError, ValueError):
+                service.assign_preset(
+                    user_id=user_id,
+                    preset_key=preset_key,
+                    assigned_by=current_actor().user_id,
+                    reason=reason,
+                )
+        elif preset_key not in BUILTIN_PRESET_KEYS:
+            try:
+                service.assign_preset(
+                    user_id=user_id,
+                    preset_key=preset_key,
+                    assigned_by=current_actor().user_id,
+                    reason=reason,
+                )
+            except (AuthorizationError, ValueError) as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if payload.display_name.strip():
+            with service.storage.transaction(immediate=True) as conn:
+                conn.execute(
+                    "UPDATE users SET display_name = ?, updated_at = ? WHERE id = ?",
+                    (payload.display_name.strip()[:160], _now(), user_id),
+                )
+        with service.storage.transaction(immediate=True) as conn:
+            service.append_security_audit(
+                conn,
+                action="user.create.telegram",
+                target_type="user",
+                target_id=user_id,
+                target_user_id=user_id,
+                reason=reason,
+                after={
+                    "provider": "telegram",
+                    "provider_subject_id": str(payload.telegram_user_id),
+                    "preset_key": preset_key,
+                    "created": bool(identity.get("created")),
+                },
+            )
+        _remember_telegram_pre_provision(
+            request,
+            telegram_user_id=int(payload.telegram_user_id),
+            user_id=user_id,
+        )
+        page = service.list_users_page(limit=1, offset=0, search=str(payload.telegram_user_id))
+        users = list(page.get("users") or [])
+        match = next((u for u in users if str(u.get("id")) == user_id), None)
+        return match or {
+            "id": user_id,
+            "provider": "telegram",
+            "provider_subject_id": str(payload.telegram_user_id),
+            "preset_key": preset_key,
+            "status": identity.get("status", "active"),
+            "created": bool(identity.get("created")),
+        }
+
+    # Local account
+    now = _now()
+    user_id = str(uuid.uuid4())
+    display = (payload.display_name or "Локальный пользователь").strip()[:160]
+    try:
+        with service.storage.transaction(immediate=True) as conn:
+            preset_row = conn.execute(
+                "SELECT id FROM permission_presets WHERE preset_key = ? AND archived_at IS NULL",
+                (preset_key,),
+            ).fetchone()
+            if preset_row is None:
+                raise HTTPException(status_code=400, detail=f"Unknown preset: {preset_key}")
+            conn.execute(
+                """
+                INSERT INTO users(
+                    id, status, display_name, locale, policy_epoch, created_at,
+                    updated_at, first_seen_at, last_seen_at
+                ) VALUES (?, 'active', ?, '', 1, ?, ?, ?, ?)
+                """,
+                (user_id, display, now, now, now, now),
+            )
+            conn.execute(
+                """
+                INSERT INTO user_preset_assignments(
+                    id, user_id, preset_id, assigned_by, assigned_at, reason
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    _new_id("assignment"),
+                    user_id,
+                    str(preset_row["id"]),
+                    current_actor().user_id,
+                    now,
+                    reason,
+                ),
+            )
+            service.append_security_audit(
+                conn,
+                action="user.create.local",
+                target_type="user",
+                target_id=user_id,
+                target_user_id=user_id,
+                reason=reason,
+                after={"preset_key": preset_key, "display_name": display},
+            )
+    except HTTPException:
+        raise
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(status_code=409, detail="Could not create user") from exc
+    return {
+        "id": user_id,
+        "status": "active",
+        "display_name": display,
+        "preset_key": preset_key,
+        "provider": "local",
+        "created": True,
+    }
+
+
+@router.delete(
+    "/api/admin/users/{user_id}",
+    dependencies=[Depends(require_security_id("admin.users.delete"))],
+)
+def delete_user(
+    request: Request, user_id: str, payload: UserDeleteRequest
+) -> dict[str, Any]:
+    service = _authorization(request)
+    _assert_target_manageable(service, user_id)
+    try:
+        result = service.set_user_status(
+            user_id=user_id,
+            status="deleted",
+            reason=payload.reason,
+            expected_row_version=_expected_user_row_version(request, user_id),
+        )
+    except AuthorizationError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    with service.storage.transaction(immediate=True) as conn:
+        # Soft-delete is enough for IAM; also revoke live sessions so TG/local stop.
+        conn.execute(
+            "UPDATE user_sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL",
+            (_now(), user_id),
+        )
+        service.append_security_audit(
+            conn,
+            action="user.delete",
+            target_type="user",
+            target_id=user_id,
+            target_user_id=user_id,
+            reason=payload.reason,
+            after={"status": "deleted", "sessions_revoked": True},
+        )
+    return {"ok": True, "user_id": user_id, **(result if isinstance(result, dict) else {})}
+
+
+@router.get(
+    "/api/admin/runtime/notices",
+    dependencies=[Depends(require_security_id("admin.runtime.service_mode"))],
+)
+def admin_runtime_notices(request: Request) -> dict[str, Any]:
+    state_dir = Path(request.app.state.settings.state_dir)
+    return {
+        "service_mode": get_service_mode(state_dir),
+        "notices": collect_notices(state_dir),
+    }
+
+
+@router.put(
+    "/api/admin/runtime/service-mode",
+    dependencies=[Depends(require_security_id("admin.runtime.service_mode"))],
+)
+def admin_set_service_mode(
+    request: Request, payload: ServiceModeUpdateRequest
+) -> dict[str, Any]:
+    state_dir = Path(request.app.state.settings.state_dir)
+    service = set_service_mode(
+        state_dir,
+        enabled=payload.enabled,
+        message=payload.message,
+        until=payload.until,
+    )
+    auth = _authorization(request)
+    with auth.storage.transaction(immediate=True) as conn:
+        auth.append_security_audit(
+            conn,
+            action="runtime.service_mode",
+            target_type="runtime",
+            target_id="service_mode",
+            target_user_id=None,
+            reason=payload.reason,
+            after=service,
+        )
+    return {"ok": True, "service_mode": service, "notices": collect_notices(state_dir)}
+
+
 @router.put(
     "/api/admin/users/{user_id}/preset",
     dependencies=[Depends(require_security_id("admin.users.preset.assign"))],
@@ -742,10 +1079,28 @@ def list_presets(request: Request) -> list[dict[str, Any]]:
 )
 def create_preset(request: Request, payload: PermissionPresetCreateRequest) -> dict[str, Any]:
     service = _authorization(request)
-    capabilities = _validate_security_ids(service, payload.security_ids)
+    merged_ids = list(payload.security_ids)
+    base_key = (payload.base_preset_key or "").strip() or None
+    if base_key:
+        try:
+            base = _preset_payload(service, base_key)
+        except HTTPException as exc:
+            if exc.status_code == 404:
+                raise HTTPException(
+                    status_code=400, detail=f"Unknown base preset: {base_key}"
+                ) from exc
+            raise
+        # Base first, then explicit extras — order preserved, duplicates dropped.
+        merged_ids = list(
+            dict.fromkeys([*list(base.get("security_ids") or []), *merged_ids])
+        )
+    capabilities = _validate_security_ids(service, merged_ids)
     now = _now()
     preset_id = _new_id("preset")
     version_id = _new_id("presetv")
+    change_reason = payload.description
+    if base_key and not change_reason:
+        change_reason = f"На базе пресета {base_key}"
     try:
         with service.storage.transaction(immediate=True) as conn:
             conn.execute(
@@ -777,7 +1132,7 @@ def create_preset(request: Request, payload: PermissionPresetCreateRequest) -> d
                     current_actor().user_id,
                     now,
                     now,
-                    payload.description,
+                    change_reason,
                 ),
             )
             conn.executemany(
@@ -798,10 +1153,11 @@ def create_preset(request: Request, payload: PermissionPresetCreateRequest) -> d
                 target_type="permission_preset",
                 target_id=preset_id,
                 target_user_id=None,
-                reason=payload.description,
+                reason=change_reason,
                 after={
                     "preset_key": payload.key,
                     "version": 1,
+                    "base_preset_key": base_key,
                     "security_ids": [item for item, _ in capabilities],
                 },
             )

@@ -352,7 +352,12 @@ class LLMRouter:
         max_tokens: int | None = None,
         thinking_enabled: bool = True,
     ) -> LLMResult:
+        import time as _time
+
+        from .runtime_notices import record_llm_sample
+
         if not self.settings.llm_enabled:
+            record_llm_sample(error=True)
             return LLMResult(
                 ok=False,
                 content="",
@@ -376,6 +381,7 @@ class LLMRouter:
         priority = self._priority.get()
         attempt = 1
         data: dict[str, Any] | None = None
+        started = _time.monotonic()
         while True:
             lease = await self._acquire_admission(priority)
             preempted = False
@@ -390,6 +396,7 @@ class LLMRouter:
                 if _is_transient_llm_error(exc) and attempt < _LLM_MAX_ATTEMPTS:
                     transient_error = exc
                 else:
+                    record_llm_sample(error=True)
                     return LLMResult(
                         ok=False,
                         content="",
@@ -407,8 +414,10 @@ class LLMRouter:
             break
 
         assert data is not None
+        latency = _time.monotonic() - started
         choices = data.get("choices") or []
         if not choices:
+            record_llm_sample(latency_sec=latency, error=True)
             return LLMResult(
                 ok=False,
                 content="",
@@ -419,6 +428,7 @@ class LLMRouter:
         content = (choices[0].get("message") or {}).get("content") or ""
         content = content.strip()
         if detect_repeated_token_degeneration(content):
+            record_llm_sample(latency_sec=latency, error=True)
             return LLMResult(
                 ok=False,
                 content="",
@@ -430,6 +440,7 @@ class LLMRouter:
                 raw=data,
                 failure_scope="request",
             )
+        record_llm_sample(latency_sec=latency, error=False)
         return LLMResult(ok=True, content=content, raw=data)
 
     async def stream_complete(

@@ -17,6 +17,7 @@ import {
   Mic,
   MicOff,
   MessageSquare,
+  Network,
   Paperclip,
   Plus,
   Play,
@@ -94,6 +95,12 @@ type RuntimeStatus = {
   counters: Record<string, number>;
   health: DiagnosticCheck[];
   recent_events: RuntimeEvent[];
+  notices?: RuntimeNotice[];
+  service_mode?: {
+    enabled?: boolean;
+    message?: string;
+    until?: string | null;
+  };
 };
 
 type RuntimeEvent = {
@@ -179,9 +186,20 @@ type ChatLine = {
   durationMs?: number | null;
   pending?: boolean;
   startedAt?: number | null;
+  /** Wall-clock bind for the message (ms since epoch). Shown in bubble meta. */
+  createdAt?: number | null;
   feedback?: "up" | "down" | null;
   verification?: { verdict: string; repaired?: boolean } | null;
   webAnswer?: WebAnswerSummary | null;
+};
+
+type RuntimeNotice = {
+  kind: string;
+  active: boolean;
+  title: string;
+  message: string;
+  until?: string | null;
+  since?: string | null;
 };
 
 type ChatWindow = {
@@ -759,6 +777,7 @@ type CommandTab =
   | "runtime"
   | "models"
   | "memory"
+  | "graph"
   | "files"
   | "diagnostics"
   | "resources"
@@ -1147,12 +1166,30 @@ function speechRecognitionConstructor() {
   return speechWindow.SpeechRecognition ?? speechWindow.webkitSpeechRecognition ?? null;
 }
 
+function formatMessageTime(value: string | number | null | undefined): string {
+  if (value == null || value === "") return "";
+  const date =
+    typeof value === "number"
+      ? new Date(value)
+      : new Date(/^\d+$/.test(String(value).trim()) ? Number(value) : value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  return date.toLocaleString("ru-RU", {
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit"
+  });
+}
+
 function bootLines(): ChatLine[] {
   return [
     {
       id: "system-boot",
       role: "system",
-      content: BOOT_MESSAGE
+      content: BOOT_MESSAGE,
+      createdAt: Date.now()
     }
   ];
 }
@@ -2134,10 +2171,9 @@ export default function CommandCenter() {
   }, [refresh]);
 
   // The graph is several megabytes on a real vault. Fetch it only after the
-  // memory tab is opened. Re-entering the tab refreshes the cache so background
-  // learning/agent writes become visible without restoring the old eager startup fetch.
+  // memory or dedicated graph tab is opened. Re-entering refreshes the cache.
   useEffect(() => {
-    if (activeTab !== "memory") return;
+    if (activeTab !== "memory" && activeTab !== "graph") return;
     void (async () => {
       try {
         await refreshMemoryVault();
@@ -2435,11 +2471,13 @@ export default function CommandCenter() {
     runtime: "Система",
     models: "Модели",
     memory: "Память",
+    graph: "Граф памяти",
     files: "Файлы",
     diagnostics: "Диагностика",
     resources: "Ресурсы",
     audit: "Аудит"
   };
+  const runtimeNotices = status?.notices?.filter((item) => item.active) ?? [];
   const chatSideTabTitle: Record<ChatSideTab, string> = {
     queue: "Очередь",
     status: "Состояние",
@@ -2755,7 +2793,11 @@ export default function CommandCenter() {
         requestId: entry.requestId,
         role: "user",
         content: entry.payload.message,
-        attachments: entry.payload.attachments
+        attachments: entry.payload.attachments,
+        createdAt:
+          userIndex >= 0 && lines[userIndex].createdAt
+            ? lines[userIndex].createdAt
+            : entry.createdAt || Date.now()
       };
       if (userIndex >= 0) lines[userIndex] = userLine;
       else lines.push(userLine);
@@ -2771,6 +2813,7 @@ export default function CommandCenter() {
         content: "",
         pending: true,
         startedAt,
+        createdAt: startedAt,
         durationMs: null,
         verification: null,
         webAnswer: null
@@ -3471,18 +3514,24 @@ export default function CommandCenter() {
       setLines(
         messages
           .filter((message) => ["user", "assistant", "system"].includes(message.role))
-          .map((message) => ({
-            id: message.id,
-            role: message.role,
-            content: message.content,
-            attachments: attachmentsFromMetadata(message.metadata),
-            durationMs: coerceDurationMs(message.metadata?.duration_ms),
-            pending: false,
-            startedAt: null,
-            feedback: feedbackFromMetadata(message.metadata),
-            verification: verificationFromEvents(message.metadata?.events),
-            webAnswer: webAnswerFromEvents(message.metadata?.events)
-          }))
+          .map((message) => {
+            const createdMs = message.created_at
+              ? Date.parse(message.created_at)
+              : Number.NaN;
+            return {
+              id: message.id,
+              role: message.role as ChatLine["role"],
+              content: message.content,
+              attachments: attachmentsFromMetadata(message.metadata),
+              durationMs: coerceDurationMs(message.metadata?.duration_ms),
+              pending: false,
+              startedAt: null,
+              createdAt: Number.isFinite(createdMs) ? createdMs : null,
+              feedback: feedbackFromMetadata(message.metadata),
+              verification: verificationFromEvents(message.metadata?.events),
+              webAnswer: webAnswerFromEvents(message.metadata?.events)
+            };
+          })
       );
     } catch (err) {
       setError(err instanceof Error ? err.message : "Не удалось загрузить диалог");
@@ -5156,6 +5205,14 @@ export default function CommandCenter() {
           <Database size={20} />
         </IconButton>
         <IconButton
+          active={activeTab === "graph"}
+          label="Граф памяти"
+          tab="graph"
+          onSelect={setActiveTab}
+        >
+          <Network size={20} />
+        </IconButton>
+        <IconButton
           active={activeTab === "files"}
           label="Файлы"
           tab="files"
@@ -5197,7 +5254,7 @@ export default function CommandCenter() {
             <button
               className="iconText"
               type="button"
-              onClick={() => void refresh(activeTab === "memory")}
+              onClick={() => void refresh(activeTab === "memory" || activeTab === "graph")}
               disabled={busy}
             >
               <RefreshCw size={17} />
@@ -5209,6 +5266,21 @@ export default function CommandCenter() {
             </button>
           </div>
         </header>
+
+        {runtimeNotices.length > 0 ? (
+          <section className="runtimeNotices" aria-label="Системные уведомления">
+            {runtimeNotices.map((notice) => (
+              <div
+                key={notice.kind}
+                className={`runtimeNoticeBanner ${notice.kind === "service_mode" ? "service" : "overload"}`}
+                role="status"
+              >
+                <strong>{notice.title}</strong>
+                <span>{notice.message}</span>
+              </div>
+            ))}
+          </section>
+        ) : null}
 
         <section className="realtimeStrip" aria-label="Живые индикаторы runtime">
           <article className={`livePill ${llmState}`}>
@@ -5362,6 +5434,11 @@ export default function CommandCenter() {
                   <article className={`bubble ${line.role}`} key={line.id ?? `${line.role}-${index}`}>
                     <div className="bubbleMeta">
                       <span>{line.role}</span>
+                      {line.createdAt ? (
+                        <time className="bubbleClock" dateTime={new Date(line.createdAt).toISOString()}>
+                          {formatMessageTime(line.createdAt)}
+                        </time>
+                      ) : null}
                       <div className="bubbleMetaRight">
                         {durationLabel && (
                           <time className="bubbleTimer" dateTime={`PT${Math.max(0, coerceDurationMs(line.durationMs) ?? 0) / 1000}S`}>
@@ -6393,6 +6470,9 @@ export default function CommandCenter() {
                   <strong>{file.name}</strong>
                   <span>{file.chunk_count}</span>
                   <small>{formatBytes(file.size)}</small>
+                  {file.created_at ? (
+                    <time dateTime={file.created_at}>{formatMessageTime(file.created_at)}</time>
+                  ) : null}
                 </div>
               ))}
             </div>
@@ -6597,15 +6677,39 @@ export default function CommandCenter() {
                 </div>
               </div>
             )}
-            {memoryVault && <MemoryGraph vault={memoryVault} />}
             <div className="memoryList">
               {memories.slice(0, 5).map((memory) => (
                 <article className="memoryRow" key={memory.id}>
                   <strong>{memory.namespace}</strong>
                   <p>{memory.snippet ?? memory.content}</p>
+                  {memory.created_at ? (
+                    <time dateTime={memory.created_at}>{formatMessageTime(memory.created_at)}</time>
+                  ) : null}
                 </article>
               ))}
             </div>
+              </>
+            )}
+
+            {activeTab === "graph" && (
+              <>
+                <div className="panelHeader" id="memory-graph">
+                  <h2>Граф памяти</h2>
+                  <span>
+                    {memoryVault
+                      ? `${memoryVault.stats.nodes ?? 0} узлов · ${memoryVault.stats.edges ?? 0} связей`
+                      : "загрузка…"}
+                  </span>
+                </div>
+                <p className="personaHint">
+                  Obsidian-like карта связей vault: перетаскивание узлов, поиск, фильтры по типам,
+                  просмотр заметки. Данные те же, что в vault памяти.
+                </p>
+                {memoryVault ? (
+                  <MemoryGraph vault={memoryVault} />
+                ) : (
+                  <div className="empty">Загрузка vault…</div>
+                )}
               </>
             )}
 

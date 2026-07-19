@@ -402,9 +402,20 @@ class JarvisDocumentSurfer:
         return result
 
     # -- archives ------------------------------------------------------------- #
-    def list_archive(self, path: str | Path, *, prefix: str = "") -> dict[str, Any]:
+    def list_archive(
+        self,
+        path: str | Path,
+        *,
+        prefix: str = "",
+        password: str | None = None,
+    ) -> dict[str, Any]:
         try:
-            return archive_list(path, config=self.config.archive_config(), prefix=prefix)
+            return archive_list(
+                path,
+                config=self.config.archive_config(),
+                prefix=prefix,
+                password=password,
+            )
         except (ArchiveError, OSError) as exc:
             raise DocumentSurferError(str(exc)) from exc
 
@@ -415,6 +426,7 @@ class JarvisDocumentSurfer:
         members: Sequence[str] | None = None,
         output_dir: str | Path | None = None,
         output_name: str | None = None,
+        password: str | None = None,
     ) -> dict[str, Any]:
         dest = self._archive_output_dir(path, output_dir=output_dir, output_name=output_name)
         try:
@@ -423,6 +435,7 @@ class JarvisDocumentSurfer:
                 output_dir=dest,
                 members=members,
                 config=self.config.archive_config(),
+                password=password,
             )
         except (ArchiveError, OSError) as exc:
             raise DocumentSurferError(str(exc)) from exc
@@ -435,6 +448,7 @@ class JarvisDocumentSurfer:
         max_bytes: int | None = None,
         as_document: bool = False,
         max_chars: int | None = None,
+        password: str | None = None,
     ) -> dict[str, Any]:
         try:
             payload = archive_read_member(
@@ -442,6 +456,7 @@ class JarvisDocumentSurfer:
                 member,
                 max_bytes=max_bytes,
                 config=self.config.archive_config(),
+                password=password,
             )
         except (ArchiveError, OSError) as exc:
             raise DocumentSurferError(str(exc)) from exc
@@ -514,10 +529,11 @@ class JarvisDocumentSurfer:
         case_sensitive: bool = False,
         max_members: int = 40,
         max_bytes_per_member: int = 1_000_000,
+        password: str | None = None,
     ) -> dict[str, Any]:
         """Search text-like members inside an archive."""
 
-        listing = self.list_archive(path)
+        listing = self.list_archive(path, password=password)
         needle = str(query or "").strip()
         if not needle:
             raise DocumentSurferError("search query must not be empty")
@@ -539,6 +555,7 @@ class JarvisDocumentSurfer:
                     path,
                     name,
                     max_bytes=max_bytes_per_member,
+                    password=password,
                 )
             except DocumentSurferError:
                 continue
