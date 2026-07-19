@@ -74,6 +74,7 @@ from .document_runtime import (
     copy_document,
     document_mime_type,
     edit_docx_document,
+    edit_pdf_document,
     edit_text_document,
     edit_workbook_xlsx,
     extract_document,
@@ -1893,7 +1894,10 @@ class ToolRegistry:
                     "starting with '=' becomes a formula. DOCX: replace {old,new}, "
                     "append_section {title, level?, body}, append_paragraph {text}, "
                     "append_markdown {markdown}. Text/Markdown/CSV: append {text}, prepend "
-                    "{text}, replace {old,new}, insert_after {anchor,text}, set_text {text}."
+                    "{text}, replace {old,new}, insert_after {anchor,text}, set_text {text}. "
+                    "PDF: same text ops as text files (replace/append/prepend/set_text/"
+                    "insert_after); the PDF is regenerated from the edited text (layout of "
+                    "the source is not preserved)."
                 ),
                 category="documents",
                 input_schema={
@@ -2607,7 +2611,9 @@ class ToolRegistry:
         self.add(
             ToolSpec(
                 name="filesystem.list",
-                description="List files below the repository or JARVIS_HOME.",
+                description=(
+                    "List files below the workspace, JARVIS_HOME, or the operator home."
+                ),
                 category="filesystem",
                 input_schema={"path": "Path to list", "limit": "Maximum entries"},
                 handler=_filesystem_list,
@@ -2616,7 +2622,10 @@ class ToolRegistry:
         self.add(
             ToolSpec(
                 name="filesystem.read_text",
-                description="Read a small text file below the repository or JARVIS_HOME.",
+                description=(
+                    "Read a small text file below the workspace, JARVIS_HOME, or the "
+                    "operator home."
+                ),
                 category="filesystem",
                 input_schema={"path": "Path to read", "max_chars": "Maximum characters"},
                 handler=_filesystem_read_text,
@@ -2626,7 +2635,8 @@ class ToolRegistry:
             ToolSpec(
                 name="filesystem.write_text",
                 description=(
-                    "Write or append text below the repository or JARVIS_HOME after approval."
+                    "Write or append text below the workspace, JARVIS_HOME, or the operator "
+                    "home after approval."
                 ),
                 category="filesystem",
                 input_schema={
@@ -2652,7 +2662,7 @@ class ToolRegistry:
                 _filesystem_copy,
                 {
                     "source": "Source file",
-                    "destination": "Destination file",
+                    "destination": "Destination file or directory",
                     "overwrite": "Overwrite destination",
                     "create_parents": "Create destination parents",
                 },
@@ -2662,7 +2672,7 @@ class ToolRegistry:
                 _filesystem_move,
                 {
                     "source": "Source file",
-                    "destination": "Destination file",
+                    "destination": "Destination file or directory",
                     "overwrite": "Overwrite destination",
                     "create_parents": "Create destination parents",
                 },
@@ -2689,7 +2699,8 @@ class ToolRegistry:
                 ToolSpec(
                     name=_fs_name,
                     description=(
-                        f"{_fs_name} (regular files only) below cwd/JARVIS_HOME after approval."
+                        f"{_fs_name} (regular files only) below workspace/JARVIS_HOME/"
+                        "operator home after approval."
                     ),
                     category="filesystem",
                     input_schema=_fs_schema,
@@ -2701,7 +2712,8 @@ class ToolRegistry:
             ToolSpec(
                 name="filesystem.find",
                 description=(
-                    "Search file contents (grep) below cwd/JARVIS_HOME; read-only and safe."
+                    "Search file contents (grep) below workspace/JARVIS_HOME/operator home; "
+                    "read-only and safe."
                 ),
                 category="filesystem",
                 input_schema={
@@ -6675,6 +6687,9 @@ def _documents_edit(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
         elif suffix == ".docx":
             result = edit_docx_document(path, operations, output_path)
             kind_label = "document"
+        elif suffix == ".pdf":
+            result = edit_pdf_document(path, operations, output_path)
+            kind_label = "PDF"
         elif suffix in _EDITABLE_TEXT_SUFFIXES:
             result = edit_text_document(path, operations, output_path)
             kind_label = "text file"
@@ -6684,7 +6699,8 @@ def _documents_edit(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
                 ok=False,
                 summary=(
                     f"documents.edit cannot edit {suffix or 'this file type'} "
-                    f"({path.name}). Supported: XLSX/XLSM, DOCX, and text/Markdown/CSV."
+                    f"({path.name}). Supported: XLSX/XLSM, DOCX, PDF, and "
+                    "text/Markdown/CSV."
                 ),
             )
         file_record = _record_generated_document(ctx, output_path)
@@ -12444,13 +12460,26 @@ async def _filesystem_copy_or_move(
         destination = _resolve_allowed_path(ctx.settings, str(args.get("destination") or ""))
     except ValueError as exc:
         return ToolRunResponse(tool=tool, ok=False, summary=str(exc))
+    # Daily phrasing is "copy/move X into folder Y". When Y is (or looks like) a
+    # directory, place the source basename under it instead of treating Y as a file.
+    raw_dest = str(args.get("destination") or "").rstrip()
+    if (
+        destination.exists() and destination.is_dir()
+    ) or raw_dest.endswith(("/", "\\")) or (
+        not destination.suffix and source.suffix and not destination.exists()
+    ):
+        destination = destination / source.name
+        try:
+            destination = _resolve_allowed_path(ctx.settings, str(destination))
+        except ValueError as exc:
+            return ToolRunResponse(tool=tool, ok=False, summary=str(exc))
     payload = _fs_execution_payload(
         {
             "kind": kind,
             "source": str(source),
             "destination": str(destination),
             "overwrite": _bool_arg(args.get("overwrite"), default=False),
-            "create_parents": _bool_arg(args.get("create_parents"), default=False),
+            "create_parents": _bool_arg(args.get("create_parents"), default=True),
         }
     )
     return await _execution_action(
@@ -12918,7 +12947,13 @@ def _resolve_allowed_path(settings: JarvisSettings, raw_path: str) -> Path:
     if not candidate.is_absolute():
         candidate = Path.cwd() / candidate
     candidate = candidate.resolve(strict=False)
-    roots = [Path.cwd().resolve(strict=False), settings.home.resolve(strict=False)]
+    # Match document tools: workspace + JARVIS_HOME + operator home. Daily file
+    # moves ("переложи сканы…") live under the user profile, not only JARVIS_HOME.
+    roots = [
+        Path.cwd().resolve(strict=False),
+        settings.home.resolve(strict=False),
+        Path.home().resolve(strict=False),
+    ]
     for root in roots:
         try:
             candidate.relative_to(root)

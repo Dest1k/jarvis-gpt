@@ -46,7 +46,7 @@ def execution_roots(settings: JarvisSettings) -> tuple[Path, ...]:
     raw_roots = (
         [item.strip() for item in configured.split(os.pathsep) if item.strip()]
         if configured
-        else [str(Path.cwd()), str(settings.home)]
+        else [str(Path.cwd()), str(settings.home), str(Path.home())]
     )
     roots: list[Path] = []
     for raw in raw_roots:

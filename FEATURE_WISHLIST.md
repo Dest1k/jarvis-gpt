@@ -105,7 +105,19 @@ Shipped this session (all on `main`, tested): **vision pipeline** (chat image �
 (hand‑rolled, zero deps; **PDF now supports Cyrillic** via embedded system TrueType);
 **Telegram bot frontend** (§0, level 1); agentic‑loop hardening (no more retry‑storms).
 In flight: **reminders/calendar**. Still open from above: code sandbox, email, voice,
-richer filesystem, clipboard, vision‑OCR, Telegram userbot.
+vision‑OCR, Telegram userbot.
+
+## Progress — light daily wins 2026-07-19
+
+Shipped on `main`: **Clipboard + richer FS + PDF edit** (routine speed):
+- Deterministic agent routes for `переложи/скопируй/переименуй/создай папку/удали файл`
+  with exact path operands (weak model no longer invents fake success).
+- Filesystem tools allow **operator home** roots (with execution roots), not only
+  `cwd` + `JARVIS_HOME`.
+- Folder destinations auto-join source basename; copy/move create parents by default.
+- Explorer reveal: «покажи в проводнике …».
+- PDF `documents.edit` (regenerate-style replace/append/set_text).
+- Clipboard transform requests («переведи что в буфере…») no longer short-circuit to bare read.
 
 ## More ideas — brainstorm 2026-07-18 (new features)
 

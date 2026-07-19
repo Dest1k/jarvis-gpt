@@ -18,6 +18,7 @@ from jarvis_gpt.agent import (
     ChatRequestInProgressError,
     _backend_runtime_generation_id,
     _chat_request_hard_cap,
+    _filesystem_op_from_message,
     _looks_like_document_memory_query,
     _native_action_from_message,
     _operator_action_scopes,
@@ -25,6 +26,7 @@ from jarvis_gpt.agent import (
     _operator_effect_ledger_key,
     _operator_tool_arguments_match,
     _prune_operator_effect_ledger,
+    _reveal_in_explorer_path_from_message,
     _schema_hint,
     _tool_observation_excerpt,
 )
@@ -2613,6 +2615,114 @@ def test_agent_creates_empty_file_without_approval(monkeypatch, tmp_path):
     assert run["arguments"] == {"path": str(target), "content": "", "mode": "create"}
     assert "Создал пустой файл" in response.answer
     storage.close()
+
+
+def test_filesystem_op_from_message_parses_daily_commands(tmp_path):
+    src = tmp_path / "scan.pdf"
+    dest_dir = tmp_path / "taxes"
+    src.write_bytes(b"%PDF-1.4\n%%EOF\n")
+
+    copy_op = _filesystem_op_from_message(f'скопируй "{src}" в "{dest_dir}"')
+    assert copy_op is not None and copy_op.tool == "filesystem.copy"
+    assert copy_op.arguments["source"] == str(src)
+    assert copy_op.arguments["destination"] == str(dest_dir / "scan.pdf")
+    assert copy_op.arguments["create_parents"] is True
+
+    move_op = _filesystem_op_from_message(f'переложи "{src}" в "{dest_dir}"')
+    assert move_op is not None and move_op.tool == "filesystem.move"
+    assert move_op.arguments["destination"] == str(dest_dir / "scan.pdf")
+
+    rename_op = _filesystem_op_from_message(f'переименуй "{src}" в "invoice.pdf"')
+    assert rename_op is not None and rename_op.tool == "filesystem.rename"
+    assert rename_op.arguments == {
+        "path": str(src),
+        "new_name": "invoice.pdf",
+        "overwrite": False,
+    }
+
+    mkdir_op = _filesystem_op_from_message(f'создай папку "{dest_dir / "2026"}"')
+    assert mkdir_op is not None and mkdir_op.tool == "filesystem.mkdir"
+    assert mkdir_op.arguments["path"] == str(dest_dir / "2026")
+
+    delete_op = _filesystem_op_from_message(f'удали файл "{src}"')
+    assert delete_op is not None and delete_op.tool == "filesystem.delete"
+    assert delete_op.arguments["path"] == str(src)
+
+    # Clipboard copy must not be mistaken for a filesystem copy.
+    assert _filesystem_op_from_message("скопируй HELLO в буфер обмена") is None
+
+
+def test_operator_scopes_include_move_for_perelozhi():
+    scopes = _operator_action_scopes('переложи "D:/a/x.pdf" в "D:/b/"')
+    assert "explicit" in scopes
+    assert "filesystem" in scopes
+    assert "move" in scopes
+
+
+def test_reveal_in_explorer_path_from_message(tmp_path):
+    target = tmp_path / "note.txt"
+    target.write_text("x", encoding="utf-8")
+    assert _reveal_in_explorer_path_from_message(f'покажи в проводнике "{target}"') == str(
+        target
+    )
+    assert _reveal_in_explorer_path_from_message("что на экране") is None
+
+
+def test_agent_moves_and_copies_files_deterministically(monkeypatch, tmp_path):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    src = tmp_path / "scan.pdf"
+    dest_dir = tmp_path / "taxes"
+    src.write_bytes(b"pdf-bytes")
+
+    response = asyncio.run(agent.chat(f'переложи "{src}" в "{dest_dir}"'))
+    moved = dest_dir / "scan.pdf"
+    assert moved.exists()
+    assert not src.exists()
+    assert moved.read_bytes() == b"pdf-bytes"
+    assert "Готово" in response.answer
+    run = _operator_tool_run(storage, "filesystem.move")
+    assert run["arguments"]["source"] == str(src)
+    assert run["arguments"]["destination"] == str(moved)
+
+    # Copy back to a new folder.
+    copy_dest = tmp_path / "backup"
+    response2 = asyncio.run(agent.chat(f'скопируй "{moved}" в "{copy_dest}"'))
+    copied = copy_dest / "scan.pdf"
+    assert copied.exists()
+    assert moved.exists()
+    assert "Готово" in response2.answer
+    storage.close()
+
+
+def test_agent_renames_and_mkdir_and_delete_file(monkeypatch, tmp_path):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    folder = tmp_path / "inbox"
+    src = tmp_path / "old-name.txt"
+    src.write_text("payload", encoding="utf-8")
+
+    mkdir_resp = asyncio.run(agent.chat(f'создай папку "{folder}"'))
+    assert folder.is_dir()
+    assert "Готово" in mkdir_resp.answer
+
+    rename_resp = asyncio.run(agent.chat(f'переименуй "{src}" в "new-name.txt"'))
+    renamed = tmp_path / "new-name.txt"
+    assert renamed.exists()
+    assert not src.exists()
+    assert "Готово" in rename_resp.answer
+
+    delete_resp = asyncio.run(agent.chat(f'удали файл "{renamed}"'))
+    assert not renamed.exists()
+    assert "Готово" in delete_resp.answer
+    storage.close()
+
+
+def test_clipboard_transform_request_is_not_bare_read():
+    # "переведи что в буфере" needs agentic read+act, not a short-circuit dump.
+    action = _native_action_from_message("переведи что в буфере обмена на английский")
+    assert action is None or action.action != "clipboard.read"
+    # Pure read still works.
+    pure = _native_action_from_message("что в буфере обмена")
+    assert pure is not None and pure.action == "clipboard.read"
 
 
 @pytest.mark.parametrize(

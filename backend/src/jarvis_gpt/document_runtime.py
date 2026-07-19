@@ -319,6 +319,80 @@ def edit_docx_document(
     }
 
 
+def _apply_text_edit_operations(
+    text: str,
+    operations: list[dict[str, Any]],
+) -> tuple[str, list[str]]:
+    """Shared text-mutation engine for plain files and regenerate-style PDF edits."""
+
+    changes: list[str] = []
+    for raw_op in operations or []:
+        if not isinstance(raw_op, dict):
+            continue
+        op = str(raw_op.get("op") or raw_op.get("action") or "").strip().casefold()
+        addition = str(raw_op.get("text") or raw_op.get("value") or "")
+        if op in {"append", "add", "append_text", "append_markdown", "append_md"}:
+            if addition:
+                text = text + ("" if not text or text.endswith("\n") else "\n") + addition
+                changes.append("appended text")
+        elif op in {"prepend", "prepend_text"}:
+            if addition:
+                text = addition + ("" if addition.endswith("\n") else "\n") + text
+                changes.append("prepended text")
+        elif op in {"replace", "substitute"}:
+            old = str(raw_op.get("old") or raw_op.get("find") or "")
+            new = str(raw_op.get("new") or raw_op.get("replace") or raw_op.get("value") or "")
+            if not old:
+                continue
+            count = text.count(old)
+            if count == 0:
+                raise DocumentRuntimeError(
+                    f"Replacement text not found in document: {old[:80]!r}"
+                )
+            text = text.replace(old, new)
+            changes.append(f"replaced {count} occurrence(s) of {old[:40]!r}")
+        elif op in {"insert_after"}:
+            anchor = str(raw_op.get("anchor") or raw_op.get("after") or "")
+            if not anchor or not addition:
+                continue
+            idx = text.find(anchor)
+            if idx < 0:
+                raise DocumentRuntimeError(
+                    f"insert_after anchor not found: {anchor[:80]!r}"
+                )
+            at = idx + len(anchor)
+            text = text[:at] + addition + text[at:]
+            changes.append("inserted text after anchor")
+        elif op in {"set_text", "overwrite", "set"}:
+            body = str(
+                raw_op.get("text")
+                or raw_op.get("value")
+                or raw_op.get("body")
+                or raw_op.get("markdown")
+                or ""
+            )
+            text = body
+            changes.append("set full text")
+        elif op in {"replacements", "replace_all"}:
+            for item in raw_op.get("items") or raw_op.get("replacements") or []:
+                if not isinstance(item, dict) or not item.get("old"):
+                    continue
+                old = str(item["old"])
+                new = str(item.get("new") or "")
+                count = text.count(old)
+                if count == 0:
+                    raise DocumentRuntimeError(
+                        f"Replacement text not found in document: {old[:80]!r}"
+                    )
+                text = text.replace(old, new)
+                changes.append(f"replaced {count} occurrence(s) of {old[:40]!r}")
+        else:
+            raise DocumentRuntimeError(f"unsupported text edit op: {op or '(missing op)'}")
+    if not changes:
+        raise DocumentRuntimeError("No document edit operation changed anything.")
+    return text, changes
+
+
 def edit_text_document(
     source_path: Path,
     operations: list[dict[str, Any]],
@@ -330,45 +404,7 @@ def edit_text_document(
 
     src = Path(source_path).resolve(strict=False)
     text = src.read_text(encoding="utf-8", errors="replace")
-    changes: list[str] = []
-    for raw_op in operations or []:
-        if not isinstance(raw_op, dict):
-            continue
-        op = str(raw_op.get("op") or raw_op.get("action") or "").strip().casefold()
-        addition = str(raw_op.get("text") or raw_op.get("value") or "")
-        if op in {"append", "add", "append_text"}:
-            if addition:
-                text = text + ("" if not text or text.endswith("\n") else "\n") + addition
-                changes.append("appended text")
-        elif op in {"prepend", "prepend_text"}:
-            if addition:
-                text = addition + ("" if addition.endswith("\n") else "\n") + text
-                changes.append("prepended text")
-        elif op in {"replace", "substitute"}:
-            old = str(raw_op.get("old") or raw_op.get("find") or "")
-            new = str(raw_op.get("new") or raw_op.get("replace") or raw_op.get("value") or "")
-            if old and old in text:
-                text = text.replace(old, new)
-                changes.append(f"replaced {old!r}")
-            elif old:
-                raise DocumentRuntimeError(f"text to replace was not found: {old!r}")
-        elif op in {"insert_after"}:
-            anchor = str(raw_op.get("anchor") or "")
-            index = text.find(anchor) if anchor else -1
-            if anchor and index >= 0:
-                cut = index + len(anchor)
-                lead = "" if addition.startswith("\n") else "\n"
-                text = text[:cut] + lead + addition + text[cut:]
-                changes.append(f"inserted after {anchor!r}")
-            elif anchor:
-                raise DocumentRuntimeError(f"anchor was not found: {anchor!r}")
-        elif op in {"set_text", "replace_all_text", "set"}:
-            text = addition
-            changes.append("replaced the full text")
-        else:
-            raise DocumentRuntimeError(f"unsupported text edit op: {op or '(missing op)'}")
-    if not changes:
-        raise DocumentRuntimeError("No text edit operation changed anything.")
+    text, changes = _apply_text_edit_operations(text, operations)
     dest = Path(output_path)
     dest.parent.mkdir(parents=True, exist_ok=True)
     if not text.endswith("\n"):
@@ -380,8 +416,57 @@ def edit_text_document(
         "name": dest.name,
         "size": dest.stat().st_size,
         "sha256": file_sha256(dest),
+        "format": src.suffix.lstrip(".") or "txt",
         "changes": changes,
         "verification": verification,
+    }
+
+
+def edit_pdf_document(
+    source_path: Path,
+    operations: list[dict[str, Any]],
+    output_path: Path,
+    *,
+    title: str | None = None,
+) -> dict[str, Any]:
+    """Edit a PDF by extracting text, applying text ops, and regenerating a new PDF.
+
+    This is intentionally regenerate-style (layout of the source is not preserved): it
+    covers daily "replace this word / append a note / set the body" requests without a
+    binary PDF editor dependency. Scanned/image-only PDFs fail closed when no text can
+    be extracted. Ops mirror text edits: ``replace``, ``append``, ``prepend``,
+    ``insert_after``, ``set_text``, ``replacements``.
+    """
+
+    src = Path(source_path).resolve(strict=False)
+    extracted = extract_document(src, max_chars=200_000)
+    text = str(extracted.get("text") or "").strip()
+    if not text:
+        raise DocumentRuntimeError(
+            "PDF has no extractable text (scanned/image-only or empty). "
+            "Run OCR first or regenerate from a text source."
+        )
+    text, changes = _apply_text_edit_operations(text, operations)
+    dest = Path(output_path)
+    if dest.suffix.lower() != ".pdf":
+        dest = dest.with_suffix(".pdf")
+    write_result = write_pdf(
+        dest,
+        text,
+        title=title or src.stem or "Document",
+    )
+    changes = list(changes)
+    changes.append("regenerated PDF from edited text")
+    return {
+        "path": str(dest),
+        "name": dest.name,
+        "size": dest.stat().st_size,
+        "sha256": write_result.get("sha256") or file_sha256(dest),
+        "format": "pdf",
+        "changes": changes,
+        "structure": {"page_count": write_result.get("page_count")},
+        "verification": write_result.get("verification"),
+        "regenerated": True,
     }
 
 

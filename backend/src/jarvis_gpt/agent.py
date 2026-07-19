@@ -5419,6 +5419,63 @@ class AgentRuntime:
                     events=[event],
                 )
 
+        # Daily FS wins ("переложи/скопируй/переименуй/создай папку/удали файл") — same
+        # pattern as empty-file create: extract exact operands and run the typed tool so
+        # the weak model cannot narrate a fake success or invent wrong argument names.
+        filesystem_op = _filesystem_op_from_message(message)
+        if filesystem_op is not None:
+            executed = await self._execute_operator_requested_tool(
+                filesystem_op.tool,
+                filesystem_op.arguments,
+                context=context,
+                action=f"fs.{filesystem_op.tool.rsplit('.', 1)[-1]}",
+            )
+            if executed is not None:
+                result, event = executed
+                status = "Готово" if result.ok else "Не смог выполнить"
+                return DirectAction(
+                    answer=(
+                        f"{status}: {filesystem_op.answer}\n\n{result.summary}"
+                    ),
+                    events=[event],
+                )
+
+        # "Покажи в проводнике D:\…" — open Explorer focused on the path.
+        reveal_path = _reveal_in_explorer_path_from_message(message)
+        if reveal_path is not None and self._owner_autonomy_active():
+            arguments = {
+                "action": "process.start",
+                "payload": {
+                    "executable": "explorer.exe",
+                    # /select highlights the file; for a bare folder Explorer still opens it.
+                    "arguments": [f"/select,{reveal_path}"],
+                },
+                "timeout_sec": 30,
+            }
+            result = await self._run_direct_operator_tool(
+                context,
+                tool="windows.native",
+                arguments=arguments,
+                allow_danger=True,
+            )
+            if result is not None:
+                event = ChatEvent(
+                    type="tool_call",
+                    title="windows.native:explorer.reveal",
+                    content=result.summary,
+                    payload={
+                        "tool": result.tool,
+                        "ok": result.ok,
+                        "action": "process.start",
+                        "path": reveal_path,
+                    },
+                )
+                status = "Открыл в проводнике" if result.ok else "Не смог открыть в проводнике"
+                return DirectAction(
+                    answer=f"{status}: {reveal_path}\n\n{result.summary}",
+                    events=[event],
+                )
+
         # A registered shop + an unambiguous catalog request already forms a
         # typed, read-only action.  Sending it through the 200-token intent
         # arbiter adds seconds on turbo and several minutes on offloaded mono,
@@ -19796,8 +19853,9 @@ _OPERATOR_COMMAND_FILLER = (
 )
 _OPERATOR_COMMAND_VERB = (
     r"(?:открой|перейди|зайди|создай|сделай|запиши|сохрани|добавь|измени|исправь|"
-    r"обнови|замени|отредактируй|удали|сотри|очисти|скопируй|перемести|перенеси|"
-    r"переименуй|запусти|выполни|установи|включи|перезапусти|останови|закрой|"
+    r"обнови|замени|отредактируй|удали|сотри|очисти|скопируй|скопировать|"
+    r"перемести|переместить|перенеси|перенести|переложи|переложить|"
+    r"переименуй|переименовать|запусти|выполни|установи|включи|перезапусти|останови|закрой|"
     r"выключи|заверши|активируй|сфокусируй|нажми|кликни|введи|набери|напечатай|"
     r"напиши|заполни|выбери|прокрути|сними|посмотри|покажи|проверь|"
     # Calculation/math verbs (imperative, infinitive and 2nd-person forms).
@@ -19929,8 +19987,11 @@ def _operator_action_scopes(message: str) -> frozenset[str]:
             r"update|set|replace)\b"
         ),
         "delete": r"\b(?:удали|сотри|очисти|delete|remove|erase|clear)\b",
-        "copy": r"\b(?:скопируй|copy)\b",
-        "move": r"\b(?:перемести|перенеси|переименуй|move|rename)\b",
+        "copy": r"\b(?:скопируй|скопировать|copy)\b",
+        "move": (
+            r"\b(?:перемести|перенеси|переложи|переместить|перенести|переложить|"
+            r"переименуй|переименовать|move|rename)\b"
+        ),
         "execute": (
             r"\b(?:запусти|запустишь|выполни|выполнишь|установи|включи|включишь|"
             r"перезапусти|переключишь\w*|run|execute|launch|"
@@ -19971,15 +20032,30 @@ def _operator_action_scopes(message: str) -> frozenset[str]:
         re.IGNORECASE,
     ):
         scopes.add("native")
+    # Paths are often stripped out of structural text (quoted operands), so probe
+    # the raw message for filesystem authority as well.
     if re.search(
         r"\b(?:file|folder|directory|path|файл\w*|папк\w*|каталог\w*|путь)\b|"
-        r"(?<!\w)[A-Za-z]:[\\/]",
-        context_text,
+        r"(?<!\w)[A-Za-z]:[\\/]|"
+        # Explicit absolute POSIX paths (Linux CI / WSL) also authorize filesystem tools.
+        r"(?<![:/\w])(/[^\s,;!?\"'«»“”]+)",
+        f"{context_text}\n{message}",
         re.IGNORECASE,
     ):
         scopes.add("filesystem")
     if "filesystem" in scopes and "open" in scopes:
         scopes.add("native")
+    # "покажи/открой в проводнике …" is an explicit Explorer reveal, not a capture.
+    if re.search(
+        r"\b(?:проводник\w*|explorer|file\s*explorer)\b",
+        f"{context_text}\n{message}",
+        re.IGNORECASE,
+    ) and re.search(
+        r"\b(?:покажи|открой|open|reveal|show)\b",
+        structural,
+        re.IGNORECASE,
+    ):
+        scopes.update({"native", "open", "filesystem"})
     if re.search(
         r"\b(?:process|command|script|pid|процесс\w*|команд\w*|скрипт\w*|\.exe)\b",
         context_text,
@@ -20413,11 +20489,22 @@ def _operator_tool_arguments_match(
         ):
             return False
         required = "copy" if name == "filesystem.copy" else "move"
+        destination = str(args.get("destination") or "")
+        # "переложи X в D:\folder" often resolves destination to D:\folder\X.name —
+        # accept either the exact dest path or its parent folder as the operator operand.
+        dest_parent = str(Path(destination).parent) if destination else ""
+        dest_mentioned = _operator_mentions_value(
+            message, destination, path_value=True
+        ) or (
+            dest_parent
+            and dest_parent not in {".", ""}
+            and _operator_mentions_value(message, dest_parent, path_value=True)
+        )
         return bool(
             "filesystem" in scopes
             and required in scopes
             and _operator_mentions_value(message, args.get("source", ""), path_value=True)
-            and _operator_mentions_value(message, args.get("destination", ""), path_value=True)
+            and dest_mentioned
         )
     if name == "filesystem.rename":
         if not set(args) <= {"path", "new_name", "overwrite"}:
@@ -21764,7 +21851,9 @@ def _native_action_from_message(
     # NOT (it also appears in "как работает clipboard api"), so English only counts as a
     # read request via an explicit "read/paste/…-clipboard" phrasing, never bare
     # "clipboard".
-    if _contains_any(
+    # Transform requests ("переведи / суммируй / сохрани то, что в буфере") must NOT
+    # short-circuit to a bare read — the agentic loop needs to read then act.
+    clipboard_read = _contains_any(
         normalized,
         (
             "буфер обмена",
@@ -21789,7 +21878,29 @@ def _native_action_from_message(
         # "скопируй ... в буфер" is a write, handled by the write route just below.
         normalized,
         ("скопируй", "скопировать", "положи в буфер", "запиши в буфер", "copy to clipboard"),
-    ):
+    )
+    clipboard_transform = clipboard_read and _contains_any(
+        normalized,
+        (
+            "переведи",
+            "перевод",
+            "translate",
+            "суммируй",
+            "кратко",
+            "summar",
+            "сохрани",
+            "запиши в файл",
+            "save",
+            "исправ",
+            "rewrite",
+            "перепиши",
+            "оформи",
+            "в docx",
+            "в pdf",
+            "в md",
+        ),
+    )
+    if clipboard_read and not clipboard_transform:
         return NativeAction(
             action="clipboard.read",
             payload={},
@@ -21979,6 +22090,197 @@ def _empty_file_path_from_message(message: str) -> str | None:
         return None
     candidate = quoted.group(1).strip()
     return candidate if Path(candidate).is_absolute() else None
+
+
+@dataclass(frozen=True)
+class FilesystemDirectOp:
+    """Deterministic filesystem tool request extracted from an operator message."""
+
+    tool: str
+    arguments: dict[str, Any]
+    answer: str
+
+
+def _all_explicit_paths_from_message(message: str) -> list[str]:
+    """Collect absolute path operands in left-to-right order (Windows, quoted, POSIX)."""
+
+    found: list[tuple[int, str]] = []
+    seen: set[str] = set()
+
+    def _add(start: int, value: str) -> None:
+        cleaned = value.strip().rstrip(".,;:!?")
+        if not cleaned or cleaned in seen:
+            return
+        # Accept Windows drive paths even when pathlib on POSIX would not.
+        if not Path(cleaned).is_absolute() and not re.match(r"^[A-Za-z]:[\\/]", cleaned):
+            return
+        seen.add(cleaned)
+        found.append((start, cleaned))
+
+    for match in re.finditer(r"[\"'«“]([A-Za-z]:[\\/][^\"'»”\r\n]+)[\"'»”]", message):
+        _add(match.start(1), match.group(1))
+    for match in re.finditer(r"(?<!\w)([A-Za-z]:[\\/][^\s,;!?\"'«»“”]+)", message):
+        _add(match.start(1), match.group(1).rstrip("."))
+    for match in re.finditer(r"[\"'«“](/[^\"'»”\r\n]+)[\"'»”]", message):
+        _add(match.start(1), match.group(1))
+    for match in re.finditer(r"(?<![:/\w])(/[^\s,;!?\"'«»“”]+)", message):
+        candidate = match.group(1).rstrip(".")
+        if Path(candidate).is_absolute():
+            _add(match.start(1), candidate)
+    found.sort(key=lambda item: item[0])
+    return [path for _, path in found]
+
+
+def _fs_destination_with_source_name(source: str, destination: str) -> str:
+    """If destination looks like a directory, place the source basename under it."""
+
+    dest = destination.rstrip()
+    source_name = Path(source.replace("\\", "/")).name
+    if not source_name:
+        return dest
+    if dest.endswith(("/", "\\")):
+        return str(Path(dest) / source_name)
+    dest_path = Path(dest)
+    # Bare folder names ("...\\taxes") have no suffix; a file target usually does.
+    if not dest_path.suffix and Path(source.replace("\\", "/")).suffix:
+        return str(dest_path / source_name)
+    return dest
+
+
+def _bare_filename_from_message(message: str, *, exclude_paths: Sequence[str]) -> str | None:
+    """Pick a bare filename operand (rename target) that is not one of the path operands."""
+
+    excluded = {Path(p.replace("\\", "/")).name.casefold() for p in exclude_paths}
+    excluded.update(p.casefold() for p in exclude_paths)
+    for match in re.finditer(r"[\"'«“]([^\"'»”\r\n]+)[\"'»”]", message):
+        candidate = match.group(1).strip()
+        if not candidate or any(sep in candidate for sep in ("/", "\\")):
+            continue
+        if candidate.casefold() in excluded:
+            continue
+        if Path(candidate).name != candidate:
+            continue
+        return candidate
+    # After "в/as/to" take a trailing bare token with an extension.
+    trailing = re.search(
+        r"(?i)\b(?:в|как|на|to|as)\s+[\"'«“]?([^\s\"'»”\\/]+?\.[A-Za-z0-9]{1,8})[\"'»”]?\s*$",
+        message.strip(),
+    )
+    if trailing:
+        candidate = trailing.group(1).strip().rstrip(".,;:!?")
+        if candidate and candidate.casefold() not in excluded:
+            return candidate
+    return None
+
+
+def _filesystem_op_from_message(message: str) -> FilesystemDirectOp | None:
+    """Parse high-confidence daily FS commands so the weak model need not invent tools.
+
+    Mirrors the clipboard.write deterministic route: exact operands from the operator
+    message, no guessing. Clipboard / conceptual questions are excluded.
+    """
+
+    text = _fold_operator_confusables(message).strip()
+    if not text:
+        return None
+    normalized = text.casefold()
+    if any(token in normalized for token in ("буфер", "clipboard")):
+        return None
+    if _OPERATOR_META_RE.search(normalized) or _OPERATOR_RETRACTION_RE.search(normalized):
+        return None
+
+    paths = _all_explicit_paths_from_message(message)
+    if not paths:
+        return None
+
+    # Rename: "переименуй D:\a\old.txt в new.txt"
+    if re.search(r"(?i)\b(?:переименуй|переименовать|rename)\b", normalized):
+        new_name = _bare_filename_from_message(message, exclude_paths=paths)
+        if new_name:
+            return FilesystemDirectOp(
+                tool="filesystem.rename",
+                arguments={"path": paths[0], "new_name": new_name, "overwrite": False},
+                answer=f"переименовал {Path(paths[0]).name} → {new_name}",
+            )
+
+    # Copy: "скопируй D:\a\x.pdf в D:\b\"
+    if re.search(r"(?i)\b(?:скопируй|скопировать|copy)\b", normalized) and len(paths) >= 2:
+        destination = _fs_destination_with_source_name(paths[0], paths[1])
+        return FilesystemDirectOp(
+            tool="filesystem.copy",
+            arguments={
+                "source": paths[0],
+                "destination": destination,
+                "overwrite": False,
+                "create_parents": True,
+            },
+            answer=f"скопировал {Path(paths[0]).name} → {destination}",
+        )
+
+    # Move / place: "переложи / перемести / перенеси"
+    if re.search(
+        r"(?i)\b(?:перемести|перенеси|переложи|переместить|перенести|переложить|move)\b",
+        normalized,
+    ) and len(paths) >= 2:
+        destination = _fs_destination_with_source_name(paths[0], paths[1])
+        return FilesystemDirectOp(
+            tool="filesystem.move",
+            arguments={
+                "source": paths[0],
+                "destination": destination,
+                "overwrite": False,
+                "create_parents": True,
+            },
+            answer=f"переместил {Path(paths[0]).name} → {destination}",
+        )
+
+    # Mkdir: "создай папку D:\taxes\2026"
+    if re.search(r"(?i)\b(?:создай|создать|create|make|mkdir)\b", normalized) and re.search(
+        r"(?i)\b(?:папк\w*|директор\w*|folder\w*|director\w*|mkdir|dir)\b",
+        normalized,
+    ):
+        return FilesystemDirectOp(
+            tool="filesystem.mkdir",
+            arguments={"path": paths[0], "parents": True},
+            answer=f"создал папку {paths[0]}",
+        )
+
+    # Delete regular file only: "удали файл D:\a\x.tmp"
+    if re.search(r"(?i)\b(?:удали|удалить|delete|remove)\b", normalized) and re.search(
+        r"(?i)\b(?:файл\w*|file)\b",
+        normalized,
+    ):
+        return FilesystemDirectOp(
+            tool="filesystem.delete",
+            arguments={"path": paths[0], "missing_ok": False},
+            answer=f"удалил файл {paths[0]}",
+        )
+
+    return None
+
+
+def _reveal_in_explorer_path_from_message(message: str) -> str | None:
+    """'покажи в проводнике / открой в explorer' with an explicit path."""
+
+    normalized = _fold_operator_confusables(message).casefold()
+    explorer_context = bool(
+        re.search(
+            r"\b(?:проводник\w*|explorer|file\s*explorer)\b",
+            normalized,
+            re.IGNORECASE,
+        )
+    )
+    open_verb = bool(
+        re.search(
+            r"\b(?:покажи|открой|open|reveal|show)\b",
+            normalized,
+            re.IGNORECASE,
+        )
+    )
+    if not (explorer_context and open_verb):
+        return None
+    paths = _all_explicit_paths_from_message(message)
+    return paths[0] if paths else None
 
 
 def _wmi_action_from_message(message: str) -> NativeAction:

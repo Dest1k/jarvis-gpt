@@ -500,6 +500,41 @@ def test_edit_docx_missing_replacement_text_raises(tmp_path: Path) -> None:
         edit_docx_document(src, [{"op": "replace", "old": "Zeta", "new": "Omega"}], out)
 
 
+def test_edit_pdf_replace_and_append_regenerates(tmp_path: Path) -> None:
+    from jarvis_gpt.document_runtime import edit_pdf_document, write_pdf
+
+    src = tmp_path / "source.pdf"
+    write_pdf(src, "Hello ALPHA world.\n\nSecond paragraph.", title="Source")
+    out = tmp_path / "edited.pdf"
+    result = edit_pdf_document(
+        src,
+        [
+            {"op": "replace", "old": "ALPHA", "new": "BETA"},
+            {"op": "append", "text": "\n\nFooter note."},
+        ],
+        out,
+    )
+    assert result["format"] == "pdf"
+    assert result.get("regenerated") is True
+    assert out.exists()
+    text = extract_document(out)["text"]
+    assert "BETA" in text
+    assert "ALPHA" not in text
+    assert "Footer note" in text
+
+
+def test_edit_pdf_empty_text_fails_closed(tmp_path: Path) -> None:
+    from jarvis_gpt.document_runtime import DocumentRuntimeError, edit_pdf_document
+
+    # Minimal valid-looking PDF shell with no extractable text.
+    src = tmp_path / "empty.pdf"
+    src.write_bytes(
+        b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\nstartxref\n0\n%%EOF\n"
+    )
+    with pytest.raises(DocumentRuntimeError, match="no extractable text|corrupt|unreadable"):
+        edit_pdf_document(src, [{"op": "append", "text": "x"}], tmp_path / "out.pdf")
+
+
 def test_edit_text_append_prepend_replace_insert(tmp_path: Path) -> None:
     src = tmp_path / "notes.md"
     src.write_text("# Notes\n\nFirst line.\n", encoding="utf-8")
