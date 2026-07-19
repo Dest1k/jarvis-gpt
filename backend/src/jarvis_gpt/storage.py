@@ -8,8 +8,9 @@ import sqlite3
 import threading
 import uuid
 from collections import Counter, OrderedDict, defaultdict, deque
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from itertools import combinations
 from pathlib import Path
@@ -22,12 +23,40 @@ from .authorization import (
     current_actor,
     current_user_id,
     migrate_iam_schema,
-    scoped_runtime_key,
 )
 from .memory_vault import MemoryVault
 from .redaction import redact_value
 
 LOGGER = logging.getLogger(__name__)
+
+_RUNTIME_KEY_MAX_CHARS = 1_024
+_LEGACY_RUNTIME_KEY_MAX_CHARS = 160
+_RUNTIME_KEY_HASH_HEAD_CHARS = _RUNTIME_KEY_MAX_CHARS - 65
+
+_CHAT_REQUEST_METADATA: ContextVar[dict[str, str] | None] = ContextVar(
+    "jarvis_chat_request_metadata",
+    default=None,
+)
+
+
+@contextmanager
+def bind_chat_request_metadata(
+    *,
+    request_hash: str,
+    fingerprint: str,
+) -> Iterable[None]:
+    """Tag every history row written by one transport-fenced chat turn."""
+
+    token = _CHAT_REQUEST_METADATA.set(
+        {
+            "chat_request_hash": request_hash,
+            "chat_request_fingerprint": fingerprint,
+        }
+    )
+    try:
+        yield
+    finally:
+        _CHAT_REQUEST_METADATA.reset(token)
 
 # Document-graph augmentation: fold uploaded documents into the memory link graph.
 DOCUMENT_GRAPH_NODE_CAP = 5000
@@ -187,6 +216,89 @@ def utc_now() -> str:
 
 def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:16]}"
+
+
+def _sql_like_prefix(prefix: str) -> str:
+    """Escape a literal SQLite LIKE prefix, including namespace underscores."""
+
+    return (
+        prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        + "%"
+    )
+
+
+def _scoped_runtime_key_unbounded(key: str) -> str:
+    clean = str(key).strip()
+    actor = current_actor()
+    if actor.user_id == LEGACY_OWNER_USER_ID:
+        return clean
+    namespace = f"user.{actor.user_id}."
+    return clean if clean.startswith(namespace) else f"{namespace}{clean}"
+
+
+def _normalized_runtime_key(key: str) -> str:
+    """Scope and bound a runtime key without collision-prone truncation."""
+
+    scoped = _scoped_runtime_key_unbounded(key)
+    if len(scoped) <= _RUNTIME_KEY_MAX_CHARS:
+        return scoped
+    digest = hashlib.sha256(scoped.encode("utf-8")).hexdigest()
+    return f"{scoped[:_RUNTIME_KEY_HASH_HEAD_CHARS]}~{digest}"
+
+
+def _normalized_runtime_prefix(prefix: str) -> str:
+    scoped = _scoped_runtime_key_unbounded(prefix)
+    # Internal runtime families are short. A hashed overlong key no longer has
+    # a meaningful SQL prefix, so reject ambiguous prefix scans explicitly.
+    if len(scoped) > _RUNTIME_KEY_HASH_HEAD_CHARS:
+        raise ValueError("runtime key prefix is too long")
+    return scoped
+
+
+def _legacy_runtime_row_matches_key(key: str, raw_value: str | None) -> bool:
+    """Verify the one known >160-char legacy family before migrating it."""
+
+    value = _loads(raw_value, None)
+    if not isinstance(value, dict):
+        return False
+    if value.get("protocol") != "jarvis.interrupted-stream.v2":
+        return False
+    request_hash = str(value.get("request_hash") or "")
+    return bool(
+        re.fullmatch(r"[0-9a-f]{64}", request_hash)
+        and key.endswith(f"agent.stream.interrupted.request.{request_hash}")
+    )
+
+
+def _runtime_row_with_legacy_migration(
+    conn: sqlite3.Connection,
+    key: str,
+) -> sqlite3.Row | None:
+    row = conn.execute(
+        "SELECT key, value, updated_at FROM runtime_kv WHERE key = ?",
+        (key,),
+    ).fetchone()
+    if row is not None or len(key) <= _LEGACY_RUNTIME_KEY_MAX_CHARS:
+        return row
+    legacy_key = key[:_LEGACY_RUNTIME_KEY_MAX_CHARS]
+    legacy = conn.execute(
+        "SELECT key, value, updated_at FROM runtime_kv WHERE key = ?",
+        (legacy_key,),
+    ).fetchone()
+    if legacy is None or not _legacy_runtime_row_matches_key(key, legacy["value"]):
+        return None
+    conn.execute(
+        "INSERT OR IGNORE INTO runtime_kv(key, value, updated_at) VALUES (?, ?, ?)",
+        (key, legacy["value"], legacy["updated_at"]),
+    )
+    conn.execute(
+        "DELETE FROM runtime_kv WHERE key = ? AND value = ?",
+        (legacy_key, legacy["value"]),
+    )
+    return conn.execute(
+        "SELECT key, value, updated_at FROM runtime_kv WHERE key = ?",
+        (key,),
+    ).fetchone()
 
 
 def _json(data: Any) -> str:
@@ -698,7 +810,7 @@ class JarvisStorage:
     def _memory_vault_repair_pending(self, conn: sqlite3.Connection) -> bool:
         row = conn.execute(
             "SELECT value FROM runtime_kv WHERE key = ?",
-            (scoped_runtime_key(_MEMORY_VAULT_REPAIR_KEY),),
+            (_normalized_runtime_key(_MEMORY_VAULT_REPAIR_KEY),),
         ).fetchone()
         if row is None:
             return False
@@ -727,7 +839,7 @@ class JarvisStorage:
                     value = excluded.value,
                     updated_at = excluded.updated_at
                 """,
-                (scoped_runtime_key(_MEMORY_VAULT_REPAIR_KEY), _json(value), now),
+                (_normalized_runtime_key(_MEMORY_VAULT_REPAIR_KEY), _json(value), now),
             )
             conn.commit()
         except Exception:
@@ -738,7 +850,7 @@ class JarvisStorage:
         try:
             conn.execute(
                 "DELETE FROM runtime_kv WHERE key = ?",
-                (scoped_runtime_key(_MEMORY_VAULT_REPAIR_KEY),),
+                (_normalized_runtime_key(_MEMORY_VAULT_REPAIR_KEY),),
             )
             conn.commit()
         except Exception:
@@ -862,8 +974,12 @@ class JarvisStorage:
                         ).fetchone()
                     else:
                         row = conn.execute(
-                            "SELECT COUNT(*) AS c FROM runtime_kv WHERE key LIKE ?",
-                            (f"user.{actor.user_id}.%",),
+                            """
+                            SELECT COUNT(*) AS c
+                            FROM runtime_kv
+                            WHERE key LIKE ? ESCAPE '\\'
+                            """,
+                            (_sql_like_prefix(f"user.{actor.user_id}."),),
                         ).fetchone()
                 elif "user_id" in _sqlite_table_columns(conn, table):
                     row = conn.execute(
@@ -922,37 +1038,74 @@ class JarvisStorage:
         ]
 
     def get_runtime_value(self, key: str, default: Any = None) -> Any:
-        key = scoped_runtime_key(key)
+        safe_key = _normalized_runtime_key(key)
         with self._lock:
-            row = self.connect().execute(
+            conn = self.connect()
+            row = conn.execute(
                 """
                 SELECT value
                 FROM runtime_kv
                 WHERE key = ?
                 """,
-                (key,),
+                (safe_key,),
             ).fetchone()
+            if row is None and len(safe_key) > _LEGACY_RUNTIME_KEY_MAX_CHARS:
+                owns_transaction = not conn.in_transaction
+                try:
+                    if owns_transaction:
+                        conn.execute("BEGIN IMMEDIATE")
+                    row = _runtime_row_with_legacy_migration(conn, safe_key)
+                    if owns_transaction:
+                        conn.commit()
+                except Exception:  # noqa: BLE001 - migration is transactional
+                    if owns_transaction:
+                        conn.rollback()
+                    raise
         if row is None:
             return default
         return _loads(row["value"], default)
 
     def set_runtime_value(self, key: str, value: Any) -> dict[str, Any]:
-        key = scoped_runtime_key(key)
+        safe_key = _normalized_runtime_key(key)
         now = utc_now()
-        row = {"key": key[:160], "value": value, "updated_at": now}
+        row = {"key": safe_key, "value": value, "updated_at": now}
         with self._lock:
-            self.connect().execute(
-                """
-                INSERT INTO runtime_kv(key, value, updated_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(key) DO UPDATE SET
-                    value = excluded.value,
-                    updated_at = excluded.updated_at
-                """,
-                (row["key"], _json(row["value"]), row["updated_at"]),
-            )
-            self.connect().commit()
+            conn = self.connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                _runtime_row_with_legacy_migration(conn, safe_key)
+                conn.execute(
+                    """
+                    INSERT INTO runtime_kv(key, value, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value = excluded.value,
+                        updated_at = excluded.updated_at
+                    """,
+                    (row["key"], _json(row["value"]), row["updated_at"]),
+                )
+                conn.commit()
+            except Exception:  # noqa: BLE001 - key migration and write are atomic
+                conn.rollback()
+                raise
         return row
+
+    def delete_runtime_value(self, key: str) -> bool:
+        safe_key = _normalized_runtime_key(key)
+        with self._lock:
+            conn = self.connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                _runtime_row_with_legacy_migration(conn, safe_key)
+                cursor = conn.execute(
+                    "DELETE FROM runtime_kv WHERE key = ?",
+                    (safe_key,),
+                )
+                conn.commit()
+            except Exception:  # noqa: BLE001 - migration and deletion are atomic
+                conn.rollback()
+                raise
+        return cursor.rowcount > 0
 
     def update_runtime_value_atomic(
         self,
@@ -972,15 +1125,12 @@ class JarvisStorage:
         into storage while this transaction is open.
         """
 
-        safe_key = scoped_runtime_key(key)[:500]
+        safe_key = _normalized_runtime_key(key)
         with self._lock:
             conn = self.connect()
             try:
                 conn.execute("BEGIN IMMEDIATE")
-                row = conn.execute(
-                    "SELECT value FROM runtime_kv WHERE key = ?",
-                    (safe_key,),
-                ).fetchone()
+                row = _runtime_row_with_legacy_migration(conn, safe_key)
                 current = default if row is None else _loads(row["value"], default)
                 updated = updater(current)
                 now = utc_now()
@@ -1000,11 +1150,83 @@ class JarvisStorage:
                 raise
         return updated
 
+    def update_runtime_value_atomic_pruned(
+        self,
+        key: str,
+        updater: Callable[[Any], Any],
+        *,
+        default: Any = None,
+        prune_prefixes: Sequence[str],
+        older_than: str,
+        hard_cap: int,
+    ) -> Any:
+        """Atomically prune a scoped key family and update one member.
+
+        Per-transport request fences need one independent row so ordinary chat
+        volume cannot inflate and rewrite a single JSON aggregate.  Pruning and
+        the emergency cap check share the same SQLite write transaction as the
+        claim, so concurrent workers cannot both step past the cap.
+        """
+
+        safe_key = _normalized_runtime_key(key)
+        safe_prefixes = tuple(
+            dict.fromkeys(_normalized_runtime_prefix(prefix) for prefix in prune_prefixes)
+        )
+        if not safe_prefixes:
+            raise ValueError("at least one prune prefix is required")
+        prefix_patterns = tuple(_sql_like_prefix(prefix) for prefix in safe_prefixes)
+        bounded_cap = max(1, int(hard_cap))
+        with self._lock:
+            conn = self.connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                for pattern in prefix_patterns:
+                    conn.execute(
+                        """
+                        DELETE FROM runtime_kv
+                        WHERE key LIKE ? ESCAPE '\\' AND updated_at < ?
+                        """,
+                        (pattern, older_than),
+                    )
+                row = _runtime_row_with_legacy_migration(conn, safe_key)
+                if row is None:
+                    where = " OR ".join(
+                        "key LIKE ? ESCAPE '\\'" for _ in prefix_patterns
+                    )
+                    count = int(
+                        conn.execute(
+                            f"SELECT COUNT(*) FROM runtime_kv WHERE {where}",  # noqa: S608
+                            prefix_patterns,
+                        ).fetchone()[0]
+                    )
+                    if count >= bounded_cap:
+                        raise RuntimeError("scoped runtime key family hard cap reached")
+                current = default if row is None else _loads(row["value"], default)
+                updated = updater(current)
+                now = utc_now()
+                conn.execute(
+                    """
+                    INSERT INTO runtime_kv(key, value, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value = excluded.value,
+                        updated_at = excluded.updated_at
+                    """,
+                    (safe_key, _json(updated), now),
+                )
+                conn.commit()
+            except Exception:  # noqa: BLE001 - the complete claim must roll back
+                conn.rollback()
+                raise
+        return updated
+
     def list_runtime_values(self, prefix: str | None = None) -> list[dict[str, Any]]:
         actor = current_actor()
         legacy_namespace = actor.user_id == LEGACY_OWNER_USER_ID
         scoped_prefix = (
-            scoped_runtime_key(prefix or "") if (prefix or not legacy_namespace) else None
+            _normalized_runtime_prefix(prefix or "")
+            if (prefix or not legacy_namespace)
+            else None
         )
         with self._lock:
             if scoped_prefix is not None:
@@ -1012,10 +1234,10 @@ class JarvisStorage:
                     """
                     SELECT key, value, updated_at
                     FROM runtime_kv
-                    WHERE key LIKE ?
+                    WHERE key LIKE ? ESCAPE '\\'
                     ORDER BY updated_at DESC
                     """,
-                    (f"{scoped_prefix}%",),
+                    (_sql_like_prefix(scoped_prefix),),
                 ).fetchall()
             elif legacy_namespace:
                 rows = self.connect().execute(
@@ -1099,6 +1321,15 @@ class JarvisStorage:
         mid = new_id("msg")
         now = utc_now()
         user_id = current_user_id()
+        effective_metadata = dict(metadata or {})
+        request_metadata = _CHAT_REQUEST_METADATA.get()
+        if request_metadata is not None and role in {"user", "assistant"}:
+            effective_metadata.update(request_metadata)
+            if role == "assistant":
+                # Only an answer written by AgentRuntime itself is a terminal
+                # recovery candidate. API interruption checkpoints are stored
+                # outside this binding and can never masquerade as completed.
+                effective_metadata["chat_request_terminal"] = True
         with self._lock:
             conn = self.connect()
             self._require_owned_resource(
@@ -1113,7 +1344,7 @@ class JarvisStorage:
                     id, conversation_id, role, content, metadata, created_at, user_id
                 ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (mid, conversation_id, role, content, _json(metadata or {}), now, user_id),
+                (mid, conversation_id, role, content, _json(effective_metadata), now, user_id),
             )
             conn.execute(
                 "UPDATE conversations SET updated_at = ? WHERE id = ? AND user_id = ?",
@@ -1127,11 +1358,71 @@ class JarvisStorage:
                 role=role,
                 content=content,
                 summary=f"{role} message captured for learning",
-                payload={"metadata": metadata or {}},
+                payload={"metadata": effective_metadata},
                 ts=now,
             )
             conn.commit()
         return mid
+
+    def find_chat_request_message(
+        self,
+        *,
+        conversation_id: str,
+        request_hash: str,
+        role: str,
+        legacy_request_fingerprint: str | None = None,
+        terminal_only: bool = False,
+    ) -> dict[str, Any] | None:
+        """Recover a request-bound message after a crash between DB commits.
+
+        The durable request ledger is written before chat history.  If the process
+        dies immediately after ``add_message`` commits, the next lease holder can
+        recover that exact row instead of appending a duplicate logical turn.
+        """
+
+        user_id = current_user_id()
+        with self._lock:
+            conn = self.connect()
+            self._require_owned_resource(
+                conn,
+                table="conversations",
+                resource_id=conversation_id,
+                user_id=user_id,
+            )
+            row = conn.execute(
+                """
+                SELECT id, conversation_id, role, content, metadata, created_at, user_id
+                FROM messages
+                WHERE conversation_id = ? AND user_id = ? AND role = ?
+                  AND (
+                      ? = 0
+                      OR json_extract(metadata, '$.chat_request_terminal') = 1
+                  )
+                  AND (
+                      json_extract(metadata, '$.chat_request_hash') = ?
+                      OR (
+                          ? <> ''
+                          AND json_extract(metadata, '$.guest_request_fingerprint') = ?
+                      )
+                  )
+                ORDER BY created_at ASC, rowid ASC
+                LIMIT 1
+                """,
+                (
+                    conversation_id,
+                    user_id,
+                    role,
+                    int(terminal_only),
+                    request_hash,
+                    str(legacy_request_fingerprint or ""),
+                    str(legacy_request_fingerprint or ""),
+                ),
+            ).fetchone()
+        if row is None:
+            return None
+        item = dict(row)
+        item["metadata"] = _loads(item.get("metadata"), {})
+        return item
 
     def list_conversations(self, limit: int = 50) -> list[dict[str, Any]]:
         with self._lock:

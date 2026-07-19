@@ -838,7 +838,7 @@ def test_exact_identifier_and_value_must_share_the_same_local_quote(monkeypatch)
             "99.75",
         ),
     )
-    separators = (". ", " and ", " и ", "; ", "\n")
+    separators = (". ", " and ", " while ", " whereas ", " и ", "; ", "\n")
 
     assert tools_module._web_answer_financial_exact_identifiers(
         "BRK.B BRNQ26 ISIN US0378331005"
@@ -871,6 +871,68 @@ def test_exact_identifier_and_value_must_share_the_same_local_quote(monkeypatch)
                 question=question,
                 sources=[source],
             ) == "unsupported_financial_number"
+
+
+def test_financial_citation_is_bound_to_its_quote_clause(monkeypatch):
+    today = date(2026, 7, 20)
+    monkeypatch.setattr(tools_module, "_web_news_today", lambda now=None: today)
+    question = "What are the current BRK.A and BRK.B stock prices?"
+    sources = [
+        {
+            "title": "BRK.A live stock price",
+            "url": "https://market.example/a",
+            "excerpt": (
+                "BRK.A stock price was 710000 USD on NYSE at "
+                "2026-07-20 12:10 UTC."
+            ),
+        },
+        {
+            "title": "BRK.B live stock price",
+            "url": "https://market.example/b",
+            "excerpt": (
+                "BRK.B stock price was 473.25 USD on NYSE at "
+                "2026-07-20 12:20 UTC."
+            ),
+        },
+    ]
+    grounded = (
+        "BRK.A stock price was 710000 USD on NYSE at 2026-07-20 12:10 UTC. "
+        "Source: https://market.example/a. BRK.B stock price was 473.25 USD on "
+        "NYSE at 2026-07-20 12:20 UTC. Source: https://market.example/b"
+    )
+    swapped = grounded.replace("https://market.example/a", "URL_TMP").replace(
+        "https://market.example/b", "https://market.example/a"
+    ).replace("URL_TMP", "https://market.example/b")
+
+    assert tools_module._web_answer_financial_synthesis_rejection(
+        grounded,
+        question=question,
+        sources=sources,
+    ) == ""
+    assert tools_module._web_answer_financial_synthesis_rejection(
+        swapped,
+        question=question,
+        sources=sources,
+    ) == "unsupported_financial_citation"
+
+    shared_source = {
+        "title": "Berkshire live stock prices",
+        "url": "https://market.example/berkshire",
+        "excerpt": (
+            "BRK.A stock price was 710000 USD on NYSE at 2026-07-20 12:10 UTC and "
+            "BRK.B stock price was 473.25 USD on NYSE at 2026-07-20 12:20 UTC."
+        ),
+    }
+    shared_answer = (
+        "BRK.A stock price was 710000 USD on NYSE at 2026-07-20 12:10 UTC and "
+        "BRK.B stock price was 473.25 USD on NYSE at 2026-07-20 12:20 UTC. "
+        "Source: https://market.example/berkshire"
+    )
+    assert tools_module._web_answer_financial_synthesis_rejection(
+        shared_answer,
+        question=question,
+        sources=[shared_source],
+    ) == ""
 
 
 def test_repeated_equal_values_keep_identifier_and_timestamp_per_occurrence(
@@ -2004,6 +2066,43 @@ def test_crypto_value_requires_source_bound_fresh_timestamp_and_timezone(monkeyp
     ) == "missing_quote_timestamp"
 
 
+def test_crypto_rfc3339_timestamps_with_fractional_seconds_are_grounded(monkeypatch):
+    fixed_now = datetime(2026, 7, 19, 12, 30, tzinfo=UTC)
+    monkeypatch.setattr(tools_module, "_web_answer_financial_now", lambda: fixed_now)
+    question = "What is the current Bitcoin price?"
+
+    for timestamp, expected_microsecond in (
+        ("2026-07-19T12:20:00Z", 0),
+        ("2026-07-19T12:20:00.123456789Z", 123456),
+    ):
+        source = {
+            "title": "Bitcoin BTC/USD live spot exchange quote",
+            "url": "https://crypto.example/btcusd",
+            "excerpt": f"Bitcoin BTC/USD spot price was 65000 USD at {timestamp}.",
+        }
+        answer = (
+            f"Bitcoin BTC/USD spot exchange price was 65000 USD at {timestamp}. "
+            "This is the current quote. Source: https://crypto.example/btcusd"
+        )
+        parsed = tools_module._web_answer_financial_timestamp_spans(timestamp)
+
+        assert len(parsed) == 1
+        assert parsed[0][0] == datetime(
+            2026,
+            7,
+            19,
+            12,
+            20,
+            tzinfo=UTC,
+            microsecond=expected_microsecond,
+        )
+        assert tools_module._web_answer_synthesis_rejection(
+            answer,
+            [source],
+            question=question,
+        ) == ""
+
+
 def test_crypto_value_and_timestamp_must_share_the_same_quote(monkeypatch):
     fixed_now = datetime(2026, 7, 19, 12, 30, tzinfo=UTC)
     monkeypatch.setattr(tools_module, "_web_answer_financial_now", lambda: fixed_now)
@@ -2397,6 +2496,22 @@ def test_current_exchange_quote_requires_latest_available_weekday_session():
     )
 
 
+def test_exchange_freshness_uses_holiday_calendar_and_exchange_session_date():
+    # Monday 2026-01-19 is MLK Day.  Before Tuesday's session opens, Friday is
+    # still the latest completed scheduled US exchange session.
+    assert tools_module._web_answer_financial_date_is_fresh(
+        date(2026, 1, 16),
+        kind="crude",
+        today=date(2026, 1, 20),
+    )
+    # On an ordinary Sunday, Thursday is stale because Friday traded.
+    assert not tools_module._web_answer_financial_date_is_fresh(
+        date(2026, 1, 15),
+        kind="equity",
+        today=date(2026, 1, 18),
+    )
+
+
 def test_cash_index_source_rejects_index_futures_contract():
     question = "What is the current S&P 500 index level?"
     source_text = (
@@ -2429,4 +2544,226 @@ def test_fx_value_cannot_be_borrowed_from_another_pair_in_the_same_sentence():
         answer,
         question="What is the current USD/RUB exchange rate?",
         sources=[source],
+    ) == "unsupported_financial_number"
+
+
+_CFTC_CRUDE_UNIT_URL = (
+    "https://www.cftc.gov/filings/orgrules/rule020217nymexdcm003.pdf"
+)
+
+
+def _typed_crude_quote_source(
+    symbol: str,
+    benchmark: str,
+    price: str,
+    quote_time: str,
+) -> dict[str, object]:
+    quote_url = f"https://quotes.example/{symbol.casefold().replace('=', '-')}"
+    return {
+        "title": f"{benchmark.title()} {symbol} typed quote",
+        "url": quote_url,
+        "market_quote": {
+            "benchmark": benchmark,
+            "symbol": symbol,
+            "instrument_type": "FUTURE",
+            "instrument_alias": "undated_provider_symbol",
+            "is_dated_contract": False,
+            "exchange": "NYM",
+            "currency": "USD",
+            "unit": "per barrel",
+            "unit_source_url": _CFTC_CRUDE_UNIT_URL,
+            "price": price,
+            "quote_time_utc": quote_time,
+        },
+    }
+
+
+def _structured_crude_quote_answer(
+    *,
+    brent_price: str = "88.1",
+    wti_price: str = "81.78",
+    brent_time: str = "2026-07-17T20:59:57Z",
+    wti_time: str = "2026-07-17T20:59:58Z",
+    extra_field: str = "",
+) -> str:
+    return (
+        "As of today, 2026-07-19, these are the latest available quotes.\n\n"
+        "## Brent — BZ=F\n"
+        "- Instrument: futures; undated provider symbol, not a specific dated contract.\n"
+        "- Exchange: NYM.\n"
+        f"{extra_field}"
+        f"- Price: {brent_price} USD per barrel.\n"
+        f"- Quote time: {brent_time}.\n"
+        "- Source: https://quotes.example/bz-f\n\n"
+        "## WTI — CL=F\n"
+        "- Instrument: futures; undated provider symbol, not a specific dated contract.\n"
+        "- Exchange: NYM.\n"
+        f"{extra_field}"
+        f"- Price: {wti_price} USD per barrel.\n"
+        f"- Quote time: {wti_time}.\n"
+        "- Source: https://quotes.example/cl-f\n\n"
+        f"Official unit source: {_CFTC_CRUDE_UNIT_URL}"
+    )
+
+
+def test_typed_quotes_ground_markdown_cards_on_weekend_without_today_relabel():
+    sources = [
+        _typed_crude_quote_source(
+            "BZ=F", "brent", "88.1", "2026-07-17T20:59:57Z"
+        ),
+        _typed_crude_quote_source(
+            "CL=F", "wti", "81.78", "2026-07-17T20:59:58Z"
+        ),
+    ]
+    question = "BZ=F CL=F futures price today 2026-07-19"
+
+    assert tools_module._web_answer_financial_exact_identifiers(question) == {
+        "BZ=F",
+        "CL=F",
+    }
+    assert tools_module._web_answer_financial_synthesis_rejection(
+        _structured_crude_quote_answer(),
+        question=question,
+        sources=sources,
+    ) == ""
+    tampered = _typed_crude_quote_source(
+        "BZ=F", "wti", "88.1", "2026-07-17T20:59:57Z"
+    )
+    assert tools_module._web_answer_financial_market_quote_tuple(tampered) == ""
+
+
+def test_structured_typed_quotes_reject_swaps_and_quote_time_relabelling():
+    sources = [
+        _typed_crude_quote_source(
+            "BZ=F", "brent", "88.1", "2026-07-17T20:59:57Z"
+        ),
+        _typed_crude_quote_source(
+            "CL=F", "wti", "81.78", "2026-07-17T20:59:58Z"
+        ),
+    ]
+    question = "BZ=F CL=F futures price today 2026-07-19"
+
+    assert tools_module._web_answer_financial_synthesis_rejection(
+        _structured_crude_quote_answer(brent_price="81.78", wti_price="88.1"),
+        question=question,
+        sources=sources,
+    ) == "unsupported_financial_number"
+    assert tools_module._web_answer_financial_synthesis_rejection(
+        _structured_crude_quote_answer(brent_time="2026-07-18T20:59:57Z"),
+        question=question,
+        sources=sources,
+    ) == "unsupported_financial_number"
+
+
+def test_historical_typed_quote_keeps_exact_requested_date_binding():
+    source = _typed_crude_quote_source(
+        "BZ=F", "brent", "79.25", "2026-07-16T20:59:57Z"
+    )
+    question = "BZ=F futures price on 2026-07-16"
+    grounded = _structured_crude_quote_answer(
+        brent_price="79.25",
+        brent_time="2026-07-16T20:59:57Z",
+        wti_price="79.25",
+        wti_time="2026-07-16T20:59:57Z",
+    ).split("## WTI", maxsplit=1)[0] + f"Official unit source: {_CFTC_CRUDE_UNIT_URL}"
+
+    assert tools_module._web_answer_financial_synthesis_rejection(
+        grounded,
+        question=question,
+        sources=[source],
+    ) == ""
+    assert tools_module._web_answer_financial_synthesis_rejection(
+        grounded.replace("2026-07-16T20:59:57Z", "2026-07-17T20:59:57Z"),
+        question=question,
+        sources=[source],
+    ) == "requested_quote_date_mismatch"
+
+
+def test_undated_typed_quote_rejects_positive_front_month_claim_with_disclosure():
+    sources = [
+        _typed_crude_quote_source(
+            "BZ=F", "brent", "88.1", "2026-07-17T20:59:57Z"
+        ),
+        _typed_crude_quote_source(
+            "CL=F", "wti", "81.78", "2026-07-17T20:59:58Z"
+        ),
+    ]
+    answer = _structured_crude_quote_answer().replace(
+        "not a specific dated contract.",
+        "not a specific dated contract; this is a continuous/front-month futures alias.",
+    )
+
+    assert tools_module._web_answer_financial_synthesis_rejection(
+        answer,
+        question="BZ=F CL=F futures price today 2026-07-19",
+        sources=sources,
+    ) == "unsupported_futures_alias"
+
+
+def test_contract_month_example_is_metadata_not_a_quote_value():
+    sources = [
+        _typed_crude_quote_source(
+            "BZ=F", "brent", "88.1", "2026-07-17T20:59:57Z"
+        ),
+        _typed_crude_quote_source(
+            "CL=F", "wti", "81.78", "2026-07-17T20:59:58Z"
+        ),
+    ]
+
+    assert tools_module._web_answer_financial_synthesis_rejection(
+        _structured_crude_quote_answer(
+            extra_field="- Contract-month example only: August 2026.\n"
+        ),
+        question="BZ=F CL=F futures price today 2026-07-19",
+        sources=sources,
+    ) == ""
+
+
+def _plain_qwen_style_crude_quote_answer(
+    *,
+    brent_price: str = "88.1",
+    wti_price: str = "81.78",
+    brent_time: str = "2026-07-17T20:59:57Z",
+    wti_time: str = "2026-07-17T20:59:58Z",
+) -> str:
+    """Qwen-style cards without Markdown AT headings (real model layout)."""
+
+    return (
+        "As of today, 2026-07-19, these are the latest available quotes.\n\n"
+        "Brent (BZ=F)\n"
+        "- Instrument: futures; undated provider symbol, not a specific dated contract.\n"
+        "- Exchange: NYM.\n"
+        f"- Price: {brent_price} USD per barrel.\n"
+        f"- Quote time: {brent_time}.\n"
+        "- Source: https://quotes.example/bz-f\n\n"
+        "WTI (CL=F)\n"
+        "- Instrument: futures; undated provider symbol, not a specific dated contract.\n"
+        "- Exchange: NYM.\n"
+        f"- Price: {wti_price} USD per barrel.\n"
+        f"- Quote time: {wti_time}.\n"
+        "- Source: https://quotes.example/cl-f\n\n"
+        f"Official unit source: {_CFTC_CRUDE_UNIT_URL}"
+    )
+
+
+def test_typed_quotes_ground_plain_qwen_cards_without_hash_headings():
+    sources = [
+        _typed_crude_quote_source(
+            "BZ=F", "brent", "88.1", "2026-07-17T20:59:57Z"
+        ),
+        _typed_crude_quote_source(
+            "CL=F", "wti", "81.78", "2026-07-17T20:59:58Z"
+        ),
+    ]
+    question = "BZ=F CL=F futures price today 2026-07-19"
+
+    assert tools_module._web_answer_financial_synthesis_rejection(
+        _plain_qwen_style_crude_quote_answer(),
+        question=question,
+        sources=sources,
+    ) == ""
+    assert tools_module._web_answer_financial_synthesis_rejection(
+        _plain_qwen_style_crude_quote_answer(brent_price="81.78", wti_price="88.1"),
+        question=question,
+        sources=sources,
     ) == "unsupported_financial_number"

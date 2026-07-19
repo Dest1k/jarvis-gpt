@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -25,7 +26,7 @@ class _FailingFtsConnection:
 
 def test_settings_use_external_home(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
-    monkeypatch.setenv("JARVIS_PROFILE", "gemma4-mono")
+    monkeypatch.setenv("JARVIS_PROFILE", "qwen36-vl")
 
     settings = load_settings()
     ensure_runtime_dirs(settings)
@@ -33,23 +34,26 @@ def test_settings_use_external_home(monkeypatch, tmp_path):
     assert settings.home == tmp_path
     assert settings.database_path.parent.exists()
     assert settings.model_root == tmp_path / "models"
-    assert settings.model_dir.name == "gemma4-31b-it-nvfp4"
+    assert settings.model_dir.name == "qwen3.6-35b-a3b-nvfp4"
 
 
-def test_mono_perf_profile_preserves_certified_fractional_vllm_tuning():
-    profile = PROFILES["gemma4-mono-perf"]
+def test_qwen_profile_preserves_certified_vllm_tuning():
+    profile = PROFILES["qwen36-vl"]
 
-    assert profile.model_dir_name == "gemma4-31b-it-nvfp4"
-    assert profile.cpu_offload_gb == 2.5
-    assert profile.gpu_memory_utilization == 0.93
-    assert profile.max_model_len == 4096
-    assert profile.eager_mode is True
+    assert profile.model_dir_name == "qwen3.6-35b-a3b-nvfp4"
+    assert profile.cpu_offload_gb == 0
+    assert profile.gpu_memory_utilization == 0.90
+    assert profile.max_model_len == 32768
+    assert profile.eager_mode is False
     assert profile.kv_cache_dtype == "fp8"
-    assert profile.max_num_seqs == 1
-    assert profile.vllm_extra_args.language_model_only is True
+    assert profile.max_num_seqs == 16
+    assert profile.tokenizer_mode == "auto"
+    assert profile.vision_capable is True
+    assert profile.suppress_model_thinking is True
+    assert profile.vllm_extra_args.language_model_only is False
     assert profile.vllm_extra_args.skip_mm_profiling is True
-    assert profile.vllm_extra_args.mm_processor_cache_gb == 0
-    assert profile.vllm_extra_args.max_num_batched_tokens == 512
+    assert profile.vllm_extra_args.mm_processor_cache_gb == 4.0
+    assert profile.vllm_extra_args.max_num_batched_tokens == 4096
 
 
 def test_storage_only_degrades_for_expected_fts_errors(tmp_path):
@@ -920,6 +924,72 @@ def test_runtime_values_are_isolated_from_additional_owner(tmp_path):
     storage.close()
 
 
+def test_runtime_long_keys_are_collision_resistant_for_nonlegacy_actor(tmp_path):
+    storage = JarvisStorage(tmp_path / "state" / "jarvis.sqlite3")
+    storage.initialize()
+    actor = ActorContext(
+        user_id="usr_long_runtime",
+        preset_key="owner",
+        source="test",
+    )
+    common = f"runtime.long.{('x' * 1_100)}"
+    first_key = f"{common}.first"
+    second_key = f"{common}.second"
+
+    with bind_actor(actor):
+        first = storage.set_runtime_value(first_key, {"value": 1})
+        second = storage.set_runtime_value(second_key, {"value": 2})
+        assert first["key"] != second["key"]
+        assert len(first["key"]) == 1_024
+        assert len(second["key"]) == 1_024
+        assert storage.get_runtime_value(first_key) == {"value": 1}
+        assert storage.get_runtime_value(second_key) == {"value": 2}
+        updated = storage.update_runtime_value_atomic(
+            first_key,
+            lambda value: {"value": value["value"] + 10},
+        )
+        assert updated == {"value": 11}
+        assert storage.get_runtime_value(first_key) == {"value": 11}
+        assert storage.delete_runtime_value(second_key) is True
+        assert storage.get_runtime_value(second_key) is None
+    storage.close()
+
+
+def test_runtime_key_migrates_verified_legacy_160_char_checkpoint(tmp_path):
+    storage = JarvisStorage(tmp_path / "state" / "jarvis.sqlite3")
+    storage.initialize()
+    actor = ActorContext(
+        user_id=f"usr_{'a' * 72}",
+        preset_key="owner",
+        source="test",
+    )
+    request_hash = "b" * 64
+    raw_key = f"agent.stream.interrupted.request.{request_hash}"
+    scoped_key = f"user.{actor.user_id}.{raw_key}"
+    legacy_key = scoped_key[:160]
+    value = {
+        "protocol": "jarvis.interrupted-stream.v2",
+        "request_hash": request_hash,
+        "answer": "partial",
+        "terminal": False,
+    }
+    storage.connect().execute(
+        "INSERT INTO runtime_kv(key, value, updated_at) VALUES (?, ?, ?)",
+        (legacy_key, json.dumps(value), "2026-07-19T12:00:00+00:00"),
+    )
+    storage.connect().commit()
+
+    with bind_actor(actor):
+        assert storage.get_runtime_value(raw_key) == value
+    keys = {
+        row["key"]
+        for row in storage.connect().execute("SELECT key FROM runtime_kv").fetchall()
+    }
+    assert scoped_key in keys
+    assert legacy_key not in keys
+    storage.close()
+
+
 def test_latest_health_uses_one_newest_row_when_timestamps_tie(monkeypatch, tmp_path):
     storage = JarvisStorage(tmp_path / "state" / "jarvis.sqlite3")
     storage.initialize()
@@ -987,43 +1057,24 @@ def test_complete_health_snapshot_is_atomic_when_one_component_insert_fails(tmp_
     storage.close()
 
 
-def test_profile_product_decision_certification_matrix():
+def test_qwen_profile_product_contract():
     from jarvis_gpt.config import (
         PROFILES,
-        certified_interactive_profiles,
         detect_repeated_token_degeneration,
         profile_public_dict,
     )
 
-    turbo = PROFILES["gemma4-turbo"]
-    mono = PROFILES["gemma4-mono"]
-    perf = PROFILES["gemma4-mono-perf"]
-
-    assert turbo.certification == "certified"
-    assert turbo.interactive_certified is True
-    assert turbo.default_recommended is True
-    assert turbo.menu_visible is True
-    assert turbo.readiness_deadline_sec > 0
-
-    assert perf.certification == "experimental"
-    assert perf.research_only is True
-    assert perf.interactive_certified is False
-    assert perf.requires_experimental_opt_in is True
-    assert perf.readiness_deadline_sec > 0
-
-    assert mono.certification == "unsupported"
-    assert mono.research_only is True
-    assert mono.interactive_certified is False
-    assert mono.requires_experimental_opt_in is True
-    assert mono.readiness_deadline_sec > 0
-
-    assert certified_interactive_profiles() == ["gemma4-turbo"]
-    public = profile_public_dict(turbo)
-    assert public["certification"] == "certified"
-    reason = mono.certification_reason
-    assert (
-        "RESOLVED_BY_PRODUCT_DECISION" in reason
-        or "unsupported" in reason.casefold()
-    )
+    qwen = PROFILES["qwen36-vl"]
+    assert qwen.certification == "experimental"
+    assert qwen.research_only is True
+    assert qwen.interactive_certified is False
+    assert qwen.default_recommended is False
+    assert qwen.menu_visible is True
+    assert qwen.requires_experimental_opt_in is False
+    assert qwen.readiness_deadline_sec > 0
+    public = profile_public_dict(qwen)
+    assert public["certification"] == "experimental"
+    assert public["vision_capable"] is True
+    assert "Qwen" in qwen.certification_reason
     assert detect_repeated_token_degeneration("4") is False
     assert detect_repeated_token_degeneration(" ".join(["token"] * 20)) is True

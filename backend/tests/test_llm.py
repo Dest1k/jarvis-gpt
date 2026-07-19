@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from dataclasses import replace
 
 import httpx
 import pytest
@@ -422,6 +423,29 @@ def test_complete_retries_transient_http_status(monkeypatch, tmp_path, status_co
     assert calls == 2
 
 
+@pytest.mark.parametrize("status_code", [408, 429, 500, 503])
+def test_exhausted_transient_http_status_keeps_service_scope(
+    monkeypatch, tmp_path, status_code
+):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setattr("jarvis_gpt.llm._LLM_RETRY_BASE_DELAY_SEC", 0.0)
+    router = LLMRouter(load_settings())
+    calls = 0
+
+    async def unavailable(_body, _lease):
+        nonlocal calls
+        calls += 1
+        raise _http_status_error(status_code)
+
+    monkeypatch.setattr(router, "_post_completion", unavailable)
+
+    result = asyncio.run(router.complete([{"role": "user", "content": "retry"}]))
+
+    assert result.ok is False
+    assert result.failure_scope == "service"
+    assert calls == 3
+
+
 def test_complete_does_not_retry_non_transient_http_status(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     router = LLMRouter(load_settings())
@@ -587,6 +611,36 @@ def test_foreground_stream_never_retries_after_partial_output(monkeypatch, tmp_p
     assert calls == 1
 
 
+def test_exhausted_transient_stream_error_keeps_service_scope(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setattr("jarvis_gpt.llm._LLM_RETRY_BASE_DELAY_SEC", 0.0)
+    router = LLMRouter(load_settings())
+    calls = 0
+
+    async def unavailable(_body, _lease):
+        nonlocal calls
+        calls += 1
+        raise _http_status_error(503)
+        yield  # pragma: no cover - keep this an async generator
+
+    monkeypatch.setattr(router, "_stream_completion", unavailable)
+
+    async def collect():
+        return [
+            chunk
+            async for chunk in router.stream_complete(
+                [{"role": "user", "content": "stream"}]
+            )
+        ]
+
+    chunks = asyncio.run(collect())
+
+    assert len(chunks) == 1
+    assert chunks[0].kind == "error"
+    assert chunks[0].failure_scope == "service"
+    assert calls == 3
+
+
 def test_background_stream_discards_buffer_before_transient_retry(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setattr("jarvis_gpt.llm._LLM_RETRY_BASE_DELAY_SEC", 0.0)
@@ -688,13 +742,21 @@ def test_suppress_model_thinking_profile_forces_enable_thinking_off(monkeypatch,
     assert captured["body"]["chat_template_kwargs"] == {"enable_thinking": False}
 
 
-def test_non_suppressing_profile_keeps_thinking_when_enabled(monkeypatch, tmp_path):
-    # A profile without the flag must NOT inject enable_thinking=False when the caller
-    # left thinking on.
+def test_qwen_profile_without_suppression_keeps_thinking_when_enabled(
+    monkeypatch,
+    tmp_path,
+):
+    # Preserve the generic router branch using a Qwen-derived profile with the
+    # suppression flag disabled; no second model family enters the test matrix.
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
-    monkeypatch.setenv("JARVIS_PROFILE", "gemma4-turbo")
+    monkeypatch.setenv("JARVIS_PROFILE", "qwen36-vl")
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "1")
-    router = LLMRouter(load_settings())
+    settings = load_settings()
+    settings = replace(
+        settings,
+        profile=replace(settings.profile, suppress_model_thinking=False),
+    )
+    router = LLMRouter(settings)
     captured: dict[str, object] = {}
 
     async def fake_post(body, _lease):

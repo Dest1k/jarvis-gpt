@@ -2253,6 +2253,901 @@ def test_web_fetch_reads_public_text(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_limited_html_read_reaches_visible_content_after_large_markup():
+    import jarvis_gpt.tools as tools_module
+
+    class FakeResponse:
+        headers = {"content-type": "text/html; charset=utf-8"}
+
+        async def aiter_bytes(self):
+            html = (
+                "<html><head><style>"
+                + (".navigation{display:block}" * 1800)
+                + "</style></head><body>"
+                + "<h2>Brent</h2><p>88.10 USD per barrel</p>"
+                + "<h2>WTI</h2><p>81.78 USD per barrel</p>"
+                + "</body></html>"
+            )
+            yield html.encode("utf-8")
+
+    text, raw_text, truncated = asyncio.run(
+        tools_module._read_limited_response_document(FakeResponse(), 1000)
+    )
+
+    assert "Brent 88.10 USD per barrel" in text
+    assert "WTI 81.78 USD per barrel" in text
+    assert ".navigation" not in text
+    assert "WTI" in raw_text
+    assert truncated is False
+
+
+def test_financial_research_excerpt_keeps_each_requested_quote_card():
+    import jarvis_gpt.tools as tools_module
+
+    navigation = " ".join(f"Navigation-{index}" for index in range(180))
+    text = (
+        f"{navigation} Brent benchmark latest quote 88.10 USD per barrel, "
+        f"updated 2026-07-17 20:59 UTC. {navigation} "
+        "WTI benchmark latest quote 81.78 USD per barrel, "
+        "updated 2026-07-17 20:59 UTC."
+    )
+
+    excerpt = tools_module._web_research_excerpt(
+        text,
+        query="current Brent and WTI oil prices",
+        claim="Give both benchmark quotes",
+        limit=900,
+    )
+
+    assert len(excerpt) <= 900
+    assert "Brent benchmark latest quote 88.10 USD per barrel" in excerpt
+    assert "WTI benchmark latest quote 81.78 USD per barrel" in excerpt
+
+
+def _validated_cme_contract_evidence(tools_module, spec):
+    code = spec["contract_code"]
+    contract_spec_url = spec["contract_spec_url"]
+    fetched = ToolRunResponse(
+        tool="web.fetch",
+        ok=True,
+        summary="ok",
+        data={
+            "url": contract_spec_url,
+            "evidence_id": f"ev_cme_{code.lower()}",
+            "text": (
+                "Contract Unit 1,000 barrels. Price Quotation U.S. dollars and "
+                f"cents per barrel. Product Code CME Globex: {code}; CME ClearPort: {code}."
+            ),
+        },
+    )
+    evidence = tools_module._web_answer_cme_crude_contract_evidence(
+        spec=spec,
+        fetched=fetched,
+        url=contract_spec_url,
+    )
+    assert evidence is not None
+    return evidence
+
+
+def _cftc_unit_filing_text() -> str:
+    return (
+        "New York Mercantile Exchange, Inc. Instrument Name Globex Symbol "
+        "Globex Non-Reviewable Ranges (NRR). "
+        "Crude Oil CL $1.00 0.50 per barrel 100 50. "
+        "Brent Last Day Financial BZ $1.00 0.50 per barrel 100 50."
+    )
+
+
+@pytest.mark.parametrize("benchmark", ["brent", "wti"])
+def test_cftc_filing_validates_exact_cl_bz_per_barrel_unit(benchmark):
+    import jarvis_gpt.tools as tools_module
+
+    spec = tools_module._WEB_ANSWER_YAHOO_CRUDE_QUOTES[benchmark]
+    url = spec["contract_spec_fallback_url"]
+    evidence = tools_module._web_answer_cftc_crude_contract_evidence(
+        spec=spec,
+        fetched=ToolRunResponse(
+            tool="web.fetch.official-pdf",
+            ok=True,
+            summary="ok",
+            data={
+                "url": url,
+                "text": _cftc_unit_filing_text(),
+                "evidence_id": "ev_cftc",
+            },
+        ),
+        url=url,
+    )
+
+    assert evidence is not None
+    assert evidence["contract_code"] == spec["contract_code"]
+    assert evidence["unit"] == "per barrel"
+    assert evidence["quote_unit"] == "USD per barrel"
+    assert evidence["source_url"] == url
+    assert evidence["source_description"] == "CFTC-hosted NYMEX rule filing"
+
+
+@pytest.mark.parametrize(
+    ("final_url", "text"),
+    [
+        ("https://example.com/rule.pdf", _cftc_unit_filing_text()),
+        (
+            "",
+            _cftc_unit_filing_text(),
+        ),
+        (
+            "valid",
+            _cftc_unit_filing_text().replace(
+                "Brent Last Day Financial BZ $1.00 0.50 per barrel",
+                "Brent Last Day Financial BB $1.00 0.50 per barrel",
+            ),
+        ),
+        (
+            "valid",
+            _cftc_unit_filing_text().replace("per barrel", "per metric ton"),
+        ),
+    ],
+)
+def test_cftc_filing_unit_evidence_fails_closed(final_url, text):
+    import jarvis_gpt.tools as tools_module
+
+    spec = tools_module._WEB_ANSWER_YAHOO_CRUDE_QUOTES["brent"]
+    url = spec["contract_spec_fallback_url"]
+    resolved_final_url = url if final_url == "valid" else final_url
+
+    assert (
+        tools_module._web_answer_cftc_crude_contract_evidence(
+            spec=spec,
+            fetched=ToolRunResponse(
+                tool="web.fetch.official-pdf",
+                ok=True,
+                summary="ok",
+                data={"url": resolved_final_url, "text": text},
+            ),
+            url=url,
+        )
+        is None
+    )
+
+
+def test_cme_contract_evidence_requires_exact_live_source_url():
+    import jarvis_gpt.tools as tools_module
+
+    spec = tools_module._WEB_ANSWER_YAHOO_CRUDE_QUOTES["brent"]
+    text = (
+        "Contract Unit 1,000 barrels. Price Quotation U.S. dollars and "
+        "cents per barrel. Product Code CME Globex: BZ."
+    )
+    for final_url in (
+        "",
+        "https://example.com/markets/energy/crude-oil/"
+        "brent-crude-oil-last-day.contractSpecs.html",
+        "https://www.cmegroup.com/markets/energy/crude-oil/"
+        "light-sweet-crude.contractSpecs.html",
+    ):
+        assert (
+            tools_module._web_answer_cme_crude_contract_evidence(
+                spec=spec,
+                fetched=ToolRunResponse(
+                    tool="web.fetch",
+                    ok=True,
+                    summary="ok",
+                    data={"url": final_url, "text": text},
+                ),
+                url=spec["contract_spec_url"],
+            )
+            is None
+        )
+
+
+def test_typed_crude_provider_quotes_ground_both_benchmarks(monkeypatch):
+    import jarvis_gpt.tools as tools_module
+
+    fixed_now = tools_module.datetime(2026, 7, 19, 12, 0, tzinfo=tools_module.UTC)
+    quote_time = tools_module.datetime(2026, 7, 17, 20, 59, 57, tzinfo=tools_module.UTC)
+    monkeypatch.setattr(tools_module, "_web_answer_financial_now", lambda: fixed_now)
+    monkeypatch.setattr(
+        tools_module,
+        "_web_news_today",
+        lambda now=None: tools_module.date(2026, 7, 19),
+    )
+
+    def source(benchmark: str, price: float, second: int):
+        spec = tools_module._WEB_ANSWER_YAHOO_CRUDE_QUOTES[benchmark]
+        contract_evidence = _validated_cme_contract_evidence(tools_module, spec)
+        symbol = spec["symbol"]
+        timestamp = int(quote_time.replace(second=second).timestamp())
+        url = (
+            "https://query1.finance.yahoo.com/v8/finance/chart/"
+            f"{tools_module.quote_plus(symbol, safe='')}?interval=1d&range=5d"
+        )
+        payload = {
+            "chart": {
+                "error": None,
+                "result": [
+                    {
+                        "meta": {
+                            "symbol": symbol,
+                            "currency": "USD",
+                            "exchangeName": "NYM",
+                            "fullExchangeName": "NY Mercantile",
+                            "instrumentType": "FUTURE",
+                            "regularMarketPrice": price,
+                            "regularMarketTime": timestamp,
+                            "exchangeTimezoneName": "America/New_York",
+                            "timezone": "EDT",
+                            "gmtoffset": -14400,
+                            "shortName": f"{benchmark.upper()} crude futures",
+                        }
+                    }
+                ],
+            }
+        }
+        fetched = ToolRunResponse(
+            tool="web.fetch",
+            ok=True,
+            summary="ok",
+            data={
+                "url": url,
+                "text": json.dumps(payload),
+                "evidence_id": f"ev_{benchmark}",
+            },
+        )
+        return tools_module._web_answer_yahoo_crude_quote_source(
+            benchmark=benchmark,
+            spec=spec,
+            fetched=fetched,
+            url=url,
+            contract_evidence=contract_evidence,
+        )
+
+    brent = source("brent", 88.1, 57)
+    wti = source("wti", 81.78, 58)
+    assert brent is not None
+    assert wti is not None
+    assert brent["market_quote"]["symbol"] == "BZ=F"
+    assert wti["market_quote"]["symbol"] == "CL=F"
+    assert brent["market_quote"]["instrument_alias"] == "undated_provider_symbol"
+    assert brent["market_quote"]["is_dated_contract"] is False
+    assert "not a specific dated contract" in brent["excerpt"]
+    assert brent["market_quote"]["unit_source_url"] == (
+        "https://www.cmegroup.com/markets/energy/crude-oil/"
+        "brent-crude-oil-last-day.contractSpecs.html"
+    )
+    assert "America/New_York" in brent["excerpt"]
+
+    brent["answer_score"] = 10.0
+    wti["answer_score"] = 9.0
+    ranked = tools_module._web_answer_financial_balanced_sources(
+        "What are the current Brent and WTI prices?",
+        [brent, wti],
+        max_sources=2,
+    )
+    assert [item["market_quote"]["benchmark"] for item in ranked] == ["brent", "wti"]
+
+    question = (
+        "What are the current Brent and WTI oil prices? Give each exact instrument, "
+        "price, currency, unit, quote time and timezone."
+    )
+    answer = (
+        "Brent benchmark: BZ=F is an undated Yahoo futures provider symbol, not a "
+        "specific dated contract. Its latest available quote is 88.1 USD per barrel "
+        f"at 2026-07-17T20:59:57Z (America/New_York). Quote: {brent['url']}; "
+        f"CME code/unit specs: {brent['market_quote']['unit_source_url']}. "
+        "WTI benchmark: CL=F is likewise an undated provider symbol, not "
+        "a specific dated contract. Its latest available quote is 81.78 USD per barrel "
+        f"at 2026-07-17T20:59:58Z (America/New_York). Quote: {wti['url']}; "
+        f"CME code/unit specs: {wti['market_quote']['unit_source_url']}"
+    )
+    assert tools_module._web_answer_financial_synthesis_rejection(
+        answer,
+        question=question,
+        sources=[brent, wti],
+    ) == ""
+    quote_only_citations = answer
+    for source in (brent, wti):
+        quote_only_citations = quote_only_citations.replace(
+            source["market_quote"]["unit_source_url"], ""
+        )
+    assert tools_module._web_answer_financial_synthesis_rejection(
+        quote_only_citations,
+        question=question,
+        sources=[brent, wti],
+    ) == "unsupported_financial_unit_citation"
+    unsupported_alias_answer = answer.replace(
+        "an undated Yahoo futures provider symbol, not a specific dated contract",
+        "a continuous/front-month futures alias",
+    ).replace(
+        "an undated provider symbol, not a specific dated contract",
+        "a continuous/front-month futures alias",
+    )
+    assert tools_module._web_answer_financial_synthesis_rejection(
+        unsupported_alias_answer,
+        question=question,
+        sources=[brent, wti],
+    ) == "missing_undated_futures_symbol_disclosure"
+
+
+def test_typed_crude_quote_requires_exact_yahoo_response_url(monkeypatch):
+    import jarvis_gpt.tools as tools_module
+
+    fixed_now = tools_module.datetime(2026, 7, 19, 12, 0, tzinfo=tools_module.UTC)
+    quote_time = tools_module.datetime(2026, 7, 17, 20, 59, tzinfo=tools_module.UTC)
+    monkeypatch.setattr(tools_module, "_web_answer_financial_now", lambda: fixed_now)
+    spec = tools_module._WEB_ANSWER_YAHOO_CRUDE_QUOTES["brent"]
+    contract_evidence = _validated_cme_contract_evidence(tools_module, spec)
+    expected_url = (
+        "https://query1.finance.yahoo.com/v8/finance/chart/"
+        "BZ%3DF?interval=1d&range=5d"
+    )
+    payload = {
+        "chart": {
+            "error": None,
+            "result": [
+                {
+                    "meta": {
+                        "symbol": "BZ=F",
+                        "currency": "USD",
+                        "exchangeName": "NYM",
+                        "instrumentType": "FUTURE",
+                        "regularMarketPrice": 88.1,
+                        "regularMarketTime": int(quote_time.timestamp()),
+                        "exchangeTimezoneName": "America/New_York",
+                        "timezone": "EDT",
+                        "gmtoffset": -14_400,
+                    }
+                }
+            ],
+        }
+    }
+    for final_url in (
+        "",
+        "https://example.com/v8/finance/chart/BZ%3DF?interval=1d&range=5d",
+        "https://query1.finance.yahoo.com/v8/finance/chart/CL%3DF?interval=1d&range=5d",
+        "https://query1.finance.yahoo.com/v8/finance/chart/BZ%3DF?interval=1m&range=5d",
+    ):
+        assert (
+            tools_module._web_answer_yahoo_crude_quote_source(
+                benchmark="brent",
+                spec=spec,
+                fetched=ToolRunResponse(
+                    tool="web.fetch",
+                    ok=True,
+                    summary="ok",
+                    data={"url": final_url, "text": json.dumps(payload)},
+                ),
+                url=expected_url,
+                contract_evidence=contract_evidence,
+            )
+            is None
+        )
+
+
+@pytest.mark.parametrize(
+    ("question", "expected_benchmarks"),
+    [
+        ("current Brent and WTI futures prices", ["brent", "wti"]),
+        ("current BZ=F price", ["brent"]),
+        ("current CL=F quote", ["wti"]),
+    ],
+)
+def test_typed_crude_provider_dispatches_futures_names_and_exact_symbols(
+    question,
+    expected_benchmarks,
+):
+    import jarvis_gpt.tools as tools_module
+
+    assert tools_module._web_answer_financial_instrument_kind(question) == "futures"
+    assert tools_module._web_answer_requested_benchmarks(question) == expected_benchmarks
+    if "=F" in question:
+        assert next(
+            symbol for symbol in ("BZ=F", "CL=F") if symbol in question
+        ) in tools_module._web_answer_financial_exact_identifiers(question)
+
+
+@pytest.mark.parametrize(
+    ("question", "expected_symbols"),
+    [
+        ("current Brent and WTI futures prices", {"BZ=F", "CL=F"}),
+        ("current BZ=F price", {"BZ=F"}),
+        ("current CL=F quote", {"CL=F"}),
+    ],
+)
+def test_typed_provider_live_path_fetches_bounded_daily_payload(
+    monkeypatch,
+    question,
+    expected_symbols,
+):
+    import jarvis_gpt.tools as tools_module
+    from jarvis_gpt.web_orchestrator import WebMode, WebOrchestrator
+
+    fixed_now = tools_module.datetime(2026, 7, 19, 12, 0, tzinfo=tools_module.UTC)
+    quote_time = tools_module.datetime(2026, 7, 17, 20, 59, tzinfo=tools_module.UTC)
+    monkeypatch.setattr(tools_module, "_web_answer_financial_now", lambda: fixed_now)
+    monkeypatch.setattr(
+        tools_module,
+        "_web_news_today",
+        lambda now=None: tools_module.date(2026, 7, 19),
+    )
+    seen: list[tuple[str, int]] = []
+    seen_contract_specs: list[str] = []
+
+    async def fake_fetch(_ctx, args):
+        url = str(args["url"])
+        assert args["max_chars"] == 20_000
+        if "cmegroup.com" in url:
+            benchmark = "brent" if "brent-crude" in url else "wti"
+            spec = tools_module._WEB_ANSWER_YAHOO_CRUDE_QUOTES[benchmark]
+            code = spec["contract_code"]
+            seen_contract_specs.append(url)
+            text = (
+                "Contract Unit 1,000 barrels. Price Quotation U.S. dollars and "
+                f"cents per barrel. Product Code CME Globex: {code}."
+            )
+            return ToolRunResponse(
+                tool="web.fetch",
+                ok=True,
+                summary="ok",
+                data={"url": url, "text": text, "bytes_read": len(text.encode())},
+            )
+        assert "interval=1d&range=5d" in url
+        symbol = "BZ=F" if "BZ%3DF" in url else "CL=F"
+        seen.append((symbol, int(args["max_chars"])))
+        payload = {
+            "chart": {
+                "error": None,
+                "result": [
+                    {
+                        "meta": {
+                            "symbol": symbol,
+                            "currency": "USD",
+                            "exchangeName": "NYM",
+                            "instrumentType": "FUTURE",
+                            "regularMarketPrice": 88.1 if symbol == "BZ=F" else 81.78,
+                            "regularMarketTime": int(quote_time.timestamp()),
+                            "exchangeTimezoneName": "America/New_York",
+                            "timezone": "EDT",
+                            "gmtoffset": -14_400,
+                        }
+                    }
+                ],
+            }
+        }
+        text = json.dumps(payload)
+        return ToolRunResponse(
+            tool="web.fetch",
+            ok=True,
+            summary="ok",
+            data={"url": url, "text": text, "bytes_read": len(text.encode())},
+        )
+
+    monkeypatch.setattr(tools_module, "_web_fetch", fake_fetch)
+    orchestrator = WebOrchestrator.create(query=question, mode=WebMode.DEEP_RESEARCH)
+    sources, steps = asyncio.run(
+        tools_module._web_answer_financial_provider_sources(
+            SimpleNamespace(),
+            question=question,
+            orchestrator=orchestrator,
+        )
+    )
+
+    assert {source["market_quote"]["symbol"] for source in sources} == expected_symbols
+    assert {symbol for symbol, _max_chars in seen} == expected_symbols
+    assert len(seen_contract_specs) == len(expected_symbols)
+    assert all(url.endswith(".contractSpecs.html") for url in seen_contract_specs)
+    assert all(step["ok"] for step in steps)
+
+
+def test_typed_provider_falls_back_once_to_exact_cftc_filing(monkeypatch):
+    import jarvis_gpt.tools as tools_module
+    from jarvis_gpt.web_orchestrator import WebMode, WebOrchestrator
+
+    fixed_now = tools_module.datetime(2026, 7, 19, 12, 0, tzinfo=tools_module.UTC)
+    quote_time = tools_module.datetime(2026, 7, 17, 20, 59, tzinfo=tools_module.UTC)
+    monkeypatch.setattr(tools_module, "_web_answer_financial_now", lambda: fixed_now)
+    cftc_url = tools_module._WEB_ANSWER_YAHOO_CRUDE_QUOTES["brent"][
+        "contract_spec_fallback_url"
+    ]
+    cftc_calls = 0
+
+    async def fake_official_pdf(_ctx, *, url, max_chars):
+        nonlocal cftc_calls
+        cftc_calls += 1
+        assert url == cftc_url
+        assert max_chars == 20_000
+        text = _cftc_unit_filing_text()
+        return ToolRunResponse(
+            tool="web.fetch.official-pdf",
+            ok=True,
+            summary="ok",
+            data={
+                "url": url,
+                "text": text,
+                "bytes_read": 488_222,
+                "evidence_id": "ev_cftc",
+            },
+        )
+
+    async def fake_fetch(_ctx, args):
+        url = str(args["url"])
+        if "cmegroup.com" in url:
+            return ToolRunResponse(
+                tool="web.fetch",
+                ok=False,
+                summary="Fetched URL with HTTP 403.",
+                data={
+                    "url": url,
+                    "text": "IP address blocked",
+                    "bytes_read": 602,
+                    "status_code": 403,
+                },
+            )
+        symbol = "BZ=F" if "BZ%3DF" in url else "CL=F"
+        payload = {
+            "chart": {
+                "error": None,
+                "result": [
+                    {
+                        "meta": {
+                            "symbol": symbol,
+                            "currency": "USD",
+                            "exchangeName": "NYM",
+                            "instrumentType": "FUTURE",
+                            "regularMarketPrice": 88.1 if symbol == "BZ=F" else 81.78,
+                            "regularMarketTime": int(quote_time.timestamp()),
+                            "exchangeTimezoneName": "America/New_York",
+                            "timezone": "EDT",
+                            "gmtoffset": -14_400,
+                        }
+                    }
+                ],
+            }
+        }
+        text = json.dumps(payload)
+        return ToolRunResponse(
+            tool="web.fetch",
+            ok=True,
+            summary="ok",
+            data={"url": url, "text": text, "bytes_read": len(text.encode())},
+        )
+
+    monkeypatch.setattr(tools_module, "_web_answer_fetch_official_pdf", fake_official_pdf)
+    monkeypatch.setattr(tools_module, "_web_fetch", fake_fetch)
+    question = "current Brent and WTI futures prices"
+    orchestrator = WebOrchestrator.create(query=question, mode=WebMode.DEEP_RESEARCH)
+    sources, steps = asyncio.run(
+        tools_module._web_answer_financial_provider_sources(
+            SimpleNamespace(),
+            question=question,
+            orchestrator=orchestrator,
+        )
+    )
+
+    assert cftc_calls == 1
+    assert {source["market_quote"]["symbol"] for source in sources} == {"BZ=F", "CL=F"}
+    assert all(
+        source["market_quote"]["unit_source_url"] == cftc_url for source in sources
+    )
+    assert all(source["market_quote"]["contract_unit"] is None for source in sources)
+    cme_steps = [
+        step
+        for step in steps
+        if step.get("source_kind") == "CME contract specification"
+    ]
+    cftc_steps = [
+        step
+        for step in steps
+        if step.get("source_kind") == "CFTC-hosted NYMEX rule filing"
+    ]
+    assert len(cme_steps) == 2 and not any(step["ok"] for step in cme_steps)
+    assert len(cftc_steps) == 2 and all(step["ok"] for step in cftc_steps)
+
+
+def test_typed_crude_quote_uses_valid_offset_fallback_and_rejects_mismatch(monkeypatch):
+    import jarvis_gpt.tools as tools_module
+
+    fixed_now = tools_module.datetime(2026, 7, 19, 12, 0, tzinfo=tools_module.UTC)
+    quote_time = tools_module.datetime(2026, 7, 17, 20, 59, tzinfo=tools_module.UTC)
+    monkeypatch.setattr(tools_module, "_web_answer_financial_now", lambda: fixed_now)
+    monkeypatch.setattr(
+        tools_module,
+        "_web_news_today",
+        lambda now=None: tools_module.date(2026, 7, 19),
+    )
+    spec = tools_module._WEB_ANSWER_YAHOO_CRUDE_QUOTES["brent"]
+    contract_evidence = _validated_cme_contract_evidence(tools_module, spec)
+
+    def parsed(offset: int):
+        url = (
+            "https://query1.finance.yahoo.com/v8/finance/chart/"
+            "BZ%3DF?interval=1d&range=5d"
+        )
+        payload = {
+            "chart": {
+                "error": None,
+                "result": [
+                    {
+                        "meta": {
+                            "symbol": "BZ=F",
+                            "currency": "USD",
+                            "exchangeName": "NYM",
+                            "instrumentType": "FUTURE",
+                            "regularMarketPrice": 88.1,
+                            "regularMarketTime": int(quote_time.timestamp()),
+                            "exchangeTimezoneName": "",
+                            "timezone": "EDT",
+                            "gmtoffset": offset,
+                        }
+                    }
+                ],
+            }
+        }
+        return tools_module._web_answer_yahoo_crude_quote_source(
+            benchmark="brent",
+            spec=spec,
+            fetched=ToolRunResponse(
+                tool="web.fetch",
+                ok=True,
+                summary="ok",
+                data={"url": url, "text": json.dumps(payload)},
+            ),
+            url=url,
+            contract_evidence=contract_evidence,
+        )
+
+    valid = parsed(-14_400)
+    assert valid is not None
+    assert valid["market_quote"]["timezone"] == "America/New_York"
+    assert parsed(0) is None
+
+
+def test_typed_crude_freshness_uses_exchange_date_not_moscow_date(monkeypatch):
+    import jarvis_gpt.tools as tools_module
+
+    now = tools_module.datetime(2026, 1, 19, 22, 0, tzinfo=tools_module.UTC)
+    quote_time = tools_module.datetime(2026, 1, 19, 0, 30, tzinfo=tools_module.UTC)
+    monkeypatch.setattr(tools_module, "_web_answer_financial_now", lambda: now)
+    # At this instant it is already Tuesday in Moscow but still the Monday US
+    # holiday. A valid Sunday-evening energy quote must use the exchange date.
+    monkeypatch.setattr(
+        tools_module,
+        "_web_news_today",
+        lambda now=None: tools_module.date(2026, 1, 20),
+    )
+    spec = tools_module._WEB_ANSWER_YAHOO_CRUDE_QUOTES["brent"]
+    contract_evidence = _validated_cme_contract_evidence(tools_module, spec)
+    url = (
+        "https://query1.finance.yahoo.com/v8/finance/chart/"
+        "BZ%3DF?interval=1d&range=5d"
+    )
+    payload = {
+        "chart": {
+            "error": None,
+            "result": [
+                {
+                    "meta": {
+                        "symbol": "BZ=F",
+                        "currency": "USD",
+                        "exchangeName": "NYM",
+                        "instrumentType": "FUTURE",
+                        "regularMarketPrice": 88.1,
+                        "regularMarketTime": int(quote_time.timestamp()),
+                        "exchangeTimezoneName": "America/New_York",
+                        "timezone": "EST",
+                        "gmtoffset": -18_000,
+                    }
+                }
+            ],
+        }
+    }
+
+    source = tools_module._web_answer_yahoo_crude_quote_source(
+        benchmark="brent",
+        spec=spec,
+        fetched=ToolRunResponse(
+            tool="web.fetch",
+            ok=True,
+            summary="ok",
+            data={"url": url, "text": json.dumps(payload)},
+        ),
+        url=url,
+        contract_evidence=contract_evidence,
+    )
+
+    assert source is not None
+    assert source["market_quote"]["quote_time_local"].startswith("2026-01-18T19:30")
+
+
+@pytest.mark.parametrize(
+    "contract_text",
+    [
+        (
+            "Contract Unit 1,000 barrels. Price Quotation U.S. dollars and cents "
+            "per barrel. Product Code CME Globex: CL."
+        ),
+        (
+            "Contract Unit 500 barrels. Price Quotation U.S. dollars and cents "
+            "per barrel. Product Code CME Globex: BZ."
+        ),
+        (
+            "Contract Unit 1,000 barrels. Price Quotation U.S. dollars per metric "
+            "ton. Product Code CME Globex: BZ."
+        ),
+    ],
+)
+def test_typed_crude_quote_fails_closed_without_matching_cme_evidence(
+    monkeypatch,
+    contract_text,
+):
+    import jarvis_gpt.tools as tools_module
+
+    fixed_now = tools_module.datetime(2026, 7, 19, 12, 0, tzinfo=tools_module.UTC)
+    quote_time = tools_module.datetime(2026, 7, 17, 20, 59, tzinfo=tools_module.UTC)
+    monkeypatch.setattr(tools_module, "_web_answer_financial_now", lambda: fixed_now)
+    monkeypatch.setattr(
+        tools_module,
+        "_web_news_today",
+        lambda now=None: tools_module.date(2026, 7, 19),
+    )
+    spec = tools_module._WEB_ANSWER_YAHOO_CRUDE_QUOTES["brent"]
+    contract_evidence = tools_module._web_answer_cme_crude_contract_evidence(
+        spec=spec,
+        fetched=ToolRunResponse(
+            tool="web.fetch",
+            ok=True,
+            summary="ok",
+            data={"url": spec["contract_spec_url"], "text": contract_text},
+        ),
+        url=spec["contract_spec_url"],
+    )
+    assert contract_evidence is None
+
+    payload = {
+        "chart": {
+            "error": None,
+            "result": [
+                {
+                    "meta": {
+                        "symbol": "BZ=F",
+                        "currency": "USD",
+                        "exchangeName": "NYM",
+                        "instrumentType": "FUTURE",
+                        "regularMarketPrice": 88.1,
+                        "regularMarketTime": int(quote_time.timestamp()),
+                        "exchangeTimezoneName": "America/New_York",
+                        "timezone": "EDT",
+                        "gmtoffset": -14_400,
+                    }
+                }
+            ],
+        }
+    }
+    assert (
+        tools_module._web_answer_yahoo_crude_quote_source(
+            benchmark="brent",
+            spec=spec,
+            fetched=ToolRunResponse(
+                tool="web.fetch",
+                ok=True,
+                summary="ok",
+                data={"text": json.dumps(payload)},
+            ),
+            url="https://query1.finance.yahoo.com/v8/finance/chart/BZ%3DF",
+            contract_evidence=contract_evidence,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        ("regularMarketPrice", True),
+        ("regularMarketPrice", float("nan")),
+        ("regularMarketPrice", float("inf")),
+        ("regularMarketPrice", 10_000.01),
+        ("regularMarketTime", True),
+        ("regularMarketTime", float("nan")),
+        ("regularMarketTime", float("inf")),
+        ("regularMarketTime", 946_684_799),
+        ("regularMarketTime", 4_102_444_801),
+    ],
+)
+def test_typed_crude_quote_rejects_bool_nonfinite_and_out_of_range_payloads(
+    monkeypatch,
+    field,
+    invalid_value,
+):
+    import jarvis_gpt.tools as tools_module
+
+    fixed_now = tools_module.datetime(2026, 7, 19, 12, 0, tzinfo=tools_module.UTC)
+    quote_time = tools_module.datetime(2026, 7, 17, 20, 59, tzinfo=tools_module.UTC)
+    monkeypatch.setattr(tools_module, "_web_answer_financial_now", lambda: fixed_now)
+    monkeypatch.setattr(
+        tools_module,
+        "_web_news_today",
+        lambda now=None: tools_module.date(2026, 7, 19),
+    )
+    spec = tools_module._WEB_ANSWER_YAHOO_CRUDE_QUOTES["brent"]
+    contract_evidence = _validated_cme_contract_evidence(tools_module, spec)
+    meta = {
+        "symbol": "BZ=F",
+        "currency": "USD",
+        "exchangeName": "NYM",
+        "instrumentType": "FUTURE",
+        "regularMarketPrice": 88.1,
+        "regularMarketTime": int(quote_time.timestamp()),
+        "exchangeTimezoneName": "America/New_York",
+        "timezone": "EDT",
+        "gmtoffset": -14_400,
+    }
+    meta[field] = invalid_value
+    payload = {"chart": {"error": None, "result": [{"meta": meta}]}}
+    url = (
+        "https://query1.finance.yahoo.com/v8/finance/chart/"
+        "BZ%3DF?interval=1d&range=5d"
+    )
+
+    assert (
+        tools_module._web_answer_yahoo_crude_quote_source(
+            benchmark="brent",
+            spec=spec,
+            fetched=ToolRunResponse(
+                tool="web.fetch",
+                ok=True,
+                summary="ok",
+                data={"url": url, "text": json.dumps(payload)},
+            ),
+            url=url,
+            contract_evidence=contract_evidence,
+        )
+        is None
+    )
+
+
+def test_orchestrated_fetch_reserves_network_capacity_before_parallel_io():
+    import jarvis_gpt.tools as tools_module
+    from jarvis_gpt.web_orchestrator import WebBudgetExceeded, WebMode, WebOrchestrator
+
+    async def scenario():
+        orchestrator = WebOrchestrator.create(
+            query="bounded parallel fetches",
+            mode=WebMode.DEEP_RESEARCH,
+        )
+        release = asyncio.Event()
+
+        async def response():
+            await release.wait()
+            return ToolRunResponse(
+                tool="web.fetch",
+                ok=True,
+                summary="ok",
+                data={"text": "x", "bytes_read": 1},
+            )
+
+        tasks = [
+            asyncio.create_task(
+                tools_module._web_orchestrated_network_call(
+                    orchestrator,
+                    "fetches",
+                    response,
+                    max_chars=16_000,
+                )
+            )
+            for _ in range(7)
+        ]
+        await asyncio.sleep(0.01)
+        exhausted = [task for task in tasks if task.done() and task.exception()]
+        assert len(exhausted) == 1
+        assert isinstance(exhausted[0].exception(), WebBudgetExceeded)
+        release.set()
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        assert sum(isinstance(item, WebBudgetExceeded) for item in results) == 1
+        assert orchestrator.budget.snapshot()["consumed"]["network_bytes"] == 6
+
+    asyncio.run(scenario())
+
+
 def test_web_fetch_flags_prompt_injection_text(monkeypatch, tmp_path):
     class FakeResponse:
         status_code = 200
@@ -5130,12 +6025,19 @@ def test_docker_logs_restricts_non_jarvis_containers(monkeypatch, tmp_path):
 
 
 def test_dispatcher_tools_are_safe_or_gated(monkeypatch, tmp_path):
+    full_id = "a" * 64
+    restart_ids = []
+
     class FakeDispatcher:
         def __init__(self, _settings):
             return None
 
         def status(self):
-            return {"docker_available": True, "port_open": True}
+            return {
+                "docker_available": True,
+                "port_open": True,
+                "container_status": {"ok": True, "exists": True, "id": full_id},
+            }
 
         def run_compose(self, action):
             return self.run_compose_verified(action)
@@ -5148,6 +6050,15 @@ def test_dispatcher_tools_are_safe_or_gated(monkeypatch, tmp_path):
                 "stderr": "",
                 "command": ["docker", "compose", action],
                 "verification": {"ok": True, "port_open": action == "up"},
+            }
+
+        def restart_verified(self, expected_container_id):
+            restart_ids.append(expected_container_id)
+            return {
+                "ok": True,
+                "summary": "dispatcher restarted by exact ID",
+                "container_id": "b" * 64,
+                "operation_nonce": "c" * 32,
             }
 
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
@@ -5164,6 +6075,7 @@ def test_dispatcher_tools_are_safe_or_gated(monkeypatch, tmp_path):
     logs = asyncio.run(tools.run("dispatcher.logs", {}))
     blocked = asyncio.run(tools.run("dispatcher.start", {}))
     started = asyncio.run(tools.run("dispatcher.start", {}, allow_danger=True))
+    restarted = asyncio.run(tools.run("dispatcher.restart", {}, allow_danger=True))
 
     assert info["dispatcher.start"].danger_level == "review"
     assert status.ok is True
@@ -5172,6 +6084,8 @@ def test_dispatcher_tools_are_safe_or_gated(monkeypatch, tmp_path):
     assert "requires approval" in blocked.summary
     assert started.ok is True
     assert started.summary == "dispatcher up"
+    assert restarted.ok is True
+    assert restart_ids == [full_id]
     storage.close()
 
 

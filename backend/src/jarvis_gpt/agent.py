@@ -22,6 +22,7 @@ from datetime import UTC, date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlparse
+from weakref import WeakValueDictionary
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from . import persona as persona_module
@@ -82,7 +83,7 @@ from .shop_registry import (
     get_shop_source_by_host,
     shop_search_url,
 )
-from .storage import JarvisStorage, utc_now
+from .storage import JarvisStorage, bind_chat_request_metadata, new_id, utc_now
 from .tools import OperatorTurnAuthorization, ToolRegistry, _canonicalize_tool_invocation
 from .verification import (
     Verdict,
@@ -302,8 +303,16 @@ MISSION_MARKERS = (
 # extraction, and its writes are single-fact, deduplicated, capped per field,
 # audit-logged and editable from Command Center.
 DEFAULT_MAX_TOOL_STEPS = 4
-OPERATOR_EFFECT_COMPLETED_TTL_SECONDS = 20 * 60
+# Must exceed Telegram's 24-hour extended outage retry horizon: a backend mutation
+# may have committed even when its HTTP response never reached the bridge.
+OPERATOR_EFFECT_COMPLETED_TTL_SECONDS = 26 * 60 * 60
 OPERATOR_EFFECT_LEDGER_MAX_REQUESTS = 64
+CHAT_REQUEST_KEY_PREFIX = "agent.chat_request."
+LEGACY_GUEST_REQUEST_KEY_PREFIX = "agent.guest_request."
+CHAT_REQUEST_TTL_SECONDS = 26 * 60 * 60
+CHAT_REQUEST_HARD_CAP_FLOOR = 4_096
+CHAT_REQUEST_LEASE_SECONDS = 15 * 60
+_PROCESS_RUNTIME_GENERATION = uuid.uuid4().hex
 AGENTIC_TOOL_DENYLIST = frozenset(
     {"memory.save", "learning.tick", "mission.brief"}
 )
@@ -323,6 +332,7 @@ AGENTIC_DURABLE_MUTATORS = frozenset(
         "documents.archive.create",
         "documents.archive.extract",
         "documents.apply_replacements",
+        "documents.edit",
         "filesystem.write_text",
         "filesystem.mkdir",
         "filesystem.copy",
@@ -332,6 +342,38 @@ AGENTIC_DURABLE_MUTATORS = frozenset(
         "mission.brief",
     }
 )
+
+
+class ChatUnavailableError(RuntimeError):
+    """A chat turn could not obtain a usable model response."""
+
+    def __init__(self, message: str, *, retry_scope: str = "request") -> None:
+        super().__init__(message)
+        self.retry_scope = "service" if retry_scope == "service" else "request"
+
+
+# Backwards-compatible import used by callers and older tests.
+GuestChatUnavailableError = ChatUnavailableError
+
+
+class ChatRequestConflictError(ValueError):
+    """A transport request id was reused for a different logical request."""
+
+
+class ChatRequestInProgressError(RuntimeError):
+    """Another worker still owns the durable lease for this logical request."""
+
+
+@dataclass
+class _ChatRequestHandle:
+    request_hash: str
+    fingerprint: str
+    conversation_id: str
+    lease_token: str
+    user_message_id: str = ""
+    cached_response: ChatResponse | None = None
+
+
 SAFE_DIRECT_NATIVE_ACTIONS = frozenset(
     {
         "capabilities",
@@ -601,6 +643,7 @@ class _AgenticResult:
     events: list[ChatEvent]
     finish_reason: str | None = None
     error: str | None = None
+    failure_scope: str | None = None
     blocked_by_approval: bool = False
     approval_ids: tuple[str, ...] = ()
     continuation_count: int = 0
@@ -880,6 +923,7 @@ class AgentRuntime:
         self.llm = llm
         self.bus = bus
         self.playbooks = playbooks
+        self._runtime_generation_id = _backend_runtime_generation_id()
         profile = host_profile or storage.get_runtime_value("environment.host_profile", None)
         self.executive = executive
         if self.executive is None and isinstance(profile, dict):
@@ -904,6 +948,9 @@ class AgentRuntime:
             self.permissions.sync_capabilities(CORE_CAPABILITIES, catalog_key="core.v1")
         self.embeddings = EmbeddingBackend(settings)
         self._mission_report_lock = asyncio.Lock()
+        self._chat_request_locks: WeakValueDictionary[str, asyncio.Lock] = (
+            WeakValueDictionary()
+        )
 
     def _capability_allowed(self, security_id: str, *, record: bool = False) -> bool:
         """Fail-closed capability probe for the currently bound principal."""
@@ -982,6 +1029,98 @@ class AgentRuntime:
         notification_chat_id: int | None = None,
         transport_request_id: str | None = None,
     ) -> ChatResponse:
+        """Run one logical chat request behind a durable transport-id fence."""
+
+        self._require_chat_capability()
+        request_id = str(transport_request_id or "").strip()
+        if not request_id:
+            return await self._chat_impl(
+                message,
+                conversation_id=conversation_id,
+                mode=mode,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                attachments=attachments,
+                thinking_enabled=thinking_enabled,
+                access_mode=access_mode,
+                notification_chat_id=notification_chat_id,
+                transport_request_id=None,
+            )
+
+        actor = current_actor()
+        capabilities = self._context_capabilities()
+        legacy_guest_downgrade = actor.source == "legacy-local" and access_mode == "guest"
+        effective_access_mode = (
+            "guest"
+            if legacy_guest_downgrade
+            or not self._full_agent_surface_allowed(capabilities)
+            else "owner"
+        )
+        request_hash = hashlib.sha256(request_id.encode("utf-8")).hexdigest()
+        lock_key = f"{actor.user_id}:{request_hash}"
+        request_lock = self._chat_request_locks.get(lock_key)
+        if request_lock is None:
+            request_lock = asyncio.Lock()
+            self._chat_request_locks[lock_key] = request_lock
+
+        async with request_lock:
+            handle = self._claim_chat_request(
+                request_id=request_id,
+                message=message,
+                requested_conversation_id=conversation_id,
+                conversation_title=(
+                    "Гостевой Telegram-диалог"
+                    if effective_access_mode == "guest"
+                    else self._title_from_goal(message)
+                ),
+                mode=mode,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                attachments=_normalize_chat_attachments(attachments),
+                thinking_enabled=thinking_enabled,
+                access_mode=effective_access_mode,
+                notification_chat_id=notification_chat_id,
+            )
+            if handle.cached_response is not None:
+                return handle.cached_response
+            try:
+                with bind_chat_request_metadata(
+                    request_hash=handle.request_hash,
+                    fingerprint=handle.fingerprint,
+                ):
+                    response = await self._chat_impl(
+                        message,
+                        conversation_id=handle.conversation_id,
+                        mode=mode,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        attachments=attachments,
+                        thinking_enabled=thinking_enabled,
+                        access_mode=access_mode,
+                        notification_chat_id=notification_chat_id,
+                        transport_request_id=request_id,
+                        _request_handle=handle,
+                    )
+                self._complete_chat_request(handle, response)
+                return response
+            except BaseException:
+                self._release_chat_request(handle)
+                raise
+
+    async def _chat_impl(
+        self,
+        message: str,
+        conversation_id: str | None = None,
+        mode: str = "auto",
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        attachments: list[dict[str, Any]] | None = None,
+        thinking_enabled: bool = True,
+        access_mode: str = "owner",
+        notification_chat_id: int | None = None,
+        transport_request_id: str | None = None,
+        _request_handle: _ChatRequestHandle | None = None,
+    ) -> ChatResponse:
         # ``access_mode`` is caller-controlled and can never elevate authority.  A
         # narrowly-scoped legacy-local ``guest`` value remains a compatible downgrade
         # while older trusted bridges migrate to authenticated actor contexts.  Preset
@@ -999,6 +1138,11 @@ class AgentRuntime:
                 conversation_id=conversation_id,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                preserve_existing_history=actor.source == "session",
+                transport_request_id=(
+                    None if _request_handle is not None else transport_request_id
+                ),
+                request_handle=_request_handle,
             )
         started_at = time.perf_counter()
         attachments = _normalize_chat_attachments(attachments)
@@ -1022,9 +1166,9 @@ class AgentRuntime:
             transport_request_id=transport_request_id,
         )
         if context.operator_cached_answer is not None:
-            context.operator_message_id = self.storage.add_message(
+            context.operator_message_id = self._chat_request_user_message(
+                _request_handle,
                 conversation_id=context.conversation_id,
-                role="user",
                 content=message,
                 metadata=_chat_message_metadata(
                     max_tokens=max_tokens,
@@ -1126,9 +1270,9 @@ class AgentRuntime:
         events.append(self._task_kernel_event(task_plan, context.conversation_id))
         await self._emit(events[-1])
 
-        context.operator_message_id = self.storage.add_message(
+        context.operator_message_id = self._chat_request_user_message(
+            _request_handle,
             conversation_id=context.conversation_id,
-            role="user",
             content=message,
             metadata=_chat_message_metadata(
                 max_tokens=max_tokens,
@@ -1159,6 +1303,17 @@ class AgentRuntime:
                 )
             )
             await self._emit(events[-1])
+            events.append(
+                ChatEvent(
+                    type="assistant_done",
+                    title="Уточнение",
+                    payload={
+                        "source": "clarification",
+                        "mission_created": False,
+                        "artifact_created": False,
+                    },
+                )
+            )
             duration_ms = _elapsed_ms(started_at)
             message_id = self.storage.add_message(
                 conversation_id=context.conversation_id,
@@ -1170,18 +1325,9 @@ class AgentRuntime:
                     "mission_created": False,
                     "artifact_created": False,
                     "pending_goal": context.pending_clarification_goal,
+                    "duration_ms": duration_ms,
+                    "events": [event.model_dump() for event in events],
                 },
-            )
-            events.append(
-                ChatEvent(
-                    type="assistant_done",
-                    title="Уточнение",
-                    payload={
-                        "source": "clarification",
-                        "mission_created": False,
-                        "artifact_created": False,
-                    },
-                )
             )
             await self._emit(events[-1])
             return ChatResponse(
@@ -1357,6 +1503,13 @@ class AgentRuntime:
                 )
             )
             await self._emit(events[-1])
+            events.append(
+                ChatEvent(
+                    type="assistant_done",
+                    title="Уточнение",
+                    payload={"source": "clarification", "mission_created": False},
+                )
+            )
             duration_ms = _elapsed_ms(started_at)
             message_id = self.storage.add_message(
                 conversation_id=context.conversation_id,
@@ -1366,14 +1519,9 @@ class AgentRuntime:
                     "source": "clarification",
                     "task_kernel": task_plan.payload(),
                     "mission_created": False,
+                    "duration_ms": duration_ms,
+                    "events": [event.model_dump() for event in events],
                 },
-            )
-            events.append(
-                ChatEvent(
-                    type="assistant_done",
-                    title="Уточнение",
-                    payload={"source": "clarification", "mission_created": False},
-                )
             )
             await self._emit(events[-1])
             return ChatResponse(
@@ -1394,6 +1542,8 @@ class AgentRuntime:
                     metadata={
                         "source": "clarification",
                         "mission_created": False,
+                        "duration_ms": duration_ms,
+                        "events": [event.model_dump() for event in events],
                     },
                 )
                 return ChatResponse(
@@ -1625,22 +1775,11 @@ class AgentRuntime:
                 )
             )
         else:
-            answer = self._offline_answer(message, agentic.error)
-            events.append(
-                ChatEvent(
-                    type="assistant_done",
-                    title="Offline fallback",
-                    content=agentic.error,
-                    payload={"source": "fallback"},
-                )
+            raise ChatUnavailableError(
+                agentic.error or "chat could not obtain a usable model response",
+                retry_scope=str(agentic.failure_scope or "request"),
             )
-        if (
-            agentic.ok
-            and agentic.answer
-            and not str(agentic.finish_reason or "").startswith(
-                ("protocol_error", "synthesis_error")
-            )
-        ):
+        if agentic.ok and agentic.answer:
             self._complete_operator_effect_turn(context, answer=answer)
         await self._emit(events[-1])
         duration_ms = _elapsed_ms(started_at)
@@ -1669,9 +1808,31 @@ class AgentRuntime:
         conversation_id: str | None,
         temperature: float | None,
         max_tokens: int | None,
+        preserve_existing_history: bool,
+        transport_request_id: str | None = None,
+        request_handle: _ChatRequestHandle | None = None,
     ) -> ChatResponse:
         """Text-only LLM chat with no access to owner memory, files, tools, or screen."""
 
+        return await self._guest_chat_locked(
+            message,
+            conversation_id=conversation_id,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            preserve_existing_history=preserve_existing_history,
+            request_handle=request_handle,
+        )
+
+    async def _guest_chat_locked(
+        self,
+        message: str,
+        *,
+        conversation_id: str | None,
+        temperature: float | None,
+        max_tokens: int | None,
+        preserve_existing_history: bool,
+        request_handle: _ChatRequestHandle | None = None,
+    ) -> ChatResponse:
         started_at = time.perf_counter()
         clean_message = " ".join(str(message or "").split()).strip()[:20_000]
         if not clean_message:
@@ -1684,22 +1845,23 @@ class AgentRuntime:
                 conversation_id, "Гостевой Telegram-диалог"
             )
             recent = self.storage.recent_messages(conversation_id, limit=12)
-            # Never attach guest mode to an owner conversation, even if a caller somehow
-            # learns its identifier. A guest history is self-identifying on every row.
-            if any(
+            if not preserve_existing_history and any(
                 not isinstance(item.get("metadata"), dict)
                 or item["metadata"].get("access_mode") != "guest"
                 for item in recent
             ):
-                conversation_id = self.storage.create_conversation("Гостевой Telegram-диалог")
+                conversation_id = self.storage.create_conversation(
+                    "Гостевой Telegram-диалог"
+                )
+                if request_handle is not None:
+                    self._rebind_chat_request_conversation(
+                        request_handle,
+                        conversation_id,
+                    )
                 recent = []
 
-        self.storage.add_message(
-            conversation_id=conversation_id,
-            role="user",
-            content=clean_message,
-            metadata={"access_mode": "guest"},
-        )
+        existing_user_message_id = ""
+
         messages: list[dict[str, Any]] = [
             {
                 "role": "system",
@@ -1725,17 +1887,26 @@ class AgentRuntime:
             max_tokens=min(max_tokens or self.settings.llm_max_tokens, 2048),
             thinking_enabled=False,
         )
-        answer = (
-            result.content.strip()
-            if result.ok and result.content.strip()
-            else "Гостевой чат сейчас не смог получить ответ от модели. Попробуйте позже."
-        )
+        answer = result.content.strip() if result.ok else ""
+        if not answer:
+            raise ChatUnavailableError(
+                "guest chat could not obtain a usable model response",
+                retry_scope=str(getattr(result, "failure_scope", None) or "request"),
+            )
+        message_metadata: dict[str, Any] = {"access_mode": "guest"}
+        if not existing_user_message_id:
+            existing_user_message_id = self._chat_request_user_message(
+                request_handle,
+                conversation_id=conversation_id,
+                content=clean_message,
+                metadata=message_metadata,
+            )
         duration_ms = _elapsed_ms(started_at)
         message_id = self.storage.add_message(
             conversation_id=conversation_id,
             role="assistant",
             content=answer,
-            metadata={"access_mode": "guest", "duration_ms": duration_ms},
+            metadata={**message_metadata, "duration_ms": duration_ms, "events": []},
         )
         return ChatResponse(
             conversation_id=conversation_id,
@@ -1756,6 +1927,127 @@ class AgentRuntime:
         thinking_enabled: bool = True,
         transport_request_id: str | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
+        """Stream one logical request while preserving the same durable fence as chat()."""
+
+        self._require_chat_capability()
+        request_id = str(transport_request_id or "").strip()
+        if not request_id:
+            async for item in self._stream_chat_impl(
+                message,
+                conversation_id=conversation_id,
+                mode=mode,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                attachments=attachments,
+                thinking_enabled=thinking_enabled,
+                transport_request_id=None,
+            ):
+                yield item
+            return
+
+        actor = current_actor()
+        capabilities = self._context_capabilities()
+        effective_access_mode = (
+            "owner" if self._full_agent_surface_allowed(capabilities) else "guest"
+        )
+        request_hash = hashlib.sha256(request_id.encode("utf-8")).hexdigest()
+        lock_key = f"{actor.user_id}:{request_hash}"
+        request_lock = self._chat_request_locks.get(lock_key)
+        if request_lock is None:
+            request_lock = asyncio.Lock()
+            self._chat_request_locks[lock_key] = request_lock
+        async with request_lock:
+            handle = self._claim_chat_request(
+                request_id=request_id,
+                message=message,
+                requested_conversation_id=conversation_id,
+                conversation_title=(
+                    "Гостевой Telegram-диалог"
+                    if effective_access_mode == "guest"
+                    else self._title_from_goal(message)
+                ),
+                mode=mode,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                attachments=_normalize_chat_attachments(attachments),
+                thinking_enabled=thinking_enabled,
+                access_mode=effective_access_mode,
+                notification_chat_id=None,
+            )
+            if handle.cached_response is not None:
+                response = handle.cached_response
+                yield {"type": "meta", "conversation_id": response.conversation_id}
+                yield {"type": "delta", "content": response.answer}
+                yield {
+                    "type": "done",
+                    "answer": response.answer,
+                    "conversation_id": response.conversation_id,
+                    "duration_ms": response.duration_ms,
+                    "events": [event.model_dump() for event in response.events],
+                    "message_id": response.message_id,
+                    "source": "idempotent_response_replay",
+                }
+                return
+            completed = False
+            stream = self._stream_chat_impl(
+                message,
+                conversation_id=handle.conversation_id,
+                mode=mode,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                attachments=attachments,
+                thinking_enabled=thinking_enabled,
+                transport_request_id=request_id,
+                _request_handle=handle,
+            )
+            try:
+                while True:
+                    try:
+                        # ContextVars propagate through async-generator yields.
+                        # Bind only while advancing AgentRuntime's generator so
+                        # the API consumer can never inherit request metadata.
+                        with bind_chat_request_metadata(
+                            request_hash=handle.request_hash,
+                            fingerprint=handle.fingerprint,
+                        ):
+                            item = await anext(stream)
+                    except StopAsyncIteration:
+                        break
+                    if item.get("type") == "done":
+                        response = ChatResponse.model_validate(
+                            {
+                                "conversation_id": item.get("conversation_id"),
+                                "message_id": item.get("message_id"),
+                                "answer": item.get("answer"),
+                                "events": item.get("events") or [],
+                                "mission_id": item.get("mission_id"),
+                                "duration_ms": item.get("duration_ms") or 0,
+                            }
+                        )
+                        self._complete_chat_request(handle, response)
+                        completed = True
+                    yield item
+            finally:
+                with bind_chat_request_metadata(
+                    request_hash=handle.request_hash,
+                    fingerprint=handle.fingerprint,
+                ):
+                    await stream.aclose()
+                if not completed:
+                    self._release_chat_request(handle)
+
+    async def _stream_chat_impl(
+        self,
+        message: str,
+        conversation_id: str | None = None,
+        mode: str = "auto",
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        attachments: list[dict[str, Any]] | None = None,
+        thinking_enabled: bool = True,
+        transport_request_id: str | None = None,
+        _request_handle: _ChatRequestHandle | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
         self._require_chat_capability()
         started_at = time.perf_counter()
         context_capabilities = self._context_capabilities()
@@ -1765,6 +2057,11 @@ class AgentRuntime:
                 conversation_id=conversation_id,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                preserve_existing_history=current_actor().source == "session",
+                transport_request_id=(
+                    None if _request_handle is not None else transport_request_id
+                ),
+                request_handle=_request_handle,
             )
             yield {"type": "meta", "conversation_id": response.conversation_id}
             yield {"type": "delta", "content": response.answer}
@@ -1798,9 +2095,9 @@ class AgentRuntime:
         )
         if context.operator_cached_answer is not None:
             yield {"type": "meta", "conversation_id": context.conversation_id}
-            context.operator_message_id = self.storage.add_message(
+            context.operator_message_id = self._chat_request_user_message(
+                _request_handle,
                 conversation_id=context.conversation_id,
-                role="user",
                 content=message,
                 metadata=_chat_message_metadata(
                     max_tokens=max_tokens,
@@ -1908,9 +2205,9 @@ class AgentRuntime:
         await self._emit(events[-1])
         yield {"type": "event", "event": events[-1].model_dump()}
 
-        context.operator_message_id = self.storage.add_message(
+        context.operator_message_id = self._chat_request_user_message(
+            _request_handle,
             conversation_id=context.conversation_id,
-            role="user",
             content=message,
             metadata=_chat_message_metadata(
                 max_tokens=max_tokens,
@@ -1955,6 +2252,8 @@ class AgentRuntime:
                     "mission_created": False,
                     "artifact_created": False,
                     "pending_goal": context.pending_clarification_goal,
+                    "duration_ms": duration_ms,
+                    "events": [event.model_dump() for event in events],
                 },
             )
             yield {
@@ -2157,6 +2456,8 @@ class AgentRuntime:
                     "source": "clarification",
                     "task_kernel": task_plan.payload(),
                     "mission_created": False,
+                    "duration_ms": duration_ms,
+                    "events": [event.model_dump() for event in events],
                 },
             )
             yield {
@@ -2181,6 +2482,8 @@ class AgentRuntime:
                     metadata={
                         "source": "clarification",
                         "mission_created": False,
+                        "duration_ms": duration_ms,
+                        "events": [event.model_dump() for event in events],
                     },
                 )
                 yield {
@@ -2350,6 +2653,7 @@ class AgentRuntime:
 
         answer_parts: list[str] = []
         stream_error: str | None = None
+        stream_failure_scope: str | None = None
         stream_finish_reason: str | None = None
         recovery_error: str | None = None
         used_tools = 0
@@ -2385,6 +2689,7 @@ class AgentRuntime:
                         stream_finish_reason = chunk.finish_reason
                 elif chunk.kind == "error":
                     stream_error = chunk.error
+                    stream_failure_scope = getattr(chunk, "failure_scope", None)
                     break
                 elif chunk.kind == "done":
                     stream_finish_reason = (
@@ -2402,10 +2707,11 @@ class AgentRuntime:
             # control payloads from leaking through the streaming endpoint.
             async def collect_round(
                 round_messages: list[dict[str, str]],
-            ) -> tuple[list[str], str | None, str | None]:
+            ) -> tuple[list[str], str | None, str | None, str | None]:
                 parts: list[str] = []
                 error: str | None = None
                 finish_reason: str | None = None
+                failure_scope: str | None = None
                 async for chunk in self._stream_llm(
                     round_messages,
                     temperature=temperature,
@@ -2418,19 +2724,22 @@ class AgentRuntime:
                             finish_reason = chunk.finish_reason
                     elif chunk.kind == "error":
                         error = chunk.error
+                        failure_scope = getattr(chunk, "failure_scope", None)
                         break
                     elif chunk.kind == "done":
                         finish_reason = (
                             getattr(chunk, "finish_reason", None) or finish_reason
                         )
                         break
-                return parts, error, finish_reason
+                return parts, error, finish_reason, failure_scope
 
             protocol_correction_used = False
             force_final = False
             blocked_by_approval = False
             while used_tools < max_steps:
-                round_parts, round_error, round_finish = await collect_round(messages)
+                round_parts, round_error, round_finish, round_failure_scope = (
+                    await collect_round(messages)
+                )
                 raw = "".join(round_parts)
                 if round_error:
                     if executed_tools or approval_ids:
@@ -2447,6 +2756,7 @@ class AgentRuntime:
                         yield {"type": "delta", "content": recovery}
                     else:
                         stream_error = round_error
+                        stream_failure_scope = round_failure_scope
                     break
                 turn = _classify_tool_turn(raw)
                 if (
@@ -2529,8 +2839,10 @@ class AgentRuntime:
                     break
 
             if force_final and not answer_parts and stream_error is None:
-                round_parts, round_error, round_finish = await collect_round(
-                    [*messages, {"role": "system", "content": FINAL_ANSWER_PROMPT}]
+                round_parts, round_error, round_finish, round_failure_scope = (
+                    await collect_round(
+                        [*messages, {"role": "system", "content": FINAL_ANSWER_PROMPT}]
+                    )
                 )
                 raw = "".join(round_parts)
                 if round_error:
@@ -2548,6 +2860,7 @@ class AgentRuntime:
                         yield {"type": "delta", "content": recovery}
                     else:
                         stream_error = round_error
+                        stream_failure_scope = round_failure_scope
                 else:
                     turn = _classify_tool_turn(raw)
                     answer = (
@@ -2576,14 +2889,23 @@ class AgentRuntime:
                             answer_parts.append(content)
                             yield {"type": "delta", "content": content}
 
+        if stream_error or not answer_parts:
+            error = stream_error or "LLM stream produced no usable output"
+            failure_scope = stream_failure_scope or "request"
+            payload = {
+                "type": "error",
+                "error": error,
+                "failure_scope": failure_scope,
+            }
+            if failure_scope == "service":
+                payload["retry_class"] = "llm-outage"
+            yield payload
+            return
+
         continuation_count = 0
         if answer_parts:
             answer = _user_visible_answer("".join(answer_parts).strip())
-            if stream_error:
-                interruption = f"\n\n[stream interrupted: {stream_error}]"
-                answer = f"{answer}{interruption}"
-                yield {"type": "delta", "content": interruption}
-            elif stream_finish_reason == "length":
+            if stream_finish_reason == "length":
                 (
                     continued_answer,
                     continuation_count,
@@ -2715,13 +3037,7 @@ class AgentRuntime:
                 )
             )
 
-        if (
-            answer_parts
-            and not stream_error
-            and not str(stream_finish_reason or "").startswith(
-                ("protocol_error", "synthesis_error")
-            )
-        ):
+        if answer_parts:
             self._complete_operator_effect_turn(context, answer=answer)
 
         await self._emit(events[-1])
@@ -4439,12 +4755,29 @@ class AgentRuntime:
             # vetted action tool runs with allow_danger under owner autonomy (which already
             # authorizes danger tools). Read-only steps never get it.
             allow_danger = name in _ORCHESTRATOR_ACTION_TOOLS and self._owner_autonomy_active()
+            if allow_danger:
+                result = await self._run_direct_operator_tool(
+                    context,
+                    tool=name,
+                    arguments=arguments,
+                    allow_danger=True,
+                )
+                if result is None:
+                    return ToolRunResponse(
+                        tool=name,
+                        ok=False,
+                        summary=(
+                            "Exact operator effect is already claimed; duplicate dispatch "
+                            "was skipped."
+                        ),
+                        data={"duplicate_effect": True, "outcome_known": False},
+                    )
+                return result
             return await self.tools.run(
                 name,
                 arguments,
                 conversation_id=context.conversation_id,
                 user_message_id=context.operator_message_id,
-                allow_danger=allow_danger,
             )
 
         async def _emit_step(kind: str, payload: dict[str, Any]) -> None:
@@ -4568,11 +4901,34 @@ class AgentRuntime:
         )
         return DirectAction(answer=msg, events=[])
 
-    async def _dispatcher_control_action(self, native_action: NativeAction) -> DirectAction:
+    async def _dispatcher_control_action(
+        self,
+        native_action: NativeAction,
+        context: AgentContext | None = None,
+    ) -> DirectAction:
         """Run a dispatcher restart/stop/start (owner's turn authorizes it, allow_danger)."""
 
         tool = native_action.action
-        result = await self.tools.run(tool, {}, allow_danger=True)
+        result = await self._run_direct_operator_tool(
+            context,
+            tool=tool,
+            arguments={},
+            allow_danger=True,
+        )
+        if result is None:
+            event = ChatEvent(
+                type="thought",
+                title="Durable duplicate effect skipped",
+                content="The same dispatcher effect is already claimed by this request.",
+                payload={"tool": tool, "replayed": False, "durable": True},
+            )
+            return DirectAction(
+                answer=(
+                    "Этот точный запрос управления диспетчером уже был принят; "
+                    "повторная команда не отправлена."
+                ),
+                events=[event],
+            )
         status = "Готово" if result.ok else "Не смог выполнить"
         note = ""
         if result.ok and tool in ("dispatcher.restart", "dispatcher.start"):
@@ -4637,6 +4993,66 @@ class AgentRuntime:
                 events=[],
             )
 
+        effect_key: str | None = None
+        reminder: dict[str, Any] | None = None
+        if (
+            context is not None
+            and context.operator_request_digest
+            and context.operator_message_id
+        ):
+            effect_key = _operator_effect_key(
+                "screen_watch.create",
+                {
+                    "condition": request.condition,
+                    "interval_sec": request.interval_sec,
+                    "duration_sec": request.duration_sec,
+                    "keep": request.keep,
+                    "conversation_id": context.conversation_id,
+                    "notification_chat_id": context.notification_chat_id,
+                },
+            )
+
+        def existing_effect_reminder() -> dict[str, Any] | None:
+            if effect_key is None:
+                return None
+            return next(
+                (
+                    item
+                    for item in self.storage.list_reminders(status="all", limit=1000)
+                    if isinstance(item.get("payload"), dict)
+                    and item["payload"].get("operator_effect_key") == effect_key
+                ),
+                None,
+            )
+
+        if effect_key is not None and (
+            effect_key in context.operator_retry_effects
+            or effect_key in context.operator_used_effects
+        ):
+            reminder = existing_effect_reminder()
+            if reminder is None:
+                return DirectAction(
+                    answer=(
+                        "Этот точный запуск наблюдения уже был принят, но его итог ещё "
+                        "не подтверждён; второе наблюдение не создано."
+                    ),
+                    events=[
+                        ChatEvent(
+                            type="thought",
+                            title="Durable duplicate effect skipped",
+                            content=(
+                                "A prior attempt already claimed this screen-watch effect."
+                            ),
+                            payload={
+                                "tool": "screen_watch.create",
+                                "effect": effect_key,
+                                "replayed": False,
+                                "durable": True,
+                            },
+                        )
+                    ],
+                )
+
         pending = self.storage.list_reminders(status="pending", limit=1000)
         active = [
             item
@@ -4645,7 +5061,7 @@ class AgentRuntime:
             and item["payload"].get("kind") == "screen_watch"
         ]
         max_active = max(1, min(int(self.settings.screen_watch_max_active), 20))
-        if len(active) >= max_active:
+        if reminder is None and len(active) >= max_active:
             return DirectAction(
                 answer=(
                     f"Уже активно {len(active)} наблюдений за экраном — лимит {max_active}. "
@@ -4654,25 +5070,90 @@ class AgentRuntime:
                 events=[],
             )
 
+        if reminder is None and effect_key is not None and not self._begin_operator_effect(
+            context,
+            tool="screen_watch.create",
+            effect_key=effect_key,
+        ):
+            reminder = existing_effect_reminder()
+            if reminder is None:
+                return DirectAction(
+                    answer=(
+                        "Этот точный запуск наблюдения уже принят; повторное наблюдение "
+                        "не создано, пока не сверено состояние первого."
+                    ),
+                    events=[
+                        ChatEvent(
+                            type="thought",
+                            title="Durable duplicate effect skipped",
+                            content=(
+                                "A concurrent attempt already claimed this screen-watch effect."
+                            ),
+                            payload={
+                                "tool": "screen_watch.create",
+                                "effect": effect_key,
+                                "replayed": False,
+                                "durable": True,
+                            },
+                        )
+                    ],
+                )
+
         now = datetime.now(UTC).replace(microsecond=0)
         due_at = (now + timedelta(seconds=request.interval_sec)).isoformat()
         expires_at = (now + timedelta(seconds=request.duration_sec)).isoformat()
         title = f"Наблюдение за экраном: {request.condition}"
-        reminder = self.storage.create_reminder(
-            text=title,
-            due_at=due_at,
-            recurrence={"kind": "interval", "seconds": request.interval_sec},
-            conversation_id=context.conversation_id if context is not None else None,
-            source_text=message,
-            payload={
+        if reminder is None:
+            reminder_payload: dict[str, Any] = {
                 "kind": "screen_watch",
                 "condition": request.condition,
                 "keep": request.keep,
                 "expires_at": expires_at,
                 "deliver": "telegram",
                 "telegram_chat_id": context.notification_chat_id if context else None,
-            },
-        )
+            }
+            if effect_key is not None:
+                reminder_payload["operator_effect_key"] = effect_key
+            reminder = self.storage.create_reminder(
+                text=title,
+                due_at=due_at,
+                recurrence={"kind": "interval", "seconds": request.interval_sec},
+                conversation_id=context.conversation_id if context is not None else None,
+                source_text=message,
+                payload=reminder_payload,
+            )
+            if effect_key is not None:
+                context.operator_used_effects.add(effect_key)
+                self._record_operator_effect_outcome(
+                    context,
+                    effect_key=effect_key,
+                    result=ToolRunResponse(
+                        tool="screen_watch.create",
+                        ok=True,
+                        summary=f"Screen watch reminder {reminder['id']} created.",
+                        data={"reminder_id": reminder["id"], "outcome_known": True},
+                    ),
+                )
+        else:
+            due_at = str(reminder.get("due_at") or due_at)
+            reminder_payload = (
+                reminder.get("payload")
+                if isinstance(reminder.get("payload"), dict)
+                else {}
+            )
+            expires_at = str(reminder_payload.get("expires_at") or expires_at)
+            if effect_key is not None:
+                self._record_operator_effect_outcome(
+                    context,
+                    effect_key=effect_key,
+                    result=ToolRunResponse(
+                        tool="screen_watch.create",
+                        ok=True,
+                        summary=f"Existing screen watch reminder {reminder['id']} verified.",
+                        data={"reminder_id": reminder["id"], "outcome_known": True},
+                    ),
+                    reconcile_existing=True,
+                )
         mode = (
             "буду продолжать после совпадения"
             if request.keep
@@ -4795,7 +5276,7 @@ class AgentRuntime:
             # gated posture, clear it so the agentic loop runs the tool through the
             # operator-approval path instead of mis-dispatching to windows.native.
             if self._owner_autonomy_active():
-                return await self._dispatcher_control_action(native_action)
+                return await self._dispatcher_control_action(native_action, context)
             native_action = None
         if (
             native_action is not None
@@ -4813,7 +5294,31 @@ class AgentRuntime:
                 "payload": native_action.payload,
                 "timeout_sec": 30,
             }
-            result = await self.tools.run("windows.native", arguments, allow_danger=True)
+            result = await self._run_direct_operator_tool(
+                context,
+                tool="windows.native",
+                arguments=arguments,
+                allow_danger=True,
+            )
+            if result is None:
+                event = ChatEvent(
+                    type="thought",
+                    title="Durable duplicate effect skipped",
+                    content="The same clipboard write is already claimed by this request.",
+                    payload={
+                        "tool": "windows.native",
+                        "action": "clipboard.write",
+                        "replayed": False,
+                        "durable": True,
+                    },
+                )
+                return DirectAction(
+                    answer=(
+                        "Эта точная запись в буфер уже была принята; "
+                        "повторная команда не отправлена."
+                    ),
+                    events=[event],
+                )
             status = "Готово" if result.ok else "Не смог записать в буфер обмена"
             event = ChatEvent(
                 type="tool_call",
@@ -8133,6 +8638,429 @@ class AgentRuntime:
             rationale="No tool or specialized route is required.",
         )
 
+    def _claim_chat_request(
+        self,
+        *,
+        request_id: str,
+        message: str,
+        requested_conversation_id: str | None,
+        conversation_title: str,
+        mode: str,
+        temperature: float | None,
+        max_tokens: int | None,
+        attachments: list[dict[str, Any]],
+        thinking_enabled: bool,
+        access_mode: str,
+        notification_chat_id: int | None,
+    ) -> _ChatRequestHandle:
+        request_hash = hashlib.sha256(request_id.encode("utf-8")).hexdigest()
+        request_key = f"{CHAT_REQUEST_KEY_PREFIX}{request_hash}"
+        fingerprint = _chat_request_fingerprint(
+            message,
+            requested_conversation_id=requested_conversation_id,
+            mode=mode,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            attachments=attachments,
+            thinking_enabled=thinking_enabled,
+            access_mode=access_mode,
+            notification_chat_id=notification_chat_id,
+        )
+        hinted_state = self.storage.get_runtime_value(request_key, None)
+        migrated_state: dict[str, Any] | None = None
+        legacy_request_fingerprint = ""
+        if hinted_state is None and access_mode == "guest":
+            legacy_state = self.storage.get_runtime_value(
+                f"{LEGACY_GUEST_REQUEST_KEY_PREFIX}{request_hash}",
+                None,
+            )
+            if isinstance(legacy_state, dict):
+                legacy_request_fingerprint = _legacy_guest_request_fingerprint(
+                    message,
+                    requested_conversation_id=requested_conversation_id,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                if legacy_state.get("request_fingerprint") != legacy_request_fingerprint:
+                    raise ChatRequestConflictError(
+                        "transport_request_id was reused with a different chat request"
+                    )
+                legacy_conversation_id = str(legacy_state.get("conversation_id") or "")
+                migrated_state = {
+                    "protocol": "jarvis.chat-request.v1",
+                    "request_hash": request_hash,
+                    "fingerprint": fingerprint,
+                    "requested_conversation_id": str(requested_conversation_id or ""),
+                    "conversation_id": legacy_conversation_id,
+                    "status": str(legacy_state.get("status") or "pending"),
+                    "started_at": time.time(),
+                    "updated_at": time.time(),
+                    "lease_token": "",
+                    "lease_expires_at": 0.0,
+                    "runtime_generation_id": "",
+                    "user_message_id": str(legacy_state.get("user_message_id") or ""),
+                }
+                if migrated_state["status"] == "completed":
+                    migrated_state["completed_at"] = time.time()
+                    migrated_state["response"] = {
+                        "conversation_id": legacy_conversation_id,
+                        "message_id": str(legacy_state.get("message_id") or ""),
+                        "answer": str(legacy_state.get("answer") or ""),
+                        "events": [],
+                        "duration_ms": int(legacy_state.get("duration_ms") or 0),
+                    }
+                hinted_state = migrated_state
+        if isinstance(hinted_state, dict):
+            supplied_conversation_id = str(requested_conversation_id or "")
+            allowed_conversation_ids = {
+                "",
+                str(hinted_state.get("requested_conversation_id") or ""),
+                str(hinted_state.get("conversation_id") or ""),
+            }
+            if (
+                hinted_state.get("fingerprint") != fingerprint
+                or supplied_conversation_id not in allowed_conversation_ids
+            ):
+                raise ChatRequestConflictError(
+                    "transport_request_id was reused with a different chat request"
+                )
+        hinted_conversation_id = (
+            str(hinted_state.get("conversation_id") or "")
+            if isinstance(hinted_state, dict)
+            and hinted_state.get("fingerprint") == fingerprint
+            else ""
+        )
+        candidate_conversation_id = hinted_conversation_id or str(
+            requested_conversation_id or ""
+        )
+        if not candidate_conversation_id:
+            # Reserve only an identifier here.  The atomically selected ledger
+            # state decides which worker's identifier wins; inserting before
+            # that claim leaves an orphan conversation for every losing worker.
+            candidate_conversation_id = new_id("conv")
+        else:
+            # Caller-supplied or already-ledgered identities are stable across
+            # workers. Validate ownership before claiming so a 404 cannot leave
+            # behind a poisoned active request lease.
+            self.storage.ensure_conversation(
+                candidate_conversation_id,
+                conversation_title,
+            )
+
+        recovered_response: ChatResponse | None = None
+        if isinstance(hinted_state, dict) and hinted_state.get("status") == "pending":
+            recovered_assistant = self.storage.find_chat_request_message(
+                conversation_id=candidate_conversation_id,
+                request_hash=request_hash,
+                role="assistant",
+                legacy_request_fingerprint=legacy_request_fingerprint,
+                terminal_only=True,
+            )
+            if recovered_assistant is not None:
+                recovered_response = _chat_response_from_persisted_message(
+                    recovered_assistant
+                )
+
+        now = time.time()
+        lease_token = uuid.uuid4().hex
+
+        def claim(current: Any) -> dict[str, Any]:
+            state = current if isinstance(current, dict) else None
+            if isinstance(state, dict):
+                supplied_conversation_id = str(requested_conversation_id or "")
+                allowed_conversation_ids = {
+                    "",
+                    str(state.get("requested_conversation_id") or ""),
+                    str(state.get("conversation_id") or ""),
+                }
+                if (
+                    state.get("fingerprint") != fingerprint
+                    or supplied_conversation_id not in allowed_conversation_ids
+                ):
+                    raise ChatRequestConflictError(
+                        "transport_request_id was reused with a different chat request"
+                    )
+                if state.get("status") == "completed":
+                    return state
+                if state.get("status") != "pending":
+                    raise RuntimeError("chat request ledger has an invalid state")
+                if recovered_response is not None:
+                    return {
+                        **state,
+                        "status": "completed",
+                        "completed_at": now,
+                        "updated_at": now,
+                        "lease_token": "",
+                        "lease_expires_at": 0.0,
+                        "response": _compact_chat_response(recovered_response),
+                    }
+                lease_expires_at = float(state.get("lease_expires_at") or 0.0)
+                lease_generation = str(state.get("runtime_generation_id") or "")
+                if (
+                    state.get("lease_token")
+                    and lease_expires_at > now
+                    and lease_generation == self._runtime_generation_id
+                ):
+                    raise ChatRequestInProgressError(
+                        "chat request is already being processed"
+                    )
+                return {
+                    **state,
+                    "lease_token": lease_token,
+                    "lease_expires_at": now + CHAT_REQUEST_LEASE_SECONDS,
+                    "runtime_generation_id": self._runtime_generation_id,
+                    "updated_at": now,
+                }
+            return {
+                "protocol": "jarvis.chat-request.v1",
+                "request_hash": request_hash,
+                "fingerprint": fingerprint,
+                "requested_conversation_id": str(requested_conversation_id or ""),
+                "conversation_id": candidate_conversation_id,
+                "status": "pending",
+                "started_at": now,
+                "updated_at": now,
+                "lease_token": lease_token,
+                "lease_expires_at": now + CHAT_REQUEST_LEASE_SECONDS,
+                "runtime_generation_id": self._runtime_generation_id,
+                "user_message_id": "",
+            }
+
+        cutoff = datetime.now(UTC) - timedelta(seconds=CHAT_REQUEST_TTL_SECONDS)
+        state = self.storage.update_runtime_value_atomic_pruned(
+            request_key,
+            claim,
+            default=migrated_state,
+            prune_prefixes=(
+                CHAT_REQUEST_KEY_PREFIX,
+                LEGACY_GUEST_REQUEST_KEY_PREFIX,
+            ),
+            older_than=cutoff.isoformat(),
+            hard_cap=_chat_request_hard_cap(),
+        )
+        if not isinstance(state, dict):
+            raise RuntimeError("chat request ledger lost the claimed request")
+        conversation_id = str(state.get("conversation_id") or "")
+        if not conversation_id:
+            raise RuntimeError("chat request ledger has no conversation")
+        self.storage.ensure_conversation(conversation_id, conversation_title)
+        handle = _ChatRequestHandle(
+            request_hash=request_hash,
+            fingerprint=fingerprint,
+            conversation_id=conversation_id,
+            lease_token=("" if state.get("status") == "completed" else lease_token),
+            user_message_id=str(state.get("user_message_id") or ""),
+        )
+        if state.get("status") == "completed":
+            handle.cached_response = self._chat_response_from_request_state(state)
+            return handle
+        if not handle.user_message_id:
+            recovered = self.storage.find_chat_request_message(
+                conversation_id=conversation_id,
+                request_hash=request_hash,
+                role="user",
+                legacy_request_fingerprint=legacy_request_fingerprint,
+            )
+            if recovered is not None:
+                handle.user_message_id = str(recovered.get("id") or "")
+                self._record_chat_request_user_message(handle, handle.user_message_id)
+        return handle
+
+    def _chat_response_from_request_state(self, state: dict[str, Any]) -> ChatResponse:
+        raw_response = state.get("response")
+        if not isinstance(raw_response, dict):
+            raise RuntimeError("completed chat request has no persisted response")
+        message_id = str(raw_response.get("message_id") or "")
+        conversation_id = str(raw_response.get("conversation_id") or "")
+        persisted = self.storage.get_message(message_id)
+        if (
+            persisted is None
+            or persisted.get("conversation_id") != conversation_id
+            or persisted.get("role") != "assistant"
+        ):
+            raise RuntimeError("completed chat request lost its persisted response")
+        payload = {
+            **raw_response,
+            "conversation_id": conversation_id,
+            "message_id": message_id,
+            "answer": str(persisted.get("content") or ""),
+        }
+        return ChatResponse.model_validate(payload)
+
+    def _record_chat_request_user_message(
+        self,
+        handle: _ChatRequestHandle,
+        message_id: str,
+    ) -> None:
+        if not message_id:
+            raise RuntimeError("chat request user message id is empty")
+        request_key = f"{CHAT_REQUEST_KEY_PREFIX}{handle.request_hash}"
+
+        def update(current: Any) -> dict[str, Any]:
+            state = current if isinstance(current, dict) else None
+            if not isinstance(state, dict) or state.get("fingerprint") != handle.fingerprint:
+                raise RuntimeError("chat request claim disappeared before history write")
+            existing_id = str(state.get("user_message_id") or "")
+            if existing_id and existing_id != message_id:
+                raise RuntimeError("chat request already points to another user message")
+            if state.get("status") != "pending" or state.get("lease_token") != handle.lease_token:
+                raise RuntimeError("chat request lease changed before history write")
+            return {
+                **state,
+                "user_message_id": message_id,
+                "updated_at": time.time(),
+            }
+
+        self.storage.update_runtime_value_atomic(
+            request_key,
+            update,
+            default=None,
+        )
+
+    def _rebind_chat_request_conversation(
+        self,
+        handle: _ChatRequestHandle,
+        conversation_id: str,
+    ) -> None:
+        """Move an unstarted legacy guest request away from owner-only history."""
+
+        request_key = f"{CHAT_REQUEST_KEY_PREFIX}{handle.request_hash}"
+
+        def update(current: Any) -> dict[str, Any]:
+            state = current if isinstance(current, dict) else None
+            if (
+                not isinstance(state, dict)
+                or state.get("fingerprint") != handle.fingerprint
+                or state.get("status") != "pending"
+                or state.get("lease_token") != handle.lease_token
+                or state.get("user_message_id")
+            ):
+                raise RuntimeError("chat request cannot change conversation after it started")
+            return {
+                **state,
+                "conversation_id": conversation_id,
+                "updated_at": time.time(),
+            }
+
+        self.storage.update_runtime_value_atomic(
+            request_key,
+            update,
+            default=None,
+        )
+        handle.conversation_id = conversation_id
+
+    def _chat_request_user_message(
+        self,
+        handle: _ChatRequestHandle | None,
+        *,
+        conversation_id: str,
+        content: str,
+        metadata: dict[str, Any],
+    ) -> str:
+        if handle is not None and handle.user_message_id:
+            persisted = self.storage.get_message(handle.user_message_id)
+            if (
+                persisted is None
+                or persisted.get("conversation_id") != conversation_id
+                or persisted.get("role") != "user"
+                or persisted.get("content") != content
+            ):
+                raise RuntimeError("chat request user message is missing or inconsistent")
+            return handle.user_message_id
+        effective_metadata = dict(metadata)
+        if handle is not None:
+            effective_metadata.update(
+                {
+                    "chat_request_hash": handle.request_hash,
+                    "chat_request_fingerprint": handle.fingerprint,
+                }
+            )
+        message_id = self.storage.add_message(
+            conversation_id=conversation_id,
+            role="user",
+            content=content,
+            metadata=effective_metadata,
+        )
+        if handle is not None:
+            self._record_chat_request_user_message(handle, message_id)
+            handle.user_message_id = message_id
+        return message_id
+
+    def _complete_chat_request(
+        self,
+        handle: _ChatRequestHandle,
+        response: ChatResponse,
+    ) -> None:
+        persisted = self.storage.get_message(response.message_id)
+        if (
+            persisted is None
+            or persisted.get("conversation_id") != handle.conversation_id
+            or persisted.get("role") != "assistant"
+            or persisted.get("content") != response.answer
+            or not isinstance(persisted.get("metadata"), dict)
+            or persisted["metadata"].get("chat_request_hash") != handle.request_hash
+            or persisted["metadata"].get("chat_request_terminal") is not True
+        ):
+            raise RuntimeError("chat response was not durably persisted before completion")
+        completed_at = time.time()
+        response_payload = _compact_chat_response(response)
+        request_key = f"{CHAT_REQUEST_KEY_PREFIX}{handle.request_hash}"
+
+        def update(current: Any) -> dict[str, Any]:
+            state = current if isinstance(current, dict) else None
+            if not isinstance(state, dict) or state.get("fingerprint") != handle.fingerprint:
+                raise RuntimeError("chat request claim disappeared before completion")
+            if state.get("status") == "completed":
+                if state.get("response") != response_payload:
+                    raise RuntimeError("chat request completed with a different response")
+                return state
+            if state.get("status") != "pending" or state.get("lease_token") != handle.lease_token:
+                raise RuntimeError("chat request lease changed before completion")
+            return {
+                **state,
+                "status": "completed",
+                "completed_at": completed_at,
+                "updated_at": completed_at,
+                "lease_token": "",
+                "lease_expires_at": 0.0,
+                "response": response_payload,
+            }
+
+        self.storage.update_runtime_value_atomic(
+            request_key,
+            update,
+            default=None,
+        )
+
+    def _release_chat_request(self, handle: _ChatRequestHandle) -> None:
+        if not handle.lease_token:
+            return
+        request_key = f"{CHAT_REQUEST_KEY_PREFIX}{handle.request_hash}"
+
+        def update(current: Any) -> dict[str, Any]:
+            state = current if isinstance(current, dict) else None
+            if (
+                isinstance(state, dict)
+                and state.get("status") == "pending"
+                and state.get("lease_token") == handle.lease_token
+            ):
+                return {
+                    **state,
+                    "lease_token": "",
+                    "lease_expires_at": 0.0,
+                    "updated_at": time.time(),
+                }
+            if not isinstance(state, dict):
+                raise RuntimeError("chat request state disappeared before lease release")
+            return state
+
+        with suppress(Exception):
+            self.storage.update_runtime_value_atomic(
+                request_key,
+                update,
+                default=None,
+            )
+
     def _task_kernel_event(self, plan: TaskKernelPlan, conversation_id: str) -> ChatEvent:
         return ChatEvent(
             type="task_kernel",
@@ -8250,7 +9178,26 @@ class AgentRuntime:
                 effects = dict(state.get("effects") or {})
             else:
                 if len(requests) >= OPERATOR_EFFECT_LEDGER_MAX_REQUESTS:
-                    return ledger
+                    # Completed effects are already replayed from the durable
+                    # chat-request record.  Keep every unfinished fence, but
+                    # recycle the oldest completed slot so successful turns
+                    # cannot permanently exhaust this safety ledger.
+                    completed = sorted(
+                        (
+                            (digest, request)
+                            for digest, request in requests.items()
+                            if isinstance(request, dict)
+                            and request.get("status") == "completed"
+                        ),
+                        key=lambda item: str(
+                            item[1].get("updated_at")
+                            or item[1].get("completed_at")
+                            or ""
+                        ),
+                    )
+                    if not completed:
+                        return ledger
+                    requests.pop(completed[0][0], None)
                 effects = {}
                 state = {
                     "request_digest": request_digest,
@@ -8294,6 +9241,7 @@ class AgentRuntime:
         *,
         tool: str,
         arguments: dict[str, Any],
+        allow_danger: bool = False,
     ) -> ToolRunResponse | None:
         """Run one durable operator tool only after its effect is persisted."""
 
@@ -8310,6 +9258,7 @@ class AgentRuntime:
             arguments,
             conversation_id=context.conversation_id,
             user_message_id=context.operator_message_id,
+            allow_danger=allow_danger,
         )
         self._record_operator_effect_outcome(
             context,
@@ -8317,6 +9266,35 @@ class AgentRuntime:
             result=result,
         )
         return result
+
+    async def _run_direct_operator_tool(
+        self,
+        context: AgentContext | None,
+        *,
+        tool: str,
+        arguments: dict[str, Any],
+        allow_danger: bool,
+    ) -> ToolRunResponse | None:
+        """Fence a direct mutation when it belongs to a persisted chat request."""
+
+        if (
+            context is None
+            or not context.operator_request_digest
+            or not context.operator_message_id
+        ):
+            return await self.tools.run(
+                tool,
+                arguments,
+                conversation_id=(context.conversation_id if context is not None else None),
+                user_message_id=(context.operator_message_id if context is not None else None),
+                allow_danger=allow_danger,
+            )
+        return await self._run_claimed_operator_tool(
+            context,
+            tool=tool,
+            arguments=arguments,
+            allow_danger=allow_danger,
+        )
 
     def _record_operator_effect_outcome(
         self,
@@ -8450,15 +9428,17 @@ class AgentRuntime:
                 conversation_id, self._title_from_goal(message)
             )
         recent = self.storage.recent_messages(conversation_id, limit=6)
-        if any(
+        if current_actor().source == "legacy-local" and any(
             isinstance(item.get("metadata"), dict)
             and item["metadata"].get("access_mode") == "guest"
             for item in recent
         ):
-            # Conversation principals are immutable. Opening a guest transcript in the
-            # owner UI starts a clean owner conversation instead of promoting adversarial
-            # guest history into the full-autonomy agent context.
-            conversation_id = self.storage.create_conversation(self._title_from_goal(message))
+            # Legacy-local access_mode is caller-controlled. Never let its guest
+            # transcript become privileged owner context. Authenticated IAM sessions
+            # are same-tenant role changes and intentionally retain their history.
+            conversation_id = self.storage.create_conversation(
+                self._title_from_goal(message)
+            )
             recent = []
         memory_hits = (
             self.storage.search_memory(_memory_search_query(message, recent), limit=8)
@@ -9493,6 +10473,15 @@ class AgentRuntime:
         effect_key: str | None = None
         duplicate_effect = False
         durable_duplicate = False
+        # Mutation semantics are independent from review risk. A safe mutator does
+        # not gain a new approval requirement, but it still claims the persisted
+        # exact-request effect before dispatch so a lost HTTP response cannot replay it.
+        if spec is not None and spec.mutates_state and not operator_binding_required:
+            effect_key = _operator_effect_key(name, args)
+            durable_duplicate = effect_key in context.operator_retry_effects
+            duplicate_effect = (
+                effect_key in context.operator_used_effects or durable_duplicate
+            )
         operator_match = (
             operator_binding_required
             and not policy_approval_required
@@ -9782,7 +10771,7 @@ class AgentRuntime:
                 ),
                 None,
             )
-        if authorization is not None and effect_key is not None and not self._begin_operator_effect(
+        if effect_key is not None and not self._begin_operator_effect(
             context,
             tool=name,
             effect_key=effect_key,
@@ -9814,8 +10803,9 @@ class AgentRuntime:
             # safe tool such as reminders.create can record where a fired reminder posts back.
             "conversation_id": context.conversation_id,
         }
+        if effect_key is not None:
+            context.operator_used_effects.add(effect_key)
         if authorization is not None:
-            context.operator_used_effects.add(effect_key or authorization.fingerprint)
             run_kwargs.update(
                 {
                     "user_message_id": context.operator_message_id,
@@ -9823,7 +10813,7 @@ class AgentRuntime:
                 }
             )
         result = await self.tools.run(name, args, **run_kwargs)
-        if authorization is not None and effect_key is not None:
+        if effect_key is not None:
             self._record_operator_effect_outcome(
                 context,
                 effect_key=effect_key,
@@ -9872,7 +10862,13 @@ class AgentRuntime:
                 thinking_enabled=thinking_enabled,
             )
             if not result.ok or not result.content:
-                return _AgenticResult(ok=False, answer="", events=events, error=result.error)
+                return _AgenticResult(
+                    ok=False,
+                    answer="",
+                    events=events,
+                    error=result.error,
+                    failure_scope=getattr(result, "failure_scope", None),
+                )
             answer = _user_visible_answer(result.content)
             finish_reason = _finish_reason_from_llm_result(result)
             continuation_count = 0
@@ -9970,7 +10966,13 @@ class AgentRuntime:
             )
             if not result.ok:
                 if used_tools == initial_used_tools:
-                    return _AgenticResult(ok=False, answer="", events=events, error=result.error)
+                    return _AgenticResult(
+                        ok=False,
+                        answer="",
+                        events=events,
+                        error=result.error,
+                        failure_scope=getattr(result, "failure_scope", None),
+                    )
                 break
             content = result.content
             finish_reason = _finish_reason_from_llm_result(result)
@@ -10171,6 +11173,7 @@ class AgentRuntime:
             answer="",
             events=events,
             error=result.error,
+            failure_scope=getattr(result, "failure_scope", None),
             blocked_by_approval=False,
             used_tools=used_tools,
         )
@@ -14201,6 +15204,7 @@ SIDE_EFFECT_MUTATING_TOOLS = frozenset(
         "documents.archive.create",
         "documents.archive.extract",
         "documents.apply_replacements",
+        "documents.edit",
         "filesystem.write_text",
         "filesystem.mkdir",
         "filesystem.copy",
@@ -18653,6 +19657,149 @@ def _has_current_operator_turn(context: AgentContext | None) -> bool:
         and context.mission_id is None
         and not str(context.conversation_id).startswith("mission:")
     )
+
+
+def _chat_request_hard_cap() -> int:
+    """Bound one user's live request rows without undercutting API admission.
+
+    The default 240 requests/minute yields a practical 374,880-row ceiling.
+    Operators who deliberately raise API admission get the matching 26-hour
+    replay capacity; two extra minute buckets cover fixed-window boundaries.
+    """
+
+    try:
+        admitted_per_minute = int(
+            os.environ.get("JARVIS_API_USER_RATE_LIMIT_PER_MINUTE", "240")
+        )
+    except ValueError:
+        admitted_per_minute = 240
+    admitted_per_minute = max(1, min(admitted_per_minute, 100_000))
+    replay_minutes = (CHAT_REQUEST_TTL_SECONDS // 60) + 2
+    return max(
+        CHAT_REQUEST_HARD_CAP_FLOOR,
+        admitted_per_minute * replay_minutes,
+    )
+
+
+def _backend_runtime_generation_id() -> str:
+    configured = os.environ.get("JARVIS_BACKEND_RUNTIME_GENERATION", "").strip()
+    if configured:
+        if re.fullmatch(r"[0-9a-f]{32}", configured) is None:
+            raise RuntimeError(
+                "JARVIS_BACKEND_RUNTIME_GENERATION must be exactly 32 lowercase hex chars"
+            )
+        return configured
+    # The shipped backend is one uvicorn worker. For an explicitly configured
+    # multi-worker process without a launcher generation, fail safe by sharing
+    # a stable sentinel: workers will not steal each other's active leases, but
+    # fast restart reclaim requires the documented launcher environment value.
+    for name in ("WEB_CONCURRENCY", "UVICORN_WORKERS"):
+        raw_workers = os.environ.get(name, "").strip()
+        if not raw_workers:
+            continue
+        try:
+            if int(raw_workers) > 1:
+                return "unconfigured-multi-worker-generation"
+        except ValueError:
+            return "unconfigured-multi-worker-generation"
+    return _PROCESS_RUNTIME_GENERATION
+
+
+def _chat_request_fingerprint(
+    message: str,
+    *,
+    requested_conversation_id: str | None,
+    mode: str,
+    temperature: float | None,
+    max_tokens: int | None,
+    attachments: list[dict[str, Any]],
+    thinking_enabled: bool,
+    access_mode: str,
+    notification_chat_id: int | None,
+) -> str:
+    # Conversation identity is validated against the durable state separately:
+    # the first call may omit it while an exact retry supplies the minted id.
+    _ = requested_conversation_id
+    attachment_identity = [
+        {
+            "id": str(item.get("id") or ""),
+            "name": str(item.get("name") or ""),
+            "mime_type": str(item.get("mime_type") or ""),
+            "size": item.get("size"),
+            "url": str(item.get("url") or ""),
+        }
+        for item in attachments
+        if isinstance(item, dict)
+    ]
+    payload = {
+        "message": " ".join(str(message).split()),
+        "mode": str(mode),
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "attachments": attachment_identity,
+        "thinking_enabled": bool(thinking_enabled),
+        "access_mode": str(access_mode),
+        "notification_chat_id": notification_chat_id,
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _compact_chat_response(response: ChatResponse) -> dict[str, Any]:
+    return {
+        "conversation_id": response.conversation_id,
+        "message_id": response.message_id,
+        "events": [event.model_dump(mode="json") for event in response.events],
+        "mission_id": response.mission_id,
+        "duration_ms": response.duration_ms,
+    }
+
+
+def _chat_response_from_persisted_message(message: dict[str, Any]) -> ChatResponse:
+    metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+    raw_events = metadata.get("events") if isinstance(metadata, dict) else []
+    events = raw_events if isinstance(raw_events, list) else []
+    return ChatResponse.model_validate(
+        {
+            "conversation_id": str(message.get("conversation_id") or ""),
+            "message_id": str(message.get("id") or ""),
+            "answer": str(message.get("content") or ""),
+            "events": events,
+            "mission_id": metadata.get("mission_id") if isinstance(metadata, dict) else None,
+            "duration_ms": (
+                int(metadata.get("duration_ms") or 0) if isinstance(metadata, dict) else 0
+            ),
+        }
+    )
+
+
+def _legacy_guest_request_fingerprint(
+    message: str,
+    *,
+    requested_conversation_id: str | None,
+    temperature: float | None,
+    max_tokens: int | None,
+) -> str:
+    clean_message = " ".join(str(message or "").split()).strip()[:20_000] or "Привет"
+    return hashlib.sha256(
+        json.dumps(
+            {
+                "conversation_id": str(requested_conversation_id or ""),
+                "message": clean_message,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _operator_effect_ledger_key(conversation_id: str) -> str:

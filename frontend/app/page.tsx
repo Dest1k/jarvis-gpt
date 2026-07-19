@@ -50,6 +50,21 @@ import {
   scopedChatWindowsKey,
   withoutEmptyAssistantPlaceholders
 } from "../lib/runtime-helpers.mjs";
+import {
+  CHAT_REQUEST_LEDGER_TTL_MS,
+  CHAT_STREAM_RETRY_MIN_DELAY_MS,
+  ChatStreamError,
+  chatRequestAutoRetryAllowed,
+  chatRequestIdsRemovedByLedgerChange,
+  chatRequestRecoveryRemainingMs,
+  chatStreamRetryDelay,
+  consumeChatStreamResponse,
+  isRetryableChatStreamError,
+  readChatRequestLedger,
+  removeChatRequestLedgerEntries,
+  scopedChatRequestLedgerKey,
+  upsertChatRequestLedger
+} from "../lib/chat-stream-recovery.mjs";
 
 const API_PROXY_URL = "/jarvis-api";
 const LEGACY_STORAGE_SUFFIX = ["g", "pt"].join("");
@@ -157,6 +172,7 @@ type WebAnswerSummary = {
 
 type ChatLine = {
   id?: string;
+  requestId?: string;
   role: "user" | "assistant" | "system";
   content: string;
   attachments?: ChatAttachment[];
@@ -175,6 +191,42 @@ type ChatWindow = {
   input: string;
   lines: ChatLine[];
   createdAt: number;
+};
+
+type DurableChatRequestPayload = {
+  request_id: string;
+  message: string;
+  conversation_id: string | null;
+  max_tokens: number;
+  mode: "auto";
+  attachments: ChatAttachment[];
+  thinking_enabled: boolean;
+};
+
+type DurableChatRequest = {
+  protocol?: string;
+  requestId: string;
+  chatWindowId: string;
+  userMessageId: string;
+  assistantMessageId: string;
+  payload: DurableChatRequestPayload;
+  createdAt: number;
+  updatedAt: number;
+  status: "pending" | "interrupted" | "error";
+  attempts: number;
+  retryAt: number;
+  lastError: string;
+  retryClass: string;
+  lastConversationId: string;
+};
+
+type ChatUploadPreflight = {
+  key: string;
+  identity: string;
+  chatWindowId: string;
+  requestId: string;
+  abortController: AbortController;
+  cancelled: boolean;
 };
 
 type StoredChatWindows = {
@@ -800,6 +852,8 @@ type ChatStreamItem = {
   answer?: string;
   duration_ms?: number;
   error?: string;
+  failure_scope?: string;
+  retry_class?: string;
   message_id?: string;
   events?: Array<Record<string, unknown>>;
 };
@@ -864,34 +918,18 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
 async function streamApi(
   path: string,
   body: Record<string, unknown>,
-  onItem: (item: ChatStreamItem) => void
-) {
+  onItem: (item: ChatStreamItem) => void,
+  signal?: AbortSignal
+): Promise<ChatStreamItem> {
   const response = await fetch(`${apiUrl()}${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Jarvis-Frontend": "command-center" },
     credentials: "same-origin",
-    body: JSON.stringify(body)
+    body: JSON.stringify(body),
+    signal
   });
-  if (!response.ok) {
-    redirectToOwnerLogin(response);
-    throw new Error(`${response.status} ${response.statusText}`);
-  }
-  if (!response.body) {
-    throw new Error("Streaming response has no body");
-  }
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    buffer = drainStreamBuffer(buffer, onItem);
-  }
-  buffer += decoder.decode();
-  drainStreamBuffer(`${buffer}\n`, onItem);
+  redirectToOwnerLogin(response);
+  return consumeChatStreamResponse(response, onItem) as Promise<ChatStreamItem>;
 }
 
 function apiUrl() {
@@ -1095,20 +1133,6 @@ async function downloadAttachment(attachment: ChatAttachment) {
   window.URL.revokeObjectURL(blobUrl);
 }
 
-function drainStreamBuffer(
-  buffer: string,
-  onItem: (item: ChatStreamItem) => void
-) {
-  const lines = buffer.split("\n");
-  const rest = lines.pop() ?? "";
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    onItem(JSON.parse(trimmed) as ChatStreamItem);
-  }
-  return rest;
-}
-
 function clampMaxTokens(value: number) {
   if (!Number.isFinite(value)) return DEFAULT_MAX_TOKENS;
   return Math.max(64, Math.min(8192, Math.round(value)));
@@ -1165,11 +1189,20 @@ function createInitialChatWindow(): ChatWindow {
 function normalizeStoredLine(line: ChatLine): ChatLine {
   const durationMs = coerceDurationMs(line.durationMs);
   const attachments = normalizeChatAttachments(line.attachments);
+  const wasInterruptedRequest = Boolean(
+    line.requestId && line.role === "assistant" && line.pending
+  );
+  const content = wasInterruptedRequest
+    ? line.content.trim()
+      ? `${line.content}\n\n[поток прерван; запрос ожидает безопасного восстановления]`
+      : "Поток прерван; запрос ожидает безопасного восстановления."
+    : line.content;
   if (line.id === "system-boot" && line.content.includes("Command Center")) {
     return { ...line, content: BOOT_MESSAGE, attachments, durationMs, pending: false, startedAt: null };
   }
   return {
     ...line,
+    content,
     attachments,
     durationMs,
     pending: false,
@@ -1776,11 +1809,24 @@ export default function CommandCenter() {
   const vitalsRequestInFlightRef = useRef(false);
   const telemetryRequestInFlightRef = useRef(false);
   const missionsRef = useRef<Mission[]>([]);
+  const chatRequestTimersRef = useRef<Map<string, number>>(new Map());
+  const chatRequestsInFlightRef = useRef<Set<string>>(new Set());
+  const chatRequestAbortControllersRef = useRef<Map<string, AbortController>>(new Map());
+  const chatUploadPreflightsRef = useRef<Map<string, ChatUploadPreflight>>(new Map());
+  const cancelledChatRequestsRef = useRef<Map<string, number>>(new Map());
+  const completedChatRequestsRef = useRef<
+    Map<string, { identity: string; chatWindowId: string; messageId: string }>
+  >(new Map());
+  const runDurableChatRequestRef = useRef<
+    (identity: string, entry: DurableChatRequest, manual?: boolean) => Promise<void>
+  >(async () => undefined);
   const memoryVaultRef = useRef<MemoryVault | null>(null);
   const memoryVaultRequestRef = useRef<Promise<MemoryVault> | null>(null);
   const memoryVaultGenerationRef = useRef(0);
   const memoryVaultRevisionRef = useRef(0);
   const memoryVaultDirtyRef = useRef(false);
+  const chatWindowsRef = useRef<ChatWindow[]>(chatWindows);
+  chatWindowsRef.current = chatWindows;
 
   const activeChatWindow = useMemo(
     () => chatWindows.find((window) => window.id === activeChatWindowId) ?? chatWindows[0],
@@ -2491,16 +2537,21 @@ export default function CommandCenter() {
     setChatFiles((current) => current.filter((_, itemIndex) => itemIndex !== index));
   }
 
-  async function uploadChatFiles(filesToUpload: File[]): Promise<ChatAttachment[]> {
+  async function uploadChatFiles(
+    filesToUpload: File[],
+    signal?: AbortSignal
+  ): Promise<ChatAttachment[]> {
     const uploaded: ChatAttachment[] = [];
     for (const file of filesToUpload) {
+      signal?.throwIfAborted();
       const formData = new FormData();
       formData.append("file", file);
       const response = await fetch(`${apiUrl()}/api/files/upload`, {
         method: "POST",
         headers: { "X-Jarvis-Frontend": "command-center" },
         credentials: "same-origin",
-        body: formData
+        body: formData,
+        signal
       });
       if (!response.ok) {
         throw new Error(`${file.name}: ${response.status} ${response.statusText}`);
@@ -2577,90 +2628,324 @@ export default function CommandCenter() {
     }
   }
 
-  async function submitChat() {
-    const typedMessage = input.trim();
-    const filesToSend = chatFiles;
-    const chatWindowId = activeChatWindow?.id;
-    if ((!typedMessage && filesToSend.length === 0) || chatBusy || !chatWindowId) return;
-    const previousConversationId = activeChatWindow.conversationId;
-    let assistantId: string | null = null;
-    let assistantStartedAt = Date.now();
+  function durableChatRequests(identity: string): DurableChatRequest[] {
+    return readChatRequestLedger(window.localStorage, identity) as DurableChatRequest[];
+  }
+
+  function persistDurableChatRequest(
+    identity: string,
+    entry: DurableChatRequest
+  ): DurableChatRequest {
+    return upsertChatRequestLedger(
+      window.localStorage,
+      identity,
+      entry
+    ) as DurableChatRequest;
+  }
+
+  function durableChatRequestKey(identity: string, requestId: string) {
+    return `${identity}:${requestId}`;
+  }
+
+  function durableChatRequestCancelled(identity: string, requestId: string) {
+    return cancelledChatRequestsRef.current.has(durableChatRequestKey(identity, requestId));
+  }
+
+  function fenceCancelledDurableChatRequest(
+    identity: string,
+    requestId: string,
+    cancelledAt = Date.now()
+  ) {
+    const key = durableChatRequestKey(identity, requestId);
+    cancelledChatRequestsRef.current.set(key, cancelledAt);
+    const timer = chatRequestTimersRef.current.get(key);
+    if (timer !== undefined) window.clearTimeout(timer);
+    chatRequestTimersRef.current.delete(key);
+    chatRequestAbortControllersRef.current.get(key)?.abort();
+    completedChatRequestsRef.current.delete(requestId);
+  }
+
+  function fenceCancelledChatUploadPreflight(preflight: ChatUploadPreflight) {
+    preflight.cancelled = true;
+    fenceCancelledDurableChatRequest(preflight.identity, preflight.requestId);
+    preflight.abortController.abort();
+  }
+
+  function cancelDurableChatRequests(
+    identity: string,
+    entries: DurableChatRequest[]
+  ): boolean {
+    if (!entries.length) return true;
+    const requestIds = entries.map((entry) => entry.requestId);
+    try {
+      const removed = removeChatRequestLedgerEntries(
+        window.localStorage,
+        identity,
+        requestIds
+      ) as DurableChatRequest[];
+      if (removed.length !== entries.length) {
+        throw new Error("журнал восстановления изменился; повторите отмену");
+      }
+    } catch (error) {
+      setError(
+        error instanceof Error
+          ? `Не удалось безопасно отменить запрос: ${error.message}`
+          : "Не удалось безопасно отменить запрос"
+      );
+      return false;
+    }
+
+    const cancelledAt = Date.now();
+    for (const [key, timestamp] of cancelledChatRequestsRef.current) {
+      if (timestamp <= cancelledAt - CHAT_REQUEST_LEDGER_TTL_MS) {
+        cancelledChatRequestsRef.current.delete(key);
+      }
+    }
+    for (const entry of entries) {
+      // The durable removal succeeds before any visible destructive mutation.
+      // This in-memory tombstone then fences already-queued callbacks in this tab.
+      fenceCancelledDurableChatRequest(identity, entry.requestId, cancelledAt);
+    }
+    return true;
+  }
+
+  function cancelDurableChatWindowRequests(chatWindowId: string) {
+    const identity = runtimeIdentityRef.current;
+    if (!identity) return true;
+    const entries = durableChatRequests(identity).filter(
+      (entry) => entry.chatWindowId === chatWindowId
+    );
+    if (!cancelDurableChatRequests(identity, entries)) return false;
+    const preflights = [...chatUploadPreflightsRef.current.values()].filter(
+      (preflight) =>
+        preflight.identity === identity && preflight.chatWindowId === chatWindowId
+    );
+    for (const preflight of preflights) {
+      fenceCancelledChatUploadPreflight(preflight);
+    }
+    return true;
+  }
+
+  function requestLineMatches(
+    line: ChatLine,
+    entry: DurableChatRequest,
+    role: "user" | "assistant"
+  ) {
+    if (line.role !== role) return false;
+    const expectedId = role === "user" ? entry.userMessageId : entry.assistantMessageId;
+    return line.requestId === entry.requestId || line.id === expectedId;
+  }
+
+  function prepareDurableChatWindow(entry: DurableChatRequest, startedAt: number) {
+    setChatWindows((current) => {
+      const existing = current.find((window) => window.id === entry.chatWindowId);
+      const base: ChatWindow = existing ?? {
+        id: entry.chatWindowId,
+        title: titleFromMessage(entry.payload.message),
+        conversationId: entry.lastConversationId || entry.payload.conversation_id,
+        input: "",
+        lines: bootLines(),
+        createdAt: entry.createdAt
+      };
+      const lines = [...base.lines];
+      const userIndex = lines.findIndex((line) => requestLineMatches(line, entry, "user"));
+      const userLine: ChatLine = {
+        ...(userIndex >= 0 ? lines[userIndex] : {}),
+        id: userIndex >= 0 ? lines[userIndex].id : entry.userMessageId,
+        requestId: entry.requestId,
+        role: "user",
+        content: entry.payload.message,
+        attachments: entry.payload.attachments
+      };
+      if (userIndex >= 0) lines[userIndex] = userLine;
+      else lines.push(userLine);
+
+      const assistantIndex = lines.findIndex((line) =>
+        requestLineMatches(line, entry, "assistant")
+      );
+      const assistantLine: ChatLine = {
+        ...(assistantIndex >= 0 ? lines[assistantIndex] : {}),
+        id: assistantIndex >= 0 ? lines[assistantIndex].id : entry.assistantMessageId,
+        requestId: entry.requestId,
+        role: "assistant",
+        content: "",
+        pending: true,
+        startedAt,
+        durationMs: null,
+        verification: null,
+        webAnswer: null
+      };
+      if (assistantIndex >= 0) lines[assistantIndex] = assistantLine;
+      else lines.push(assistantLine);
+
+      const updated: ChatWindow = {
+        ...base,
+        input: "",
+        title:
+          base.title === "Новый чат" || base.title === "Чат"
+            ? titleFromMessage(entry.payload.message)
+            : base.title,
+        conversationId:
+          base.conversationId || entry.lastConversationId || entry.payload.conversation_id,
+        lines
+      };
+      if (existing) {
+        return current.map((window) => (window.id === entry.chatWindowId ? updated : window));
+      }
+      return [updated, ...current].slice(0, 8);
+    });
+  }
+
+  function automaticChatRetryAllowed(entry: DurableChatRequest) {
+    return chatRequestAutoRetryAllowed(entry) as boolean;
+  }
+
+  function markDurableChatRequestStopped(
+    identity: string,
+    entry: DurableChatRequest,
+    reason: string
+  ) {
+    let stopped = entry;
+    try {
+      stopped = persistDurableChatRequest(identity, {
+        ...entry,
+        status: "error",
+        retryAt: 0,
+        updatedAt: Date.now(),
+        lastError: reason
+      });
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "Не удалось сохранить запрос");
+    }
+    updateChatWindow(stopped.chatWindowId, (window) => ({
+      ...window,
+      lines: window.lines.map((line) => {
+        if (!requestLineMatches(line, stopped, "assistant")) return line;
+        const marker = `[автовосстановление остановлено: ${reason}; нажмите «Повторить»]`;
+        const content = String(line.content || "").trim();
+        return {
+          ...line,
+          requestId: stopped.requestId,
+          content: content.includes(marker) ? content : `${content}${content ? "\n\n" : ""}${marker}`,
+          pending: false,
+          startedAt: null
+        };
+      })
+    }));
+  }
+
+  function scheduleDurableChatRetry(
+    identity: string,
+    entry: DurableChatRequest,
+    delayMs: number,
+    manual = false
+  ) {
+    if (durableChatRequestCancelled(identity, entry.requestId)) return;
+    const remainingMs = chatRequestRecoveryRemainingMs(entry) as number;
+    if (!manual && remainingMs <= 0) {
+      markDurableChatRequestStopped(
+        identity,
+        entry,
+        "истёк 26-часовой срок автоматического восстановления"
+      );
+      return;
+    }
+    const timerKey = durableChatRequestKey(identity, entry.requestId);
+    const currentTimer = chatRequestTimersRef.current.get(timerKey);
+    if (currentTimer !== undefined) window.clearTimeout(currentTimer);
+    const timer = window.setTimeout(() => {
+      chatRequestTimersRef.current.delete(timerKey);
+      if (runtimeIdentityRef.current !== identity) return;
+      if (durableChatRequestCancelled(identity, entry.requestId)) return;
+      const latest = durableChatRequests(identity).find(
+        (item) => item.requestId === entry.requestId
+      );
+      if (latest) void runDurableChatRequestRef.current(identity, latest, manual);
+    }, Math.min(Math.max(0, delayMs), manual ? 2_147_000_000 : remainingMs));
+    chatRequestTimersRef.current.set(timerKey, timer);
+  }
+
+  async function runDurableChatRequest(
+    identity: string,
+    entry: DurableChatRequest,
+    manual = false
+  ) {
+    if (runtimeIdentityRef.current !== identity) return;
+    if (durableChatRequestCancelled(identity, entry.requestId)) return;
+    if (!manual && entry.status === "error") return;
+    if (!manual && !automaticChatRetryAllowed(entry)) {
+      markDurableChatRequestStopped(
+        identity,
+        entry,
+        "истёк 26-часовой срок автоматического восстановления"
+      );
+      return;
+    }
+    if (!manual && entry.retryAt > Date.now()) {
+      scheduleDurableChatRetry(identity, entry, entry.retryAt - Date.now());
+      return;
+    }
+    if (
+      chatRequestsInFlightRef.current.size > 0 &&
+      !chatRequestsInFlightRef.current.has(entry.requestId)
+    ) {
+      scheduleDurableChatRetry(identity, entry, CHAT_STREAM_RETRY_MIN_DELAY_MS, manual);
+      return;
+    }
+    if (chatRequestsInFlightRef.current.has(entry.requestId)) return;
+
+    chatRequestsInFlightRef.current.add(entry.requestId);
+    const requestKey = durableChatRequestKey(identity, entry.requestId);
+    const abortController = new AbortController();
+    chatRequestAbortControllersRef.current.set(requestKey, abortController);
+    const assistantStartedAt = Date.now();
+    let activeEntry = entry;
+    let observedConversationId = entry.lastConversationId;
     setChatBusy(true);
-    let attachments: ChatAttachment[] = [];
-    const message = typedMessage || "Проанализируй вложенные файлы.";
-    const userId = randomId("msg");
-    assistantId = randomId("msg");
     transcriptManualScrollRef.current = false;
     transcriptShouldStickRef.current = true;
-    updateChatWindow(chatWindowId, (window) => ({
-      ...window,
-      title: window.title === "Новый чат" || window.title === "Чат"
-        ? titleFromMessage(message)
-        : window.title,
-      input: "",
-      lines: [
-        ...window.lines,
-        { id: userId, role: "user", content: message, attachments },
-        {
-          id: assistantId,
-          role: "assistant",
-          content: "",
-          pending: true,
-          startedAt: assistantStartedAt
-        }
-      ]
-    }));
     try {
-      if (filesToSend.length) {
-        setActiveOperation({
-          title: "Загрузка вложений",
-          detail: filesToSend.map((file) => file.name).join(", ")
-        });
-        attachments = await uploadChatFiles(filesToSend);
-        setChatFiles([]);
-        updateChatWindow(chatWindowId, (window) => ({
-          ...window,
-          lines: window.lines.map((line) => (line.id === userId ? { ...line, attachments } : line))
-        }));
-        setActiveOperation(null);
-      }
-      await streamApi(
+      activeEntry = persistDurableChatRequest(identity, {
+        ...entry,
+        status: "pending",
+        attempts: entry.attempts + 1,
+        retryAt: 0,
+        updatedAt: Date.now(),
+        lastError: "",
+        retryClass: ""
+      });
+      if (durableChatRequestCancelled(identity, activeEntry.requestId)) return;
+      prepareDurableChatWindow(activeEntry, assistantStartedAt);
+      const terminal = await streamApi(
         "/api/chat/stream",
-        {
-          message,
-          conversation_id: previousConversationId,
-          max_tokens: maxTokens,
-          mode: "auto",
-          attachments,
-          thinking_enabled: thinkingEnabled
-        },
+        activeEntry.payload,
         (item) => {
+          if (durableChatRequestCancelled(identity, activeEntry.requestId)) return;
           if (item.type === "meta" && item.conversation_id) {
-            updateChatWindow(chatWindowId, (window) => ({
+            observedConversationId = item.conversation_id;
+            updateChatWindow(activeEntry.chatWindowId, (window) => ({
               ...window,
               conversationId: item.conversation_id ?? window.conversationId
             }));
           }
           if (item.type === "delta" && item.content) {
-            updateChatWindow(chatWindowId, (window) => ({
+            updateChatWindow(activeEntry.chatWindowId, (window) => ({
               ...window,
               lines: window.lines.map((line) =>
-                line.id === assistantId ? { ...line, content: `${line.content}${item.content}` } : line
+                requestLineMatches(line, activeEntry, "assistant")
+                  ? { ...line, content: `${line.content}${item.content}` }
+                  : line
               )
             }));
           }
           if (item.type === "done") {
             const durationMs = coerceDurationMs(item.duration_ms);
-            if (item.conversation_id) {
-              updateChatWindow(chatWindowId, (window) => ({
-                ...window,
-                conversationId: item.conversation_id ?? window.conversationId
-              }));
-            }
-            updateChatWindow(chatWindowId, (window) => ({
+            if (item.conversation_id) observedConversationId = item.conversation_id;
+            updateChatWindow(activeEntry.chatWindowId, (window) => ({
               ...window,
+              conversationId: item.conversation_id ?? window.conversationId,
               lines: window.lines.map((line) =>
-                line.id === assistantId
+                requestLineMatches(line, activeEntry, "assistant")
                   ? {
                       ...line,
                       id: item.message_id ?? line.id,
@@ -2676,15 +2961,14 @@ export default function CommandCenter() {
             }));
           }
           if (item.type === "error") {
-            const durationMs = Math.max(0, Date.now() - assistantStartedAt);
-            updateChatWindow(chatWindowId, (window) => ({
+            updateChatWindow(activeEntry.chatWindowId, (window) => ({
               ...window,
               lines: window.lines.map((line) =>
-                line.id === assistantId
+                requestLineMatches(line, activeEntry, "assistant")
                   ? {
                       ...line,
                       content: item.error ?? "Ошибка потока ответа",
-                      durationMs,
+                      durationMs: Math.max(0, Date.now() - assistantStartedAt),
                       pending: false,
                       startedAt: null
                     }
@@ -2692,67 +2976,374 @@ export default function CommandCenter() {
               )
             }));
           }
-        }
+        },
+        abortController.signal
       );
+      if (durableChatRequestCancelled(identity, activeEntry.requestId)) return;
+      if (terminal.type !== "done") {
+        throw new ChatStreamError("Chat stream did not confirm completion", {
+          interrupted: true
+        });
+      }
+      completedChatRequestsRef.current.set(activeEntry.requestId, {
+        identity,
+        chatWindowId: activeEntry.chatWindowId,
+        messageId: terminal.message_id ?? activeEntry.assistantMessageId
+      });
       await refresh();
-      // Stream ended without a terminal done/error: drop empty placeholder so a
-      // retry cannot leave a stale 0 ms assistant bubble (FUNC-FIND-011).
-      updateChatWindow(chatWindowId, (window) => ({
+    } catch (error) {
+      if (durableChatRequestCancelled(identity, activeEntry.requestId)) return;
+      const failure =
+        error instanceof ChatStreamError
+          ? error
+          : new ChatStreamError(
+              error instanceof Error ? error.message : "Chat stream was interrupted",
+              { interrupted: true }
+            );
+      const retryable = isRetryableChatStreamError(failure);
+      const delayMs = retryable ? chatStreamRetryDelay(failure, activeEntry.attempts) : 0;
+      try {
+        activeEntry = persistDurableChatRequest(identity, {
+          ...activeEntry,
+          status: retryable ? "interrupted" : "error",
+          retryAt: retryable ? Date.now() + delayMs : 0,
+          updatedAt: Date.now(),
+          lastError: failure.message,
+          retryClass: failure.retryClass ?? "",
+          lastConversationId: observedConversationId
+        });
+      } catch (ledgerError) {
+        setError(
+          ledgerError instanceof Error
+            ? `Не удалось сохранить восстановление запроса: ${ledgerError.message}`
+            : "Не удалось сохранить восстановление запроса"
+        );
+        return;
+      }
+      updateChatWindow(activeEntry.chatWindowId, (window) => ({
         ...window,
-        lines: withoutEmptyAssistantPlaceholders(
-          window.lines.map((line) =>
-            line.id === assistantId && line.pending
-              ? {
-                  ...line,
-                  pending: false,
-                  startedAt: null,
-                  durationMs:
-                    coerceDurationMs(line.durationMs) ??
-                    Math.max(0, Date.now() - assistantStartedAt)
-                }
-              : line
-          )
-        )
-      }));
-    } catch (err) {
-      updateChatWindow(chatWindowId, (window) => ({
-        ...window,
-        lines: window.lines.flatMap((line) => {
-          if (line.id !== assistantId) return [line];
-          const content = String(line.content ?? "").trim();
-          if (!content) {
-            // Remove empty stream placeholder instead of committing a 0 ms bubble.
-            return [];
-          }
-          return [
-            {
-              ...line,
-              content:
-                err instanceof Error
-                  ? `${content}\n\n[stream interrupted: ${err.message}]`
-                  : content,
-              durationMs: Math.max(0, Date.now() - assistantStartedAt),
-              pending: false,
-              startedAt: null
-            }
-          ];
+        conversationId: observedConversationId || window.conversationId,
+        lines: window.lines.map((line) => {
+          if (!requestLineMatches(line, activeEntry, "assistant")) return line;
+          const content = String(line.content || "").trim();
+          const marker = `[поток прерван: ${failure.message}]`;
+          return {
+            ...line,
+            requestId: activeEntry.requestId,
+            content:
+              failure.terminalType === "error"
+                ? failure.message
+                : content.includes(marker)
+                  ? content
+                  : `${content}${content ? "\n\n" : ""}${marker}`,
+            durationMs: Math.max(0, Date.now() - assistantStartedAt),
+            pending: false,
+            startedAt: null
+          };
         })
       }));
-    } finally {
-      if (assistantId) {
-        updateChatWindow(chatWindowId, (window) => ({
-          ...window,
-          lines: withoutEmptyAssistantPlaceholders(window.lines)
-        }));
+      if (retryable && automaticChatRetryAllowed(activeEntry)) {
+        scheduleDurableChatRetry(
+          identity,
+          activeEntry,
+          Math.min(delayMs, chatRequestRecoveryRemainingMs(activeEntry) as number)
+        );
+      } else if (retryable) {
+        markDurableChatRequestStopped(
+          identity,
+          activeEntry,
+          "истёк 26-часовой срок автоматического восстановления"
+        );
       }
-      setChatBusy(false);
+    } finally {
+      if (chatRequestAbortControllersRef.current.get(requestKey) === abortController) {
+        chatRequestAbortControllersRef.current.delete(requestKey);
+      }
+      chatRequestsInFlightRef.current.delete(entry.requestId);
+      setChatBusy(chatRequestsInFlightRef.current.size > 0);
       setActiveOperation(null);
+    }
+  }
+
+  runDurableChatRequestRef.current = runDurableChatRequest;
+
+  function retryDurableChatLine(line: ChatLine) {
+    const identity = runtimeIdentityRef.current;
+    if (!identity || !line.requestId) return;
+    const entry = durableChatRequests(identity).find(
+      (item) => item.requestId === line.requestId
+    );
+    if (!entry) {
+      setError("Срок безопасного повтора истёк; отправьте новый запрос осознанно.");
+      updateActiveChatWindow((window) => ({
+        ...window,
+        lines: window.lines.map((item) =>
+          item.requestId === line.requestId ? { ...item, requestId: undefined } : item
+        )
+      }));
+      return;
+    }
+    void runDurableChatRequestRef.current(identity, entry, true);
+  }
+
+  function dismissDurableChatLine(line: ChatLine) {
+    const identity = runtimeIdentityRef.current;
+    if (!identity || !line.requestId) return;
+    const requestId = line.requestId;
+    const entry = durableChatRequests(identity).find(
+      (item) => item.requestId === requestId
+    );
+    if (!entry || !cancelDurableChatRequests(identity, [entry])) return;
+    updateActiveChatWindow((window) => ({
+      ...window,
+      lines: window.lines.map((item) =>
+        item.requestId === requestId ? { ...item, requestId: undefined } : item
+      )
+    }));
+  }
+
+  useEffect(() => {
+    const cleared = new Set<string>();
+    for (const [requestId, completed] of completedChatRequestsRef.current) {
+      const finalLine = chatWindows
+        .find((window) => window.id === completed.chatWindowId)
+        ?.lines.find(
+          (line) =>
+            line.role === "assistant" &&
+            line.requestId === requestId &&
+            line.id === completed.messageId &&
+            !line.pending
+        );
+      if (!finalLine) continue;
+      try {
+        const removed = removeChatRequestLedgerEntries(
+          window.localStorage,
+          completed.identity,
+          [requestId]
+        ).length > 0;
+        const stillPresent = durableChatRequests(completed.identity).some(
+          (entry) => entry.requestId === requestId
+        );
+        if (!removed && stillPresent) continue;
+      } catch (error) {
+        setError(
+          error instanceof Error
+            ? `Ответ получен, но журнал восстановления не очищен: ${error.message}`
+            : "Ответ получен, но журнал восстановления не очищен"
+        );
+        continue;
+      }
+      completedChatRequestsRef.current.delete(requestId);
+      cleared.add(requestId);
+    }
+    if (!cleared.size) return;
+    setChatWindows((current) =>
+      current.map((window) => ({
+        ...window,
+        lines: window.lines.map((line) =>
+          line.requestId && cleared.has(line.requestId)
+            ? { ...line, requestId: undefined }
+            : line
+        )
+      }))
+    );
+  }, [chatWindows]);
+
+  useEffect(() => {
+    if (!storageReady || !runtimeIdentity) return;
+    durableChatRequests(runtimeIdentity).forEach((entry, index) => {
+      if (entry.status === "error") return;
+      if (!automaticChatRetryAllowed(entry)) {
+        markDurableChatRequestStopped(
+          runtimeIdentity,
+          entry,
+          "исчерпан безопасный срок автоматического восстановления"
+        );
+        return;
+      }
+      scheduleDurableChatRetry(
+        runtimeIdentity,
+        entry,
+        Math.max(0, entry.retryAt - Date.now()) + index * 100
+      );
+    });
+  }, [runtimeIdentity, storageReady]);
+
+  useEffect(() => {
+    if (!storageReady || !runtimeIdentity) return;
+    const ledgerKey = scopedChatRequestLedgerKey(runtimeIdentity);
+    const handleLedgerChange = (event: StorageEvent) => {
+      if (event.storageArea !== window.localStorage || event.key !== ledgerKey) return;
+      // StorageEvent snapshots are immutable.  Re-reading localStorage here is
+      // unsafe: a late writer may already have resurrected the removed entry.
+      const removed = new Set(
+        chatRequestIdsRemovedByLedgerChange(event.oldValue, event.newValue)
+      );
+      if (!removed.size) return;
+      for (const requestId of removed) {
+        fenceCancelledDurableChatRequest(runtimeIdentity, requestId);
+      }
+      try {
+        // If a stale tab re-added an entry before this event was delivered,
+        // remove that resurrection while the immutable removal still fences it.
+        removeChatRequestLedgerEntries(
+          window.localStorage,
+          runtimeIdentity,
+          removed
+        );
+      } catch (error) {
+        setError(
+          error instanceof Error
+            ? `Не удалось закрепить межвкладочную отмену: ${error.message}`
+            : "Не удалось закрепить межвкладочную отмену"
+        );
+      }
+      setChatWindows((current) =>
+        current.map((window) => ({
+          ...window,
+          lines: window.lines.map((line) =>
+            line.requestId && removed.has(line.requestId)
+              ? { ...line, requestId: undefined, pending: false, startedAt: null }
+              : line
+          )
+        }))
+      );
+    };
+    window.addEventListener("storage", handleLedgerChange);
+    return () => window.removeEventListener("storage", handleLedgerChange);
+  }, [runtimeIdentity, storageReady]);
+
+  useEffect(() => {
+    return () => {
+      for (const timer of chatRequestTimersRef.current.values()) window.clearTimeout(timer);
+      chatRequestTimersRef.current.clear();
+      for (const controller of chatRequestAbortControllersRef.current.values()) {
+        controller.abort();
+      }
+      chatRequestAbortControllersRef.current.clear();
+      for (const preflight of chatUploadPreflightsRef.current.values()) {
+        preflight.cancelled = true;
+        preflight.abortController.abort();
+      }
+      chatUploadPreflightsRef.current.clear();
+    };
+  }, []);
+
+  async function submitChatDurable() {
+    const typedMessage = input.trim();
+    const filesToSend = chatFiles;
+    const chatWindowId = activeChatWindow?.id;
+    const identity = runtimeIdentityRef.current;
+    if (
+      (!typedMessage && filesToSend.length === 0) ||
+      chatBusy ||
+      !chatWindowId ||
+      !identity
+    ) return;
+    const previousConversationId = activeChatWindow.conversationId;
+    const message = typedMessage || "Проанализируй вложенные файлы.";
+    const requestId = randomId("chatreq");
+    const userId = randomId("msg");
+    const assistantId = randomId("msg");
+    const createdAt = Date.now();
+    let attachments: ChatAttachment[] = [];
+    let uploadPreflight: ChatUploadPreflight | null = null;
+    setChatBusy(true);
+    try {
+      if (filesToSend.length) {
+        const abortController = new AbortController();
+        const key = durableChatRequestKey(identity, requestId);
+        uploadPreflight = {
+          key,
+          identity,
+          chatWindowId,
+          requestId,
+          abortController,
+          cancelled: false
+        };
+        // Register the preflight synchronously before the first await.  Clear
+        // and close can now fence it even though no chat WAL exists yet.
+        chatUploadPreflightsRef.current.set(key, uploadPreflight);
+        setActiveOperation({
+          title: "Загрузка вложений",
+          detail: filesToSend.map((file) => file.name).join(", ")
+        });
+        attachments = await uploadChatFiles(filesToSend, abortController.signal);
+        setActiveOperation(null);
+      }
+      if (
+        uploadPreflight?.cancelled ||
+        uploadPreflight?.abortController.signal.aborted ||
+        (uploadPreflight &&
+          chatUploadPreflightsRef.current.get(uploadPreflight.key) !== uploadPreflight) ||
+        runtimeIdentityRef.current !== identity ||
+        !chatWindowsRef.current.some((window) => window.id === chatWindowId)
+      ) {
+        if (uploadPreflight) uploadPreflight.cancelled = true;
+        throw new DOMException("Chat upload preflight was cancelled", "AbortError");
+      }
+      // File upload is an explicit preflight: until it completes, the draft
+      // remains in the composer and no fake recoverable chat bubble is stored.
+      // The first durable chat mutation is this write-ahead record.
+      const entry = persistDurableChatRequest(identity, {
+        requestId,
+        chatWindowId,
+        userMessageId: userId,
+        assistantMessageId: assistantId,
+        payload: {
+          request_id: requestId,
+          message,
+          conversation_id: previousConversationId,
+          max_tokens: maxTokens,
+          mode: "auto",
+          attachments,
+          thinking_enabled: thinkingEnabled
+        },
+        createdAt,
+        updatedAt: Date.now(),
+        status: "pending",
+        attempts: 0,
+        retryAt: 0,
+        lastError: "",
+        retryClass: "",
+        lastConversationId: previousConversationId ?? ""
+      });
+      if (
+        uploadPreflight &&
+        chatUploadPreflightsRef.current.get(uploadPreflight.key) === uploadPreflight
+      ) {
+        chatUploadPreflightsRef.current.delete(uploadPreflight.key);
+      }
+      setChatFiles([]);
+      setActiveOperation(null);
+      await runDurableChatRequestRef.current(identity, entry);
+    } catch (error) {
+      // No chat line exists before the durable record, so a failed/crashed
+      // upload cannot leave a misleading pending request behind.
+      const explicitlyCancelled = Boolean(
+        uploadPreflight?.cancelled || uploadPreflight?.abortController.signal.aborted
+      );
+      const windowStillOwnsDraft =
+        runtimeIdentityRef.current === identity &&
+        chatWindowsRef.current.some((window) => window.id === chatWindowId);
+      if (!explicitlyCancelled && windowStillOwnsDraft) {
+        setError(error instanceof Error ? error.message : "Не удалось подготовить запрос");
+      }
+      setChatBusy(chatRequestsInFlightRef.current.size > 0);
+      setActiveOperation(null);
+    } finally {
+      if (
+        uploadPreflight &&
+        chatUploadPreflightsRef.current.get(uploadPreflight.key) === uploadPreflight
+      ) {
+        chatUploadPreflightsRef.current.delete(uploadPreflight.key);
+      }
     }
   }
 
   async function sendChat(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    await submitChat();
+    await submitChatDurable();
   }
 
   function handleComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
@@ -2760,7 +3351,7 @@ export default function CommandCenter() {
       return;
     }
     event.preventDefault();
-    void submitChat();
+    void submitChatDurable();
   }
 
   function newChatWindow() {
@@ -2771,6 +3362,7 @@ export default function CommandCenter() {
   }
 
   function closeChatWindow(id: string) {
+    if (!cancelDurableChatWindowRequests(id)) return;
     setChatWindows((current) => {
       if (current.length <= 1) {
         const replacement = createChatWindow();
@@ -2789,6 +3381,7 @@ export default function CommandCenter() {
 
   async function clearCurrentChat() {
     if (!activeChatWindow) return;
+    if (!cancelDurableChatWindowRequests(activeChatWindow.id)) return;
     transcriptShouldStickRef.current = true;
     const clearedWindow = {
       ...activeChatWindow,
@@ -4777,6 +5370,30 @@ export default function CommandCenter() {
                         )}
                         {line.role === "assistant" && line.content.trim() && !line.pending && (
                           <>
+                            {line.requestId && (
+                              <>
+                                <button
+                                  className="bubbleAction"
+                                  type="button"
+                                  title="Повторить тот же запрос безопасно"
+                                  aria-label="Повторить тот же запрос безопасно"
+                                  disabled={chatBusy}
+                                  onClick={() => retryDurableChatLine(line)}
+                                >
+                                  <RefreshCw size={13} />
+                                </button>
+                                <button
+                                  className="bubbleAction"
+                                  type="button"
+                                  title="Не повторять этот запрос"
+                                  aria-label="Не повторять этот запрос"
+                                  disabled={chatBusy}
+                                  onClick={() => dismissDurableChatLine(line)}
+                                >
+                                  <X size={13} />
+                                </button>
+                              </>
+                            )}
                             {line.verification && (
                               <span
                                 className={`bubbleBadge ${

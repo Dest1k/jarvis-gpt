@@ -105,7 +105,13 @@ _USER_SESSION_HEADER = "X-Jarvis-User-Session"
 _BRIDGE_SECRET_HEADER = "X-Jarvis-Bridge-Secret"
 _BRIDGE_HOT_CACHE_SIZE = 4_096
 _INBOX_MAX_ATTEMPTS = 3
-_INBOX_RETRY_DELAYS_SEC = (2.0, 10.0)
+_INBOX_TRANSIENT_MAX_ATTEMPTS = 288
+_INBOX_TRANSIENT_MAX_AGE_SEC = 24 * 60 * 60
+_INBOX_RETRY_DELAYS_SEC = (2.0, 10.0, 30.0, 60.0, 300.0)
+_INBOX_TRANSIENT_ERROR = "transient_backend_failure"
+_BACKEND_RETRY_CLASS_HEADER = "X-Jarvis-Retry-Class"
+_BACKEND_LLM_OUTAGE_CLASS = "llm-outage"
+_BACKEND_CHAT_REQUEST_IN_PROGRESS_CLASS = "chat-request-in-progress"
 
 # Audio/video attachments are transcribed backend-side; the bridge only relays them and,
 # for a spoken turn, mirrors the modality by replying with a synthesized voice note.
@@ -139,6 +145,39 @@ def _telegram_command(text: str) -> str:
     if not first_token.startswith("/"):
         return ""
     return first_token.split("@", 1)[0]
+
+
+def _retryable_backend_http_error(exc: httpx.HTTPError) -> bool:
+    """Classify machine-marked failures for the longer durable retry budget."""
+
+    if isinstance(exc, httpx.RequestError):
+        return True
+    if not isinstance(exc, httpx.HTTPStatusError):
+        return False
+    response = exc.response
+    if (
+        response.status_code == 503
+        and response.headers.get(_BACKEND_RETRY_CLASS_HEADER, "").strip().casefold()
+        == _BACKEND_LLM_OUTAGE_CLASS
+    ):
+        return True
+    if (
+        response.status_code == 409
+        and response.headers.get(_BACKEND_RETRY_CLASS_HEADER, "").strip().casefold()
+        == _BACKEND_CHAT_REQUEST_IN_PROGRESS_CLASS
+    ):
+        return True
+    if response.status_code != 409:
+        return False
+    try:
+        detail = str((response.json() or {}).get("detail") or "")
+    except ValueError:
+        return False
+    return detail in {
+        "Telegram update was already processed",
+        "Telegram update processing lease changed during claim",
+        "Telegram update processing lease was superseded",
+    }
 
 
 def _looks_like_audio(attachment: Mapping[str, object]) -> bool:
@@ -194,7 +233,10 @@ class TelegramConfig:
     # Separate from the general API token: possession authorizes binding an immutable
     # Telegram identity to a short-lived Jarvis session.
     bridge_secret: str = ""
-    realm_id: str = "default"
+    # Optional standalone assertions. Production identity is derived from Telegram
+    # getMe and uses the canonical realm ``telegram:<immutable bot id>``.
+    realm_id: str = ""
+    bot_id: int = 0
     # Deprecated compatibility hint. Backend permissions remain authoritative.
     owner_chat_ids: frozenset[int] = frozenset()
     api_token: str = ""
@@ -216,9 +258,10 @@ class TelegramConfig:
     conversation_store_path: Path | None = None
     legacy_conversation_store_path: Path | None = None
     # Realm-less databases predate multi-bot isolation. Importing one into a custom
-    # realm requires an explicit operator mapping; the historical ``default`` realm is
-    # the only backward-compatible implicit mapping.
+    # realm requires an explicit destination mapping. A formerly configured named realm
+    # additionally requires an explicit source mapping; it is never inferred from the bot.
     legacy_conversation_realm_id: str | None = None
+    legacy_conversation_source_realm_id: str | None = None
 
 
 def load_config(env: Mapping[str, str] | None = None) -> TelegramConfig:
@@ -303,15 +346,40 @@ def load_config(env: Mapping[str, str] | None = None) -> TelegramConfig:
             value = default
         return max(minimum, min(value, maximum))
 
-    realm_id = (env.get("JARVIS_TELEGRAM_REALM_ID") or "default").strip() or "default"
-    if len(realm_id) > 120:
-        raise SystemExit("JARVIS_TELEGRAM_REALM_ID must not exceed 120 characters.")
+    realm_id = (env.get("JARVIS_TELEGRAM_REALM_ID") or "").strip()
+    if realm_id and (realm_id == "default" or len(realm_id) > 120):
+        raise SystemExit(
+            "JARVIS_TELEGRAM_REALM_ID, when set as an assertion, must be canonical "
+            "and must not exceed 120 characters."
+        )
+    raw_bot_id = (env.get("JARVIS_TELEGRAM_BOT_ID") or "").strip()
+    bot_id = 0
+    if raw_bot_id:
+        try:
+            bot_id = int(raw_bot_id)
+        except ValueError as exc:
+            raise SystemExit("JARVIS_TELEGRAM_BOT_ID must be a positive integer.") from exc
+        if bot_id <= 0:
+            raise SystemExit("JARVIS_TELEGRAM_BOT_ID must be a positive integer.")
+    if bool(realm_id) != bool(bot_id):
+        raise SystemExit(
+            "JARVIS_TELEGRAM_REALM_ID and JARVIS_TELEGRAM_BOT_ID assertions "
+            "must be set together."
+        )
+    if bot_id and realm_id != f"telegram:{bot_id}":
+        raise SystemExit(
+            "JARVIS_TELEGRAM_REALM_ID must equal telegram:<JARVIS_TELEGRAM_BOT_ID>."
+        )
     legacy_realm_id = (env.get("JARVIS_TELEGRAM_LEGACY_REALM_ID") or "").strip()
     if legacy_realm_id and len(legacy_realm_id) > 120:
         raise SystemExit("JARVIS_TELEGRAM_LEGACY_REALM_ID must not exceed 120 characters.")
-    if not legacy_realm_id and realm_id == "default":
-        legacy_realm_id = "default"
-
+    legacy_source_realm_id = (
+        env.get("JARVIS_TELEGRAM_LEGACY_SOURCE_REALM_ID") or ""
+    ).strip()
+    if legacy_source_realm_id and len(legacy_source_realm_id) > 120:
+        raise SystemExit(
+            "JARVIS_TELEGRAM_LEGACY_SOURCE_REALM_ID must not exceed 120 characters."
+        )
     state_dir = default_home() / "data" / "jarvis-gpt" / "state"
     main_store = state_dir / "jarvis.sqlite3"
     configured_store = (env.get("TELEGRAM_CONVERSATION_STORE_PATH") or "").strip()
@@ -326,6 +394,7 @@ def load_config(env: Mapping[str, str] | None = None) -> TelegramConfig:
         backend_url=backend_url,
         bridge_secret=bridge_secret,
         realm_id=realm_id,
+        bot_id=bot_id,
         owner_chat_ids=owner_ids,
         api_token=api_token,
         voice_replies=voice_replies,
@@ -347,6 +416,7 @@ def load_config(env: Mapping[str, str] | None = None) -> TelegramConfig:
         conversation_store_path=main_store,
         legacy_conversation_store_path=legacy_store,
         legacy_conversation_realm_id=legacy_realm_id or None,
+        legacy_conversation_source_realm_id=legacy_source_realm_id or None,
     )
 
 
@@ -405,6 +475,7 @@ class TelegramConversationStore:
         realm_id: str = "default",
         legacy_path: Path | None = None,
         legacy_realm_id: str | None = None,
+        legacy_source_realm_id: str | None = None,
     ) -> None:
         self.path = path
         self.realm_id = str(realm_id).strip() or "default"
@@ -418,6 +489,20 @@ class TelegramConversationStore:
         self.legacy_realm_id = normalized_legacy_realm or (
             "default" if self.realm_id == "default" else None
         )
+        normalized_legacy_source_realm = (
+            str(legacy_source_realm_id).strip()
+            if legacy_source_realm_id is not None
+            else ""
+        )
+        if len(normalized_legacy_source_realm) > 120:
+            raise ValueError(
+                "Telegram legacy_source_realm_id must not exceed 120 characters"
+            )
+        if normalized_legacy_source_realm == self.realm_id:
+            raise ValueError(
+                "Telegram legacy_source_realm_id must differ from the destination realm"
+            )
+        self.legacy_source_realm_id = normalized_legacy_source_realm or None
         self.path.parent.mkdir(parents=True, exist_ok=True)
         external_migration = self._read_legacy_store(legacy_path)
         try:
@@ -589,16 +674,63 @@ class TelegramConversationStore:
                         "legacy Telegram database has no compatible binding table"
                     )
                 realm_aware = "realm_id" in columns
+                if not realm_aware and self.legacy_source_realm_id is not None:
+                    raise TelegramConversationMigrationError(
+                        "JARVIS_TELEGRAM_LEGACY_SOURCE_REALM_ID cannot describe a "
+                        "realm-less Telegram database"
+                    )
                 if not realm_aware and self.legacy_realm_id != self.realm_id:
                     raise TelegramConversationMigrationError(
                         "realm-less Telegram history requires an explicit matching "
                         "JARVIS_TELEGRAM_LEGACY_REALM_ID"
                     )
+                source_realm: str | None = None
+                if realm_aware:
+                    source_realms = {
+                        str(row[0])
+                        for row in legacy.execute(
+                            "SELECT DISTINCT realm_id FROM telegram_conversations"
+                        ).fetchall()
+                    }
+                    source_realm = self.realm_id
+                    if self.legacy_source_realm_id is not None:
+                        if self.legacy_realm_id != self.realm_id:
+                            raise TelegramConversationMigrationError(
+                                "named external Telegram history requires an explicit "
+                                "matching JARVIS_TELEGRAM_LEGACY_REALM_ID"
+                            )
+                        if self.legacy_source_realm_id not in source_realms:
+                            raise TelegramConversationMigrationError(
+                                "configured legacy source realm contains no external "
+                                "Telegram history"
+                            )
+                        if self.realm_id in source_realms:
+                            raise TelegramConversationMigrationError(
+                                "external legacy source and canonical Telegram realms "
+                                "both contain state"
+                            )
+                        source_realm = self.legacy_source_realm_id
+                    elif "default" in source_realms and self.realm_id not in source_realms:
+                        if self.legacy_realm_id != self.realm_id:
+                            raise TelegramConversationMigrationError(
+                                "default external Telegram history requires an explicit "
+                                "matching JARVIS_TELEGRAM_LEGACY_REALM_ID"
+                            )
+                        source_realm = "default"
+                    elif (
+                        self.realm_id != "default"
+                        and "default" in source_realms
+                        and self.realm_id in source_realms
+                        and self.legacy_realm_id == self.realm_id
+                    ):
+                        raise TelegramConversationMigrationError(
+                            "external default and canonical Telegram realms both contain state"
+                        )
                 rows = self._read_binding_rows(
                     legacy,
                     table="telegram_conversations",
                     source="legacy",
-                    realm_id=self.realm_id if realm_aware else None,
+                    realm_id=source_realm,
                 )
                 snapshot_sha256 = hashlib.sha256(
                     json.dumps(
@@ -608,7 +740,9 @@ class TelegramConversationStore:
                     ).encode("utf-8")
                 ).hexdigest()
                 source_scope = (
-                    f"realm:{self.realm_id}" if realm_aware else "realm-less"
+                    f"realm:{source_realm}->realm:{self.realm_id}"
+                    if realm_aware
+                    else "realm-less"
                 )
                 source_key = (
                     f"legacy-file:{path_key}:{source_scope}:snapshot:{snapshot_sha256}"
@@ -820,6 +954,10 @@ class TelegramConversationStore:
             (source_key,),
         ).fetchone()
         if claimed is not None:
+            if str(claimed[0]) != self.realm_id:
+                raise TelegramConversationMigrationError(
+                    "legacy Telegram snapshot was already claimed by another bot realm"
+                )
             return 0
         current_rows = self._read_binding_rows(
             conn,
@@ -891,6 +1029,123 @@ class TelegramConversationStore:
             )
         return migrated
 
+    def _migrate_legacy_realm(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        external_source_present: bool = False,
+    ) -> int:
+        """Atomically upgrade an explicitly identified former bot realm.
+
+        Releases before canonical bot realms stored bridge bindings, durable inbox
+        rows and IAM Telegram identities under ``default`` or an operator-configured
+        name. Silently ignoring those rows loses history; silently claiming an arbitrary
+        realm for the current token can cross bot tenants. The destination and every
+        non-default source are therefore explicit, and mixed source/target state fails.
+        """
+
+        source_realm = self.legacy_source_realm_id or "default"
+        if source_realm == self.realm_id:
+            return 0
+        if (
+            self.legacy_source_realm_id is not None
+            and self.legacy_realm_id != self.realm_id
+        ):
+            raise TelegramConversationMigrationError(
+                "named Telegram realm history requires an explicit matching "
+                "JARVIS_TELEGRAM_LEGACY_REALM_ID"
+            )
+        marker_key = f"realm-upgrade:{source_realm}:{self.realm_id}"
+        scoped_tables = (
+            ("telegram_conversations", ""),
+            ("telegram_update_inbox", ""),
+            ("telegram_store_migrations", ""),
+            ("telegram_updates", ""),
+            ("external_identities", " AND provider = 'telegram'"),
+        )
+        available: list[tuple[str, str]] = []
+        source_total = 0
+        canonical_total = 0
+        for table, suffix in scoped_tables:
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table,),
+            ).fetchone()
+            if exists is None:
+                continue
+            columns = {
+                str(row[1])
+                for row in conn.execute(f'PRAGMA table_info("{table}")').fetchall()
+            }
+            if "realm_id" not in columns:
+                continue
+            available.append((table, suffix))
+            source_total += int(
+                conn.execute(
+                    f'SELECT COUNT(*) FROM "{table}" '
+                    f"WHERE realm_id = ?{suffix}",  # noqa: S608 - fixed table/suffix
+                    (source_realm,),
+                ).fetchone()[0]
+            )
+            canonical_total += int(
+                conn.execute(
+                    f'SELECT COUNT(*) FROM "{table}" '
+                    f"WHERE realm_id = ?{suffix}",  # noqa: S608 - fixed table/suffix
+                    (self.realm_id,),
+                ).fetchone()[0]
+            )
+        marker = conn.execute(
+            "SELECT 1 FROM telegram_store_migrations "
+            "WHERE source_key = ? AND realm_id = ?",
+            (marker_key, self.realm_id),
+        ).fetchone()
+        if marker is not None:
+            if source_total:
+                raise TelegramConversationMigrationError(
+                    "legacy Telegram realm contains new state after its migration marker"
+                )
+            return 0
+        if source_total == 0:
+            if (
+                self.legacy_source_realm_id is not None
+                and not external_source_present
+            ):
+                raise TelegramConversationMigrationError(
+                    "configured legacy source realm contains no Telegram state"
+                )
+            return 0
+        if self.legacy_realm_id != self.realm_id:
+            raise TelegramConversationMigrationError(
+                f"{source_realm} Telegram realm history requires an explicit matching "
+                "JARVIS_TELEGRAM_LEGACY_REALM_ID"
+            )
+        if canonical_total:
+            raise TelegramConversationMigrationError(
+                "legacy source and canonical Telegram realms both contain state"
+            )
+        migrated = 0
+        for table, suffix in available:
+            cursor = conn.execute(
+                f'UPDATE "{table}" SET realm_id = ? '
+                f"WHERE realm_id = ?{suffix}",  # noqa: S608 - fixed table/suffix
+                (self.realm_id, source_realm),
+            )
+            migrated += int(cursor.rowcount)
+        conn.execute(
+            """
+            INSERT INTO telegram_store_migrations(source_key, realm_id)
+            VALUES (?, ?)
+            """,
+            (marker_key, self.realm_id),
+        )
+        log.info(
+            "Migrated %d Telegram realm-scoped row(s) from %s to %s",
+            migrated,
+            source_realm,
+            self.realm_id,
+        )
+        return migrated
+
     def _initialize_primary_store(
         self,
         conn: sqlite3.Connection,
@@ -951,6 +1206,10 @@ class TelegramConversationStore:
         self._create_primary_schema(conn)
         self._validate_primary_schema(conn)
         self._validate_all_realm_rows(conn)
+        self._migrate_legacy_realm(
+            conn,
+            external_source_present=external_migration is not None,
+        )
         if inline_rows is not None:
             self._apply_migration(
                 conn,
@@ -1047,11 +1306,20 @@ class TelegramConversationStore:
                 WHERE realm_id = ?
                   AND (
                       status IN ('completed', 'rejected')
-                      OR (status = 'failed' AND attempt_count >= ?)
+                      OR (
+                          status = 'failed'
+                          AND COALESCE(last_error, '') <> ?
+                          AND attempt_count >= ?
+                      )
                   )
                   AND updated_at < ?
                 """,
-                (self.realm_id, _INBOX_MAX_ATTEMPTS, now - 7 * 86_400),
+                (
+                    self.realm_id,
+                    _INBOX_TRANSIENT_ERROR,
+                    _INBOX_MAX_ATTEMPTS,
+                    now - 7 * 86_400,
+                ),
             )
         return inserted
 
@@ -1075,17 +1343,35 @@ class TelegramConversationStore:
                 SELECT i.update_id, i.payload_json
                 FROM telegram_update_inbox i
                 WHERE i.realm_id = ?
-                  AND i.attempt_count < ?
                   AND (
                       i.status = 'pending'
                       OR (
                           i.status = 'failed'
+                          AND (
+                              (
+                                  i.last_error = ?
+                                  AND i.attempt_count < ?
+                                  AND i.received_at >= ?
+                              )
+                              OR (
+                                  COALESCE(i.last_error, '') <> ?
+                                  AND i.attempt_count < ?
+                              )
+                          )
                           AND i.updated_at + CASE
                               WHEN i.attempt_count <= 1 THEN ?
+                              WHEN i.attempt_count = 2 THEN ?
+                              WHEN i.attempt_count <= 4 THEN ?
+                              WHEN i.attempt_count <= 8 THEN ?
                               ELSE ?
                           END <= ?
                       )
-                      OR (i.status = 'processing' AND i.lease_expires_at < ?)
+                      OR (
+                          i.status = 'processing'
+                          AND i.lease_expires_at < ?
+                          AND i.attempt_count < ?
+                          AND i.received_at >= ?
+                      )
                   )
                   AND NOT EXISTS (
                       SELECT 1 FROM telegram_update_inbox active
@@ -1099,20 +1385,57 @@ class TelegramConversationStore:
                       WHERE earlier.realm_id = i.realm_id
                         AND earlier.chat_id = i.chat_id
                         AND earlier.update_id < i.update_id
-                        AND earlier.status IN ('pending', 'processing', 'failed')
-                        AND earlier.attempt_count < ?
+                        AND (
+                            earlier.status = 'pending'
+                            OR (
+                                earlier.status = 'processing'
+                                AND earlier.lease_expires_at < ?
+                                AND earlier.attempt_count < ?
+                                AND earlier.received_at >= ?
+                            )
+                            OR (
+                                earlier.status = 'failed'
+                                AND (
+                                    (
+                                        earlier.last_error = ?
+                                        AND earlier.attempt_count < ?
+                                        AND earlier.received_at >= ?
+                                    )
+                                    OR (
+                                        COALESCE(earlier.last_error, '') <> ?
+                                        AND earlier.attempt_count < ?
+                                    )
+                                )
+                            )
+                        )
                   )
                 ORDER BY i.update_id
                 LIMIT ?
                 """,
                 (
                     self.realm_id,
+                    _INBOX_TRANSIENT_ERROR,
+                    _INBOX_TRANSIENT_MAX_ATTEMPTS,
+                    now - _INBOX_TRANSIENT_MAX_AGE_SEC,
+                    _INBOX_TRANSIENT_ERROR,
                     _INBOX_MAX_ATTEMPTS,
                     _INBOX_RETRY_DELAYS_SEC[0],
                     _INBOX_RETRY_DELAYS_SEC[1],
+                    _INBOX_RETRY_DELAYS_SEC[2],
+                    _INBOX_RETRY_DELAYS_SEC[3],
+                    _INBOX_RETRY_DELAYS_SEC[4],
                     now,
                     now,
+                    _INBOX_TRANSIENT_MAX_ATTEMPTS,
+                    now - _INBOX_TRANSIENT_MAX_AGE_SEC,
                     now,
+                    now,
+                    _INBOX_TRANSIENT_MAX_ATTEMPTS,
+                    now - _INBOX_TRANSIENT_MAX_AGE_SEC,
+                    _INBOX_TRANSIENT_ERROR,
+                    _INBOX_TRANSIENT_MAX_ATTEMPTS,
+                    now - _INBOX_TRANSIENT_MAX_AGE_SEC,
+                    _INBOX_TRANSIENT_ERROR,
                     _INBOX_MAX_ATTEMPTS,
                     bounded_limit,
                 ),
@@ -1125,17 +1448,36 @@ class TelegramConversationStore:
                     SET status = 'processing', attempt_count = attempt_count + 1,
                         lease_token = ?, lease_expires_at = ?, last_error = NULL,
                         updated_at = ?
-                    WHERE realm_id = ? AND update_id = ? AND attempt_count < ?
+                    WHERE realm_id = ? AND update_id = ?
                       AND (
                           status = 'pending'
                           OR (
                               status = 'failed'
+                              AND (
+                                  (
+                                      last_error = ?
+                                      AND attempt_count < ?
+                                      AND received_at >= ?
+                                  )
+                                  OR (
+                                      COALESCE(last_error, '') <> ?
+                                      AND attempt_count < ?
+                                  )
+                              )
                               AND updated_at + CASE
                                   WHEN attempt_count <= 1 THEN ?
+                                  WHEN attempt_count = 2 THEN ?
+                                  WHEN attempt_count <= 4 THEN ?
+                                  WHEN attempt_count <= 8 THEN ?
                                   ELSE ?
                               END <= ?
                           )
-                          OR (status = 'processing' AND lease_expires_at < ?)
+                          OR (
+                              status = 'processing'
+                              AND lease_expires_at < ?
+                              AND attempt_count < ?
+                              AND received_at >= ?
+                          )
                       )
                     """,
                     (
@@ -1144,11 +1486,20 @@ class TelegramConversationStore:
                         now,
                         self.realm_id,
                         update_id,
+                        _INBOX_TRANSIENT_ERROR,
+                        _INBOX_TRANSIENT_MAX_ATTEMPTS,
+                        now - _INBOX_TRANSIENT_MAX_AGE_SEC,
+                        _INBOX_TRANSIENT_ERROR,
                         _INBOX_MAX_ATTEMPTS,
                         _INBOX_RETRY_DELAYS_SEC[0],
                         _INBOX_RETRY_DELAYS_SEC[1],
+                        _INBOX_RETRY_DELAYS_SEC[2],
+                        _INBOX_RETRY_DELAYS_SEC[3],
+                        _INBOX_RETRY_DELAYS_SEC[4],
                         now,
                         now,
+                        _INBOX_TRANSIENT_MAX_ATTEMPTS,
+                        now - _INBOX_TRANSIENT_MAX_AGE_SEC,
                     ),
                 )
                 if cursor.rowcount != 1:
@@ -1232,21 +1583,22 @@ class TelegramConversationStore:
             ).fetchone()
             if row is not None:
                 stored_user_id = str(row[2]) if row[2] is not None else None
-                if stored_user_id is None:
-                    # The authenticated private Telegram identity is immutable. Claim a
-                    # pre-user_id row exactly once so upgrades preserve history.
+                if stored_user_id is not None and stored_user_id != user_id:
+                    self._raise_ownership_mismatch(chat_id)
+                # IAM presets control the next turn's capabilities, not conversation
+                # identity. Preserve history across role changes; only /new and /reset
+                # intentionally rotate a Telegram conversation.
+                if stored_user_id is None or str(row[1]) != access_mode:
                     conn.execute(
                         """
                         UPDATE telegram_conversations
-                        SET user_id = ?, updated_at = CURRENT_TIMESTAMP
-                        WHERE realm_id = ? AND chat_id = ? AND user_id IS NULL
+                        SET user_id = ?, access_mode = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE realm_id = ? AND chat_id = ?
+                          AND (user_id IS NULL OR user_id = ?)
                         """,
-                        (user_id, self.realm_id, chat_id),
+                        (user_id, access_mode, self.realm_id, chat_id, user_id),
                     )
-                elif stored_user_id != user_id:
-                    self._raise_ownership_mismatch(chat_id)
-                if row[1] == access_mode:
-                    return str(row[0])
+                return str(row[0])
 
             conversation_id = self._new_conversation_id()
             conn.execute(
@@ -1363,6 +1715,8 @@ class TelegramBridge:
         api_client: httpx.AsyncClient | None = None,
     ) -> None:
         self.cfg = cfg
+        self._realm_id = cfg.realm_id
+        self._bot_id = cfg.bot_id
         self.tg = tg_client or httpx.AsyncClient(
             base_url=f"https://api.telegram.org/bot{cfg.bot_token}",
             timeout=cfg.poll_timeout + 15,
@@ -1376,31 +1730,59 @@ class TelegramBridge:
             timeout=cfg.request_timeout,
             trust_env=False,
         )
-        self._conversation_store = (
-            TelegramConversationStore(
-                cfg.conversation_store_path,
-                realm_id=cfg.realm_id,
-                legacy_path=cfg.legacy_conversation_store_path,
-                legacy_realm_id=cfg.legacy_conversation_realm_id,
-            )
-            if cfg.conversation_store_path is not None
-            else None
-        )
+        # Production must verify getMe before it can read or migrate bot-scoped history.
+        # Tests and embedders establish the same identity explicitly through
+        # ``_initialize_bot_identity`` before handling updates.
+        self._conversation_store: TelegramConversationStore | None = None
         # These are bounded hot caches only; the durable store is queried lazily.
         self.conversations: OrderedDict[int, str] = OrderedDict()
         self._conversation_modes: OrderedDict[int, str] = OrderedDict()
         self._sessions: OrderedDict[int, TelegramUserSession] = OrderedDict()
-        self._offset = (
-            self._conversation_store.next_update_offset()
-            if self._conversation_store is not None
-            else 0
-        )
+        self._offset = 0
         self._update_slots = asyncio.Semaphore(max(1, cfg.max_concurrent_updates))
         self._chat_locks: dict[int, asyncio.Lock] = {}
         self._pending_per_chat: dict[int, int] = {}
         self._update_tasks: set[asyncio.Task[None]] = set()
         self._intake_windows: OrderedDict[int, tuple[float, int]] = OrderedDict()
         self._closing = False
+
+    def _initialize_bot_identity(self, me: object) -> None:
+        actual_bot_id = me.get("id") if isinstance(me, dict) else None
+        if (
+            isinstance(actual_bot_id, bool)
+            or not isinstance(actual_bot_id, int)
+            or actual_bot_id <= 0
+        ):
+            raise RuntimeError("Telegram getMe did not return a valid immutable bot id")
+        canonical_realm = f"telegram:{actual_bot_id}"
+        if self.cfg.bot_id and self.cfg.bot_id != actual_bot_id:
+            raise RuntimeError(
+                "Telegram getMe identity does not match JARVIS_TELEGRAM_BOT_ID"
+            )
+        if self.cfg.realm_id and self.cfg.realm_id != canonical_realm:
+            raise RuntimeError(
+                "Telegram getMe identity does not match JARVIS_TELEGRAM_REALM_ID"
+            )
+        if self._conversation_store is not None and self._realm_id != canonical_realm:
+            raise RuntimeError("Telegram bot identity changed after history store binding")
+        self._bot_id = actual_bot_id
+        self._realm_id = canonical_realm
+        if self.cfg.conversation_store_path is not None and self._conversation_store is None:
+            self._conversation_store = TelegramConversationStore(
+                self.cfg.conversation_store_path,
+                realm_id=canonical_realm,
+                legacy_path=self.cfg.legacy_conversation_store_path,
+                legacy_realm_id=self.cfg.legacy_conversation_realm_id,
+                legacy_source_realm_id=(
+                    self.cfg.legacy_conversation_source_realm_id
+                ),
+            )
+            self._offset = self._conversation_store.next_update_offset()
+
+    def _bot_identity(self) -> tuple[str, int]:
+        if not self._realm_id or self._bot_id <= 0:
+            raise RuntimeError("Telegram bot identity has not been established by getMe")
+        return self._realm_id, self._bot_id
 
     async def aclose(self) -> None:
         self._closing = True
@@ -1540,7 +1922,7 @@ class TelegramBridge:
             )
         else:
             conversation_id = self.conversations.get(chat_id, "")
-            if not conversation_id or self._conversation_modes.get(chat_id) != access_mode:
+            if not conversation_id:
                 conversation_id = TelegramConversationStore._new_conversation_id()
         self._cache_conversation(chat_id, conversation_id, access_mode)
         return conversation_id
@@ -1635,7 +2017,10 @@ class TelegramBridge:
         reappeared with different identity/content and is ignored as a replay mismatch.
         """
 
+        realm_id, bot_id = self._bot_identity()
         payload = {
+            "realm_id": realm_id,
+            "bot_id": bot_id,
             "update_id": update_id,
             "telegram_user": {
                 "id": chat_id,
@@ -1658,10 +2043,20 @@ class TelegramBridge:
             headers=headers,
         )
         if response.status_code == 409:
-            log.warning("Ignored conflicting Telegram replay update_id=%s", update_id)
-            return None
+            try:
+                detail = str((response.json() or {}).get("detail") or "")
+            except ValueError:
+                detail = ""
+            if detail == "Telegram update replay mismatch":
+                log.warning("Ignored conflicting Telegram replay update_id=%s", update_id)
+                return None
         response.raise_for_status()
         body = response.json()
+        if (
+            str(body.get("realm_id") or "").strip() != realm_id
+            or body.get("bot_id") != bot_id
+        ):
+            raise ValueError("backend returned a mismatched Telegram realm identity")
         token = str(body.get("session_token") or "").strip()
         user = body.get("user") if isinstance(body.get("user"), dict) else {}
         user_id = str(body.get("user_id") or user.get("id") or "").strip()
@@ -1733,6 +2128,7 @@ class TelegramBridge:
     # -- main loop ------------------------------------------------------------
     async def run(self) -> None:
         me = await self._tg("getMe")
+        self._initialize_bot_identity(me)
         username = me.get("username") if isinstance(me, dict) else "?"
         log.info(
             "Telegram bridge online as @%s; allowlist=%s (%d id(s))",
@@ -1828,11 +2224,13 @@ class TelegramBridge:
                 chat_id=chat_id,
                 sender=sender,
             )
-        except (httpx.HTTPError, ValueError):
+        except httpx.HTTPError as exc:
             log.exception("Could not establish scoped Telegram session for user_id=%s", chat_id)
             # The durable inbox retries the same immutable update id. The backend's
             # registration CAS makes an ambiguous lost response safe to replay.
-            return False
+            if _retryable_backend_http_error(exc):
+                return False
+            raise
         if session is None:
             return
 
@@ -1865,7 +2263,7 @@ class TelegramBridge:
             text,
             attachments,
             voice_reply=audio_in,
-            request_id=f"telegram:{self.cfg.realm_id}:{update_id}",
+            request_id=f"{self._realm_id}:{update_id}",
         )
 
     # -- inbound files (photo/document -> /api/files/upload) ------------------
@@ -1976,11 +2374,13 @@ class TelegramBridge:
                 )
                 response.raise_for_status()
                 body = response.json()
-            except (httpx.HTTPError, ValueError):
+            except httpx.HTTPError as exc:
                 log.exception("backend /api/chat failed")
                 # ``request_id`` is stable for this Telegram update, so retrying an
                 # ambiguous response cannot execute a second logical agent turn.
-                return False
+                if _retryable_backend_http_error(exc):
+                    return False
+                raise
         finally:
             typing.cancel()
             with suppress(asyncio.CancelledError):

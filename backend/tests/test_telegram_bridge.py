@@ -7,11 +7,14 @@ import io
 import json
 import logging
 import sqlite3
+import time
 
 import httpx
 import pytest
 from jarvis_gpt.storage import JarvisStorage
 from jarvis_gpt.telegram_bridge import (
+    _INBOX_TRANSIENT_MAX_AGE_SEC,
+    _INBOX_TRANSIENT_MAX_ATTEMPTS,
     TelegramBridge,
     TelegramConfig,
     TelegramConversationIsolationError,
@@ -20,6 +23,7 @@ from jarvis_gpt.telegram_bridge import (
     _chunks,
     _configure_logging,
     _looks_like_audio,
+    _retryable_backend_http_error,
     load_config,
 )
 
@@ -32,6 +36,8 @@ def _cfg(**over) -> TelegramConfig:
         "allowed_chat_ids": frozenset({42}),
         "backend_url": "http://backend.test",
         "bridge_secret": "bridge-secret",
+        "realm_id": "telegram:700001",
+        "bot_id": 700001,
     }
     base.update(over)
     return TelegramConfig(**base)
@@ -47,6 +53,8 @@ def _bridge(tg_handler, api_handler, *, session_presets=None, **cfg_over):
             return httpx.Response(
                 200,
                 json={
+                    "realm_id": payload["realm_id"],
+                    "bot_id": payload["bot_id"],
                     "session_token": f"session-{telegram_id}",
                     "user": {
                         "id": f"user-{telegram_id}",
@@ -64,7 +72,10 @@ def _bridge(tg_handler, api_handler, *, session_presets=None, **cfg_over):
         base_url="http://backend.test",
         transport=httpx.MockTransport(scoped_api_handler),
     )
-    return TelegramBridge(_cfg(**cfg_over), tg_client=tg, api_client=api)
+    cfg = _cfg(**cfg_over)
+    bridge = TelegramBridge(cfg, tg_client=tg, api_client=api)
+    bridge._initialize_bot_identity({"id": cfg.bot_id})
+    return bridge
 
 
 def test_load_config_fails_closed_without_token():
@@ -79,7 +90,10 @@ def test_load_config_fails_closed_without_bridge_secret():
 
 def test_load_config_allows_empty_optional_allowlist():
     cfg = load_config(
-        {"TELEGRAM_BOT_TOKEN": "T", "JARVIS_TELEGRAM_BRIDGE_SECRET": BRIDGE_SECRET}
+        {
+            "TELEGRAM_BOT_TOKEN": "T",
+            "JARVIS_TELEGRAM_BRIDGE_SECRET": BRIDGE_SECRET,
+        }
     )
     assert cfg.allowed_chat_ids == frozenset()
 
@@ -89,6 +103,8 @@ def test_load_config_parses_allowlist():
         {
             "TELEGRAM_BOT_TOKEN": "T",
             "JARVIS_TELEGRAM_BRIDGE_SECRET": BRIDGE_SECRET,
+            "JARVIS_TELEGRAM_REALM_ID": "telegram:700001",
+            "JARVIS_TELEGRAM_BOT_ID": "700001",
             "TELEGRAM_ALLOWED_CHAT_IDS": "42, 7 99",
             "TELEGRAM_OWNER_CHAT_IDS": "42",
         }
@@ -105,17 +121,20 @@ def test_load_config_treats_old_store_override_as_migration_source(tmp_path):
         {
             "TELEGRAM_BOT_TOKEN": "T",
             "JARVIS_TELEGRAM_BRIDGE_SECRET": BRIDGE_SECRET,
-            "JARVIS_TELEGRAM_REALM_ID": "bot-a",
-            "JARVIS_TELEGRAM_LEGACY_REALM_ID": "bot-a",
+            "JARVIS_TELEGRAM_REALM_ID": "telegram:700001",
+            "JARVIS_TELEGRAM_BOT_ID": "700001",
+            "JARVIS_TELEGRAM_LEGACY_REALM_ID": "telegram:700001",
+            "JARVIS_TELEGRAM_LEGACY_SOURCE_REALM_ID": "legacy-bot-realm",
             "TELEGRAM_CONVERSATION_STORE_PATH": str(old_store),
         }
     )
 
-    assert cfg.realm_id == "bot-a"
+    assert cfg.realm_id == "telegram:700001"
     assert cfg.conversation_store_path.name == "jarvis.sqlite3"
     assert cfg.conversation_store_path.resolve() != old_store.resolve()
     assert cfg.legacy_conversation_store_path.resolve() == old_store.resolve()
-    assert cfg.legacy_conversation_realm_id == "bot-a"
+    assert cfg.legacy_conversation_realm_id == "telegram:700001"
+    assert cfg.legacy_conversation_source_realm_id == "legacy-bot-realm"
 
 
 def test_load_config_rejects_truncated_realm_collisions():
@@ -125,8 +144,71 @@ def test_load_config_rejects_truncated_realm_collisions():
                 "TELEGRAM_BOT_TOKEN": "T",
                 "JARVIS_TELEGRAM_BRIDGE_SECRET": BRIDGE_SECRET,
                 "JARVIS_TELEGRAM_REALM_ID": "r" * 121,
+                "JARVIS_TELEGRAM_BOT_ID": "700001",
             }
         )
+
+
+def test_getme_derives_canonical_realm_before_legacy_store_migration(tmp_path):
+    legacy_path = tmp_path / "telegram_bridge.sqlite3"
+    main_path = tmp_path / "jarvis.sqlite3"
+    with sqlite3.connect(legacy_path) as legacy:
+        legacy.execute(
+            """
+            CREATE TABLE telegram_conversations (
+                chat_id INTEGER PRIMARY KEY,
+                conversation_id TEXT NOT NULL UNIQUE,
+                access_mode TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        legacy.execute(
+            "INSERT INTO telegram_conversations VALUES "
+            "(42, 'legacy-getme-history', 'guest', 'now')"
+        )
+    tg = httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(500)))
+    api = httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(500)))
+    bridge = TelegramBridge(
+        _cfg(
+            realm_id="",
+            bot_id=0,
+            conversation_store_path=main_path,
+            legacy_conversation_store_path=legacy_path,
+            legacy_conversation_realm_id="telegram:700001",
+        ),
+        tg_client=tg,
+        api_client=api,
+    )
+
+    assert not main_path.exists()
+    bridge._initialize_bot_identity({"id": 700001})
+
+    assert bridge._bot_identity() == ("telegram:700001", 700001)
+    assert bridge._conversation_store is not None
+    assert bridge._conversation_store.load_all() == {42: "legacy-getme-history"}
+    asyncio.run(bridge.aclose())
+
+
+def test_getme_mismatch_fails_before_history_database_is_touched(tmp_path):
+    main_path = tmp_path / "jarvis.sqlite3"
+    tg = httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(500)))
+    api = httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(500)))
+    bridge = TelegramBridge(
+        _cfg(
+            realm_id="telegram:700001",
+            bot_id=700001,
+            conversation_store_path=main_path,
+        ),
+        tg_client=tg,
+        api_client=api,
+    )
+
+    with pytest.raises(RuntimeError, match="JARVIS_TELEGRAM_BOT_ID"):
+        bridge._initialize_bot_identity({"id": 700002})
+
+    assert not main_path.exists()
+    asyncio.run(bridge.aclose())
 
 
 def test_load_config_bounds_bridge_worker_pool():
@@ -134,6 +216,8 @@ def test_load_config_bounds_bridge_worker_pool():
         {
             "TELEGRAM_BOT_TOKEN": "T",
             "JARVIS_TELEGRAM_BRIDGE_SECRET": BRIDGE_SECRET,
+            "JARVIS_TELEGRAM_REALM_ID": "telegram:700001",
+            "JARVIS_TELEGRAM_BOT_ID": "700001",
             "JARVIS_TELEGRAM_MAX_CONCURRENT_UPDATES": "999",
             "JARVIS_TELEGRAM_MAX_PENDING_UPDATES": "8",
             "JARVIS_TELEGRAM_MAX_PENDING_PER_USER": "3",
@@ -151,6 +235,8 @@ def test_multiple_users_do_not_require_bridge_side_owner_assignment():
         {
             "TELEGRAM_BOT_TOKEN": "T",
             "JARVIS_TELEGRAM_BRIDGE_SECRET": BRIDGE_SECRET,
+            "JARVIS_TELEGRAM_REALM_ID": "telegram:700001",
+            "JARVIS_TELEGRAM_BOT_ID": "700001",
             "TELEGRAM_ALLOWED_CHAT_IDS": "42, 99",
         }
     )
@@ -163,6 +249,8 @@ def test_load_config_requires_tls_for_remote_backend():
             {
                 "TELEGRAM_BOT_TOKEN": "T",
                 "JARVIS_TELEGRAM_BRIDGE_SECRET": BRIDGE_SECRET,
+                "JARVIS_TELEGRAM_REALM_ID": "telegram:700001",
+                "JARVIS_TELEGRAM_BOT_ID": "700001",
                 "JARVIS_BACKEND_URL": "http://jarvis.example.test:8000",
             }
         )
@@ -171,6 +259,8 @@ def test_load_config_requires_tls_for_remote_backend():
         {
             "TELEGRAM_BOT_TOKEN": "T",
             "JARVIS_TELEGRAM_BRIDGE_SECRET": BRIDGE_SECRET,
+            "JARVIS_TELEGRAM_REALM_ID": "telegram:700001",
+            "JARVIS_TELEGRAM_BOT_ID": "700001",
             "JARVIS_BACKEND_URL": "https://jarvis.example.test",
         }
     )
@@ -354,7 +444,7 @@ def test_text_turn_relays_to_backend_and_replies():
     asyncio.run(bridge._handle({"update_id": 1, "message": msg}))
     assert len(chat_bodies) == 1
     assert chat_bodies[0]["message"] == "здравствуй"
-    assert chat_bodies[0]["request_id"] == "telegram:default:1"
+    assert chat_bodies[0]["request_id"] == "telegram:700001:1"
     assert "access_mode" not in chat_bodies[0]
     assert "notification_chat_id" not in chat_bodies[0]
     # The bridge allocates the id before the backend call, closing the crash window where
@@ -434,7 +524,8 @@ def test_bridge_does_not_make_permission_decisions_for_non_owner():
         },
     }
 
-    asyncio.run(bridge._handle(update))
+    with pytest.raises(httpx.HTTPStatusError):
+        asyncio.run(bridge._handle(update))
 
     # Authorization is enforced by the backend using the scoped user session. The bridge
     # neither elevates the user nor silently turns a non-owner into an owner.
@@ -611,7 +702,7 @@ def test_reset_rotation_is_persisted_before_the_next_turn(tmp_path):
     assert chat_bodies[-1]["conversation_id"] == reset_id
 
 
-def test_access_mode_change_rotates_persisted_conversation(tmp_path):
+def test_access_mode_change_preserves_persisted_conversation(tmp_path):
     chat_bodies: list[dict] = []
 
     def tg_handler(_request):
@@ -666,7 +757,7 @@ def test_access_mode_change_rotates_persisted_conversation(tmp_path):
     asyncio.run(promoted_owner._handle(update))
     asyncio.run(promoted_owner.aclose())
 
-    assert chat_bodies[-1]["conversation_id"] != guest_id
+    assert chat_bodies[-1]["conversation_id"] == guest_id
 
 
 def test_legacy_binding_store_migrates_into_main_database(tmp_path):
@@ -975,6 +1066,242 @@ def test_conversation_bindings_are_isolated_by_bot_realm_and_migrate_old_schema(
     assert realm_b.load_all() == {42: "bot-b-conv"}
 
 
+def test_default_realm_upgrade_requires_explicit_mapping_and_migrates_all_state(tmp_path):
+    database_path = tmp_path / "jarvis.sqlite3"
+    legacy = TelegramConversationStore(database_path)
+    legacy.bind(42, "legacy-default-conversation", "guest", user_id="user-42")
+    legacy.persist_updates(
+        [
+            (
+                7,
+                42,
+                {
+                    "update_id": 7,
+                    "message": {
+                        "chat": {"id": 42, "type": "private"},
+                        "from": {"id": 42, "is_bot": False},
+                        "text": "pending",
+                    },
+                },
+            )
+        ]
+    )
+    with sqlite3.connect(database_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE external_identities (
+                id TEXT PRIMARY KEY,
+                provider TEXT NOT NULL,
+                realm_id TEXT NOT NULL,
+                provider_subject_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                UNIQUE(provider, realm_id, provider_subject_id)
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO external_identities VALUES "
+            "('identity-42', 'telegram', 'default', '42', 'user-42')"
+        )
+        conn.execute(
+            """
+            CREATE TABLE telegram_updates (
+                realm_id TEXT NOT NULL,
+                update_id INTEGER NOT NULL,
+                PRIMARY KEY(realm_id, update_id)
+            )
+            """
+        )
+        conn.execute("INSERT INTO telegram_updates VALUES ('default', 6)")
+        conn.execute(
+            "INSERT INTO telegram_store_migrations(source_key, realm_id) "
+            "VALUES ('old-default-marker', 'default')"
+        )
+
+    with pytest.raises(TelegramConversationMigrationError, match="explicit matching"):
+        TelegramConversationStore(
+            database_path,
+            realm_id="telegram:700001",
+        )
+
+    upgraded = TelegramConversationStore(
+        database_path,
+        realm_id="telegram:700001",
+        legacy_realm_id="telegram:700001",
+    )
+    assert upgraded.load_all() == {42: "legacy-default-conversation"}
+    assert upgraded.next_update_offset() == 8
+    with sqlite3.connect(database_path) as conn:
+        for table in (
+            "telegram_conversations",
+            "telegram_update_inbox",
+            "telegram_store_migrations",
+            "telegram_updates",
+            "external_identities",
+        ):
+            assert conn.execute(
+                f'SELECT DISTINCT realm_id FROM "{table}" ORDER BY realm_id'
+            ).fetchall() == [("telegram:700001",)]
+
+
+def test_default_realm_upgrade_rejects_mixed_canonical_state_without_mutation(tmp_path):
+    database_path = tmp_path / "jarvis.sqlite3"
+    legacy = TelegramConversationStore(database_path)
+    legacy.bind(42, "legacy-default-conversation", "guest", user_id="user-42")
+    with sqlite3.connect(database_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO telegram_conversations(
+                realm_id, chat_id, conversation_id, access_mode, user_id
+            ) VALUES ('telegram:700001', 99, 'canonical-conversation', 'guest', 'user-99')
+            """
+        )
+        before = "\n".join(conn.iterdump())
+
+    with pytest.raises(TelegramConversationMigrationError, match="both contain state"):
+        TelegramConversationStore(
+            database_path,
+            realm_id="telegram:700001",
+            legacy_realm_id="telegram:700001",
+        )
+
+    with sqlite3.connect(database_path) as conn:
+        assert "\n".join(conn.iterdump()) == before
+
+
+def test_named_realm_upgrade_requires_explicit_source_and_migrates_all_state(tmp_path):
+    database_path = tmp_path / "jarvis.sqlite3"
+    source_realm = "legacy-custom-bot"
+    target_realm = "telegram:700001"
+    legacy = TelegramConversationStore(database_path, realm_id=source_realm)
+    legacy.bind(42, "legacy-custom-conversation", "guest", user_id="user-42")
+    legacy.persist_updates(
+        [
+            (
+                7,
+                42,
+                {
+                    "update_id": 7,
+                    "message": {
+                        "chat": {"id": 42, "type": "private"},
+                        "from": {"id": 42, "is_bot": False},
+                        "text": "pending custom realm",
+                    },
+                },
+            )
+        ]
+    )
+    with sqlite3.connect(database_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE external_identities (
+                id TEXT PRIMARY KEY,
+                provider TEXT NOT NULL,
+                realm_id TEXT NOT NULL,
+                provider_subject_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                UNIQUE(provider, realm_id, provider_subject_id)
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO external_identities VALUES (?, 'telegram', ?, '42', 'user-42')",
+            ("identity-42", source_realm),
+        )
+        conn.execute(
+            """
+            CREATE TABLE telegram_updates (
+                realm_id TEXT NOT NULL,
+                update_id INTEGER NOT NULL,
+                PRIMARY KEY(realm_id, update_id)
+            )
+            """
+        )
+        conn.execute("INSERT INTO telegram_updates VALUES (?, 6)", (source_realm,))
+        conn.execute(
+            "INSERT INTO telegram_store_migrations(source_key, realm_id) VALUES (?, ?)",
+            ("old-custom-marker", source_realm),
+        )
+
+    with pytest.raises(TelegramConversationMigrationError, match="explicit matching"):
+        TelegramConversationStore(
+            database_path,
+            realm_id=target_realm,
+            legacy_source_realm_id=source_realm,
+        )
+    with pytest.raises(TelegramConversationMigrationError, match="contains no Telegram state"):
+        TelegramConversationStore(
+            database_path,
+            realm_id=target_realm,
+            legacy_realm_id=target_realm,
+            legacy_source_realm_id="mistyped-legacy-realm",
+        )
+
+    upgraded = TelegramConversationStore(
+        database_path,
+        realm_id=target_realm,
+        legacy_realm_id=target_realm,
+        legacy_source_realm_id=source_realm,
+    )
+
+    assert upgraded.load_all() == {42: "legacy-custom-conversation"}
+    assert upgraded.next_update_offset() == 8
+    with sqlite3.connect(database_path) as conn:
+        for table in (
+            "telegram_conversations",
+            "telegram_update_inbox",
+            "telegram_store_migrations",
+            "telegram_updates",
+            "external_identities",
+        ):
+            assert conn.execute(
+                f'SELECT DISTINCT realm_id FROM "{table}" ORDER BY realm_id'
+            ).fetchall() == [(target_realm,)]
+        assert conn.execute(
+            "SELECT COUNT(*) FROM telegram_store_migrations "
+            "WHERE source_key = ? AND realm_id = ?",
+            (f"realm-upgrade:{source_realm}:{target_realm}", target_realm),
+        ).fetchone() == (1,)
+
+    # The explicit marker makes the same migration configuration restart-safe.
+    restarted = TelegramConversationStore(
+        database_path,
+        realm_id=target_realm,
+        legacy_realm_id=target_realm,
+        legacy_source_realm_id=source_realm,
+    )
+    assert restarted.load_all() == {42: "legacy-custom-conversation"}
+
+
+def test_named_realm_upgrade_rejects_mixed_target_state_without_mutation(tmp_path):
+    database_path = tmp_path / "jarvis.sqlite3"
+    source_realm = "legacy-custom-bot"
+    target_realm = "telegram:700001"
+    legacy = TelegramConversationStore(database_path, realm_id=source_realm)
+    legacy.bind(42, "legacy-custom-conversation", "guest", user_id="user-42")
+    with sqlite3.connect(database_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO telegram_conversations(
+                realm_id, chat_id, conversation_id, access_mode, user_id
+            ) VALUES (?, 99, 'canonical-conversation', 'guest', 'user-99')
+            """,
+            (target_realm,),
+        )
+        before = "\n".join(conn.iterdump())
+
+    with pytest.raises(TelegramConversationMigrationError, match="both contain state"):
+        TelegramConversationStore(
+            database_path,
+            realm_id=target_realm,
+            legacy_realm_id=target_realm,
+            legacy_source_realm_id=source_realm,
+        )
+
+    with sqlite3.connect(database_path) as conn:
+        assert "\n".join(conn.iterdump()) == before
+
+
 def test_realm_less_external_legacy_store_is_claimed_by_one_realm(tmp_path):
     legacy_path = tmp_path / "telegram_bridge.sqlite3"
     main_path = tmp_path / "jarvis.sqlite3"
@@ -1006,8 +1333,116 @@ def test_realm_less_external_legacy_store_is_claimed_by_one_realm(tmp_path):
             realm_id="bot-b",
             legacy_path=legacy_path,
         )
+    with pytest.raises(TelegramConversationMigrationError, match="another bot realm"):
+        TelegramConversationStore(
+            main_path,
+            realm_id="bot-b",
+            legacy_path=legacy_path,
+            legacy_realm_id="bot-b",
+        )
 
     assert realm_a.load_all() == {42: "legacy-conv"}
+
+
+def test_realm_aware_external_default_store_requires_mapping_and_preserves_history(
+    tmp_path,
+):
+    legacy_path = tmp_path / "telegram_bridge.sqlite3"
+    main_path = tmp_path / "jarvis.sqlite3"
+    with sqlite3.connect(legacy_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE telegram_conversations (
+                realm_id TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                conversation_id TEXT NOT NULL,
+                access_mode TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                user_id TEXT,
+                PRIMARY KEY(realm_id, chat_id)
+            )
+            """
+        )
+        conn.executemany(
+            """
+            INSERT INTO telegram_conversations(
+                realm_id, chat_id, conversation_id, access_mode, updated_at, user_id
+            ) VALUES ('default', ?, ?, 'owner', CURRENT_TIMESTAMP, NULL)
+            """,
+            [(42, "legacy-owner"), (99, "legacy-second-user")],
+        )
+
+    with pytest.raises(TelegramConversationMigrationError, match="explicit matching"):
+        TelegramConversationStore(
+            main_path,
+            realm_id="telegram:700001",
+            legacy_path=legacy_path,
+        )
+    assert not main_path.exists()
+
+    migrated = TelegramConversationStore(
+        main_path,
+        realm_id="telegram:700001",
+        legacy_path=legacy_path,
+        legacy_realm_id="telegram:700001",
+    )
+
+    assert migrated.load_all() == {42: "legacy-owner", 99: "legacy-second-user"}
+    with sqlite3.connect(main_path) as conn:
+        assert conn.execute(
+            "SELECT DISTINCT realm_id FROM telegram_conversations"
+        ).fetchall() == [("telegram:700001",)]
+    with sqlite3.connect(legacy_path) as conn:
+        assert conn.execute(
+            "SELECT DISTINCT realm_id FROM telegram_conversations"
+        ).fetchall() == [("default",)]
+
+
+def test_getme_migrates_explicit_named_external_source_to_canonical_realm(tmp_path):
+    legacy_path = tmp_path / "telegram_bridge.sqlite3"
+    main_path = tmp_path / "jarvis.sqlite3"
+    with sqlite3.connect(legacy_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE telegram_conversations (
+                realm_id TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                conversation_id TEXT NOT NULL,
+                access_mode TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                user_id TEXT,
+                PRIMARY KEY(realm_id, chat_id)
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO telegram_conversations VALUES "
+            "('old-production-bot', 42, 'legacy-named-history', 'guest', 'now', NULL)"
+        )
+    tg = httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(500)))
+    api = httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(500)))
+    bridge = TelegramBridge(
+        _cfg(
+            realm_id="",
+            bot_id=0,
+            conversation_store_path=main_path,
+            legacy_conversation_store_path=legacy_path,
+            legacy_conversation_realm_id="telegram:700001",
+            legacy_conversation_source_realm_id="old-production-bot",
+        ),
+        tg_client=tg,
+        api_client=api,
+    )
+
+    bridge._initialize_bot_identity({"id": 700001})
+
+    assert bridge._conversation_store is not None
+    assert bridge._conversation_store.load_all() == {42: "legacy-named-history"}
+    with sqlite3.connect(main_path) as conn:
+        assert conn.execute(
+            "SELECT DISTINCT realm_id FROM telegram_conversations"
+        ).fetchall() == [("telegram:700001",)]
+    asyncio.run(bridge.aclose())
 
 
 def test_durable_update_inbox_advances_offset_only_after_commit_and_recovers_lease(tmp_path):
@@ -1040,6 +1475,99 @@ def test_durable_update_inbox_advances_offset_only_after_commit_and_recovers_lea
     assert restarted.finalize_update(7, first_lease, status="completed") is False
     assert restarted.finalize_update(7, second_lease, status="completed") is True
     assert restarted.claim_pending_updates(limit=10, lease_seconds=60) == []
+
+
+def test_backend_retry_classifier_requires_machine_outage_marker_for_http_responses():
+    request = httpx.Request("POST", "http://backend.test/api/chat")
+
+    def status_error(status: int, *, headers=None, detail="failure"):
+        response = httpx.Response(
+            status,
+            request=request,
+            headers=headers,
+            json={"detail": detail},
+        )
+        return httpx.HTTPStatusError(
+            f"HTTP {status}",
+            request=request,
+            response=response,
+        )
+
+    assert _retryable_backend_http_error(httpx.ConnectError("offline", request=request))
+    assert _retryable_backend_http_error(
+        status_error(503, headers={"X-Jarvis-Retry-Class": "llm-outage"})
+    )
+    assert _retryable_backend_http_error(
+        status_error(
+            409,
+            headers={"X-Jarvis-Retry-Class": "chat-request-in-progress"},
+        )
+    )
+    assert not _retryable_backend_http_error(status_error(500))
+    assert not _retryable_backend_http_error(status_error(503))
+    assert not _retryable_backend_http_error(status_error(409, detail="conflict"))
+    assert _retryable_backend_http_error(
+        status_error(409, detail="Telegram update processing lease was superseded")
+    )
+
+
+@pytest.mark.parametrize("exhaustion", ["attempts", "age"])
+def test_exhausted_transient_update_is_retained_but_unblocks_same_chat(
+    tmp_path,
+    exhaustion,
+):
+    database_path = tmp_path / f"jarvis-{exhaustion}.sqlite3"
+    store = TelegramConversationStore(database_path, realm_id="telegram:700001")
+    first = {
+        "update_id": 30,
+        "message": {
+            "chat": {"id": 42, "type": "private"},
+            "from": {"id": 42, "is_bot": False},
+            "text": "outage message",
+        },
+    }
+    second = {
+        "update_id": 31,
+        "message": {
+            "chat": {"id": 42, "type": "private"},
+            "from": {"id": 42, "is_bot": False},
+            "text": "later message",
+        },
+    }
+    store.persist_updates([(30, 42, first), (31, 42, second)])
+    now = time.time()
+    attempt_count = (
+        _INBOX_TRANSIENT_MAX_ATTEMPTS
+        if exhaustion == "attempts"
+        else _INBOX_TRANSIENT_MAX_ATTEMPTS - 1
+    )
+    received_at = (
+        now
+        if exhaustion == "attempts"
+        else now - _INBOX_TRANSIENT_MAX_AGE_SEC - 1
+    )
+    with sqlite3.connect(database_path) as conn:
+        conn.execute(
+            """
+            UPDATE telegram_update_inbox
+            SET status = 'failed', attempt_count = ?, received_at = ?, updated_at = ?,
+                last_error = 'transient_backend_failure'
+            WHERE realm_id = 'telegram:700001' AND update_id = 30
+            """,
+            (attempt_count, received_at, now - 301),
+        )
+
+    claimed = store.claim_pending_updates(limit=10, lease_seconds=60)
+
+    assert [payload["update_id"] for payload, _lease in claimed] == [31]
+    with sqlite3.connect(database_path) as conn:
+        retained = conn.execute(
+            "SELECT status, attempt_count, payload_json FROM telegram_update_inbox "
+            "WHERE realm_id = 'telegram:700001' AND update_id = 30"
+        ).fetchone()
+    assert retained is not None
+    assert retained[:2] == ("failed", attempt_count)
+    assert json.loads(retained[2]) == first
 
 
 def test_durable_inbox_retries_transient_session_failure_after_backoff(
@@ -1094,7 +1622,7 @@ def test_durable_inbox_retries_transient_session_failure_after_backoff(
         with sqlite3.connect(database_path) as conn:
             first = conn.execute(
                 "SELECT status, attempt_count, last_error FROM telegram_update_inbox "
-                "WHERE realm_id = 'default' AND update_id = 7"
+                "WHERE realm_id = 'telegram:700001' AND update_id = 7"
             ).fetchone()
         assert first == ("failed", 1, "transient_backend_failure")
 
@@ -1109,7 +1637,7 @@ def test_durable_inbox_retries_transient_session_failure_after_backoff(
         with sqlite3.connect(database_path) as conn:
             final = conn.execute(
                 "SELECT status, attempt_count FROM telegram_update_inbox "
-                "WHERE realm_id = 'default' AND update_id = 7"
+                "WHERE realm_id = 'telegram:700001' AND update_id = 7"
             ).fetchone()
         assert final == ("completed", 2)
         assert session_attempts == 2
@@ -1118,7 +1646,7 @@ def test_durable_inbox_retries_transient_session_failure_after_backoff(
     asyncio.run(scenario())
 
 
-def test_durable_inbox_retries_chat_with_same_id_and_stops_after_bound(
+def test_durable_inbox_keeps_transient_chat_retryable_after_normal_attempt_bound(
     tmp_path, monkeypatch
 ):
     database_path = tmp_path / "jarvis.sqlite3"
@@ -1131,7 +1659,21 @@ def test_durable_inbox_retries_chat_with_same_id_and_stops_after_bound(
             return httpx.Response(200, json=[])
         if request.url.path == "/api/chat":
             chat_payloads.append(json.loads(request.content))
-            return httpx.Response(503, json={"detail": "temporarily unavailable"})
+            if len(chat_payloads) <= 4:
+                return httpx.Response(
+                    503,
+                    json={"detail": "Language model is temporarily unavailable"},
+                    headers={"X-Jarvis-Retry-Class": "llm-outage"},
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "conversation_id": chat_payloads[-1]["conversation_id"],
+                    "message_id": "answer-after-outage",
+                    "answer": "Модель восстановилась",
+                    "events": [],
+                },
+            )
         return httpx.Response(404)
 
     bridge = _bridge(
@@ -1158,23 +1700,294 @@ def test_durable_inbox_retries_chat_with_same_id_and_stops_after_bound(
             await asyncio.gather(*tuple(bridge._update_tasks))
 
         with sqlite3.connect(database_path) as conn:
-            exhausted = conn.execute(
+            still_pending = conn.execute(
                 "SELECT status, attempt_count FROM telegram_update_inbox "
-                "WHERE realm_id = 'default' AND update_id = 9"
+                "WHERE realm_id = 'telegram:700001' AND update_id = 9"
             ).fetchone()
-        assert exhausted == ("failed", 3)
+        assert still_pending == ("failed", 3)
         assert len(chat_payloads) == 3
         assert {payload["request_id"] for payload in chat_payloads} == {
-            "telegram:default:9"
+            "telegram:700001:9"
         }
         assert len({payload["conversation_id"] for payload in chat_payloads}) == 1
 
-        # Exhausted updates are terminal: even a much later drain cannot create a
-        # fourth backend turn.
-        now[0] += 10_000
+        # A model/container restart routinely takes longer than the first two
+        # retry delays. The durable update must remain retryable instead of being
+        # silently discarded after the ordinary poison-message attempt bound.
+        now[0] += 29.0
         bridge._drain_durable_inbox()
         await asyncio.sleep(0)
         assert len(chat_payloads) == 3
+
+        now[0] += 1.1
+        bridge._drain_durable_inbox()
+        await asyncio.gather(*tuple(bridge._update_tasks))
+        with sqlite3.connect(database_path) as conn:
+            retried = conn.execute(
+                "SELECT status, attempt_count FROM telegram_update_inbox "
+                "WHERE realm_id = 'telegram:700001' AND update_id = 9"
+            ).fetchone()
+        assert retried == ("failed", 4)
+        assert len(chat_payloads) == 4
+
+        now[0] += 300.1
+        bridge._drain_durable_inbox()
+        await asyncio.gather(*tuple(bridge._update_tasks))
+        with sqlite3.connect(database_path) as conn:
+            recovered = conn.execute(
+                "SELECT status, attempt_count FROM telegram_update_inbox "
+                "WHERE realm_id = 'telegram:700001' AND update_id = 9"
+            ).fetchone()
+        assert recovered == ("completed", 5)
+        assert len(chat_payloads) == 5
+        await bridge.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_durable_inbox_still_bounds_non_transient_poison_updates(tmp_path, monkeypatch):
+    database_path = tmp_path / "jarvis.sqlite3"
+    now = [2_500.0]
+    monkeypatch.setattr("jarvis_gpt.telegram_bridge.time.time", lambda: now[0])
+    bridge = _bridge(
+        lambda _request: httpx.Response(200, json={"ok": True, "result": {}}),
+        lambda _request: httpx.Response(200, json=[]),
+        conversation_store_path=database_path,
+    )
+    store = bridge._conversation_store
+    assert store is not None
+    update = {
+        "update_id": 11,
+        "message": {
+            "chat": {"id": 42, "type": "private"},
+            "from": {"id": 42, "is_bot": False},
+            "text": "poison update",
+        },
+    }
+    store.persist_updates([(11, 42, update)])
+    attempts = 0
+
+    async def broken_handler(_update):
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("deterministic bridge bug")
+
+    bridge._handle = broken_handler  # type: ignore[method-assign]
+
+    async def scenario() -> None:
+        for retry_delay in (0.0, 2.1, 10.1):
+            now[0] += retry_delay
+            bridge._drain_durable_inbox()
+            await asyncio.gather(*tuple(bridge._update_tasks))
+
+        now[0] += 10_000.0
+        bridge._drain_durable_inbox()
+        await asyncio.sleep(0)
+        with sqlite3.connect(database_path) as conn:
+            terminal = conn.execute(
+                "SELECT status, attempt_count, last_error FROM telegram_update_inbox "
+                "WHERE realm_id = 'telegram:700001' AND update_id = 11"
+            ).fetchone()
+        assert terminal == ("failed", 3, "RuntimeError")
+        assert attempts == 3
+        await bridge.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("status_code", [500, 503])
+def test_unmarked_http_failure_stops_after_three_and_unblocks_later_update(
+    tmp_path,
+    monkeypatch,
+    status_code,
+):
+    database_path = tmp_path / f"jarvis-{status_code}.sqlite3"
+    now = [2_700.0]
+    monkeypatch.setattr("jarvis_gpt.telegram_bridge.time.time", lambda: now[0])
+    chat_payloads: list[dict] = []
+    replies: list[str] = []
+
+    def tg_handler(request):
+        if request.url.path.endswith("/sendMessage"):
+            replies.append(str(json.loads(request.content).get("text") or ""))
+        return httpx.Response(200, json={"ok": True, "result": {}})
+
+    def api_handler(request):
+        if request.url.path == "/api/files":
+            return httpx.Response(200, json=[])
+        if request.url.path == "/api/chat":
+            payload = json.loads(request.content)
+            chat_payloads.append(payload)
+            if payload["message"] == "deterministic poison":
+                return httpx.Response(
+                    status_code,
+                    json={"detail": "payload-specific backend failure"},
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "conversation_id": payload["conversation_id"],
+                    "message_id": "later-answer",
+                    "answer": "Следующее сообщение обработано",
+                    "events": [],
+                },
+            )
+        return httpx.Response(404)
+
+    bridge = _bridge(
+        tg_handler,
+        api_handler,
+        conversation_store_path=database_path,
+    )
+    store = bridge._conversation_store
+    assert store is not None
+    updates = [
+        (
+            20,
+            42,
+            {
+                "update_id": 20,
+                "message": {
+                    "chat": {"id": 42, "type": "private"},
+                    "from": {"id": 42, "is_bot": False},
+                    "text": "deterministic poison",
+                },
+            },
+        ),
+        (
+            21,
+            42,
+            {
+                "update_id": 21,
+                "message": {
+                    "chat": {"id": 42, "type": "private"},
+                    "from": {"id": 42, "is_bot": False},
+                    "text": "later message",
+                },
+            },
+        ),
+    ]
+    store.persist_updates(updates)
+
+    async def drain_spawned_tasks() -> None:
+        for _ in range(10):
+            tasks = tuple(bridge._update_tasks)
+            if not tasks:
+                await asyncio.sleep(0)
+                tasks = tuple(bridge._update_tasks)
+            if not tasks:
+                return
+            await asyncio.gather(*tasks)
+            await asyncio.sleep(0)
+        raise AssertionError("durable inbox did not quiesce")
+
+    async def scenario() -> None:
+        for retry_delay in (0.0, 2.1, 10.1):
+            now[0] += retry_delay
+            bridge._drain_durable_inbox()
+            await drain_spawned_tasks()
+
+        poison = [
+            payload for payload in chat_payloads if payload["message"] == "deterministic poison"
+        ]
+        later = [payload for payload in chat_payloads if payload["message"] == "later message"]
+        assert len(poison) == 3
+        assert len(later) == 1
+        assert replies == ["Следующее сообщение обработано"]
+        with sqlite3.connect(database_path) as conn:
+            rows = conn.execute(
+                "SELECT update_id, status, attempt_count, last_error "
+                "FROM telegram_update_inbox WHERE realm_id = 'telegram:700001' "
+                "ORDER BY update_id"
+            ).fetchall()
+        assert rows == [
+            (20, "failed", 3, "HTTPStatusError"),
+            (21, "completed", 1, None),
+        ]
+
+        now[0] += 10_000.0
+        bridge._drain_durable_inbox()
+        await asyncio.sleep(0)
+        assert len(
+            [
+                payload
+                for payload in chat_payloads
+                if payload["message"] == "deterministic poison"
+            ]
+        ) == 3
+        await bridge.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_durable_inbox_retries_guest_chat_and_sends_one_reply(tmp_path, monkeypatch):
+    database_path = tmp_path / "jarvis.sqlite3"
+    now = [3_000.0]
+    monkeypatch.setattr("jarvis_gpt.telegram_bridge.time.time", lambda: now[0])
+    chat_payloads: list[dict] = []
+    replies: list[str] = []
+
+    def tg_handler(request):
+        if request.url.path.endswith("/sendMessage"):
+            replies.append(str(json.loads(request.content).get("text") or ""))
+        return httpx.Response(200, json={"ok": True, "result": {}})
+
+    def api_handler(request):
+        if request.url.path == "/api/files":
+            return httpx.Response(200, json=[])
+        if request.url.path == "/api/chat":
+            chat_payloads.append(json.loads(request.content))
+            if len(chat_payloads) == 1:
+                return httpx.Response(503, json={"detail": "guest model unavailable"})
+            return httpx.Response(
+                200,
+                json={
+                    "conversation_id": chat_payloads[-1]["conversation_id"],
+                    "message_id": "guest-answer-1",
+                    "answer": "Ответ после безопасного повтора",
+                    "events": [],
+                },
+            )
+        return httpx.Response(404)
+
+    bridge = _bridge(
+        tg_handler,
+        api_handler,
+        session_presets={42: "guest"},
+        conversation_store_path=database_path,
+    )
+    store = bridge._conversation_store
+    assert store is not None
+    update = {
+        "update_id": 10,
+        "message": {
+            "chat": {"id": 42, "type": "private"},
+            "from": {"id": 42, "is_bot": False},
+            "text": "retry guest chat",
+        },
+    }
+    store.persist_updates([(10, 42, update)])
+
+    async def scenario() -> None:
+        bridge._drain_durable_inbox()
+        await asyncio.gather(*tuple(bridge._update_tasks))
+        assert replies == []
+
+        now[0] += 2.1
+        bridge._drain_durable_inbox()
+        await asyncio.gather(*tuple(bridge._update_tasks))
+        with sqlite3.connect(database_path) as conn:
+            final = conn.execute(
+                "SELECT status, attempt_count FROM telegram_update_inbox "
+                "WHERE realm_id = 'telegram:700001' AND update_id = 10"
+            ).fetchone()
+        assert final == ("completed", 2)
+        assert len(chat_payloads) == 2
+        assert {payload["request_id"] for payload in chat_payloads} == {
+            "telegram:700001:10"
+        }
+        assert len({payload["conversation_id"] for payload in chat_payloads}) == 1
+        assert replies == ["Ответ после безопасного повтора"]
         await bridge.aclose()
 
     asyncio.run(scenario())
@@ -1182,13 +1995,13 @@ def test_durable_inbox_retries_chat_with_same_id_and_stops_after_bound(
 
 def test_bridge_uses_lazy_bounded_hot_caches_for_unlimited_registered_users(tmp_path):
     database_path = tmp_path / "jarvis.sqlite3"
-    store = TelegramConversationStore(database_path)
+    store = TelegramConversationStore(database_path, realm_id="telegram:700001")
     with store._connect() as conn:
         conn.executemany(
             """
             INSERT INTO telegram_conversations(
                 realm_id, chat_id, conversation_id, access_mode, updated_at
-            ) VALUES ('default', ?, ?, 'guest', CURRENT_TIMESTAMP)
+            ) VALUES ('telegram:700001', ?, ?, 'guest', CURRENT_TIMESTAMP)
             """,
             [(chat_id + 1, f"conv-{chat_id}") for chat_id in range(5_000)],
         )
@@ -1334,6 +2147,8 @@ def test_load_config_voice_replies_toggle():
     common = {
         "TELEGRAM_BOT_TOKEN": "T",
         "JARVIS_TELEGRAM_BRIDGE_SECRET": BRIDGE_SECRET,
+        "JARVIS_TELEGRAM_REALM_ID": "telegram:700001",
+        "JARVIS_TELEGRAM_BOT_ID": "700001",
         "TELEGRAM_ALLOWED_CHAT_IDS": "42",
     }
     assert load_config(common).voice_replies is True

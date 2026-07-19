@@ -139,6 +139,47 @@ def test_dispatcher_control_runs_tool_with_allow_danger(monkeypatch, tmp_path):
     assert "прогреется" in result.answer  # warmup note for a restart
 
 
+def test_dispatcher_control_exact_transport_retry_runs_once(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_OPERATOR_FULL_AUTONOMY", "1")
+    agent = _agent(monkeypatch, tmp_path)
+    calls: list[tuple[str, bool]] = []
+
+    async def fake_run(name, args=None, allow_danger=False, **kwargs):
+        calls.append((name, allow_danger))
+        return ToolRunResponse(tool=name, ok=True, summary="перезапуск выполнен", data={})
+
+    monkeypatch.setattr(agent.tools, "run", fake_run)
+    message = "перезапусти модель"
+    first = asyncio.run(
+        agent.chat(message, transport_request_id="telegram:700001:restart-1")
+    )
+
+    # The first HTTP response is treated as lost; the bridge repeats the exact request id.
+    retry = asyncio.run(
+        agent.chat(
+            message,
+            conversation_id=first.conversation_id,
+            transport_request_id="telegram:700001:restart-1",
+        )
+    )
+
+    assert calls == [("dispatcher.restart", True)]
+    assert retry.answer == first.answer
+    assert any(event.title == "Idempotent response replay" for event in retry.events)
+
+    asyncio.run(
+        agent.chat(
+            message,
+            conversation_id=first.conversation_id,
+            transport_request_id="telegram:700001:restart-2",
+        )
+    )
+    assert calls == [
+        ("dispatcher.restart", True),
+        ("dispatcher.restart", True),
+    ]
+
+
 def test_model_status_summary_reports(monkeypatch, tmp_path):
     agent = _agent(monkeypatch, tmp_path)
 

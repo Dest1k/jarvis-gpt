@@ -58,6 +58,15 @@ def test_shared_orchestrator_enforces_global_parallelism_and_operation_budget():
         with pytest.raises(WebBudgetExceeded, match="network_bytes"):
             await orchestrator.budget.reserve("network_bytes", 1)
 
+        await orchestrator.budget.release("network_bytes", 40)
+        assert orchestrator.budget.snapshot()["consumed"]["network_bytes"] == (
+            orchestrator.limits.network_bytes - 40
+        )
+        with pytest.raises(ValueError, match="exceeds"):
+            await orchestrator.budget.release(
+                "network_bytes", orchestrator.limits.network_bytes
+            )
+
     asyncio.run(scenario())
 
 

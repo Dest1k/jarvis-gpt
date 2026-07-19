@@ -1,0 +1,16 @@
+feature_group,surface,primary_cases,live_contract,status,gap
+launcher/start/stop/restart/status,launcher+CLI+GUI,Q036 Q041,profile selection to healthy loaded Qwen model to truthful UI,IN_PROGRESS,
+profile/model selection,launcher+CLI+GUI,Q036,declared qwen36-vl profile equals container args model identity and UI,IN_PROGRESS,other model profiles excluded by operator scope
+chat and streaming,GUI+API+WebSocket,Q001-Q012 Q055,complete answer with one terminal and no protocol leakage,IN_PROGRESS,
+conversations/history,GUI+API+Telegram,Q014-Q021 Q058-Q059,durable isolated context with explicit reset boundaries,IN_PROGRESS,
+tools and approvals,GUI+API+CLI,Q005 Q039-Q040,authorization then exact execution with evidence,IN_PROGRESS,
+files/documents,GUI+API+CLI,Q013 Q026-Q035,synthetic files only with integrity and provenance,IN_PROGRESS,
+web/browser,GUI+tool API,Q042-Q047,live synthesis citations freshness and recoverable network failure,IN_PROGRESS,
+missions/planning/final report,GUI+API+CLI,Q048-Q052,real steps truthful progress resume and deliverables,IN_PROGRESS,
+memory/persona/learning,GUI+API+CLI,Q057-Q059,durable tenant-scoped data and dedup,IN_PROGRESS,
+diagnostics/telemetry/benchmark,GUI+API+CLI,Q036-Q038,truthful read-only host and model observations,IN_PROGRESS,
+autonomy/routines/self-heal,GUI+API,Q039-Q041 Q049-Q051,bounded safe execution and no warmup restart,IN_PROGRESS,
+Command Center/admin/errors/recovery,GUI,Q021 Q034 Q041 Q054-Q060,authenticated panels truthful errors reload resize focus,IN_PROGRESS,
+offline-ready,launcher+GUI+API,Q047 Q056,local core boots without pull and network tools fail clearly,IN_PROGRESS,
+CLI public commands,CLI+API matrix,Q036-Q041,all documented commands normal or safe error contract,IN_PROGRESS,
+Telegram admission and rights,Telegram+admin GUI,Q059,stable bot realm durable identity owner mapping and isolated history,IN_PROGRESS,

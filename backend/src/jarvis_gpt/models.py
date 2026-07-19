@@ -308,7 +308,9 @@ class DispatcherStatusResponse(BaseModel):
     runtime: dict[str, Any] | None = None
     desired_runtime: dict[str, Any] = Field(default_factory=dict)
     actual_image: str = ""
+    actual_image_id: str = ""
     desired_image: str = ""
+    desired_image_id: str = ""
     runtime_matches_desired: bool = False
     runtime_mismatches: dict[str, Any] = Field(default_factory=dict)
     compose: list[str]

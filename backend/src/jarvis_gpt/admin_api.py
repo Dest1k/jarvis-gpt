@@ -918,11 +918,50 @@ def update_preset(
     return _preset_payload(service, preset_key)
 
 
-def _telegram_realm_id() -> str:
-    value = os.environ.get("JARVIS_TELEGRAM_REALM_ID", "default").strip() or "default"
-    if len(value) > 120:
-        raise RuntimeError("JARVIS_TELEGRAM_REALM_ID must not exceed 120 characters")
-    return value
+def _canonical_telegram_realm_id(bot_id: int) -> str:
+    if isinstance(bot_id, bool) or bot_id <= 0:
+        raise ValueError("Telegram bot id must be a positive integer")
+    return f"telegram:{bot_id}"
+
+
+def _bind_telegram_realm(
+    conn: sqlite3.Connection,
+    *,
+    realm_id: str,
+    bot_id: int,
+    now: str,
+) -> None:
+    by_realm = conn.execute(
+        "SELECT bot_id FROM telegram_realms WHERE realm_id = ?",
+        (realm_id,),
+    ).fetchone()
+    if by_realm is not None and int(by_realm["bot_id"]) != bot_id:
+        raise HTTPException(
+            status_code=409,
+            detail="Telegram realm is already bound to another bot",
+        )
+    by_bot = conn.execute(
+        "SELECT realm_id FROM telegram_realms WHERE bot_id = ?",
+        (bot_id,),
+    ).fetchone()
+    if by_bot is not None and str(by_bot["realm_id"]) != realm_id:
+        raise HTTPException(
+            status_code=409,
+            detail="Telegram bot is already bound to another realm",
+        )
+    if by_realm is None:
+        conn.execute(
+            """
+            INSERT INTO telegram_realms(realm_id, bot_id, first_seen_at, last_seen_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (realm_id, bot_id, now, now),
+        )
+    else:
+        conn.execute(
+            "UPDATE telegram_realms SET last_seen_at = ? WHERE realm_id = ?",
+            (now, realm_id),
+        )
 
 
 def _telegram_session_ttl() -> int:
@@ -1055,7 +1094,13 @@ def _telegram_session(request: Request, payload: TelegramSessionRequest) -> Tele
         sort_keys=True,
     )
     payload_sha256 = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    realm_id = _telegram_realm_id()
+    bot_id = payload.bot_id
+    realm_id = _canonical_telegram_realm_id(bot_id)
+    if payload.realm_id != realm_id:
+        raise HTTPException(
+            status_code=409,
+            detail="Telegram realm is not canonical for the authenticated bot identity",
+        )
     _enforce_telegram_ingress_limit(
         service,
         realm_id=realm_id,
@@ -1067,6 +1112,7 @@ def _telegram_session(request: Request, payload: TelegramSessionRequest) -> Tele
         timespec="seconds"
     )
     with service.storage.transaction(immediate=True) as conn:
+        _bind_telegram_realm(conn, realm_id=realm_id, bot_id=bot_id, now=now)
         existing = conn.execute(
             """
             SELECT payload_sha256, status, attempt_count, updated_at
@@ -1086,19 +1132,31 @@ def _telegram_session(request: Request, payload: TelegramSessionRequest) -> Tele
                 existing["status"] == "processing"
                 and str(existing["updated_at"]) < stale_processing_before
             )
-            if not retryable or attempts >= 3:
+            # A completed registration is only an identity/session handshake. The
+            # durable chat request id is enforced separately by the agent effect
+            # ledger, so an exact completed replay must remain available across a
+            # model/container outage of arbitrary length. Failed or abandoned
+            # registration attempts keep their poison-message bound.
+            retry_budget_exhausted = (
+                attempts >= 3 and existing["status"] != "completed"
+            )
+            if not retryable or retry_budget_exhausted:
                 raise HTTPException(
                     status_code=409,
                     detail=(
                         "Telegram update retry budget exhausted"
-                        if attempts >= 3 and retryable
+                        if retry_budget_exhausted
                         else "Telegram update was already processed"
                     ),
                 )
             claimed = conn.execute(
                 """
                 UPDATE telegram_updates
-                SET status = 'processing', attempt_count = attempt_count + 1,
+                SET status = 'processing',
+                    attempt_count = CASE
+                        WHEN status = 'completed' THEN attempt_count
+                        ELSE attempt_count + 1
+                    END,
                     lease_token = ?, last_error = NULL, updated_at = ?
                 WHERE realm_id = ? AND update_id = ?
                   AND payload_sha256 = ? AND status = ? AND attempt_count = ?
@@ -1227,6 +1285,8 @@ def _telegram_session(request: Request, payload: TelegramSessionRequest) -> Tele
             detail="Telegram update processing lease was superseded",
         )
     return TelegramSessionResponse(
+        realm_id=realm_id,
+        bot_id=bot_id,
         session_token=str(session["session_token"]),
         session_id=str(session["session_id"]),
         expires_at=str(session["expires_at"]),

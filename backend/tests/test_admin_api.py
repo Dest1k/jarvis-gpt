@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import pytest
 from jarvis_gpt.api import app
@@ -9,6 +10,7 @@ from jarvis_gpt.authorization import (
     AuthorizationError,
     current_actor,
 )
+from jarvis_gpt.telegram_bridge import TelegramConversationStore
 from starlette.testclient import TestClient
 
 BRIDGE_SECRET = "bridge-test-secret-with-at-least-32-chars"
@@ -20,7 +22,6 @@ def client(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
     monkeypatch.setenv("JARVIS_AUTONOMY_ENABLED", "0")
     monkeypatch.setenv("JARVIS_TELEGRAM_BRIDGE_SECRET", BRIDGE_SECRET)
-    monkeypatch.setenv("JARVIS_TELEGRAM_REALM_ID", "test-bot")
     # The restricted CI sandbox cannot create the Linux abstract UNIX socket used by
     # the production single-primary lease. Lease semantics have their own test module.
     monkeypatch.setattr("jarvis_gpt.api.PrimaryRuntimeLease.acquire", lambda _self: None)
@@ -34,11 +35,16 @@ def _register_telegram_user(
     *,
     update_id: int = 1,
     telegram_user_id: int = 424242,
+    bot_id: int = 700001,
+    realm_id: str | None = None,
 ) -> dict:
+    realm_id = realm_id or f"telegram:{bot_id}"
     response = client.post(
         "/api/integrations/telegram/session",
         headers={"X-Jarvis-Bridge-Secret": BRIDGE_SECRET},
         json={
+            "realm_id": realm_id,
+            "bot_id": bot_id,
             "update_id": update_id,
             "telegram_user": {
                 "id": telegram_user_id,
@@ -56,6 +62,331 @@ def _register_telegram_user(
     )
     assert response.status_code == 200, response.text
     return response.json()
+
+
+def _seed_legacy_telegram_history(
+    *,
+    chat_id: int,
+    conversation_id: str,
+    access_mode: str,
+) -> TelegramConversationStore:
+    store = TelegramConversationStore(
+        app.state.storage.database_path,
+        realm_id="telegram:700001",
+    )
+    now = datetime.now(UTC).isoformat(timespec="seconds")
+    with app.state.storage.transaction(immediate=True) as conn:
+        conn.execute(
+            """
+            INSERT INTO conversations(id, title, created_at, updated_at, user_id)
+            VALUES (?, 'Legacy Telegram', ?, ?, ?)
+            """,
+            (conversation_id, now, now, LEGACY_OWNER_USER_ID),
+        )
+        conn.execute(
+            """
+            INSERT INTO messages(
+                id, conversation_id, role, content, metadata, created_at, user_id
+            ) VALUES (?, ?, 'user', 'legacy private history', '{}', ?, ?)
+            """,
+            (
+                f"msg_{chat_id}",
+                conversation_id,
+                now,
+                LEGACY_OWNER_USER_ID,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO reminders(
+                id, created_at, updated_at, text, due_at, status,
+                conversation_id, source_text, payload, user_id
+            ) VALUES (?, ?, ?, 'legacy reminder', ?, 'pending', ?, '', '{}', ?)
+            """,
+            (
+                f"rem_{chat_id}",
+                now,
+                now,
+                now,
+                conversation_id,
+                LEGACY_OWNER_USER_ID,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO learning_observations(
+                id, ts, kind, conversation_id, content, payload, user_id
+            ) VALUES (?, ?, 'conversation', ?, 'legacy observation', '{}', ?)
+            """,
+            (
+                f"learn_{chat_id}",
+                now,
+                conversation_id,
+                LEGACY_OWNER_USER_ID,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO telegram_conversations(
+                realm_id, chat_id, conversation_id, access_mode, user_id
+            ) VALUES ('telegram:700001', ?, ?, ?, NULL)
+            """,
+            (chat_id, conversation_id, access_mode),
+        )
+    return store
+
+
+@pytest.mark.parametrize("legacy_access_mode", ["owner", "guest"])
+def test_first_telegram_registration_claims_history_without_trusting_legacy_mode(
+    client,
+    monkeypatch,
+    legacy_access_mode,
+):
+    async def guest_completion(*_args, **_kwargs):
+        return SimpleNamespace(ok=True, content="guest migration reply", error=None)
+
+    monkeypatch.setattr(app.state.agent.llm, "complete", guest_completion)
+    chat_id = 810001 if legacy_access_mode == "owner" else 810002
+    conversation_id = f"legacy_{legacy_access_mode}_conversation"
+    store = _seed_legacy_telegram_history(
+        chat_id=chat_id,
+        conversation_id=conversation_id,
+        access_mode=legacy_access_mode,
+    )
+
+    registered = _register_telegram_user(
+        client,
+        update_id=810000 + chat_id,
+        telegram_user_id=chat_id,
+    )
+    user_id = str(registered["user"]["id"])
+
+    assert user_id != LEGACY_OWNER_USER_ID
+    assert registered["user"]["preset_key"] == "guest"
+    assert (
+        store.get_or_create(chat_id, "guest", user_id=user_id)
+        == conversation_id
+    )
+    history = client.get(
+        f"/api/conversations/{conversation_id}/messages",
+        headers={"X-Jarvis-User-Session": registered["session_token"]},
+    )
+    assert history.status_code == 200, history.text
+    assert [item["content"] for item in history.json()] == ["legacy private history"]
+
+    first_turn = client.post(
+        "/api/chat",
+        headers={"X-Jarvis-User-Session": registered["session_token"]},
+        json={
+            "message": "first turn after legacy migration",
+            "conversation_id": conversation_id,
+        },
+    )
+    assert first_turn.status_code == 200, first_turn.text
+    assert first_turn.json()["conversation_id"] == conversation_id
+
+    # A bridge restart reconstructs its hot cache from the durable binding.  The next
+    # authenticated update must still use the claimed conversation, not mint a guest one.
+    restarted_store = TelegramConversationStore(
+        app.state.storage.database_path,
+        realm_id="telegram:700001",
+    )
+    assert (
+        restarted_store.get_or_create(chat_id, "guest", user_id=user_id)
+        == conversation_id
+    )
+    registered_after_restart = _register_telegram_user(
+        client,
+        update_id=1_700_000 + chat_id,
+        telegram_user_id=chat_id,
+    )
+    second_turn = client.post(
+        "/api/chat",
+        headers={
+            "X-Jarvis-User-Session": registered_after_restart["session_token"]
+        },
+        json={
+            "message": "turn after bridge restart",
+            "conversation_id": restarted_store.get_or_create(
+                chat_id,
+                "guest",
+                user_id=user_id,
+            ),
+        },
+    )
+    assert second_turn.status_code == 200, second_turn.text
+    assert second_turn.json()["conversation_id"] == conversation_id
+
+    with app.state.storage.locked_connection() as conn:
+        owners = {
+            table: conn.execute(
+                f'SELECT DISTINCT user_id FROM "{table}" WHERE '
+                + (
+                    "id = ?"
+                    if table == "conversations"
+                    else "conversation_id = ?"
+                ),
+                (conversation_id,),
+            ).fetchall()
+            for table in (
+                "conversations",
+                "messages",
+                "reminders",
+                "learning_observations",
+            )
+        }
+        binding = conn.execute(
+            """
+            SELECT user_id, access_mode FROM telegram_conversations
+            WHERE realm_id = 'telegram:700001' AND chat_id = ?
+            """,
+            (chat_id,),
+        ).fetchone()
+        user_conversation_ids = {
+            str(row["id"])
+            for row in conn.execute(
+                "SELECT id FROM conversations WHERE user_id = ?",
+                (user_id,),
+            ).fetchall()
+        }
+    assert {
+        table: {str(row["user_id"]) for row in rows}
+        for table, rows in owners.items()
+    } == {
+        "conversations": {user_id},
+        "messages": {user_id},
+        "reminders": {user_id},
+        "learning_observations": {user_id},
+    }
+    assert dict(binding) == {"user_id": user_id, "access_mode": "guest"}
+    assert user_conversation_ids == {conversation_id}
+
+
+def test_same_telegram_user_id_is_isolated_across_canonical_bot_realms(client):
+    first = _register_telegram_user(
+        client,
+        update_id=900001,
+        telegram_user_id=919191,
+        bot_id=700001,
+    )
+    second = _register_telegram_user(
+        client,
+        update_id=900001,
+        telegram_user_id=919191,
+        bot_id=700002,
+    )
+    first_again = _register_telegram_user(
+        client,
+        update_id=900002,
+        telegram_user_id=919191,
+        bot_id=700001,
+    )
+
+    assert first["user"]["id"] != second["user"]["id"]
+    assert first_again["user"]["id"] == first["user"]["id"]
+    with app.state.storage.locked_connection() as conn:
+        realms = conn.execute(
+            "SELECT realm_id, bot_id FROM telegram_realms ORDER BY bot_id"
+        ).fetchall()
+        identities = conn.execute(
+            """
+            SELECT realm_id, user_id FROM external_identities
+            WHERE provider = 'telegram' AND provider_subject_id = '919191'
+            ORDER BY realm_id
+            """
+        ).fetchall()
+    assert [dict(row) for row in realms] == [
+        {"realm_id": "telegram:700001", "bot_id": 700001},
+        {"realm_id": "telegram:700002", "bot_id": 700002},
+    ]
+    assert len({str(row["user_id"]) for row in identities}) == 2
+
+
+def test_backend_rejects_noncanonical_bridge_realm_before_persisting_identity(client):
+    response = client.post(
+        "/api/integrations/telegram/session",
+        headers={"X-Jarvis-Bridge-Secret": BRIDGE_SECRET},
+        json={
+            "realm_id": "telegram:700002",
+            "bot_id": 700001,
+            "update_id": 700001,
+            "telegram_user": {"id": 717171, "is_bot": False},
+            "chat": {"id": 717171, "type": "private"},
+        },
+    )
+
+    assert response.status_code == 409, response.text
+    with app.state.storage.locked_connection() as conn:
+        assert conn.execute("SELECT 1 FROM telegram_realms").fetchone() is None
+        assert conn.execute("SELECT 1 FROM telegram_updates").fetchone() is None
+        assert conn.execute(
+            "SELECT 1 FROM external_identities WHERE provider = 'telegram'"
+        ).fetchone() is None
+
+
+def test_legacy_history_claim_rolls_back_on_foreign_tenant_owner(client):
+    foreign = app.state.authorization.upsert_external_identity(
+        provider="test",
+        realm_id="foreign-owner",
+        provider_subject_id="foreign-owner",
+        bootstrap_preset="guest",
+    )
+    foreign_user_id = str(foreign["user_id"])
+    store = TelegramConversationStore(
+        app.state.storage.database_path,
+        realm_id="telegram:700001",
+    )
+    now = datetime.now(UTC).isoformat(timespec="seconds")
+    with app.state.storage.transaction(immediate=True) as conn:
+        conn.execute(
+            """
+            INSERT INTO conversations(id, title, created_at, updated_at, user_id)
+            VALUES ('foreign-history', 'Foreign', ?, ?, ?)
+            """,
+            (now, now, foreign_user_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO telegram_conversations(
+                realm_id, chat_id, conversation_id, access_mode, user_id
+            ) VALUES ('telegram:700001', 818181, 'foreign-history', 'guest', NULL)
+            """
+        )
+
+    response = client.post(
+        "/api/integrations/telegram/session",
+        headers={"X-Jarvis-Bridge-Secret": BRIDGE_SECRET},
+        json={
+            "realm_id": "telegram:700001",
+            "bot_id": 700001,
+            "update_id": 818181,
+            "telegram_user": {"id": 818181, "is_bot": False},
+            "chat": {"id": 818181, "type": "private"},
+        },
+    )
+
+    assert response.status_code == 403, response.text
+    with app.state.storage.locked_connection() as conn:
+        identity = conn.execute(
+            """
+            SELECT 1 FROM external_identities
+            WHERE provider = 'telegram' AND realm_id = 'telegram:700001'
+              AND provider_subject_id = '818181'
+            """
+        ).fetchone()
+        binding = conn.execute(
+            """
+            SELECT user_id FROM telegram_conversations
+            WHERE realm_id = 'telegram:700001' AND chat_id = 818181
+            """
+        ).fetchone()
+        owner = conn.execute(
+            "SELECT user_id FROM conversations WHERE id = 'foreign-history'"
+        ).fetchone()
+    assert identity is None
+    assert binding["user_id"] is None
+    assert owner["user_id"] == foreign_user_id
+    assert store.load_all()[818181] == "foreign-history"
 
 
 def test_telegram_sessions_isolate_memory_preferences_persona_and_files(client):
@@ -168,6 +499,8 @@ def test_telegram_registration_creates_scoped_session_and_denies_admin(client):
         "/api/integrations/telegram/session",
         headers={"X-Jarvis-Bridge-Secret": "wrong-secret"},
         json={
+            "realm_id": "telegram:700001",
+            "bot_id": 700001,
             "update_id": 1,
             "telegram_user": {"id": 424242, "is_bot": False},
             "chat": {"id": 424242, "type": "private"},
@@ -418,11 +751,13 @@ def test_admin_approval_is_invalidated_when_target_policy_state_changes(client):
 
 
 def test_telegram_update_retry_is_idempotent_but_cannot_change_identity(client):
-    _register_telegram_user(client, update_id=10)
+    registered = _register_telegram_user(client, update_id=10)
     identical_replay = client.post(
         "/api/integrations/telegram/session",
         headers={"X-Jarvis-Bridge-Secret": BRIDGE_SECRET},
         json={
+            "realm_id": "telegram:700001",
+            "bot_id": 700001,
             "update_id": 10,
             "telegram_user": {
                 "id": 424242,
@@ -437,10 +772,38 @@ def test_telegram_update_retry_is_idempotent_but_cannot_change_identity(client):
     assert identical_replay.status_code == 200
     assert identical_replay.json()["user"]["id"]
 
+    # Session registration is not the agent turn. Exact completed replays remain
+    # available while a model/container outage is retried by the durable bridge.
+    for _ in range(4):
+        identical_replay = client.post(
+            "/api/integrations/telegram/session",
+            headers={
+                "X-Jarvis-Bridge-Secret": BRIDGE_SECRET,
+                "X-Jarvis-User-Session": registered["session_token"],
+            },
+            json={
+                "realm_id": "telegram:700001",
+                "bot_id": 700001,
+                "update_id": 10,
+                "telegram_user": {
+                    "id": 424242,
+                    "is_bot": False,
+                    "username": "secure_user",
+                    "first_name": "Secure",
+                    "language_code": "en",
+                },
+                "chat": {"id": 424242, "type": "private"},
+            },
+        )
+        assert identical_replay.status_code == 200
+        assert identical_replay.json()["session_token"] == registered["session_token"]
+
     replay = client.post(
         "/api/integrations/telegram/session",
         headers={"X-Jarvis-Bridge-Secret": BRIDGE_SECRET},
         json={
+            "realm_id": "telegram:700001",
+            "bot_id": 700001,
             "update_id": 10,
             "telegram_user": {"id": 999999, "is_bot": False},
             "chat": {"id": 999999, "type": "private"},
@@ -462,7 +825,7 @@ def test_stale_telegram_attempt_cannot_finalize_after_lease_is_reclaimed(
                 """
                 UPDATE telegram_updates
                 SET lease_token = ?, attempt_count = attempt_count + 1, updated_at = ?
-                WHERE realm_id = 'test-bot' AND update_id = 11
+                WHERE realm_id = 'telegram:700001' AND update_id = 11
                   AND status = 'processing'
                 """,
                 (newer_lease, datetime.now(UTC).isoformat(timespec="seconds")),
@@ -475,6 +838,8 @@ def test_stale_telegram_attempt_cannot_finalize_after_lease_is_reclaimed(
         "/api/integrations/telegram/session",
         headers={"X-Jarvis-Bridge-Secret": BRIDGE_SECRET},
         json={
+            "realm_id": "telegram:700001",
+            "bot_id": 700001,
             "update_id": 11,
             "telegram_user": {"id": 424243, "is_bot": False},
             "chat": {"id": 424243, "type": "private"},
@@ -487,14 +852,14 @@ def test_stale_telegram_attempt_cannot_finalize_after_lease_is_reclaimed(
         ledger = conn.execute(
             """
             SELECT status, attempt_count, lease_token
-            FROM telegram_updates WHERE realm_id = 'test-bot' AND update_id = 11
+            FROM telegram_updates WHERE realm_id = 'telegram:700001' AND update_id = 11
             """
         ).fetchone()
         active_sessions = conn.execute(
             """
             SELECT COUNT(*) AS count FROM user_sessions s
             JOIN external_identities ei ON ei.user_id = s.user_id
-            WHERE ei.provider = 'telegram' AND ei.realm_id = 'test-bot'
+            WHERE ei.provider = 'telegram' AND ei.realm_id = 'telegram:700001'
               AND ei.provider_subject_id = '424243' AND s.revoked_at IS NULL
             """
         ).fetchone()["count"]
@@ -519,7 +884,7 @@ def test_losing_telegram_attempt_cannot_overwrite_newer_completion(client, monke
                 UPDATE telegram_updates
                 SET lease_token = ?, attempt_count = attempt_count + 1,
                     status = 'completed', user_id = ?, updated_at = ?
-                WHERE realm_id = 'test-bot' AND update_id = 12
+                WHERE realm_id = 'telegram:700001' AND update_id = 12
                   AND status = 'processing'
                 """,
                 (
@@ -536,6 +901,8 @@ def test_losing_telegram_attempt_cannot_overwrite_newer_completion(client, monke
         "/api/integrations/telegram/session",
         headers={"X-Jarvis-Bridge-Secret": BRIDGE_SECRET},
         json={
+            "realm_id": "telegram:700001",
+            "bot_id": 700001,
             "update_id": 12,
             "telegram_user": {"id": 424244, "is_bot": False},
             "chat": {"id": 424244, "type": "private"},
@@ -547,7 +914,7 @@ def test_losing_telegram_attempt_cannot_overwrite_newer_completion(client, monke
         ledger = conn.execute(
             """
             SELECT status, attempt_count, lease_token, last_error
-            FROM telegram_updates WHERE realm_id = 'test-bot' AND update_id = 12
+            FROM telegram_updates WHERE realm_id = 'telegram:700001' AND update_id = 12
             """
         ).fetchone()
     assert dict(ledger) == {
@@ -567,6 +934,8 @@ def test_telegram_bridge_reuses_valid_scoped_session_without_row_growth(client):
             "X-Jarvis-User-Session": first["session_token"],
         },
         json={
+            "realm_id": "telegram:700001",
+            "bot_id": 700001,
             "update_id": 21,
             "telegram_user": {
                 "id": 424242,
@@ -601,6 +970,8 @@ def test_telegram_ingress_and_scoped_api_are_rate_limited(client, monkeypatch):
         "/api/integrations/telegram/session",
         headers={"X-Jarvis-Bridge-Secret": BRIDGE_SECRET},
         json={
+            "realm_id": "telegram:700001",
+            "bot_id": 700001,
             "update_id": 102,
             "telegram_user": {"id": 424242, "is_bot": False},
             "chat": {"id": 424242, "type": "private"},

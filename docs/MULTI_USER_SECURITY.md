@@ -68,6 +68,7 @@ The IAM tables are stored in the same SQLite database as the current runtime:
 | `user_sessions` | Random session tokens stored only as SHA-256 digests, with expiry and revocation. |
 | `authorization_decisions` | Allow/deny decision trail, policy version, source, request context, and hashed resource reference. |
 | `security_audit_log` | Administrative mutations with actor, target, reason, and before/after JSON. |
+| `telegram_realms` | Persistent one-to-one binding between a canonical realm and immutable bot ID. |
 | `telegram_updates` | Telegram replay ledger keyed by bot realm/update with bounded attempts and CAS lease tokens. |
 | `ingress_rate_limits` | Hashed per-principal/global fixed-window ingress budgets. |
 | `iam_migrations` | Idempotent schema and capability-catalog migration markers. |
@@ -139,8 +140,20 @@ small `TENANT_SAFE_TOOL_SECURITY_IDS` allowlist is seeded for ordinary users.
 
 The Telegram bridge accepts only messages where the sender is a real user, the chat is
 private, and `chat.id == from.id`. The immutable numeric Telegram user ID—not username or
-display name—is the identity key. `JARVIS_TELEGRAM_REALM_ID` must be stable and unique per
-bot so the same numeric account on different bot realms is not conflated.
+display name—is the identity key. The bridge derives a stable canonical realm
+`telegram:<bot-id>` from the positive immutable bot id returned by Telegram `getMe`.
+The backend independently validates that derivation, and the database permanently binds one
+realm to one bot id (and vice versa). Optional `JARVIS_TELEGRAM_REALM_ID` and
+`JARVIS_TELEGRAM_BOT_ID` values are standalone fail-closed assertions, not identity inputs.
+Realm-less legacy history has no trustworthy bot provenance. After verifying the destination
+bot with Telegram `getMe`, the operator must set `JARVIS_TELEGRAM_LEGACY_REALM_ID` to that
+canonical realm explicitly. The Windows launcher never derives this migration authority from
+the currently configured bot token and refuses to start the bridge while the mapping is absent.
+If the old store already used a non-default realm, the operator must also set
+`JARVIS_TELEGRAM_LEGACY_SOURCE_REALM_ID` to that exact old realm. The bridge migrates all
+realm-scoped conversation, inbox, replay-ledger, migration-marker, and Telegram-identity rows
+in one transaction; it rejects a missing source, a source equal to the destination, and mixed
+source/canonical state.
 
 For every accepted update, the bridge calls:
 
@@ -148,15 +161,22 @@ For every accepted update, the bridge calls:
 
 The backend atomically rejects mismatched `(realm_id, update_id)` replays and bounds exact
 retry attempts, upserts the external identity and profile metadata, auto-creates an active
-`guest` user when needed, and returns a short-lived random session. Only the token digest is persisted. The
+`guest` user when needed, and returns a short-lived random session. A one-time legacy
+binding claim moves its conversation, messages, reminders, and learning observations to the
+new IAM tenant in the same transaction. The legacy `access_mode` is only a conversation-cache
+hint and never grants IAM authority; elevated rights must be restored explicitly by an admin.
+Only the token digest is persisted. The
 bridge sends the token in `X-Jarvis-User-Session` for the user's API operations. Suspended or
 deleted users cannot obtain or use sessions.
 
 Processing attempts use compare-and-swap lease tokens, so a stale retry cannot overwrite a
 newer result or publish its session. The bridge persists accepted updates before advancing
 Telegram's polling offset, isolates conversation bindings by bot realm, and retries the same
-transport request ID idempotently after a crash. Transient backend failures use bounded
-2/10-second backoff and stop after three attempts instead of creating a tight retry loop.
+transport request ID idempotently after a crash. Ordinary HTTP/payload failures use 2/10-second
+backoff and stop after three attempts. A transport failure, or a backend `503` explicitly marked
+`X-Jarvis-Retry-Class: llm-outage`, uses 2/10/30/60/300-second backoff for at most 288 attempts
+and 24 hours. An exhausted outage row remains durable for diagnosis but stops blocking later
+updates from the same chat; an unmarked `5xx` never receives the extended budget.
 
 `TELEGRAM_ALLOWED_CHAT_IDS` is an optional deployment restriction; an empty value allows
 every valid private Telegram user to register. `TELEGRAM_OWNER_CHAT_IDS` is compatibility

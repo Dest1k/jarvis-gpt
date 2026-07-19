@@ -253,6 +253,54 @@ def test_direct_route_creates_bounded_watch_before_one_shot_capture(monkeypatch,
     storage.close()
 
 
+def test_screen_watch_exact_transport_retry_creates_one_reminder(monkeypatch, tmp_path):
+    settings, storage = _settings_storage(
+        monkeypatch,
+        tmp_path,
+        env={"JARVIS_OPERATOR_FULL_AUTONOMY": "1"},
+    )
+    agent = AgentRuntime(settings=settings, storage=storage, llm=_VisionLLM())
+    message = "Следи за экраном и скажи когда появится окно Успех"
+
+    first = asyncio.run(
+        agent.chat(message, transport_request_id="telegram:700001:watch-1")
+    )
+    retry = asyncio.run(
+        agent.chat(
+            message,
+            conversation_id=first.conversation_id,
+            transport_request_id="telegram:700001:watch-1",
+        )
+    )
+
+    reminders = [
+        item
+        for item in storage.list_reminders(status="pending", limit=1000)
+        if isinstance(item.get("payload"), dict)
+        and item["payload"].get("kind") == "screen_watch"
+    ]
+    assert len(reminders) == 1
+    assert reminders[0]["payload"].get("operator_effect_key")
+    assert retry.answer == first.answer
+    assert any(event.title == "Idempotent response replay" for event in retry.events)
+
+    asyncio.run(
+        agent.chat(
+            message,
+            conversation_id=first.conversation_id,
+            transport_request_id="telegram:700001:watch-2",
+        )
+    )
+    reminders = [
+        item
+        for item in storage.list_reminders(status="pending", limit=1000)
+        if isinstance(item.get("payload"), dict)
+        and item["payload"].get("kind") == "screen_watch"
+    ]
+    assert len(reminders) == 2
+    storage.close()
+
+
 def test_watch_phrasing_is_an_explicit_operator_capture_command():
     scopes = _operator_action_scopes(
         "Следи за экраном и скажи, когда появится окно Успех"

@@ -26,6 +26,7 @@ class LLMResult:
     error: str | None = None
     raw: dict[str, Any] | None = None
     preempted: bool = False
+    failure_scope: Literal["service", "request"] | None = None
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,7 @@ class LLMStreamChunk:
     finish_reason: str | None = None
     raw: dict[str, Any] | None = None
     preempted: bool = False
+    failure_scope: Literal["service", "request"] | None = None
 
 
 LLMPriority = Literal["foreground", "background"]
@@ -351,7 +353,12 @@ class LLMRouter:
         thinking_enabled: bool = True,
     ) -> LLMResult:
         if not self.settings.llm_enabled:
-            return LLMResult(ok=False, content="", error="LLM router is disabled")
+            return LLMResult(
+                ok=False,
+                content="",
+                error="LLM router is disabled",
+                failure_scope="service",
+            )
 
         messages = _system_first(messages)
         request_temperature = (
@@ -383,7 +390,12 @@ class LLMRouter:
                 if _is_transient_llm_error(exc) and attempt < _LLM_MAX_ATTEMPTS:
                     transient_error = exc
                 else:
-                    return LLMResult(ok=False, content="", error=_exc_message(exc))
+                    return LLMResult(
+                        ok=False,
+                        content="",
+                        error=_exc_message(exc),
+                        failure_scope=_llm_failure_scope(exc),
+                    )
             finally:
                 await self._release_admission(lease)
             if preempted:
@@ -397,7 +409,13 @@ class LLMRouter:
         assert data is not None
         choices = data.get("choices") or []
         if not choices:
-            return LLMResult(ok=False, content="", error="LLM response has no choices", raw=data)
+            return LLMResult(
+                ok=False,
+                content="",
+                error="LLM response has no choices",
+                raw=data,
+                failure_scope="request",
+            )
         content = (choices[0].get("message") or {}).get("content") or ""
         content = content.strip()
         if detect_repeated_token_degeneration(content):
@@ -410,6 +428,7 @@ class LLMRouter:
                     "and must not be reported as ready."
                 ),
                 raw=data,
+                failure_scope="request",
             )
         return LLMResult(ok=True, content=content, raw=data)
 
@@ -423,7 +442,11 @@ class LLMRouter:
         include_usage: bool = False,
     ) -> AsyncIterator[LLMStreamChunk]:
         if not self.settings.llm_enabled:
-            yield LLMStreamChunk(kind="error", error="LLM router is disabled")
+            yield LLMStreamChunk(
+                kind="error",
+                error="LLM router is disabled",
+                failure_scope="service",
+            )
             return
 
         messages = _system_first(messages)
@@ -479,7 +502,11 @@ class LLMRouter:
                     await asyncio.sleep(_llm_retry_delay(error, attempt))
                     attempt += 1
                     continue
-                yield LLMStreamChunk(kind="error", error=_exc_message(error))
+                yield LLMStreamChunk(
+                    kind="error",
+                    error=_exc_message(error),
+                    failure_scope=_llm_failure_scope(error),
+                )
                 return
             # Release the background lease before exposing buffered output. A
             # slow nested consumer must never hold up newly arrived foreground
@@ -658,6 +685,12 @@ def _is_transient_llm_error(exc: Exception) -> bool:
         return False
     status_code = exc.response.status_code
     return status_code in {408, 429} or 500 <= status_code <= 599
+
+
+def _llm_failure_scope(exc: Exception) -> Literal["service", "request"]:
+    """Keep exhausted retry classification consistent with the retry predicate."""
+
+    return "service" if _is_transient_llm_error(exc) else "request"
 
 
 def _llm_retry_delay(exc: Exception, attempt: int) -> float:

@@ -460,6 +460,13 @@ CREATE TABLE IF NOT EXISTS telegram_updates (
     PRIMARY KEY(realm_id, update_id)
 );
 
+CREATE TABLE IF NOT EXISTS telegram_realms (
+    realm_id TEXT PRIMARY KEY,
+    bot_id INTEGER NOT NULL UNIQUE CHECK(bot_id > 0),
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS ingress_rate_limits (
     scope TEXT NOT NULL,
     subject_hash TEXT NOT NULL,
@@ -1105,6 +1112,15 @@ class AuthorizationService:
             raise ValueError("Unknown bootstrap preset")
         now = _now()
         with self.storage.transaction(immediate=True) as conn:
+            telegram_binding = (
+                self._telegram_conversation_binding(
+                    conn,
+                    realm_id=realm_id,
+                    provider_subject_id=subject,
+                )
+                if provider == "telegram"
+                else None
+            )
             identity = conn.execute(
                 """
                 SELECT ei.*, u.status, u.policy_epoch
@@ -1116,20 +1132,36 @@ class AuthorizationService:
             ).fetchone()
             created = identity is None
             if created:
-                user_id = str(uuid.uuid4())
                 identity_id = _new_id("identity")
-                display_name = " ".join(
-                    part for part in (first_name or "", last_name or "") if part
-                ).strip()[:160]
-                conn.execute(
-                    """
-                    INSERT INTO users(
-                        id, status, display_name, locale, policy_epoch, created_at,
-                        updated_at, first_seen_at, last_seen_at
-                    ) VALUES (?, 'active', ?, ?, 1, ?, ?, ?, ?)
-                    """,
-                    (user_id, display_name, (locale or "")[:32], now, now, now, now),
+                bound_user_id = (
+                    str(telegram_binding["user_id"] or "").strip()
+                    if telegram_binding is not None
+                    else ""
                 )
+                if bound_user_id:
+                    bound_user = conn.execute(
+                        "SELECT id, status FROM users WHERE id = ?",
+                        (bound_user_id,),
+                    ).fetchone()
+                    if bound_user is None:
+                        raise AuthorizationError(
+                            "Telegram conversation binding references an unknown user"
+                        )
+                    user_id = bound_user_id
+                else:
+                    user_id = str(uuid.uuid4())
+                    display_name = " ".join(
+                        part for part in (first_name or "", last_name or "") if part
+                    ).strip()[:160]
+                    conn.execute(
+                        """
+                        INSERT INTO users(
+                            id, status, display_name, locale, policy_epoch, created_at,
+                            updated_at, first_seen_at, last_seen_at
+                        ) VALUES (?, 'active', ?, ?, 1, ?, ?, ?, ?)
+                        """,
+                        (user_id, display_name, (locale or "")[:32], now, now, now, now),
+                    )
                 conn.execute(
                     """
                     INSERT INTO external_identities(
@@ -1151,22 +1183,28 @@ class AuthorizationService:
                         now,
                     ),
                 )
-                preset_key = bootstrap_preset or DEFAULT_PRESET_KEY
-                conn.execute(
-                    """
-                    INSERT INTO user_preset_assignments(
-                        id, user_id, preset_id, assigned_by, assigned_at, reason
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        _new_id("assignment"),
-                        user_id,
-                        f"preset_{preset_key}",
-                        LEGACY_OWNER_USER_ID,
-                        now,
-                        f"Automatic {provider} registration",
-                    ),
-                )
+                if not bound_user_id:
+                    # The old bridge stored ``access_mode`` as a conversation-cache
+                    # hint.  It is not an IAM grant and older schemas even defaulted a
+                    # missing value to ``owner`` during import.  New identities must
+                    # therefore start from the normal least-privilege bootstrap; an
+                    # operator restores elevated rights explicitly through IAM.
+                    preset_key = bootstrap_preset or DEFAULT_PRESET_KEY
+                    conn.execute(
+                        """
+                        INSERT INTO user_preset_assignments(
+                            id, user_id, preset_id, assigned_by, assigned_at, reason
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            _new_id("assignment"),
+                            user_id,
+                            f"preset_{preset_key}",
+                            LEGACY_OWNER_USER_ID,
+                            now,
+                            f"Automatic {provider} registration",
+                        ),
+                    )
             else:
                 user_id = str(identity["user_id"])
                 identity_id = str(identity["id"])
@@ -1190,6 +1228,13 @@ class AuthorizationService:
                     "UPDATE users SET last_seen_at = ?, updated_at = ? WHERE id = ?",
                     (now, now, user_id),
                 )
+            if telegram_binding is not None:
+                self._claim_telegram_conversation_binding(
+                    conn,
+                    binding=telegram_binding,
+                    user_id=user_id,
+                    now=now,
+                )
             row = conn.execute(
                 """
                 SELECT u.id AS user_id, u.status, u.policy_epoch, ei.id AS identity_id,
@@ -1204,6 +1249,156 @@ class AuthorizationService:
                 (user_id, identity_id),
             ).fetchone()
         return {**dict(row), "created": created}
+
+    @staticmethod
+    def _telegram_conversation_binding(
+        conn: sqlite3.Connection,
+        *,
+        realm_id: str,
+        provider_subject_id: str,
+    ) -> sqlite3.Row | None:
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'telegram_conversations'"
+        ).fetchone()
+        if table is None:
+            return None
+        required = {
+            "realm_id",
+            "chat_id",
+            "conversation_id",
+            "access_mode",
+            "user_id",
+        }
+        if not required.issubset(_table_columns(conn, "telegram_conversations")):
+            raise AuthorizationError(
+                "Telegram conversation bindings must be migrated before registration"
+            )
+        try:
+            chat_id = int(provider_subject_id)
+        except ValueError as exc:
+            raise AuthorizationError("Telegram subject is not a numeric user id") from exc
+        row = conn.execute(
+            """
+            SELECT realm_id, chat_id, conversation_id, access_mode, user_id
+            FROM telegram_conversations
+            WHERE realm_id = ? AND chat_id = ?
+            """,
+            (realm_id, chat_id),
+        ).fetchone()
+        if row is not None and str(row["access_mode"]) not in {"owner", "guest"}:
+            raise AuthorizationError("Telegram conversation binding has an invalid mode")
+        return row
+
+    @staticmethod
+    def _active_preset_key(conn: sqlite3.Connection, user_id: str) -> str:
+        row = conn.execute(
+            """
+            SELECT p.preset_key
+            FROM user_preset_assignments upa
+            JOIN permission_presets p ON p.id = upa.preset_id
+            WHERE upa.user_id = ? AND upa.revoked_at IS NULL
+            """,
+            (user_id,),
+        ).fetchone()
+        if row is None:
+            raise AuthorizationError("Telegram identity has no active permission preset")
+        return str(row["preset_key"])
+
+    @classmethod
+    def _claim_telegram_conversation_binding(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        binding: sqlite3.Row,
+        user_id: str,
+        now: str,
+    ) -> None:
+        bound_user_id = str(binding["user_id"] or "").strip()
+        if bound_user_id and bound_user_id != user_id:
+            raise AuthorizationError(
+                "Telegram conversation binding belongs to another user"
+            )
+
+        preset_key = cls._active_preset_key(conn, user_id)
+        legacy_mode = str(binding["access_mode"])
+        conversation_id = str(binding["conversation_id"])
+        conversation = conn.execute(
+            "SELECT user_id FROM conversations WHERE id = ?",
+            (conversation_id,),
+        ).fetchone()
+        moved_rows: dict[str, int] = {}
+        if conversation is not None:
+            conversation_owner = str(conversation["user_id"])
+            if conversation_owner not in {LEGACY_OWNER_USER_ID, user_id}:
+                raise AuthorizationError(
+                    "Telegram conversation history belongs to another user"
+                )
+            for table in ("messages", "reminders", "learning_observations"):
+                if not {"conversation_id", "user_id"}.issubset(
+                    _table_columns(conn, table)
+                ):
+                    continue
+                foreign = conn.execute(
+                    f'SELECT 1 FROM "{table}" WHERE conversation_id = ? '
+                    "AND user_id NOT IN (?, ?) LIMIT 1",
+                    (conversation_id, LEGACY_OWNER_USER_ID, user_id),
+                ).fetchone()
+                if foreign is not None:
+                    raise AuthorizationError(
+                        "Telegram conversation dependencies belong to another user"
+                    )
+                cursor = conn.execute(
+                    f'UPDATE "{table}" SET user_id = ? '
+                    "WHERE conversation_id = ? AND user_id = ?",
+                    (user_id, conversation_id, LEGACY_OWNER_USER_ID),
+                )
+                moved_rows[table] = int(cursor.rowcount)
+            cursor = conn.execute(
+                "UPDATE conversations SET user_id = ? WHERE id = ? AND user_id = ?",
+                (user_id, conversation_id, LEGACY_OWNER_USER_ID),
+            )
+            moved_rows["conversations"] = int(cursor.rowcount)
+
+        access_mode = "owner" if preset_key == "owner" else "guest"
+        claimed = conn.execute(
+            """
+            UPDATE telegram_conversations
+            SET user_id = ?, access_mode = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE realm_id = ? AND chat_id = ?
+              AND (user_id IS NULL OR user_id = ?)
+            """,
+            (
+                user_id,
+                access_mode,
+                str(binding["realm_id"]),
+                int(binding["chat_id"]),
+                user_id,
+            ),
+        )
+        if claimed.rowcount != 1:
+            raise AuthorizationError("Telegram conversation binding claim was superseded")
+        if not bound_user_id:
+            cls.append_security_audit(
+                conn,
+                action="telegram.binding.migrate",
+                target_type="telegram_conversation",
+                target_id=conversation_id,
+                target_user_id=user_id,
+                reason="Claim legacy Telegram history for immutable identity",
+                before={
+                    "realm_id": str(binding["realm_id"]),
+                    "chat_id": int(binding["chat_id"]),
+                    "access_mode": legacy_mode,
+                    "user_id": None,
+                },
+                after={
+                    "access_mode": access_mode,
+                    "user_id": user_id,
+                    "moved_rows": moved_rows,
+                },
+                actor_user_id=LEGACY_OWNER_USER_ID,
+            )
 
     def create_user_session(
         self,

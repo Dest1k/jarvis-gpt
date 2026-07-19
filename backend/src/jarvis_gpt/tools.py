@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html import unescape
+from io import BytesIO
 from pathlib import Path, PureWindowsPath
 from typing import Any, Literal
 from urllib.parse import parse_qs, parse_qsl, quote_plus, unquote, urlencode, urljoin, urlparse
@@ -38,6 +39,7 @@ import httpcore
 import httpx
 from httpcore._backends.auto import AutoBackend
 from httpcore._backends.base import SOCKET_OPTION, AsyncNetworkBackend, AsyncNetworkStream
+from pypdf import PdfReader
 
 from . import sandbox, speech
 from .authorization import (
@@ -361,6 +363,9 @@ class ToolSpec:
     handler: ToolHandler
     danger_level: DangerLevel = "safe"
     security_id: str = ""
+    # Orthogonal to review risk: a "safe" call may still create durable state and
+    # therefore must participate in the exact-request effect ledger.
+    mutates_state: bool = False
 
     def __post_init__(self) -> None:
         expected = f"tool.{self.name}"
@@ -1095,6 +1100,7 @@ class ToolRegistry:
                 category="execution",
                 input_schema=_execution_session_tool_schema(),
                 handler=_execution_session,
+                mutates_state=True,
             )
         )
         self.add(
@@ -1220,6 +1226,7 @@ class ToolRegistry:
                 category="runtime",
                 input_schema={"persist": "Store snapshot in SQLite"},
                 handler=_telemetry_snapshot,
+                mutates_state=True,
             )
         )
         self.add(
@@ -1620,6 +1627,7 @@ class ToolRegistry:
                     "value": "The single learned fact, short and durable",
                 },
                 handler=_persona_insight,
+                mutates_state=True,
             )
         )
         self.add(
@@ -1665,6 +1673,7 @@ class ToolRegistry:
                     "prompt": "Optional: the action to run on schedule (forces a scheduled task)",
                 },
                 handler=_reminders_create,
+                mutates_state=True,
             )
         )
         self.add(
@@ -1693,6 +1702,7 @@ class ToolRegistry:
                     "match": "Text to match against pending reminders",
                 },
                 handler=_reminders_cancel,
+                mutates_state=True,
             )
         )
         self.add(
@@ -1893,6 +1903,7 @@ class ToolRegistry:
                     "output_name": "Optional output filename",
                 },
                 handler=_documents_edit,
+                mutates_state=True,
             )
         )
         self.add(
@@ -2341,6 +2352,7 @@ class ToolRegistry:
                     "pattern": "Optional regex; watch only the first match, not the whole page",
                 },
                 handler=_web_watch_add,
+                mutates_state=True,
             )
         )
         self.add(
@@ -2359,6 +2371,7 @@ class ToolRegistry:
                 category="web",
                 input_schema={"job_id": "Watch job id"},
                 handler=_web_watch_remove,
+                mutates_state=True,
             )
         )
         self.add(
@@ -2503,6 +2516,7 @@ class ToolRegistry:
                     "filename": "Optional quarantine filename",
                 },
                 handler=_web_download,
+                mutates_state=True,
             )
         )
         self.add(
@@ -4152,13 +4166,15 @@ async def _dispatcher_stop(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunRe
 
 async def _dispatcher_restart(ctx: ToolContext, _args: dict[str, Any]) -> ToolRunResponse:
     manager = DispatcherManager(ctx.settings)
-    down = await asyncio.to_thread(manager.run_compose, "down")
-    up = await asyncio.to_thread(manager.run_compose_verified, "up")
+    status = await asyncio.to_thread(manager.status)
+    container = status.get("container_status") if isinstance(status, dict) else None
+    expected_id = str(container.get("id") or "") if isinstance(container, dict) else ""
+    up = await asyncio.to_thread(manager.restart_verified, expected_id)
     return ToolRunResponse(
         tool="dispatcher.restart",
         ok=bool(up.get("ok")),
         summary=str(up.get("summary") or "Dispatcher restart requested."),
-        data={"down": down, "up": up},
+        data={"expected_container_id": expected_id, "restart": up},
     )
 
 
@@ -9017,6 +9033,45 @@ async def _targeted_shop_source(query: str) -> dict[str, Any] | None:
     return None
 
 
+async def _web_orchestrated_network_call(
+    orchestrator: WebOrchestrator,
+    operation: Literal["fetches", "renders"],
+    factory: Callable[[], Awaitable[ToolRunResponse]],
+    *,
+    max_chars: int,
+) -> ToolRunResponse:
+    """Reserve bounded response capacity before concurrent network I/O.
+
+    Accounting only after a download lets every parallel worker observe the same
+    remaining budget and collectively exceed it.  Reserve the HTML worst case first,
+    then atomically return only unused capacity after the bounded reader completes.
+    """
+
+    capacity = _web_response_byte_limit(max_chars, html_response=True)
+    await orchestrator.budget.reserve("network_bytes", capacity)
+    response: ToolRunResponse | None = None
+    actual = 0
+    try:
+        response = await orchestrator.run(operation, factory)
+        response_text = str((response.data or {}).get("text") or "")
+        cache = (response.data or {}).get("cache")
+        cache_hit = isinstance(cache, dict) and cache.get("hit") is True
+        actual = 0 if cache_hit else int(
+            (response.data or {}).get("bytes_read")
+            or len(response_text.encode("utf-8", errors="replace"))
+        )
+        actual = max(0, actual)
+        if actual > capacity:
+            await orchestrator.budget.reserve("network_bytes", actual - capacity)
+        return response
+    finally:
+        unused = max(0, capacity - min(actual, capacity))
+        if unused:
+            await asyncio.shield(
+                orchestrator.budget.release("network_bytes", unused)
+            )
+
+
 async def _web_research(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     query = " ".join(str(args.get("query") or "").split())
     claim = " ".join(str(args.get("claim") or "").split())
@@ -9109,7 +9164,8 @@ async def _web_research(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
 
         async def inspect_result(result: dict[str, Any]) -> dict[str, Any]:
             item_steps: list[dict[str, Any]] = []
-            fetched = await orchestrator.run(
+            fetched = await _web_orchestrated_network_call(
+                orchestrator,
                 "fetches",
                 lambda: _web_fetch(
                     ctx,
@@ -9119,13 +9175,10 @@ async def _web_research(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
                         "use_cache": use_cache,
                     },
                 ),
+                max_chars=max_chars,
             )
             fetched_text = (
                 str(fetched.data.get("text") or "") if isinstance(fetched.data, dict) else ""
-            )
-            await orchestrator.budget.reserve(
-                "network_bytes",
-                len(fetched_text.encode("utf-8", errors="replace")),
             )
             content_type = str(fetched.data.get("content_type") or "").lower()
             should_render = render_fallback and (
@@ -9135,7 +9188,8 @@ async def _web_research(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
             )
             if should_render:
                 try:
-                    rendered = await orchestrator.run(
+                    rendered = await _web_orchestrated_network_call(
+                        orchestrator,
                         "renders",
                         lambda: _web_render(
                             ctx,
@@ -9154,6 +9208,7 @@ async def _web_research(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
                                 ),
                             },
                         ),
+                        max_chars=max_chars,
                     )
                 except WebBudgetExceeded as exc:
                     orchestrator.budget.warn(str(exc))
@@ -9164,22 +9219,20 @@ async def _web_research(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
                     if rendered.ok and str(rendered.data.get("text") or "").strip():
                         fetched = rendered
                         fetched_text = str(rendered.data.get("text") or "")
-                        await orchestrator.budget.reserve(
-                            "network_bytes",
-                            len(fetched_text.encode("utf-8", errors="replace")),
-                        )
             if archive_fallback and (
                 not fetched.ok
                 or bool((fetched.data or {}).get("blocked"))
                 or bool((fetched.data or {}).get("consent_wall"))
             ):
                 try:
-                    archived = await orchestrator.run(
+                    archived = await _web_orchestrated_network_call(
+                        orchestrator,
                         "fetches",
                         lambda: _web_archive(
                             ctx,
                             {"url": result["url"], "max_chars": max_chars},
                         ),
+                        max_chars=max_chars,
                     )
                 except WebBudgetExceeded as exc:
                     orchestrator.budget.warn(str(exc))
@@ -9190,10 +9243,6 @@ async def _web_research(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
                     if archived.ok and str(archived.data.get("text") or "").strip():
                         fetched = archived
                         fetched_text = str(archived.data.get("text") or "")
-                        await orchestrator.budget.reserve(
-                            "network_bytes",
-                            len(fetched_text.encode("utf-8", errors="replace")),
-                        )
             item_steps.append(
                 {
                     "tool": fetched.tool,
@@ -9247,9 +9296,11 @@ async def _web_research(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
                     "fetched": fetched.ok,
                     "tool": fetched.tool,
                     "evidence_id": evidence_id or None,
-                    "excerpt": _short_text(
+                    "excerpt": _web_research_excerpt(
                         fetched_text or str(result.get("snippet") or ""),
-                        1800 if vertical == "shopping" else 900,
+                        query=query,
+                        claim=claim,
+                        limit=1800 if vertical == "shopping" else 900,
                     ),
                     "quality": _web_source_quality(final_url, fetched=fetched.ok),
                     "extraction": _compact_extraction(extraction),
@@ -9540,6 +9591,28 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
     evidence_ids: list[str] = []
     steps: list[dict[str, Any]] = []
 
+    if financial_market:
+        market_sources, market_steps = await _web_answer_financial_provider_sources(
+            ctx,
+            question=resolved_question,
+            orchestrator=orchestrator,
+        )
+        steps.extend(market_steps)
+        for source in market_sources:
+            url = str(source.get("url") or "")
+            if not url:
+                continue
+            sources_by_url[url] = source
+            evidence_id = str(source.get("evidence_id") or "")
+            if evidence_id and evidence_id not in evidence_ids:
+                evidence_ids.append(evidence_id)
+            supporting_evidence_ids = source.get("supporting_evidence_ids")
+            if isinstance(supporting_evidence_ids, list):
+                for supporting_id in supporting_evidence_ids:
+                    normalized_id = str(supporting_id or "").strip()
+                    if normalized_id and normalized_id not in evidence_ids:
+                        evidence_ids.append(normalized_id)
+
     active_queries = queries[:1] if orchestrator.mode is WebMode.FAST_FACT else queries[:4]
 
     async def research_query(item: tuple[int, str]) -> ToolRunResponse:
@@ -9688,6 +9761,12 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
             max_sources=max_sources,
             date_from=news_window[0],
             date_to=news_window[1],
+        )
+    elif financial_market:
+        ranked_sources = _web_answer_financial_balanced_sources(
+            resolved_question,
+            ranked_candidates,
+            max_sources=max_sources,
         )
     else:
         ranked_sources = _web_answer_diverse_sources(
@@ -10169,6 +10248,7 @@ async def _fetch_public_document(
                             "content_type": response.headers.get("content-type"),
                             "text": text,
                             "raw_text": raw_text,
+                            "bytes_read": len(raw_text.encode("utf-8", errors="replace")),
                             "truncated": truncated,
                             "redirects": redirects,
                             "blocked": blocked,
@@ -10310,6 +10390,7 @@ async def _web_fetch(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
                         "status_code": response.status_code,
                         "content_type": content_type,
                         "text": text,
+                        "bytes_read": len(raw_text.encode("utf-8", errors="replace")),
                         "truncated": truncated,
                         "redirects": redirects,
                         "safety": safety,
@@ -15561,6 +15642,837 @@ def _web_answer_financial_query_variant(question: str) -> str:
     return _web_answer_clean_query(f"{question} {suffix}")
 
 
+_WEB_ANSWER_YAHOO_CRUDE_QUOTES = {
+    "brent": {
+        "symbol": "BZ=F",
+        "label": "Brent Yahoo undated futures quote symbol",
+        "currency": "USD",
+        "timezone": "America/New_York",
+        "yahoo_exchange": "NYM",
+        "contract_code": "BZ",
+        "contract_spec_url": (
+            "https://www.cmegroup.com/markets/energy/crude-oil/"
+            "brent-crude-oil-last-day.contractSpecs.html"
+        ),
+        "contract_spec_fallback_url": (
+            "https://www.cftc.gov/filings/orgrules/"
+            "rule020217nymexdcm003.pdf"
+        ),
+        "cftc_product_name": "Brent Last Day Financial",
+    },
+    "wti": {
+        "symbol": "CL=F",
+        "label": "WTI Yahoo undated futures quote symbol",
+        "currency": "USD",
+        "timezone": "America/New_York",
+        "yahoo_exchange": "NYM",
+        "contract_code": "CL",
+        "contract_spec_url": (
+            "https://www.cmegroup.com/markets/energy/crude-oil/"
+            "light-sweet-crude.contractSpecs.html"
+        ),
+        "contract_spec_fallback_url": (
+            "https://www.cftc.gov/filings/orgrules/"
+            "rule020217nymexdcm003.pdf"
+        ),
+        "cftc_product_name": "Crude Oil",
+    },
+}
+
+_WEB_ANSWER_MIN_MARKET_QUOTE_EPOCH = 946_684_800.0  # 2000-01-01T00:00:00Z
+_WEB_ANSWER_MAX_MARKET_QUOTE_EPOCH = 4_102_444_800.0  # 2100-01-01T00:00:00Z
+_WEB_ANSWER_MAX_CRUDE_PRICE_USD_PER_BARREL = 10_000.0
+
+
+def _web_answer_cme_crude_contract_evidence(
+    *,
+    spec: dict[str, str],
+    fetched: ToolRunResponse,
+    url: str,
+) -> dict[str, str] | None:
+    """Validate product-code and unit claims against a live CME contract-spec page."""
+
+    if not fetched.ok:
+        return None
+    expected_url = urlparse(str(spec.get("contract_spec_url") or ""))
+    final_url_raw = str((fetched.data or {}).get("url") or "").strip()
+    if not final_url_raw:
+        return None
+    final_url = urlparse(final_url_raw)
+    if (
+        expected_url.scheme != "https"
+        or expected_url.hostname not in {"cmegroup.com", "www.cmegroup.com"}
+        or final_url.scheme != "https"
+        or final_url.hostname not in {"cmegroup.com", "www.cmegroup.com"}
+        or final_url.path.rstrip("/") != expected_url.path.rstrip("/")
+        or final_url.username is not None
+        or final_url.password is not None
+        or final_url.port not in {None, 443}
+    ):
+        return None
+    text = " ".join(str((fetched.data or {}).get("text") or "").split())
+    if not text:
+        return None
+    contract_code = str(spec.get("contract_code") or "").strip().upper()
+    if not re.fullmatch(r"[A-Z]{1,4}", contract_code):
+        return None
+    code_match = re.search(
+        rf"\bproduct\s+code\b.{{0,400}}(?<![A-Z0-9])"
+        rf"{re.escape(contract_code)}(?![A-Z0-9])",
+        text,
+        flags=re.IGNORECASE,
+    )
+    contract_unit_match = re.search(
+        r"\bcontract\s+(?:unit|size)\b.{0,300}"
+        r"\b1(?:[,\s]?000)\s+(?:u\.?s\.?\s+)?barrels?\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    quote_unit_match = re.search(
+        r"\b(?:price\s+quotation|quotation\s+unit)\b.{0,400}"
+        r"(?:(?:u\.?\s*s\.?\s*)?(?:dollars?|usd)|\$).{0,120}"
+        r"(?:\bper\b|/)\s*barrel\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if code_match is None or contract_unit_match is None or quote_unit_match is None:
+        return None
+    evidence_id = str((fetched.data or {}).get("evidence_id") or "").strip()
+    return {
+        "contract_code": contract_code,
+        "contract_unit": "1,000 barrels",
+        "unit": "per barrel",
+        "quote_unit": "USD per barrel",
+        "source_url": str(spec["contract_spec_url"]),
+        "source_description": "CME contract specification",
+        "evidence_id": evidence_id,
+    }
+
+
+def _web_answer_extract_official_pdf_text(
+    data: bytes,
+    *,
+    max_chars: int,
+) -> tuple[str, bool]:
+    """Extract bounded text from a small, allowlisted official PDF."""
+
+    try:
+        reader = PdfReader(BytesIO(data), strict=False)
+        if reader.is_encrypted and reader.decrypt("") == 0:
+            return "", False
+        page_limit = 32
+        truncated = len(reader.pages) > page_limit
+        parts: list[str] = []
+        length = 0
+        for page in reader.pages[:page_limit]:
+            page_text = str(page.extract_text() or "")
+            if not page_text:
+                continue
+            remaining = max_chars - length
+            if remaining <= 0:
+                truncated = True
+                break
+            if len(page_text) > remaining:
+                parts.append(page_text[:remaining])
+                truncated = True
+                break
+            parts.append(page_text)
+            length += len(page_text) + 1
+        return _repair_mojibake("\n".join(parts).strip()), truncated
+    except Exception:
+        # PDF parsers reject malformed/encrypted documents in several library-specific
+        # ways. This path is allowlisted and bounded, but evidence must still fail closed.
+        return "", False
+
+
+async def _web_answer_fetch_official_pdf(
+    ctx: ToolContext,
+    *,
+    url: str,
+    max_chars: int = 20_000,
+) -> ToolRunResponse:
+    """Fetch and parse an exact allowlisted regulator filing with SSRF controls."""
+
+    allowed_urls = {
+        str(spec["contract_spec_fallback_url"])
+        for spec in _WEB_ANSWER_YAHOO_CRUDE_QUOTES.values()
+    }
+    if url not in allowed_urls:
+        return ToolRunResponse(
+            tool="web.fetch.official-pdf",
+            ok=False,
+            summary="Official PDF URL is not allowlisted.",
+        )
+    try:
+        current_url = await _validate_public_http_url_async(url)
+    except ValueError as exc:
+        return ToolRunResponse(
+            tool="web.fetch.official-pdf",
+            ok=False,
+            summary=str(exc),
+        )
+    expected = urlparse(url)
+    redirects: list[dict[str, Any]] = []
+    byte_limit = _web_response_byte_limit(max_chars, html_response=True)
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(20.0),
+            trust_env=False,
+            transport=_PublicOnlyAsyncHTTPTransport(),
+        ) as client:
+            for _ in range(6):
+                async with client.stream(
+                    "GET",
+                    current_url,
+                    headers={**WEB_HEADERS, "Accept": "application/pdf"},
+                    follow_redirects=False,
+                ) as response:
+                    location = response.headers.get("location")
+                    if response.status_code in {301, 302, 303, 307, 308} and location:
+                        next_url = str(httpx.URL(current_url).join(location))
+                        redirects.append(
+                            {
+                                "from": current_url,
+                                "to": next_url,
+                                "status_code": response.status_code,
+                            }
+                        )
+                        try:
+                            current_url = await _validate_public_http_url_async(next_url)
+                        except ValueError as exc:
+                            return ToolRunResponse(
+                                tool="web.fetch.official-pdf",
+                                ok=False,
+                                summary=f"Blocked redirect target: {exc}",
+                                data={"redirects": redirects},
+                            )
+                        continue
+                    content = bytearray()
+                    too_large = False
+                    async for chunk in response.aiter_bytes():
+                        remaining = byte_limit - len(content)
+                        if remaining <= 0:
+                            too_large = True
+                            break
+                        if len(chunk) > remaining:
+                            content.extend(chunk[:remaining])
+                            too_large = True
+                            break
+                        content.extend(chunk)
+                    status_code = response.status_code
+                    content_type = str(response.headers.get("content-type") or "")
+                    final = urlparse(current_url)
+                    exact_source = (
+                        final.scheme == expected.scheme == "https"
+                        and final.hostname == expected.hostname == "www.cftc.gov"
+                        and final.path == expected.path
+                        and final.query == expected.query
+                        and final.fragment == expected.fragment == ""
+                        and final.username is None
+                        and final.password is None
+                        and final.port in {None, 443}
+                    )
+                    if status_code >= 400 or not exact_source:
+                        return ToolRunResponse(
+                            tool="web.fetch.official-pdf",
+                            ok=False,
+                            summary=(
+                                f"Official PDF responded with HTTP {status_code}."
+                                if exact_source
+                                else "Official PDF final URL did not match the allowlisted source."
+                            ),
+                            data={
+                                "url": current_url,
+                                "status_code": status_code,
+                                "bytes_read": len(content),
+                                "redirects": redirects,
+                            },
+                        )
+                    if (
+                        too_large
+                        or "application/pdf" not in content_type.casefold()
+                        or not bytes(content).startswith(b"%PDF-")
+                    ):
+                        return ToolRunResponse(
+                            tool="web.fetch.official-pdf",
+                            ok=False,
+                            summary="Official PDF was oversized or had an invalid media signature.",
+                            data={
+                                "url": current_url,
+                                "status_code": status_code,
+                                "bytes_read": len(content),
+                                "redirects": redirects,
+                            },
+                        )
+                    text, truncated = await asyncio.to_thread(
+                        _web_answer_extract_official_pdf_text,
+                        bytes(content),
+                        max_chars=max_chars,
+                    )
+                    if not text or truncated:
+                        return ToolRunResponse(
+                            tool="web.fetch.official-pdf",
+                            ok=False,
+                            summary="Official PDF text could not be extracted completely.",
+                            data={
+                                "url": current_url,
+                                "status_code": status_code,
+                                "bytes_read": len(content),
+                                "redirects": redirects,
+                            },
+                        )
+                    safety = _web_content_safety(
+                        source="web.fetch.official-pdf",
+                        url=current_url,
+                        text=text,
+                    )
+                    evidence = _store_web_evidence(
+                        ctx.storage,
+                        source="web.fetch.official-pdf",
+                        url=current_url,
+                        title="CFTC-hosted NYMEX rule filing",
+                        text=text,
+                        content_type=content_type,
+                        safety=safety,
+                        confidence=0.92,
+                        extra={"status_code": status_code},
+                    )
+                    return ToolRunResponse(
+                        tool="web.fetch.official-pdf",
+                        ok=True,
+                        summary="Fetched and parsed an allowlisted CFTC-hosted NYMEX filing.",
+                        data={
+                            "url": current_url,
+                            "status_code": status_code,
+                            "content_type": content_type,
+                            "text": text,
+                            "bytes_read": len(content),
+                            "truncated": False,
+                            "redirects": redirects,
+                            "safety": safety,
+                            "evidence_id": evidence["id"],
+                        },
+                    )
+    except httpx.HTTPError as exc:
+        return ToolRunResponse(
+            tool="web.fetch.official-pdf",
+            ok=False,
+            summary=f"Official PDF request failed: {exc}",
+            data={"url": current_url, "redirects": redirects},
+        )
+    return ToolRunResponse(
+        tool="web.fetch.official-pdf",
+        ok=False,
+        summary="Official PDF exceeded the redirect limit.",
+        data={"url": current_url, "redirects": redirects},
+    )
+
+
+def _web_answer_cftc_crude_contract_evidence(
+    *,
+    spec: dict[str, str],
+    fetched: ToolRunResponse,
+    url: str,
+) -> dict[str, str] | None:
+    """Validate CL/BZ price-unit evidence in a live CFTC-hosted NYMEX filing."""
+
+    if not fetched.ok or url != spec.get("contract_spec_fallback_url"):
+        return None
+    expected = urlparse(str(spec.get("contract_spec_fallback_url") or ""))
+    final_url_raw = str((fetched.data or {}).get("url") or "").strip()
+    if not final_url_raw:
+        return None
+    final = urlparse(final_url_raw)
+    if (
+        expected.scheme != "https"
+        or expected.hostname != "www.cftc.gov"
+        or final.scheme != expected.scheme
+        or final.hostname != expected.hostname
+        or final.path != expected.path
+        or final.query != expected.query
+        or final.fragment
+        or final.username is not None
+        or final.password is not None
+        or final.port not in {None, 443}
+    ):
+        return None
+    text = " ".join(str((fetched.data or {}).get("text") or "").split())
+    if not all(
+        marker.casefold() in text.casefold()
+        for marker in (
+            "New York Mercantile Exchange",
+            "Instrument Name",
+            "Globex Symbol",
+            "Globex Non-Reviewable Ranges",
+        )
+    ):
+        return None
+    contract_code = str(spec.get("contract_code") or "").strip().upper()
+    product_name = str(spec.get("cftc_product_name") or "").strip()
+    if not re.fullmatch(r"[A-Z]{1,4}", contract_code) or not product_name:
+        return None
+    unit_match = re.search(
+        rf"\b{re.escape(product_name)}\s+{re.escape(contract_code)}\s+"
+        r"\$\d+(?:\.\d+)?(?:\s+\$?\d+(?:\.\d+)?)*\s+per\s+barrel\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if unit_match is None:
+        return None
+    return {
+        "contract_code": contract_code,
+        "contract_unit": "",
+        "unit": "per barrel",
+        "quote_unit": "USD per barrel",
+        "source_url": str(spec["contract_spec_fallback_url"]),
+        "source_description": "CFTC-hosted NYMEX rule filing",
+        "evidence_id": str((fetched.data or {}).get("evidence_id") or "").strip(),
+    }
+
+
+async def _web_answer_financial_provider_sources(
+    ctx: ToolContext,
+    *,
+    question: str,
+    orchestrator: WebOrchestrator,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Fetch typed live quote tuples before generic financial web search."""
+
+    benchmarks = _web_answer_requested_benchmarks(question)
+    if (
+        not benchmarks
+        or _web_answer_financial_instrument_kind(question) not in {"crude", "futures"}
+    ):
+        return [], []
+    sources: list[dict[str, Any]] = []
+    steps: list[dict[str, Any]] = []
+    contract_fetch_cache: dict[str, ToolRunResponse] = {}
+    accounted_contract_sources: set[str] = set()
+    for benchmark in benchmarks:
+        spec = _WEB_ANSWER_YAHOO_CRUDE_QUOTES.get(benchmark)
+        if spec is None:
+            continue
+        contract_evidence: dict[str, str] | None = None
+        contract_sources = (
+            ("CME contract specification", str(spec["contract_spec_url"])),
+            ("CFTC-hosted NYMEX rule filing", str(spec["contract_spec_fallback_url"])),
+        )
+        for source_kind, contract_spec_url in contract_sources:
+            contract_fetched = contract_fetch_cache.get(contract_spec_url)
+            if contract_fetched is None:
+                async def fetch_contract_source(
+                    source_url: str = contract_spec_url,
+                    kind: str = source_kind,
+                ) -> ToolRunResponse:
+                    if kind == "CFTC-hosted NYMEX rule filing":
+                        return await _web_answer_fetch_official_pdf(
+                            ctx,
+                            url=source_url,
+                            max_chars=20_000,
+                        )
+                    return await _web_fetch(
+                        ctx,
+                        {
+                            "url": source_url,
+                            "max_chars": 20_000,
+                            "use_cache": False,
+                        },
+                    )
+
+                try:
+                    contract_fetched = await _web_orchestrated_network_call(
+                        orchestrator,
+                        "fetches",
+                        fetch_contract_source,
+                        max_chars=20_000,
+                    )
+                except WebBudgetExceeded as exc:
+                    orchestrator.budget.warn(str(exc))
+                    steps.append(
+                        {
+                            "tool": "web.market.unit-source",
+                            "ok": False,
+                            "summary": str(exc),
+                            "benchmark": benchmark,
+                            "source_kind": source_kind,
+                            "url": contract_spec_url,
+                        }
+                    )
+                    continue
+                contract_fetch_cache[contract_spec_url] = contract_fetched
+            if contract_spec_url not in accounted_contract_sources:
+                contract_text = str((contract_fetched.data or {}).get("text") or "")
+                try:
+                    await orchestrator.budget.account_content(contract_text)
+                except WebBudgetExceeded as exc:
+                    orchestrator.budget.warn(str(exc))
+                    steps.append(
+                        {
+                            "tool": "web.market.unit-source",
+                            "ok": False,
+                            "summary": str(exc),
+                            "benchmark": benchmark,
+                            "source_kind": source_kind,
+                            "url": contract_spec_url,
+                        }
+                    )
+                    continue
+                accounted_contract_sources.add(contract_spec_url)
+            contract_evidence = (
+                _web_answer_cftc_crude_contract_evidence(
+                    spec=spec,
+                    fetched=contract_fetched,
+                    url=contract_spec_url,
+                )
+                if source_kind == "CFTC-hosted NYMEX rule filing"
+                else _web_answer_cme_crude_contract_evidence(
+                    spec=spec,
+                    fetched=contract_fetched,
+                    url=contract_spec_url,
+                )
+            )
+            steps.append(
+                {
+                    "tool": "web.market.unit-source",
+                    "ok": contract_evidence is not None,
+                    "summary": (
+                        f"Validated {source_kind} unit evidence for {benchmark.upper()}."
+                        if contract_evidence is not None
+                        else f"Could not validate {source_kind} for {benchmark.upper()}."
+                    ),
+                    "benchmark": benchmark,
+                    "source_kind": source_kind,
+                    "url": contract_spec_url,
+                }
+            )
+            if contract_evidence is not None:
+                break
+        if contract_evidence is None:
+            continue
+        symbol = str(spec["symbol"])
+        url = (
+            "https://query1.finance.yahoo.com/v8/finance/chart/"
+            f"{quote_plus(symbol, safe='')}?interval=1d&range=5d"
+        )
+        try:
+            fetched = await _web_orchestrated_network_call(
+                orchestrator,
+                "fetches",
+                lambda url=url: _web_fetch(
+                    ctx,
+                    {"url": url, "max_chars": 20_000, "use_cache": False},
+                ),
+                max_chars=20_000,
+            )
+        except WebBudgetExceeded as exc:
+            orchestrator.budget.warn(str(exc))
+            steps.append(
+                {
+                    "tool": "web.market.quote",
+                    "ok": False,
+                    "summary": str(exc),
+                    "benchmark": benchmark,
+                    "url": url,
+                }
+            )
+            continue
+        raw_text = str((fetched.data or {}).get("text") or "")
+        try:
+            await orchestrator.budget.account_content(raw_text)
+        except WebBudgetExceeded as exc:
+            orchestrator.budget.warn(str(exc))
+            steps.append(
+                {
+                    "tool": "web.market.quote",
+                    "ok": False,
+                    "summary": str(exc),
+                    "benchmark": benchmark,
+                    "url": url,
+                }
+            )
+            continue
+        source = (
+            _web_answer_yahoo_crude_quote_source(
+                benchmark=benchmark,
+                spec=spec,
+                fetched=fetched,
+                url=url,
+                contract_evidence=contract_evidence,
+            )
+            if fetched.ok
+            else None
+        )
+        steps.append(
+            {
+                "tool": "web.market.quote",
+                "ok": source is not None,
+                "summary": (
+                    f"Fetched a typed {benchmark.upper()} market quote."
+                    if source is not None
+                    else f"Could not validate the {benchmark.upper()} market quote payload."
+                ),
+                "benchmark": benchmark,
+                "url": url,
+            }
+        )
+        if source is not None:
+            source["answer_score"] = round(
+                _web_answer_source_score(question, source) + 4.0,
+                3,
+            )
+            sources.append(source)
+    return sources, steps
+
+
+def _web_answer_yahoo_crude_quote_source(
+    *,
+    benchmark: str,
+    spec: dict[str, str],
+    fetched: ToolRunResponse,
+    url: str,
+    contract_evidence: dict[str, str] | None,
+) -> dict[str, Any] | None:
+    """Turn a Yahoo chart response into one evidence-bound market quote tuple."""
+
+    if not fetched.ok or contract_evidence is None:
+        return None
+    configured_spec = _WEB_ANSWER_YAHOO_CRUDE_QUOTES.get(benchmark)
+    if configured_spec is None or configured_spec != spec:
+        return None
+    allowed_unit_urls = {
+        str(spec.get("contract_spec_url") or ""),
+        str(spec.get("contract_spec_fallback_url") or ""),
+    }
+    if (
+        contract_evidence.get("contract_code") != spec.get("contract_code")
+        or contract_evidence.get("unit") != "per barrel"
+        or contract_evidence.get("quote_unit") != "USD per barrel"
+        or contract_evidence.get("source_url") not in allowed_unit_urls
+    ):
+        return None
+
+    expected_url = urlparse(url)
+    final_url_raw = str((fetched.data or {}).get("url") or "").strip()
+    if not final_url_raw:
+        return None
+    final_url = urlparse(final_url_raw)
+    try:
+        expected_query = parse_qs(expected_url.query, strict_parsing=True)
+        final_query = parse_qs(final_url.query, strict_parsing=True)
+    except ValueError:
+        return None
+    if (
+        expected_url.scheme != "https"
+        or expected_url.hostname != "query1.finance.yahoo.com"
+        or final_url.scheme != "https"
+        or final_url.hostname != "query1.finance.yahoo.com"
+        or unquote(final_url.path) != unquote(expected_url.path)
+        or final_query != expected_query
+        or expected_query != {"interval": ["1d"], "range": ["5d"]}
+        or final_url.username is not None
+        or final_url.password is not None
+        or final_url.port not in {None, 443}
+        or final_url.fragment
+    ):
+        return None
+
+    try:
+        payload = json.loads(str((fetched.data or {}).get("text") or ""))
+        chart = payload["chart"]
+        if chart.get("error") is not None:
+            return None
+        meta = chart["result"][0]["meta"]
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+        return None
+    if not isinstance(meta, dict):
+        return None
+    symbol = str(meta.get("symbol") or "").strip()
+    if symbol != spec["symbol"]:
+        return None
+    if str(meta.get("instrumentType") or "").strip().upper() != "FUTURE":
+        return None
+    price_value = meta.get("regularMarketPrice")
+    quote_epoch = meta.get("regularMarketTime")
+    if (
+        isinstance(price_value, bool)
+        or not isinstance(price_value, int | float)
+        or not math.isfinite(float(price_value))
+        or not 0 < float(price_value) <= _WEB_ANSWER_MAX_CRUDE_PRICE_USD_PER_BARREL
+    ):
+        return None
+    if (
+        isinstance(quote_epoch, bool)
+        or not isinstance(quote_epoch, int | float)
+        or not math.isfinite(float(quote_epoch))
+        or not _WEB_ANSWER_MIN_MARKET_QUOTE_EPOCH
+        <= float(quote_epoch)
+        <= _WEB_ANSWER_MAX_MARKET_QUOTE_EPOCH
+    ):
+        return None
+    with suppress(ValueError, OverflowError, OSError):
+        quote_utc = datetime.fromtimestamp(float(quote_epoch), tz=UTC)
+        now = _web_answer_financial_now().astimezone(UTC)
+        if quote_utc > now + timedelta(minutes=5):
+            return None
+        currency = str(meta.get("currency") or "").strip().upper()
+        if not re.fullmatch(r"[A-Z]{3}", currency) or currency != spec["currency"]:
+            return None
+        timezone_name = str(meta.get("exchangeTimezoneName") or "").strip()
+        timezone_abbr = str(meta.get("timezone") or "").strip()
+        expected_timezone_name = str(spec.get("timezone") or "").strip()
+        if (
+            timezone_name
+            and expected_timezone_name
+            and timezone_name != expected_timezone_name
+        ):
+            return None
+        expected_zone: ZoneInfo | None = None
+        if expected_timezone_name:
+            with suppress(ZoneInfoNotFoundError, ValueError):
+                expected_zone = ZoneInfo(expected_timezone_name)
+        quote_zone: timezone | ZoneInfo | None = None
+        try:
+            quote_zone = ZoneInfo(timezone_name) if timezone_name else None
+        except (ZoneInfoNotFoundError, ValueError):
+            quote_zone = None
+        raw_offset = meta.get("gmtoffset")
+        reported_offset: int | None = None
+        if raw_offset is not None:
+            if (
+                isinstance(raw_offset, bool)
+                or not isinstance(raw_offset, int | float)
+                or not math.isfinite(float(raw_offset))
+                or float(raw_offset) != int(raw_offset)
+            ):
+                return None
+            reported_offset = int(raw_offset)
+            if abs(reported_offset) >= 24 * 60 * 60:
+                return None
+        if quote_zone is None:
+            if reported_offset is None:
+                return None
+            quote_zone = timezone(timedelta(seconds=reported_offset))
+        zone_offset = quote_utc.astimezone(quote_zone).utcoffset()
+        if zone_offset is None:
+            return None
+        zone_offset_seconds = int(zone_offset.total_seconds())
+        if reported_offset is not None and zone_offset_seconds != reported_offset:
+            return None
+        if expected_zone is not None:
+            expected_offset = quote_utc.astimezone(expected_zone).utcoffset()
+            if expected_offset is None or zone_offset_seconds != int(
+                expected_offset.total_seconds()
+            ):
+                return None
+            quote_zone = expected_zone
+            timezone_name = expected_timezone_name
+        elif expected_timezone_name == "America/New_York":
+            # Windows installations may not carry the optional IANA tzdata wheel.
+            # Yahoo still supplies the exchange offset and abbreviation; accept only
+            # the two valid New York combinations and retain the canonical IANA label.
+            expected_offsets = {"EST": -18_000, "EDT": -14_400}
+            if (
+                reported_offset is None
+                or timezone_abbr not in expected_offsets
+                or expected_offsets[timezone_abbr] != reported_offset
+            ):
+                return None
+            quote_zone = timezone(timedelta(seconds=reported_offset), name=timezone_abbr)
+            timezone_name = expected_timezone_name
+        quote_local = quote_utc.astimezone(quote_zone)
+        resolved_abbr = str(quote_local.tzname() or "").strip()
+        if timezone_abbr and resolved_abbr and timezone_abbr != resolved_abbr:
+            return None
+        if not _web_answer_financial_date_is_fresh(
+            quote_local.date(),
+            kind="crude",
+            today=now.astimezone(quote_zone).date(),
+        ):
+            return None
+        # A scheduled-holiday calendar protects date-only validation below; this
+        # independent elapsed-time ceiling fails closed for extraordinary closures.
+        if now - quote_utc > timedelta(hours=96):
+            return None
+        price = format(float(price_value), ".12g")
+        utc_timestamp = quote_utc.isoformat().replace("+00:00", "Z")
+        local_timestamp = quote_local.isoformat()
+        exchange_code = str(meta.get("exchangeName") or "").strip()
+        if exchange_code.upper() != spec["yahoo_exchange"]:
+            return None
+        zone_label = " ".join(
+            item
+            for item in (
+                timezone_name,
+                f"({resolved_abbr})" if resolved_abbr else "",
+            )
+            if item
+        )
+        contract_unit = str(contract_evidence.get("contract_unit") or "").strip()
+        contract_unit_clause = (
+            f", contract unit {contract_unit}," if contract_unit else ""
+        )
+        source_description = str(
+            contract_evidence.get("source_description") or "official unit source"
+        )
+        excerpt = (
+            f"{benchmark.upper()} benchmark Yahoo Finance payload identifies {symbol} as "
+            f"a FUTURE at exchange code {exchange_code}. No dated-contract identifier was "
+            f"validated for this provider symbol, so it is not a specific dated contract. "
+            f"Its latest available futures market quote is {price} "
+            f"{contract_evidence['quote_unit']} at {utc_timestamp} (exchange-local "
+            f"{local_timestamp} {zone_label}). {source_description} verifies product code "
+            f"{contract_evidence['contract_code']}{contract_unit_clause} and price unit "
+            f"{contract_evidence['quote_unit']}: {contract_evidence['source_url']}. "
+            f"Yahoo quote source: {url}."
+        )
+        return {
+            "rank": 0,
+            "title": f"{spec['label']} ({symbol}) latest market quote",
+            "url": url,
+            "requested_url": None,
+            "snippet": excerpt,
+            "vertical": "web",
+            "published": utc_timestamp,
+            "price": f"{price} {currency}",
+            "products": None,
+            "rating": None,
+            "fetched": True,
+            "tool": fetched.tool,
+            "evidence_id": str((fetched.data or {}).get("evidence_id") or "") or None,
+            "supporting_evidence_ids": [contract_evidence["evidence_id"]]
+            if contract_evidence["evidence_id"]
+            else [],
+            "excerpt": excerpt,
+            "quality": "market-data-api",
+            "extraction": {
+                "kind": "market_quote",
+                "prices": [f"{price} {currency}"],
+                "dates": [quote_utc.date().isoformat()],
+                "availability": [],
+                "schema_types": [],
+            },
+            "market_quote": {
+                "benchmark": benchmark,
+                "symbol": symbol,
+                "instrument_type": "FUTURE",
+                "instrument_alias": "undated_provider_symbol",
+                "is_dated_contract": False,
+                "exchange": exchange_code,
+                "contract_code": contract_evidence["contract_code"],
+                "currency": currency,
+                "unit": contract_evidence["unit"],
+                "contract_unit": contract_unit or None,
+                "unit_source_url": contract_evidence["source_url"],
+                "unit_source_evidence_id": contract_evidence["evidence_id"],
+                "price": price,
+                "quote_time_utc": utc_timestamp,
+                "quote_time_local": local_timestamp,
+                "timezone": timezone_name,
+            },
+        }
+    return None
+
+
 def _web_answer_news_datetime(value: Any, *, now: datetime | None = None) -> datetime | None:
     raw = " ".join(str(value or "").strip().split())
     if not raw:
@@ -16571,6 +17483,9 @@ def _web_answer_financial_exact_identifiers(text: str) -> set[str]:
             re.IGNORECASE,
         ),
         (r"(?<![A-Za-z0-9])[A-Z]{1,6}\.[A-Z](?![A-Za-z0-9])", re.IGNORECASE),
+        # Yahoo continuous-futures symbols contain an equals sign; treating
+        # ``BZ=F`` as separate ``BZ``/``F`` tokens loses exact contract identity.
+        (r"(?<![A-Za-z0-9])[A-Z]{1,6}=F(?![A-Za-z0-9])", re.IGNORECASE),
         (
             r"(?<![A-Za-z0-9])[A-Z]{2,6}[FGHJKMNQUVXZ]\d{1,4}(?![A-Za-z0-9])",
             re.IGNORECASE,
@@ -16578,7 +17493,7 @@ def _web_answer_financial_exact_identifiers(text: str) -> set[str]:
         # Do not also extract ``BRK`` from the class ticker ``BRK.B``.  A partial
         # identifier must never become an alternate identity that can be matched
         # by prefix or by presence elsewhere in the page.
-        (r"(?<![A-Za-z0-9.])[A-Z]{2,8}(?![A-Za-z0-9.])", 0),
+        (r"(?<![A-Za-z0-9.=])[A-Z]{2,8}(?![A-Za-z0-9.=])", 0),
     )
     for pattern, flags in patterns:
         for match in re.finditer(pattern, repaired, flags=flags):
@@ -16594,7 +17509,9 @@ def _web_answer_financial_exact_identifiers(text: str) -> set[str]:
         repaired,
         flags=re.IGNORECASE,
     ):
-        for match in re.finditer(r"(?<![A-Za-z0-9.])[A-Z](?![A-Za-z0-9.])", repaired):
+        for match in re.finditer(
+            r"(?<![A-Za-z0-9.=])[A-Z](?![A-Za-z0-9.=])", repaired
+        ):
             identifier = match.group(0).upper()
             if identifier not in {"A", "I"}:
                 identifiers.add(identifier)
@@ -16666,6 +17583,47 @@ def _web_answer_financial_exact_identifiers(text: str) -> set[str]:
         and identifier not in {"A", "I"}
     )
     return identifiers
+
+
+def _web_answer_discloses_undated_futures_symbol(text: str) -> bool:
+    normalized = _repair_mojibake(text).casefold()
+    return any(
+        marker in normalized
+        for marker in (
+            "not a specific dated contract",
+            "no dated-contract identifier",
+            "no dated contract identifier",
+            "undated provider symbol",
+            "не конкретный датированный контракт",
+            "без датированного контракта",
+        )
+    )
+
+
+def _web_answer_claims_unsupported_futures_alias(text: str) -> bool:
+    """Reject positive front-month/continuous claims for an undated provider symbol."""
+
+    normalized = _repair_mojibake(text).casefold()
+    pattern = re.compile(
+        r"(?<![a-zа-яё])(?:"
+        r"continuous(?:\s*/\s*front[\s-]?month)?(?:\s+(?:futures?|contract|alias|symbol))?"
+        r"|front[\s-]?month(?:\s+(?:futures?|contract|alias|symbol))?"
+        r"|непрерывн\w*\s+(?:фьючерс\w*|контракт\w*)"
+        r"|ближайш\w*\s+(?:фьючерс\w*|контракт\w*)"
+        r")(?![a-zа-яё])"
+    )
+    for match in pattern.finditer(normalized):
+        clause = normalized[max(0, match.start() - 80):match.start()]
+        clause = re.split(r"[.;!?\n]", clause)[-1]
+        if re.search(
+            r"(?:\b(?:not|no|never)\b(?:\W+\w+){0,5}\W*|"
+            r"\b(?:does|do|is|are|was|were)\s+not\b(?:\W+\w+){0,5}\W*|"
+            r"\bне\b(?:\W+\w+){0,5}\W*)$",
+            clause,
+        ):
+            continue
+        return True
+    return False
 
 
 def _web_answer_contains_exact_financial_identifier(text: str, identifier: str) -> bool:
@@ -16918,10 +17876,20 @@ def _web_answer_financial_identifier_raw_binding_score(
 
 def _web_answer_requested_benchmarks(text: str) -> list[str]:
     normalized = _repair_mojibake(text).casefold()
+    aliases = {
+        "brent": (
+            r"(?<![a-z])brent(?![a-z])",
+            r"(?<![a-z0-9])bz\s*=\s*f(?![a-z0-9])",
+        ),
+        "wti": (
+            r"(?<![a-z])wti(?![a-z])",
+            r"(?<![a-z0-9])cl\s*=\s*f(?![a-z0-9])",
+        ),
+    }
     return [
         benchmark
-        for benchmark in ("brent", "wti")
-        if re.search(rf"(?<![a-z]){benchmark}(?![a-z])", normalized)
+        for benchmark, patterns in aliases.items()
+        if any(re.search(pattern, normalized) for pattern in patterns)
     ]
 
 
@@ -17325,6 +18293,7 @@ def _web_answer_nearest_currency_pairs_for_value(text: str, value: str) -> set[s
 
 def _web_answer_financial_source_text(source: dict[str, Any]) -> str:
     extraction = source.get("extraction") if isinstance(source.get("extraction"), dict) else {}
+    typed_quote = _web_answer_financial_market_quote_tuple(source)
     return " ".join(
         [
             *(str(source.get(key) or "") for key in (
@@ -17335,6 +18304,7 @@ def _web_answer_financial_source_text(source: dict[str, Any]) -> str:
                 "published_date",
             )),
             json.dumps(extraction, ensure_ascii=False),
+            typed_quote,
         ]
     )
 
@@ -17344,6 +18314,17 @@ def _web_answer_strip_urls_preserve_punctuation(text: str) -> str:
         raw = match.group(0)
         trimmed = raw.rstrip(".,;:!?)]}")
         return raw[len(trimmed) :]
+
+    return re.sub(r"https?://\S+", replace, text, flags=re.IGNORECASE)
+
+
+def _web_answer_mask_urls_preserve_offsets(text: str) -> str:
+    """Remove URL content without shifting financial evidence offsets."""
+
+    def replace(match: re.Match[str]) -> str:
+        raw = match.group(0)
+        trimmed = raw.rstrip(".,;:!?)]}")
+        return (" " * len(trimmed)) + raw[len(trimmed) :]
 
     return re.sub(r"https?://\S+", replace, text, flags=re.IGNORECASE)
 
@@ -17377,12 +18358,40 @@ def _web_answer_canonical_citation_url(value: str) -> str:
     return f"{parsed.scheme.lower()}://{host}{path}" + (f"?{query}" if query else "")
 
 
+def _web_answer_cited_url_spans(answer: str) -> list[tuple[str, int, int]]:
+    spans: list[tuple[str, int, int]] = []
+    for match in re.finditer(r"https?://\S+", answer, flags=re.IGNORECASE):
+        raw = match.group(0)
+        trimmed = raw.rstrip(".,;:!?)]}")
+        canonical = _web_answer_canonical_citation_url(trimmed)
+        if canonical:
+            spans.append((canonical, match.start(), match.start() + len(trimmed)))
+    return spans
+
+
 def _web_answer_cited_urls(answer: str) -> set[str]:
-    return {
-        canonical
-        for raw in re.findall(r"https?://\S+", answer, flags=re.IGNORECASE)
-        if (canonical := _web_answer_canonical_citation_url(raw))
-    }
+    return {canonical for canonical, _start, _end in _web_answer_cited_url_spans(answer)}
+
+
+def _web_answer_cited_urls_by_value(
+    answer: str,
+    value_spans: list[tuple[int, int]],
+) -> dict[tuple[int, int], set[str]]:
+    """Bind citations to claims while retaining safe group-level citations."""
+
+    ordered = sorted(set(value_spans))
+    result = {span: set() for span in ordered}
+    for canonical, url_start, _url_end in _web_answer_cited_url_spans(answer):
+        preceding = [span for span in ordered if span[1] <= url_start]
+        if preceding:
+            target = max(preceding, key=lambda span: span[1])
+        else:
+            following = [span for span in ordered if span[0] >= url_start]
+            if not following:
+                continue
+            target = min(following, key=lambda span: span[0])
+        result[target].add(canonical)
+    return result
 
 
 def _web_answer_financial_quote_chunks(source: dict[str, Any]) -> list[str]:
@@ -17390,11 +18399,60 @@ def _web_answer_financial_quote_chunks(source: dict[str, Any]) -> list[str]:
     # only human-visible fields where value and quote timestamp can be bound in
     # one local fragment. Generic extraction stores prices and dates in separate
     # arrays and is therefore not a typed market-quote tuple.
-    return [
+    chunks = [
         chunk
         for key in ("title", "snippet", "excerpt")
         if (chunk := str(source.get(key) or "").strip())
     ]
+    typed_quote = _web_answer_financial_market_quote_tuple(source)
+    if typed_quote:
+        chunks.append(typed_quote)
+    return chunks
+
+
+def _web_answer_financial_market_quote_tuple(source: dict[str, Any]) -> str:
+    """Render a validated typed provider quote as one indivisible evidence tuple."""
+
+    quote = source.get("market_quote")
+    if not isinstance(quote, dict):
+        return ""
+    benchmark = str(quote.get("benchmark") or "").strip().casefold()
+    symbol = str(quote.get("symbol") or "").strip().upper()
+    instrument_type = str(quote.get("instrument_type") or "").strip().upper()
+    instrument_alias = str(quote.get("instrument_alias") or "").strip()
+    exchange = str(quote.get("exchange") or "").strip().upper()
+    currency = str(quote.get("currency") or "").strip().upper()
+    unit = " ".join(str(quote.get("unit") or "").strip().casefold().split())
+    price = str(quote.get("price") or "").strip()
+    quote_time = str(quote.get("quote_time_utc") or "").strip()
+    if (
+        benchmark not in {"brent", "wti"}
+        or not re.fullmatch(r"(?:BZ|CL)=F", symbol)
+        or symbol != {"brent": "BZ=F", "wti": "CL=F"}.get(benchmark)
+        or instrument_type != "FUTURE"
+        or instrument_alias != "undated_provider_symbol"
+        or quote.get("is_dated_contract") is not False
+        or exchange != "NYM"
+        or currency != "USD"
+        or unit != "per barrel"
+        or not re.fullmatch(r"\d+(?:\.\d+)?", price)
+    ):
+        return ""
+    with suppress(ValueError, OverflowError):
+        numeric_price = float(price)
+        parsed_time = datetime.fromisoformat(quote_time.replace("Z", "+00:00"))
+        if (
+            math.isfinite(numeric_price)
+            and 0 < numeric_price <= _WEB_ANSWER_MAX_CRUDE_PRICE_USD_PER_BARREL
+            and parsed_time.tzinfo is not None
+            and parsed_time.utcoffset() is not None
+        ):
+            return (
+                f"{benchmark.upper()} {symbol} FUTURE at {exchange}. Undated provider "
+                f"symbol, not a specific dated contract. {symbol} latest available futures "
+                f"market quote price is {price} {currency} {unit} at {quote_time}."
+            )
+    return ""
 
 
 _WEB_FINANCIAL_MONTHS = {
@@ -17453,7 +18511,10 @@ def _web_answer_financial_explicit_dates(
             if value not in found:
                 found.append(value)
 
-    for year, month, day in re.findall(r"\b(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})\b", normalized):
+    for year, month, day in re.findall(
+        r"\b(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})(?=\b|t)",
+        normalized,
+    ):
         append_date(int(year), int(month), int(day))
     for first, second, year in re.findall(
         r"\b(\d{1,2})[-/.](\d{1,2})[-/.](20\d{2})\b",
@@ -17505,7 +18566,10 @@ def _web_answer_financial_date_spans(
         with suppress(ValueError):
             found.append((date(year, month, day), match.start(), match.end()))
 
-    for match in re.finditer(r"\b(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})\b", normalized):
+    for match in re.finditer(
+        r"\b(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})(?=\b|t)",
+        normalized,
+    ):
         add(match, int(match.group(1)), int(match.group(2)), int(match.group(3)))
     for match in re.finditer(r"\b(\d{1,2})[-/.](\d{1,2})[-/.](20\d{2})\b", normalized):
         add(match, int(match.group(3)), int(match.group(2)), int(match.group(1)))
@@ -17554,12 +18618,12 @@ def _web_answer_financial_timestamp_spans(text: str) -> list[tuple[datetime, int
     found: list[tuple[datetime, int, int]] = []
     pattern = re.compile(
         r"(?<!\d)(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})[T\s]+"
-        r"(\d{1,2}):(\d{2})(?::(\d{2}))?\s*"
+        r"(\d{1,2}):(\d{2})(?::(\d{2})(?:[.,](\d{1,9}))?)?\s*"
         r"(Z|UTC|GMT|MSK|[+-]\d{2}:?\d{2})(?![A-Za-z])",
         flags=re.IGNORECASE,
     )
     for match in pattern.finditer(repaired):
-        zone_token = match.group(7).upper()
+        zone_token = match.group(8).upper()
         if zone_token in {"Z", "UTC", "GMT"}:
             zone = UTC
         elif zone_token == "MSK":
@@ -17578,9 +18642,12 @@ def _web_answer_financial_timestamp_spans(text: str) -> list[tuple[datetime, int
                 sign * timedelta(hours=offset_hours, minutes=offset_minutes)
             )
         with suppress(ValueError):
+            fraction = match.group(7) or ""
+            microsecond = int((fraction + "000000")[:6]) if fraction else 0
             moment = datetime(
                 int(match.group(1)), int(match.group(2)), int(match.group(3)),
                 int(match.group(4)), int(match.group(5)), int(match.group(6) or 0),
+                microsecond,
                 tzinfo=zone,
             )
             found.append((moment.astimezone(UTC), match.start(), match.end()))
@@ -17597,7 +18664,7 @@ def _web_answer_financial_metadata_spans(text: str) -> list[tuple[int, int]]:
     spans.extend(
         (match.start(), match.end())
         for match in re.finditer(
-            r"(?<!\d)\d{1,2}:\d{2}(?::\d{2})?"
+            r"(?<!\d)\d{1,2}:\d{2}(?::\d{2}(?:[.,]\d{1,9})?)?"
             r"(?:\s*(?:Z|UTC|GMT|MSK|[+-]\d{2}:?\d{2}))?(?!\d)",
             repaired,
             flags=re.IGNORECASE,
@@ -17612,6 +18679,20 @@ def _web_answer_financial_metadata_spans(text: str) -> list[tuple[int, int]]:
         r"\s*(?:[:=,;-]|\bon\b|\bat\b|\bна\b|\bот\b)?\s*(20\d{2})\b"
     )
     spans.extend(match.span(1) for match in year_context.finditer(repaired))
+    month_pattern = "|".join(
+        re.escape(name) + r"\w*" for name in _WEB_FINANCIAL_MONTHS
+    )
+    # Contract-month examples such as ``August 2026`` describe an instrument
+    # period.  They are neither a quote value nor a complete quote date.
+    spans.extend(
+        match.span()
+        for match in re.finditer(
+            rf"\b(?:{month_pattern})\s+20\d{{2}}\b|"
+            rf"\b20\d{{2}}\s+(?:{month_pattern})\b",
+            repaired,
+            flags=re.IGNORECASE,
+        )
+    )
     return sorted(set(spans))
 
 
@@ -17741,6 +18822,13 @@ def _web_answer_number_spans(text: str, value: str) -> list[tuple[int, int]]:
     ]
 
 
+_WEB_FINANCIAL_COORDINATION_PATTERN = (
+    r"(?<![a-zа-яё])"
+    r"(?:and|but|then|versus|while|whereas|meanwhile|и|а|но|затем)"
+    r"(?![a-zа-яё])"
+)
+
+
 def _web_answer_financial_clause_bounds(
     text: str,
     start: int,
@@ -17758,8 +18846,7 @@ def _web_answer_financial_clause_bounds(
         re.finditer(
             # A sentence-ending dot is a boundary, while decimal dots and the dot
             # inside class tickers (BRK.B) are not followed by whitespace/end.
-            r"[;\n]|\.(?=\s|$)|"
-            r"(?<![a-zа-яё])(?:and|while|whereas|и|а)(?![a-zа-яё])",
+            rf"[;\n]|\.(?=\s|$)|{_WEB_FINANCIAL_COORDINATION_PATTERN}",
             text,
             flags=re.IGNORECASE,
         )
@@ -17825,6 +18912,125 @@ def _web_answer_financial_hard_clause_bounds(
         default=len(text),
     )
     return left, right
+
+
+def _web_answer_financial_markdown_section(
+    text: str,
+    start: int,
+    end: int,
+) -> tuple[str, str] | None:
+    """Return a value's instrument-card title and body without crossing cards.
+
+    Accepts AT headings and plain/bold card titles such as ``Brent (BZ=F)`` that
+    live models commonly emit without ``#`` prefixes.
+    """
+
+    headings = list(
+        re.finditer(
+            r"(?m)^[ \t]{0,3}(?:#{1,6}[ \t]+|\*{0,2})([^\n*]+?)(?:\*{0,2})[ \t]*$",
+            text,
+        )
+    )
+    card_headings: list[re.Match[str]] = []
+    for item in headings:
+        title = re.sub(r"[*_`]", "", item.group(1)).strip()
+        title = re.sub(r"^[-+•]\s+", "", title)
+        if not title or title.endswith(":"):
+            continue
+        # Bullet fields are not card titles; keep short title-like lines only.
+        if re.match(r"(?i)^(?:price|quote|source|instrument|exchange|unit)\b", title):
+            continue
+        if len(title) > 120:
+            continue
+        # Prefer titles that look like instrument cards (ticker / benchmark).
+        if not (
+            re.search(r"\b[A-Z]{1,6}=F\b", title, flags=re.I)
+            or re.search(
+                r"\b(?:brent|wti|gold|silver|nasdaq|s&p|spx|btc|eth)\b",
+                title,
+                flags=re.I,
+            )
+            or item.group(0).lstrip().startswith("#")
+        ):
+            continue
+        card_headings.append(item)
+    preceding = [item for item in card_headings if item.end() <= start]
+    if not preceding:
+        return None
+    heading = preceding[-1]
+    section_end = min(
+        (item.start() for item in card_headings if item.start() > heading.start()),
+        default=len(text),
+    )
+    if end > section_end:
+        return None
+    title = re.sub(r"[*_`]", "", heading.group(1)).strip()
+    return title, text[heading.end():section_end]
+
+
+def _web_answer_financial_structured_identifiers_for_span(
+    text: str,
+    start: int,
+    end: int,
+    *,
+    known_identifiers: set[str],
+) -> set[str]:
+    section = _web_answer_financial_markdown_section(text, start, end)
+    if section is None:
+        return set()
+    identifiers = (
+        _web_answer_financial_exact_identifiers(section[0]) & known_identifiers
+    )
+    return identifiers if len(identifiers) == 1 else set()
+
+
+def _web_answer_financial_structured_quote_metadata_for_span(
+    text: str,
+    start: int,
+    end: int,
+    *,
+    known_identifiers: set[str],
+) -> tuple[set[date], set[datetime]]:
+    """Inherit only an explicitly labelled quote time inside one instrument card."""
+
+    section = _web_answer_financial_markdown_section(text, start, end)
+    if section is None or len(
+        _web_answer_financial_exact_identifiers(section[0]) & known_identifiers
+    ) != 1:
+        return set(), set()
+    dates: set[date] = set()
+    timestamps: set[datetime] = set()
+    for raw_line in section[1].splitlines():
+        line = re.sub(r"[*_`]", "", raw_line).strip()
+        line = re.sub(r"^[-+]\s+", "", line)
+        label, separator, _value = line.partition(":")
+        if not separator or not re.fullmatch(
+            r"(?:quote\s+(?:time|date|timestamp)|last[\s-]+trade\s+time|"
+            r"settlement\s+time|время\s+котировки|"
+            r"дата\s+котировки|время\s+сделки)",
+            _repair_mojibake(label).casefold().strip(),
+        ):
+            continue
+        line_timestamps = {
+            moment
+            for moment, _line_start, _line_end in _web_answer_financial_timestamp_spans(
+                line
+            )
+        }
+        if line_timestamps:
+            timestamps.update(line_timestamps)
+            continue
+        dates.update(_web_answer_financial_explicit_dates(line))
+    if len(timestamps) == 1:
+        # Use the quote timestamp's own calendar date (UTC for Zulu quotes), not
+        # the operator's local news timezone, so US session Friday stays Friday.
+        return {
+            (item.astimezone(UTC).date() if item.tzinfo is not None else item.date())
+            for item in timestamps
+        }, timestamps
+    if timestamps or len(dates) != 1:
+        return set(), set()
+    return dates, set()
 
 
 def _web_answer_financial_field_bounds(
@@ -18204,8 +19410,7 @@ def _web_answer_financial_has_unknown_role_modifier(
     coordination_cuts = [
         match.end()
         for match in re.finditer(
-            r"(?<![a-zа-яё])(?:and|but|then|versus|и|а|но|затем)"
-            r"(?![a-zа-яё])",
+            _WEB_FINANCIAL_COORDINATION_PATTERN,
             prefix,
             flags=re.IGNORECASE,
         )
@@ -18248,9 +19453,14 @@ def _web_answer_financial_has_unknown_role_modifier(
         "on", "at", "in", "from", "as",
         "stock", "share", "shares", "equity", "bond", "futures", "future",
         "contract", "market", "quote", "price", "spot", "settlement", "index",
+        "benchmark", "instrument", "exact", "crude", "oil", "provider", "code",
+        "yahoo", "finance", "mercantile", "ny", "nym",
         "current", "live", "latest", "last", "actual", "official", "real",
         "available", "common", "class", "isin", "ticker", "symbol", "exchange",
         "nyse", "nasdaq", "lse", "moex", "ice", "cme", "nymex", "otc",
+        "est", "edt", "cst", "cdt", "mst", "mdt", "pst", "pdt", "cet", "cest",
+        "eet", "eest", "bst", "jst", "ist", "aest", "aedt", "timezone", "time",
+        "local",
         "usd", "rub", "eur", "gbp", "cny", "jpy", "brent", "wti", "bitcoin",
         "ethereum", "btc", "eth", "forex", "fx", "currency", "pair",
         "акция", "акции", "акций", "облигация", "облигации", "фьючерс",
@@ -18287,7 +19497,7 @@ def _web_answer_financial_suffix_status(
     tail_start = end - left
     tail = fragment[tail_start:]
     coordination = re.search(
-        r"(?<![a-zа-яё])(?:and|but|then|versus|и|а|но|затем)(?![a-zа-яё])",
+        _WEB_FINANCIAL_COORDINATION_PATTERN,
         tail,
         flags=re.IGNORECASE,
     )
@@ -18319,6 +19529,9 @@ def _web_answer_financial_suffix_status(
         "пункт", "пункта", "percent", "процент", "процента", "shares", "share",
         "nyse", "nasdaq", "lse", "moex", "ice", "cme", "nymex", "otc",
         "utc", "gmt", "msk", "z", "t", "per", "за", "on", "at", "as", "of",
+        "est", "edt", "cst", "cdt", "mst", "mdt", "pst", "pdt", "cet", "cest",
+        "eet", "eest", "bst", "jst", "ist", "aest", "aedt", "timezone", "time",
+        "exchange", "local",
         "the", "is", "was", "for", "stock", "price", "quote", "market", "contract",
         "futures", "bond", "isin", "current", "latest", "live", "available", "last",
         "actual", "official", "real", "this", "на", "по", "в", "от", "акций",
@@ -18326,6 +19539,13 @@ def _web_answer_financial_suffix_status(
     }
     for annotation in annotations:
         masked = list(annotation)
+        for timezone_match in re.finditer(
+            r"\b[A-Za-z]+(?:[_-][A-Za-z]+)*/[A-Za-z]+(?:[_-][A-Za-z]+)*\b",
+            annotation,
+        ):
+            masked[timezone_match.start():timezone_match.end()] = " " * (
+                timezone_match.end() - timezone_match.start()
+            )
         for metadata_start, metadata_end in _web_answer_financial_metadata_spans(
             annotation
         ):
@@ -19264,6 +20484,81 @@ def _web_answer_current_financial_quote_requested(question: str) -> bool:
     )
 
 
+def _web_answer_nth_weekday(
+    year: int,
+    month: int,
+    weekday: int,
+    occurrence: int,
+) -> date:
+    first = date(year, month, 1)
+    delta = (weekday - first.weekday()) % 7
+    return first + timedelta(days=delta + 7 * (occurrence - 1))
+
+
+def _web_answer_last_weekday(year: int, month: int, weekday: int) -> date:
+    if month == 12:
+        cursor = date(year + 1, 1, 1) - timedelta(days=1)
+    else:
+        cursor = date(year, month + 1, 1) - timedelta(days=1)
+    return cursor - timedelta(days=(cursor.weekday() - weekday) % 7)
+
+
+def _web_answer_easter_sunday(year: int) -> date:
+    # Gregorian computus (Meeus/Jones/Butcher), valid for the supported 20xx dates.
+    a = year % 19
+    b = year // 100
+    c = year % 100
+    d = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    ell = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * ell) // 451
+    month = (h + ell - 7 * m + 114) // 31
+    day = (h + ell - 7 * m + 114) % 31 + 1
+    return date(year, month, day)
+
+
+def _web_answer_observed_holiday(value: date) -> date:
+    if value.weekday() == 5:
+        return value - timedelta(days=1)
+    if value.weekday() == 6:
+        return value + timedelta(days=1)
+    return value
+
+
+def _web_answer_us_exchange_holidays(year: int) -> set[date]:
+    """Scheduled full-day US exchange closures used by freshness validation."""
+
+    holidays = {
+        _web_answer_observed_holiday(date(year, 1, 1)),
+        _web_answer_nth_weekday(year, 1, 0, 3),  # Martin Luther King Jr. Day
+        _web_answer_nth_weekday(year, 2, 0, 3),  # Washington's Birthday
+        _web_answer_easter_sunday(year) - timedelta(days=2),  # Good Friday
+        _web_answer_last_weekday(year, 5, 0),  # Memorial Day
+        _web_answer_observed_holiday(date(year, 7, 4)),
+        _web_answer_nth_weekday(year, 9, 0, 1),  # Labor Day
+        _web_answer_nth_weekday(year, 11, 3, 4),  # Thanksgiving
+        _web_answer_observed_holiday(date(year, 12, 25)),
+    }
+    if year >= 2022:
+        holidays.add(_web_answer_observed_holiday(date(year, 6, 19)))
+    # An observed New Year's Day can fall in the preceding calendar year.
+    observed_next_new_year = _web_answer_observed_holiday(date(year + 1, 1, 1))
+    if observed_next_new_year.year == year:
+        holidays.add(observed_next_new_year)
+    return {item for item in holidays if item.year == year}
+
+
+def _web_answer_us_exchange_trading_day(value: date) -> bool:
+    return value.weekday() < 5 and value not in _web_answer_us_exchange_holidays(
+        value.year
+    )
+
+
 def _web_answer_financial_date_is_fresh(
     value: date,
     *,
@@ -19281,20 +20576,22 @@ def _web_answer_financial_date_is_fresh(
         "commodity",
         "fx",
     }:
-        # Exchange-traded instruments do not acquire a new official session date
-        # over a weekend.  A calendar-day TTL accepted Thursday's equity close as
-        # "current" on Sunday even though Friday had traded.  On a weekday allow
-        # both today's session and the immediately preceding weekday because the
-        # request can arrive before the local market opens.
-        latest_weekday = current
-        while latest_weekday.weekday() >= 5:
-            latest_weekday -= timedelta(days=1)
-        allowed = {latest_weekday}
-        if current.weekday() < 5:
-            previous_weekday = current - timedelta(days=1)
-            while previous_weekday.weekday() >= 5:
-                previous_weekday -= timedelta(days=1)
-            allowed.add(previous_weekday)
+        # Use scheduled exchange sessions, not Moscow calendar weekdays.  This
+        # accepts Friday's last quote on Tuesday before the open after a Monday
+        # holiday, while still rejecting Thursday on an ordinary Sunday.
+        latest_session = current
+        while not _web_answer_us_exchange_trading_day(latest_session):
+            latest_session -= timedelta(days=1)
+        allowed = {latest_session}
+        if _web_answer_us_exchange_trading_day(current):
+            previous_session = current - timedelta(days=1)
+            while not _web_answer_us_exchange_trading_day(previous_session):
+                previous_session -= timedelta(days=1)
+            allowed.add(previous_session)
+        if kind in {"crude", "futures"}:
+            # Energy futures can publish a new electronic-session quote on Sunday.
+            allowed.add(current)
+            allowed.add(current - timedelta(days=1))
         return value in allowed
     max_age_days = 1 if kind == "crypto" else 3
     return current - timedelta(days=max_age_days) <= value <= current
@@ -19324,6 +20621,16 @@ def _web_answer_financial_source_supports_value(
     if not _web_answer_financial_source_relevant(question, source_text, kind=kind):
         return False
     requested_identifiers = _web_answer_financial_exact_identifiers(question)
+    typed_quote = _web_answer_financial_market_quote_tuple(source)
+    typed_identifier = (
+        str(source["market_quote"].get("symbol") or "").strip().upper()
+        if typed_quote and isinstance(source.get("market_quote"), dict)
+        else ""
+    )
+    binding_identifiers = requested_identifiers
+    structured_metadata_identifiers = requested_identifiers or (
+        {typed_identifier} if typed_identifier else set()
+    )
     answer_value_start, answer_value_end = answer_value_span
     requested_role = _web_answer_financial_requested_value_role(question, kind=kind)
     requested_status = _web_answer_financial_requested_value_status(question)
@@ -19345,11 +20652,18 @@ def _web_answer_financial_source_supports_value(
             answer_text,
             answer_value_start,
             answer_value_end,
-            known_identifiers=requested_identifiers,
+            known_identifiers=binding_identifiers,
         )
-        & requested_identifiers
+        & binding_identifiers
     )
-    if requested_identifiers and not answer_value_identifiers:
+    if binding_identifiers and not answer_value_identifiers:
+        answer_value_identifiers = _web_answer_financial_structured_identifiers_for_span(
+            answer_text,
+            answer_value_start,
+            answer_value_end,
+            known_identifiers=binding_identifiers,
+        )
+    if binding_identifiers and not answer_value_identifiers:
         return False
     answer_identifier_entities = _web_answer_financial_adjacent_identifier_entities(
         answer_text,
@@ -19397,15 +20711,15 @@ def _web_answer_financial_source_supports_value(
                 match.end(),
             )
             quote_fragment = chunk[occurrence_left:occurrence_right].strip()
-            if requested_identifiers:
+            if binding_identifiers:
                 source_value_identifiers = (
                     _web_answer_nearest_financial_identifiers_for_span(
                         chunk,
                         match.start(),
                         match.end(),
-                        known_identifiers=requested_identifiers,
+                        known_identifiers=binding_identifiers,
                     )
-                    & requested_identifiers
+                    & binding_identifiers
                 )
                 if not answer_value_identifiers.issubset(source_value_identifiers):
                     continue
@@ -19622,6 +20936,15 @@ def _web_answer_financial_source_supports_value(
                     answer_value_end,
                     kind=kind,
                 )
+                if not answer_value_dates:
+                    answer_value_dates, _structured_timestamps = (
+                        _web_answer_financial_structured_quote_metadata_for_span(
+                            answer_text,
+                            answer_value_start,
+                            answer_value_end,
+                            known_identifiers=structured_metadata_identifiers,
+                        )
+                    )
                 fragment_value_dates = _web_answer_financial_dates_for_occurrence(
                     chunk,
                     value,
@@ -19646,6 +20969,15 @@ def _web_answer_financial_source_supports_value(
                 answer_value_end,
                 kind=kind,
             )
+            if not answer_timestamps:
+                _structured_dates, answer_timestamps = (
+                    _web_answer_financial_structured_quote_metadata_for_span(
+                        answer_text,
+                        answer_value_start,
+                        answer_value_end,
+                        known_identifiers=structured_metadata_identifiers,
+                    )
+                )
             fragment_timestamps = _web_answer_financial_timestamps_for_occurrence(
                 chunk,
                 value,
@@ -19705,13 +21037,18 @@ def _web_answer_financial_instrument_kind(question: str) -> str:
     repaired = _repair_mojibake(question)
     normalized = repaired.lower()
     exact_identifiers = _web_answer_financial_exact_identifiers(question)
+    crude_future_symbol = bool(
+        re.search(r"(?<![a-z0-9])(?:bz|cl)\s*=\s*f(?![a-z0-9])", normalized)
+    )
     identifier_quote = bool(exact_identifiers) and any(
         marker in normalized
         for marker in ("price", "quote", "stock", "share", "ticker", "цена", "котиров")
     )
     if not _web_answer_looks_like_financial_market(normalized) and not identifier_quote:
         return ""
-    oil = any(marker in normalized for marker in ("нефт", "brent", "wti", "crude"))
+    oil = crude_future_symbol or any(
+        marker in normalized for marker in ("нефт", "brent", "wti", "crude")
+    )
     equity = any(
         marker in normalized
         for marker in ("акци", "shares", "stock", "тикер", "компан", "equity")
@@ -19748,7 +21085,9 @@ def _web_answer_financial_instrument_kind(question: str) -> str:
         return "ambiguous_oil_security"
     if any(marker in normalized for marker in ("etf", "биржевой фонд", "exchange-traded")):
         return "etf"
-    if any(marker in normalized for marker in ("фьючерс", "futures", "future contract")):
+    if crude_future_symbol or any(
+        marker in normalized for marker in ("фьючерс", "futures", "future contract")
+    ):
         return "futures"
     if any(marker in normalized for marker in ("облигац", "bond", "ofz", "офз", "isin")):
         return "bond"
@@ -20232,6 +21571,100 @@ def _web_answer_diverse_sources(
     return selected
 
 
+def _web_answer_financial_balanced_sources(
+    question: str,
+    sources: list[dict[str, Any]],
+    *,
+    max_sources: int,
+) -> list[dict[str, Any]]:
+    """Preserve one typed source per requested benchmark before domain diversity."""
+
+    selected: list[dict[str, Any]] = []
+    selected_ids: set[int] = set()
+    for benchmark in _web_answer_requested_benchmarks(question):
+        typed = [
+            source
+            for source in sources
+            if isinstance(source.get("market_quote"), dict)
+            and str(source["market_quote"].get("benchmark") or "").casefold() == benchmark
+        ]
+        candidates = typed or [
+            source
+            for source in sources
+            if re.search(
+                rf"(?<![a-z]){benchmark}(?![a-z])",
+                _repair_mojibake(_web_answer_financial_source_text(source)).casefold(),
+            )
+        ]
+        if not candidates:
+            continue
+        best = max(candidates, key=lambda item: float(item.get("answer_score") or 0))
+        if id(best) not in selected_ids:
+            selected.append(best)
+            selected_ids.add(id(best))
+        if len(selected) >= max_sources:
+            return selected
+    remainder = [source for source in sources if id(source) not in selected_ids]
+    selected.extend(
+        _web_answer_diverse_sources(
+            remainder,
+            max_sources=max(0, max_sources - len(selected)),
+        )
+    )
+    return selected[:max_sources]
+
+
+def _web_research_excerpt(
+    text: Any,
+    *,
+    query: str,
+    claim: str,
+    limit: int,
+) -> str:
+    """Keep complete requested quote cards instead of an arbitrary page prefix."""
+
+    compact = " ".join(str(text or "").split())
+    if len(compact) <= limit:
+        return compact
+    benchmarks = _web_answer_requested_benchmarks(f"{query} {claim}")
+    if not benchmarks:
+        return _short_text(compact, limit)
+    per_benchmark = max(220, (limit - 5 * max(0, len(benchmarks) - 1)) // len(benchmarks))
+    normalized = _repair_mojibake(compact).casefold()
+    excerpts: list[str] = []
+    for benchmark in benchmarks:
+        matches = list(re.finditer(rf"(?<![a-z]){benchmark}(?![a-z])", normalized))
+        if not matches:
+            continue
+        scored: list[tuple[int, int, int]] = []
+        for match in matches:
+            start = max(0, match.start() - 90)
+            end = min(len(compact), match.end() + per_benchmark - 90)
+            window = _repair_mojibake(compact[start:end]).casefold()
+            score = 0
+            if _WEB_FINANCIAL_NUMBER_RE.search(window):
+                score += 3
+            if re.search(r"(?<![a-z])(?:usd|eur|rub|gbp)(?![a-z])|[$в‚¬ВЈв‚Ѕ]", window):
+                score += 3
+            if any(
+                marker in window
+                for marker in ("barrel", "Р±Р°СЂСЂРµР»", "quote", "РєРѕС‚РёСЂ")
+            ):
+                score += 2
+            if _web_answer_financial_explicit_dates(window):
+                score += 3
+            if any(marker in window for marker in ("updated", "as of", "РѕР±РЅРѕРІР»РµРЅ")):
+                score += 1
+            scored.append((score, start, end))
+        _score, start, end = max(scored, key=lambda item: (item[0], item[1]))
+        excerpt = compact[start:end].strip()
+        if excerpt and excerpt not in excerpts:
+            excerpts.append(excerpt)
+    if not excerpts:
+        return _short_text(compact, limit)
+    return _short_text(" ... ".join(excerpts), limit)
+
+
 async def _web_answer_synthesis(
     ctx: ToolContext,
     *,
@@ -20292,6 +21725,12 @@ async def _web_answer_synthesis(
                 "say 'latest available' and name the last-trade/settlement time rather than "
                 "calling it live. If the instrument is ambiguous, explain the alternatives and "
                 "ask for a benchmark, ticker, exchange, ETF, or contract before giving a price. "
+                "Treat Yahoo symbols ending in =F as undated provider symbols: the supplied "
+                "payload does not establish a specific dated contract. Preserve that "
+                "disclosure and never invent a contract month or call the symbol front-month "
+                "unless supplied evidence says so. Use the supplied official unit-source "
+                "URL (a CME contract specification or CFTC-hosted NYMEX filing) for product "
+                "code and unit claims. "
                 "Never merge spot, futures, equity, ETF, or FX values into one quote. Every "
                 "factual paragraph or bullet must include at least one supplied source URL. "
                 "If evidence is incomplete, "
@@ -20367,6 +21806,26 @@ def _web_answer_synthesis_sources(sources: list[dict[str, Any]]) -> list[dict[st
                 "dates": extraction.get("dates", [])[:3],
                 "availability": extraction.get("availability", [])[:3],
                 "schema_types": extraction.get("schema_types", [])[:5],
+            }
+        market_quote = source.get("market_quote")
+        if isinstance(market_quote, dict):
+            item["market_quote"] = {
+                key: market_quote.get(key)
+                for key in (
+                    "benchmark",
+                    "symbol",
+                    "instrument_alias",
+                    "is_dated_contract",
+                    "exchange",
+                    "contract_code",
+                    "currency",
+                    "unit",
+                    "contract_unit",
+                    "unit_source_url",
+                    "price",
+                    "quote_time_utc",
+                    "timezone",
+                )
             }
         payload.append(item)
     return payload
@@ -20446,10 +21905,26 @@ def _web_answer_financial_synthesis_rejection(
     kind = _web_answer_financial_instrument_kind(question)
     if not kind:
         return ""
-    answer_without_urls = _web_answer_strip_urls_preserve_punctuation(answer)
+    # Keep offsets aligned with the original answer so each quote value can be
+    # attributed to its own citation instead of merely checking a global URL bag.
+    answer_without_urls = _web_answer_mask_urls_preserve_offsets(answer)
     normalized = _repair_mojibake(answer_without_urls).lower()
     source_texts = [_web_answer_financial_source_text(source) for source in sources]
     all_source_text = " ".join(source_texts)
+    typed_undated_symbol = any(
+        isinstance(source.get("market_quote"), dict)
+        and source["market_quote"].get("instrument_alias")
+        == "undated_provider_symbol"
+        for source in sources
+    )
+    if typed_undated_symbol and not _web_answer_discloses_undated_futures_symbol(
+        answer_without_urls
+    ):
+        return "missing_undated_futures_symbol_disclosure"
+    if typed_undated_symbol and _web_answer_claims_unsupported_futures_alias(
+        answer_without_urls
+    ):
+        return "unsupported_futures_alias"
     for identifier in _web_answer_financial_exact_identifiers(question):
         if not _web_answer_contains_exact_financial_identifier(
             answer_without_urls, identifier
@@ -20531,8 +22006,32 @@ def _web_answer_financial_synthesis_rejection(
         return ""
 
     price_sensitive = _web_answer_current_financial_quote_requested(question)
-    requested_date_values = set(_web_answer_financial_explicit_dates(question))
-    required_quote_dates = requested_date_values if len(requested_date_values) == 1 else set()
+    current_quote_date = _web_news_today()
+    requested_date_values = set(
+        _web_answer_financial_explicit_dates(question, today=current_quote_date)
+    )
+    absolute_requested_dates = {
+        value
+        for value, start, end in _web_answer_financial_date_spans(
+            question, today=current_quote_date
+        )
+        if _repair_mojibake(question[start:end]).casefold()
+        not in {"today", "сегодня", "yesterday", "вчера"}
+    }
+    normalized_question = _repair_mojibake(question).casefold()
+    contextual_current_date = (
+        requested_date_values == {current_quote_date}
+        and absolute_requested_dates.issubset({current_quote_date})
+        and any(
+            marker in normalized_question
+            for marker in ("сейчас", "сегодня", "текущ", "current", "now", "today")
+        )
+    )
+    required_quote_dates = (
+        requested_date_values
+        if len(requested_date_values) == 1 and not contextual_current_date
+        else set()
+    )
     if required_quote_dates and not required_quote_dates.issubset(
         set(_web_answer_financial_explicit_dates(answer_without_urls))
     ):
@@ -20548,6 +22047,8 @@ def _web_answer_financial_synthesis_rejection(
             marker in normalized
             for marker in (
                 "spot",
+                "future",
+                "futures",
                 "спот",
                 "фьючер",
                 "settlement",
@@ -20727,6 +22228,11 @@ def _web_answer_financial_synthesis_rejection(
     if price_sensitive and not value_matches:
         return "missing_financial_value"
     cited_urls = _web_answer_cited_urls(answer)
+    cited_urls_by_value = _web_answer_cited_urls_by_value(
+        answer,
+        [(match.start(), match.end()) for match in value_matches],
+    )
+    supported_values: list[tuple[re.Match[str], set[str]]] = []
     for value_match in value_matches:
         value = value_match.group(0)
         supporting_sources = [
@@ -20745,12 +22251,41 @@ def _web_answer_financial_synthesis_rejection(
         ]
         if not supporting_sources:
             return "unsupported_financial_number"
-        if not any(
-            (url := _web_answer_canonical_citation_url(str(source.get("url") or "")))
-            and url in cited_urls
+        supporting_urls = {
+            url
             for source in supporting_sources
+            if (url := _web_answer_canonical_citation_url(str(source.get("url") or "")))
+        }
+        supported_values.append((value_match, supporting_urls))
+
+    common_supporting_urls = (
+        set.intersection(*(item[1] for item in supported_values))
+        if supported_values
+        else set()
+    )
+    for value_match, supporting_urls in supported_values:
+        local_citations = cited_urls_by_value.get(
+            (value_match.start(), value_match.end()),
+            set(),
+        )
+        if not (
+            supporting_urls.intersection(local_citations)
+            or supporting_urls.intersection(common_supporting_urls).intersection(cited_urls)
         ):
             return "unsupported_financial_citation"
+    required_unit_source_urls = {
+        canonical
+        for source in sources
+        if isinstance(source.get("market_quote"), dict)
+        and source["market_quote"].get("unit")
+        and (
+            canonical := _web_answer_canonical_citation_url(
+                str(source["market_quote"].get("unit_source_url") or "")
+            )
+        )
+    }
+    if required_unit_source_urls and not required_unit_source_urls.issubset(cited_urls):
+        return "unsupported_financial_unit_citation"
     return ""
 
 
@@ -22758,11 +24293,28 @@ def _timestamp_slug() -> str:
     return datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
 
 
+def _web_response_byte_limit(max_chars: int, *, html_response: bool) -> int:
+    return max(
+        65_536 if html_response else 4096,
+        min(1_000_000, max(1, int(max_chars)) * (64 if html_response else 4)),
+    )
+
+
 async def _read_limited_response_document(
     response: httpx.Response,
     max_chars: int,
 ) -> tuple[str, str, bool]:
-    byte_limit = max(4096, min(1_000_000, max_chars * 4))
+    content_type = response.headers.get("content-type", "").lower()
+    # The output budget is measured after markup removal.  A fixed 4x raw-byte
+    # allowance truncates ordinary HTML inside a style/script block, leaving only
+    # navigation/CSS and silently dropping the actual article or quote cards.
+    # Keep the same 1 MiB hard ceiling, but allow enough bounded raw markup to
+    # produce ``max_chars`` of visible text.
+    html_response = "html" in content_type
+    byte_limit = _web_response_byte_limit(
+        max_chars,
+        html_response=html_response,
+    )
     content = bytearray()
     truncated = False
     async for chunk in response.aiter_bytes():
@@ -22779,7 +24331,6 @@ async def _read_limited_response_document(
     encoding = _charset_from_content_type(response.headers.get("content-type")) or "utf-8"
     raw_text = _repair_mojibake(bytes(content).decode(encoding, errors="replace"))
     text = raw_text
-    content_type = response.headers.get("content-type", "").lower()
     if "html" in content_type or "<html" in text[:500].lower():
         text = _html_to_text(text)
     if len(text) > max_chars:

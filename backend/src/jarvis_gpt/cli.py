@@ -268,7 +268,12 @@ def cmd_dispatcher_compose(args: argparse.Namespace) -> None:
 
 def cmd_dispatcher_up(args: argparse.Namespace) -> None:
     with _primary_runtime(args.profile) as (settings, storage, _llm, _agent):
-        result = DispatcherManager(settings, storage=storage).run_compose_verified("up")
+        result = DispatcherManager(settings, storage=storage).run_compose_verified(
+            "up",
+            ownership_intent=(
+                "launcher" if bool(getattr(args, "launcher_owned", False)) else None
+            ),
+        )
         _print_json(result)
         if not result.get("ok"):
             raise SystemExit(1)
@@ -574,6 +579,11 @@ def build_parser() -> argparse.ArgumentParser:
     dispatcher_compose_parser.set_defaults(func=cmd_dispatcher_compose)
 
     dispatcher_up_parser = sub.add_parser("dispatcher-up", help="Start vLLM dispatcher service")
+    dispatcher_up_parser.add_argument(
+        "--launcher-owned",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     dispatcher_up_parser.set_defaults(func=cmd_dispatcher_up)
 
     dispatcher_down_parser = sub.add_parser("dispatcher-down", help="Stop vLLM dispatcher service")

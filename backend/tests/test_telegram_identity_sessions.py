@@ -20,16 +20,20 @@ def _bridge(api_handler, *, allowed_chat_ids: frozenset[int] = frozenset()):
         base_url="http://backend.test",
         transport=httpx.MockTransport(api_handler),
     )
-    return TelegramBridge(
+    bridge = TelegramBridge(
         TelegramConfig(
             bot_token="T",
             allowed_chat_ids=allowed_chat_ids,
             backend_url="http://backend.test",
             bridge_secret="bridge-secret",
+            realm_id="telegram:700001",
+            bot_id=700001,
         ),
         tg_client=tg,
         api_client=api,
     )
+    bridge._initialize_bot_identity({"id": 700001})
+    return bridge
 
 
 def _update(user_id: int = 77, *, update_id: int = 1, text: str = "привет") -> dict:
@@ -96,6 +100,8 @@ def test_empty_allowlist_auto_registers_and_scopes_every_user_backend_call():
             return httpx.Response(
                 200,
                 json={
+                    "realm_id": "telegram:700001",
+                    "bot_id": 700001,
                     "session_token": "short-lived-session",
                     "expires_at": "2099-01-01T00:00:00Z",
                     "user": {"id": "user-77", "preset_key": "user", "created": True},
@@ -124,6 +130,8 @@ def test_empty_allowlist_auto_registers_and_scopes_every_user_backend_call():
 
     assert registration == [
         {
+            "realm_id": "telegram:700001",
+            "bot_id": 700001,
             "update_id": 1,
             "telegram_user": {
                 "id": 77,
@@ -182,6 +190,8 @@ def test_bridge_offers_existing_scoped_session_for_backend_reuse():
             return httpx.Response(
                 200,
                 json={
+                    "realm_id": "telegram:700001",
+                    "bot_id": 700001,
                     "session_token": "reusable-session",
                     "session_id": "session-1",
                     "expires_at": "2099-01-01T00:00:00Z",

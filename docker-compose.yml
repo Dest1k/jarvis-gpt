@@ -3,6 +3,8 @@ services:
     profiles: ["llm"]
     image: ${JARVIS_VLLM_IMAGE:-vllm/vllm-openai:v0.23.0}
     container_name: jarvis-gpt-dispatcher
+    labels:
+      com.jarvis-gpt.dispatcher.operation-nonce: ${JARVIS_DISPATCHER_OPERATION_NONCE:-unmanaged}
     restart: unless-stopped
     ipc: host
     command: >
@@ -96,7 +98,8 @@ services:
       JARVIS_API_PORT: ${JARVIS_API_PORT:-8000}
       JARVIS_API_TOKEN: ${JARVIS_API_TOKEN:?set JARVIS_API_TOKEN to a random 32+ character secret}
       JARVIS_TELEGRAM_BRIDGE_SECRET: ${JARVIS_TELEGRAM_BRIDGE_SECRET:-}
-      JARVIS_TELEGRAM_REALM_ID: ${JARVIS_TELEGRAM_REALM_ID:-default}
+      JARVIS_TELEGRAM_REALM_ID: ${JARVIS_TELEGRAM_REALM_ID:-}
+      JARVIS_TELEGRAM_BOT_ID: ${JARVIS_TELEGRAM_BOT_ID:-}
       JARVIS_TELEGRAM_SESSION_TTL_SECONDS: ${JARVIS_TELEGRAM_SESSION_TTL_SECONDS:-900}
       JARVIS_API_REQUIRE_TOKEN_ON_LOOPBACK: ${JARVIS_API_REQUIRE_TOKEN_ON_LOOPBACK:-1}
       JARVIS_TELEGRAM_USER_RATE_LIMIT_PER_MINUTE: ${JARVIS_TELEGRAM_USER_RATE_LIMIT_PER_MINUTE:-30}

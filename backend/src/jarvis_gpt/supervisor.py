@@ -202,6 +202,10 @@ class RuntimeSupervisor:
         self._last_health_at: str | None = None
         self._last_health_attempt_at: str | None = None
         self._last_health_attempt_ok: bool | None = None
+        # A failed required readiness component is retried quickly until it recovers.
+        # The regular diagnostics cadence can be several minutes and must not keep
+        # /health stale after a long-running model finally becomes ready.
+        self._health_recovery_pending = False
         self._last_learning_at: str | None = None
         self._last_cognition_at: str | None = None
         self._last_cognition_error: str | None = None
@@ -224,8 +228,8 @@ class RuntimeSupervisor:
         self._self_heal_budget_alerted = False
         self._self_heal_count = 0
         self._last_self_heal_at: str | None = None
-        # After a restart, suppress probing until this monotonic deadline so a large model
-        # reloading is not mistaken for a fresh failure and thrashed.
+        # Observed Docker warmup deadline, anchored to the container's StartedAt. It is
+        # diagnostic state only: health is still probed so a real crash is never hidden.
         self._self_heal_grace_until = 0.0
 
     async def start(self) -> None:
@@ -344,6 +348,7 @@ class RuntimeSupervisor:
             "last_health_at": self._last_health_at,
             "last_health_attempt_at": self._last_health_attempt_at,
             "last_health_attempt_ok": self._last_health_attempt_ok,
+            "health_recovery_pending": self._health_recovery_pending,
             "last_learning_at": self._last_learning_at,
             "last_cognition_at": self._last_cognition_at,
             "last_cognition_error": self._last_cognition_error,
@@ -397,8 +402,14 @@ class RuntimeSupervisor:
 
     async def _health_loop(self) -> None:
         while True:
-            await asyncio.sleep(max(60, self.settings.health_interval_sec))
+            await asyncio.sleep(self._health_poll_interval())
             await self._record_health()
+
+    def _health_poll_interval(self) -> float:
+        regular = float(max(60, self.settings.health_interval_sec))
+        # During warmup/recovery, converge persisted readiness quickly. This is bounded
+        # and returns to the configured cadence as soon as every required component is ok.
+        return min(regular, 15.0) if self._health_recovery_pending else regular
 
     async def _background_job_loop(self) -> None:
         while True:
@@ -1089,9 +1100,9 @@ class RuntimeSupervisor:
         consecutive unhealthy probes, and only after ``_classify_dispatcher`` confirms the
         container actually crashed (not a clean owner stop or a never-started box).
 
-        Three guards keep it from doing harm: (1) after a restart, a grace window lets a
-        big model (re)load before the next probe, so a slow warmup is not mistaken for a
-        fresh failure and thrashed; (2) only a STABLE non-restart reason (owner stopped it,
+        Three guards keep it from doing harm: (1) Docker ``health=starting`` plus the
+        remaining StartedAt-based profile deadline distinguishes warmup from a hang without
+        hiding real health probes; (2) only a STABLE non-restart reason (owner stopped it,
         no container, no docker) latches self-healing off until the dispatcher returns —
         a TRANSIENT reason (a `docker ps` hiccup) is retried, never latched; (3) a
         rolling-window restart budget; exhausting it escalates once AND stops restarting
@@ -1100,14 +1111,11 @@ class RuntimeSupervisor:
 
         if not self.settings.self_healing_enabled or not self.settings.llm_enabled:
             return
-        # A just-restarted dispatcher may still be loading a large model. Stay quiet for
-        # the grace window instead of counting the warmup as a fresh failure.
-        if self._self_heal_grace_until and time.monotonic() < self._self_heal_grace_until:
-            return
         if await self._dispatcher_is_live():
             self._self_heal_streak = 0
             self._self_heal_blocked = False
             self._self_heal_budget_alerted = False
+            self._self_heal_grace_until = 0.0
             # A recovered dispatcher earns a fresh restart budget for any future incident.
             self._self_heal_history = []
             return
@@ -1121,10 +1129,19 @@ class RuntimeSupervisor:
         if dispatcher is None:
             # No handle to restart with. Do NOT latch — one may appear; retry next tick.
             return
-        action, detail = await asyncio.to_thread(self._classify_dispatcher, dispatcher)
+        action, detail, warmup_remaining = await asyncio.to_thread(
+            self._classify_dispatcher,
+            dispatcher,
+        )
         if action == "transient":
             # An ambiguous probe (docker daemon hiccup / status timeout). Do NOT latch —
             # the real state will be seen on a later tick and healed/escalated then.
+            return
+        if action == "warming":
+            # Anchor the deadline to Docker StartedAt. Re-detecting the same warmup must
+            # never grant a fresh full profile window.
+            self._self_heal_streak = 0
+            self._open_self_heal_grace(warmup_remaining)
             return
         if action == "stable":
             # Owner stopped it / never launched it / no docker — latch until it returns.
@@ -1166,7 +1183,7 @@ class RuntimeSupervisor:
             self.dispatcher = None
         return self.dispatcher
 
-    def _classify_dispatcher(self, dispatcher: Any) -> tuple[str, str]:
+    def _classify_dispatcher(self, dispatcher: Any) -> tuple[str, str, float]:
         """Classify an unresponsive dispatcher into restart / stable-skip / transient-skip.
 
         - ``"restart"``: a genuine failure worth an automatic restart — a crashed/OOM-killed
@@ -1177,6 +1194,8 @@ class RuntimeSupervisor:
         - ``"stable"``: a state that only the owner changes — a clean ``Exited (0)`` (they
           stopped it), a genuinely-absent container (never launched), or no Docker at all.
           The caller latches self-healing off until the dispatcher returns.
+        - ``"warming"``: Docker reports ``health=starting`` and the container age is still
+          within this profile's readiness deadline. The caller opens a warmup grace window.
         - ``"transient"``: an ambiguous probe that must be retried, never latched — a
           ``docker ps`` that errored (daemon restarting/timeout), a raised ``status()``, or
           an unrecognized container state.
@@ -1185,32 +1204,51 @@ class RuntimeSupervisor:
         try:
             status = dispatcher.status()
         except Exception as exc:  # noqa: BLE001
-            return ("transient", f"status-error:{exc.__class__.__name__}")
+            return ("transient", f"status-error:{exc.__class__.__name__}", 0.0)
         if not isinstance(status, dict):
-            return ("transient", "status-unavailable")
+            return ("transient", "status-unavailable", 0.0)
         if not status.get("docker_available"):
-            return ("stable", "docker-unavailable")
+            return ("stable", "docker-unavailable", 0.0)
         container = status.get("container_status")
         if isinstance(container, dict) and container.get("ok") is False:
             # `docker ps` itself failed (daemon down/restarting, timeout) — not proof the
             # container is gone. Retry rather than latch off on a transient docker hiccup.
-            return ("transient", "docker-query-failed")
+            return ("transient", "docker-query-failed", 0.0)
         if not isinstance(container, dict) or not container.get("exists"):
-            return ("stable", "no-container")
+            return ("stable", "no-container", 0.0)
         state = str(container.get("status") or "")
         lowered = state.casefold()
         if lowered.startswith("up"):
-            return ("restart", "running-but-unresponsive")
+            if container.get("inspect_ok") is False:
+                return ("transient", "container-inspect-failed", 0.0)
+            health = str(container.get("health") or "").casefold()
+            if not health and "health: starting" in lowered:
+                health = "starting"
+            if health == "starting":
+                started_at = _parse_utc_datetime(container.get("started_at"))
+                if started_at is None:
+                    return ("transient", "warming-start-time-unavailable", 0.0)
+                age = max(0.0, (datetime.now(UTC) - started_at).total_seconds())
+                readiness_deadline = max(
+                    0.0, float(self.settings.profile.readiness_deadline_sec)
+                )
+                if age < readiness_deadline:
+                    return (
+                        "warming",
+                        "container-health-starting",
+                        max(0.0, readiness_deadline - age),
+                    )
+            return ("restart", "running-but-unresponsive", 0.0)
         if lowered.startswith("restarting"):
             # Crash-looping under the compose restart policy — the dominant crash signature.
-            return ("restart", "restarting-crash-loop")
+            return ("restart", "restarting-crash-loop", 0.0)
         exit_code = _container_exit_code(state)
         if exit_code is not None and exit_code != 0:
-            return ("restart", f"exited-{exit_code}")
+            return ("restart", f"exited-{exit_code}", 0.0)
         if exit_code == 0:
-            return ("stable", "stopped-clean")
+            return ("stable", "stopped-clean", 0.0)
         # Created / Paused / Removing / Dead / empty — don't guess a restart; retry.
-        return ("transient", f"unknown-state:{lowered[:24]}")
+        return ("transient", f"unknown-state:{lowered[:24]}", 0.0)
 
     def _self_heal_budget_ok(self) -> bool:
         now = time.monotonic()
@@ -1218,25 +1256,51 @@ class RuntimeSupervisor:
         self._self_heal_history = [t for t in self._self_heal_history if now - t < window]
         return len(self._self_heal_history) < max(1, self.settings.self_healing_max_restarts)
 
+    def _open_self_heal_grace(self, remaining_seconds: float) -> None:
+        self._self_heal_grace_until = time.monotonic() + max(
+            0.0,
+            float(remaining_seconds),
+        )
+
     def _restart_dispatcher(self, dispatcher: Any) -> dict[str, Any]:
         # Force a fresh container: stop first (clears a hung process), then bring it up
         # with independent state verification.
-        down: dict[str, Any] = {}
-        with suppress(Exception):
-            down = dispatcher.run_compose("down") or {}
-        up = dispatcher.run_compose_verified("up")
+        try:
+            status = dispatcher.status()
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "ok": False,
+                "summary": f"restart identity probe failed: {exc.__class__.__name__}",
+            }
+        container = status.get("container_status") if isinstance(status, dict) else None
+        previous_id = (
+            str(container.get("id") or "").strip().casefold()
+            if isinstance(container, dict)
+            else ""
+        )
+        if re.fullmatch(r"[0-9a-f]{64}", previous_id) is None:
+            return {
+                "ok": False,
+                "summary": "restart refused: full immutable dispatcher ID is unavailable",
+            }
+        restart = getattr(dispatcher, "restart_verified", None)
+        if not callable(restart):
+            return {
+                "ok": False,
+                "summary": "restart refused: atomic exact-ID dispatcher API is unavailable",
+            }
+        up = restart(previous_id)
         # If the stop failed, `up` may take the "reused" branch and keep the still-running
         # hung container instead of replacing it — report that as a failed restart so the
         # owner is alerted rather than being told the brain is fine.
-        reused = bool(isinstance(up, dict) and (up.get("replacement") or {}).get("reused"))
-        if isinstance(down, dict) and down.get("ok") is False and reused:
-            return {
-                "ok": False,
-                "summary": (
-                    "stop failed and up reused the still-running container: "
-                    f"{down.get('summary') or down.get('stderr') or 'unknown'}"
-                ),
-            }
+        if isinstance(up, dict) and up.get("ok"):
+            ownership_commit = up.get("ownership_commit")
+            if isinstance(ownership_commit, dict) and not ownership_commit.get("ok"):
+                up = {
+                    **up,
+                    "ok": False,
+                    "summary": "restart verification passed but ownership commit failed",
+                }
         return up
 
     async def _perform_self_heal(self, dispatcher: Any, detail: str) -> None:
@@ -1244,11 +1308,8 @@ class RuntimeSupervisor:
         self._self_heal_streak = 0
         self._self_heal_count += 1
         self._last_self_heal_at = utc_now()
-        # Open the grace window now so the (slow) restart + model reload is not probed and
-        # re-restarted mid-warmup by the next tick.
-        self._self_heal_grace_until = time.monotonic() + max(
-            0, self.settings.self_healing_grace_sec
-        )
+        # A previous container's grace must never suppress retries for this attempt.
+        self._self_heal_grace_until = 0.0
         with suppress(Exception):
             self.storage.add_event(
                 kind="self_heal.restart",
@@ -1262,6 +1323,13 @@ class RuntimeSupervisor:
         result = await asyncio.to_thread(self._restart_dispatcher, dispatcher)
         ok = bool(isinstance(result, dict) and result.get("ok"))
         summary = str(result.get("summary")) if isinstance(result, dict) else ""
+        if ok:
+            action, _post_restart_detail, warmup_remaining = await asyncio.to_thread(
+                self._classify_dispatcher,
+                dispatcher,
+            )
+            if action == "warming":
+                self._open_self_heal_grace(warmup_remaining)
         with suppress(Exception):
             self.storage.add_event(
                 kind="self_heal.result",
@@ -1321,6 +1389,19 @@ class RuntimeSupervisor:
                 llm=self.llm,
                 persist=True,
             )
+            required_components = {
+                "runtime.home",
+                "runtime.data",
+                "runtime.cache",
+                "runtime.logs",
+                "storage.sqlite",
+            }
+            if self.settings.llm_enabled:
+                required_components.add("llm.router")
+            check_statuses = {check.name: check.status.casefold() for check in result.checks}
+            self._health_recovery_pending = any(
+                check_statuses.get(component) != "ok" for component in required_components
+            )
             self._last_health_at = utc_now()
             self._last_health_attempt_ok = True
             error_count = sum(1 for check in result.checks if check.status == "error")
@@ -1336,6 +1417,7 @@ class RuntimeSupervisor:
                     payload={"checks": len(result.checks), "ok": result.ok},
                 )
         except Exception as exc:  # noqa: BLE001
+            self._health_recovery_pending = True
             self._last_error = str(exc) or exc.__class__.__name__
             with suppress(Exception):
                 self.storage.add_event(

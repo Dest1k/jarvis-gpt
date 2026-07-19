@@ -3,10 +3,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
-from jarvis_gpt.agent import AgentContext, AgentRuntime
+from jarvis_gpt.agent import AgentContext, AgentRuntime, ChatUnavailableError
 from jarvis_gpt.approval_executor import ApprovalExecutor
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
 from jarvis_gpt.dispatcher import DispatcherManager
@@ -16,7 +17,7 @@ from jarvis_gpt.experience import DEFAULT_AUTONOMY_POLICY
 from jarvis_gpt.ingest import FileIngestor
 from jarvis_gpt.llm import LLMStreamChunk
 from jarvis_gpt.models import ToolRunResponse
-from jarvis_gpt.storage import JarvisStorage
+from jarvis_gpt.storage import _CHAT_REQUEST_METADATA, JarvisStorage
 
 
 def _result(content: str, ok: bool = True, finish_reason: str | None = None):
@@ -96,6 +97,105 @@ def test_agentic_loop_runs_safe_tool_then_answers(monkeypatch, tmp_path):
         event.type == "tool_call" and event.payload.get("autonomous")
         for event in response.events
     )
+    storage.close()
+
+
+def test_owner_service_outage_retries_same_user_turn_without_fake_fallback(
+    monkeypatch,
+    tmp_path,
+):
+    class RecoveringLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, messages, *, temperature=None, max_tokens=None, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return SimpleNamespace(
+                    ok=False,
+                    content="",
+                    error="Qwen unavailable",
+                    raw={},
+                    failure_scope="service",
+                )
+            return _result("Готов.")
+
+    llm = RecoveringLLM()
+    agent, storage = _agent(monkeypatch, tmp_path, llm)
+    storage.set_runtime_value("experience.autonomy_policy", {"verify_answers": False})
+    conversation_id = storage.create_conversation("Owner retry")
+    kwargs = {
+        "conversation_id": conversation_id,
+        "transport_request_id": "telegram:owner:outage-1",
+    }
+
+    with pytest.raises(ChatUnavailableError) as raised:
+        asyncio.run(agent.chat("Ответь: готов", **kwargs))
+
+    assert raised.value.retry_scope == "service"
+    assert [item["role"] for item in storage.list_messages(conversation_id)] == ["user"]
+
+    response = asyncio.run(agent.chat("Ответь: готов", **kwargs))
+    rows_after_success = storage.list_messages(conversation_id)
+    replay = asyncio.run(agent.chat("Ответь: готов", **kwargs))
+
+    assert response.answer == "Готов."
+    assert replay == response
+    assert storage.list_messages(conversation_id) == rows_after_success
+    assert [item["role"] for item in rows_after_success] == ["user", "assistant"]
+    assert llm.calls == 2
+    storage.close()
+
+
+def test_pending_request_recovers_persisted_assistant_before_active_lease_expires(
+    monkeypatch,
+    tmp_path,
+):
+    class OneShotLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, messages, *, temperature=None, max_tokens=None, **kwargs):
+            self.calls += 1
+            return _result("Ответ сохранён.")
+
+    llm = OneShotLLM()
+    agent, storage = _agent(monkeypatch, tmp_path, llm)
+    storage.set_runtime_value("experience.autonomy_policy", {"verify_answers": False})
+    original_complete = agent._complete_chat_request
+    original_release = agent._release_chat_request
+
+    def crash_after_assistant(*_args, **_kwargs):
+        raise SystemExit("simulated process loss")
+
+    monkeypatch.setattr(agent, "_complete_chat_request", crash_after_assistant)
+    monkeypatch.setattr(agent, "_release_chat_request", lambda _handle: None)
+
+    with pytest.raises(SystemExit):
+        asyncio.run(
+            agent.chat(
+                "Сохрани ответ",
+                transport_request_id="telegram:owner:crash-window-1",
+            )
+        )
+
+    rows_after_crash = storage.list_conversations(limit=1)
+    conversation_id = rows_after_crash[0]["id"]
+    history_after_crash = storage.list_messages(conversation_id)
+    assert [item["role"] for item in history_after_crash] == ["user", "assistant"]
+
+    monkeypatch.setattr(agent, "_complete_chat_request", original_complete)
+    monkeypatch.setattr(agent, "_release_chat_request", original_release)
+    replay = asyncio.run(
+        agent.chat(
+            "Сохрани ответ",
+            transport_request_id="telegram:owner:crash-window-1",
+        )
+    )
+
+    assert replay.answer == "Ответ сохранён."
+    assert storage.list_messages(conversation_id) == history_after_crash
+    assert llm.calls == 1
     storage.close()
 
 
@@ -203,6 +303,171 @@ def test_agentic_stream_reports_completed_tool_when_synthesis_stream_dies(
     assert done is not None
     assert done["events"][-1]["payload"]["source"] == "tool_fallback"
     assert done["events"][-1]["payload"]["finish_reason"] == "synthesis_error"
+    storage.close()
+
+
+def test_stream_service_outage_without_output_is_structured_and_saves_no_assistant(
+    monkeypatch,
+    tmp_path,
+):
+    class OutageStreamLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None, **kwargs):
+            return _result("unused")
+
+        async def stream_complete(
+            self, messages, *, temperature=None, max_tokens=None, **kwargs
+        ):
+            yield LLMStreamChunk(
+                kind="error",
+                error="Qwen stream unavailable",
+                failure_scope="service",
+            )
+
+    agent, storage = _agent(monkeypatch, tmp_path, OutageStreamLLM())
+    storage.set_runtime_value("experience.autonomy_policy", {"verify_answers": False})
+    conversation_id = storage.create_conversation("Stream outage")
+
+    async def collect():
+        return [
+            item
+            async for item in agent.stream_chat(
+                "Ответь кратко",
+                conversation_id=conversation_id,
+                transport_request_id="stream:owner:outage-1",
+            )
+        ]
+
+    items = asyncio.run(collect())
+
+    assert items[-1] == {
+        "type": "error",
+        "error": "Qwen stream unavailable",
+        "failure_scope": "service",
+        "retry_class": "llm-outage",
+    }
+    assert not any(item.get("type") == "done" for item in items)
+    assert [item["role"] for item in storage.list_messages(conversation_id)] == ["user"]
+    storage.close()
+
+
+def test_cancelled_partial_stream_is_not_replayed_as_terminal_answer(
+    monkeypatch,
+    tmp_path,
+):
+    class RecoveringQwenStream:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream_complete(
+            self, messages, *, temperature=None, max_tokens=None, **kwargs
+        ):
+            self.calls += 1
+            content = "cut partial" if self.calls == 1 else "complete terminal answer"
+            yield LLMStreamChunk(kind="delta", content=content)
+            yield LLMStreamChunk(kind="done", finish_reason="stop")
+
+    llm = RecoveringQwenStream()
+    agent, storage = _agent(monkeypatch, tmp_path, llm)
+    storage.set_runtime_value("experience.autonomy_policy", {"verify_answers": False})
+    request_id = "stream:owner:cancelled-1"
+
+    async def scenario():
+        first_stream = agent.stream_chat(
+            "answer once",
+            transport_request_id=request_id,
+        )
+        conversation_id = ""
+        partial = ""
+        while True:
+            item = await anext(first_stream)
+            if item.get("type") == "meta":
+                conversation_id = str(item.get("conversation_id") or "")
+            if item.get("type") == "delta":
+                partial += str(item.get("content") or "")
+                break
+        assert _CHAT_REQUEST_METADATA.get() is None
+        await first_stream.aclose()
+        retried = [
+            item
+            async for item in agent.stream_chat(
+                "answer once",
+                transport_request_id=request_id,
+            )
+        ]
+        return conversation_id, partial, retried
+
+    conversation_id, partial, retried = asyncio.run(scenario())
+    done = next(item for item in retried if item.get("type") == "done")
+    history = storage.list_messages(conversation_id)
+
+    assert partial == "cut partial"
+    assert done["answer"] == "complete terminal answer"
+    assert done.get("source") != "idempotent_response_replay"
+    assert llm.calls == 2
+    assert [item["role"] for item in history] == ["user", "assistant"]
+    assert history[-1]["metadata"]["chat_request_terminal"] is True
+    storage.close()
+
+
+def test_partial_qwen_stream_error_retries_instead_of_completing_partial(
+    monkeypatch,
+    tmp_path,
+):
+    class RecoveringQwenStream:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream_complete(
+            self, messages, *, temperature=None, max_tokens=None, **kwargs
+        ):
+            self.calls += 1
+            if self.calls == 1:
+                yield LLMStreamChunk(kind="delta", content="cut partial")
+                yield LLMStreamChunk(
+                    kind="error",
+                    error="Qwen stream unavailable",
+                    failure_scope="service",
+                )
+                return
+            yield LLMStreamChunk(kind="delta", content="complete terminal answer")
+            yield LLMStreamChunk(kind="done", finish_reason="stop")
+
+    llm = RecoveringQwenStream()
+    agent, storage = _agent(monkeypatch, tmp_path, llm)
+    storage.set_runtime_value("experience.autonomy_policy", {"verify_answers": False})
+    request_id = "stream:owner:partial-error-1"
+
+    async def collect():
+        first = [
+            item
+            async for item in agent.stream_chat(
+                "answer once",
+                transport_request_id=request_id,
+            )
+        ]
+        second = [
+            item
+            async for item in agent.stream_chat(
+                "answer once",
+                transport_request_id=request_id,
+            )
+        ]
+        return first, second
+
+    first, second = asyncio.run(collect())
+    conversation_id = next(
+        item["conversation_id"] for item in first if item.get("type") == "meta"
+    )
+    history = storage.list_messages(conversation_id)
+
+    assert first[-1]["type"] == "error"
+    assert first[-1]["retry_class"] == "llm-outage"
+    assert not any(item.get("type") == "done" for item in first)
+    assert next(item for item in second if item.get("type") == "done")["answer"] == (
+        "complete terminal answer"
+    )
+    assert llm.calls == 2
+    assert [item["role"] for item in history] == ["user", "assistant"]
     storage.close()
 
 
@@ -983,9 +1248,9 @@ def test_unfinished_operator_effect_is_not_replayed_by_new_message_id(
 
     assert [name for name, _args in runs] == ["browser.click"]
     assert first.events[-1].payload["source"] == "tool_fallback"
-    assert any(
-        event.title == "Durable duplicate effect skipped" for event in second.events
-    )
+    assert second.answer == first.answer
+    ledger = storage.list_runtime_values(prefix="agent.operator_effect.")[0]["value"]
+    assert next(iter(ledger["requests"].values()))["status"] == "completed"
 
     # A restated command is a deliberate new operator request and gets a fresh
     # effect claim even though the canonical tool effect is identical.
@@ -1126,6 +1391,16 @@ def test_completed_operator_turn_fences_exact_http_response_retry(
 
     # Treat the first successful response as lost by the HTTP client.
     first = asyncio.run(agent.chat(message, transport_request_id="telegram:default:1"))
+    ledger_item = storage.list_runtime_values(prefix="agent.operator_effect.")[0]
+    ledger = ledger_item["value"]
+    request_state = next(iter(ledger["requests"].values()))
+    # Telegram may retain a machine-classified outage for 24 hours. A response
+    # lost before that outage must remain fenced well beyond the former 20-minute TTL.
+    request_state["completed_at"] = (
+        datetime.now(UTC) - timedelta(hours=23)
+    ).isoformat()
+    request_state["updated_at"] = request_state["completed_at"]
+    storage.set_runtime_value(ledger_item["key"], ledger)
     agent.llm = ToolThenAnswerLLM()
     retry = asyncio.run(
         agent.chat(
@@ -1136,10 +1411,7 @@ def test_completed_operator_turn_fences_exact_http_response_retry(
     )
 
     assert runs == ["browser.click"]
-    assert retry.answer == first.answer
-    assert any(
-        event.title == "Idempotent response replay" for event in retry.events
-    )
+    assert retry == first
 
     # The same words in a different Telegram update are a deliberate new turn.
     agent.llm = ToolThenAnswerLLM()
@@ -1165,6 +1437,68 @@ def test_completed_operator_turn_fences_exact_http_response_retry(
     assert not any(
         event.title == "Durable duplicate effect skipped" for event in repeated.events
     )
+    storage.close()
+
+
+def test_safe_reminder_mutation_fences_exact_http_response_retry(
+    monkeypatch,
+    tmp_path,
+):
+    class ReminderThenAnswerLLM:
+        async def complete(self, messages, *, temperature=None, max_tokens=None, **kwargs):
+            if any("Ты intent-router" in item["content"] for item in messages):
+                return _result(
+                    '{"route":"local_action","confidence":0.99,'
+                    '"rationale":"explicit reminder"}'
+                )
+            if any(
+                "observation[reminders.create" in item["content"]
+                for item in messages
+                if item["role"] == "user"
+            ):
+                return _result("Напоминание создано.")
+            return _result(
+                '{"tool":"reminders.create","arguments":'
+                '{"text":"проверить бэкап","when":"завтра в 10"}}'
+            )
+
+    agent, storage = _agent(monkeypatch, tmp_path, ReminderThenAnswerLLM())
+    storage.set_runtime_value("experience.autonomy_policy", {"verify_answers": False})
+    original_run = agent.tools.run
+    runs: list[str] = []
+
+    async def counted_run(name, arguments=None, **kwargs):
+        runs.append(name)
+        return await original_run(name, arguments, **kwargs)
+
+    monkeypatch.setattr(agent.tools, "run", counted_run)
+    message = "Напомни завтра в 10 проверить бэкап"
+    first = asyncio.run(
+        agent.chat(message, transport_request_id="telegram:700001:reminder-1")
+    )
+
+    # Simulate loss of the successful HTTP response and an exact Telegram retry.
+    retry = asyncio.run(
+        agent.chat(
+            message,
+            conversation_id=first.conversation_id,
+            transport_request_id="telegram:700001:reminder-1",
+        )
+    )
+
+    assert runs == ["reminders.create"]
+    assert len(storage.list_reminders(status="pending", limit=1000)) == 1
+    assert retry == first
+
+    asyncio.run(
+        agent.chat(
+            message,
+            conversation_id=first.conversation_id,
+            transport_request_id="telegram:700001:reminder-2",
+        )
+    )
+    assert runs == ["reminders.create", "reminders.create"]
+    assert len(storage.list_reminders(status="pending", limit=1000)) == 2
     storage.close()
 
 

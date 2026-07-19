@@ -58,12 +58,16 @@ class TelegramChatPayload(BaseModel):
 
 
 class TelegramSessionRequest(BaseModel):
+    realm_id: str = Field(min_length=1, max_length=120)
+    bot_id: int = Field(gt=0)
     update_id: int = Field(ge=0)
     telegram_user: TelegramUserPayload
     chat: TelegramChatPayload
 
 
 class TelegramSessionResponse(BaseModel):
+    realm_id: str
+    bot_id: int
     session_token: str
     session_id: str
     expires_at: str

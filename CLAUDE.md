@@ -24,6 +24,9 @@ Guidance for AI coding agents working in this repository.
   prompting, routing, tools, memory, vision, or model-facing behavior, exercise the
   real running stack with its live configured LLM and verify the actual response/path.
   Mocks and unit tests remain regression coverage, not a substitute for that smoke test.
+- **Run model-facing tests only on Qwen.** Use the `qwen36-vl` profile for live, GUI,
+  API, Telegram, recovery, and soak validation. Do not start, switch to, or exercise
+  Gemma during tests unless the owner explicitly changes this directive.
 
 ## Project layout
 
@@ -85,7 +88,7 @@ and after a change rather than assuming a red test is a new regression.
 
 ## Hybrid brain (scaffold — INACTIVE)
 
-- The active brain is the local Gemma profile. `backend/src/jarvis_gpt/frontier_brain.py`
+- The active test profile is local Qwen (`qwen36-vl`). `backend/src/jarvis_gpt/frontier_brain.py`
   is a **prepared-but-off** second brain that can delegate hard reasoning/synthesis to a
   frontier model. It is dormant: `build_frontier_brain` returns `None` and `select_brain`
   returns `"local"` unless the owner opts in, so `LLMRouter.frontier` is `None` and nothing

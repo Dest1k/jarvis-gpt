@@ -6,6 +6,7 @@ import binascii
 import hashlib
 import ipaddress
 import json
+import logging
 import os
 import re
 import secrets
@@ -37,7 +38,12 @@ from starlette.routing import Match
 from . import speech
 from .admin_api import ADMIN_API_CAPABILITIES
 from .admin_api import router as admin_router
-from .agent import AgentRuntime
+from .agent import (
+    AgentRuntime,
+    ChatRequestConflictError,
+    ChatRequestInProgressError,
+    ChatUnavailableError,
+)
 from .approval_executor import ApprovalExecutor
 from .authorization import (
     CORE_CAPABILITIES,
@@ -145,6 +151,8 @@ from .supervisor import RuntimeSupervisor
 from .telemetry import TelemetryCollector
 from .tools import ToolRegistry, browser_handoff_snapshot, internet_observability_snapshot
 from .web_surfer_adapter import WebSurferAdapter
+
+LOGGER = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -1022,8 +1030,12 @@ async def local_api_guard(request: Request, call_next):
             _api_token(),
             os.environ.get("TELEGRAM_BOT_TOKEN", "").strip(),
         )
-        if len(expected) < 32 or any(
-            item and secrets.compare_digest(expected, item) for item in reused_secrets
+        if (
+            len(expected) < 32
+            or any(
+                item and secrets.compare_digest(expected, item)
+                for item in reused_secrets
+            )
         ):
             return JSONResponse(
                 {"detail": "Telegram bridge authentication is not configured safely."},
@@ -1803,11 +1815,39 @@ async def chat(request: ChatRequest) -> ChatResponse:
             ),
             transport_request_id=request.request_id,
         )
-    except ResourceIsolationError as exc:
+    except (
+        AuthorizationError,
+        ChatRequestConflictError,
+        ChatRequestInProgressError,
+        ChatUnavailableError,
+        ResourceIsolationError,
+    ) as exc:
+        raise _chat_http_exception(exc) from exc
+
+
+def _chat_http_exception(exc: Exception) -> HTTPException:
+    if isinstance(exc, ResourceIsolationError):
         # A foreign id is indistinguishable from a missing conversation at the API.
-        raise HTTPException(status_code=404, detail="Conversation not found") from exc
-    except AuthorizationError as exc:
-        raise HTTPException(status_code=403, detail="Chat permission denied") from exc
+        return HTTPException(status_code=404, detail="Conversation not found")
+    if isinstance(exc, ChatUnavailableError):
+        return HTTPException(
+            status_code=503,
+            detail="Language model is temporarily unavailable",
+            headers=(
+                {"X-Jarvis-Retry-Class": "llm-outage"}
+                if exc.retry_scope == "service"
+                else None
+            ),
+        )
+    if isinstance(exc, ChatRequestInProgressError):
+        return HTTPException(
+            status_code=409,
+            detail=str(exc),
+            headers={"X-Jarvis-Retry-Class": "chat-request-in-progress"},
+        )
+    if isinstance(exc, ChatRequestConflictError):
+        return HTTPException(status_code=409, detail=str(exc))
+    return HTTPException(status_code=403, detail="Chat permission denied")
 
 
 @app.get("/api/voice/status")
@@ -1857,6 +1897,7 @@ async def voice_speak(request: VoiceSpeakRequest) -> Response:
 
 
 INTERRUPTED_STREAM_KEY_PREFIX = "agent.stream.interrupted."
+INTERRUPTED_STREAM_REQUEST_KEY_PREFIX = f"{INTERRUPTED_STREAM_KEY_PREFIX}request."
 
 
 def _persist_interrupted_stream(
@@ -1865,37 +1906,116 @@ def _persist_interrupted_stream(
     conversation_id: str | None,
     partial: list[str],
     events: list[dict[str, Any]],
+    request_id: str | None = None,
 ) -> dict[str, Any] | None:
     if not conversation_id:
         return None
     answer = "".join(partial).strip()
     if not answer:
         return None
-    message_id = storage.add_message(
-        conversation_id=conversation_id,
-        role="assistant",
-        content=answer,
-        metadata={
-            "duration_ms": None,
-            "events": events,
-            "interrupted": True,
-            "stream": True,
-        },
-    )
+    request_scope = str(request_id or "").strip()
+    request_hash = hashlib.sha256(
+        (
+            request_scope
+            if request_scope
+            else f"{conversation_id}\x00{answer}"
+        ).encode("utf-8")
+    ).hexdigest()
+    checkpoint_key = f"{INTERRUPTED_STREAM_REQUEST_KEY_PREFIX}{request_hash}"
     item = {
+        "protocol": "jarvis.interrupted-stream.v2",
         "conversation_id": conversation_id,
-        "message_id": message_id,
+        "checkpoint_id": f"stream_checkpoint_{request_hash[:16]}",
+        "request_hash": request_hash,
+        "answer": answer,
+        "events": events,
+        "terminal": False,
         "saved_at": utc_now(),
         "chars": len(answer),
     }
-    storage.set_runtime_value(f"{INTERRUPTED_STREAM_KEY_PREFIX}{conversation_id}", item)
+    index_key = f"{INTERRUPTED_STREAM_KEY_PREFIX}{conversation_id}"
+    previous = storage.get_runtime_value(index_key, None)
+    storage.set_runtime_value(checkpoint_key, item)
+    storage.set_runtime_value(
+        index_key,
+        {
+            "checkpoint_key": checkpoint_key,
+            "conversation_id": conversation_id,
+            "request_hash": request_hash,
+        },
+    )
+    previous_key = (
+        str(previous.get("checkpoint_key") or "")
+        if isinstance(previous, dict)
+        else ""
+    )
+    if previous_key and previous_key != checkpoint_key:
+        storage.delete_runtime_value(previous_key)
     storage.add_event(
         kind="agent.stream.interrupted",
         title="Interrupted streaming answer persisted.",
         level="warn",
-        payload=item,
+        payload={key: value for key, value in item.items() if key != "answer"},
     )
     return item
+
+
+def _clear_interrupted_stream(
+    storage: JarvisStorage,
+    *,
+    conversation_id: str | None,
+    request_id: str | None,
+) -> None:
+    if not conversation_id:
+        return
+    index_key = f"{INTERRUPTED_STREAM_KEY_PREFIX}{conversation_id}"
+    index = storage.get_runtime_value(index_key, None)
+    if not isinstance(index, dict):
+        return
+    request_scope = str(request_id or "").strip()
+    if request_scope:
+        request_hash = hashlib.sha256(request_scope.encode("utf-8")).hexdigest()
+        if index.get("request_hash") != request_hash:
+            return
+    checkpoint_key = str(index.get("checkpoint_key") or "")
+    if checkpoint_key:
+        storage.delete_runtime_value(checkpoint_key)
+    storage.delete_runtime_value(index_key)
+
+
+async def _close_chat_stream(stream: Any) -> None:
+    close = getattr(stream, "aclose", None)
+    if close is None:
+        return
+    try:
+        await close()
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - response cleanup cannot expose internals
+        LOGGER.exception("Failed to close backend chat stream")
+
+
+def _stream_error_envelope(exc: Exception) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "type": "error",
+        "error": "Streaming response failed",
+        "failure_scope": "request",
+    }
+    if isinstance(exc, ChatUnavailableError):
+        payload["error"] = "Language model is temporarily unavailable"
+        payload["failure_scope"] = exc.retry_scope
+        if exc.retry_scope == "service":
+            payload["retry_class"] = "llm-outage"
+    elif isinstance(exc, ChatRequestInProgressError):
+        payload["error"] = "Chat request is still being processed"
+        payload["retry_class"] = "chat-request-in-progress"
+    elif isinstance(exc, ChatRequestConflictError):
+        payload["error"] = "Chat request conflicts with an existing request"
+    elif isinstance(exc, ResourceIsolationError):
+        payload["error"] = "Conversation is unavailable"
+    elif isinstance(exc, AuthorizationError):
+        payload["error"] = "Chat permission denied"
+    return payload
 
 
 @app.post("/api/chat/stream")
@@ -1903,51 +2023,135 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
     if current_actor().preset_key == "guest":
         raise HTTPException(status_code=403, detail="Guest streaming is not available")
 
+    stream: Any = None
+    try:
+        stream = app.state.agent.stream_chat(
+            request.message,
+            conversation_id=request.conversation_id,
+            mode=request.mode,
+            temperature=request.temperature,
+            max_tokens=request.max_tokens,
+            attachments=[item.model_dump() for item in request.attachments],
+            thinking_enabled=request.thinking_enabled,
+            transport_request_id=request.request_id,
+        )
+        # Advance through authorization and the durable request claim before
+        # Starlette commits a 200 response header.
+        first_item = await anext(stream)
+    except asyncio.CancelledError:
+        await _close_chat_stream(stream)
+        raise
+    except (
+        AuthorizationError,
+        ChatRequestConflictError,
+        ChatRequestInProgressError,
+        ChatUnavailableError,
+        ResourceIsolationError,
+    ) as exc:
+        await _close_chat_stream(stream)
+        raise _chat_http_exception(exc) from exc
+    except StopAsyncIteration as exc:
+        await _close_chat_stream(stream)
+        raise HTTPException(
+            status_code=503,
+            detail="Streaming response ended before output",
+        ) from exc
+    except Exception as exc:
+        await _close_chat_stream(stream)
+        raise HTTPException(
+            status_code=503,
+            detail="Streaming response is temporarily unavailable",
+        ) from exc
+
     async def lines():
         conversation_id = request.conversation_id
         partial: list[str] = []
         events: list[dict[str, Any]] = []
-        saved_done = False
+        terminal_sent = False
+        item = first_item
         try:
-            async for item in app.state.agent.stream_chat(
-                request.message,
-                conversation_id=request.conversation_id,
-                mode=request.mode,
-                temperature=request.temperature,
-                max_tokens=request.max_tokens,
-                attachments=[item.model_dump() for item in request.attachments],
-                thinking_enabled=request.thinking_enabled,
-                transport_request_id=request.request_id,
-            ):
+            while True:
                 if item.get("type") == "meta":
-                    conversation_id = str(item.get("conversation_id") or conversation_id or "")
+                    conversation_id = str(
+                        item.get("conversation_id") or conversation_id or ""
+                    )
                 elif item.get("type") == "delta":
                     partial.append(str(item.get("content") or ""))
                 elif item.get("type") == "event" and isinstance(item.get("event"), dict):
                     events.append(item["event"])
                 elif item.get("type") == "done":
-                    saved_done = True
+                    _clear_interrupted_stream(
+                        app.state.storage,
+                        conversation_id=conversation_id,
+                        request_id=request.request_id,
+                    )
+                elif item.get("type") == "error":
+                    _persist_interrupted_stream(
+                        app.state.storage,
+                        conversation_id=conversation_id,
+                        partial=partial,
+                        events=events,
+                        request_id=request.request_id,
+                    )
+                terminal_sent = item.get("type") in {"done", "error"}
                 yield f"{json.dumps(item, ensure_ascii=False)}\n".encode()
+                if terminal_sent:
+                    return
+                try:
+                    item = await anext(stream)
+                except StopAsyncIteration as exc:
+                    item = _stream_error_envelope(exc)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    item = _stream_error_envelope(exc)
         except asyncio.CancelledError:
-            if not saved_done:
-                _persist_interrupted_stream(
-                    app.state.storage,
-                    conversation_id=conversation_id,
-                    partial=partial,
-                    events=events,
-                )
+            if not terminal_sent:
+                try:
+                    _persist_interrupted_stream(
+                        app.state.storage,
+                        conversation_id=conversation_id,
+                        partial=partial,
+                        events=events,
+                        request_id=request.request_id,
+                    )
+                except Exception:  # noqa: BLE001 - preserve cancellation semantics
+                    LOGGER.exception("Failed to checkpoint cancelled chat stream")
             raise
+        except Exception as exc:  # noqa: BLE001 - wire errors are sanitized
+            LOGGER.exception("Backend chat stream failed after response start")
+            if not terminal_sent:
+                with suppress(Exception):
+                    _persist_interrupted_stream(
+                        app.state.storage,
+                        conversation_id=conversation_id,
+                        partial=partial,
+                        events=events,
+                        request_id=request.request_id,
+                    )
+                terminal_sent = True
+                envelope = _stream_error_envelope(exc)
+                yield f"{json.dumps(envelope, ensure_ascii=False)}\n".encode()
+        finally:
+            await _close_chat_stream(stream)
 
     return StreamingResponse(lines(), media_type="application/x-ndjson")
 
 
 @app.get("/api/chat/stream/interrupted/{conversation_id}")
 async def interrupted_stream(conversation_id: str) -> dict[str, Any]:
-    item = app.state.storage.get_runtime_value(
-        f"{INTERRUPTED_STREAM_KEY_PREFIX}{conversation_id}",
-        None,
+    index = app.state.storage.get_runtime_value(
+        f"{INTERRUPTED_STREAM_KEY_PREFIX}{conversation_id}", None
     )
-    if item is None:
+    if not isinstance(index, dict):
+        raise HTTPException(status_code=404, detail="Interrupted stream not found")
+    checkpoint_key = str(index.get("checkpoint_key") or "")
+    item = (
+        app.state.storage.get_runtime_value(checkpoint_key, None)
+        if checkpoint_key
+        else index
+    )
+    if not isinstance(item, dict):
         raise HTTPException(status_code=404, detail="Interrupted stream not found")
     return item
 

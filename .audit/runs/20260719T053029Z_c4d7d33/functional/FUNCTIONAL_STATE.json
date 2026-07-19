@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "run_id": "20260719T053029Z_c4d7d33",
+  "functional_run_path": ".audit/runs/20260719T053029Z_c4d7d33/functional",
+  "status": "IN_PROGRESS",
+  "operator_ready": false,
+  "started_at_utc": "2026-07-19T05:30:29Z",
+  "source_head_at_start": "c4d7d3302bba5384d235295c7d8da37eb0cdb734",
+  "source_head_tested": null,
+  "source_drift": "NONE_AT_START",
+  "checkpoint_path": "D:\\jarvis\\audit-backups\\20260713T002206Z_686424795712\\pre-functional-resume\\checkpoint-20260719T053029Z",
+  "progress_percent": 8,
+  "counts": {
+    "scenarios": 0,
+    "operator_cases": 0,
+    "operator_repeats": 0,
+    "findings": 1
+  },
+  "profiles": ["qwen36-vl"],
+  "markers": {
+    "functional_ready": false,
+    "spark_ready": false
+  }
+}

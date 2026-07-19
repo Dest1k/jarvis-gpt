@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import time
+from datetime import UTC, datetime, timedelta
 
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
 from jarvis_gpt.storage import JarvisStorage
 from jarvis_gpt.supervisor import RuntimeSupervisor, _container_exit_code
+
+OLD_CONTAINER_ID = "a" * 64
+NEW_CONTAINER_ID = "b" * 64
+OPERATION_NONCE = "c" * 32
 
 
 class _CaptureBus:
@@ -28,21 +34,32 @@ class _FakeLLM:
 
 
 class _FakeDispatcher:
-    def __init__(self, status: dict, *, up_ok: bool = True) -> None:
+    def __init__(
+        self,
+        status: dict,
+        *,
+        up_ok: bool = True,
+        up_status: dict | None = None,
+    ) -> None:
         self._status = status
         self.up_ok = up_ok
+        self.up_status = up_status
         self.calls: list[tuple[str, str]] = []
 
     def status(self) -> dict:
         return self._status
 
-    def run_compose(self, action: str) -> dict:
-        self.calls.append(("compose", action))
-        return {"ok": True, "summary": f"{action} ok"}
-
-    def run_compose_verified(self, action: str) -> dict:
-        self.calls.append(("verified", action))
-        return {"ok": self.up_ok, "summary": f"{action} verified"}
+    def restart_verified(self, expected_container_id: str) -> dict:
+        self.calls.append(("restart", expected_container_id))
+        if self.up_ok and self.up_status is not None:
+            self._status = self.up_status
+        return {
+            "ok": self.up_ok,
+            "summary": "restart verified",
+            "container_id": NEW_CONTAINER_ID,
+            "operation_nonce": OPERATION_NONCE,
+            "ownership_commit": {"ok": self.up_ok},
+        }
 
 
 def _dispatcher_status(
@@ -52,6 +69,10 @@ def _dispatcher_status(
     exists: bool = True,
     state: str = "Exited (137) 2 minutes ago",
     container_ok: bool = True,
+    health: str = "",
+    started_at: str = "",
+    inspect_ok: bool | None = None,
+    container_id: str = OLD_CONTAINER_ID,
 ) -> dict:
     if not container_ok:
         # How dispatcher._container_status reports a failed `docker ps` (daemon
@@ -61,6 +82,11 @@ def _dispatcher_status(
         container = {"ok": True, "exists": exists}
         if exists:
             container["status"] = state
+            container["id"] = container_id
+            container["health"] = health
+            container["started_at"] = started_at
+            if inspect_ok is not None:
+                container["inspect_ok"] = inspect_ok
     return {
         "docker_available": docker,
         "port_open": port_open,
@@ -69,13 +95,20 @@ def _dispatcher_status(
 
 
 def _supervisor(
-    monkeypatch, tmp_path, *, llm_ok: bool, dispatcher: _FakeDispatcher | None, bus=None, env=None
+    monkeypatch,
+    tmp_path,
+    *,
+    llm_ok: bool,
+    dispatcher: _FakeDispatcher | None,
+    bus=None,
+    env=None,
+    profile: str = "qwen36-vl",
 ):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "1")
     for key, value in (env or {}).items():
         monkeypatch.setenv(key, value)
-    settings = load_settings()
+    settings = load_settings(profile)
     ensure_runtime_dirs(settings)
     storage = JarvisStorage(settings.database_path)
     storage.initialize()
@@ -123,9 +156,7 @@ def test_self_heal_restarts_crashed_dispatcher(monkeypatch, tmp_path):
 
     asyncio.run(scenario())
 
-    # down then verified up, so a hung/crashed container is fully replaced.
-    assert ("compose", "down") in dispatcher.calls
-    assert ("verified", "up") in dispatcher.calls
+    assert ("restart", OLD_CONTAINER_ID) in dispatcher.calls
     assert supervisor._self_heal_count == 1
     # owner is told twice: restarting… then restored.
     assert len(pushes) == 2
@@ -147,8 +178,44 @@ def test_self_heal_restarts_running_but_unresponsive(monkeypatch, tmp_path):
 
     asyncio.run(supervisor._maybe_self_heal())
 
-    assert ("verified", "up") in dispatcher.calls
+    assert ("restart", OLD_CONTAINER_ID) in dispatcher.calls
     assert supervisor._self_heal_count == 1
+    storage.close()
+
+
+def test_self_heal_does_not_report_success_when_ownership_commit_failed(
+    monkeypatch,
+    tmp_path,
+):
+    class CommitFailDispatcher(_FakeDispatcher):
+        def restart_verified(self, expected_container_id: str) -> dict:
+            self.calls.append(("restart", expected_container_id))
+            return {
+                "ok": True,
+                "summary": "runtime answered but state CAS failed",
+                "container_id": NEW_CONTAINER_ID,
+                "operation_nonce": OPERATION_NONCE,
+                "ownership_commit": {
+                    "ok": False,
+                    "reason": "launcher-state-write-failed:OSError",
+                },
+            }
+
+    dispatcher = CommitFailDispatcher(
+        _dispatcher_status(port_open=False, state="Up 5 minutes")
+    )
+    supervisor, storage = _supervisor(
+        monkeypatch,
+        tmp_path,
+        llm_ok=False,
+        dispatcher=dispatcher,
+        env={"JARVIS_SELF_HEALING_MIN_FAILURES": "1"},
+    )
+
+    result = supervisor._restart_dispatcher(dispatcher)
+
+    assert result["ok"] is False
+    assert "ownership commit failed" in result["summary"]
     storage.close()
 
 
@@ -203,6 +270,9 @@ def test_self_heal_respects_restart_budget_and_escalates(monkeypatch, tmp_path):
     async def scenario():
         for _ in range(5):
             await supervisor._maybe_self_heal()
+            # Deliberately expire each post-restart profile grace to exercise only the
+            # independent rolling restart budget in this test.
+            supervisor._self_heal_grace_until = 0.0
 
     asyncio.run(scenario())
 
@@ -228,7 +298,7 @@ def test_self_heal_restarts_crash_loop(monkeypatch, tmp_path):
     )
     _patch_push(monkeypatch)
     asyncio.run(supervisor._maybe_self_heal())
-    assert ("verified", "up") in dispatcher.calls
+    assert ("restart", OLD_CONTAINER_ID) in dispatcher.calls
     assert supervisor._self_heal_count == 1
     storage.close()
 
@@ -251,25 +321,209 @@ def test_self_heal_transient_docker_error_does_not_latch(monkeypatch, tmp_path):
     storage.close()
 
 
-def test_self_heal_grace_suppresses_reprobe_after_restart(monkeypatch, tmp_path):
-    # After a restart, the grace window must suppress the next probe entirely so a big
-    # model reloading is not mistaken for a fresh failure and re-restarted mid-warmup.
-    dispatcher = _FakeDispatcher(_dispatcher_status(state="Exited (137) 1 minute ago"))
+def test_self_heal_restart_uses_remaining_container_warmup_and_still_probes(
+    monkeypatch,
+    tmp_path,
+):
+    started_at = (datetime.now(UTC) - timedelta(seconds=120)).isoformat()
+    dispatcher = _FakeDispatcher(
+        _dispatcher_status(state="Exited (137) 1 minute ago"),
+        up_status=_dispatcher_status(
+            state="Up 2 minutes (health: starting)",
+            health="starting",
+            started_at=started_at,
+            inspect_ok=True,
+        ),
+    )
     supervisor, storage = _supervisor(
         monkeypatch, tmp_path, llm_ok=False, dispatcher=dispatcher,
-        env={"JARVIS_SELF_HEALING_MIN_FAILURES": "1", "JARVIS_SELF_HEALING_GRACE_SEC": "600"},
+        profile="qwen36-vl",
+        env={"JARVIS_SELF_HEALING_MIN_FAILURES": "1", "JARVIS_SELF_HEALING_GRACE_SEC": "0"},
     )
     _patch_push(monkeypatch)
 
-    asyncio.run(supervisor._maybe_self_heal())  # restart #1, opens the grace window
+    asyncio.run(supervisor._maybe_self_heal())
     assert supervisor._self_heal_count == 1
+    remaining = supervisor._self_heal_grace_until - time.monotonic()
+    assert 770 <= remaining <= 780
     calls_after_restart = supervisor.llm.calls
+    supervisor.llm.ok = True
 
-    asyncio.run(supervisor._maybe_self_heal())  # within grace → no probe, no restart
+    asyncio.run(supervisor._maybe_self_heal())  # observed warmup deadline does not hide probes
     asyncio.run(supervisor._maybe_self_heal())
 
-    assert supervisor._self_heal_count == 1  # no thrash during warmup
-    assert supervisor.llm.calls == calls_after_restart  # health not even probed in grace
+    assert supervisor._self_heal_count == 1
+    assert supervisor.llm.calls == calls_after_restart + 2
+    assert supervisor._self_heal_grace_until == 0.0
+    storage.close()
+
+
+def test_backend_start_does_not_open_blind_grace_for_healthy_model(monkeypatch, tmp_path):
+    dispatcher = _FakeDispatcher(_dispatcher_status(state="Up 1 hour", health="healthy"))
+    supervisor, storage = _supervisor(
+        monkeypatch,
+        tmp_path,
+        llm_ok=True,
+        dispatcher=dispatcher,
+        profile="qwen36-vl",
+        env={"JARVIS_AUTONOMY_ENABLED": "0", "JARVIS_SELF_HEALING_GRACE_SEC": "0"},
+    )
+
+    async def scenario() -> None:
+        await supervisor.start()
+        try:
+            assert supervisor._self_heal_grace_until == 0.0
+            calls_before = supervisor.llm.calls
+            await supervisor._maybe_self_heal()
+            assert supervisor.llm.calls == calls_before + 1
+            assert dispatcher.calls == []
+        finally:
+            await supervisor.stop()
+
+    asyncio.run(scenario())
+    storage.close()
+
+
+def test_external_start_health_starting_is_not_restarted(monkeypatch, tmp_path):
+    started_at = (datetime.now(UTC) - timedelta(seconds=120)).isoformat()
+    dispatcher = _FakeDispatcher(
+        _dispatcher_status(
+            state="Up 2 minutes (health: starting)",
+            health="starting",
+            started_at=started_at,
+            inspect_ok=True,
+        )
+    )
+    supervisor, storage = _supervisor(
+        monkeypatch,
+        tmp_path,
+        llm_ok=False,
+        dispatcher=dispatcher,
+        profile="qwen36-vl",
+        env={"JARVIS_SELF_HEALING_MIN_FAILURES": "1", "JARVIS_SELF_HEALING_GRACE_SEC": "0"},
+    )
+
+    asyncio.run(supervisor._maybe_self_heal())
+
+    assert dispatcher.calls == []
+    assert supervisor._self_heal_streak == 0
+    first_deadline = supervisor._self_heal_grace_until
+    assert 770 <= first_deadline - time.monotonic() <= 780
+
+    asyncio.run(supervisor._maybe_self_heal())
+
+    assert abs(supervisor._self_heal_grace_until - first_deadline) < 1.0
+    storage.close()
+
+
+def test_observed_warmup_deadline_does_not_hide_real_container_crash(monkeypatch, tmp_path):
+    started_at = (datetime.now(UTC) - timedelta(seconds=120)).isoformat()
+    dispatcher = _FakeDispatcher(
+        _dispatcher_status(
+            state="Up 2 minutes (health: starting)",
+            health="starting",
+            started_at=started_at,
+            inspect_ok=True,
+        )
+    )
+    supervisor, storage = _supervisor(
+        monkeypatch,
+        tmp_path,
+        llm_ok=False,
+        dispatcher=dispatcher,
+        profile="qwen36-vl",
+        env={"JARVIS_SELF_HEALING_MIN_FAILURES": "1"},
+    )
+    _patch_push(monkeypatch)
+
+    asyncio.run(supervisor._maybe_self_heal())
+    assert supervisor._self_heal_grace_until > time.monotonic()
+
+    dispatcher._status = _dispatcher_status(state="Exited (139) 1 second ago")
+    asyncio.run(supervisor._maybe_self_heal())
+
+    assert supervisor._self_heal_count == 1
+    assert ("restart", OLD_CONTAINER_ID) in dispatcher.calls
+    storage.close()
+
+
+def test_failed_dispatcher_restart_does_not_leave_retry_grace(monkeypatch, tmp_path):
+    dispatcher = _FakeDispatcher(
+        _dispatcher_status(state="Exited (137) 1 minute ago"),
+        up_ok=False,
+    )
+    supervisor, storage = _supervisor(
+        monkeypatch,
+        tmp_path,
+        llm_ok=False,
+        dispatcher=dispatcher,
+        profile="qwen36-vl",
+        env={"JARVIS_SELF_HEALING_MIN_FAILURES": "1"},
+    )
+    _patch_push(monkeypatch)
+
+    asyncio.run(supervisor._maybe_self_heal())
+    assert supervisor._self_heal_grace_until == 0.0
+
+    asyncio.run(supervisor._maybe_self_heal())
+
+    assert dispatcher.calls.count(("restart", OLD_CONTAINER_ID)) == 2
+    assert supervisor._self_heal_count == 2
+    storage.close()
+
+
+def test_expired_external_warmup_is_treated_as_unresponsive(monkeypatch, tmp_path):
+    started_at = (datetime.now(UTC) - timedelta(seconds=901)).isoformat()
+    dispatcher = _FakeDispatcher(
+        _dispatcher_status(
+            state="Up 15 minutes (health: starting)",
+            health="starting",
+            started_at=started_at,
+            inspect_ok=True,
+        )
+    )
+    supervisor, storage = _supervisor(
+        monkeypatch,
+        tmp_path,
+        llm_ok=False,
+        dispatcher=dispatcher,
+        profile="qwen36-vl",
+        env={"JARVIS_SELF_HEALING_MIN_FAILURES": "1", "JARVIS_SELF_HEALING_GRACE_SEC": "0"},
+    )
+    _patch_push(monkeypatch)
+
+    asyncio.run(supervisor._maybe_self_heal())
+
+    assert ("restart", OLD_CONTAINER_ID) in dispatcher.calls
+    storage.close()
+
+
+def test_health_readiness_retries_quickly_until_llm_recovers(monkeypatch, tmp_path):
+    supervisor, storage = _supervisor(
+        monkeypatch,
+        tmp_path,
+        llm_ok=False,
+        dispatcher=None,
+        profile="qwen36-vl",
+        env={"JARVIS_HEALTH_INTERVAL_SEC": "300"},
+    )
+
+    asyncio.run(supervisor._record_health())
+    assert supervisor._health_recovery_pending is True
+    assert supervisor._health_poll_interval() == 15.0
+    first_llm = next(
+        row for row in storage.latest_complete_health(limit=20) if row["component"] == "llm.router"
+    )
+    assert first_llm["status"] == "warn"
+
+    supervisor.llm.ok = True
+    asyncio.run(supervisor._record_health())
+    assert supervisor._health_recovery_pending is False
+    assert supervisor._health_poll_interval() == 300.0
+    recovered_llm = next(
+        row for row in storage.latest_complete_health(limit=20) if row["component"] == "llm.router"
+    )
+    assert recovered_llm["status"] == "ok"
     storage.close()
 
 

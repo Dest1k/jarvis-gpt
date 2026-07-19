@@ -11,13 +11,18 @@ from threading import Barrier
 
 import pytest
 from jarvis_gpt.agent import (
+    CHAT_REQUEST_KEY_PREFIX,
     OPERATOR_EFFECT_LEDGER_MAX_REQUESTS,
     AgentContext,
     AgentRuntime,
+    ChatRequestInProgressError,
+    _backend_runtime_generation_id,
+    _chat_request_hard_cap,
     _looks_like_document_memory_query,
     _native_action_from_message,
     _operator_action_scopes,
     _operator_effect_key,
+    _operator_effect_ledger_key,
     _operator_tool_arguments_match,
     _prune_operator_effect_ledger,
     _schema_hint,
@@ -27,7 +32,7 @@ from jarvis_gpt.config import ensure_runtime_dirs, load_settings
 from jarvis_gpt.event_bus import EventBus
 from jarvis_gpt.executive_runtime import ExecutiveCoordinator
 from jarvis_gpt.ingest import FileIngestor
-from jarvis_gpt.llm import LLMRouter, LLMStreamChunk
+from jarvis_gpt.llm import LLMResult, LLMRouter, LLMStreamChunk
 from jarvis_gpt.models import ToolRunResponse
 from jarvis_gpt.storage import JarvisStorage
 
@@ -57,6 +62,151 @@ def _agent_without_llm(monkeypatch, tmp_path):
         bus=EventBus(),
     )
     return agent, storage
+
+
+def _use_qwen_contract_stub(agent: AgentRuntime, answer: str = "Qwen contract answer"):
+    async def complete(*_args, **_kwargs):
+        return LLMResult(ok=True, content=answer)
+
+    agent.llm.complete = complete
+
+
+def test_chat_request_cap_tracks_configured_api_admission(monkeypatch):
+    monkeypatch.setenv("JARVIS_API_USER_RATE_LIMIT_PER_MINUTE", "240")
+    assert _chat_request_hard_cap() == 240 * ((26 * 60) + 2)
+    monkeypatch.setenv("JARVIS_API_USER_RATE_LIMIT_PER_MINUTE", "1")
+    assert _chat_request_hard_cap() == 4_096
+    monkeypatch.setenv("JARVIS_API_USER_RATE_LIMIT_PER_MINUTE", "100000")
+    assert _chat_request_hard_cap() == 100_000 * ((26 * 60) + 2)
+
+
+def test_backend_runtime_generation_rejects_malformed_config(monkeypatch):
+    monkeypatch.setenv("JARVIS_BACKEND_RUNTIME_GENERATION", "constant-generation")
+    with pytest.raises(RuntimeError, match="32 lowercase hex"):
+        _backend_runtime_generation_id()
+
+
+def test_concurrent_chat_request_claim_creates_no_orphan_conversation(
+    monkeypatch,
+    tmp_path,
+):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    second_storage = JarvisStorage(storage.database_path)
+    second_storage.initialize()
+    second_agent = AgentRuntime(
+        settings=agent.settings,
+        storage=second_storage,
+        llm=LLMRouter(agent.settings),
+        bus=EventBus(),
+    )
+    before_ids = {item["id"] for item in storage.list_conversations(limit=1_000)}
+    barrier = Barrier(2)
+
+    def claim(runtime: AgentRuntime) -> tuple[str, str]:
+        barrier.wait()
+        try:
+            handle = runtime._claim_chat_request(
+                request_id="telegram:42:concurrent",
+                message="one logical request",
+                requested_conversation_id=None,
+                conversation_title="concurrent request",
+                mode="auto",
+                temperature=None,
+                max_tokens=None,
+                attachments=[],
+                thinking_enabled=True,
+                access_mode="owner",
+                notification_chat_id=None,
+            )
+        except ChatRequestInProgressError:
+            return "in-progress", ""
+        return "claimed", handle.conversation_id
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(claim, (agent, second_agent)))
+
+    assert sorted(status for status, _conversation_id in results) == [
+        "claimed",
+        "in-progress",
+    ]
+    claimed_id = next(
+        conversation_id
+        for status, conversation_id in results
+        if status == "claimed"
+    )
+    after_ids = {item["id"] for item in storage.list_conversations(limit=1_000)}
+    assert after_ids - before_ids == {claimed_id}
+    ledger = storage.list_runtime_values(prefix=CHAT_REQUEST_KEY_PREFIX)
+    assert len(ledger) == 1
+    assert ledger[0]["value"]["conversation_id"] == claimed_id
+    original_lease = ledger[0]["value"]["lease_token"]
+    storage.update_runtime_value_atomic(
+        ledger[0]["key"],
+        lambda state: {**state, "lease_expires_at": 0.0},
+    )
+    reclaimed = second_agent._claim_chat_request(
+        request_id="telegram:42:concurrent",
+        message="one logical request",
+        requested_conversation_id=None,
+        conversation_title="concurrent request",
+        mode="auto",
+        temperature=None,
+        max_tokens=None,
+        attachments=[],
+        thinking_enabled=True,
+        access_mode="owner",
+        notification_chat_id=None,
+    )
+    assert reclaimed.conversation_id == claimed_id
+    assert reclaimed.lease_token != original_lease
+    assert {
+        item["id"] for item in storage.list_conversations(limit=1_000)
+    } - before_ids == {claimed_id}
+    second_storage.close()
+    storage.close()
+
+
+def test_new_backend_generation_reclaims_active_chat_request_lease(
+    monkeypatch,
+    tmp_path,
+):
+    first_generation = "a" * 32
+    second_generation = "b" * 32
+    monkeypatch.setenv("JARVIS_BACKEND_RUNTIME_GENERATION", first_generation)
+    first_agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    claim_arguments = {
+        "request_id": "telegram:42:backend-restart",
+        "message": "resume after backend restart",
+        "requested_conversation_id": None,
+        "conversation_title": "restart reclaim",
+        "mode": "auto",
+        "temperature": None,
+        "max_tokens": None,
+        "attachments": [],
+        "thinking_enabled": True,
+        "access_mode": "owner",
+        "notification_chat_id": None,
+    }
+    first = first_agent._claim_chat_request(**claim_arguments)
+
+    monkeypatch.setenv("JARVIS_BACKEND_RUNTIME_GENERATION", second_generation)
+    second_storage = JarvisStorage(storage.database_path)
+    second_storage.initialize()
+    second_agent = AgentRuntime(
+        settings=first_agent.settings,
+        storage=second_storage,
+        llm=LLMRouter(first_agent.settings),
+        bus=EventBus(),
+    )
+    reclaimed = second_agent._claim_chat_request(**claim_arguments)
+    ledger = second_storage.list_runtime_values(prefix=CHAT_REQUEST_KEY_PREFIX)
+
+    assert reclaimed.conversation_id == first.conversation_id
+    assert reclaimed.lease_token != first.lease_token
+    assert ledger[0]["value"]["runtime_generation_id"] == second_generation
+    assert len(storage.list_conversations(limit=100)) == 1
+    second_storage.close()
+    storage.close()
 
 
 def _pending_native_request(storage: JarvisStorage):
@@ -561,16 +711,16 @@ def test_operator_effect_ledger_prunes_expired_completions_and_is_bounded():
         **{
             f"expired-{index}": {
                 "status": "completed",
-                "completed_at": (now - timedelta(hours=1)).isoformat(),
-                "updated_at": (now - timedelta(hours=1)).isoformat(),
+                "completed_at": (now - timedelta(hours=27)).isoformat(),
+                "updated_at": (now - timedelta(hours=27)).isoformat(),
                 "effects": {f"effect-{index}": {}},
             }
             for index in range(80)
         },
         "recent": {
             "status": "completed",
-            "completed_at": (now - timedelta(minutes=10)).isoformat(),
-            "updated_at": (now - timedelta(minutes=10)).isoformat(),
+            "completed_at": (now - timedelta(hours=23)).isoformat(),
+            "updated_at": (now - timedelta(hours=23)).isoformat(),
             "effects": {"recent-effect": {}},
         },
         "unfinished": {
@@ -613,6 +763,56 @@ def test_operator_effect_ledger_prunes_expired_completions_and_is_bounded():
     )
     assert len(bounded["requests"]) == OPERATOR_EFFECT_LEDGER_MAX_REQUESTS
     assert bounded["overflowed"] is True
+
+
+def test_operator_effect_ledger_recycles_completed_slot_for_next_request(
+    monkeypatch,
+    tmp_path,
+):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    conversation_id = storage.create_conversation("completed effect capacity")
+    now = datetime.now(UTC)
+    requests = {
+        f"completed-{index}": {
+            "status": "completed",
+            "completed_at": (now - timedelta(minutes=index + 1)).isoformat(),
+            "updated_at": (now - timedelta(minutes=index + 1)).isoformat(),
+            "effects": {f"effect-{index}": {"state": "completed"}},
+        }
+        for index in range(OPERATOR_EFFECT_LEDGER_MAX_REQUESTS)
+    }
+    storage.set_runtime_value(
+        _operator_effect_ledger_key(conversation_id),
+        {
+            "protocol": "jarvis.operator-effect-ledger.v1",
+            "conversation_id": conversation_id,
+            "requests": requests,
+        },
+    )
+    context = AgentContext(
+        conversation_id=conversation_id,
+        memory_hits=[],
+        file_hits=[],
+        operator_message="Click Search at https://example.com",
+        operator_scopes=frozenset({"explicit", "browser", "click"}),
+        operator_request_digest="next-request",
+    )
+    context.operator_message_id = storage.add_message(
+        conversation_id=conversation_id,
+        role="user",
+        content="Click Search at https://example.com",
+    )
+
+    assert agent._begin_operator_effect(
+        context,
+        tool="browser.click",
+        effect_key="next-effect",
+    )
+    ledger = storage.get_runtime_value(_operator_effect_ledger_key(conversation_id))
+    assert len(ledger["requests"]) == OPERATOR_EFFECT_LEDGER_MAX_REQUESTS
+    assert "next-request" in ledger["requests"]
+    assert "completed-63" not in ledger["requests"]
+    storage.close()
 
 
 def test_operator_effect_ledger_claim_is_atomic_for_concurrent_conversation_requests(
@@ -2297,6 +2497,7 @@ def test_agent_creates_empty_file_without_approval(monkeypatch, tmp_path):
 )
 def test_meta_or_deferred_phrases_do_not_authorize_actions(monkeypatch, tmp_path, message):
     agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    _use_qwen_contract_stub(agent)
 
     response = asyncio.run(agent.chat(message))
 
@@ -2462,6 +2663,7 @@ def test_agent_returns_bounded_top_process_snapshot(monkeypatch, tmp_path):
 
 def test_agent_ignores_raw_console_commands_without_approval_or_execution(monkeypatch, tmp_path):
     agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    _use_qwen_contract_stub(agent)
     conversation_id = storage.create_conversation("active console")
     storage.set_runtime_value(
         f"ui.target.console.{conversation_id}",
@@ -2496,6 +2698,7 @@ def test_agent_ignores_raw_console_commands_without_approval_or_execution(monkey
 
 def test_agent_does_not_treat_creative_writing_as_gui_input(monkeypatch, tmp_path):
     agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    _use_qwen_contract_stub(agent)
 
     for message in (
         "write a poem about the sea",
@@ -4988,6 +5191,7 @@ def test_agent_context_includes_relevance_snippets(monkeypatch, tmp_path):
 
 def test_agent_captures_explicit_operator_memory(monkeypatch, tmp_path):
     agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    _use_qwen_contract_stub(agent)
 
     response = asyncio.run(agent.chat("запомни: модели лежат в D:\\jarvis\\models"))
     hits = storage.search_memory("модели D:\\jarvis\\models", limit=5)
@@ -5001,6 +5205,7 @@ def test_agent_captures_explicit_operator_memory(monkeypatch, tmp_path):
 
 def test_agent_compacts_long_conversation_with_fallback(monkeypatch, tmp_path):
     agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    _use_qwen_contract_stub(agent)
     conversation_id = storage.create_conversation("Long memory")
     for index in range(16):
         storage.add_message(

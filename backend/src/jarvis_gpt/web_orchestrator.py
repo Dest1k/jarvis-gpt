@@ -176,6 +176,22 @@ class WebRunBudget:
                 )
             self._consumed[operation] = consumed + amount
 
+    async def release(self, operation: WebOperation, amount: int) -> None:
+        """Return an unused pre-reservation without allowing budget creation.
+
+        Network readers reserve their bounded worst-case response size before I/O so
+        concurrent downloads cannot all pass the budget check and overshoot it.  Once
+        the response is bounded, only the unused part of that reservation is returned.
+        """
+
+        if amount < 0:
+            raise ValueError("Budget release cannot be negative.")
+        async with self._lock:
+            consumed = self._consumed[operation]
+            if amount > consumed:
+                raise ValueError("Budget release exceeds the consumed amount.")
+            self._consumed[operation] = consumed - amount
+
     async def run(
         self,
         operation: WebOperation,

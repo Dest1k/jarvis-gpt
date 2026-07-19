@@ -26,7 +26,10 @@ const FORWARDED_RESPONSE_HEADERS = [
   "content-range",
   "content-type",
   "etag",
-  "last-modified"
+  "last-modified",
+  "retry-after",
+  "x-jarvis-request-id",
+  "x-jarvis-retry-class"
 ];
 const UNSAFE_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 

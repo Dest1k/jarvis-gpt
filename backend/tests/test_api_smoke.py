@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -476,6 +477,27 @@ def test_dispatcher_action_api_preserves_independent_verification(client, monkey
     assert response.json()["verification"]["port_open"] is True
 
 
+def test_dispatcher_stop_api_uses_verified_exact_id_manager_path(client, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        app.state.dispatcher,
+        "run_compose_verified",
+        lambda action: calls.append(action)
+        or {
+            "ok": True,
+            "summary": "exact-ID stop verified",
+            "returncode": 0,
+            "verification": {"ok": True, "container_absent": True},
+        },
+    )
+
+    response = _approved_request(client, "POST", "/api/dispatcher/stop")
+
+    assert response.status_code == 200
+    assert calls == ["down"]
+    assert response.json()["verification"]["container_absent"] is True
+
+
 def test_loopback_api_can_require_token(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
@@ -646,7 +668,14 @@ def test_cors_is_loopback_only(client):
     assert "access-control-allow-origin" not in denied.headers
 
 
-def test_chat_offline_and_feedback_roundtrip(client):
+def test_chat_and_feedback_roundtrip(client, monkeypatch):
+    from jarvis_gpt.llm import LLMResult
+
+    async def successful_qwen_turn(*_args, **_kwargs):
+        return LLMResult(ok=True, content="Live-Qwen contract response")
+
+    monkeypatch.setattr(app.state.agent.llm, "complete", successful_qwen_turn)
+
     response = client.post(
         "/api/chat",
         json={"message": "Привет, JARVIS", "mode": "chat"},
@@ -685,6 +714,188 @@ def test_chat_offline_and_feedback_roundtrip(client):
     assert bad_rating.status_code == 422
 
 
+def test_chat_reports_transient_guest_llm_failure_as_service_unavailable(
+    client, monkeypatch
+):
+    from jarvis_gpt.agent import GuestChatUnavailableError
+
+    async def unavailable(*_args, **_kwargs):
+        raise GuestChatUnavailableError("guest LLM request failed")
+
+    monkeypatch.setattr(app.state.agent, "chat", unavailable)
+
+    response = client.post(
+        "/api/chat",
+        json={"message": "Проверка временной недоступности", "mode": "chat"},
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": "Language model is temporarily unavailable"
+    }
+    assert "x-jarvis-retry-class" not in response.headers
+
+
+def test_chat_marks_only_service_wide_guest_llm_outage_for_extended_retry(
+    client, monkeypatch
+):
+    from jarvis_gpt.agent import GuestChatUnavailableError
+
+    async def unavailable(*_args, **_kwargs):
+        raise GuestChatUnavailableError(
+            "guest LLM transport failed",
+            retry_scope="service",
+        )
+
+    monkeypatch.setattr(app.state.agent, "chat", unavailable)
+
+    response = client.post(
+        "/api/chat",
+        json={"message": "Проверка глобальной недоступности", "mode": "chat"},
+    )
+
+    assert response.status_code == 503
+    assert response.headers["x-jarvis-retry-class"] == "llm-outage"
+
+
+def test_chat_marks_active_request_lease_for_extended_retry(client, monkeypatch):
+    from jarvis_gpt.agent import ChatRequestInProgressError
+
+    async def in_progress(*_args, **_kwargs):
+        raise ChatRequestInProgressError("chat request is already being processed")
+
+    monkeypatch.setattr(app.state.agent, "chat", in_progress)
+
+    response = client.post(
+        "/api/chat",
+        json={"message": "same durable request", "request_id": "telegram:42:7"},
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "chat request is already being processed"}
+    assert response.headers["x-jarvis-retry-class"] == "chat-request-in-progress"
+
+
+def test_chat_stream_maps_claim_failures_before_committing_200(client, monkeypatch):
+    from jarvis_gpt.agent import (
+        ChatRequestConflictError,
+        ChatRequestInProgressError,
+        ChatUnavailableError,
+    )
+    from jarvis_gpt.authorization import AuthorizationError, ResourceIsolationError
+
+    cases = (
+        (ResourceIsolationError("foreign"), 404, None),
+        (
+            ChatUnavailableError("Qwen down", retry_scope="service"),
+            503,
+            "llm-outage",
+        ),
+        (ChatRequestConflictError("request conflict"), 409, None),
+        (
+            ChatRequestInProgressError("request active"),
+            409,
+            "chat-request-in-progress",
+        ),
+        (AuthorizationError("denied"), 403, None),
+    )
+
+    class FailingStream:
+        def __init__(self, error, closed):
+            self.error = error
+            self.closed = closed
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise self.error
+
+        async def aclose(self):
+            self.closed.append(True)
+
+    for error, expected_status, retry_class in cases:
+        closed: list[bool] = []
+
+        monkeypatch.setattr(
+            app.state.agent,
+            "stream_chat",
+            lambda *_args, _error=error, _closed=closed, **_kwargs: FailingStream(
+                _error, _closed
+            ),
+        )
+        response = client.post(
+            "/api/chat/stream",
+            json={"message": "pre-header contract", "request_id": "stream:claim"},
+        )
+
+        assert response.status_code == expected_status
+        assert response.headers.get("x-jarvis-retry-class") == retry_class
+        assert closed == [True]
+
+
+def test_chat_stream_emits_one_sanitized_terminal_envelope_and_closes(
+    client,
+    monkeypatch,
+):
+    scenarios = ("eof", "exception", "done_then_extra")
+
+    def make_stream(current_scenario, closed):
+        async def stream(*_args, **_kwargs):
+            try:
+                conversation_id = f"conv_stream_contract_{current_scenario}"
+                yield {"type": "meta", "conversation_id": conversation_id}
+                if current_scenario == "eof":
+                    yield {"type": "delta", "content": "partial"}
+                    return
+                if current_scenario == "exception":
+                    yield {"type": "delta", "content": "partial"}
+                    raise RuntimeError("backend secret must not leak")
+                yield {
+                    "type": "done",
+                    "answer": "complete",
+                    "conversation_id": conversation_id,
+                    "message_id": "msg_terminal",
+                    "duration_ms": 1,
+                    "events": [],
+                }
+                yield {"type": "error", "error": "must not be emitted"}
+            finally:
+                closed.append(True)
+
+        return stream
+
+    for scenario in scenarios:
+        closed: list[bool] = []
+        monkeypatch.setattr(
+            app.state.agent,
+            "stream_chat",
+            make_stream(scenario, closed),
+        )
+        response = client.post(
+            "/api/chat/stream",
+            json={"message": "terminal contract", "request_id": f"stream:{scenario}"},
+        )
+        items = [json.loads(line) for line in response.text.splitlines() if line]
+        terminals = [item for item in items if item.get("type") in {"done", "error"}]
+
+        assert response.status_code == 200
+        assert len(terminals) == 1
+        assert items[-1] == terminals[0]
+        assert closed == [True]
+        if scenario == "done_then_extra":
+            assert terminals[0]["type"] == "done"
+        else:
+            assert terminals[0]["type"] == "error"
+            assert "backend secret" not in terminals[0]["error"]
+            checkpoint = client.get(
+                f"/api/chat/stream/interrupted/conv_stream_contract_{scenario}"
+            )
+            assert checkpoint.status_code == 200
+            assert checkpoint.json()["answer"] == "partial"
+            assert checkpoint.json()["terminal"] is False
+
+
 def test_interrupted_stream_partial_answer_is_recoverable(client):
     conversation_id = app.state.storage.create_conversation("interrupted stream")
     saved = _persist_interrupted_stream(
@@ -699,9 +910,10 @@ def test_interrupted_stream_partial_answer_is_recoverable(client):
 
     assert saved is not None
     assert response.status_code == 200
-    assert response.json()["message_id"] == saved["message_id"]
-    assert messages[-1]["content"] == "partial answer"
-    assert messages[-1]["metadata"]["interrupted"] is True
+    assert response.json()["checkpoint_id"] == saved["checkpoint_id"]
+    assert response.json()["answer"] == "partial answer"
+    assert response.json()["terminal"] is False
+    assert messages == []
 
 
 def test_interrupted_stream_empty_partial_is_not_persisted_as_final(client):
@@ -724,7 +936,7 @@ def test_interrupted_stream_empty_partial_is_not_persisted_as_final(client):
     assert saved is None
     assert len(after) == len(before)
     assert all(body for body in assistant_bodies)
-    assert interrupted.status_code in {200, 404}
+    assert interrupted.status_code == 404
 
 
 def test_mission_lifecycle_and_report(client):
