@@ -265,6 +265,11 @@ type ConversationItem = {
   title: string;
   created_at: string;
   updated_at: string;
+  last_message?: string;
+  last_message_at?: string;
+  unread_count?: number;
+  is_pinned?: number;
+  is_archived?: number;
   message_count: number;
 };
 
@@ -2617,6 +2622,46 @@ export default function CommandCenter() {
     anchor.download = `jarvis-response-${index + 1}.md`;
     anchor.click();
     window.URL.revokeObjectURL(url);
+  }
+
+  async function exportConversation(conversationId: string, title: string) {
+    try {
+      const result = await api<{ content: string; exported_at: string }>(
+        `/api/conversations/${encodeURIComponent(conversationId)}/export`
+      );
+      const blob = new Blob([result.content], { type: "text/markdown;charset=utf-8" });
+      const url = window.URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      const safeTitle = title.replace(/[^a-zа-я0-9 _-]/gi, "").slice(0, 40);
+      anchor.download = `jarvis-chat-${safeTitle || conversationId.slice(0, 8)}.md`;
+      anchor.href = url;
+      anchor.click();
+      window.URL.revokeObjectURL(url);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Не удалось экспортировать диалог");
+    }
+  }
+
+  function replyToMessage(line: ChatLine) {
+    if (chatBusy) return;
+    const quote = line.content.split("\n").map((l) => `> ${l}`).join("\n");
+    setInput((current) => `${quote}\n\n${current}`.trimStart());
+  }
+
+  async function deleteOwnedMessage(line: ChatLine) {
+    if (!line.id?.startsWith("msg_") || line.role !== "user") return;
+    try {
+      await api<{ ok: boolean }>(`/api/messages/${encodeURIComponent(line.id)}`, { method: "DELETE" });
+      setLines((current) =>
+        current.map((item) =>
+          item.id === line.id
+            ? { ...item, content: "[сообщение удалено]", pending: false }
+            : item
+        )
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Не удалось удалить сообщение");
+    }
   }
 
   function stopSpeaking() {
@@ -5121,15 +5166,25 @@ export default function CommandCenter() {
       ) : (
         conversations.slice(0, 8).map((conversation) => (
           <button
-            className={`conversationRow ${conversation.id === conversationId ? "active" : ""}`}
+            className={`conversationRow ${conversation.id === conversationId ? "active" : ""}${conversation.is_pinned ? " pinned" : ""}`}
             disabled={busy}
             key={conversation.id}
             onClick={() => loadConversation(conversation.id)}
             type="button"
           >
             <MessageSquare size={14} />
-            <strong>{conversation.title}</strong>
-            <span>{conversation.message_count}</span>
+            <span className="conversationMeta">
+              <strong>{conversation.title}</strong>
+              {conversation.last_message ? (
+                <small>{conversation.last_message.slice(0, 60)}</small>
+              ) : null}
+            </span>
+            <span className="conversationBadges">
+              {conversation.unread_count ? (
+                <span className="unreadBadge">{conversation.unread_count}</span>
+              ) : null}
+              <span>{conversation.message_count}</span>
+            </span>
           </button>
         ))
       )}
@@ -5377,6 +5432,17 @@ export default function CommandCenter() {
               <h2>Диалог</h2>
               <div className="chatHeaderActions">
                 <span>{conversationId ? "активен" : "новый"}</span>
+                {conversationId && (
+                  <button
+                    type="button" title="Экспорт диалога" aria-label="Экспорт диалога"
+                    onClick={() => {
+                      const conv = conversations.find((c) => c.id === conversationId);
+                      void exportConversation(conversationId, conv?.title ?? "Чат");
+                    }}
+                  >
+                    <Download size={15} />
+                  </button>
+                )}
                 <button type="button" title="Новое окно" aria-label="Новое окно" onClick={newChatWindow}>
                   <Plus size={15} />
                 </button>
@@ -5548,6 +5614,18 @@ export default function CommandCenter() {
                         )}
                       </div>
                     </div>
+                    {line.id?.startsWith("msg_") && (
+                      <button
+                        className="bubbleAction replyAction"
+                        type="button"
+                        title="Ответить с цитированием"
+                        aria-label="Ответить с цитированием"
+                        disabled={chatBusy}
+                        onClick={() => replyToMessage(line)}
+                      >
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="9 17 4 12 9 7"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/></svg>
+                      </button>
+                    )}
                     {renderRichMessage(line.content, line.role)}
                     {line.role === "assistant" && line.webAnswer && (
                       <WebAnswerPanel summary={line.webAnswer} />
