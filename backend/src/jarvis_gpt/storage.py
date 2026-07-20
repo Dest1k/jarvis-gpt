@@ -1697,6 +1697,54 @@ class JarvisStorage:
             for row in reversed(rows)
         ]
 
+    def search_recent_user_messages(self, query: str, limit: int = 15) -> list[dict[str, Any]]:
+        """Full-text search across recent user messages in all conversations."""
+        terms = _query_terms(query, limit=4)
+        if not terms:
+            return []
+        clauses: list[str] = []
+        params: list[Any] = [current_user_id(), "user"]
+        for term in terms:
+            like = f"%{term}%"
+            clauses.append("content LIKE ?")
+            params.append(like)
+        params.append(min(60, limit * 3))
+        with self._lock:
+            rows = self.connect().execute(
+                f"""
+                SELECT id, role, content, created_at, conversation_id
+                FROM messages
+                WHERE user_id = ? AND role = ? AND ({" OR ".join(clauses)})
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                tuple(params),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def retire_compacted_raw_messages(self, conversation_id: str) -> int:
+        """Mark raw-message memories for a conversation as compacted (no longer fresh).
+
+        Updates tags to ['raw-message', 'compacted'] so they can be excluded from search.
+        Returns the number of rows updated.
+        """
+        with self._lock:
+            conn = self.connect()
+            cursor = conn.execute(
+                """
+                UPDATE memories
+                SET tags = '["raw-message", "compacted"]', importance = 0.05
+                WHERE namespace = 'conversation'
+                  AND tags LIKE '%raw-message%'
+                  AND tags NOT LIKE '%compacted%'
+                  AND content LIKE ?
+                  AND user_id = ?
+                """,
+                (f"%[conversation_id={conversation_id}]%", current_user_id()),
+            )
+            conn.commit()
+            return cursor.rowcount
+
     def add_memory(
         self,
         *,
@@ -1889,6 +1937,7 @@ class JarvisStorage:
                             WHERE memories_fts MATCH ?
                               AND memories_fts.user_id = ?
                               AND m.user_id = ?
+                              AND m.tags NOT LIKE '%compacted%'
                             {namespace_sql}
                             {since_clause}
                             ORDER BY rank ASC, m.importance DESC, m.updated_at DESC
@@ -1922,6 +1971,7 @@ class JarvisStorage:
                     FROM memories
                     WHERE user_id = ? AND ({" OR ".join(clauses)}){namespace_sql}
                     {since_clause}
+                    AND tags NOT LIKE '%compacted%'
                     ORDER BY importance DESC, updated_at DESC
                     LIMIT ?
                 """
@@ -1957,6 +2007,7 @@ class JarvisStorage:
             FROM memories
             WHERE {where}
             {since_clause}
+            AND tags NOT LIKE '%compacted%'
             ORDER BY importance DESC, updated_at DESC
             LIMIT ?
         """
