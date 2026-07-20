@@ -1836,10 +1836,17 @@ class JarvisStorage:
         limit: int = 25,
         *,
         namespaces: Iterable[str] | None = None,
+        since_date: str | None = None,
     ) -> list[dict[str, Any]]:
         namespace_filter = [str(item) for item in (namespaces or []) if str(item).strip()]
         seen_ids: set[str] = set()
         decorated: list[dict[str, Any]] = []
+
+        since_clause = ""
+        since_params: list[Any] = []
+        if since_date:
+            since_clause = " AND created_at >= ?"
+            since_params = [since_date]
 
         def add_rows(rows: Iterable[sqlite3.Row]) -> None:
             for row in rows:
@@ -1861,6 +1868,7 @@ class JarvisStorage:
                         namespace_sql = f" AND m.namespace IN ({placeholders})"
                         params.extend(namespace_filter)
                     oversample = max(limit * 4, limit)
+                    params.extend(since_params)
                     params.append(min(200, oversample))
                     with self._lock:
                         rows = self.connect().execute(
@@ -1882,6 +1890,7 @@ class JarvisStorage:
                               AND memories_fts.user_id = ?
                               AND m.user_id = ?
                             {namespace_sql}
+                            {since_clause}
                             ORDER BY rank ASC, m.importance DESC, m.updated_at DESC
                             LIMIT ?
                             """,
@@ -1912,9 +1921,11 @@ class JarvisStorage:
                         NULL AS rank
                     FROM memories
                     WHERE user_id = ? AND ({" OR ".join(clauses)}){namespace_sql}
+                    {since_clause}
                     ORDER BY importance DESC, updated_at DESC
                     LIMIT ?
                 """
+                params.extend(since_params)
                 params.append(min(200, max(limit * 4, limit)))
                 with self._lock:
                     rows = self.connect().execute(sql, tuple(params)).fetchall()
@@ -1939,11 +1950,13 @@ class JarvisStorage:
         if namespace_sql:
             where = f"{where} AND {namespace_sql}"
             params.extend(namespace_filter)
+        params.extend(since_params)
         params.append(limit)
         sql = f"""
             SELECT id, namespace, content, tags, importance, created_at, updated_at, NULL AS rank
             FROM memories
             WHERE {where}
+            {since_clause}
             ORDER BY importance DESC, updated_at DESC
             LIMIT ?
         """

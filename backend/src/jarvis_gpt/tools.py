@@ -1640,9 +1640,9 @@ class ToolRegistry:
         self.add(
             ToolSpec(
                 name="memory.search",
-                description="Search long-term memory using FTS when available.",
+                description="Search long-term memory using FTS when available. Optionally filter by since_date (ISO-8601 UTC).",
                 category="memory",
-                input_schema={"query": "Text query", "limit": "Maximum results"},
+                input_schema={"query": "Text query", "limit": "Maximum results", "since_date": "Optional ISO-8601 UTC lower bound (e.g. 2026-07-15T00:00:00+00:00)"},
                 handler=_memory_search,
             )
         )
@@ -5852,7 +5852,8 @@ def _approval_request(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
 def _memory_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     query = str(args.get("query") or "")
     limit = _int_arg(args.get("limit"), default=10, minimum=1, maximum=50)
-    items = ctx.storage.search_memory(query or None, limit=limit)
+    since_date = str(args.get("since_date") or "").strip() or None
+    items = ctx.storage.search_memory(query or None, limit=limit, since_date=since_date)
     return ToolRunResponse(
         tool="memory.search",
         ok=True,

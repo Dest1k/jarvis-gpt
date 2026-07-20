@@ -1065,15 +1065,15 @@ def test_qwen_profile_product_contract():
     )
 
     qwen = PROFILES["qwen36-vl"]
-    assert qwen.certification == "experimental"
-    assert qwen.research_only is True
-    assert qwen.interactive_certified is False
-    assert qwen.default_recommended is False
+    assert qwen.certification == "certified"
+    assert qwen.research_only is False
+    assert qwen.interactive_certified is True
+    assert qwen.default_recommended is True
     assert qwen.menu_visible is True
     assert qwen.requires_experimental_opt_in is False
     assert qwen.readiness_deadline_sec > 0
     public = profile_public_dict(qwen)
-    assert public["certification"] == "experimental"
+    assert public["certification"] == "certified"
     assert public["vision_capable"] is True
     assert "Qwen" in qwen.certification_reason
     assert detect_repeated_token_degeneration("4") is False
