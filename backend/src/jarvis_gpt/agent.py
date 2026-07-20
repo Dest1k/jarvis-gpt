@@ -1338,6 +1338,8 @@ class AgentRuntime:
             events.append(event)
             await self._emit(event)
 
+        await self._capture_raw_user_message(message, context.conversation_id)
+
         if not admitted and clarification:
             events.append(
                 ChatEvent(
@@ -9838,7 +9840,11 @@ class AgentRuntime:
         ranked = await self._hybrid_rerank(
             query,
             context.memory_hits,
-            self.storage.search_memory(None, limit=60),
+            _merge_context_memories(
+                self.storage.search_memory(None, limit=60),
+                self.storage.search_memory(None, limit=20, namespaces=["conversation"]),
+                limit=100,
+            ),
             id_key="id",
             limit=limit,
         )
@@ -12358,6 +12364,25 @@ class AgentRuntime:
                 },
             )
         ]
+
+    async def _capture_raw_user_message(self, message: str, conversation_id: str | None) -> None:
+        """Persist every user message into durable memory so short conversations survive restarts.
+
+        Stored with low importance so compaction-later summaries always outrank raw snippets,
+        but the exact timestamp and wording remain searchable forever.
+        """
+        if not self._capability_allowed("memory.write.own"):
+            return
+        cleaned = " ".join(message.split()).strip()
+        if len(cleaned) < 10:
+            return
+        with suppress(Exception):
+            self.storage.add_memory(
+                content=f"[conversation_id={conversation_id or 'unknown'}] {cleaned}",
+                namespace="conversation",
+                tags=["raw-message"],
+                importance=0.25,
+            )
 
     async def _compact_conversation_memory(self, conversation_id: str) -> None:
         if not self._capability_allowed("memory.write.own"):

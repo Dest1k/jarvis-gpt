@@ -6034,7 +6034,7 @@ def test_underspecified_artifact_blocks_even_when_model_requests_generate(
     assert "?" in response.answer or "Уточните" in response.answer
     assert response.answer.count("?") >= 1
     assert "documents.generate" not in tool_calls
-    assert len(after) == len(before)
+    assert len(after) == len(before) + 1  # +1 for raw-message mem added by _capture_raw_user_message
     assert storage.list_missions(limit=10) == []
     assert not any(event.type == "mission" for event in response.events)
     pending = storage.get_runtime_value(
