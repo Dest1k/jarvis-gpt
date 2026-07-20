@@ -12,7 +12,6 @@ import ntpath
 import os
 import re
 import time
-import unicodedata
 import uuid
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import suppress
@@ -10929,10 +10928,8 @@ class AgentRuntime:
         if clean_request:
             self._turn_by_request_id[clean_request] = key
         if notification_chat_id is not None and not isinstance(notification_chat_id, bool):
-            try:
+            with suppress(TypeError, ValueError):
                 self._turn_by_chat_id[int(notification_chat_id)] = key
-            except (TypeError, ValueError):
-                pass
         return key
 
     def _unregister_turn_cancel(self, key: str | None) -> None:
@@ -15378,22 +15375,7 @@ def _is_document_like_attachment(item: dict[str, Any]) -> bool:
         return False
     if mime.startswith("text/"):
         return True
-    if any(
-        token in mime
-        for token in (
-            "pdf",
-            "word",
-            "excel",
-            "spreadsheet",
-            "presentation",
-            "officedocument",
-            "opendocument",
-            "rtf",
-            "msword",
-        )
-    ):
-        return True
-    return False
+    return bool(any(token in mime for token in ("pdf", "word", "excel", "spreadsheet", "presentation", "officedocument", "opendocument", "rtf", "msword")))
 
 
 def _is_archive_like_attachment(item: dict[str, Any]) -> bool:
@@ -15483,9 +15465,7 @@ def _looks_like_bare_archive_password_reply(message: str) -> bool:
         return False
     if re.fullmatch(r"[0-9A-Za-zА-Яа-яЁё_@#$!%^&*+=.\-]{2,64}", text):
         # Pure Russian words of 2–3 letters are unlikely passwords for this path.
-        if re.fullmatch(r"[А-Яа-яЁё]{1,4}", text):
-            return False
-        return True
+        return not re.fullmatch("[А-Яа-яЁё]{1,4}", text)
     return False
 
 
@@ -15513,9 +15493,7 @@ def _is_lightweight_operator_turn(message: str) -> bool:
         text.strip(),
     ):
         return True
-    if len(text) <= 12 and re.fullmatch(r"[\d\s+\-*/().=]+", text):
-        return True
-    return False
+    return bool(len(text) <= 12 and re.fullmatch("[\\d\\s+\\-*/().=]+", text))
 
 
 def _looks_like_document_followup(message: str) -> bool:
@@ -22463,6 +22441,7 @@ def _native_action_from_message(
             "нагрузка на процессор",
             "загружен процессор",
             "сколько ядер",
+            "нагрузк",
         ),
     )
     if not machine_health:

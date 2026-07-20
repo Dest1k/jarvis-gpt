@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import zipfile
 from pathlib import Path
 
 import pytest
-
 from jarvis_gpt.agent import (
     _extract_archive_password,
     _looks_like_bare_archive_password_reply,
@@ -22,7 +20,6 @@ from jarvis_gpt.config import ensure_runtime_dirs, load_settings
 from jarvis_gpt.llm import LLMRouter
 from jarvis_gpt.storage import JarvisStorage
 from jarvis_gpt.tools import ToolRegistry
-
 
 _LIVE_PWD_FIXTURE = Path(r"D:\jarvis\data\jarvis-gpt\files\live_smoke_pwd.zip")
 _LIVE_PWD = "secret42"

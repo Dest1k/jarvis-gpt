@@ -22,12 +22,12 @@ Safety policy:
 from __future__ import annotations
 
 import bz2
+import contextlib
 import gzip
 import hashlib
 import io
 import lzma
 import os
-import re
 import shutil
 import struct
 import subprocess
@@ -1882,7 +1882,7 @@ def _run_7z(
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
-        raise ArchiveError(f"7-Zip timed out on archive operation") from exc
+        raise ArchiveError("7-Zip timed out on archive operation") from exc
     if binary_stdout:
         return completed
     # Decode for error mapping
@@ -2036,10 +2036,8 @@ def _extract_via_7z(
             safe = _safe_member_name(rel)
         except ArchiveSafetyError as exc:
             # Remove escapes if any slipped through.
-            try:
+            with contextlib.suppress(OSError):
                 file_path.unlink()
-            except OSError:
-                pass
             raise ArchiveSafetyError(f"Member escapes output directory: {rel}") from exc
         if wanted is not None and safe not in wanted and rel not in wanted:
             continue

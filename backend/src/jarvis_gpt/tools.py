@@ -6158,10 +6158,8 @@ def _reminders_create(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
     if isinstance(chat_id, bool):
         chat_id = None
     if chat_id is not None:
-        try:
+        with suppress(TypeError, ValueError):
             delivery["telegram_chat_id"] = int(chat_id)
-        except (TypeError, ValueError):
-            pass
     if payload is None:
         payload = delivery
     else:

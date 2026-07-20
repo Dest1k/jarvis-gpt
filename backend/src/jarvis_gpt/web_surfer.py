@@ -697,7 +697,16 @@ class JarvisWebSurfer:
                 return
             sink.append({"url": response.url, "status": response.status, "json": body})
 
-        page.on("response", lambda response: asyncio.ensure_future(_on_response(response)))
+        tasks: set[asyncio.Task] = set()
+        page.on(
+            "response",
+            lambda response: tasks.add(asyncio.ensure_future(_on_response(response))),
+        )
+
+        def _cancel_tasks():
+            for task in tasks:
+                task.cancel()
+            tasks.clear()
 
     async def _extract_app_state(self, page: Page) -> dict[str, Any]:
         state: dict[str, Any] = {}

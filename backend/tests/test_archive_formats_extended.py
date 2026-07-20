@@ -8,7 +8,6 @@ import tarfile
 from pathlib import Path
 
 import pytest
-
 from jarvis_gpt.archive_runtime import (
     ArchivePasswordError,
     archive_capabilities,
@@ -151,7 +150,7 @@ def test_passworded_7z_list_extract_read(tmp_path: Path) -> None:
     assert "top-secret-7z" in payload["text_preview"]
 
     out = tmp_path / "7z-out"
-    extracted = extract_archive(archive_path, output_dir=out, password="s3cret")
+    extract_archive(archive_path, output_dir=out, password="s3cret")
     assert (out / "hidden.txt").read_text(encoding="utf-8") == "top-secret-7z"
 
 

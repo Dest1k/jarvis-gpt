@@ -894,7 +894,6 @@ _RU_WORDS = frozenset(
         "онлайн",
         "офлайн",
         "поиск",
-        "найти",
         "гугл",
         "google",
         "яндекс",
@@ -926,7 +925,6 @@ _RU_WORDS = frozenset(
         "строки",
         "абзац",
         "заголовок",
-        "список",
         "маркер",
         "формула",
         "формулы",
@@ -963,7 +961,6 @@ _RU_WORDS = frozenset(
         "юзер",
         "сессия",
         "сессии",
-        "токен",
         "ключ",
         "секреты",
         "секрет",
@@ -1027,7 +1024,6 @@ _RU_WORDS = frozenset(
         "описать",
         "формат",
         "формате",
-        "markdown",
         "одной",
         "одним",
         "слово",
@@ -1042,9 +1038,24 @@ _RU_WORDS = frozenset(
         "опечатки",
         "очепятка",
         "очепятки",
-        "ошибся",
         "перепутал",
         "перепутала",
+        "нагрузкой",
+        "подними",
+        "привет",
+        "можешь",
+        "положи",
+        "запустишь",
+        "какой",
+        "какая",
+        "какое",
+        "какие",
+        "объем",
+        "объём",
+        "буфера",
+        "буфере",
+        "содержимое",
+        "сколько",
     }
 )
 _EN_WORDS = frozenset(
@@ -1389,7 +1400,6 @@ _EN_WORDS = frozenset(
         "runtime",
         "backup",
         "backups",
-        "copy",
         "copies",
         "error",
         "errors",
@@ -1415,7 +1425,6 @@ _EN_WORDS = frozenset(
         "internet",
         "online",
         "offline",
-        "search",
         "google",
         "yandex",
         "weather",
@@ -1436,7 +1445,6 @@ _EN_WORDS = frozenset(
         "lines",
         "paragraph",
         "heading",
-        "list",
         "formula",
         "cell",
         "cells",
@@ -1474,19 +1482,14 @@ _EN_WORDS = frozenset(
         "configuration",
         "version",
         "versions",
-        "update",
         "updates",
         "release",
-        "build",
-        "test",
         "tests",
         "smoke",
         "audit",
-        "check",
         "result",
         "results",
         "summary",
-        "done",
         "ready",
         "wrong",
         "right",
@@ -1503,13 +1506,11 @@ _EN_WORDS = frozenset(
         "dialog",
         "dialogue",
         "conversation",
-        "answer",
         "question",
         "clarify",
         "explain",
         "describe",
         "format",
-        "word",
         "phrase",
         "sentence",
         "minutes",
@@ -1542,17 +1543,19 @@ _EN_WORDS = frozenset(
         "servers",
         "health",
         "state",
-        "ok",
         "fail",
         "failed",
         "success",
         "successful",
-        "please",
         "asap",
         "typo",
         "typos",
         "layout",
-        "keyboard",
+        "active",
+        "hello",
+        "abort",
+        "pause",
+        "resume",
     }
 )
 
@@ -1640,20 +1643,22 @@ def correct_operator_typos(text: str) -> str:
     if not parts:
         return raw
     out: list[str] = []
-    changed = False
+    changed_count = 0
+    total_word_tokens = 0
     for part in parts:
         if _CYR_WORD.fullmatch(part) and len(part) >= 4:
+            total_word_tokens += 1
             folded = _fold_word(part)
-            # Exact lexicon hit — leave alone (no second-guessing real words).
             if folded in _RU_WORDS:
                 out.append(part)
                 continue
             hit = fuzzy_token_match(folded, list(_TYPO_CANDIDATES_RU))
             if hit and hit != folded:
                 out.append(_preserve_case(part, hit))
-                changed = True
+                changed_count += 1
                 continue
         elif _LAT_WORD.fullmatch(part) and len(part) >= 4:
+            total_word_tokens += 1
             folded = part.casefold()
             if folded in _EN_WORDS:
                 out.append(part)
@@ -1661,10 +1666,14 @@ def correct_operator_typos(text: str) -> str:
             hit = fuzzy_token_match(folded, list(_TYPO_CANDIDATES_EN))
             if hit and hit != folded:
                 out.append(_preserve_case(part, hit))
-                changed = True
+                changed_count += 1
                 continue
         out.append(part)
-    return "".join(out) if changed else raw
+    # Bail out when too many tokens were changed — the message is probably correct
+    # and the lexicon gap is the real issue, not an operator typo.
+    if changed_count > max(2, total_word_tokens // 3):
+        return raw
+    return "".join(out) if changed_count else raw
 
 
 def _tokenwise_layout_flip(raw: str) -> str | None:

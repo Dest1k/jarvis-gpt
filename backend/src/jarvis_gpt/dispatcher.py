@@ -735,7 +735,15 @@ class DispatcherManager:
         if docker is None:
             return {"ok": False, "summary": "Docker is not available in PATH.", "returncode": None}
         command = self.compose_command(action)
-        env = {**os.environ, **compose_env}
+        safe_keys = {
+            "PATH", "HOME", "USER", "USERNAME", "SYSTEMDRIVE", "SYSTEMROOT",
+            "COMPUTERNAME", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CERT_PATH",
+            "DOCKER_TLS_VERIFY", "NVIDIA_VISIBLE_DEVICES", "NVIDIA_DRIVER_CAPABILITIES",
+            "CUDA_VISIBLE_DEVICES", "CUDA_HOME", "NCCL_BN_DISABLE", "TEMP", "TMP",
+            "ProgramData", "APPDATA", "LOCALAPPDATA", "USERPROFILE",
+        }
+        env = {k: v for k, v in os.environ.items() if k in safe_keys}
+        env.update(compose_env)
         try:
             result = subprocess.run(
                 command,

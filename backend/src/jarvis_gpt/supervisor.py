@@ -460,7 +460,7 @@ class RuntimeSupervisor:
                     payload={"error": self._last_error},
                 )
             return
-        authorization = AuthorizationService(self.storage)
+        authorization = self.authorization
         for reminder in due:
             actor = authorization.actor_for_user(
                 str(reminder.get("user_id") or ""), source="reminder-scheduler"
@@ -486,7 +486,7 @@ class RuntimeSupervisor:
                 reminder_id = str(reminder.get("id") or "")
                 if not reminder_id or reminder_id in self._screen_watch_runs:
                     return
-                authorization = AuthorizationService(self.storage)
+                authorization = self.authorization
                 required_security_ids = (
                     "background.screen_watch.create",
                     "privacy.screen.capture",
@@ -730,10 +730,7 @@ class RuntimeSupervisor:
         }
         current = self.storage.get_runtime_value(_QUIET_DEFERRED_KEY, [])
         items: list[Any]
-        if isinstance(current, list):
-            items = list(current)
-        else:
-            items = []
+        items = list(current) if isinstance(current, list) else []
         items.append(entry)
         # Cap buffer so a long vacation cannot grow unbounded.
         items = items[-80:]
@@ -1095,7 +1092,7 @@ class RuntimeSupervisor:
             pending = self.storage.list_pending_screen_watch_notifications(
                 limit=50, all_users=True
             )
-            authorization = AuthorizationService(self.storage)
+            authorization = self.authorization
             for reminder in pending:
                 actor = authorization.actor_for_user(
                     str(reminder.get("user_id") or ""),
@@ -1801,7 +1798,7 @@ class RuntimeSupervisor:
     async def _run_background_jobs(self) -> None:
         if self.autonomy_executor is None:
             return
-        authorization = AuthorizationService(self.storage)
+        authorization = self.authorization
         for user_id in self._background_job_user_ids(limit=100):
             self._background_user_cursor = user_id
             actor = authorization.actor_for_user(user_id, source="autonomy-scheduler")

@@ -542,8 +542,12 @@ class _CdpConnection:
             message["params"] = params
         await self.websocket.send(json.dumps(message, ensure_ascii=False))
 
+        deadline = asyncio.get_running_loop().time() + timeout * 4
         while True:
-            raw = await asyncio.wait_for(self.websocket.recv(), timeout=timeout)
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise BrowserCdpError(f"CDP command {method} timed out (too many interleaved events)")
+            raw = await asyncio.wait_for(self.websocket.recv(), timeout=max(0.5, min(timeout, remaining)))
             data = json.loads(raw)
             event_method = str(data.get("method") or "")
             if event_method == "Fetch.requestPaused":

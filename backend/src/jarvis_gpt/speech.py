@@ -43,6 +43,12 @@ _MAX_TRANSCRIPT_CHARS = 20000
 # Loaded faster-whisper models are expensive to build; cache per (model, device,
 # compute) so repeated turns reuse the warm model.
 _WHISPER_MODELS: dict[tuple[str, str, str], Any] = {}
+_MAX_CACHED_STT_MODELS = 2
+
+
+def _lru_evict(cache: dict, max_size: int) -> None:
+    while len(cache) > max_size:
+        cache.pop(next(iter(cache)), None)
 
 
 @dataclass
@@ -313,6 +319,7 @@ def _load_whisper_model(model_size: str, device: str, compute_type: str) -> Any:
         from faster_whisper import WhisperModel  # lazy — optional dependency
 
         model = WhisperModel(model_size, device=device, compute_type=compute_type)
+        _lru_evict(_WHISPER_MODELS, _MAX_CACHED_STT_MODELS)
         _WHISPER_MODELS[key] = model
     return model
 
@@ -559,6 +566,7 @@ def _sapi_synthesize_to_wav(
 # --------------------------------------------------------------------------- #
 
 _SILERO_MODELS: dict[tuple[str, str], Any] = {}
+_MAX_CACHED_TTS_MODELS = 2
 _SILERO_CHAR_LIMIT = 900
 
 
@@ -576,6 +584,7 @@ def _load_silero_model(language: str = "ru", package: str = "v4_ru") -> Any:
             trust_repo=True,
         )
         model.to("cpu")
+        _lru_evict(_SILERO_MODELS, _MAX_CACHED_TTS_MODELS)
         _SILERO_MODELS[key] = model
     return model
 

@@ -185,15 +185,10 @@ class CheckpointManager:
         try:
             _write_manifest(checkpoint)
         except BaseException:
-            # A failed durability barrier is not a commit. Keep the in-memory
-            # state rollback-eligible so the transactional executor can restore
-            # the checkpoint before surfacing the error.
             checkpoint.status = CheckpointStatus.ACTIVE
             checkpoint.commit_record = previous_record
             raise
         if commit_barrier is not None and checkpoint.commit_record is not None:
-            # The committed checkpoint manifest is the recovery WAL for the
-            # narrow window before the replay ledger replacement is durable.
             commit_barrier(checkpoint.commit_record)
         with contextlib.suppress(OSError):
             shutil.rmtree(checkpoint.directory)
@@ -591,6 +586,8 @@ async def _rollback_if_needed(
 def _rollback_anchor(path: Path) -> Path:
     candidate = path
     while not candidate.exists() and not candidate.parent.exists():
+        if candidate.parent == candidate:
+            return candidate
         candidate = candidate.parent
     return candidate
 

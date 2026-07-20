@@ -98,6 +98,9 @@ class TelemetryCollector:
                 return copy.deepcopy(cached)
         fresh = probe()
         with self._cache_lock:
+            cached_at = float(getattr(self, at_attr))
+            if time.monotonic() - cached_at < max_age_sec:
+                return copy.deepcopy(getattr(self, attr))
             setattr(self, attr, copy.deepcopy(fresh))
             setattr(self, at_attr, time.monotonic())
         return fresh

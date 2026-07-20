@@ -1124,7 +1124,8 @@ class WebSurferAdapter:
                             process.wait(), timeout=_WORKER_STOP_TIMEOUT
                         )
             if os.name != "nt" and handle.parent_guard_fd is not None:
-                os.close(handle.parent_guard_fd)
+                with suppress(OSError):
+                    os.close(handle.parent_guard_fd)
                 handle.parent_guard_fd = None
                 with suppress(TimeoutError):
                     await asyncio.wait_for(process.wait(), timeout=0.75)

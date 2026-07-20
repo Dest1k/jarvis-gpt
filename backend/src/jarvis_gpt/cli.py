@@ -129,9 +129,6 @@ def _primary_runtime(
         )
         yield settings, storage, llm, agent
     finally:
-        if agent is not None:
-            with suppress(Exception):
-                agent.tools.web_surfer.close()
         if playbooks is not None:
             with suppress(Exception):
                 playbooks.close()

@@ -283,7 +283,13 @@ def run_python(
         try:
             job = _assign_windows_job(proc.pid, mem_bytes)
         except Exception:  # noqa: BLE001 — job binding is best-effort hardening
-            job = None
+            proc.kill()
+            proc.wait(timeout=5)
+            return SandboxResult(
+                ok=False, exit_code=None, stdout="", stderr="",
+                timed_out=False, duration_sec=round(time.monotonic() - start, 3),
+                error="Не удалось изолировать процесс (Job Object) — выполнение отменено",
+            )
 
     timed_out = False
     try:

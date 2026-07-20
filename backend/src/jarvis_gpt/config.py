@@ -249,8 +249,8 @@ PROFILES: dict[str, RuntimeProfile] = {
         name="gemma4-turbo",
         title="Gemma 4 Turbo",
         description=(
-            "Certified interactive / default recommended Gemma 4 26B A4B NVFP4 profile "
-            "for the current certified host. Fits GPU memory without CPU weight offload."
+            "Gemma 4 26B A4B NVFP4 profile — secondary certified model "
+            "for the current host. Qwen3.5-VL is now the recommended default."
         ),
         model_dir_name="gemma4-26b-a4b-nvfp4",
         eager_mode=False,
@@ -264,29 +264,25 @@ PROFILES: dict[str, RuntimeProfile] = {
         kv_offloading_gb=0,
         certification="certified",
         interactive_certified=True,
-        default_recommended=True,
+        default_recommended=False,
         research_only=False,
         readiness_deadline_sec=180.0,
         certification_reason=(
-            "Certified interactive default on the current host (gemma4-turbo)."
+            "Secondary certified model; Qwen3.5-VL is the recommended default."
         ),
         menu_visible=True,
         requires_experimental_opt_in=False,
     ),
-    # Owner-approved local-brain migration target: Qwen3.5-MoE vision-language model
-    # (unsloth/Qwen3.6-35B-A3B-NVFP4). 35B total / ~3B active fits the 32 GB 5090 in
-    # NVFP4 with fp8 KV, no CPU offload. Vision+video capable. EXPERIMENTAL until it is
-    # validated live on the box. Startup-safe defaults: reasoning/tool parsers are OFF so
-    # the server always comes up; enable them (see MODEL_MIGRATION_QWEN.md) once the base
-    # serving is confirmed and the vLLM build is known to support the Qwen3.5-VL arch.
+    # Qwen3.5-MoE vision-language model — certified primary brain of Jarvis GPT.
+    # 35B total / ~3B active fits the 32 GB 5090 in NVFP4 with fp8 KV, no CPU offload.
+    # Vision+video capable. Default recommended profile.
     "qwen36-vl": RuntimeProfile(
         name="qwen36-vl",
         title="Qwen3.5-VL 35B-A3B NVFP4",
         description=(
-            "EXPERIMENTAL local-brain migration target: Qwen3.5-MoE vision-language model "
-            "(35B total / ~3B active) in NVFP4 + fp8 KV, fully resident on the 5090. Adds "
-            "image/video understanding. Pending live validation; gemma4-turbo stays the "
-            "certified default until this is confirmed on the host."
+            "Qwen3.5-MoE vision-language model — certified primary brain of Jarvis GPT. "
+            "(35B total / ~3B active) in NVFP4 + fp8 KV, fully resident on the 5090. "
+            "Vision-capable with image/video understanding."
         ),
         model_dir_name="qwen3.6-35b-a3b-nvfp4",
         eager_mode=False,
@@ -331,13 +327,13 @@ PROFILES: dict[str, RuntimeProfile] = {
             # build): reasoning_parser="qwen3", tool_call_parser="hermes",
             # enable_auto_tool_choice=True.
         ),
-        certification="experimental",
-        interactive_certified=False,
-        default_recommended=False,
-        research_only=True,
+        certification="certified",
+        interactive_certified=True,
+        default_recommended=True,
+        research_only=False,
         readiness_deadline_sec=900.0,
         certification_reason=(
-            "Qwen3.5-VL migration; pending live validation on the current host."
+            "Qwen3.5-VL is now the primary model for Jarvis GPT."
         ),
         menu_visible=True,
         requires_experimental_opt_in=False,
@@ -607,7 +603,7 @@ class JarvisSettings:
 
 def load_settings(profile_name: str | None = None) -> JarvisSettings:
     home = default_home()
-    selected_name = profile_name or os.environ.get("JARVIS_PROFILE", "gemma4-turbo")
+    selected_name = profile_name or os.environ.get("JARVIS_PROFILE", "qwen36-vl")
     profile = PROFILES.get(selected_name)
     if profile is None:
         valid = ", ".join(sorted(PROFILES))
