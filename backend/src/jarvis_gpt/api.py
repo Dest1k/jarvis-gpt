@@ -2384,6 +2384,62 @@ async def set_message_feedback(message_id: str, request: MessageFeedbackRequest)
     return MessageItem.model_validate(updated)
 
 
+@app.patch("/api/messages/{message_id}", response_model=MessageItem)
+async def edit_message(message_id: str, payload: dict[str, Any]) -> MessageItem:
+    content = str(payload.get("content") or "")
+    if not content.strip():
+        raise HTTPException(status_code=400, detail="Content is required")
+    updated = app.state.storage.edit_message(message_id, content)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Message not found or already deleted")
+    return MessageItem.model_validate(updated)
+
+
+@app.delete("/api/messages/{message_id}")
+async def delete_message(message_id: str) -> dict[str, bool]:
+    deleted = app.state.storage.delete_message(message_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Message not found or already deleted")
+    return {"ok": True}
+
+
+@app.patch("/api/conversations/{conversation_id}")
+async def update_conversation(conversation_id: str, payload: dict[str, Any]) -> ConversationItem:
+    updated = app.state.storage.update_conversation(
+        conversation_id,
+        is_pinned=payload.get("is_pinned"),
+        is_archived=payload.get("is_archived"),
+        unread_count=payload.get("unread_count"),
+        title=payload.get("title"),
+    )
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return ConversationItem.model_validate(updated)
+
+
+@app.get("/api/conversations/{conversation_id}/export")
+async def export_conversation(conversation_id: str) -> dict[str, Any]:
+    conversation = app.state.storage.get_conversation(conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    messages = app.state.storage.list_messages(conversation_id, limit=500)
+    lines: list[str] = []
+    for msg in messages:
+        if msg.get("is_deleted"):
+            continue
+        role_label = "Вы" if msg["role"] == "user" else "Jarvis" if msg["role"] == "assistant" else msg["role"]
+        ts = str(msg.get("created_at") or "")[:19].replace("T", " ")
+        lines.append(f"**{role_label}** ({ts}):\n{msg['content']}\n")
+    return {
+        "conversation_id": conversation_id,
+        "title": conversation.get("title", ""),
+        "exported_at": utc_now(),
+        "format": "markdown",
+        "content": "\n".join(lines),
+        "message_count": len(lines),
+    }
+
+
 @app.delete("/api/conversations/{conversation_id}")
 async def delete_conversation(conversation_id: str) -> dict[str, bool]:
     deleted = app.state.storage.delete_conversation(conversation_id)

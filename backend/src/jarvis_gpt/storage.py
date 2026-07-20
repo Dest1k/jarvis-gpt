@@ -714,6 +714,7 @@ class JarvisStorage:
             try:
                 conn.executescript(SCHEMA)
                 migrate_iam_schema(conn)
+                _migrate_messenger_schema(conn)
                 self._memory_fts_available = self._ensure_memory_fts(conn)
                 self._file_fts_available = self._ensure_file_chunks_fts(conn)
                 conn.commit()
@@ -1317,6 +1318,7 @@ class JarvisStorage:
         role: str,
         content: str,
         metadata: dict[str, Any] | None = None,
+        reply_to_message_id: str | None = None,
     ) -> str:
         mid = new_id("msg")
         now = utc_now()
@@ -1326,10 +1328,8 @@ class JarvisStorage:
         if request_metadata is not None and role in {"user", "assistant"}:
             effective_metadata.update(request_metadata)
             if role == "assistant":
-                # Only an answer written by AgentRuntime itself is a terminal
-                # recovery candidate. API interruption checkpoints are stored
-                # outside this binding and can never masquerade as completed.
                 effective_metadata["chat_request_terminal"] = True
+        preview = " ".join(content.split())[:120]
         with self._lock:
             conn = self.connect()
             self._require_owned_resource(
@@ -1341,14 +1341,18 @@ class JarvisStorage:
             conn.execute(
                 """
                 INSERT INTO messages(
-                    id, conversation_id, role, content, metadata, created_at, user_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    id, conversation_id, role, content, metadata, created_at,
+                    user_id, reply_to_message_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (mid, conversation_id, role, content, _json(effective_metadata), now, user_id),
+                (mid, conversation_id, role, content, _json(effective_metadata), now,
+                 user_id, reply_to_message_id),
             )
             conn.execute(
-                "UPDATE conversations SET updated_at = ? WHERE id = ? AND user_id = ?",
-                (now, conversation_id, user_id),
+                """UPDATE conversations
+                   SET updated_at = ?, last_message = ?, last_message_at = ?
+                   WHERE id = ? AND user_id = ?""",
+                (now, preview, now, conversation_id, user_id),
             )
             self._insert_learning_observation(
                 conn,
@@ -1429,16 +1433,16 @@ class JarvisStorage:
             rows = self.connect().execute(
                 """
                 SELECT
-                    c.id,
-                    c.title,
-                    c.created_at,
-                    c.updated_at,
+                    c.id, c.title, c.created_at, c.updated_at,
+                    c.last_message, c.last_message_at,
+                    c.unread_count, c.is_pinned, c.is_archived,
                     COUNT(m.id) AS message_count
                 FROM conversations c
                 LEFT JOIN messages m ON m.conversation_id = c.id AND m.user_id = c.user_id
+                    AND m.is_deleted = 0
                 WHERE c.user_id = ?
                 GROUP BY c.id
-                ORDER BY c.updated_at DESC, c.rowid DESC
+                ORDER BY c.is_pinned DESC, c.updated_at DESC, c.rowid DESC
                 LIMIT ?
                 """,
                 (current_user_id(), limit),
@@ -1696,6 +1700,78 @@ class JarvisStorage:
             {**dict(row), "metadata": _loads(row["metadata"], {})}
             for row in reversed(rows)
         ]
+
+    def edit_message(self, message_id: str, content: str) -> dict[str, Any] | None:
+        now = utc_now()
+        user_id = current_user_id()
+        preview = " ".join(content.split())[:120]
+        with self._lock:
+            conn = self.connect()
+            self._require_owned_resource(conn, table="messages", resource_id=message_id, user_id=user_id)
+            cursor = conn.execute(
+                """UPDATE messages SET content = ?, edited_at = ?
+                   WHERE id = ? AND user_id = ? AND is_deleted = 0""",
+                (content, now, message_id, user_id),
+            )
+            if cursor.rowcount == 0:
+                return None
+            row = conn.execute(
+                "SELECT conversation_id FROM messages WHERE id = ?", (message_id,)
+            ).fetchone()
+            if row:
+                conn.execute(
+                    """UPDATE conversations SET last_message = ?, last_message_at = ?
+                       WHERE id = ? AND user_id = ?""",
+                    (preview, now, row["conversation_id"], user_id),
+                )
+            conn.commit()
+            return self.get_message(message_id)
+
+    def delete_message(self, message_id: str) -> bool:
+        user_id = current_user_id()
+        with self._lock:
+            conn = self.connect()
+            self._require_owned_resource(conn, table="messages", resource_id=message_id, user_id=user_id)
+            cursor = conn.execute(
+                """UPDATE messages SET is_deleted = 1
+                   WHERE id = ? AND user_id = ? AND is_deleted = 0""",
+                (message_id, user_id),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def update_conversation(
+        self, conversation_id: str, *, is_pinned: bool | None = None,
+        is_archived: bool | None = None, unread_count: int | None = None,
+        title: str | None = None,
+    ) -> dict[str, Any] | None:
+        user_id = current_user_id()
+        updates: list[str] = []
+        params: list[Any] = []
+        if is_pinned is not None:
+            updates.append("is_pinned = ?")
+            params.append(1 if is_pinned else 0)
+        if is_archived is not None:
+            updates.append("is_archived = ?")
+            params.append(1 if is_archived else 0)
+        if unread_count is not None:
+            updates.append("unread_count = ?")
+            params.append(max(0, unread_count))
+        if title is not None and title.strip():
+            updates.append("title = ?")
+            params.append(title.strip()[:200])
+        if not updates:
+            return self.get_conversation(conversation_id)
+        params.extend([conversation_id, user_id])
+        with self._lock:
+            conn = self.connect()
+            conn.execute(
+                f"""UPDATE conversations SET {', '.join(updates)}
+                   WHERE id = ? AND user_id = ?""",
+                tuple(params),
+            )
+            conn.commit()
+            return self.get_conversation(conversation_id)
 
     def search_recent_user_messages(self, query: str, limit: int = 15) -> list[dict[str, Any]]:
         """Full-text search across recent user messages in all conversations."""
@@ -4992,6 +5068,11 @@ CREATE TABLE IF NOT EXISTS conversations (
     title TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
+    last_message TEXT NOT NULL DEFAULT '',
+    last_message_at TEXT NOT NULL DEFAULT '',
+    unread_count INTEGER NOT NULL DEFAULT 0,
+    is_pinned INTEGER NOT NULL DEFAULT 0,
+    is_archived INTEGER NOT NULL DEFAULT 0,
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT
 );
 
@@ -5002,6 +5083,9 @@ CREATE TABLE IF NOT EXISTS messages (
     content TEXT NOT NULL,
     metadata TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL,
+    edited_at TEXT,
+    is_deleted INTEGER NOT NULL DEFAULT 0,
+    reply_to_message_id TEXT,
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT
 );
 
@@ -5170,3 +5254,23 @@ CREATE INDEX IF NOT EXISTS idx_telemetry_ts ON telemetry_snapshots(ts);
 CREATE INDEX IF NOT EXISTS idx_audit_log_target ON audit_log(target_type, target_id, ts);
 CREATE INDEX IF NOT EXISTS idx_audit_log_ts ON audit_log(ts);
 """
+
+
+def _migrate_messenger_schema(conn: sqlite3.Connection) -> None:
+    for stmt in _MESSENGER_MIGRATIONS:
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
+
+_MESSENGER_MIGRATIONS = [
+    "ALTER TABLE conversations ADD COLUMN last_message TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE conversations ADD COLUMN last_message_at TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE conversations ADD COLUMN unread_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE conversations ADD COLUMN is_pinned INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE conversations ADD COLUMN is_archived INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE messages ADD COLUMN edited_at TEXT",
+    "ALTER TABLE messages ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE messages ADD COLUMN reply_to_message_id TEXT",
+]
