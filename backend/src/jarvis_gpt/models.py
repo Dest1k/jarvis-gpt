@@ -38,6 +38,7 @@ class ChatRequest(BaseModel):
     # surface. The normal web/API path remains owner mode.
     access_mode: Literal["owner", "guest"] = "owner"
     notification_chat_id: int | None = None
+    response_modality: Literal["text", "voice"] = "text"
 
 
 class ChatCancelRequest(BaseModel):

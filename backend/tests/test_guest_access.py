@@ -57,6 +57,23 @@ def test_guest_chat_never_enters_local_agent_routes(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_guest_voice_turn_knows_transport_will_synthesize_reply(monkeypatch, tmp_path):
+    storage, llm, agent = _runtime(monkeypatch, tmp_path)
+
+    asyncio.run(
+        agent.chat(
+            "Ответь голосом",
+            access_mode="guest",
+            response_modality="voice",
+        )
+    )
+
+    rendered = "\n".join(str(message["content"]) for message in llm.calls[0])
+    assert "Telegram bridge will synthesize your final answer" in rendered
+    assert "Do not claim that TTS is unavailable" in rendered
+    storage.close()
+
+
 def test_legacy_guest_cannot_attach_to_or_read_owner_conversation(monkeypatch, tmp_path):
     storage, llm, agent = _runtime(monkeypatch, tmp_path)
     owner_conversation = storage.create_conversation("Владелец")

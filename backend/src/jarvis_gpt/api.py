@@ -592,6 +592,8 @@ _HTTP_GUEST_ENDPOINTS = frozenset(
         "list_conversations",
         "list_conversation_messages",
         "set_message_feedback",
+        "voice_status",
+        "voice_speak",
     }
 )
 
@@ -607,8 +609,6 @@ _HTTP_PERSONAL_ENDPOINTS = frozenset(
         "persona",
         "update_persona",
         "add_persona_insight",
-        "voice_status",
-        "voice_speak",
         "delete_conversation",
         "executive_plan",
         "web_surfer_capabilities",
@@ -1959,6 +1959,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
             notification_chat_id=(
                 request.notification_chat_id if current_actor().is_owner else None
             ),
+            response_modality=request.response_modality,
             transport_request_id=request.request_id,
         )
     except (
@@ -2222,6 +2223,7 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
             max_tokens=request.max_tokens,
             attachments=[item.model_dump() for item in request.attachments],
             thinking_enabled=request.thinking_enabled,
+            response_modality=request.response_modality,
             transport_request_id=request.request_id,
         )
         # Advance through authorization and the durable request claim before

@@ -5429,6 +5429,19 @@ def test_agent_context_includes_relevance_snippets(monkeypatch, tmp_path):
     storage.close()
 
 
+def test_agent_voice_delivery_contract_is_in_model_context(monkeypatch, tmp_path):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    context = agent._prepare_context("voice response", None)
+    context.response_modality = "voice"
+
+    messages = agent._build_llm_messages(context, "voice response")
+    rendered = "\n".join(str(message["content"]) for message in messages)
+
+    assert "Telegram bridge will synthesize your final answer" in rendered
+    assert "Do not claim that TTS is unavailable" in rendered
+    storage.close()
+
+
 def test_agent_captures_explicit_operator_memory(monkeypatch, tmp_path):
     agent, storage = _agent_without_llm(monkeypatch, tmp_path)
     _use_qwen_contract_stub(agent)

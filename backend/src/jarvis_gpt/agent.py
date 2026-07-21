@@ -554,6 +554,7 @@ class AgentContext:
     operator_retry_source_message_id: str | None = None
     operator_cached_answer: str | None = None
     notification_chat_id: int | None = None
+    response_modality: str = "text"
     # Opaque token for cooperative + hard cancel of this turn (/stop, /api/chat/cancel).
     cancel_key: str | None = None
     # RB-2: side-effect admission is decided before mission/artifact/tool mutation.
@@ -766,6 +767,7 @@ def _chat_message_metadata(
     temperature: float | None,
     attachments: list[dict[str, Any]],
     thinking_enabled: bool,
+    response_modality: str = "text",
     task_plan: TaskKernelPlan | None = None,
 ) -> dict[str, Any]:
     metadata: dict[str, Any] = {
@@ -773,12 +775,25 @@ def _chat_message_metadata(
         "mode": mode,
         "temperature": temperature,
         "thinking_enabled": thinking_enabled,
+        "response_modality": response_modality,
     }
     if task_plan is not None:
         metadata["task_kernel"] = task_plan.payload()
     if attachments:
         metadata["attachments"] = attachments
     return metadata
+
+
+def _response_delivery_prompt(response_modality: str) -> str:
+    if response_modality != "voice":
+        return ""
+    return (
+        "Delivery contract for this turn: the user sent a Telegram voice message. "
+        "The Telegram bridge will synthesize your final answer with the configured TTS "
+        "engine and deliver it as audio. Answer the transcribed request directly in concise, "
+        "spoken-friendly language. Do not claim that TTS is unavailable, do not ask to "
+        "transcribe the already-transcribed attachment, and do not describe transport details."
+    )
 
 
 # Vision attachment bounds: cap how many images and how large each image may be before
@@ -1052,6 +1067,7 @@ class AgentRuntime:
         thinking_enabled: bool = True,
         access_mode: str = "owner",
         notification_chat_id: int | None = None,
+        response_modality: str = "text",
         transport_request_id: str | None = None,
     ) -> ChatResponse:
         """Run one logical chat request behind a durable transport-id fence."""
@@ -1074,6 +1090,7 @@ class AgentRuntime:
                     thinking_enabled=thinking_enabled,
                     access_mode=access_mode,
                     notification_chat_id=notification_chat_id,
+                    response_modality=response_modality,
                     transport_request_id=None,
                     cancel_key=cancel_key,
                 )
@@ -1111,6 +1128,7 @@ class AgentRuntime:
                     thinking_enabled=thinking_enabled,
                     access_mode=effective_access_mode,
                     notification_chat_id=notification_chat_id,
+                    response_modality=response_modality,
                 )
                 if handle.cached_response is not None:
                     # Transport-level retry of a completed request must surface the same
@@ -1131,6 +1149,7 @@ class AgentRuntime:
                             thinking_enabled=thinking_enabled,
                             access_mode=access_mode,
                             notification_chat_id=notification_chat_id,
+                            response_modality=response_modality,
                             transport_request_id=request_id,
                             _request_handle=handle,
                             cancel_key=cancel_key,
@@ -1167,6 +1186,7 @@ class AgentRuntime:
         thinking_enabled: bool = True,
         access_mode: str = "owner",
         notification_chat_id: int | None = None,
+        response_modality: str = "text",
         transport_request_id: str | None = None,
         _request_handle: _ChatRequestHandle | None = None,
         cancel_key: str | None = None,
@@ -1189,6 +1209,7 @@ class AgentRuntime:
                 temperature=temperature,
                 max_tokens=max_tokens,
                 preserve_existing_history=actor.source == "session",
+                response_modality=response_modality,
                 transport_request_id=(
                     None if _request_handle is not None else transport_request_id
                 ),
@@ -1206,6 +1227,7 @@ class AgentRuntime:
             capabilities=context_capabilities,
         )
         context.notification_chat_id = notification_chat_id
+        context.response_modality = response_modality
         context.cancel_key = cancel_key
         context.operator_message = message
         context.operator_scopes = _operator_action_scopes(message)
@@ -1227,6 +1249,7 @@ class AgentRuntime:
                     temperature=temperature,
                     attachments=attachments,
                     thinking_enabled=thinking_enabled,
+                    response_modality=response_modality,
                 ),
             )
             replay_event = ChatEvent(
@@ -1331,6 +1354,7 @@ class AgentRuntime:
                 temperature=temperature,
                 attachments=attachments,
                 thinking_enabled=thinking_enabled,
+                response_modality=response_modality,
                 task_plan=task_plan,
             ),
         )
@@ -1904,6 +1928,7 @@ class AgentRuntime:
         temperature: float | None,
         max_tokens: int | None,
         preserve_existing_history: bool,
+        response_modality: str = "text",
         transport_request_id: str | None = None,
         request_handle: _ChatRequestHandle | None = None,
     ) -> ChatResponse:
@@ -1915,6 +1940,7 @@ class AgentRuntime:
             temperature=temperature,
             max_tokens=max_tokens,
             preserve_existing_history=preserve_existing_history,
+            response_modality=response_modality,
             request_handle=request_handle,
         )
 
@@ -1926,6 +1952,7 @@ class AgentRuntime:
         temperature: float | None,
         max_tokens: int | None,
         preserve_existing_history: bool,
+        response_modality: str = "text",
         request_handle: _ChatRequestHandle | None = None,
     ) -> ChatResponse:
         started_at = time.perf_counter()
@@ -1970,6 +1997,9 @@ class AgentRuntime:
                 ),
             }
         ]
+        delivery_prompt = _response_delivery_prompt(response_modality)
+        if delivery_prompt:
+            messages.append({"role": "system", "content": delivery_prompt})
         for item in recent[-10:]:
             if item.get("role") in {"user", "assistant"}:
                 messages.append(
@@ -1988,7 +2018,10 @@ class AgentRuntime:
                 "guest chat could not obtain a usable model response",
                 retry_scope=str(getattr(result, "failure_scope", None) or "request"),
             )
-        message_metadata: dict[str, Any] = {"access_mode": "guest"}
+        message_metadata: dict[str, Any] = {
+            "access_mode": "guest",
+            "response_modality": response_modality,
+        }
         if not existing_user_message_id:
             existing_user_message_id = self._chat_request_user_message(
                 request_handle,
@@ -2020,6 +2053,7 @@ class AgentRuntime:
         max_tokens: int | None = None,
         attachments: list[dict[str, Any]] | None = None,
         thinking_enabled: bool = True,
+        response_modality: str = "text",
         transport_request_id: str | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Stream one logical request while preserving the same durable fence as chat()."""
@@ -2035,6 +2069,7 @@ class AgentRuntime:
                 max_tokens=max_tokens,
                 attachments=attachments,
                 thinking_enabled=thinking_enabled,
+                response_modality=response_modality,
                 transport_request_id=None,
             ):
                 yield item
@@ -2068,6 +2103,7 @@ class AgentRuntime:
                 thinking_enabled=thinking_enabled,
                 access_mode=effective_access_mode,
                 notification_chat_id=None,
+                response_modality=response_modality,
             )
             if handle.cached_response is not None:
                 response = self._as_idempotent_replay_response(handle.cached_response)
@@ -2092,6 +2128,7 @@ class AgentRuntime:
                 max_tokens=max_tokens,
                 attachments=attachments,
                 thinking_enabled=thinking_enabled,
+                response_modality=response_modality,
                 transport_request_id=request_id,
                 _request_handle=handle,
             )
@@ -2140,6 +2177,7 @@ class AgentRuntime:
         max_tokens: int | None = None,
         attachments: list[dict[str, Any]] | None = None,
         thinking_enabled: bool = True,
+        response_modality: str = "text",
         transport_request_id: str | None = None,
         _request_handle: _ChatRequestHandle | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
@@ -2153,6 +2191,7 @@ class AgentRuntime:
                 temperature=temperature,
                 max_tokens=max_tokens,
                 preserve_existing_history=current_actor().source == "session",
+                response_modality=response_modality,
                 transport_request_id=(
                     None if _request_handle is not None else transport_request_id
                 ),
@@ -2179,6 +2218,7 @@ class AgentRuntime:
             conversation_id,
             capabilities=context_capabilities,
         )
+        context.response_modality = response_modality
         context.operator_message = message
         context.operator_scopes = _operator_action_scopes(message)
         self._bind_operator_request_identity(
@@ -2200,6 +2240,7 @@ class AgentRuntime:
                     temperature=temperature,
                     attachments=attachments,
                     thinking_enabled=thinking_enabled,
+                    response_modality=response_modality,
                 ),
             )
             replay_event = ChatEvent(
@@ -8910,6 +8951,7 @@ class AgentRuntime:
         thinking_enabled: bool,
         access_mode: str,
         notification_chat_id: int | None,
+        response_modality: str = "text",
     ) -> _ChatRequestHandle:
         request_hash = hashlib.sha256(request_id.encode("utf-8")).hexdigest()
         request_key = f"{CHAT_REQUEST_KEY_PREFIX}{request_hash}"
@@ -8923,6 +8965,7 @@ class AgentRuntime:
             thinking_enabled=thinking_enabled,
             access_mode=access_mode,
             notification_chat_id=notification_chat_id,
+            response_modality=response_modality,
         )
         hinted_state = self.storage.get_runtime_value(request_key, None)
         migrated_state: dict[str, Any] | None = None
@@ -12140,6 +12183,9 @@ class AgentRuntime:
             {"role": "system", "content": _runtime_date_context()},
             {"role": "system", "content": self._capability_manifest(context=context)},
         ]
+        delivery_prompt = _response_delivery_prompt(context.response_modality)
+        if delivery_prompt:
+            messages.append({"role": "system", "content": delivery_prompt})
         if context.task_plan is not None:
             messages.append({"role": "system", "content": _task_kernel_prompt(context.task_plan)})
         operator_prompt = self._operator_prompt()
@@ -20907,6 +20953,7 @@ def _chat_request_fingerprint(
     thinking_enabled: bool,
     access_mode: str,
     notification_chat_id: int | None,
+    response_modality: str = "text",
 ) -> str:
     # Conversation identity is validated against the durable state separately:
     # the first call may omit it while an exact retry supplies the minted id.
@@ -20931,6 +20978,7 @@ def _chat_request_fingerprint(
         "thinking_enabled": bool(thinking_enabled),
         "access_mode": str(access_mode),
         "notification_chat_id": notification_chat_id,
+        "response_modality": response_modality,
     }
     return hashlib.sha256(
         json.dumps(

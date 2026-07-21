@@ -2158,7 +2158,7 @@ def test_load_config_voice_replies_toggle():
     assert load_config({**common, "TELEGRAM_VOICE_REPLIES": "0"}).voice_replies is False
 
 
-def _voice_bridge(monkeypatch, *, ogg: bytes | None):
+def _voice_bridge(monkeypatch, *, ogg: bytes | None, speak_status: int = 200):
     monkeypatch.setattr("jarvis_gpt.telegram_bridge._wav_to_ogg_opus", lambda wav: ogg)
     tg_posts: list[str] = []
     chat_bodies: list[dict] = []
@@ -2194,7 +2194,10 @@ def _voice_bridge(monkeypatch, *, ogg: bytes | None):
                 },
             )
         if path == "/api/voice/speak":
-            return httpx.Response(200, content=b"RIFFwav-bytes")
+            return httpx.Response(
+                speak_status,
+                content=b"RIFFwav-bytes" if speak_status == 200 else b"",
+            )
         if path == "/api/files":
             return httpx.Response(200, json=[])
         return httpx.Response(404, json={})
@@ -2217,8 +2220,10 @@ def test_inbound_voice_transcribed_and_answered_with_voice(monkeypatch):
     # folds the transcript in as the real query.
     assert chat_bodies[0]["message"] == " "
     assert chat_bodies[0]["attachments"][0]["id"] == "v1"
+    assert chat_bodies[0]["response_modality"] == "voice"
     # Spoken input -> a synthesized voice note reply (inline OGG/Opus).
     assert any(p.endswith("/sendVoice") for p in tg_posts)
+    assert not any(p.endswith("/sendMessage") for p in tg_posts)
 
 
 def test_voice_reply_falls_back_to_audio_when_no_opus(monkeypatch):
@@ -2234,12 +2239,39 @@ def test_voice_reply_falls_back_to_audio_when_no_opus(monkeypatch):
     asyncio.run(bridge._handle(update))
     assert any(p.endswith("/sendAudio") for p in tg_posts)
     assert not any(p.endswith("/sendVoice") for p in tg_posts)
+    assert not any(p.endswith("/sendMessage") for p in tg_posts)
+
+
+def test_voice_reply_falls_back_to_text_when_tts_is_unavailable(monkeypatch):
+    bridge, tg_posts, chat_bodies = _voice_bridge(
+        monkeypatch,
+        ogg=b"OggS-opus",
+        speak_status=503,
+    )
+    update = {
+        "update_id": 1,
+        "message": {
+            "chat": {"id": 42, "type": "private"},
+            "from": {"id": 42, "is_bot": False},
+            "voice": {"file_id": "vf", "mime_type": "audio/ogg"},
+        },
+    }
+
+    asyncio.run(bridge._handle(update))
+
+    assert chat_bodies[0]["response_modality"] == "voice"
+    assert any(p.endswith("/sendMessage") for p in tg_posts)
+    assert not any(p.endswith("/sendVoice") for p in tg_posts)
+    assert not any(p.endswith("/sendAudio") for p in tg_posts)
 
 
 def test_text_input_never_triggers_a_voice_reply():
     speak_calls: list[str] = []
+    chat_bodies: list[dict] = []
+    tg_posts: list[str] = []
 
     def tg_handler(request):
+        tg_posts.append(request.url.path)
         return httpx.Response(200, json={"ok": True, "result": {}})
 
     def api_handler(request):
@@ -2247,6 +2279,7 @@ def test_text_input_never_triggers_a_voice_reply():
             speak_calls.append("speak")
             return httpx.Response(200, content=b"wav")
         if request.url.path == "/api/chat":
+            chat_bodies.append(json.loads(request.content))
             return httpx.Response(
                 200,
                 json={
@@ -2271,6 +2304,10 @@ def test_text_input_never_triggers_a_voice_reply():
     }
     asyncio.run(bridge._handle(update))
     assert speak_calls == []  # text in -> text out, never voice
+    assert chat_bodies[0]["response_modality"] == "text"
+    assert any(p.endswith("/sendMessage") for p in tg_posts)
+    assert not any(p.endswith("/sendVoice") for p in tg_posts)
+    assert not any(p.endswith("/sendAudio") for p in tg_posts)
 
 
 def test_quick_capture_body_parsers():

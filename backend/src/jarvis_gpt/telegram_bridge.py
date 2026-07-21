@@ -3363,6 +3363,7 @@ class TelegramBridge:
                 "conversation_id": conversation_id,
                 # Stamp the Telegram chat so reminders/scheduled tasks fire back here.
                 "notification_chat_id": int(chat_id),
+                "response_modality": "voice" if voice_reply else "text",
             }
             if request_id:
                 payload["request_id"] = request_id
@@ -3424,19 +3425,21 @@ class TelegramBridge:
         answer = body.get("answer") or "(пустой ответ)"
         self._last_answers[chat_id] = str(answer)
         markup = answer_action_keyboard() if action_chips else None
-        await self._send(chat_id, answer, reply_markup=markup)
+        voice_sent = False
         if voice_reply and self.cfg.voice_replies:
-            await self._reply_with_voice(chat_id, answer)
+            voice_sent = await self._reply_with_voice(chat_id, answer)
+        if not voice_sent:
+            await self._send(chat_id, answer, reply_markup=markup)
 
         inbound_ids = {a["id"] for a in attachments}
         await self._deliver_new_files(chat_id, before | inbound_ids)
 
-    async def _reply_with_voice(self, chat_id: int, answer: str) -> None:
+    async def _reply_with_voice(self, chat_id: int, answer: str) -> bool:
         """Speak the answer back as a Telegram voice note (spoken input → spoken reply)."""
 
         text = (answer or "").strip()
         if not text or len(text) > self.cfg.voice_reply_max_chars:
-            return
+            return False
         try:
             response = await self.api.post(
                 "/api/voice/speak",
@@ -3444,24 +3447,29 @@ class TelegramBridge:
                 headers=self._session_headers(chat_id),
             )
             if response.status_code != 200 or not response.content:
-                return
+                return False
             wav = response.content
         except httpx.HTTPError:
-            return
+            return False
         ogg = await asyncio.to_thread(_wav_to_ogg_opus, wav)
-        with suppress(httpx.HTTPError, RuntimeError):
+        try:
             if ogg:
-                await self.tg.post(
+                sent = await self.tg.post(
                     "/sendVoice",
                     data={"chat_id": chat_id},
                     files={"voice": ("jarvis.ogg", ogg, "audio/ogg")},
                 )
             else:  # no ffmpeg — fall back to a playable audio file
-                await self.tg.post(
+                sent = await self.tg.post(
                     "/sendAudio",
                     data={"chat_id": chat_id},
                     files={"audio": ("jarvis.wav", wav, "audio/wav")},
                 )
+            sent.raise_for_status()
+            body = sent.json()
+            return bool(body.get("ok"))
+        except (httpx.HTTPError, RuntimeError, ValueError):
+            return False
 
     async def _file_ids(self, chat_id: int) -> set[str]:
         try:

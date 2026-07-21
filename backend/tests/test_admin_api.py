@@ -707,6 +707,54 @@ def test_owner_can_create_assign_and_version_custom_preset(client):
     assert by_id["memory.read.own"]["allowed"] is False
 
 
+def test_preset_assignment_refreshes_next_telegram_session_permissions(client):
+    registered = _register_telegram_user(client, update_id=30)
+    user_id = registered["user"]["id"]
+    old_token = registered["session_token"]
+
+    assigned = _approved_request(
+        client,
+        "PUT",
+        f"/api/admin/users/{user_id}/preset",
+        json={"preset_key": "admin", "reason": "verify Telegram role refresh"},
+    )
+    assert assigned.status_code == 200, assigned.text
+    assert assigned.json()["preset_key"] == "admin"
+    assert client.get(
+        "/api/conversations",
+        headers={"X-Jarvis-User-Session": old_token},
+    ).status_code == 401
+
+    refreshed = client.post(
+        "/api/integrations/telegram/session",
+        headers={
+            "X-Jarvis-Bridge-Secret": BRIDGE_SECRET,
+            "X-Jarvis-User-Session": old_token,
+        },
+        json={
+            "realm_id": "telegram:700001",
+            "bot_id": 700001,
+            "update_id": 31,
+            "telegram_user": {
+                "id": 424242,
+                "is_bot": False,
+                "username": "secure_user",
+                "first_name": "Secure",
+                "language_code": "en",
+            },
+            "chat": {"id": 424242, "type": "private"},
+        },
+    )
+    assert refreshed.status_code == 200, refreshed.text
+    refreshed_body = refreshed.json()
+    assert refreshed_body["session_token"] != old_token
+    assert refreshed_body["user"]["preset_key"] == "admin"
+    assert client.get(
+        "/api/admin/users",
+        headers={"X-Jarvis-User-Session": refreshed_body["session_token"]},
+    ).status_code == 200
+
+
 def test_status_change_revokes_existing_sessions(client):
     registered = _register_telegram_user(client, update_id=3)
     user_id = registered["user"]["id"]
