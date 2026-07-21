@@ -1674,6 +1674,22 @@ class ToolRegistry:
         )
         self.add(
             ToolSpec(
+                name="voice.transcribe",
+                description=(
+                    "Расшифровать аудио/голосовое сообщение в текст через faster-whisper. "
+                    "Принимает путь к файлу (ogg, wav, mp3, m4a, flac и др.). "
+                    "Используй когда собеседник отправил голосовое сообщение или аудиофайл."
+                ),
+                category="speech",
+                input_schema={
+                    "path": "Локальный путь к аудиофайлу",
+                    "language": "Язык (auto для автоопределения, ru для русского)",
+                },
+                handler=_voice_transcribe,
+            )
+        )
+        self.add(
+            ToolSpec(
                 name="reminders.create",
                 description=(
                     "Create a reminder, calendar entry, or SCHEDULED AGENT TASK from natural "
@@ -5975,6 +5991,32 @@ def _voice_speak(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
         ok=True,
         summary=f"Speech synthesized ({round(result.duration_sec or 0, 1)}s): {text[:80]}",
         data={"path": str(tmp_path), "duration_sec": result.duration_sec},
+    )
+
+
+def _voice_transcribe(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    from . import speech
+    raw_path = str(args.get("path") or "").strip()
+    if not raw_path:
+        return ToolRunResponse(tool="voice.transcribe", ok=False, summary="File path is required.")
+    try:
+        path = _resolve_document_path(ctx.settings, raw_path)
+    except ValueError as exc:
+        return ToolRunResponse(tool="voice.transcribe", ok=False, summary=str(exc))
+    if not path.exists() or not path.is_file():
+        return ToolRunResponse(tool="voice.transcribe", ok=False, summary="Audio file does not exist.")
+    lang = str(args.get("language") or "auto").strip() or "auto"
+    result = speech.transcribe(path, language=lang)
+    if not result.ok:
+        return ToolRunResponse(
+            tool="voice.transcribe", ok=False,
+            summary=f"Transcription failed: {result.error or 'unknown error'}",
+        )
+    return ToolRunResponse(
+        tool="voice.transcribe",
+        ok=True,
+        summary=f"Transcribed ({round(result.duration_sec or 0, 1)}s): {result.text[:200]}",
+        data={"text": result.text, "language": result.language, "duration_sec": result.duration_sec},
     )
 
 
