@@ -67,6 +67,10 @@ class AuthorizationError(PermissionError):
     """The authenticated principal is not allowed to perform an operation."""
 
 
+class OwnerInvitationError(AuthorizationError):
+    """A one-time Telegram owner invitation cannot be claimed."""
+
+
 class ResourceIsolationError(AuthorizationError):
     """A resource exists, but belongs to another user."""
 
@@ -397,6 +401,19 @@ CREATE TABLE IF NOT EXISTS external_identities (
     UNIQUE(provider, realm_id, provider_subject_id)
 );
 
+CREATE TABLE IF NOT EXISTS telegram_owner_invitations (
+    id TEXT PRIMARY KEY,
+    token_verifier_sha256 TEXT NOT NULL UNIQUE,
+    created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    consumed_at TEXT,
+    claimed_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+    claimed_identity_id TEXT REFERENCES external_identities(id) ON DELETE SET NULL,
+    revoked_at TEXT,
+    reason TEXT NOT NULL DEFAULT ''
+);
+
 CREATE TABLE IF NOT EXISTS security_ids (
     id TEXT PRIMARY KEY,
     security_id TEXT NOT NULL UNIQUE,
@@ -567,6 +584,8 @@ ON security_audit_log(target_user_id, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_user_sessions_user ON user_sessions(user_id, expires_at DESC);
 CREATE INDEX IF NOT EXISTS idx_external_identities_provider_user
 ON external_identities(provider, user_id, last_seen_at DESC);
+CREATE INDEX IF NOT EXISTS idx_telegram_owner_invitations_expiry
+ON telegram_owner_invitations(expires_at, consumed_at, revoked_at);
 CREATE INDEX IF NOT EXISTS idx_telegram_updates_updated
 ON telegram_updates(updated_at);
 CREATE INDEX IF NOT EXISTS idx_ingress_rate_limits_updated
@@ -993,7 +1012,10 @@ class AuthorizationService:
             presets.update({"user", "moderator", "admin"})
         if entry.security_id == "approvals.read.own":
             presets.update({"user", "moderator", "admin"})
-        if entry.security_id.startswith("admin.") and entry.security_id != "admin.owner.transfer":
+        if entry.security_id.startswith("admin.") and entry.security_id not in {
+            "admin.owner.transfer",
+            "admin.users.owner.invite",
+        }:
             presets.add("admin")
         if (
             bootstrap_safe_presets
@@ -1195,6 +1217,65 @@ class AuthorizationService:
             )
         return decision
 
+    def create_telegram_owner_invitation(
+        self,
+        *,
+        expires_in_seconds: int,
+        reason: str,
+    ) -> dict[str, str]:
+        """Issue a one-time owner credential without persisting its bearer value."""
+
+        if not 60 <= int(expires_in_seconds) <= 86_400:
+            raise ValueError("Owner invitation lifetime must be between 60 and 86400 seconds")
+        clean_reason = reason.strip()
+        if not clean_reason:
+            raise ValueError("Owner invitation reason is required")
+        raw_token = secrets.token_urlsafe(32)
+        transport_proof = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+        verifier = hashlib.sha256(transport_proof.encode("ascii")).hexdigest()
+        invitation_id = _new_id("tgowinv")
+        now_dt = datetime.now(UTC)
+        now = now_dt.isoformat(timespec="seconds")
+        expires_at = (now_dt + timedelta(seconds=int(expires_in_seconds))).isoformat(
+            timespec="seconds"
+        )
+        actor_user_id = current_actor().user_id
+        with self.storage.transaction(immediate=True) as conn:
+            self.assert_actor_is_active_owner(conn, actor_user_id)
+            conn.execute(
+                """
+                INSERT INTO telegram_owner_invitations(
+                    id, token_verifier_sha256, created_by, created_at,
+                    expires_at, reason
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    invitation_id,
+                    verifier,
+                    actor_user_id,
+                    now,
+                    expires_at,
+                    clean_reason[:500],
+                ),
+            )
+            self.append_security_audit(
+                conn,
+                action="telegram.owner_invitation.create",
+                target_type="telegram_owner_invitation",
+                target_id=invitation_id,
+                target_user_id=None,
+                reason=clean_reason,
+                before={},
+                after={"expires_at": expires_at, "single_use": True},
+                actor_user_id=actor_user_id,
+            )
+        return {
+            "id": invitation_id,
+            "token": raw_token,
+            "created_at": now,
+            "expires_at": expires_at,
+        }
+
     def upsert_external_identity(
         self,
         *,
@@ -1206,14 +1287,57 @@ class AuthorizationService:
         last_name: str | None = None,
         locale: str | None = None,
         bootstrap_preset: str | None = None,
+        owner_invite_proof: str | None = None,
     ) -> dict[str, Any]:
         subject = str(provider_subject_id).strip()
         if not subject or len(subject) > 80:
             raise ValueError("provider_subject_id is required")
         if bootstrap_preset is not None and bootstrap_preset not in BUILTIN_PRESET_KEYS:
             raise ValueError("Unknown bootstrap preset")
+        invite_proof = str(owner_invite_proof or "").strip()
+        if invite_proof:
+            if provider != "telegram" or not re.fullmatch(r"[0-9a-f]{64}", invite_proof):
+                raise ValueError("Invalid Telegram owner invitation proof")
+            invite_verifier = hashlib.sha256(invite_proof.encode("ascii")).hexdigest()
+        else:
+            invite_verifier = ""
         now = _now()
         with self.storage.transaction(immediate=True) as conn:
+            invitation = None
+            if invite_verifier:
+                invitation = conn.execute(
+                    """
+                    SELECT id, created_by, expires_at, consumed_at, claimed_user_id,
+                           claimed_identity_id, revoked_at, reason
+                    FROM telegram_owner_invitations
+                    WHERE token_verifier_sha256 = ?
+                    """,
+                    (invite_verifier,),
+                ).fetchone()
+                if (
+                    invitation is None
+                    or invitation["revoked_at"] is not None
+                    or (
+                        invitation["consumed_at"] is None
+                        and str(invitation["expires_at"]) <= now
+                    )
+                ):
+                    raise OwnerInvitationError("Owner invitation is invalid or expired")
+                if invitation["consumed_at"] is None:
+                    issuer = conn.execute(
+                        """
+                        SELECT 1
+                        FROM users u
+                        JOIN user_preset_assignments upa
+                          ON upa.user_id = u.id AND upa.revoked_at IS NULL
+                        JOIN permission_presets p ON p.id = upa.preset_id
+                        WHERE u.id = ? AND u.status = 'active'
+                          AND p.preset_key = 'owner'
+                        """,
+                        (invitation["created_by"],),
+                    ).fetchone()
+                    if issuer is None:
+                        raise OwnerInvitationError("Owner invitation is invalid or expired")
             telegram_binding = (
                 self._telegram_conversation_binding(
                     conn,
@@ -1337,6 +1461,98 @@ class AuthorizationService:
                     user_id=user_id,
                     now=now,
                 )
+            owner_invite_claimed = False
+            if invitation is not None:
+                target = conn.execute(
+                    """
+                    SELECT u.status, p.preset_key
+                    FROM users u
+                    JOIN user_preset_assignments upa
+                      ON upa.user_id = u.id AND upa.revoked_at IS NULL
+                    JOIN permission_presets p ON p.id = upa.preset_id
+                    WHERE u.id = ?
+                    """,
+                    (user_id,),
+                ).fetchone()
+                if target is None or str(target["status"]) != "active":
+                    raise AuthorizationError("Telegram user is inactive")
+                if invitation["consumed_at"] is not None:
+                    if (
+                        str(invitation["claimed_user_id"] or "") != user_id
+                        or str(invitation["claimed_identity_id"] or "") != identity_id
+                    ):
+                        raise OwnerInvitationError("Owner invitation is invalid or expired")
+                    # Replays are idempotent, but an operator's later demotion must
+                    # not let an already-consumed invitation elevate the user again.
+                    owner_invite_claimed = str(target["preset_key"]) == "owner"
+                else:
+                    claimed = conn.execute(
+                        """
+                        UPDATE telegram_owner_invitations
+                        SET consumed_at = ?, claimed_user_id = ?, claimed_identity_id = ?
+                        WHERE id = ? AND consumed_at IS NULL AND revoked_at IS NULL
+                          AND expires_at > ?
+                        """,
+                        (now, user_id, identity_id, invitation["id"], now),
+                    )
+                    if claimed.rowcount != 1:
+                        raise OwnerInvitationError("Owner invitation is invalid or expired")
+                    previous_preset = str(target["preset_key"])
+                    if previous_preset != "owner":
+                        conn.execute(
+                            """
+                            UPDATE user_preset_assignments SET revoked_at = ?
+                            WHERE user_id = ? AND revoked_at IS NULL
+                            """,
+                            (now, user_id),
+                        )
+                        conn.execute(
+                            """
+                            INSERT INTO user_preset_assignments(
+                                id, user_id, preset_id, assigned_by, assigned_at, reason
+                            ) VALUES (?, ?, 'preset_owner', ?, ?, ?)
+                            """,
+                            (
+                                _new_id("assignment"),
+                                user_id,
+                                str(invitation["created_by"]),
+                                now,
+                                "Accepted one-time Telegram owner invitation",
+                            ),
+                        )
+                        conn.execute(
+                            """
+                            UPDATE users
+                            SET policy_epoch = policy_epoch + 1,
+                                row_version = row_version + 1, updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (now, user_id),
+                        )
+                        conn.execute(
+                            """
+                            UPDATE user_sessions SET revoked_at = ?
+                            WHERE user_id = ? AND revoked_at IS NULL
+                            """,
+                            (now, user_id),
+                        )
+                        self.assert_owner_recovery_invariant(conn)
+                    self.append_security_audit(
+                        conn,
+                        action="telegram.owner_invitation.claim",
+                        target_type="user",
+                        target_id=user_id,
+                        target_user_id=user_id,
+                        reason=str(invitation["reason"]),
+                        before={"preset_key": previous_preset},
+                        after={
+                            "preset_key": "owner",
+                            "identity_id": identity_id,
+                            "invitation_id": str(invitation["id"]),
+                        },
+                        actor_user_id=user_id,
+                    )
+                    owner_invite_claimed = True
             row = conn.execute(
                 """
                 SELECT u.id AS user_id, u.status, u.policy_epoch, ei.id AS identity_id,
@@ -1350,7 +1566,11 @@ class AuthorizationService:
                 """,
                 (user_id, identity_id),
             ).fetchone()
-        return {**dict(row), "created": created}
+        return {
+            **dict(row),
+            "created": created,
+            "owner_invite_claimed": owner_invite_claimed,
+        }
 
     @staticmethod
     def _telegram_conversation_binding(

@@ -73,6 +73,14 @@ type SecurityAudit = {
   reason?: string;
 };
 
+type TelegramOwnerInvitation = {
+  id: string;
+  command: string;
+  start_parameter: string;
+  created_at: string;
+  expires_at: string;
+};
+
 function asList<T>(value: unknown, key: string): T[] {
   if (Array.isArray(value)) return value as T[];
   if (value && typeof value === "object") {
@@ -190,6 +198,8 @@ export default function AdminPage() {
   const [expandedPreset, setExpandedPreset] = useState<string>("");
   const [showPresetForm, setShowPresetForm] = useState(false);
   const [showUserForm, setShowUserForm] = useState(false);
+  const [showOwnerInvite, setShowOwnerInvite] = useState(false);
+  const [ownerInvite, setOwnerInvite] = useState<TelegramOwnerInvitation | null>(null);
   const [userKind, setUserKind] = useState<"local" | "telegram">("local");
   const [userDisplayName, setUserDisplayName] = useState("");
   const [userPreset, setUserPreset] = useState("guest");
@@ -419,6 +429,38 @@ export default function AdminPage() {
     });
   }
 
+  async function createOwnerInvitation() {
+    setWorking("owner-invite");
+    setError("");
+    setNotice("");
+    try {
+      const payload = await requestJson("/api/admin/telegram-owner-invitations", {
+        method: "POST",
+        body: JSON.stringify({
+          expires_in_seconds: 1800,
+          reason: "Одноразовое приглашение owner через web-панель администратора"
+        })
+      }) as TelegramOwnerInvitation;
+      setOwnerInvite(payload);
+      setNotice("Owner-инвайт выпущен на 30 минут и записан в аудит.");
+      await loadCatalog();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setWorking("");
+    }
+  }
+
+  async function copyOwnerInvitation() {
+    if (!ownerInvite) return;
+    try {
+      await navigator.clipboard.writeText(ownerInvite.command);
+      setNotice("Команда приглашения скопирована.");
+    } catch {
+      setError("Не удалось скопировать команду. Скопируйте её из поля вручную.");
+    }
+  }
+
   async function deleteSelectedUser() {
     if (!selected) return;
     if (!window.confirm(
@@ -549,12 +591,55 @@ export default function AdminPage() {
           <div className={styles.panelHeader}>
             <div><h2>Учётные записи</h2><span>Локальные и Telegram, в т.ч. заранее добавленные</span></div>
             <div className={styles.headerActions}>
+              <button className={styles.secondaryButton} onClick={() => setShowOwnerInvite((v) => !v)}>
+                <KeyRound size={15} /> Owner-инвайт
+              </button>
               <button className={styles.primaryButton} onClick={() => setShowUserForm((v) => !v)}>
                 <Plus size={15} /> Добавить
               </button>
               <span className={styles.count}>{matchingUsers}</span>
             </div>
           </div>
+          {showOwnerInvite ? (
+            <div className={styles.presetForm}>
+              <div className={styles.formFields}>
+                <label className={styles.fullField}>
+                  <span>Одноразовая команда для Telegram</span>
+                  <input
+                    readOnly
+                    value={ownerInvite?.command || "Сначала выпустите приглашение"}
+                  />
+                  <small>
+                    Передайте команду только нужному человеку. Первый Telegram ID,
+                    отправивший её боту, атомарно получит роль owner; @username не используется.
+                  </small>
+                </label>
+                {ownerInvite ? (
+                  <label className={styles.fullField}>
+                    <span>Истекает</span>
+                    <input readOnly value={formattedDate(ownerInvite.expires_at)} />
+                  </label>
+                ) : null}
+              </div>
+              <div className={styles.formActions}>
+                <button
+                  className={styles.secondaryButton}
+                  disabled={!ownerInvite}
+                  onClick={() => void copyOwnerInvitation()}
+                >
+                  Скопировать
+                </button>
+                <button
+                  className={styles.primaryButton}
+                  disabled={working !== ""}
+                  onClick={() => void createOwnerInvitation()}
+                >
+                  {working === "owner-invite" ? <Loader2 className={styles.spin} size={15} /> : <KeyRound size={15} />}
+                  Выпустить на 30 минут
+                </button>
+              </div>
+            </div>
+          ) : null}
           {showUserForm ? (
             <div className={styles.presetForm}>
               <div className={styles.formFields}>

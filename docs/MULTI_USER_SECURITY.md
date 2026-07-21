@@ -70,6 +70,7 @@ The IAM tables are stored in the same SQLite database as the current runtime:
 | `security_audit_log` | Administrative mutations with actor, target, reason, and before/after JSON. |
 | `telegram_realms` | Persistent one-to-one binding between a canonical realm and immutable bot ID. |
 | `telegram_updates` | Telegram replay ledger keyed by bot realm/update with bounded attempts and CAS lease tokens. |
+| `telegram_owner_invitations` | Hashed, expiring, single-use owner invitations and their immutable claimant identity. |
 | `ingress_rate_limits` | Hashed per-principal/global fixed-window ingress budgets. |
 | `iam_migrations` | Idempotent schema and capability-catalog migration markers. |
 
@@ -182,6 +183,15 @@ updates from the same chat; an unmarked `5xx` never receives the extended budget
 every valid private Telegram user to register. `TELEGRAM_OWNER_CHAT_IDS` is compatibility
 metadata and never grants backend authority. Roles must be assigned through IAM.
 
+An active owner may issue a 30-minute one-time Telegram owner invitation from `/admin`.
+The recipient sends `/start owner_<secret>` to the bot. A syntactically valid invitation may
+cross the optional deployment allowlist exactly for this claim; after a successful claim the
+numeric Telegram ID is persisted as admitted. The bridge replaces the raw secret with a
+SHA-256 proof before durable inbox storage, the backend stores only a second hash, and the
+identity upsert, invitation consumption, and `owner` assignment commit in one transaction.
+Exact transport retries by the winning identity are idempotent; another identity cannot reuse
+the invitation. Telegram usernames are display metadata and never participate in the grant.
+
 Required transport controls:
 
 - `JARVIS_TELEGRAM_BRIDGE_SECRET` must be at least 32 characters, shared only by backend
@@ -209,6 +219,7 @@ The implemented administration endpoints are:
 | `GET /api/admin/users/{user_id}/permissions` | `admin.users.permissions.list` | Effective decision for every registered security ID. |
 | `PATCH /api/admin/users/{user_id}/status` | `admin.users.status.update` | Activate, suspend, or soft-delete a user. |
 | `POST /api/admin/users` | `admin.users.create` | Create a local account or pre-provision a Telegram identity. |
+| `POST /api/admin/telegram-owner-invitations` | `admin.users.owner.invite` | Issue an expiring, single-use Telegram owner invitation (active owner only). |
 | `DELETE /api/admin/users/{user_id}` | `admin.users.delete` | Permanently delete a non-owner account, external identities, sessions, IAM assignments, and tenant-owned data. |
 | `PUT /api/admin/users/{user_id}/preset` | `admin.users.preset.assign` | Replace the active preset assignment. |
 | `PUT /api/admin/users/{user_id}/permissions/{security_id}` | `admin.users.permission.set` | Set a direct grant or deny. |

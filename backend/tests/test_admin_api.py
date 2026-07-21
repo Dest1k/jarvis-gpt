@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -39,6 +40,8 @@ def _register_telegram_user(
     telegram_user_id: int = 424242,
     bot_id: int = 700001,
     realm_id: str | None = None,
+    owner_invite_token: str | None = None,
+    username: str | None = None,
 ) -> dict:
     realm_id = realm_id or f"telegram:{bot_id}"
     response = client.post(
@@ -51,7 +54,7 @@ def _register_telegram_user(
             "telegram_user": {
                 "id": telegram_user_id,
                 "is_bot": False,
-                "username": (
+                "username": username or (
                     "secure_user"
                     if telegram_user_id == 424242
                     else f"secure_user_{telegram_user_id}"
@@ -60,6 +63,15 @@ def _register_telegram_user(
                 "language_code": "en",
             },
             "chat": {"id": telegram_user_id, "type": "private"},
+            **(
+                {
+                    "owner_invite_proof": hashlib.sha256(
+                        owner_invite_token.encode("utf-8")
+                    ).hexdigest()
+                }
+                if owner_invite_token
+                else {}
+            ),
         },
     )
     assert response.status_code == 200, response.text
@@ -528,7 +540,6 @@ def test_telegram_registration_creates_scoped_session_and_denies_admin(client):
     admin_users = client.get("/api/admin/users", headers=session_headers)
     assert admin_users.status_code == 403
     assert admin_users.json()["detail"]["security_id"] == "admin.users.list"
-
     with app.state.storage.locked_connection() as conn:
         decision = conn.execute(
             """
@@ -539,6 +550,129 @@ def test_telegram_registration_creates_scoped_session_and_denies_admin(client):
             (registered["user"]["id"],),
         ).fetchone()
     assert dict(decision) == {"effect": "deny", "reason_code": "not_granted"}
+
+
+def test_one_time_owner_invitation_claims_immutable_telegram_identity(client):
+    username_only = _register_telegram_user(
+        client,
+        update_id=60,
+        telegram_user_id=515_151,
+        username="JBL61R",
+    )
+    assert username_only["user"]["preset_key"] == "guest"
+
+    issued = _approved_request(
+        client,
+        "POST",
+        "/api/admin/telegram-owner-invitations",
+        json={"expires_in_seconds": 1800, "reason": "Invite JBL61R as owner"},
+    )
+    assert issued.status_code == 201, issued.text
+    invitation = issued.json()
+    prefix = "/start owner_"
+    assert invitation["command"].startswith(prefix)
+    raw_token = invitation["command"].removeprefix(prefix)
+    assert len(raw_token) == 43
+    proof = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+    verifier = hashlib.sha256(proof.encode("ascii")).hexdigest()
+
+    with app.state.storage.locked_connection() as conn:
+        stored = conn.execute(
+            """
+            SELECT token_verifier_sha256, consumed_at, claimed_user_id,
+                   claimed_identity_id, reason
+            FROM telegram_owner_invitations WHERE id = ?
+            """,
+            (invitation["id"],),
+        ).fetchone()
+    assert stored is not None
+    assert stored["token_verifier_sha256"] == verifier
+    assert raw_token not in json.dumps(dict(stored), ensure_ascii=False)
+    assert stored["consumed_at"] is None
+
+    claimed = _register_telegram_user(
+        client,
+        update_id=61,
+        telegram_user_id=616_161,
+        username="JBL61R",
+        owner_invite_token=raw_token,
+    )
+    assert claimed["user"]["created"] is True
+    assert claimed["user"]["preset_key"] == "owner"
+    assert claimed["user"]["owner_invite_claimed"] is True
+    assert client.get(
+        "/api/admin/users",
+        headers={"X-Jarvis-User-Session": claimed["session_token"]},
+    ).status_code == 200
+
+    with app.state.storage.transaction(immediate=True) as conn:
+        conn.execute(
+            "UPDATE telegram_owner_invitations SET expires_at = ? WHERE id = ?",
+            ("2000-01-01T00:00:00+00:00", invitation["id"]),
+        )
+
+    # Once consumed, expiry must not break an exact lost-response replay by the
+    # immutable winning identity. It still cannot grant anyone else.
+    replay = _register_telegram_user(
+        client,
+        update_id=61,
+        telegram_user_id=616_161,
+        username="JBL61R",
+        owner_invite_token=raw_token,
+    )
+    assert replay["user"]["id"] == claimed["user"]["id"]
+    assert replay["user"]["preset_key"] == "owner"
+    assert replay["user"]["owner_invite_claimed"] is True
+
+    rejected = client.post(
+        "/api/integrations/telegram/session",
+        headers={"X-Jarvis-Bridge-Secret": BRIDGE_SECRET},
+        json={
+            "realm_id": "telegram:700001",
+            "bot_id": 700001,
+            "update_id": 62,
+            "telegram_user": {"id": 626_262, "is_bot": False, "username": "attacker"},
+            "chat": {"id": 626_262, "type": "private"},
+            "owner_invite_proof": proof,
+        },
+    )
+    assert rejected.status_code == 403, rejected.text
+    assert rejected.json()["detail"] == "Owner invitation is invalid or expired"
+
+    with app.state.storage.locked_connection() as conn:
+        consumed = conn.execute(
+            """
+            SELECT consumed_at, claimed_user_id, claimed_identity_id
+            FROM telegram_owner_invitations WHERE id = ?
+            """,
+            (invitation["id"],),
+        ).fetchone()
+        attacker = conn.execute(
+            """
+            SELECT 1 FROM external_identities
+            WHERE provider = 'telegram' AND provider_subject_id = '626262'
+            """
+        ).fetchone()
+        claims = conn.execute(
+            """
+            SELECT COUNT(*) AS c FROM security_audit_log
+            WHERE action = 'telegram.owner_invitation.claim'
+              AND target_user_id = ?
+            """,
+            (claimed["user"]["id"],),
+        ).fetchone()
+    assert consumed["consumed_at"] is not None
+    assert consumed["claimed_user_id"] == claimed["user"]["id"]
+    assert consumed["claimed_identity_id"] == claimed["user"]["identity_id"]
+    assert attacker is None
+    assert claims["c"] == 1
+
+    pre_provisioned = json.loads(
+        (app.state.settings.state_dir / "telegram_pre_provisioned.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert 616_161 in pre_provisioned["chat_ids"]
 
 
 def test_invalid_session_never_falls_back_to_local_owner(client):

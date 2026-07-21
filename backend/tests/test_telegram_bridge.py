@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import json
 import logging
@@ -45,13 +46,23 @@ def _cfg(**over) -> TelegramConfig:
     return TelegramConfig(**base)
 
 
-def _bridge(tg_handler, api_handler, *, session_presets=None, **cfg_over):
+def _bridge(
+    tg_handler,
+    api_handler,
+    *,
+    session_presets=None,
+    session_payloads: list[dict] | None = None,
+    **cfg_over,
+):
     presets = {42: "owner", **(session_presets or {})}
 
     def scoped_api_handler(request):
         if request.url.path == "/api/integrations/telegram/session":
             payload = json.loads(request.content)
+            if session_payloads is not None:
+                session_payloads.append(payload)
             telegram_id = payload["telegram_user"]["id"]
+            invite_claimed = bool(payload.get("owner_invite_proof"))
             return httpx.Response(
                 200,
                 json={
@@ -60,7 +71,10 @@ def _bridge(tg_handler, api_handler, *, session_presets=None, **cfg_over):
                     "session_token": f"session-{telegram_id}",
                     "user": {
                         "id": f"user-{telegram_id}",
-                        "preset_key": presets.get(telegram_id, "guest"),
+                        "preset_key": (
+                            "owner" if invite_claimed else presets.get(telegram_id, "guest")
+                        ),
+                        "owner_invite_claimed": invite_claimed,
                     },
                 },
             )
@@ -583,6 +597,91 @@ def test_start_command_preserves_existing_conversation():
 
     assert bridge.conversations[42] == "existing"
     assert "/api/chat" not in api_calls
+
+
+def test_owner_invite_bypasses_allowlist_once_and_redacts_durable_secret(tmp_path):
+    raw_token = "A" * 43
+    command = f"/start owner_{raw_token}"
+    session_payloads: list[dict] = []
+    api_calls: list[str] = []
+    sent_messages: list[dict] = []
+
+    def tg_handler(request):
+        if request.url.path.endswith("/sendMessage"):
+            sent_messages.append(json.loads(request.content))
+        return httpx.Response(200, json={"ok": True, "result": {}})
+
+    def api_handler(request):
+        api_calls.append(request.url.path)
+        return httpx.Response(200, json={})
+
+    bridge = _bridge(
+        tg_handler,
+        api_handler,
+        allowed_chat_ids=frozenset({42}),
+        session_payloads=session_payloads,
+    )
+    update = {
+        "update_id": 71,
+        "message": {
+            "chat": {"id": 99, "type": "private"},
+            "from": {"id": 99, "is_bot": False, "username": "JBL61R"},
+            "text": command,
+        },
+    }
+
+    async def run_invite():
+        accepted = bridge._enqueue_update(update)
+        tasks = tuple(bridge._update_tasks)
+        if tasks:
+            await asyncio.gather(*tasks)
+        return accepted
+
+    assert asyncio.run(run_invite()) is True
+    proof = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+    assert session_payloads == [
+        {
+            "realm_id": "telegram:700001",
+            "bot_id": 700001,
+            "update_id": 71,
+            "telegram_user": {
+                "id": 99,
+                "username": "JBL61R",
+                "first_name": None,
+                "last_name": None,
+                "language_code": None,
+                "is_premium": False,
+            },
+            "chat": {"id": 99, "type": "private"},
+            "owner_invite_proof": proof,
+        }
+    ]
+    assert "/api/chat" not in api_calls
+    assert any("статус owner активирован" in item.get("text", "") for item in sent_messages)
+
+    rejected = {
+        "update_id": 72,
+        "message": {
+            "chat": {"id": 100, "type": "private"},
+            "from": {"id": 100, "is_bot": False},
+            "text": "/start owner_short",
+        },
+    }
+    assert bridge._enqueue_update(rejected) is False
+
+    store = TelegramConversationStore(
+        tmp_path / "telegram.sqlite3",
+        realm_id="telegram:700001",
+    )
+    assert store.persist_updates([(71, 99, update)]) == 1
+    with sqlite3.connect(tmp_path / "telegram.sqlite3") as conn:
+        persisted = conn.execute(
+            "SELECT payload_json FROM telegram_update_inbox WHERE update_id = 71"
+        ).fetchone()[0]
+    assert raw_token not in persisted
+    durable = json.loads(persisted)
+    assert durable["_jarvis_owner_invite_proof"] == proof
+    assert durable["message"]["text"] == "/start owner_[redacted]"
 
 
 def test_conversation_ids_survive_restart_and_stay_isolated_per_chat(tmp_path):

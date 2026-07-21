@@ -158,6 +158,9 @@ _INBOX_TRANSIENT_ERROR = "transient_backend_failure"
 _BACKEND_RETRY_CLASS_HEADER = "X-Jarvis-Retry-Class"
 _BACKEND_LLM_OUTAGE_CLASS = "llm-outage"
 _BACKEND_CHAT_REQUEST_IN_PROGRESS_CLASS = "chat-request-in-progress"
+_OWNER_INVITE_UPDATE_KEY = "_jarvis_owner_invite_proof"
+_OWNER_INVITE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
+_OWNER_INVITE_PROOF_RE = re.compile(r"^[0-9a-f]{64}$")
 
 # Audio/video attachments are transcribed backend-side; the bridge only relays them and,
 # for a spoken turn, mirrors the modality by replying with a synthesized voice note.
@@ -191,6 +194,49 @@ def _telegram_command(text: str) -> str:
     if not first_token.startswith("/"):
         return ""
     return first_token.split("@", 1)[0]
+
+
+def _owner_invite_token(text: str) -> str | None:
+    tokens = str(text or "").strip().split(maxsplit=1)
+    if len(tokens) != 2 or _telegram_command(text) not in _START_COMMANDS:
+        return None
+    payload = tokens[1].strip()
+    if not payload.startswith("owner_"):
+        return None
+    token = payload.removeprefix("owner_")
+    return token if _OWNER_INVITE_TOKEN_RE.fullmatch(token) else None
+
+
+def _owner_invite_proof_from_update(update: Mapping[str, object]) -> str | None:
+    persisted = str(update.get(_OWNER_INVITE_UPDATE_KEY) or "").strip()
+    if _OWNER_INVITE_PROOF_RE.fullmatch(persisted):
+        return persisted
+    message = update.get("message")
+    if not isinstance(message, dict):
+        return None
+    text = str(message.get("text") or message.get("caption") or "")
+    token = _owner_invite_token(text)
+    if token is None:
+        return None
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _sanitize_owner_invite_update(update: dict) -> dict:
+    """Replace the raw one-time bearer before an update reaches durable storage."""
+
+    proof = _owner_invite_proof_from_update(update)
+    if proof is None or _OWNER_INVITE_UPDATE_KEY in update:
+        return update
+    message = update.get("message")
+    if not isinstance(message, dict):
+        return update
+    field = "text" if message.get("text") else "caption"
+    sanitized_message = {**message, field: "/start owner_[redacted]"}
+    return {
+        **update,
+        _OWNER_INVITE_UPDATE_KEY: proof,
+        "message": sanitized_message,
+    }
 
 
 def _retryable_backend_http_error(exc: httpx.HTTPError) -> bool:
@@ -766,6 +812,7 @@ class TelegramUserSession:
     token: str
     user_id: str
     preset_key: str
+    owner_invite_claimed: bool = False
 
 
 class TelegramConversationStore:
@@ -1586,6 +1633,7 @@ class TelegramConversationStore:
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             for update_id, chat_id, payload in updates:
+                durable_payload = _sanitize_owner_invite_update(payload)
                 cursor = conn.execute(
                     """
                     INSERT INTO telegram_update_inbox(
@@ -1599,7 +1647,7 @@ class TelegramConversationStore:
                         update_id,
                         chat_id,
                         json.dumps(
-                            payload,
+                            durable_payload,
                             ensure_ascii=False,
                             separators=(",", ":"),
                             sort_keys=True,
@@ -2191,7 +2239,8 @@ class TelegramBridge:
             log.warning("DENIED ambiguous Telegram update before bridge queue")
             return False
         chat_id = identity[0]
-        if not self._chat_is_allowed(chat_id):
+        owner_invite_proof = _owner_invite_proof_from_update(update)
+        if not self._chat_is_allowed(chat_id) and owner_invite_proof is None:
             log.warning("DENIED Telegram user_id=%s by optional allowlist", chat_id)
             return False
         # /stop must not sit behind a long agent turn on the same chat lock.
@@ -2643,6 +2692,7 @@ class TelegramBridge:
         update_id: int,
         chat_id: int,
         sender: Mapping[str, object],
+        owner_invite_proof: str | None = None,
     ) -> TelegramUserSession | None:
         """Register/update the Telegram identity and obtain a scoped backend session.
 
@@ -2665,6 +2715,8 @@ class TelegramBridge:
             },
             "chat": {"id": chat_id, "type": "private"},
         }
+        if owner_invite_proof is not None:
+            payload["owner_invite_proof"] = owner_invite_proof
         headers = {_BRIDGE_SECRET_HEADER: self.cfg.bridge_secret}
         existing_session = self._sessions.get(chat_id)
         if existing_session is not None:
@@ -2699,9 +2751,15 @@ class TelegramBridge:
             or user.get("preset")
             or "guest"
         ).strip()
+        owner_invite_claimed = bool(user.get("owner_invite_claimed", False))
         if not token or not user_id:
             raise ValueError("backend returned an incomplete Telegram user session")
-        session = TelegramUserSession(token=token, user_id=user_id, preset_key=preset_key)
+        session = TelegramUserSession(
+            token=token,
+            user_id=user_id,
+            preset_key=preset_key,
+            owner_invite_claimed=owner_invite_claimed,
+        )
         self._cache_session(chat_id, session)
         return session
 
@@ -2882,7 +2940,8 @@ class TelegramBridge:
                     log.warning("DENIED ambiguous Telegram update_id=%s", update_id)
                     continue
                 chat_id = identity[0]
-                if not self._chat_is_allowed(chat_id):
+                owner_invite_proof = _owner_invite_proof_from_update(update)
+                if not self._chat_is_allowed(chat_id) and owner_invite_proof is None:
                     log.warning("DENIED Telegram user_id=%s by optional allowlist", chat_id)
                     continue
                 staged.append((update_id, chat_id, update))
@@ -2931,7 +2990,9 @@ class TelegramBridge:
             )
             return
         chat_id, sender = identity
-        if not self._chat_is_allowed(chat_id):
+        text = (message.get("text") or message.get("caption") or "").strip()
+        owner_invite_proof = _owner_invite_proof_from_update(update)
+        if not self._chat_is_allowed(chat_id) and owner_invite_proof is None:
             log.warning("DENIED Telegram user_id=%s by optional allowlist", chat_id)
             return
         update_id = update.get("update_id")
@@ -2943,7 +3004,26 @@ class TelegramBridge:
                 update_id=update_id,
                 chat_id=chat_id,
                 sender=sender,
+                owner_invite_proof=owner_invite_proof,
             )
+        except httpx.HTTPStatusError as exc:
+            detail = ""
+            with suppress(ValueError):
+                detail = str((exc.response.json() or {}).get("detail") or "")
+            if (
+                owner_invite_proof is not None
+                and exc.response.status_code == 403
+                and detail == "Owner invitation is invalid or expired"
+            ):
+                await self._send(
+                    chat_id,
+                    "Owner-приглашение недействительно, уже использовано или истекло.",
+                )
+                return
+            log.exception("Could not establish scoped Telegram session for user_id=%s", chat_id)
+            if _retryable_backend_http_error(exc):
+                return False
+            raise
         except httpx.HTTPError as exc:
             log.exception("Could not establish scoped Telegram session for user_id=%s", chat_id)
             # The durable inbox retries the same immutable update id. The backend's
@@ -2954,7 +3034,20 @@ class TelegramBridge:
         if session is None:
             return
 
-        text = (message.get("text") or message.get("caption") or "").strip()
+        if owner_invite_proof is not None:
+            if session.owner_invite_claimed and session.preset_key == "owner":
+                await self._send(
+                    chat_id,
+                    "Готово: учётная запись создана или обновлена, статус owner активирован.",
+                    reply_markup=operator_reply_keyboard(),
+                )
+            else:
+                await self._send(
+                    chat_id,
+                    "Owner-приглашение уже не может быть использовано.",
+                )
+            return
+
         command = _telegram_command(text)
         console_action = _console_action_for_text(text)
         if console_action == "start" or command in _START_COMMANDS:

@@ -62,6 +62,11 @@ class UserDeleteRequest(BaseModel):
     reason: str = Field(min_length=1, max_length=500)
 
 
+class TelegramOwnerInvitationCreateRequest(BaseModel):
+    expires_in_seconds: int = Field(default=1800, ge=60, le=86400)
+    reason: str = Field(min_length=1, max_length=500)
+
+
 class ServiceModeUpdateRequest(BaseModel):
     enabled: bool
     message: str = Field(default="", max_length=500)
@@ -95,6 +100,14 @@ class TelegramSessionRequest(BaseModel):
     update_id: int = Field(ge=0)
     telegram_user: TelegramUserPayload
     chat: TelegramChatPayload
+    # SHA-256 proof derived by the bridge from a one-time /start secret. The raw
+    # bearer secret never enters the backend request or durable Telegram inbox.
+    owner_invite_proof: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
 
 
 class TelegramSessionResponse(BaseModel):

@@ -12,12 +12,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 
 from .admin_models import (
     PermissionPresetCreateRequest,
     PermissionPresetUpdateRequest,
     ServiceModeUpdateRequest,
+    TelegramOwnerInvitationCreateRequest,
     TelegramSessionRequest,
     TelegramSessionResponse,
     UserCreateRequest,
@@ -35,6 +36,7 @@ from .authorization import (
     AuthorizationService,
     CapabilityDefinition,
     ConcurrentPolicyUpdateError,
+    OwnerInvitationError,
     current_actor,
 )
 from .runtime_notices import (
@@ -227,6 +229,14 @@ ADMIN_API_CAPABILITIES: tuple[CapabilityDefinition, ...] = (
     CapabilityDefinition(
         "admin.users.create",
         "Создание локальной или Telegram-учётной записи (в т.ч. заранее, до первого сообщения)",
+        "admin",
+        4,
+        True,
+        source="admin_api",
+    ),
+    CapabilityDefinition(
+        "admin.users.owner.invite",
+        "Выпуск одноразового Telegram-приглашения с ролью owner",
         "admin",
         4,
         True,
@@ -891,6 +901,34 @@ def create_user(request: Request, payload: UserCreateRequest) -> dict[str, Any]:
     }
 
 
+@router.post(
+    "/api/admin/telegram-owner-invitations",
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_security_id("admin.users.owner.invite"))],
+)
+def create_telegram_owner_invitation(
+    request: Request,
+    response: Response,
+    payload: TelegramOwnerInvitationCreateRequest,
+) -> dict[str, Any]:
+    service = _authorization(request)
+    try:
+        invitation = service.create_telegram_owner_invitation(
+            expires_in_seconds=payload.expires_in_seconds,
+            reason=payload.reason,
+        )
+    except AuthorizationError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    raw_token = invitation.pop("token")
+    start_parameter = f"owner_{raw_token}"
+    response.headers["Cache-Control"] = "no-store"
+    return {
+        **invitation,
+        "start_parameter": start_parameter,
+        "command": f"/start {start_parameter}",
+    }
+
+
 @router.delete(
     "/api/admin/users/{user_id}",
     dependencies=[Depends(require_security_id("admin.users.delete"))],
@@ -1532,8 +1570,13 @@ def _telegram_session(request: Request, payload: TelegramSessionRequest) -> Tele
         )
     service = _authorization(request)
     service.prune_ephemeral_security_state()
+    canonical_payload = payload.model_dump(mode="json")
+    if payload.owner_invite_proof is None:
+        # Preserve the pre-invitation payload hash so an update durably staged before
+        # deployment can finish after the backend restarts without a false mismatch.
+        canonical_payload.pop("owner_invite_proof", None)
     canonical = json.dumps(
-        payload.model_dump(mode="json"),
+        canonical_payload,
         ensure_ascii=False,
         separators=(",", ":"),
         sort_keys=True,
@@ -1648,7 +1691,14 @@ def _telegram_session(request: Request, payload: TelegramSessionRequest) -> Tele
             first_name=payload.telegram_user.first_name,
             last_name=payload.telegram_user.last_name,
             locale=payload.telegram_user.language_code,
+            owner_invite_proof=payload.owner_invite_proof,
         )
+        if payload.owner_invite_proof and identity["owner_invite_claimed"]:
+            _remember_telegram_pre_provision(
+                request,
+                telegram_user_id=payload.telegram_user.id,
+                user_id=str(identity["user_id"]),
+            )
         raw_existing_session = str(
             request.headers.get("x-jarvis-user-session") or ""
         ).strip()
@@ -1685,6 +1735,24 @@ def _telegram_session(request: Request, payload: TelegramSessionRequest) -> Tele
                 ttl_seconds=_telegram_session_ttl(),
             )
             created_session_id = str(session["session_id"])
+    except OwnerInvitationError as exc:
+        finalized = _finalize_telegram_update_lease(
+            service,
+            realm_id=realm_id,
+            update_id=payload.update_id,
+            lease_token=lease_token,
+            status="failed",
+            last_error=type(exc).__name__,
+        )
+        if not finalized:
+            raise HTTPException(
+                status_code=409,
+                detail="Telegram update processing lease was superseded",
+            ) from exc
+        raise HTTPException(
+            status_code=403,
+            detail="Owner invitation is invalid or expired",
+        ) from exc
     except AuthorizationError as exc:
         finalized = _finalize_telegram_update_lease(
             service,
@@ -1741,6 +1809,7 @@ def _telegram_session(request: Request, payload: TelegramSessionRequest) -> Tele
             "status": str(identity["status"]),
             "preset_key": str(identity["preset_key"]),
             "created": bool(identity["created"]),
+            "owner_invite_claimed": bool(identity["owner_invite_claimed"]),
         },
     )
 
