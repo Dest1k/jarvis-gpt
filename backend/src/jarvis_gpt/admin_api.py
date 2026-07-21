@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import sqlite3
 import uuid
@@ -41,6 +42,8 @@ from .runtime_notices import (
     get_service_mode,
     set_service_mode,
 )
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _telegram_pre_provision_path(request: Request) -> Path:
@@ -85,7 +88,66 @@ def _remember_telegram_pre_provision(
     )
 
 
+def _detach_telegram_pre_provisioned_user(
+    request: Request,
+    *,
+    user_id: str,
+    telegram_user_ids: list[int],
+) -> bool:
+    """Forget the deleted account mapping while retaining explicit bot eligibility."""
+
+    if not telegram_user_ids:
+        return True
+    ids = {int(item) for item in telegram_user_ids}
+    if not ids:
+        return True
+    path = _telegram_pre_provision_path(request)
+    if not path.is_file():
+        return True
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(raw, dict):
+        return False
+    users = dict(raw.get("users") or {})
+    for key, value in list(users.items()):
+        mapped_user_id = str(value.get("user_id") or "") if isinstance(value, dict) else ""
+        if mapped_user_id == user_id or (
+            str(key).lstrip("-").isdigit() and int(key) in ids
+        ):
+            users.pop(key, None)
+    try:
+        path.write_text(
+            json.dumps(
+                {
+                    # Eligibility is a deployment access policy, not an account binding.
+                    # Keeping it lets a deliberately admitted person register a clean
+                    # least-privilege account if they contact the bot again.
+                    "chat_ids": sorted(
+                        {
+                            int(item)
+                            for item in (raw.get("chat_ids") or [])
+                            if str(item).lstrip("-").isdigit()
+                        }
+                    ),
+                    "users": users,
+                },
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        return False
+    return True
+
+
 def _forget_telegram_pre_provision(request: Request, *, telegram_user_id: int | None) -> None:
+    """Remove both account metadata and eligibility when explicitly requested elsewhere."""
+
     if telegram_user_id is None:
         return
     path = _telegram_pre_provision_path(request)
@@ -839,30 +901,48 @@ def delete_user(
     service = _authorization(request)
     _assert_target_manageable(service, user_id)
     try:
-        result = service.set_user_status(
+        result = service.delete_user(
             user_id=user_id,
-            status="deleted",
             reason=payload.reason,
             expected_row_version=_expected_user_row_version(request, user_id),
         )
     except AuthorizationError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    with service.storage.transaction(immediate=True) as conn:
-        # Soft-delete is enough for IAM; also revoke live sessions so TG/local stop.
-        conn.execute(
-            "UPDATE user_sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL",
-            (_now(), user_id),
+    telegram_identities = list(result.pop("telegram_identities", []))
+    telegram_user_ids = [
+        int(item["telegram_user_id"])
+        for item in telegram_identities
+        if isinstance(item, dict) and isinstance(item.get("telegram_user_id"), int)
+    ]
+    pre_provision_cleanup = _detach_telegram_pre_provisioned_user(
+        request,
+        user_id=user_id,
+        telegram_user_ids=telegram_user_ids,
+    )
+    if not pre_provision_cleanup:
+        LOGGER.error(
+            "Deleted user %s but could not detach the stale Telegram pre-provision mapping",
+            user_id,
         )
-        service.append_security_audit(
-            conn,
-            action="user.delete",
-            target_type="user",
-            target_id=user_id,
-            target_user_id=user_id,
-            reason=payload.reason,
-            after={"status": "deleted", "sessions_revoked": True},
-        )
-    return {"ok": True, "user_id": user_id, **(result if isinstance(result, dict) else {})}
+
+    playbook_cleanup = True
+    playbook_count = 0
+    try:
+        playbooks = getattr(request.app.state, "playbooks", None)
+        if playbooks is not None:
+            playbook_count = int(playbooks.delete_for_user(user_id))
+    except Exception:  # noqa: BLE001 - DB deletion already committed; report cleanup honestly
+        playbook_cleanup = False
+        LOGGER.exception("Deleted user %s but playbook cleanup failed", user_id)
+
+    deleted_counts = dict(result.get("deleted_counts") or {})
+    deleted_counts["execution_playbooks"] = playbook_count
+    result["deleted_counts"] = deleted_counts
+    artifact_cleanup = dict(result.get("artifact_cleanup") or {})
+    result["cleanup_complete"] = bool(artifact_cleanup.get("complete", False)) and bool(
+        pre_provision_cleanup and playbook_cleanup
+    )
+    return result
 
 
 @router.get(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -8,6 +9,7 @@ from jarvis_gpt.api import app
 from jarvis_gpt.authorization import (
     LEGACY_OWNER_USER_ID,
     AuthorizationError,
+    bind_actor,
     current_actor,
 )
 from jarvis_gpt.telegram_bridge import TelegramConversationStore
@@ -771,6 +773,278 @@ def test_status_change_revokes_existing_sessions(client):
         headers={"X-Jarvis-User-Session": registered["session_token"]},
     )
     assert denied.status_code == 401
+
+
+def test_soft_deleted_telegram_user_stays_blocked_until_reactivated(client):
+    registered = _register_telegram_user(client, update_id=38, telegram_user_id=383_838)
+    user_id = registered["user"]["id"]
+    blocked = _approved_request(
+        client,
+        "PATCH",
+        f"/api/admin/users/{user_id}/status",
+        json={"status": "deleted", "reason": "retain identity as a block"},
+    )
+    assert blocked.status_code == 200, blocked.text
+
+    retry = client.post(
+        "/api/integrations/telegram/session",
+        headers={"X-Jarvis-Bridge-Secret": BRIDGE_SECRET},
+        json={
+            "realm_id": "telegram:700001",
+            "bot_id": 700001,
+            "update_id": 39,
+            "telegram_user": {"id": 383_838, "is_bot": False},
+            "chat": {"id": 383_838, "type": "private"},
+        },
+    )
+    assert retry.status_code == 403, retry.text
+    assert retry.json()["detail"] == "Telegram user is inactive"
+    with app.state.storage.locked_connection() as conn:
+        assert conn.execute(
+            "SELECT status FROM users WHERE id = ?", (user_id,)
+        ).fetchone()["status"] == "deleted"
+        assert conn.execute(
+            "SELECT 1 FROM external_identities WHERE user_id = ?", (user_id,)
+        ).fetchone()
+
+    reactivated = _approved_request(
+        client,
+        "PATCH",
+        f"/api/admin/users/{user_id}/status",
+        json={"status": "active", "reason": "explicit reactivation"},
+    )
+    assert reactivated.status_code == 200, reactivated.text
+    refreshed = _register_telegram_user(
+        client,
+        update_id=40,
+        telegram_user_id=383_838,
+    )
+    assert refreshed["user"]["id"] == user_id
+    assert refreshed["user"]["created"] is False
+
+
+def test_admin_delete_permanently_purges_user_and_allows_clean_registration(client):
+    registered = _register_telegram_user(client, update_id=50, telegram_user_id=404_040)
+    user_id = registered["user"]["id"]
+    service = app.state.authorization
+    storage = app.state.storage
+    actor = service.actor_for_user(user_id, source="deletion-test")
+    assert actor is not None
+
+    with bind_actor(actor):
+        conversation_id = storage.create_conversation("private deletion test")
+        storage.add_message(
+            conversation_id=conversation_id,
+            role="user",
+            content="private message that must be deleted",
+        )
+        memory = storage.add_memory(
+            content="private memory that must be deleted",
+            namespace="private",
+        )
+        storage.set_runtime_value("preferences", {"private": True})
+        user_files_dir = (
+            app.state.settings.data_dir / "files" / "users" / user_id
+        )
+        user_files_dir.mkdir(parents=True, exist_ok=True)
+        stored_path = user_files_dir / "private.txt"
+        stored_path.write_text("private file", encoding="utf-8")
+        file_record = storage.create_file_record(
+            name=stored_path.name,
+            stored_path=stored_path,
+            sha256="a" * 64,
+            size=stored_path.stat().st_size,
+            mime_type="text/plain",
+            status="indexed",
+            chunk_count=1,
+        )
+        storage.add_file_chunks(file_record["id"], ["private indexed content"])
+        app.state.playbooks.record(
+            symptom="private deletion symptom",
+            solution="private deletion solution",
+            verification="private deletion verification",
+            outcome="success",
+        )
+
+    TelegramConversationStore(
+        storage.database_path,
+        realm_id="telegram:700001",
+    )
+    with storage.transaction(immediate=True) as conn:
+        conn.execute(
+            """
+            INSERT INTO telegram_conversations(
+                realm_id, chat_id, conversation_id, access_mode, user_id
+            ) VALUES ('telegram:700001', 404040, ?, 'guest', ?)
+            """,
+            (conversation_id, user_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO telegram_update_inbox(
+                realm_id, update_id, chat_id, payload_json, status,
+                attempt_count, received_at, updated_at
+            ) VALUES ('telegram:700001', 404040, 404040, '{"private":true}',
+                      'completed', 1, 1.0, 1.0)
+            """
+        )
+
+    provisioned = _approved_request(
+        client,
+        "POST",
+        "/api/admin/users",
+        json={
+            "kind": "telegram",
+            "telegram_user_id": 404_040,
+            "realm_id": "telegram:700001",
+            "preset_key": "guest",
+            "reason": "retain eligibility while deleting the old account",
+        },
+    )
+    assert provisioned.status_code == 201, provisioned.text
+
+    deleted = _approved_request(
+        client,
+        "DELETE",
+        f"/api/admin/users/{user_id}",
+        json={"reason": "permanent deletion regression"},
+    )
+    assert deleted.status_code == 200, deleted.text
+    body = deleted.json()
+    assert body["permanently_deleted"] is True
+    assert body["cleanup_complete"] is True
+    assert body["deleted_counts"]["messages"] >= 1
+    assert body["deleted_counts"]["memories"] == 1
+    assert body["deleted_counts"]["execution_playbooks"] == 1
+
+    with storage.locked_connection() as conn:
+        assert conn.execute("SELECT 1 FROM users WHERE id = ?", (user_id,)).fetchone() is None
+        assert conn.execute(
+            "SELECT 1 FROM external_identities WHERE user_id = ?", (user_id,)
+        ).fetchone() is None
+        for table in (
+            "runtime_events",
+            "conversations",
+            "messages",
+            "memories",
+            "files",
+            "file_chunks",
+            "learning_observations",
+            "approvals",
+            "audit_log",
+        ):
+            assert conn.execute(
+                f'SELECT 1 FROM "{table}" WHERE user_id = ?', (user_id,)
+            ).fetchone() is None
+        assert conn.execute(
+            "SELECT 1 FROM runtime_kv WHERE key LIKE ?",
+            (f"user.{user_id}.%",),
+        ).fetchone() is None
+        assert conn.execute(
+            "SELECT 1 FROM telegram_conversations WHERE chat_id = 404040"
+        ).fetchone() is None
+        assert conn.execute(
+            "SELECT 1 FROM telegram_update_inbox WHERE chat_id = 404040"
+        ).fetchone() is None
+        audit = conn.execute(
+            """
+            SELECT target_id, target_user_id, after_json
+            FROM security_audit_log
+            WHERE action = 'user.delete' AND target_id = ?
+            ORDER BY ts DESC LIMIT 1
+            """,
+            (user_id,),
+        ).fetchone()
+    assert audit is not None
+    assert audit["target_user_id"] is None
+    assert json.loads(audit["after_json"])["permanently_deleted"] is True
+
+    with bind_actor(actor):
+        assert app.state.playbooks.stats()["entries"] == 0
+    assert not stored_path.exists()
+    vault_note = (
+        app.state.settings.data_dir
+        / "memory-vault"
+        / "users"
+        / user_id
+        / "private"
+        / f"{memory['id']}.md"
+    )
+    assert not vault_note.exists()
+
+    pre_provisioned = json.loads(
+        (app.state.settings.state_dir / "telegram_pre_provisioned.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert 404_040 in pre_provisioned["chat_ids"]
+    assert "404040" not in pre_provisioned["users"]
+
+    assert client.get(
+        "/api/conversations",
+        headers={"X-Jarvis-User-Session": registered["session_token"]},
+    ).status_code == 401
+    replacement = _register_telegram_user(
+        client,
+        update_id=51,
+        telegram_user_id=404_040,
+    )
+    assert replacement["user"]["created"] is True
+    assert replacement["user"]["id"] != user_id
+    assert replacement["user"]["preset_key"] == "guest"
+    replacement_headers = {"X-Jarvis-User-Session": replacement["session_token"]}
+    assert client.get("/api/conversations", headers=replacement_headers).json() == []
+
+
+def test_admin_delete_rejects_owner_accounts(client):
+    response = _approved_request(
+        client,
+        "DELETE",
+        f"/api/admin/users/{LEGACY_OWNER_USER_ID}",
+        json={"reason": "owner must remain protected"},
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"] == "Owner accounts cannot be permanently deleted"
+    assert app.state.authorization.get_user(LEGACY_OWNER_USER_ID)["status"] == "active"
+
+
+def test_user_delete_rolls_back_all_rows_when_final_account_delete_fails(client):
+    registered = _register_telegram_user(client, update_id=52, telegram_user_id=424_242)
+    user_id = registered["user"]["id"]
+    storage = app.state.storage
+    service = app.state.authorization
+    with storage.transaction(immediate=True) as conn:
+        conn.execute(
+            f"""
+            CREATE TRIGGER block_test_user_delete
+            BEFORE DELETE ON users
+            WHEN OLD.id = '{user_id}'
+            BEGIN
+                SELECT RAISE(ABORT, 'test deletion failure');
+            END
+            """
+        )
+
+    with pytest.raises(AuthorizationError, match="rolled back"):
+        service.delete_user(user_id=user_id, reason="rollback regression")
+
+    with storage.transaction(immediate=True) as conn:
+        assert conn.execute("SELECT 1 FROM users WHERE id = ?", (user_id,)).fetchone()
+        assert conn.execute(
+            "SELECT 1 FROM external_identities WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        assert conn.execute(
+            "SELECT 1 FROM user_sessions WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        assert conn.execute(
+            "SELECT 1 FROM user_preset_assignments WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        conn.execute("DROP TRIGGER block_test_user_delete")
+
+    assert client.get(
+        "/api/conversations",
+        headers={"X-Jarvis-User-Session": registered["session_token"]},
+    ).status_code == 200
 
 
 def test_admin_approval_is_invalidated_when_target_policy_state_changes(client):

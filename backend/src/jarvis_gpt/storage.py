@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import re
+import shutil
 import sqlite3
 import threading
 import uuid
@@ -636,6 +637,86 @@ class JarvisStorage:
             except Exception:
                 conn.rollback()
                 raise
+
+    def cleanup_deleted_user_artifacts(
+        self,
+        user_id: str,
+        *,
+        stored_paths: Iterable[str] = (),
+    ) -> dict[str, Any]:
+        """Remove managed filesystem artifacts after a user's DB deletion commits.
+
+        Account deletion is authoritative in SQLite. Filesystem cleanup is deliberately
+        restricted to the deleted tenant's managed directories and recorded generated
+        documents under ``data_dir``; an unexpected path is skipped instead of allowing
+        an IAM operation to erase an arbitrary host file.
+        """
+
+        owner_id = str(user_id).strip()
+        if (
+            not owner_id
+            or owner_id == LEGACY_OWNER_USER_ID
+            or Path(owner_id).name != owner_id
+            or "/" in owner_id
+            or "\\" in owner_id
+            or owner_id in {".", ".."}
+        ):
+            return {
+                "complete": False,
+                "removed": 0,
+                "failures": ["invalid or protected user artifact scope"],
+            }
+
+        data_root = self.database_path.parent.parent.resolve(strict=False)
+        files_users_root = (data_root / "files" / "users").resolve(strict=False)
+        vault_users_root = (data_root / "memory-vault" / "users").resolve(strict=False)
+        generated_root = (data_root / "document-outputs").resolve(strict=False)
+        files_root = files_users_root / owner_id
+        vault_root = vault_users_root / owner_id
+        failures: list[str] = []
+        removed = 0
+
+        with self._lock:
+            self._user_memory_vaults.pop(owner_id, None)
+
+        for root, expected_parent in (
+            (files_root, files_users_root),
+            (vault_root, vault_users_root),
+        ):
+            try:
+                if root.parent.resolve(strict=False) != expected_parent:
+                    failures.append(f"unsafe managed directory: {root}")
+                    continue
+                if root.is_symlink():
+                    root.unlink(missing_ok=True)
+                    removed += 1
+                elif root.exists():
+                    shutil.rmtree(root)
+                    removed += 1
+            except OSError as exc:
+                failures.append(f"{root}: {type(exc).__name__}")
+
+        # Generated documents predate per-user filesystem directories. Delete only exact
+        # DB-recorded files that remain inside the managed output directory.
+        for raw_path in dict.fromkeys(str(item) for item in stored_paths if str(item)):
+            path = Path(raw_path)
+            try:
+                resolved = path.resolve(strict=False)
+                if not resolved.is_relative_to(generated_root):
+                    continue
+                if path.is_file() or path.is_symlink():
+                    path.unlink(missing_ok=True)
+                    removed += 1
+            except OSError as exc:
+                failures.append(f"{path}: {type(exc).__name__}")
+
+        if failures:
+            LOGGER.error(
+                "Deleted user %s but could not remove every managed artifact: %s",
+                owner_id,
+                "; ".join(failures),
+            )
+        return {"complete": not failures, "removed": removed, "failures": failures}
 
     def _memory_vault_for(self, user_id: str | None = None) -> MemoryVault:
         owner_id = user_id or current_user_id()

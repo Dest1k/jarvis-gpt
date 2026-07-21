@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import secrets
+import sqlite3
 import threading
 import uuid
 from collections.abc import Iterable, Iterator
@@ -14,8 +15,6 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
-    import sqlite3
-
     from .storage import JarvisStorage
 
 
@@ -591,6 +590,24 @@ PERSONAL_TABLES: tuple[str, ...] = (
     "audit_log",
 )
 
+PERSONAL_DELETE_ORDER: tuple[str, ...] = (
+    "tool_runs",
+    "mission_tasks",
+    "missions",
+    "file_chunks",
+    "files",
+    "messages",
+    "reminders",
+    "learning_observations",
+    "conversations",
+    "memories",
+    "approvals",
+    "runtime_events",
+    "audit_log",
+)
+if frozenset(PERSONAL_DELETE_ORDER) != frozenset(PERSONAL_TABLES):
+    raise RuntimeError("Every personal table must participate in permanent user deletion")
+
 
 TENANT_INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_runtime_events_user_ts
@@ -646,6 +663,18 @@ def _json(value: Any) -> str:
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {str(row[1]) for row in conn.execute(f'PRAGMA table_info("{table}")').fetchall()}
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table,),
+    ).fetchone()
+    return row is not None
+
+
+def _sql_like_prefix(prefix: str) -> str:
+    return prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
 
 
 def migrate_iam_schema(conn: sqlite3.Connection) -> None:
@@ -2264,6 +2293,273 @@ class AuthorizationService:
             raise RuntimeError("Status target disappeared after update")
         result["change_reason"] = reason[:500]
         return result
+
+    @staticmethod
+    def _assert_user_deletion_integrity(
+        conn: sqlite3.Connection,
+        *,
+        user_id: str,
+        telegram_bindings: Iterable[sqlite3.Row],
+    ) -> None:
+        """Fail closed instead of cascading through a corrupted cross-tenant link."""
+
+        tenant_relations = (
+            ("messages", "conversation_id", "conversations", "id"),
+            ("mission_tasks", "mission_id", "missions", "id"),
+            ("file_chunks", "file_id", "files", "id"),
+            ("tool_runs", "mission_id", "missions", "id"),
+            ("tool_runs", "task_id", "mission_tasks", "id"),
+        )
+        for child, child_key, parent, parent_key in tenant_relations:
+            row = conn.execute(
+                f"""
+                SELECT 1
+                FROM "{child}" child
+                JOIN "{parent}" parent ON parent."{parent_key}" = child."{child_key}"
+                WHERE parent.user_id = ? AND child.user_id != ?
+                LIMIT 1
+                """,
+                (user_id, user_id),
+            ).fetchone()
+            if row is not None:
+                raise AuthorizationError(
+                    "User deletion blocked by an inconsistent cross-user data reference"
+                )
+
+        for binding in telegram_bindings:
+            bound_user_id = str(binding["user_id"] or "").strip()
+            if bound_user_id and bound_user_id != user_id:
+                raise AuthorizationError(
+                    "User deletion blocked by an inconsistent Telegram identity binding"
+                )
+            conversation_id = str(binding["conversation_id"] or "").strip()
+            if not conversation_id:
+                continue
+            conversation = conn.execute(
+                "SELECT user_id FROM conversations WHERE id = ?",
+                (conversation_id,),
+            ).fetchone()
+            if conversation is not None and str(conversation["user_id"]) != user_id:
+                raise AuthorizationError(
+                    "User deletion blocked by an inconsistent Telegram conversation owner"
+                )
+
+    def delete_user(
+        self,
+        *,
+        user_id: str,
+        reason: str,
+        expected_row_version: int | None = None,
+    ) -> dict[str, Any]:
+        """Permanently delete a non-owner account and its tenant-owned data."""
+
+        stored_paths: list[str] = []
+        telegram_identities: list[dict[str, Any]] = []
+        deleted_counts: dict[str, int] = {}
+        try:
+            with self.storage.transaction(immediate=True) as conn:
+                current = conn.execute(
+                    """
+                    SELECT u.status, u.row_version, p.preset_key
+                    FROM users u
+                    LEFT JOIN user_preset_assignments upa
+                      ON upa.user_id = u.id AND upa.revoked_at IS NULL
+                    LEFT JOIN permission_presets p ON p.id = upa.preset_id
+                    WHERE u.id = ?
+                    """,
+                    (user_id,),
+                ).fetchone()
+                if current is None:
+                    raise AuthorizationError("Unknown user")
+                if str(current["preset_key"] or "") == "owner":
+                    raise AuthorizationError("Owner accounts cannot be permanently deleted")
+                if (
+                    expected_row_version is not None
+                    and int(current["row_version"]) != expected_row_version
+                ):
+                    raise ConcurrentPolicyUpdateError(
+                        "Target user changed after authorization"
+                    )
+
+                identities = conn.execute(
+                    """
+                    SELECT id, provider, realm_id, provider_subject_id
+                    FROM external_identities
+                    WHERE user_id = ?
+                    ORDER BY id
+                    """,
+                    (user_id,),
+                ).fetchall()
+                identity_ids = [str(row["id"]) for row in identities]
+                telegram_identities = [
+                    {
+                        "realm_id": str(row["realm_id"]),
+                        "telegram_user_id": int(str(row["provider_subject_id"])),
+                    }
+                    for row in identities
+                    if str(row["provider"]) == "telegram"
+                    and str(row["provider_subject_id"]).lstrip("-").isdigit()
+                ]
+
+                bindings_by_key: dict[tuple[str, int], sqlite3.Row] = {}
+                if _table_exists(conn, "telegram_conversations"):
+                    for row in conn.execute(
+                        """
+                        SELECT realm_id, chat_id, conversation_id, user_id
+                        FROM telegram_conversations
+                        WHERE user_id = ?
+                        """,
+                        (user_id,),
+                    ).fetchall():
+                        bindings_by_key[(str(row["realm_id"]), int(row["chat_id"]))] = row
+                    for identity in telegram_identities:
+                        row = conn.execute(
+                            """
+                            SELECT realm_id, chat_id, conversation_id, user_id
+                            FROM telegram_conversations
+                            WHERE realm_id = ? AND chat_id = ?
+                            """,
+                            (
+                                identity["realm_id"],
+                                identity["telegram_user_id"],
+                            ),
+                        ).fetchone()
+                        if row is not None:
+                            bindings_by_key[
+                                (str(row["realm_id"]), int(row["chat_id"]))
+                            ] = row
+                bindings = list(bindings_by_key.values())
+                telegram_scope_keys = set(bindings_by_key)
+                telegram_scope_keys.update(
+                    (
+                        str(identity["realm_id"]),
+                        int(identity["telegram_user_id"]),
+                    )
+                    for identity in telegram_identities
+                )
+                self._assert_user_deletion_integrity(
+                    conn,
+                    user_id=user_id,
+                    telegram_bindings=bindings,
+                )
+
+                for row in conn.execute(
+                    "SELECT stored_path FROM files WHERE user_id = ?",
+                    (user_id,),
+                ).fetchall():
+                    stored_path = str(row["stored_path"] or "").strip()
+                    if not stored_path:
+                        continue
+                    shared = conn.execute(
+                        "SELECT 1 FROM files WHERE user_id != ? AND stored_path = ? LIMIT 1",
+                        (user_id, stored_path),
+                    ).fetchone()
+                    if shared is None:
+                        stored_paths.append(stored_path)
+
+                for table in PERSONAL_TABLES:
+                    row = conn.execute(
+                        f'SELECT COUNT(*) AS count FROM "{table}" WHERE user_id = ?',
+                        (user_id,),
+                    ).fetchone()
+                    deleted_counts[table] = int(row["count"])
+                runtime_row = conn.execute(
+                    """
+                    SELECT COUNT(*) AS count FROM runtime_kv
+                    WHERE key LIKE ? ESCAPE '\\'
+                    """,
+                    (_sql_like_prefix(f"user.{user_id}."),),
+                ).fetchone()
+                deleted_counts["runtime_kv"] = int(runtime_row["count"])
+
+                if _table_exists(conn, "memories_fts"):
+                    conn.execute("DELETE FROM memories_fts WHERE user_id = ?", (user_id,))
+                if _table_exists(conn, "file_chunks_fts"):
+                    conn.execute("DELETE FROM file_chunks_fts WHERE user_id = ?", (user_id,))
+
+                if _table_exists(conn, "telegram_update_inbox"):
+                    for realm_id, chat_id in telegram_scope_keys:
+                        conn.execute(
+                            "DELETE FROM telegram_update_inbox WHERE realm_id = ? AND chat_id = ?",
+                            (realm_id, chat_id),
+                        )
+                if _table_exists(conn, "telegram_conversations"):
+                    conn.execute(
+                        "DELETE FROM telegram_conversations WHERE user_id = ?",
+                        (user_id,),
+                    )
+                    for realm_id, chat_id in telegram_scope_keys:
+                        conn.execute(
+                            "DELETE FROM telegram_conversations WHERE realm_id = ? AND chat_id = ?",
+                            (realm_id, chat_id),
+                        )
+
+                for table in PERSONAL_DELETE_ORDER:
+                    conn.execute(f'DELETE FROM "{table}" WHERE user_id = ?', (user_id,))
+                conn.execute(
+                    "DELETE FROM runtime_kv WHERE key LIKE ? ESCAPE '\\'",
+                    (_sql_like_prefix(f"user.{user_id}."),),
+                )
+
+                self.append_security_audit(
+                    conn,
+                    action="user.delete",
+                    target_type="user",
+                    target_id=user_id,
+                    target_user_id=user_id,
+                    reason=reason,
+                    before={
+                        "status": str(current["status"]),
+                        "preset_key": str(current["preset_key"] or ""),
+                    },
+                    after={
+                        "permanently_deleted": True,
+                        "identity_count": len(identity_ids),
+                        "personal_row_count": sum(deleted_counts.values()),
+                    },
+                )
+
+                if identity_ids:
+                    placeholders = ",".join("?" for _ in identity_ids)
+                    conn.execute(
+                        f"""
+                        DELETE FROM authorization_decisions
+                        WHERE actor_user_id = ? OR identity_id IN ({placeholders})
+                        """,
+                        (user_id, *identity_ids),
+                    )
+                else:
+                    conn.execute(
+                        "DELETE FROM authorization_decisions WHERE actor_user_id = ?",
+                        (user_id,),
+                    )
+                conn.execute("DELETE FROM telegram_updates WHERE user_id = ?", (user_id,))
+                conn.execute("DELETE FROM user_sessions WHERE user_id = ?", (user_id,))
+                conn.execute("DELETE FROM user_permissions WHERE user_id = ?", (user_id,))
+                conn.execute(
+                    "DELETE FROM user_preset_assignments WHERE user_id = ?", (user_id,)
+                )
+                conn.execute("DELETE FROM external_identities WHERE user_id = ?", (user_id,))
+                deleted = conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+                if deleted.rowcount != 1:
+                    raise AuthorizationError("User deletion was superseded")
+        except sqlite3.IntegrityError as exc:
+            raise AuthorizationError(
+                "User deletion was rolled back because dependent data could not be removed safely"
+            ) from exc
+
+        artifact_cleanup = self.storage.cleanup_deleted_user_artifacts(
+            user_id,
+            stored_paths=stored_paths,
+        )
+        return {
+            "ok": True,
+            "user_id": user_id,
+            "permanently_deleted": True,
+            "deleted_counts": deleted_counts,
+            "artifact_cleanup": artifact_cleanup,
+            "telegram_identities": telegram_identities,
+        }
 
     def set_user_permission(
         self,

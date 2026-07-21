@@ -856,6 +856,27 @@ class ExecutionPlaybookStore:
             "uses": int(row["uses"]),
         }
 
+    def delete_for_user(self, user_id: str) -> int:
+        """Permanently remove learned execution playbooks for one deleted account."""
+
+        owner_id = str(user_id).strip()
+        if not owner_id:
+            raise ValueError("user_id is required")
+        with self._lock:
+            self._require_open()
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                cursor = self._connection.execute(
+                    "DELETE FROM execution_playbooks WHERE user_id = ?",
+                    (owner_id,),
+                )
+                self._connection.execute("COMMIT")
+            except BaseException:
+                if self._connection.in_transaction:
+                    self._connection.execute("ROLLBACK")
+                raise
+        return int(cursor.rowcount)
+
     def close(self) -> None:
         with self._lock:
             if self._closed:

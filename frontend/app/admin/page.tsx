@@ -309,7 +309,7 @@ export default function AdminPage() {
     if (!selected || statusDraft === selected.status) return;
     if (
       statusDraft === "deleted" &&
-      !window.confirm("Пометить пользователя удалённым и отозвать его активные сессии?")
+      !window.confirm("Заблокировать пользователя, сохранив учётную запись и Telegram identity для запрета повторной регистрации?")
     ) {
       return;
     }
@@ -421,7 +421,10 @@ export default function AdminPage() {
 
   async function deleteSelectedUser() {
     if (!selected) return;
-    if (!window.confirm(`Удалить пользователя ${userTitle(selected)}?`)) return;
+    if (!window.confirm(
+      `Полностью удалить пользователя ${userTitle(selected)}, его identity, историю, память и файлы? ` +
+      "Действие необратимо. При следующем допустимом сообщении Telegram будет создана новая чистая учётная запись."
+    )) return;
     await mutate("delete-user", async () => {
       await requestJson(`/api/admin/users/${selected.id}`, {
         method: "DELETE",
@@ -664,7 +667,7 @@ export default function AdminPage() {
                     <select value={statusDraft} onChange={(event) => setStatusDraft(event.target.value as AdminUser["status"])}>
                       <option value="active">active</option>
                       <option value="suspended">suspended</option>
-                      <option value="deleted">deleted</option>
+                      <option value="deleted">deleted — блокировка</option>
                     </select>
                     <button onClick={() => void saveStatus()} disabled={working !== "" || statusDraft === selected.status}>Сохранить</button>
                   </div>
@@ -684,7 +687,7 @@ export default function AdminPage() {
                     disabled={working !== "" || selected.preset_key === "owner"}
                     onClick={() => void deleteSelectedUser()}
                   >
-                    <Ban size={15} /> Удалить пользователя
+                    <Ban size={15} /> Удалить полностью
                   </button>
                 </div>
               </div>

@@ -208,6 +208,8 @@ The implemented administration endpoints are:
 | `GET /api/admin/users` | `admin.users.list` | Paginated registered-user/identity list (`limit`, `offset`). |
 | `GET /api/admin/users/{user_id}/permissions` | `admin.users.permissions.list` | Effective decision for every registered security ID. |
 | `PATCH /api/admin/users/{user_id}/status` | `admin.users.status.update` | Activate, suspend, or soft-delete a user. |
+| `POST /api/admin/users` | `admin.users.create` | Create a local account or pre-provision a Telegram identity. |
+| `DELETE /api/admin/users/{user_id}` | `admin.users.delete` | Permanently delete a non-owner account, external identities, sessions, IAM assignments, and tenant-owned data. |
 | `PUT /api/admin/users/{user_id}/preset` | `admin.users.preset.assign` | Replace the active preset assignment. |
 | `PUT /api/admin/users/{user_id}/permissions/{security_id}` | `admin.users.permission.set` | Set a direct grant or deny. |
 | `DELETE /api/admin/users/{user_id}/permissions/{security_id}` | `admin.users.permission.revoke` | Revoke a direct override. |
@@ -219,6 +221,16 @@ The implemented administration endpoints are:
 
 `/admin` provides loaded-user search, status and preset assignment, effective-permission inspection,
 direct grant/deny/inherit controls, security-ID filtering, and custom-preset creation.
+Setting the status to `deleted` is an access block: the account and immutable external
+identity remain, active sessions are revoked, and a later Telegram message cannot silently
+register around the block. The separate permanent-delete action is owner-protected and
+transactionally removes the account plus its tenant rows, Telegram binding/inbox, search
+indexes, and runtime preferences, then cleans the managed per-user files, memory vault, and
+learned execution playbooks. The response reports whether every post-commit artifact cleanup
+completed. Security audit rows remain with their user foreign key cleared. If the same Telegram
+sender is still admitted by the deployment allowlist (or the bot accepts automatic
+registration), a later message creates a new least-privilege account without the deleted
+history.
 `/login` compares the legacy-user credential to `JARVIS_API_TOKEN` with a timing-safe digest,
 rate-limits attempts, and creates an eight-hour signed HttpOnly, SameSite=Strict cookie.
 The server-side `/jarvis-api` proxy injects the API token only after validating that
