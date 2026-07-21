@@ -251,23 +251,40 @@ def test_chromium_seccomp_profile_keeps_default_deny_and_allows_namespaces() -> 
         assert syscall in profile
 
 
-def test_launcher_is_local_only_and_preserves_foreign_listeners() -> None:
+def test_launcher_exposes_only_authenticated_ui_to_explicit_lan() -> None:
     launcher = _read("scripts/jarvis-launcher.ps1")
     dispatcher_script = _read("scripts/dispatcher.ps1")
     dev_script = _read("scripts/dev.ps1")
     frontend_package = json.loads(_read("frontend/package.json"))
     frontend_dockerfile = _read("frontend/Dockerfile")
+    lan_server = _read("frontend/lan-server.mjs")
 
-    assert "$script:LanMode = $false" in launcher
+    assert '[string]$LanSubnet = "192.168.31.0/24"' in launcher
+    assert "$script:LanMode = [bool]$Lan" in launcher
+    assert "Initialize-LanModeFromState" in launcher
+    assert "JARVIS_UI_LAN_BIND_ADDRESS" in launcher
+    assert "JARVIS_UI_ALLOWED_CIDRS" in launcher
+    assert "-LocalAddress $lanIp" in launcher
+    assert "-RemoteAddress $script:LanSubnet" in launcher
+    assert '"lan-server.mjs"' in launcher
+    assert '$env:JARVIS_API_HOST = "127.0.0.1"' in launcher
+    assert '$env:JARVIS_BACKEND_URL = "http://127.0.0.1:8000"' in launcher
     assert frontend_package["scripts"]["dev"] == "next dev --hostname 127.0.0.1"
     assert frontend_package["scripts"]["start"] == "next start --hostname 127.0.0.1"
+    assert frontend_package["scripts"]["test:network-access"] == (
+        "node tests/network-access.mjs"
+    )
     assert "npm run dev -- --hostname 127.0.0.1" in dev_script
     assert (
         'CMD ["node", "node_modules/next/dist/bin/next", "start", '
         '"--hostname", "0.0.0.0"]'
     ) in frontend_dockerfile
-    assert 'Label = "Start with LAN"' not in launcher
-    assert "temporarily disabled" in launcher
+    assert "temporarily disabled" not in launcher
+    assert 'const loopbackAddress = "127.0.0.1"' in lan_server
+    assert "request.socket.remoteAddress" in lan_server
+    assert "isIPv4Allowed" in lan_server
+    assert "Client network is not allowed" in lan_server
+    assert "Command Center did not establish the required loopback" in launcher
     assert 'Label = "Start app without LLM"' in launcher
     assert '"app" { $script:NoDispatcher = $true; Start-JarvisStack }' in launcher
     assert "function Get-LlmStartDecision" in launcher
@@ -289,7 +306,7 @@ def test_launcher_is_local_only_and_preserves_foreign_listeners() -> None:
     assert "function Get-AlreadyRunningStackServices" in launcher
     assert "function Test-FrontendBindingMatchesMode" in launcher
     assert '$loopbackAddresses = @("127.0.0.1", "::1")' in launcher
-    assert launcher.count("-not (Test-FrontendBindingMatchesMode -Port 3000)") == 2
+    assert launcher.count("-not (Test-FrontendBindingMatchesMode -Port 3000)") == 4
     assert "-not $NoFrontend -and" in launcher
     assert "$frontendBindingMismatch" in launcher
     assert '"loopback-only binding is required"' in launcher

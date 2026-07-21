@@ -11,7 +11,8 @@
     "test:runtime-identity": "node tests/runtime-identity.mjs",
     "test:stream-placeholder": "node tests/stream-placeholder.mjs",
     "test:chat-recovery": "node tests/chat-stream-recovery.mjs",
-    "test:owner-session": "node tests/owner-session.mjs"
+    "test:owner-session": "node tests/owner-session.mjs",
+    "test:network-access": "node tests/network-access.mjs"
   },
   "dependencies": {
     "clsx": "2.1.1",

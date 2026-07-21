@@ -20,6 +20,7 @@ param(
   [switch]$NoTelegram,
   [switch]$Lan,
   [switch]$LocalOnly,
+  [string]$LanSubnet = "192.168.31.0/24",
   [switch]$WatchLlm,
   [switch]$BuildFrontend,
   [switch]$DevFrontend,
@@ -45,32 +46,76 @@ $BridgePolicyRevision = "native-app-v3"
 $ApiTokenFile = Join-Path $HomePath ".jarvis\api.token"
 $script:ConfiguredApiToken = [string]$env:JARVIS_API_TOKEN
 $script:ConfiguredCorsOrigins = [string]$env:JARVIS_CORS_ORIGINS
-if ($Lan) {
-  throw "-Lan is temporarily disabled while Command Center browser authentication is removed."
+if ($Lan -and $LocalOnly) {
+  throw "-Lan and -LocalOnly cannot be used together."
 }
-$script:LanMode = $false
+$script:LanMode = [bool]$Lan
+$script:LanSubnet = $LanSubnet.Trim()
+$script:LanSubnetExplicit = [bool]$PSBoundParameters.ContainsKey("LanSubnet")
+
+function Get-IPv4Bytes {
+  param([string]$Address)
+
+  try {
+    $parsed = [System.Net.IPAddress]::Parse($Address)
+    if ($parsed.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork) {
+      return @()
+    }
+    return @($parsed.GetAddressBytes())
+  } catch {
+    return @()
+  }
+}
+
+function Test-IPv4InCidr {
+  param(
+    [string]$Address,
+    [string]$Cidr
+  )
+
+  $parts = @($Cidr.Split("/"))
+  if ($parts.Count -ne 2) {
+    return $false
+  }
+  [int]$prefixLength = -1
+  if (-not [int]::TryParse($parts[1], [ref]$prefixLength)) {
+    return $false
+  }
+  if ($prefixLength -lt 0 -or $prefixLength -gt 32) {
+    return $false
+  }
+  $addressBytes = @(Get-IPv4Bytes -Address $Address)
+  $networkBytes = @(Get-IPv4Bytes -Address $parts[0])
+  if ($addressBytes.Count -ne 4 -or $networkBytes.Count -ne 4) {
+    return $false
+  }
+  $fullBytes = [int][Math]::Floor($prefixLength / 8)
+  for ($index = 0; $index -lt $fullBytes; $index += 1) {
+    if ($addressBytes[$index] -ne $networkBytes[$index]) {
+      return $false
+    }
+  }
+  $remainingBits = $prefixLength % 8
+  if ($remainingBits -eq 0) {
+    return $true
+  }
+  $mask = [byte](256 - [Math]::Pow(2, 8 - $remainingBits))
+  return (
+    ($addressBytes[$fullBytes] -band $mask) -eq
+    ($networkBytes[$fullBytes] -band $mask)
+  )
+}
 
 function Get-LanIPv4 {
-  try {
-    $candidate = Get-NetIPConfiguration |
-      Where-Object { $_.IPv4DefaultGateway -and $_.NetAdapter.Status -eq "Up" } |
-      ForEach-Object { $_.IPv4Address } |
-      Where-Object { $_ -and $_.IPAddress -and $_.IPAddress -notmatch "^(127\.|169\.254\.)" } |
-      Select-Object -First 1
-    if ($candidate) {
-      return [string]$candidate.IPAddress
-    }
-  } catch {
-  }
-
   try {
     $candidate = Get-NetIPAddress -AddressFamily IPv4 |
       Where-Object {
         $_.IPAddress -and
-        $_.IPAddress -notmatch "^(127\.|169\.254\.)" -and
-        $_.PrefixOrigin -ne "WellKnown"
+        $_.AddressState -eq "Preferred" -and
+        -not $_.SkipAsSource -and
+        (Test-IPv4InCidr -Address ([string]$_.IPAddress) -Cidr $script:LanSubnet)
       } |
-      Sort-Object InterfaceMetric |
+      Sort-Object InterfaceIndex, IPAddress |
       Select-Object -First 1
     if ($candidate) {
       return [string]$candidate.IPAddress
@@ -93,7 +138,7 @@ function Get-PublicHost {
 
 function Get-FrontendBindHost {
   if ($script:LanMode) {
-    return "0.0.0.0"
+    return (Get-LanIPv4)
   }
   return "127.0.0.1"
 }
@@ -379,6 +424,8 @@ function Get-FrontendEnvironmentSha256 {
     [string]$env:JARVIS_API_TOKEN
     [string]$env:JARVIS_UI_SESSION_SECRET
     [string]$env:JARVIS_TRUST_PROXY_HEADERS
+    [string]$env:JARVIS_UI_LAN_BIND_ADDRESS
+    [string]$env:JARVIS_UI_ALLOWED_CIDRS
   )
   return Get-StringSha256 -Value ($values -join "`n")
 }
@@ -536,6 +583,13 @@ function Set-JarvisEnvironment {
   }
   $env:JARVIS_CORS_ORIGINS = $corsOrigins -join ","
   $env:JARVIS_BACKEND_URL = "http://127.0.0.1:8000"
+  if ($script:LanMode) {
+    $env:JARVIS_UI_LAN_BIND_ADDRESS = Get-LanIPv4
+    $env:JARVIS_UI_ALLOWED_CIDRS = "127.0.0.0/8,$($script:LanSubnet)"
+  } else {
+    Remove-Item Env:\JARVIS_UI_LAN_BIND_ADDRESS -ErrorAction SilentlyContinue
+    Remove-Item Env:\JARVIS_UI_ALLOWED_CIDRS -ErrorAction SilentlyContinue
+  }
 }
 
 function Ensure-LauncherFolders {
@@ -619,18 +673,24 @@ function Test-PortExposedForLan {
 
   $addresses = @(Get-PortListenAddresses -Port $Port)
   $lanIp = Get-LanIPv4
-  return [bool](
-    $addresses -contains "0.0.0.0" -or
-    $addresses -contains "::" -or
-    $addresses -contains $lanIp
-  )
+  return [bool]($lanIp -and $addresses -contains $lanIp)
 }
 
 function Test-FrontendBindingMatchesMode {
   param([int]$Port)
 
   if ($script:LanMode) {
-    return (Test-PortExposedForLan -Port $Port)
+    $addresses = @(Get-PortListenAddresses -Port $Port)
+    $lanIp = Get-LanIPv4
+    if (-not $lanIp) {
+      return $false
+    }
+    $allowedAddresses = @("127.0.0.1", $lanIp)
+    return [bool](
+      $addresses -contains "127.0.0.1" -and
+      $addresses -contains $lanIp -and
+      @($addresses | Where-Object { $_ -notin $allowedAddresses }).Count -eq 0
+    )
   }
 
   $addresses = @(Get-PortListenAddresses -Port $Port)
@@ -646,32 +706,55 @@ function Ensure-LanFirewallRules {
     return
   }
 
+  $lanIp = Get-LanIPv4
+  if (-not $lanIp) {
+    throw "No local IPv4 address belongs to the configured LAN subnet $($script:LanSubnet)."
+  }
+
   $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
     [Security.Principal.WindowsBuiltinRole]::Administrator
   )
   if (-not $isAdmin) {
-    Write-Host "Firewall rules were not changed because the launcher is not elevated." -ForegroundColor DarkYellow
-    Write-Host "If another device cannot connect, run this command as Administrator once." -ForegroundColor DarkGray
+    Write-Host "The subnet-scoped Windows Firewall rule was not changed because the launcher is not elevated." -ForegroundColor DarkYellow
+    Write-Host "The UI still binds only to the selected LAN address and rejects clients outside the configured subnet." -ForegroundColor DarkGray
     return
   }
 
-  foreach ($port in @(3000)) {
-    $name = "Jarvis LAN $port"
-    try {
-      $existing = Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue
-      if (-not $existing) {
-        New-NetFirewallRule `
-          -DisplayName $name `
-          -Direction Inbound `
-          -Action Allow `
-          -Protocol TCP `
-          -LocalPort $port `
-          -Profile Private `
-          -Description "Allow Jarvis LAN access on TCP $port." | Out-Null
-      }
-    } catch {
-      Write-Host ("Could not create firewall rule for TCP {0}: {1}" -f $port, $_.Exception.Message) -ForegroundColor DarkYellow
+  $name = "Jarvis LAN UI 3000"
+  try {
+    $legacy = Get-NetFirewallRule -DisplayName "Jarvis LAN 3000" -ErrorAction SilentlyContinue
+    if ($legacy) {
+      $legacy | Disable-NetFirewallRule | Out-Null
     }
+    $existing = Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue
+    if (-not $existing) {
+      New-NetFirewallRule `
+        -DisplayName $name `
+        -Direction Inbound `
+        -Action Allow `
+        -Protocol TCP `
+        -LocalAddress $lanIp `
+        -LocalPort 3000 `
+        -RemoteAddress $script:LanSubnet `
+        -Profile Any `
+        -Description "Allow authenticated Jarvis UI only from $($script:LanSubnet)." | Out-Null
+    } else {
+      $existing | Set-NetFirewallRule `
+        -Enabled True `
+        -Direction Inbound `
+        -Action Allow `
+        -Profile Any `
+        -Description "Allow authenticated Jarvis UI only from $($script:LanSubnet)." | Out-Null
+      $existing | Get-NetFirewallAddressFilter | Set-NetFirewallAddressFilter `
+        -LocalAddress $lanIp `
+        -RemoteAddress $script:LanSubnet | Out-Null
+      $existing | Get-NetFirewallPortFilter | Set-NetFirewallPortFilter `
+        -Protocol TCP `
+        -LocalPort 3000 `
+        -RemotePort Any | Out-Null
+    }
+  } catch {
+    Write-Host ("Could not reconcile the subnet-scoped firewall rule: {0}" -f $_.Exception.Message) -ForegroundColor DarkYellow
   }
 }
 
@@ -1493,7 +1576,9 @@ function Test-ManagedServiceProcess {
     }
     "frontend" {
       return $text.Contains($frontendNeedle) -and (
-        $text.Contains("next") -or $text.Contains("npm")
+        $text.Contains("next") -or
+        $text.Contains("npm") -or
+        $text.Contains("lan-server.mjs")
       )
     }
     "bridge" {
@@ -2233,6 +2318,7 @@ function Save-LauncherState {
       home = $HomePath
       lan = [bool]$script:LanMode
       lan_ip = if ($script:LanMode) { Get-LanIPv4 } else { $null }
+      lan_subnet = if ($script:LanMode) { $script:LanSubnet } else { $null }
       frontend_url = Get-FrontendUrl
       backend_url = Get-BackendUrl
       backend_environment_sha256 = (Get-BackendEnvironmentSha256)
@@ -2330,6 +2416,23 @@ function Read-LauncherState {
     return Get-Content -Path $StateFile -Raw | ConvertFrom-Json
   } catch {
     return $null
+  }
+}
+
+function Initialize-LanModeFromState {
+  if ($Lan -or $LocalOnly) {
+    return
+  }
+  $state = Read-LauncherState
+  if (-not $state -or -not [bool]$state.lan) {
+    return
+  }
+  $script:LanMode = $true
+  if (
+    -not $script:LanSubnetExplicit -and
+    -not [string]::IsNullOrWhiteSpace([string]$state.lan_subnet)
+  ) {
+    $script:LanSubnet = [string]$state.lan_subnet
   }
 }
 
@@ -2826,6 +2929,12 @@ function Get-AlreadyRunningStackServices {
 }
 
 function Start-JarvisStack {
+  if ($script:LanMode -and -not (Get-LanIPv4)) {
+    throw (
+      "LAN mode requires a preferred local IPv4 address in " +
+      "$($script:LanSubnet); refusing to expose the UI on another interface."
+    )
+  }
   Ensure-LauncherFolders
   try {
     Set-JarvisEnvironment -SelectedProfile $Profile
@@ -2865,6 +2974,13 @@ function Start-JarvisStack {
   $frontendBindHost = Get-FrontendBindHost
 
   Write-Banner
+  if ($script:LanMode) {
+    Write-Host ("LAN UI: http://{0}:3000" -f $frontendBindHost) -ForegroundColor Cyan
+    Write-Host ("Allowed clients: {0}" -f $script:LanSubnet) -ForegroundColor Cyan
+    Write-Host "Backend, dispatcher, and host bridge remain loopback-only." -ForegroundColor DarkGray
+    Write-Host "Command Center owner login remains required." -ForegroundColor DarkGray
+    Write-Host ""
+  }
   $telegramLaunchRequested = [bool](
     $script:TelegramBridgeEnabled -and -not $NoTelegram -and -not $NoBackend
   )
@@ -3209,7 +3325,10 @@ function Start-JarvisStack {
     }
 
     if (-not (Test-PortOpen -Port 3000)) {
-      $frontendArgs = if ($DevFrontend) {
+      $frontendFilePath = if ($script:LanMode) { "node.exe" } else { "npm.cmd" }
+      $frontendArgs = if ($script:LanMode) {
+        @((Join-Path $FrontendRoot "lan-server.mjs"))
+      } elseif ($DevFrontend) {
         @("run", "dev", "--", "--hostname", $frontendBindHost)
       } else {
         @("run", "start", "--", "--hostname", $frontendBindHost)
@@ -3220,7 +3339,7 @@ function Start-JarvisStack {
         phase = "starting"
         pid = Start-ManagedProcess `
           -Name "frontend" `
-          -FilePath "npm.cmd" `
+          -FilePath $frontendFilePath `
           -Arguments $frontendArgs `
           -WorkingDirectory $FrontendRoot `
           -Stdout (Join-Path $LogDir "frontend.out.log") `
@@ -3347,7 +3466,24 @@ function Start-JarvisStack {
     }
     Save-LauncherState -Services $services
   }
-  Start-Sleep -Seconds 3
+  if ($script:LanMode -and -not $NoFrontend) {
+    $frontendBindingDeadline = (Get-Date).AddSeconds(15)
+    while (
+      (Get-Date) -lt $frontendBindingDeadline -and
+      -not (Test-FrontendBindingMatchesMode -Port 3000)
+    ) {
+      Start-Sleep -Milliseconds 250
+    }
+    if (-not (Test-FrontendBindingMatchesMode -Port 3000)) {
+      Stop-PortOwner -Port 3000 -ManagedOnly -Service "frontend"
+      throw (
+        "Command Center did not establish the required loopback and " +
+        "$($frontendBindHost):3000 listeners; LAN mode was stopped."
+      )
+    }
+  } else {
+    Start-Sleep -Seconds 3
+  }
   Show-JarvisStatus
 }
 
@@ -3514,16 +3650,46 @@ function Show-ManagedProcessRow {
 }
 
 function Get-EffectiveLanMode {
-  return $false
+  if ($Lan) {
+    return $true
+  }
+  if ($LocalOnly) {
+    return $false
+  }
+  $state = Read-LauncherState
+  if ($state) {
+    return [bool]$state.lan
+  }
+  return [bool]($script:LanMode -and (Get-LanIPv4))
 }
 
 function Get-EffectivePublicHost {
+  if ($LocalOnly) {
+    return "127.0.0.1"
+  }
+  if ($Lan) {
+    $requestedLanIp = Get-LanIPv4
+    if ($requestedLanIp) {
+      return $requestedLanIp
+    }
+  }
+  $state = Read-LauncherState
+  if ($state -and $state.lan -and $state.lan_ip) {
+    return [string]$state.lan_ip
+  }
+  if (Get-EffectiveLanMode) {
+    $lanIp = Get-LanIPv4
+    if ($lanIp) {
+      return $lanIp
+    }
+  }
   return "127.0.0.1"
 }
 
 function Show-JarvisStatus {
   Set-JarvisEnvironment -SelectedProfile $Profile -SkipTelegramInitialization
   $statusHost = Get-EffectivePublicHost
+  $lanStatus = Get-EffectiveLanMode
   Write-Banner
   Write-Host "+----------------+----------+-------------+----------------------------+" -ForegroundColor DarkCyan
   Write-Host "| Service        | State    | Process     | URL                        |" -ForegroundColor Cyan
@@ -3534,6 +3700,10 @@ function Show-JarvisStatus {
   Show-ManagedProcessRow -Name "Telegram bot" -Service "telegram"
   Show-ServiceRow -Name "Dispatcher" -Port 8001 -Url "http://127.0.0.1:8001/v1"
   Write-Host "+----------------+----------+-------------+----------------------------+" -ForegroundColor DarkCyan
+  if ($lanStatus) {
+    Write-Host ("LAN access: http://{0}:3000 from {1}" -f $statusHost, $script:LanSubnet) -ForegroundColor Cyan
+    Write-Host "Only the authenticated UI is exposed; privileged services stay on localhost." -ForegroundColor DarkGray
+  }
   Write-Host ""
   Write-LlmReadinessBlock -Readiness (Get-LlmReadiness)
   Write-Host ""
@@ -3703,6 +3873,8 @@ function Invoke-Menu {
   [void]$Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
   Invoke-Menu
 }
+
+Initialize-LanModeFromState
 
 if ([string]::IsNullOrWhiteSpace($script:Profile)) {
   $script:Profile = Get-DefaultProfileName

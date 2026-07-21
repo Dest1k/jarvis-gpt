@@ -278,20 +278,21 @@ For the operator and the second model:
   download cache, reports signature/SHA256/executable risk, and lists ZIP
   entries without opening or executing them.
 
-## 2026-07-10 handoff - local-only deployment without browser login
+## 2026-07-22 handoff - authenticated LAN deployment
 
 For the operator and the second model:
 
-- `jarvis-launcher.ps1 start` and `app` are loopback-only. Browser-facing Basic
-  Auth is temporarily removed, so localhost:3000 opens without a login prompt.
-  `lan`/`-Lan` are disabled until an operator-facing authentication policy is
-  restored. The launcher still generates an ACL-restricted server API token;
-  it is never exposed to browser JavaScript.
+- `jarvis-launcher.ps1 start` and `app` remain loopback-only by default. With
+  `-Lan -LanSubnet 192.168.31.0/24`, only the authenticated Command Center is
+  bound to the selected LAN address; it validates each socket peer against the
+  configured subnet. The launcher still generates an ACL-restricted server API
+  token; it is exchanged for a signed HttpOnly UI session and is never exposed
+  to browser JavaScript.
 - The launcher refuses to reuse or terminate listeners on ports 3000, 8000, or
   8765 unless their command line belongs to the corresponding Jarvis service.
-- Compose binds the UI to fixed `127.0.0.1:3000`; there is no environment override
-  for remote exposure while browser authentication is absent. The backend remains
-  on loopback/private Compose networking.
+- Local and Compose starts bind the UI to fixed `127.0.0.1:3000`. LAN mode uses
+  the dedicated authenticated UI server, while the backend, dispatcher, and host
+  bridge remain on loopback/private Compose networking.
 - The same-origin API proxy returns HTTP 503 when `JARVIS_API_TOKEN` is empty.
   Set the same non-empty server token for backend/frontend; the dispatcher-only
   profile remains independent of this requirement.
