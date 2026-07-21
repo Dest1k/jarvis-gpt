@@ -1662,6 +1662,18 @@ class ToolRegistry:
         )
         self.add(
             ToolSpec(
+                name="voice.speak",
+                description=(
+                    "Озвучить текст голосом через TTS (Silero / Windows SAPI5). "
+                    "Возвращает аудиофайл с синтезированной речью. Доступно всем пользователям."
+                ),
+                category="speech",
+                input_schema={"text": "Текст для озвучивания (русский)"},
+                handler=_voice_speak,
+            )
+        )
+        self.add(
+            ToolSpec(
                 name="reminders.create",
                 description=(
                     "Create a reminder, calendar entry, or SCHEDULED AGENT TASK from natural "
@@ -5934,6 +5946,35 @@ def _memory_save(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
         ok=True,
         summary=f"Memory item saved in namespace {namespace}.",
         data={"item": item, "namespace": namespace},
+    )
+
+
+def _voice_speak(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    text = str(args.get("text") or "").strip()
+    if not text:
+        return ToolRunResponse(tool="voice.speak", ok=False, summary="Text is required for speech synthesis.")
+    import tempfile, os
+    from pathlib import Path
+    from . import speech
+    fd, tmp_name = tempfile.mkstemp(suffix=".wav", prefix="jarvis-tts-tool-")
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        result = speech.synthesize(text, tmp_path)
+        if not result.ok:
+            return ToolRunResponse(
+                tool="voice.speak", ok=False,
+                summary=f"TTS failed: {result.error or 'unknown error'}",
+            )
+    except Exception as exc:
+        with suppress(OSError):
+            tmp_path.unlink(missing_ok=True)
+        return ToolRunResponse(tool="voice.speak", ok=False, summary=f"TTS error: {exc}")
+    return ToolRunResponse(
+        tool="voice.speak",
+        ok=True,
+        summary=f"Speech synthesized ({round(result.duration_sec or 0, 1)}s): {text[:80]}",
+        data={"path": str(tmp_path), "duration_sec": result.duration_sec},
     )
 
 
