@@ -5,6 +5,8 @@ import mimetypes
 import os
 import re
 import zipfile
+from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -22,7 +24,7 @@ from .document_surfer import (
     JarvisDocumentSurfer,
     is_document_path_supported,
 )
-from .storage import JarvisStorage, new_id
+from .storage import JarvisStorage
 
 TEXT_EXTENSIONS = {
     ".cfg",
@@ -65,12 +67,24 @@ MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 CHUNK_CHARS = 1_800
 CHUNK_OVERLAP = 180
 SURFER_ONLY_DOCUMENT_EXTENSIONS = {".odt", ".pptx", ".rtf"}
+OCR_IMAGE_EXTENSIONS = {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 
 
 @dataclass(frozen=True)
 class StoredFile:
     name: str
     path: Path
+    sha256: str
+    size: int
+    mime_type: str
+
+
+@dataclass(frozen=True)
+class StagedUpload:
+    intent_id: str
+    name: str
+    ready_path: Path
+    final_path: Path
     sha256: str
     size: int
     mime_type: str
@@ -93,8 +107,8 @@ class FileIngestor:
         if not path.exists() or not path.is_file():
             raise FileNotFoundError(f"File does not exist: {path}")
         with path.open("rb") as stream:
-            stored = self._store_stream(path.name, stream)
-        return self._index_stored_file(stored, source_path=path)
+            staged = self._store_stream(path.name, stream, source_path=path)
+        return self._index_stored_file(staged)
 
     def ingest_directory(self, root_path: str | Path, *, max_files: int = 50) -> dict[str, Any]:
         root = _resolve_allowed_ingest_root(self.settings, root_path)
@@ -144,18 +158,30 @@ class FileIngestor:
         }
 
     def ingest_upload(self, filename: str, stream: BinaryIO) -> dict[str, Any]:
-        stored = self._store_stream(filename, stream)
-        return self._index_stored_file(stored, source_path=None)
+        staged = self._store_stream(filename, stream, source_path=None)
+        return self._index_stored_file(staged)
 
-    def _store_stream(self, filename: str, stream: BinaryIO) -> StoredFile:
-        files_dir = self._files_dir_for_actor()
-        files_dir.mkdir(parents=True, exist_ok=True)
+    def _store_stream(
+        self,
+        filename: str,
+        stream: BinaryIO,
+        *,
+        source_path: Path | None,
+    ) -> StagedUpload:
         safe_name = _safe_filename(filename)
-        temp_path = files_dir / f".{new_id('upload')}.tmp"
+        mime_type = _mime_type_for_name(safe_name)
+        intent = self.storage.begin_file_upload(
+            name=safe_name,
+            mime_type=mime_type,
+            source_path=source_path,
+        )
+        part_path = Path(str(intent["part_path"]))
+        ready_path = Path(str(intent["ready_path"]))
+        part_path.parent.mkdir(parents=True, exist_ok=True)
         digest = hashlib.sha256()
         size = 0
         try:
-            with temp_path.open("wb") as target:
+            with part_path.open("xb") as target:
                 while True:
                     chunk = stream.read(1024 * 1024)
                     if not chunk:
@@ -167,21 +193,29 @@ class FileIngestor:
                         )
                     digest.update(chunk)
                     target.write(chunk)
-        except BaseException:
-            temp_path.unlink(missing_ok=True)
+                target.flush()
+                os.fsync(target.fileno())
+            part_path.replace(ready_path)
+        except BaseException as exc:
+            part_path.unlink(missing_ok=True)
+            with suppress(Exception):
+                self.storage.fail_file_upload_intent(
+                    str(intent["id"]),
+                    f"Upload stream failed ({type(exc).__name__}): {exc}",
+                )
             raise
 
         sha256 = digest.hexdigest()
-        stored_path = files_dir / f"{sha256[:12]}_{safe_name}"
-        if stored_path.exists():
-            temp_path.unlink(missing_ok=True)
-        else:
-            temp_path.replace(stored_path)
-
-        mime_type = _mime_type_for_name(safe_name)
-        return StoredFile(
+        prepared = self.storage.prepare_file_upload(
+            str(intent["id"]),
+            sha256=sha256,
+            size=size,
+        )
+        return StagedUpload(
+            intent_id=str(intent["id"]),
             name=safe_name,
-            path=stored_path,
+            ready_path=ready_path,
+            final_path=Path(str(prepared["final_path"])),
             sha256=sha256,
             size=size,
             mime_type=mime_type,
@@ -189,75 +223,112 @@ class FileIngestor:
 
     def _index_stored_file(
         self,
-        stored: StoredFile,
-        *,
-        source_path: Path | None,
+        staged: StagedUpload,
     ) -> dict[str, Any]:
-        existing = self.storage.get_file_by_sha256(stored.sha256)
-        if existing is not None:
-            existing_path = Path(existing["stored_path"]).resolve(strict=False)
-            reindexed = False
-            if existing.get("status") != "indexed" and stored.path.is_file():
-                chunks, status, error = self._extract_index(stored)
+        preexisting = self.storage.get_file_by_sha256(staged.sha256)
+        previous_path = (
+            Path(str(preexisting["stored_path"])).resolve(strict=False)
+            if preexisting is not None
+            else staged.final_path.resolve(strict=False)
+        )
+        file_record = self.storage.commit_file_upload(staged.intent_id)
+        blob_healed = bool(file_record.pop("_blob_healed", False))
+        intent = self.storage.get_file_upload_intent(staged.intent_id)
+        if intent is None or intent.get("status") != "committed":
+            raise RuntimeError("upload blob was not durably committed")
+        created = bool(intent.get("created_file"))
+        stored = StoredFile(
+            name=staged.name,
+            path=Path(str(file_record["stored_path"])),
+            sha256=staged.sha256,
+            size=staged.size,
+            mime_type=staged.mime_type,
+        )
+
+        owns_indexing = False
+        if file_record.get("status") not in {"indexed", "indexing"}:
+            file_record, owns_indexing = self.storage.begin_file_reindex(
+                str(file_record["id"]),
+                name=stored.name,
+                source_path=(
+                    Path(str(intent["source_path"])) if intent.get("source_path") else None
+                ),
+                stored_path=stored.path,
+                size=stored.size,
+                mime_type=stored.mime_type,
+            )
+
+        chunks: list[str] = []
+        if owns_indexing:
+            chunks, status, error = self._extract_index_safely(stored)
+            try:
                 updated = self.storage.reindex_file(
-                    str(existing["id"]),
+                    str(file_record["id"]),
                     chunks,
                     name=stored.name,
-                    source_path=source_path,
+                    source_path=(
+                        Path(str(intent["source_path"])) if intent.get("source_path") else None
+                    ),
                     stored_path=stored.path,
                     size=stored.size,
                     mime_type=stored.mime_type,
                     status=status,
                     error=error,
                 )
-                existing = updated or existing
-                reindexed = bool(chunks)
-                if reindexed:
-                    self.storage.record_audit(
-                        actor="operator",
-                        action="file.reindex",
-                        target_type="file",
-                        target_id=str(existing["id"]),
-                        summary=(
-                            f"File reindexed: {existing['name']} ({len(chunks)} chunk(s))."
-                        ),
-                            after={"file": existing, "chunks_indexed": len(chunks)},
-                        )
-            active_path = Path(existing["stored_path"]).resolve(strict=False)
-            for obsolete_path in (existing_path, stored.path.resolve(strict=False)):
-                if obsolete_path != active_path:
-                    obsolete_path.unlink(missing_ok=True)
+            except Exception as exc:  # noqa: BLE001 - keep the uploaded file retryable
+                chunks = []
+                detail = str(exc).strip()
+                suffix = f": {detail}" if detail else ""
+                updated = self.storage.fail_file_indexing(
+                    str(file_record["id"]),
+                    f"Index finalization failed ({type(exc).__name__}){suffix}",
+                )
+            file_record = updated or file_record
+
+        active_path = Path(file_record["stored_path"]).resolve(strict=False)
+        for obsolete_path in (previous_path, stored.path.resolve(strict=False)):
+            self._remove_obsolete_managed_blob(
+                obsolete_path,
+                active_path=active_path,
+                expected_sha256=stored.sha256,
+            )
+
+        ocr_job = self._enqueue_automatic_ocr(
+            stored,
+            file_record,
+            verified_reupload=not created,
+        )
+
+        if not created:
+            reindexed = owns_indexing and bool(chunks)
+            if reindexed:
+                self.storage.record_audit(
+                    actor="operator",
+                    action="file.reindex",
+                    target_type="file",
+                    target_id=str(file_record["id"]),
+                    summary=(f"File reindexed: {file_record['name']} ({len(chunks)} chunk(s))."),
+                    after={"file": file_record, "chunks_indexed": len(chunks)},
+                )
             self.storage.add_event(
                 kind="file.ingest.deduplicated",
-                title=f"File already indexed: {existing['name']}",
+                title=f"File already stored: {file_record['name']}",
                 payload={
-                    "file_id": existing["id"],
+                    "file_id": file_record["id"],
                     "sha256": stored.sha256,
+                    "indexing": file_record.get("status") == "indexing",
                     "reindexed": reindexed,
+                    "blob_healed": blob_healed,
                 },
             )
             return {
-                "file": existing,
-                "chunks_indexed": int(existing.get("chunk_count") or 0),
+                "file": file_record,
+                "chunks_indexed": int(file_record.get("chunk_count") or 0),
                 "deduplicated": True,
                 "reindexed": reindexed,
+                "blob_healed": blob_healed,
+                "ocr_job": ocr_job,
             }
-
-        chunks, status, error = self._extract_index(stored)
-        file_record = self.storage.create_file_record(
-            name=stored.name,
-            source_path=source_path,
-            stored_path=stored.path,
-            sha256=stored.sha256,
-            size=stored.size,
-            mime_type=stored.mime_type,
-            status=status,
-            error=error,
-            chunk_count=len(chunks),
-        )
-        if chunks:
-            self.storage.add_file_chunks(file_record["id"], chunks)
-            file_record = self.storage.get_file(file_record["id"]) or file_record
 
         self.storage.record_audit(
             actor="operator",
@@ -272,7 +343,112 @@ class FileIngestor:
             title=f"File ingested: {file_record['name']}",
             payload={"file_id": file_record["id"], "chunks_indexed": len(chunks)},
         )
-        return {"file": file_record, "chunks_indexed": len(chunks)}
+        return {"file": file_record, "chunks_indexed": len(chunks), "ocr_job": ocr_job}
+
+    def _remove_obsolete_managed_blob(
+        self,
+        candidate: Path,
+        *,
+        active_path: Path,
+        expected_sha256: str,
+    ) -> None:
+        resolved = candidate.resolve(strict=False)
+        if resolved == active_path or candidate.is_symlink() or not candidate.is_file():
+            return
+        managed_root = self._files_dir_for_actor().resolve(strict=False)
+        try:
+            resolved.relative_to(managed_root)
+        except ValueError:
+            return
+        digest = hashlib.sha256()
+        try:
+            with candidate.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            if digest.hexdigest() == expected_sha256:
+                candidate.unlink(missing_ok=True)
+        except OSError:
+            return
+
+    def _enqueue_automatic_ocr(
+        self,
+        stored: StoredFile,
+        file_record: dict[str, Any],
+        *,
+        verified_reupload: bool = False,
+    ) -> dict[str, Any] | None:
+        suffix = Path(stored.name).suffix.lower()
+        is_image = stored.mime_type.startswith("image/") or suffix in OCR_IMAGE_EXTENSIONS
+        is_pdf = stored.mime_type == "application/pdf" or suffix == ".pdf"
+        if not is_image and not is_pdf:
+            return None
+        reason = "image_upload" if is_image else "pdf_completeness_upload"
+        return self.storage.enqueue_file_ocr_job(
+            str(file_record["id"]),
+            reason=reason,
+            allow_existing_index=is_pdf,
+            restart_failed=verified_reupload,
+        )
+
+    def process_next_ocr_job(
+        self,
+        processor: Callable[[dict[str, Any]], str | dict[str, Any]],
+        *,
+        worker_id: str = "local-ocr-worker",
+        lease_seconds: int = 300,
+    ) -> dict[str, Any] | None:
+        """Process one current tenant's job through an injected OCR implementation."""
+
+        job = self.storage.claim_next_file_ocr_job(
+            worker_id=worker_id,
+            lease_seconds=lease_seconds,
+        )
+        if job is None:
+            return None
+        try:
+            raw_result = processor(job)
+            if isinstance(raw_result, dict):
+                text = str(raw_result.get("text") or "")
+                source = str(raw_result.get("source") or "automatic_ocr")
+                details = raw_result.get("details")
+                warning = raw_result.get("warning")
+            else:
+                text = str(raw_result or "")
+                source = "automatic_ocr"
+                details = None
+                warning = None
+            completed = self.storage.complete_file_ocr_job(
+                str(job["id"]),
+                str(job["lease_token"]),
+                text,
+                source=source,
+                details=details if isinstance(details, dict) else None,
+                warning=str(warning) if warning else None,
+            )
+            return {"ok": True, "job": completed}
+        except Exception as exc:  # noqa: BLE001 - durable retry is the processing contract
+            failed = self.storage.fail_file_ocr_job(
+                str(job["id"]),
+                str(job["lease_token"]),
+                f"OCR processor failed ({type(exc).__name__}): {exc}",
+            )
+            return {"ok": False, "job": failed, "error": str(exc)}
+
+    @classmethod
+    def _extract_index_safely(
+        cls,
+        stored: StoredFile,
+    ) -> tuple[list[str], str, str | None]:
+        try:
+            return cls._extract_index(stored)
+        except Exception as exc:  # noqa: BLE001 - the durable record must reach a terminal state
+            detail = str(exc).strip()
+            suffix = f": {detail}" if detail else ""
+            return (
+                [],
+                "failed",
+                f"Document indexing failed unexpectedly ({type(exc).__name__}){suffix}"[:4_000],
+            )
 
     @staticmethod
     def _extract_index(stored: StoredFile) -> tuple[list[str], str, str | None]:
@@ -291,6 +467,8 @@ class FileIngestor:
                     document.get("warnings") if isinstance(document.get("warnings"), list) else []
                 )
                 error = "; ".join(str(item) for item in warnings[:3]) or None
+                if not chunks and error is None:
+                    error = "No extractable text found; OCR or document conversion may be required."
             except (DocumentSurferError, OSError, zipfile.BadZipFile) as exc:
                 status = "failed"
                 error = f"Document indexing failed: {exc}"
@@ -303,6 +481,8 @@ class FileIngestor:
                     text = stored.path.read_text(encoding="utf-8", errors="replace")
                     chunks = _chunk_text(text)
                     status = "indexed" if chunks else "stored"
+                    if not chunks:
+                        error = "Text file is empty or contains no indexable text."
                 except OSError as exc:
                     status = "failed"
                     error = str(exc)
@@ -315,6 +495,8 @@ class FileIngestor:
                     document.get("warnings") if isinstance(document.get("warnings"), list) else []
                 )
                 error = "; ".join(str(item) for item in warnings[:3]) or None
+                if not chunks and error is None:
+                    error = "No extractable text found; OCR or document conversion may be required."
             except (DocumentRuntimeError, OSError, zipfile.BadZipFile) as exc:
                 status = "failed"
                 error = f"Document indexing failed: {exc}"
@@ -340,6 +522,12 @@ def extract_file_index(path: str | Path, mime_type: str = "") -> tuple[list[str]
 def _safe_filename(filename: str) -> str:
     raw = Path(filename or "upload.txt").name
     clean = re.sub(r"[^\w.\- ()\[\]]+", "_", raw, flags=re.UNICODE).strip(" .")
+    if len(clean) <= 180:
+        return clean or "upload.txt"
+    suffix = Path(clean).suffix
+    if suffix and len(suffix) <= 17:
+        stem = clean[: 180 - len(suffix)].rstrip(" .")
+        return f"{stem}{suffix}" if stem else f"upload{suffix}"
     return clean[:180] or "upload.txt"
 
 

@@ -185,7 +185,8 @@ ADMIN_API_CAPABILITIES: tuple[CapabilityDefinition, ...] = (
         "admin",
         2,
         source="admin_api",
-        default_presets=("moderator", "admin"),
+        default_presets=("admin",),
+        required_presets=("owner", "admin"),
     ),
     CapabilityDefinition(
         "admin.users.permissions.list",
@@ -256,7 +257,8 @@ ADMIN_API_CAPABILITIES: tuple[CapabilityDefinition, ...] = (
         "admin",
         2,
         source="admin_api",
-        default_presets=("moderator", "admin"),
+        default_presets=("admin",),
+        required_presets=("owner", "admin"),
     ),
     CapabilityDefinition(
         "admin.presets.list",
@@ -264,7 +266,8 @@ ADMIN_API_CAPABILITIES: tuple[CapabilityDefinition, ...] = (
         "admin",
         2,
         source="admin_api",
-        default_presets=("moderator", "admin"),
+        default_presets=("admin",),
+        required_presets=("owner", "admin"),
     ),
     CapabilityDefinition(
         "admin.audit.list",

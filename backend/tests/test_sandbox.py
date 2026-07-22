@@ -97,7 +97,30 @@ def test_code_run_tool_delivers_produced_file(monkeypatch, tmp_path):
     assert result.ok is True
     assert "done" in result.data["stdout"]
     files = result.data["files"]
-    assert any(record["name"] == "result.csv" for record in files)
+    generated = next(record for record in files if record["name"] == "result.csv")
+    assert generated["status"] == "indexed"
+    assert generated["chunk_count"] == 1
+    assert storage.search_file_chunks("a,b", limit=5)[0]["file_id"] == generated["id"]
+    storage.close()
+
+
+def test_code_run_keeps_generated_file_when_indexing_fails(monkeypatch, tmp_path):
+    tools, storage = _registry(monkeypatch, tmp_path)
+
+    def fail_extraction(*_args, **_kwargs):
+        raise RuntimeError("generated extractor failed")
+
+    monkeypatch.setattr("jarvis_gpt.tools.extract_file_index", fail_extraction)
+    code = "open('durable.txt', 'w', encoding='utf-8').write('keep me')"
+
+    result = asyncio.run(tools.run("code.run", {"code": code}, allow_danger=True))
+
+    assert result.ok is True
+    generated = next(record for record in result.data["files"] if record["name"] == "durable.txt")
+    assert generated["status"] == "failed"
+    assert generated["chunk_count"] == 0
+    assert "generated extractor failed" in generated["error"]
+    assert storage.get_file(generated["id"])["status"] == "failed"
     storage.close()
 
 

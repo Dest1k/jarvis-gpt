@@ -468,6 +468,10 @@ class ToolInfo(BaseModel):
     # ToolInfo values (tests/older integrations) source-compatible; registry
     # responses always populate it as ``tool.<name>``.
     security_id: str = ""
+    # Public policy metadata lets clients explain why a capability is present and
+    # prevents the account model from confusing default grants with a hard role floor.
+    default_presets: list[str] = Field(default_factory=list)
+    required_presets: list[str] = Field(default_factory=list)
 
 
 class ToolRunRequest(BaseModel):

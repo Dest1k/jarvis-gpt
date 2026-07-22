@@ -25,18 +25,20 @@ from __future__ import annotations
 
 import math
 import re
+import unicodedata
 
 import httpx
 
 from .config import JarvisSettings
 
-_TOKEN_RE = re.compile(r"[0-9a-zA-Zа-яёА-ЯЁ]+", re.UNICODE)
+_TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
 
 
 def lexical_vector(text: str) -> dict[str, float]:
     """A sparse, L2-normalized fuzzy vector of a text (words + char trigrams)."""
 
-    tokens = [token.lower() for token in _TOKEN_RE.findall(text)]
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    tokens = _TOKEN_RE.findall(normalized)
     weights: dict[str, float] = {}
     for token in tokens:
         weights[f"w:{token}"] = weights.get(f"w:{token}", 0.0) + 1.0
@@ -44,6 +46,13 @@ def lexical_vector(text: str) -> dict[str, float]:
         for index in range(len(padded) - 2):
             key = f"t:{padded[index : index + 3]}"
             weights[key] = weights.get(key, 0.0) + 0.5
+        # Chinese, Korean, and Japanese commonly omit ASCII-style word spaces.
+        # Character bigrams keep short names and two-character queries searchable;
+        # the normal trigrams still provide the more selective ranking signal.
+        if any(ord(char) > 127 for char in token):
+            for index in range(max(0, len(token) - 1)):
+                key = f"b:{token[index : index + 2]}"
+                weights[key] = weights.get(key, 0.0) + 0.35
     norm = math.sqrt(sum(value * value for value in weights.values()))
     if norm == 0.0:
         return {}

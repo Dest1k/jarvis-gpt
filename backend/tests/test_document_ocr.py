@@ -66,6 +66,14 @@ def test_ocr_image_via_vlm(monkeypatch, tmp_path):
     assert result.ok is True
     assert result.data["text"] == "Счёт №42 на 12345 рублей"
     assert result.data["pages"] == 1
+    assert result.data["indexed"] is True
+    record = storage.get_file(file_id)
+    assert record["status"] == "indexed"
+    assert record["chunk_count"] == 1
+    assert storage.search_file_chunks("12345", limit=5)[0]["file_id"] == file_id
+    provenance = storage.get_file_index_metadata(file_id)
+    assert provenance["source"] == "vlm_ocr:qwen36-vl"
+    assert provenance["details"] == {"pages_attempted": 1, "pages_failed": 0}
     storage.close()
 
 

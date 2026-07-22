@@ -21,6 +21,7 @@ from .diagnostics import run_diagnostics
 from .learning import LearningEngine
 from .llm import LLMRouter, background_llm_priority
 from .notify import in_quiet_hours, push_telegram_alert, telegram_targets
+from .ocr import extract_ocr_job
 from .storage import JarvisStorage, utc_now
 from .telemetry import TelemetryCollector
 
@@ -212,6 +213,8 @@ class RuntimeSupervisor:
         self._last_cognition_at: str | None = None
         self._last_cognition_error: str | None = None
         self._last_background_job_at: str | None = None
+        self._last_ocr_job_at: str | None = None
+        self._last_ocr_error: str | None = None
         self._background_user_cursor = ""
         self._last_error: str | None = None
         # Edge-triggered health-alert state: key -> last-fired alert payload. Kept so a
@@ -271,6 +274,10 @@ class RuntimeSupervisor:
             asyncio.create_task(self._health_loop(), name="jarvis-health-loop"),
             asyncio.create_task(self._reminder_loop(), name="jarvis-reminder-loop"),
         ]
+        if self.settings.llm_enabled and self.settings.profile.vision_capable:
+            self._tasks.append(
+                asyncio.create_task(self._ocr_job_loop(), name="jarvis-ocr-jobs")
+            )
         # Self-healing is a reliability guarantee (keep the local brain alive), not an
         # opt-in autonomy behavior, so it runs even when background autonomy is disabled.
         if self.settings.self_healing_enabled:
@@ -355,6 +362,8 @@ class RuntimeSupervisor:
             "last_cognition_at": self._last_cognition_at,
             "last_cognition_error": self._last_cognition_error,
             "last_background_job_at": self._last_background_job_at,
+            "last_ocr_job_at": self._last_ocr_job_at,
+            "last_ocr_error": self._last_ocr_error,
             "last_error": self._last_error,
             "self_healing_enabled": self.settings.self_healing_enabled,
             "self_heal_count": self._self_heal_count,
@@ -379,6 +388,7 @@ class RuntimeSupervisor:
                 "background.mission.scheduler",
                 "background.mission.runner",
                 "background.mission.budgeted",
+                "documents.ocr.queue",
                 "reminders.scheduler",
                 "reminders.fire",
                 "audit.observe",
@@ -417,6 +427,87 @@ class RuntimeSupervisor:
         while True:
             await asyncio.sleep(max(30, self.settings.autonomy_mission_interval_sec))
             await self._run_background_jobs()
+
+    async def _ocr_job_loop(self) -> None:
+        while True:
+            try:
+                processed = await self._run_ocr_job()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - keep the durable worker alive.
+                self._last_ocr_error = f"{type(exc).__name__}: {exc}"[:1000]
+                processed = False
+                with suppress(Exception):
+                    self.storage.add_event(
+                        kind="documents.ocr.worker_error",
+                        title="Automatic OCR worker iteration failed",
+                        level="warn",
+                        payload={"error": self._last_ocr_error},
+                    )
+            await asyncio.sleep(1 if processed else 10)
+
+    async def _run_ocr_job(self) -> bool:
+        system_actor = ActorContext(
+            user_id=LEGACY_OWNER_USER_ID,
+            preset_key="owner",
+            source="ocr-supervisor",
+        )
+        with bind_actor(system_actor):
+            job = await asyncio.to_thread(
+                self.storage.claim_next_file_ocr_job,
+                worker_id="runtime-ocr",
+                lease_seconds=3_600,
+                all_users=True,
+            )
+        if job is None:
+            return False
+        actor = self.authorization.actor_for_user(
+            str(job["user_id"]),
+            source="ocr-supervisor",
+        )
+        if actor is None:
+            # The queue claim is restricted to active users, so this can only be a
+            # concurrent suspension/deletion. Leave the lease to expire safely.
+            return True
+        try:
+            with bind_actor(actor), background_llm_priority(self.llm):
+                result = await extract_ocr_job(
+                    job,
+                    self.llm,
+                    profile_name=self.settings.profile.name,
+                )
+                completed = await asyncio.to_thread(
+                    self.storage.complete_file_ocr_job,
+                    str(job["id"]),
+                    str(job["lease_token"]),
+                    str(result["text"]),
+                    source=str(result["source"]),
+                    details=dict(result["details"]),
+                    warning=str(result["warning"]) if result.get("warning") else None,
+                )
+                self._last_ocr_job_at = utc_now()
+                self._last_ocr_error = None
+                self.storage.add_event(
+                    kind="documents.ocr.completed",
+                    title="Automatic document OCR completed",
+                    payload={
+                        "file_id": job["file_id"],
+                        "job_id": job["id"],
+                        "result_status": completed.get("result_status"),
+                    },
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - durable retry is the queue contract.
+            self._last_ocr_error = f"{type(exc).__name__}: {exc}"[:1000]
+            with bind_actor(actor), suppress(Exception):
+                await asyncio.to_thread(
+                    self.storage.fail_file_ocr_job,
+                    str(job["id"]),
+                    str(job["lease_token"]),
+                    self._last_ocr_error,
+                )
+        return True
 
     async def _reminder_loop(self) -> None:
         while True:
@@ -755,7 +846,7 @@ class RuntimeSupervisor:
                 continue
             user_id = str(raw.get("user_id") or "")
             by_user.setdefault(user_id, []).append(raw)
-        for user_id, entries in by_user.items():
+        for _user_id, entries in by_user.items():
             if len(entries) == 1:
                 item = entries[0]
                 targets = tuple(

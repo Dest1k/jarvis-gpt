@@ -35,6 +35,7 @@ from .persona import PersonaManager
 from .runtime_lease import PrimaryRuntimeLease, RuntimeLeaseError
 from .storage import JarvisStorage
 from .supervisor import RuntimeSupervisor
+from .telegram_reader import load_authorized_reader_from_environment
 from .telemetry import TelemetryCollector
 from .tools import ToolRegistry
 
@@ -115,6 +116,7 @@ def _primary_runtime(
             llm,
             playbooks=playbooks,
             executive=executive,
+            telegram_authorized_reader=load_authorized_reader_from_environment(),
             recover_execution=True,
         )
         agent = AgentRuntime(

@@ -7,10 +7,11 @@ import re
 import shutil
 import sqlite3
 import threading
+import unicodedata
 import uuid
 from collections import Counter, OrderedDict, defaultdict, deque
 from collections.abc import Callable, Iterable, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 from itertools import combinations
@@ -38,6 +39,16 @@ _CHAT_REQUEST_METADATA: ContextVar[dict[str, str] | None] = ContextVar(
     "jarvis_chat_request_metadata",
     default=None,
 )
+_CHAT_INGRESS_MESSAGE_ID: ContextVar[str | None] = ContextVar(
+    "jarvis_chat_ingress_message_id",
+    default=None,
+)
+
+
+def set_chat_ingress_message_id(message_id: str) -> None:
+    """Bind the exact durable user row that the next terminal assistant row answers."""
+
+    _CHAT_INGRESS_MESSAGE_ID.set(str(message_id or "").strip() or None)
 
 
 @contextmanager
@@ -65,6 +76,7 @@ _DOC_DERIV_BUCKET_K = 6  # groups larger than this collapse to a hub-and-star, n
 _DOC_DERIV_PER_DOC_DEGREE_CAP = 8  # max derived edges any single document may accrue
 _DOC_MENTION_EDGE_CAP = 10_000  # bound adversarial all-notes x all-documents mentions
 _MEMORY_VAULT_REPAIR_KEY = "memory_vault.repair_required"
+_PRIVILEGED_DERIVED_TAG = "privileged-derived"
 _MEMORY_VAULT_CACHE_MAX = 512
 # Mirrors document_memory._FILE_ID_RE; duplicated locally to avoid an import cycle.
 _DOC_FILE_ID_RE = re.compile(r"\bfile_[0-9a-fA-F]{8,}\b")
@@ -420,6 +432,12 @@ def _query_terms(query: str | None, *, limit: int = 12) -> list[str]:
     return terms
 
 
+def _unicode_search_fold(value: Any) -> str:
+    """Stable Unicode normalization used by literal fallbacks and SQLite."""
+
+    return unicodedata.normalize("NFKC", str(value or "")).casefold()
+
+
 def _fts_query(query: str) -> str:
     return " OR ".join(f'"{term}"' for term in _query_terms(query, limit=8))
 
@@ -430,6 +448,10 @@ def _recoverable_fts_error(exc: sqlite3.OperationalError) -> bool:
         marker in message
         for marker in (
             "no such module: fts5",
+            "no such tokenizer: trigram",
+            "unknown tokenizer: trigram",
+            "error in tokenizer constructor",
+            "no such table: messages_fts",
             "no such table: memories_fts",
             "no such table: file_chunks_fts",
             "fts5: syntax error",
@@ -458,6 +480,23 @@ def _decorate_memory_hit(row: dict[str, Any], query: str | None) -> dict[str, An
         matched_terms=matched,
         query_terms=terms,
         importance=float(row.get("importance") or 0),
+    )
+    return row
+
+
+def _decorate_message_hit(row: dict[str, Any], query: str) -> dict[str, Any]:
+    terms = _query_terms(query)
+    if not terms and query.strip():
+        terms = [query.strip()]
+    matched = _matched_terms(str(row.get("content") or ""), terms)
+    row["metadata"] = _loads(row.get("metadata"), {})
+    row["matched_terms"] = matched
+    row["snippet"] = _snippet(str(row.get("content") or ""), matched or terms)
+    row["relevance"] = _relevance(
+        row.get("rank"),
+        matched_terms=matched,
+        query_terms=terms,
+        importance=0,
     )
     return row
 
@@ -585,14 +624,61 @@ def _sqlite_table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {str(row[1]) for row in conn.execute(f'PRAGMA table_info("{table}")').fetchall()}
 
 
+def _sqlite_fts_tokenizer(conn: sqlite3.Connection, table: str) -> str | None:
+    safe_table = str(table).replace("'", "''")
+    row = conn.execute(
+        f"SELECT sql FROM sqlite_master WHERE type = 'table' AND name = '{safe_table}'",
+    ).fetchone()
+    if row is None or not row[0]:
+        return None
+    match = re.search(
+        r"\btokenize\s*=\s*(?:'([^']+)'|\"([^\"]+)\"|([^\s,)]+))",
+        str(row[0]),
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        return "unicode61"
+    specification = next((item for item in match.groups() if item is not None), "")
+    return specification.strip().split(maxsplit=1)[0].casefold() or None
+
+
+def _physical_file_suffix(name: str) -> str:
+    suffix = Path(str(name or "")).suffix.lower()
+    return suffix if re.fullmatch(r"\.[\w-]{1,16}", suffix, flags=re.UNICODE) else ""
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+_AUTOMATIC_OCR_IMAGE_SUFFIXES = {
+    ".bmp",
+    ".gif",
+    ".heic",
+    ".heif",
+    ".jpeg",
+    ".jpg",
+    ".png",
+    ".tif",
+    ".tiff",
+    ".webp",
+}
+
+
 class JarvisStorage:
     def __init__(self, database_path: Path) -> None:
         self.database_path = database_path
         self._lock = threading.RLock()
         self._conn: sqlite3.Connection | None = None
         self._read_only = False
+        self._message_fts_available = False
         self._memory_fts_available = False
         self._file_fts_available = False
+        self._files_root = database_path.parent.parent / "files"
         self._memory_vault_root = database_path.parent.parent / "memory-vault"
         self.memory_vault = MemoryVault(self._memory_vault_root)
         self._user_memory_vaults: OrderedDict[str, MemoryVault] = OrderedDict()
@@ -601,11 +687,41 @@ class JarvisStorage:
     def read_only(self) -> bool:
         return self._read_only
 
+    def _can_read_privileged_derived(self) -> bool:
+        """Recheck the current role in SQLite before exposing classified history."""
+
+        actor = current_actor()
+        if actor.preset_key not in {"owner", "admin"}:
+            return False
+        with self._lock:
+            row = self.connect().execute(
+                """
+                SELECT p.preset_key, u.status
+                FROM users u
+                JOIN user_preset_assignments upa
+                  ON upa.user_id = u.id AND upa.revoked_at IS NULL
+                JOIN permission_presets p ON p.id = upa.preset_id
+                WHERE u.id = ?
+                """,
+                (actor.user_id,),
+            ).fetchone()
+        return bool(
+            row is not None
+            and str(row["status"]) == "active"
+            and str(row["preset_key"]) in {"owner", "admin"}
+        )
+
     def connect(self) -> sqlite3.Connection:
         if self._conn is None:
             self.database_path.parent.mkdir(parents=True, exist_ok=True)
             self._conn = sqlite3.connect(self.database_path, check_same_thread=False)
             self._conn.row_factory = sqlite3.Row
+            self._conn.create_function(
+                "jarvis_search_fold",
+                1,
+                _unicode_search_fold,
+                deterministic=True,
+            )
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
         return self._conn
@@ -777,12 +893,15 @@ class JarvisStorage:
                 conn.row_factory = sqlite3.Row
                 conn.execute("PRAGMA query_only=ON")
                 conn.execute("PRAGMA foreign_keys=ON")
+                self._message_fts_available = _sqlite_table_exists(
+                    conn, "messages_fts"
+                ) and _sqlite_fts_tokenizer(conn, "messages_fts") == "trigram"
                 self._memory_fts_available = _sqlite_table_exists(
                     conn, "memories_fts"
-                )
+                ) and _sqlite_fts_tokenizer(conn, "memories_fts") == "trigram"
                 self._file_fts_available = _sqlite_table_exists(
                     conn, "file_chunks_fts"
-                )
+                ) and _sqlite_fts_tokenizer(conn, "file_chunks_fts") == "trigram"
             except BaseException:
                 conn.close()
                 raise
@@ -796,7 +915,12 @@ class JarvisStorage:
                 conn.executescript(SCHEMA)
                 migrate_iam_schema(conn)
                 _migrate_messenger_schema(conn)
+                _migrate_file_reliability_schema(conn)
+                self._message_fts_available = self._ensure_messages_fts(conn)
                 self._memory_fts_available = self._ensure_memory_fts(conn)
+                self._reconcile_upload_intents(conn)
+                self._reconcile_file_ocr_jobs(conn)
+                self._reconcile_file_index_states(conn)
                 self._file_fts_available = self._ensure_file_chunks_fts(conn)
                 conn.commit()
             except Exception:
@@ -807,26 +931,770 @@ class JarvisStorage:
             # the durable repair marker makes the next write retry a full sync.
             self._sync_memory_vault_after_commit(conn, force_full=True)
 
-    def _ensure_memory_fts(self, conn: sqlite3.Connection) -> bool:
+    def _tenant_files_root(self, user_id: str) -> Path:
+        if user_id == LEGACY_OWNER_USER_ID:
+            return self._files_root
+        return self._files_root / "users" / user_id
+
+    def _upload_intent_paths(
+        self,
+        *,
+        user_id: str,
+        intent_id: str,
+        name: str,
+        sha256: str = "",
+    ) -> tuple[Path, Path, Path | None]:
+        tenant_root = self._tenant_files_root(user_id)
+        staging_root = tenant_root / ".staging"
+        if tenant_root.is_symlink() or staging_root.is_symlink():
+            raise ValueError("managed upload directories cannot be symbolic links")
+        part_path = staging_root / f"{intent_id}.part"
+        ready_path = staging_root / f"{intent_id}.ready"
+        final_path = (
+            tenant_root / f"{sha256}{_physical_file_suffix(name)}" if sha256 else None
+        )
+        return part_path, ready_path, final_path
+
+    def _validate_upload_intent_paths(self, row: dict[str, Any]) -> None:
+        expected_part, expected_ready, expected_final = self._upload_intent_paths(
+            user_id=str(row["user_id"]),
+            intent_id=str(row["id"]),
+            name=str(row["name"]),
+            sha256=str(row.get("sha256") or ""),
+        )
+        for actual, expected, label in (
+            (Path(str(row["part_path"])), expected_part, "part"),
+            (Path(str(row["ready_path"])), expected_ready, "ready"),
+        ):
+            if actual.resolve(strict=False) != expected.resolve(strict=False):
+                raise ValueError(f"upload intent {label} path escaped its managed directory")
+        raw_final = str(row.get("final_path") or "").strip()
+        if expected_final is not None and (
+            not raw_final
+            or Path(raw_final).resolve(strict=False) != expected_final.resolve(strict=False)
+        ):
+            raise ValueError("upload intent final path escaped its managed directory")
+
+    def begin_file_upload(
+        self,
+        *,
+        name: str,
+        mime_type: str,
+        source_path: Path | None = None,
+    ) -> dict[str, Any]:
+        """Persist an intent before the first staging byte is written."""
+
+        intent_id = new_id("upload")
+        user_id = current_user_id()
+        part_path, ready_path, _final_path = self._upload_intent_paths(
+            user_id=user_id,
+            intent_id=intent_id,
+            name=name,
+        )
+        now = utc_now()
+        row = {
+            "id": intent_id,
+            "user_id": user_id,
+            "status": "receiving",
+            "name": str(name)[:260],
+            "source_path": str(source_path) if source_path else None,
+            "part_path": str(part_path),
+            "ready_path": str(ready_path),
+            "final_path": None,
+            "mime_type": str(mime_type)[:120],
+            "size": 0,
+            "sha256": "",
+            "file_id": None,
+            "created_file": 0,
+            "error": None,
+            "created_at": now,
+            "updated_at": now,
+            "committed_at": None,
+        }
+        with self.transaction(immediate=True) as conn:
+            conn.execute(
+                """
+                INSERT INTO file_upload_intents(
+                    id, user_id, status, name, source_path, part_path, ready_path,
+                    final_path, mime_type, size, sha256, file_id, created_file,
+                    error, created_at, updated_at, committed_at
+                ) VALUES (
+                    :id, :user_id, :status, :name, :source_path, :part_path, :ready_path,
+                    :final_path, :mime_type, :size, :sha256, :file_id, :created_file,
+                    :error, :created_at, :updated_at, :committed_at
+                )
+                """,
+                row,
+            )
+        return row
+
+    @staticmethod
+    def _decode_upload_intent(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+        return dict(row)
+
+    def get_file_upload_intent(self, intent_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self.connect().execute(
+                """
+                SELECT * FROM file_upload_intents
+                WHERE id = ? AND user_id = ?
+                """,
+                (intent_id, current_user_id()),
+            ).fetchone()
+        return self._decode_upload_intent(row) if row is not None else None
+
+    def fail_file_upload_intent(self, intent_id: str, error: str) -> dict[str, Any] | None:
+        with self.transaction(immediate=True) as conn:
+            conn.execute(
+                """
+                UPDATE file_upload_intents
+                SET status = 'failed', error = ?, updated_at = ?
+                WHERE id = ? AND user_id = ? AND status = 'receiving'
+                """,
+                (str(error)[:4_000], utc_now(), intent_id, current_user_id()),
+            )
+        return self.get_file_upload_intent(intent_id)
+
+    def _prepare_file_upload_conn(
+        self,
+        conn: sqlite3.Connection,
+        row: dict[str, Any],
+        *,
+        sha256: str | None = None,
+        size: int | None = None,
+    ) -> dict[str, Any]:
+        if str(row.get("status")) != "receiving":
+            return row
+        self._validate_upload_intent_paths(row)
+        ready_path = Path(str(row["ready_path"]))
+        if not ready_path.is_file():
+            raise FileNotFoundError(f"Completed upload staging blob is missing: {ready_path}")
+        actual_size = ready_path.stat().st_size
+        actual_sha256 = _file_sha256(ready_path)
+        if sha256 is not None and str(sha256).casefold() != actual_sha256:
+            raise ValueError("staged upload hash changed before it was prepared")
+        if size is not None and int(size) != actual_size:
+            raise ValueError("staged upload size changed before it was prepared")
+        _part, _ready, final_path = self._upload_intent_paths(
+            user_id=str(row["user_id"]),
+            intent_id=str(row["id"]),
+            name=str(row["name"]),
+            sha256=actual_sha256,
+        )
+        assert final_path is not None
+        now = utc_now()
+        conn.execute(
+            """
+            UPDATE file_upload_intents
+            SET status = 'ready', sha256 = ?, size = ?, final_path = ?,
+                error = NULL, updated_at = ?
+            WHERE id = ? AND user_id = ? AND status = 'receiving'
+            """,
+            (
+                actual_sha256,
+                actual_size,
+                str(final_path),
+                now,
+                row["id"],
+                row["user_id"],
+            ),
+        )
+        updated = conn.execute(
+            "SELECT * FROM file_upload_intents WHERE id = ? AND user_id = ?",
+            (row["id"], row["user_id"]),
+        ).fetchone()
+        if updated is None:
+            raise KeyError(str(row["id"]))
+        return dict(updated)
+
+    def prepare_file_upload(
+        self,
+        intent_id: str,
+        *,
+        sha256: str,
+        size: int,
+    ) -> dict[str, Any]:
+        with self.transaction(immediate=True) as conn:
+            row = conn.execute(
+                "SELECT * FROM file_upload_intents WHERE id = ? AND user_id = ?",
+                (intent_id, current_user_id()),
+            ).fetchone()
+            if row is None:
+                raise KeyError(intent_id)
+            updated = self._prepare_file_upload_conn(
+                conn,
+                dict(row),
+                sha256=sha256,
+                size=size,
+            )
+        return updated
+
+    def _claim_file_upload_conn(
+        self,
+        conn: sqlite3.Connection,
+        row: dict[str, Any],
+    ) -> dict[str, Any]:
+        status = str(row.get("status") or "")
+        if status in {"claimed", "committed"}:
+            existing = conn.execute(
+                "SELECT * FROM files WHERE id = ? AND user_id = ?",
+                (row.get("file_id"), row["user_id"]),
+            ).fetchone()
+            if existing is None:
+                raise KeyError(str(row.get("file_id") or ""))
+            return dict(existing)
+        if status != "ready":
+            raise ValueError(f"upload intent is not ready to claim: {status}")
+        self._validate_upload_intent_paths(row)
+        user_id = str(row["user_id"])
+        sha256 = str(row["sha256"])
+        claimed = conn.execute(
+            """
+            SELECT f.*
+            FROM file_ingest_claims claim
+            JOIN files f ON f.id = claim.file_id AND f.user_id = claim.user_id
+            WHERE claim.user_id = ? AND claim.sha256 = ?
+            """,
+            (user_id, sha256),
+        ).fetchone()
+        if claimed is None:
+            conn.execute(
+                """
+                DELETE FROM file_ingest_claims
+                WHERE user_id = ? AND sha256 = ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM files
+                      WHERE files.id = file_ingest_claims.file_id
+                        AND files.user_id = file_ingest_claims.user_id
+                  )
+                """,
+                (user_id, sha256),
+            )
+            claimed = conn.execute(
+                """
+                SELECT * FROM files
+                WHERE sha256 = ? AND user_id = ?
+                ORDER BY
+                    CASE WHEN status = 'indexed' THEN 0 ELSE 1 END,
+                    CASE WHEN mime_type = 'application/octet-stream' THEN 1 ELSE 0 END,
+                    created_at ASC, rowid ASC
+                LIMIT 1
+                """,
+                (sha256, user_id),
+            ).fetchone()
+        created = claimed is None
+        if created:
+            now = utc_now()
+            file_id = new_id("file")
+            conn.execute(
+                """
+                INSERT INTO files(
+                    id, name, source_path, stored_path, mime_type, size, sha256,
+                    status, error, chunk_count, created_at, updated_at, user_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'stored', ?, 0, ?, ?, ?)
+                """,
+                (
+                    file_id,
+                    str(row["name"])[:260],
+                    row.get("source_path"),
+                    str(row["final_path"]),
+                    str(row["mime_type"])[:120],
+                    int(row["size"]),
+                    sha256,
+                    "Upload committed; content indexing is pending.",
+                    now,
+                    now,
+                    user_id,
+                ),
+            )
+            claimed = conn.execute(
+                "SELECT * FROM files WHERE id = ? AND user_id = ?",
+                (file_id, user_id),
+            ).fetchone()
+            conn.execute(
+                """
+                INSERT INTO file_ingest_claims(user_id, sha256, file_id, claimed_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (user_id, sha256, file_id, now),
+            )
+        else:
+            file_id = str(claimed["id"])
+            conn.execute(
+                """
+                INSERT INTO file_ingest_claims(user_id, sha256, file_id, claimed_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id, sha256) DO NOTHING
+                """,
+                (user_id, sha256, file_id, utc_now()),
+            )
+        conn.execute(
+            """
+            UPDATE file_upload_intents
+            SET status = 'claimed', file_id = ?, created_file = ?, updated_at = ?
+            WHERE id = ? AND user_id = ? AND status = 'ready'
+            """,
+            (file_id, int(created), utc_now(), row["id"], user_id),
+        )
+        assert claimed is not None
+        return dict(claimed)
+
+    def claim_file_upload(self, intent_id: str) -> dict[str, Any]:
+        with self.transaction(immediate=True) as conn:
+            row = conn.execute(
+                "SELECT * FROM file_upload_intents WHERE id = ? AND user_id = ?",
+                (intent_id, current_user_id()),
+            ).fetchone()
+            if row is None:
+                raise KeyError(intent_id)
+            file_record = self._claim_file_upload_conn(conn, dict(row))
+        return file_record
+
+    def _commit_file_upload_blob_conn(
+        self,
+        conn: sqlite3.Connection,
+        row: dict[str, Any],
+    ) -> dict[str, Any]:
+        status = str(row.get("status") or "")
+        if status == "committed":
+            file_record = conn.execute(
+                "SELECT * FROM files WHERE id = ? AND user_id = ?",
+                (row.get("file_id"), row["user_id"]),
+            ).fetchone()
+            if file_record is None:
+                raise KeyError(str(row.get("file_id") or ""))
+            return dict(file_record)
+        if status != "claimed":
+            raise ValueError(f"upload intent is not claimed: {status}")
+        self._validate_upload_intent_paths(row)
+        user_id = str(row["user_id"])
+        sha256 = str(row["sha256"])
+        ready_path = Path(str(row["ready_path"]))
+        final_path = Path(str(row["final_path"]))
+        file_record = conn.execute(
+            "SELECT * FROM files WHERE id = ? AND user_id = ?",
+            (row["file_id"], user_id),
+        ).fetchone()
+        if file_record is None:
+            raise KeyError(str(row.get("file_id") or ""))
+        existing_path = Path(str(file_record["stored_path"]))
+
+        def matches(path: Path) -> bool:
+            try:
+                return (
+                    path.is_file()
+                    and path.stat().st_size == int(row["size"])
+                    and _file_sha256(path) == sha256
+                )
+            except OSError:
+                return False
+
+        existing_blob_present = existing_path.exists()
+        existing_matches = matches(existing_path)
+        ready_matches = matches(ready_path)
+        final_matches = matches(final_path)
+        prefer_incoming_path = (
+            str(file_record["status"]) != "indexed"
+            and ready_path.is_file()
+            and existing_path.resolve(strict=False) != final_path.resolve(strict=False)
+        )
+        blob_healed = False
+        if existing_matches and not prefer_incoming_path:
+            active_path = existing_path
+            if ready_path.exists():
+                if not ready_matches:
+                    raise ValueError("recorded ready blob failed its content hash")
+                ready_path.unlink()
+        else:
+            if final_matches:
+                active_path = final_path
+                if ready_path.exists():
+                    if not ready_matches:
+                        raise ValueError("recorded ready blob failed its content hash")
+                    ready_path.unlink()
+            else:
+                if not ready_matches:
+                    if final_path.exists():
+                        raise ValueError(
+                            "managed final blob exists with an unexpected content hash"
+                        )
+                    raise FileNotFoundError("prepared upload blob is missing or corrupt")
+                final_path.parent.mkdir(parents=True, exist_ok=True)
+                # ``Path.replace`` is an atomic same-volume replacement. A verified
+                # reupload therefore heals a corrupt managed blob without a delete gap.
+                ready_path.replace(final_path)
+                active_path = final_path
+                blob_healed = existing_blob_present and not existing_matches
+            conn.execute(
+                """
+                UPDATE files
+                SET stored_path = ?, size = ?, updated_at = ?
+                WHERE id = ? AND user_id = ?
+                """,
+                (str(active_path), int(row["size"]), utc_now(), row["file_id"], user_id),
+            )
+        part_path = Path(str(row["part_path"]))
+        if part_path.exists():
+            part_path.unlink()
+        now = utc_now()
+        conn.execute(
+            """
+            UPDATE file_upload_intents
+            SET status = 'committed', error = NULL, updated_at = ?, committed_at = ?
+            WHERE id = ? AND user_id = ? AND status = 'claimed'
+            """,
+            (now, now, row["id"], user_id),
+        )
+        updated = conn.execute(
+            "SELECT * FROM files WHERE id = ? AND user_id = ?",
+            (row["file_id"], user_id),
+        ).fetchone()
+        if updated is None:
+            raise KeyError(str(row.get("file_id") or ""))
+        result = dict(updated)
+        if blob_healed:
+            result["_blob_healed"] = True
+        return result
+
+    def commit_file_upload(self, intent_id: str) -> dict[str, Any]:
+        """Idempotently claim and promote a prepared blob into its canonical record."""
+
+        with self.transaction(immediate=True) as conn:
+            raw = conn.execute(
+                "SELECT * FROM file_upload_intents WHERE id = ? AND user_id = ?",
+                (intent_id, current_user_id()),
+            ).fetchone()
+            if raw is None:
+                raise KeyError(intent_id)
+            row = dict(raw)
+            if row["status"] == "receiving" and Path(str(row["ready_path"])).is_file():
+                row = self._prepare_file_upload_conn(conn, row)
+            if row["status"] == "ready":
+                self._claim_file_upload_conn(conn, row)
+                claimed = conn.execute(
+                    "SELECT * FROM file_upload_intents WHERE id = ? AND user_id = ?",
+                    (intent_id, current_user_id()),
+                ).fetchone()
+                if claimed is None:
+                    raise KeyError(intent_id)
+                row = dict(claimed)
+            return self._commit_file_upload_blob_conn(conn, row)
+
+    def _reconcile_upload_intents(self, conn: sqlite3.Connection) -> None:
+        rows = conn.execute(
+            """
+            SELECT * FROM file_upload_intents
+            WHERE status IN ('receiving', 'ready', 'claimed')
+            ORDER BY created_at ASC
+            LIMIT 1000
+            """
+        ).fetchall()
+        stale_before = (datetime.now(UTC) - timedelta(minutes=5)).isoformat()
+        for raw in rows:
+            row = dict(raw)
+            savepoint = f"upload_recovery_{re.sub(r'[^a-zA-Z0-9_]', '_', str(row['id']))}"
+            conn.execute(f'SAVEPOINT "{savepoint}"')
+            try:
+                self._validate_upload_intent_paths(row)
+                if row["status"] == "receiving":
+                    ready_path = Path(str(row["ready_path"]))
+                    part_path = Path(str(row["part_path"]))
+                    if ready_path.is_file():
+                        row = self._prepare_file_upload_conn(conn, row)
+                    elif str(row["updated_at"]) <= stale_before:
+                        if part_path.exists():
+                            part_path.unlink()
+                        conn.execute(
+                            """
+                            UPDATE file_upload_intents
+                            SET status = 'failed', error = ?, updated_at = ?
+                            WHERE id = ? AND user_id = ? AND status = 'receiving'
+                            """,
+                            (
+                                "Interrupted before the upload completion marker was written.",
+                                utc_now(),
+                                row["id"],
+                                row["user_id"],
+                            ),
+                        )
+                        conn.execute(f'RELEASE SAVEPOINT "{savepoint}"')
+                        continue
+                    else:
+                        conn.execute(f'RELEASE SAVEPOINT "{savepoint}"')
+                        continue
+                if row["status"] == "ready":
+                    self._claim_file_upload_conn(conn, row)
+                    claimed = conn.execute(
+                        "SELECT * FROM file_upload_intents WHERE id = ? AND user_id = ?",
+                        (row["id"], row["user_id"]),
+                    ).fetchone()
+                    if claimed is None:
+                        raise KeyError(str(row["id"]))
+                    row = dict(claimed)
+                self._commit_file_upload_blob_conn(conn, row)
+                conn.execute(f'RELEASE SAVEPOINT "{savepoint}"')
+            except Exception as exc:  # noqa: BLE001 - preserve the intent for a later retry
+                conn.execute(f'ROLLBACK TO SAVEPOINT "{savepoint}"')
+                conn.execute(f'RELEASE SAVEPOINT "{savepoint}"')
+                conn.execute(
+                    """
+                    UPDATE file_upload_intents
+                    SET error = ?, updated_at = ?
+                    WHERE id = ? AND user_id = ?
+                    """,
+                    (
+                        f"Upload recovery pending ({type(exc).__name__}): {exc}"[:4_000],
+                        utc_now(),
+                        row["id"],
+                        row["user_id"],
+                    ),
+                )
+
+    @staticmethod
+    def _reconcile_file_ocr_jobs(conn: sqlite3.Connection) -> None:
+        now = utc_now()
+        conn.execute(
+            """
+            UPDATE file_ocr_jobs
+            SET status = CASE WHEN attempt_count >= max_attempts THEN 'failed' ELSE 'retry' END,
+                available_at = ?, lease_token = NULL, lease_owner = NULL,
+                lease_expires_at = NULL,
+                last_error = COALESCE(last_error, 'OCR worker lease expired before completion.'),
+                updated_at = ?
+            WHERE status = 'leased' AND lease_expires_at <= ?
+            """,
+            (now, now, now),
+        )
+        candidates = conn.execute(
+            """
+            SELECT f.id, f.user_id, f.name, f.mime_type, f.sha256,
+                   f.status, f.chunk_count
+            FROM files f
+            WHERE NOT EXISTS (
+                  SELECT 1 FROM file_ocr_jobs job
+                  WHERE job.file_id = f.id AND job.user_id = f.user_id
+              )
+            ORDER BY f.created_at ASC, f.rowid ASC
+            LIMIT 1000
+            """
+        ).fetchall()
+        for file_record in candidates:
+            suffix = Path(str(file_record["name"] or "")).suffix.casefold()
+            mime_type = str(file_record["mime_type"] or "").casefold()
+            is_image = mime_type.startswith("image/") or suffix in _AUTOMATIC_OCR_IMAGE_SUFFIXES
+            is_pdf = mime_type == "application/pdf" or suffix == ".pdf"
+            if not is_image and not is_pdf:
+                continue
+            if (
+                is_image
+                and str(file_record["status"]) == "indexed"
+                and int(file_record["chunk_count"]) > 0
+            ):
+                continue
+            conn.execute(
+                """
+                INSERT INTO file_ocr_jobs(
+                    id, user_id, file_id, status, reason, source_sha256,
+                    attempt_count, max_attempts, available_at, result_metadata_json,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, 'pending', ?, ?, 0, 4, ?, '{}', ?, ?)
+                ON CONFLICT(file_id) DO NOTHING
+                """,
+                (
+                    new_id("ocrjob"),
+                    file_record["user_id"],
+                    file_record["id"],
+                    "image_upload_recovered" if is_image else "pdf_completeness_recovered",
+                    file_record["sha256"],
+                    now,
+                    now,
+                    now,
+                ),
+            )
+
+    @staticmethod
+    def _reconcile_file_index_states(conn: sqlite3.Connection) -> None:
+        """Fail closed after an interrupted file-index transaction.
+
+        ``indexing`` is deliberately non-searchable, transient state.  A process
+        restart cannot prove that any chunks left by an older implementation form
+        a complete document, so discard those derived rows while retaining the
+        authoritative uploaded file and an actionable failure reason.  Conversely,
+        a completed ``indexed`` row with committed chunks is trustworthy; repair
+        only its denormalized count.
+        """
+
+        interrupted = conn.execute("SELECT id FROM files WHERE status = 'indexing'").fetchall()
+        interrupted_ids = [str(row["id"]) for row in interrupted]
+        if interrupted_ids:
+            placeholders = ",".join("?" for _item in interrupted_ids)
+            conn.execute(
+                f"DELETE FROM file_chunks WHERE file_id IN ({placeholders})",
+                interrupted_ids,
+            )
+            conn.execute(
+                f"DELETE FROM file_index_metadata WHERE file_id IN ({placeholders})",
+                interrupted_ids,
+            )
+            conn.execute(
+                f"""
+                UPDATE files
+                SET status = 'failed',
+                    error = 'Indexing was interrupted before durable completion; retry the upload.',
+                    chunk_count = 0,
+                    updated_at = ?
+                WHERE id IN ({placeholders})
+                """,
+                (utc_now(), *interrupted_ids),
+            )
+            LOGGER.warning(
+                "Recovered %s interrupted file indexing operation(s)",
+                len(interrupted_ids),
+            )
+
+        conn.execute(
+            """
+            UPDATE files
+            SET chunk_count = (
+                    SELECT COUNT(*) FROM file_chunks c
+                    WHERE c.file_id = files.id AND c.user_id = files.user_id
+                ),
+                updated_at = ?
+            WHERE status = 'indexed'
+              AND chunk_count != (
+                    SELECT COUNT(*) FROM file_chunks c
+                    WHERE c.file_id = files.id AND c.user_id = files.user_id
+                )
+              AND EXISTS (
+                    SELECT 1 FROM file_chunks c
+                    WHERE c.file_id = files.id AND c.user_id = files.user_id
+                )
+            """,
+            (utc_now(),),
+        )
+        conn.execute(
+            """
+            UPDATE files
+            SET status = 'failed',
+                error = 'Indexed metadata had no durable chunks; retry the upload.',
+                chunk_count = 0,
+                updated_at = ?
+            WHERE status = 'indexed'
+              AND NOT EXISTS (
+                    SELECT 1 FROM file_chunks c
+                    WHERE c.file_id = files.id AND c.user_id = files.user_id
+                )
+            """,
+            (utc_now(),),
+        )
+        conn.execute(
+            """
+            DELETE FROM file_index_metadata
+            WHERE file_id IN (
+                SELECT f.id
+                FROM files f
+                WHERE f.status = 'failed'
+                  AND f.error = 'Indexed metadata had no durable chunks; retry the upload.'
+            )
+            """
+        )
+
+    def _ensure_messages_fts(self, conn: sqlite3.Connection) -> bool:
+        schema_version = "messages-trigram-v2"
+        trigger_names = (
+            "messages_fts_after_insert",
+            "messages_fts_after_update",
+            "messages_fts_after_delete",
+        )
         try:
+            table_exists = _sqlite_table_exists(conn, "messages_fts")
             columns = (
-                _sqlite_table_columns(conn, "memories_fts")
-                if _sqlite_table_exists(conn, "memories_fts")
+                _sqlite_table_columns(conn, "messages_fts")
+                if table_exists
                 else set()
             )
-            if columns and "user_id" not in columns:
-                conn.execute("DROP TABLE memories_fts")
+            expected_columns = {"id", "user_id", "conversation_id", "role", "content"}
+            schema_matches = bool(table_exists) and (
+                columns == expected_columns
+                and _sqlite_fts_tokenizer(conn, "messages_fts") == "trigram"
+            )
+            marker = conn.execute(
+                "SELECT schema_version FROM fts_index_metadata WHERE name = ?",
+                ("messages",),
+            ).fetchone()
+            needs_rebuild = not schema_matches or marker is None or marker[0] != schema_version
+            if needs_rebuild:
+                for trigger_name in trigger_names:
+                    conn.execute(f'DROP TRIGGER IF EXISTS "{trigger_name}"')
+            if table_exists and not schema_matches:
+                conn.execute("DROP TABLE messages_fts")
             conn.execute(
                 """
-                CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts
-                USING fts5(id UNINDEXED, user_id UNINDEXED, namespace, content, tags)
+                CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts
+                USING fts5(
+                    id UNINDEXED,
+                    user_id UNINDEXED,
+                    conversation_id UNINDEXED,
+                    role UNINDEXED,
+                    content,
+                    tokenize='trigram'
+                )
                 """
             )
-            conn.execute("DELETE FROM memories_fts")
+            if needs_rebuild:
+                # The enclosing initialize transaction makes this rebuild atomic: a
+                # crash restores the previous complete index rather than a partial one.
+                conn.execute("DELETE FROM messages_fts")
+                conn.execute(
+                    """
+                    INSERT INTO messages_fts(id, user_id, conversation_id, role, content)
+                    SELECT id, user_id, conversation_id, role, content
+                    FROM messages
+                    WHERE is_deleted = 0
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO fts_index_metadata(name, schema_version, rebuilt_at)
+                    VALUES ('messages', ?, ?)
+                    ON CONFLICT(name) DO UPDATE SET
+                        schema_version = excluded.schema_version,
+                        rebuilt_at = excluded.rebuilt_at
+                    """,
+                    (schema_version, utc_now()),
+                )
             conn.execute(
                 """
-                INSERT INTO memories_fts(id, user_id, namespace, content, tags)
-                SELECT id, user_id, namespace, content, tags FROM memories
+                CREATE TRIGGER IF NOT EXISTS messages_fts_after_insert
+                AFTER INSERT ON messages
+                WHEN NEW.is_deleted = 0
+                BEGIN
+                    INSERT INTO messages_fts(id, user_id, conversation_id, role, content)
+                    VALUES (NEW.id, NEW.user_id, NEW.conversation_id, NEW.role, NEW.content);
+                END
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS messages_fts_after_update
+                AFTER UPDATE OF user_id, conversation_id, role, content, is_deleted ON messages
+                BEGIN
+                    DELETE FROM messages_fts
+                    WHERE id = OLD.id AND user_id = OLD.user_id;
+                    INSERT INTO messages_fts(id, user_id, conversation_id, role, content)
+                    SELECT NEW.id, NEW.user_id, NEW.conversation_id, NEW.role, NEW.content
+                    WHERE NEW.is_deleted = 0;
+                END
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS messages_fts_after_delete
+                AFTER DELETE ON messages
+                BEGIN
+                    DELETE FROM messages_fts
+                    WHERE id = OLD.id AND user_id = OLD.user_id;
+                END
                 """
             )
             return True
@@ -835,30 +1703,115 @@ class JarvisStorage:
                 return False
             raise
 
-    def _ensure_file_chunks_fts(self, conn: sqlite3.Connection) -> bool:
+    def _ensure_memory_fts(self, conn: sqlite3.Connection) -> bool:
+        schema_version = "memories-trigram-v2"
         try:
+            table_exists = _sqlite_table_exists(conn, "memories_fts")
             columns = (
-                _sqlite_table_columns(conn, "file_chunks_fts")
-                if _sqlite_table_exists(conn, "file_chunks_fts")
+                _sqlite_table_columns(conn, "memories_fts")
+                if table_exists
                 else set()
             )
-            if columns and "user_id" not in columns:
+            expected_columns = {"id", "user_id", "namespace", "content", "tags"}
+            schema_matches = bool(table_exists) and (
+                columns == expected_columns
+                and _sqlite_fts_tokenizer(conn, "memories_fts") == "trigram"
+            )
+            marker = conn.execute(
+                "SELECT schema_version FROM fts_index_metadata WHERE name = ?",
+                ("memories",),
+            ).fetchone()
+            needs_rebuild = not schema_matches or marker is None or marker[0] != schema_version
+            if table_exists and not schema_matches:
+                conn.execute("DROP TABLE memories_fts")
+            conn.execute(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts
+                USING fts5(
+                    id UNINDEXED,
+                    user_id UNINDEXED,
+                    namespace,
+                    content,
+                    tags,
+                    tokenize='trigram'
+                )
+                """
+            )
+            if needs_rebuild:
+                conn.execute("DELETE FROM memories_fts")
+                conn.execute(
+                    """
+                    INSERT INTO memories_fts(id, user_id, namespace, content, tags)
+                    SELECT id, user_id, namespace, content, tags FROM memories
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO fts_index_metadata(name, schema_version, rebuilt_at)
+                    VALUES ('memories', ?, ?)
+                    ON CONFLICT(name) DO UPDATE SET
+                        schema_version = excluded.schema_version,
+                        rebuilt_at = excluded.rebuilt_at
+                    """,
+                    (schema_version, utc_now()),
+                )
+            return True
+        except sqlite3.OperationalError as exc:
+            if _recoverable_fts_error(exc):
+                return False
+            raise
+
+    def _ensure_file_chunks_fts(self, conn: sqlite3.Connection) -> bool:
+        schema_version = "file-chunks-trigram-v2"
+        try:
+            table_exists = _sqlite_table_exists(conn, "file_chunks_fts")
+            columns = (
+                _sqlite_table_columns(conn, "file_chunks_fts")
+                if table_exists
+                else set()
+            )
+            expected_columns = {"file_id", "chunk_id", "user_id", "content"}
+            schema_matches = bool(table_exists) and (
+                columns == expected_columns
+                and _sqlite_fts_tokenizer(conn, "file_chunks_fts") == "trigram"
+            )
+            marker = conn.execute(
+                "SELECT schema_version FROM fts_index_metadata WHERE name = ?",
+                ("file_chunks",),
+            ).fetchone()
+            needs_rebuild = not schema_matches or marker is None or marker[0] != schema_version
+            if table_exists and not schema_matches:
                 conn.execute("DROP TABLE file_chunks_fts")
             conn.execute(
                 """
                 CREATE VIRTUAL TABLE IF NOT EXISTS file_chunks_fts
                 USING fts5(
-                    file_id UNINDEXED, chunk_id UNINDEXED, user_id UNINDEXED, content
+                    file_id UNINDEXED,
+                    chunk_id UNINDEXED,
+                    user_id UNINDEXED,
+                    content,
+                    tokenize='trigram'
                 )
                 """
             )
-            conn.execute("DELETE FROM file_chunks_fts")
-            conn.execute(
-                """
-                INSERT INTO file_chunks_fts(file_id, chunk_id, user_id, content)
-                SELECT file_id, id, user_id, content FROM file_chunks
-                """
-            )
+            if needs_rebuild:
+                conn.execute("DELETE FROM file_chunks_fts")
+                conn.execute(
+                    """
+                    INSERT INTO file_chunks_fts(file_id, chunk_id, user_id, content)
+                    SELECT file_id, id, user_id, content FROM file_chunks
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO fts_index_metadata(name, schema_version, rebuilt_at)
+                    VALUES ('file_chunks', ?, ?)
+                    ON CONFLICT(name) DO UPDATE SET
+                        schema_version = excluded.schema_version,
+                        rebuilt_at = excluded.rebuilt_at
+                    """,
+                    (schema_version, utc_now()),
+                )
             return True
         except sqlite3.OperationalError as exc:
             if _recoverable_fts_error(exc):
@@ -872,11 +1825,17 @@ class JarvisStorage:
         user_id: str | None = None,
     ) -> list[dict[str, Any]]:
         owner_id = user_id or current_user_id()
+        privileged_clause = (
+            ""
+            if owner_id == current_user_id() and self._can_read_privileged_derived()
+            else f" AND tags NOT LIKE '%{_PRIVILEGED_DERIVED_TAG}%'"
+        )
         rows = conn.execute(
-            """
+            f"""
             SELECT id, user_id, namespace, content, tags, importance, created_at, updated_at
             FROM memories
             WHERE user_id = ?
+              {privileged_clause}
             ORDER BY updated_at DESC
             """,
             (owner_id,),
@@ -1410,7 +2369,17 @@ class JarvisStorage:
             effective_metadata.update(request_metadata)
             if role == "assistant":
                 effective_metadata["chat_request_terminal"] = True
-        preview = " ".join(content.split())[:120]
+        effective_reply_to = reply_to_message_id
+        if role == "assistant" and not effective_reply_to:
+            effective_reply_to = _CHAT_INGRESS_MESSAGE_ID.get()
+        privileged_derived = bool(
+            role == "assistant" and effective_metadata.get("privileged_derived") is True
+        )
+        preview = (
+            "[owner/admin result]"
+            if privileged_derived
+            else " ".join(content.split())[:120]
+        )
         with self._lock:
             conn = self.connect()
             self._require_owned_resource(
@@ -1419,6 +2388,18 @@ class JarvisStorage:
                 resource_id=conversation_id,
                 user_id=user_id,
             )
+            ingress_row = None
+            if role == "assistant" and effective_reply_to:
+                ingress_row = conn.execute(
+                    """
+                    SELECT id, metadata
+                    FROM messages
+                    WHERE id = ? AND conversation_id = ? AND user_id = ? AND role = 'user'
+                    """,
+                    (effective_reply_to, conversation_id, user_id),
+                ).fetchone()
+                if ingress_row is None:
+                    effective_reply_to = None
             conn.execute(
                 """
                 INSERT INTO messages(
@@ -1427,8 +2408,24 @@ class JarvisStorage:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (mid, conversation_id, role, content, _json(effective_metadata), now,
-                 user_id, reply_to_message_id),
+                 user_id, effective_reply_to),
             )
+            if ingress_row is not None:
+                ingress_metadata = _loads(ingress_row["metadata"], {})
+                if not isinstance(ingress_metadata, dict):
+                    ingress_metadata = {}
+                if ingress_metadata.get("ingress_status") == "accepted":
+                    ingress_metadata.update(
+                        {
+                            "ingress_status": "processed",
+                            "ingress_processed_at": now,
+                            "ingress_terminal_message_id": mid,
+                        }
+                    )
+                    conn.execute(
+                        "UPDATE messages SET metadata = ? WHERE id = ? AND user_id = ?",
+                        (_json(ingress_metadata), ingress_row["id"], user_id),
+                    )
             conn.execute(
                 """UPDATE conversations
                    SET updated_at = ?, last_message = ?, last_message_at = ?
@@ -1441,9 +2438,21 @@ class JarvisStorage:
                 source_id=mid,
                 conversation_id=conversation_id,
                 role=role,
-                content=content,
-                summary=f"{role} message captured for learning",
-                payload={"metadata": effective_metadata},
+                content="" if privileged_derived else content,
+                summary=(
+                    "Privileged assistant content omitted from learning history"
+                    if privileged_derived
+                    else f"{role} message captured for learning"
+                ),
+                payload=(
+                    {
+                        "privileged_derived": True,
+                        "content_omitted": True,
+                        "required_presets": ["owner", "admin"],
+                    }
+                    if privileged_derived
+                    else {"metadata": effective_metadata}
+                ),
                 ts=now,
             )
             conn.commit()
@@ -1466,6 +2475,11 @@ class JarvisStorage:
         """
 
         user_id = current_user_id()
+        visibility_clause = (
+            ""
+            if self._can_read_privileged_derived()
+            else " AND COALESCE(json_extract(metadata, '$.privileged_derived'), 0) != 1"
+        )
         with self._lock:
             conn = self.connect()
             self._require_owned_resource(
@@ -1475,7 +2489,7 @@ class JarvisStorage:
                 user_id=user_id,
             )
             row = conn.execute(
-                """
+                f"""
                 SELECT id, conversation_id, role, content, metadata, created_at, user_id
                 FROM messages
                 WHERE conversation_id = ? AND user_id = ? AND role = ?
@@ -1490,6 +2504,7 @@ class JarvisStorage:
                           AND json_extract(metadata, '$.guest_request_fingerprint') = ?
                       )
                   )
+                  {visibility_clause}
                 ORDER BY created_at ASC, rowid ASC
                 LIMIT 1
                 """,
@@ -1550,6 +2565,11 @@ class JarvisStorage:
         messages_per_conversation = max(1, min(int(messages_per_conversation or 6), 20))
         # ISO cutoff matches storage.utc_now() strings better than SQLite datetime().
         cutoff = (datetime.now(UTC) - timedelta(hours=hours)).isoformat()
+        visibility_clause = (
+            ""
+            if self._can_read_privileged_derived()
+            else " AND COALESCE(json_extract(metadata, '$.privileged_derived'), 0) != 1"
+        )
         with self._lock:
             conn = self.connect()
             conv_rows = conn.execute(
@@ -1569,11 +2589,12 @@ class JarvisStorage:
                 if not conv_id or conv_id == exclude_conversation_id:
                     continue
                 msg_rows = conn.execute(
-                    """
+                    f"""
                     SELECT role, content, created_at
                     FROM messages
                     WHERE conversation_id = ? AND user_id = ?
                       AND role IN ('user', 'assistant')
+                      {visibility_clause}
                     ORDER BY created_at DESC, rowid DESC
                     LIMIT ?
                     """,
@@ -1617,12 +2638,18 @@ class JarvisStorage:
         return dict(row) if row else None
 
     def get_message(self, message_id: str) -> dict[str, Any] | None:
+        visibility_clause = (
+            ""
+            if self._can_read_privileged_derived()
+            else " AND COALESCE(json_extract(metadata, '$.privileged_derived'), 0) != 1"
+        )
         with self._lock:
             row = self.connect().execute(
-                """
+                f"""
                 SELECT id, conversation_id, role, content, metadata, created_at
                 FROM messages
                 WHERE id = ? AND user_id = ?
+                  {visibility_clause}
                 """,
                 (message_id, current_user_id()),
             ).fetchone()
@@ -1693,6 +2720,33 @@ class JarvisStorage:
         )
         return {**message, "metadata": metadata}
 
+    def merge_message_metadata(
+        self,
+        message_id: str,
+        updates: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Merge trusted runtime metadata into one current-tenant message."""
+
+        user_id = current_user_id()
+        with self._lock:
+            conn = self.connect()
+            row = conn.execute(
+                "SELECT metadata FROM messages WHERE id = ? AND user_id = ?",
+                (message_id, user_id),
+            ).fetchone()
+            if row is None:
+                return None
+            metadata = _loads(row["metadata"], {})
+            if not isinstance(metadata, dict):
+                metadata = {}
+            metadata.update(dict(updates))
+            conn.execute(
+                "UPDATE messages SET metadata = ? WHERE id = ? AND user_id = ?",
+                (_json(metadata), message_id, user_id),
+            )
+            conn.commit()
+        return self.get_message(message_id)
+
     def delete_conversation(self, conversation_id: str) -> bool:
         with self._lock:
             conn = self.connect()
@@ -1726,12 +2780,18 @@ class JarvisStorage:
         return True
 
     def list_messages(self, conversation_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        visibility_clause = (
+            ""
+            if self._can_read_privileged_derived()
+            else " AND COALESCE(json_extract(metadata, '$.privileged_derived'), 0) != 1"
+        )
         with self._lock:
             rows = self.connect().execute(
-                """
+                f"""
                 SELECT id, conversation_id, role, content, metadata, created_at
                 FROM messages
                 WHERE conversation_id = ? AND user_id = ?
+                  {visibility_clause}
                 ORDER BY created_at ASC, rowid ASC
                 LIMIT ?
                 """,
@@ -1749,12 +2809,18 @@ class JarvisStorage:
         offset: int = 0,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
+        visibility_clause = (
+            ""
+            if self._can_read_privileged_derived()
+            else " AND COALESCE(json_extract(metadata, '$.privileged_derived'), 0) != 1"
+        )
         with self._lock:
             rows = self.connect().execute(
-                """
+                f"""
                 SELECT id, conversation_id, role, content, metadata, created_at
                 FROM messages
                 WHERE conversation_id = ? AND user_id = ?
+                  {visibility_clause}
                 ORDER BY created_at ASC, rowid ASC
                 LIMIT ? OFFSET ?
                 """,
@@ -1766,12 +2832,18 @@ class JarvisStorage:
         ]
 
     def recent_messages(self, conversation_id: str, limit: int = 20) -> list[dict[str, Any]]:
+        visibility_clause = (
+            ""
+            if self._can_read_privileged_derived()
+            else " AND COALESCE(json_extract(metadata, '$.privileged_derived'), 0) != 1"
+        )
         with self._lock:
             rows = self.connect().execute(
-                """
-                SELECT role, content, metadata, created_at
+                f"""
+                SELECT id, role, content, metadata, created_at
                 FROM messages
                 WHERE conversation_id = ? AND user_id = ?
+                  {visibility_clause}
                 ORDER BY created_at DESC, rowid DESC
                 LIMIT ?
                 """,
@@ -1788,7 +2860,12 @@ class JarvisStorage:
         preview = " ".join(content.split())[:120]
         with self._lock:
             conn = self.connect()
-            self._require_owned_resource(conn, table="messages", resource_id=message_id, user_id=user_id)
+            self._require_owned_resource(
+                conn,
+                table="messages",
+                resource_id=message_id,
+                user_id=user_id,
+            )
             cursor = conn.execute(
                 """UPDATE messages SET content = ?, edited_at = ?
                    WHERE id = ? AND user_id = ? AND is_deleted = 0""",
@@ -1812,7 +2889,12 @@ class JarvisStorage:
         user_id = current_user_id()
         with self._lock:
             conn = self.connect()
-            self._require_owned_resource(conn, table="messages", resource_id=message_id, user_id=user_id)
+            self._require_owned_resource(
+                conn,
+                table="messages",
+                resource_id=message_id,
+                user_id=user_id,
+            )
             cursor = conn.execute(
                 """UPDATE messages SET is_deleted = 1
                    WHERE id = ? AND user_id = ? AND is_deleted = 0""",
@@ -1854,30 +2936,154 @@ class JarvisStorage:
             conn.commit()
             return self.get_conversation(conversation_id)
 
-    def search_recent_user_messages(self, query: str, limit: int = 15) -> list[dict[str, Any]]:
-        """Full-text search across recent user messages in all conversations."""
-        terms = _query_terms(query, limit=4)
-        if not terms:
+    def search_messages(
+        self,
+        query: str,
+        limit: int = 25,
+        *,
+        roles: Iterable[str] | None = None,
+        conversation_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Search the complete current tenant's user/assistant message history.
+
+        Trigram FTS handles arbitrary Unicode scripts and old rows without a recency
+        window. SQLite FTS cannot index one- or two-codepoint tokens, so literal
+        normalized ``instr`` predicates provide a Unicode-casefold fallback and are
+        merged with FTS results for mixed short/long queries.
+        """
+
+        clean_query = str(query or "").strip()
+        requested_limit = max(0, int(limit))
+        if not clean_query or requested_limit == 0:
             return []
-        clauses: list[str] = []
-        params: list[Any] = [current_user_id(), "user"]
-        for term in terms:
-            like = f"%{term}%"
-            clauses.append("content LIKE ?")
-            params.append(like)
-        params.append(min(60, limit * 3))
-        with self._lock:
-            rows = self.connect().execute(
-                f"""
-                SELECT id, role, content, created_at, conversation_id
-                FROM messages
-                WHERE user_id = ? AND role = ? AND ({" OR ".join(clauses)})
-                ORDER BY created_at DESC
-                LIMIT ?
-                """,
-                tuple(params),
-            ).fetchall()
-        return [dict(row) for row in rows]
+
+        requested_roles = (roles,) if isinstance(roles, str) else roles
+        normalized_roles: list[str] = []
+        for role in requested_roles or ("user", "assistant"):
+            normalized = str(role).strip().casefold()
+            if normalized in {"user", "assistant"} and normalized not in normalized_roles:
+                normalized_roles.append(normalized)
+        if not normalized_roles:
+            return []
+
+        user_id = current_user_id()
+        visibility_clause = (
+            ""
+            if self._can_read_privileged_derived()
+            else " AND COALESCE(json_extract(m.metadata, '$.privileged_derived'), 0) != 1"
+        )
+        role_placeholders = ",".join("?" for _ in normalized_roles)
+        seen_ids: set[str] = set()
+        results: list[dict[str, Any]] = []
+
+        def add_rows(rows: Iterable[sqlite3.Row]) -> None:
+            for row in rows:
+                item = dict(row)
+                message_id = str(item.get("id") or "")
+                if not message_id or message_id in seen_ids:
+                    continue
+                seen_ids.add(message_id)
+                results.append(_decorate_message_hit(item, clean_query))
+
+        terms = _query_terms(clean_query, limit=8)
+        folded_terms = [_unicode_search_fold(term) for term in terms]
+        fts_terms = [term for term in terms if len(_unicode_search_fold(term)) >= 3]
+        fts_returned = False
+        if self._message_fts_available and fts_terms:
+            match = " OR ".join(f'"{term}"' for term in fts_terms)
+            conversation_clause = ""
+            params: list[Any] = [match, user_id, user_id, *normalized_roles]
+            if conversation_id is not None:
+                conversation_clause = " AND m.conversation_id = ?"
+                params.append(str(conversation_id))
+            params.append(min(500, max(requested_limit * 4, requested_limit)))
+            try:
+                with self._lock:
+                    rows = self.connect().execute(
+                        f"""
+                        SELECT
+                            m.id,
+                            m.conversation_id,
+                            m.role,
+                            m.content,
+                            m.metadata,
+                            m.created_at,
+                            m.edited_at,
+                            bm25(messages_fts) AS rank
+                        FROM messages_fts
+                        JOIN messages m
+                          ON m.id = messages_fts.id
+                         AND m.user_id = messages_fts.user_id
+                        WHERE messages_fts MATCH ?
+                          AND messages_fts.user_id = ?
+                          AND m.user_id = ?
+                          AND m.is_deleted = 0
+                          AND m.role IN ({role_placeholders})
+                          {visibility_clause}
+                          {conversation_clause}
+                        ORDER BY rank ASC, m.created_at DESC, m.rowid DESC
+                        LIMIT ?
+                        """,
+                        tuple(params),
+                    ).fetchall()
+                add_rows(rows)
+                fts_returned = bool(rows)
+            except sqlite3.OperationalError as exc:
+                if not _recoverable_fts_error(exc):
+                    raise
+
+        literal_terms = [
+            folded
+            for folded in folded_terms
+            if folded and len(folded) < 3
+        ]
+        if not self._message_fts_available or not fts_returned:
+            literal_terms.extend(folded_terms)
+            literal_terms.append(_unicode_search_fold(clean_query))
+        literal_terms = list(dict.fromkeys(term for term in literal_terms if term))
+        if literal_terms:
+            literal_clauses = " OR ".join(
+                "instr(jarvis_search_fold(m.content), ?) > 0" for _ in literal_terms
+            )
+            conversation_clause = ""
+            params = [user_id, *normalized_roles]
+            if conversation_id is not None:
+                conversation_clause = " AND m.conversation_id = ?"
+                params.append(str(conversation_id))
+            params.extend(literal_terms)
+            params.append(min(500, max(requested_limit * 8, requested_limit)))
+            with self._lock:
+                rows = self.connect().execute(
+                    f"""
+                    SELECT
+                        m.id,
+                        m.conversation_id,
+                        m.role,
+                        m.content,
+                        m.metadata,
+                        m.created_at,
+                        m.edited_at,
+                        NULL AS rank
+                    FROM messages m
+                    WHERE m.user_id = ?
+                      AND m.is_deleted = 0
+                      AND m.role IN ({role_placeholders})
+                      {visibility_clause}
+                      {conversation_clause}
+                      AND ({literal_clauses})
+                    ORDER BY m.created_at DESC, m.rowid DESC
+                    LIMIT ?
+                    """,
+                    tuple(params),
+                ).fetchall()
+            add_rows(rows)
+
+        return results[:requested_limit]
+
+    def search_recent_user_messages(self, query: str, limit: int = 15) -> list[dict[str, Any]]:
+        """Backward-compatible user-only view over complete message search."""
+
+        return self.search_messages(query, limit=limit, roles=("user",))
 
     def retire_compacted_raw_messages(self, conversation_id: str) -> int:
         """Mark raw-message memories for a conversation as compacted (no longer fresh).
@@ -1914,6 +3120,7 @@ class JarvisStorage:
         content = " ".join(str(content).split()).strip()[:20000]
         namespace = (str(namespace).strip() or "core")[:80]
         tags = _normalize_tags(tags)
+        privileged_derived = _PRIVILEGED_DERIVED_TAG in tags
         importance = max(0.0, min(1.0, float(importance)))
         content_key = _normalize_memory_content(content)
         row = {
@@ -2000,8 +3207,21 @@ class JarvisStorage:
                 action="memory.merge",
                 target_type="memory",
                 target_id=row["id"],
-                summary=f"Memory refreshed in namespace {row['namespace']}.",
-                after=row,
+                summary=(
+                    "Privileged-derived memory refreshed; content omitted from audit."
+                    if privileged_derived
+                    else f"Memory refreshed in namespace {row['namespace']}."
+                ),
+                after=(
+                    {
+                        "id": row["id"],
+                        "namespace": row["namespace"],
+                        "privileged_derived": True,
+                        "content_omitted": True,
+                    }
+                    if privileged_derived
+                    else row
+                ),
             )
         else:
             self.record_audit(
@@ -2009,8 +3229,21 @@ class JarvisStorage:
                 action="memory.create",
                 target_type="memory",
                 target_id=row["id"],
-                summary=f"Memory saved in namespace {row['namespace']}.",
-                after=row,
+                summary=(
+                    "Privileged-derived memory saved; content omitted from audit."
+                    if privileged_derived
+                    else f"Memory saved in namespace {row['namespace']}."
+                ),
+                after=(
+                    {
+                        "id": row["id"],
+                        "namespace": row["namespace"],
+                        "privileged_derived": True,
+                        "content_omitted": True,
+                    }
+                    if privileged_derived
+                    else row
+                ),
             )
         return row
 
@@ -2044,6 +3277,16 @@ class JarvisStorage:
         since_date: str | None = None,
     ) -> list[dict[str, Any]]:
         namespace_filter = [str(item) for item in (namespaces or []) if str(item).strip()]
+        privileged_fts_clause = (
+            ""
+            if self._can_read_privileged_derived()
+            else f" AND m.tags NOT LIKE '%{_PRIVILEGED_DERIVED_TAG}%'"
+        )
+        privileged_plain_clause = (
+            ""
+            if self._can_read_privileged_derived()
+            else f" AND tags NOT LIKE '%{_PRIVILEGED_DERIVED_TAG}%'"
+        )
         seen_ids: set[str] = set()
         decorated: list[dict[str, Any]] = []
 
@@ -2061,60 +3304,72 @@ class JarvisStorage:
                 seen_ids.add(item["id"])
                 decorated.append(_decorate_memory_hit(item, query))
 
-        if query and self._memory_fts_available:
-            match = _fts_query(query)
-            if match:
-                try:
-                    namespace_sql = ""
-                    user_id = current_user_id()
-                    params: list[Any] = [match, user_id, user_id]
-                    if namespace_filter:
-                        placeholders = ",".join("?" for _ in namespace_filter)
-                        namespace_sql = f" AND m.namespace IN ({placeholders})"
-                        params.extend(namespace_filter)
-                    oversample = max(limit * 4, limit)
-                    params.extend(since_params)
-                    params.append(min(200, oversample))
-                    with self._lock:
-                        rows = self.connect().execute(
-                            f"""
-                            SELECT
-                                m.id,
-                                m.namespace,
-                                m.content,
-                                m.tags,
-                                m.importance,
-                                m.created_at,
-                                m.updated_at,
-                                bm25(memories_fts) AS rank
-                            FROM memories_fts
-                            JOIN memories m
-                              ON m.id = memories_fts.id
-                             AND m.user_id = memories_fts.user_id
-                            WHERE memories_fts MATCH ?
-                              AND memories_fts.user_id = ?
-                              AND m.user_id = ?
-                              AND m.tags NOT LIKE '%compacted%'
-                            {namespace_sql}
-                            {since_clause}
-                            ORDER BY rank ASC, m.importance DESC, m.updated_at DESC
-                            LIMIT ?
-                            """,
-                            tuple(params),
-                        ).fetchall()
-                    add_rows(rows)
-                except sqlite3.OperationalError as exc:
-                    if not _recoverable_fts_error(exc):
-                        raise
+        terms = _query_terms(query, limit=8) if query else []
+        folded_terms = [_unicode_search_fold(term) for term in terms]
+        fts_terms = [term for term in terms if len(_unicode_search_fold(term)) >= 3]
+        fts_returned = False
+        if query and self._memory_fts_available and fts_terms:
+            match = " OR ".join(f'"{term}"' for term in fts_terms)
+            try:
+                namespace_sql = ""
+                user_id = current_user_id()
+                params: list[Any] = [match, user_id, user_id]
+                if namespace_filter:
+                    placeholders = ",".join("?" for _ in namespace_filter)
+                    namespace_sql = f" AND m.namespace IN ({placeholders})"
+                    params.extend(namespace_filter)
+                oversample = max(limit * 4, limit)
+                params.extend(since_params)
+                params.append(min(500, oversample))
+                with self._lock:
+                    rows = self.connect().execute(
+                        f"""
+                        SELECT
+                            m.id,
+                            m.namespace,
+                            m.content,
+                            m.tags,
+                            m.importance,
+                            m.created_at,
+                            m.updated_at,
+                            bm25(memories_fts) AS rank
+                        FROM memories_fts
+                        JOIN memories m
+                          ON m.id = memories_fts.id
+                         AND m.user_id = memories_fts.user_id
+                        WHERE memories_fts MATCH ?
+                          AND memories_fts.user_id = ?
+                          AND m.user_id = ?
+                          AND m.tags NOT LIKE '%compacted%'
+                          {privileged_fts_clause}
+                        {namespace_sql}
+                        {since_clause}
+                        ORDER BY rank ASC, m.importance DESC, m.updated_at DESC
+                        LIMIT ?
+                        """,
+                        tuple(params),
+                    ).fetchall()
+                add_rows(rows)
+                fts_returned = bool(rows)
+            except sqlite3.OperationalError as exc:
+                if not _recoverable_fts_error(exc):
+                    raise
 
-        if query and len(decorated) < limit:
-            terms = _query_terms(query, limit=8)
+        if query:
+            literal_terms = [term for term in folded_terms if term and len(term) < 3]
+            if not self._memory_fts_available or not fts_returned:
+                literal_terms.extend(folded_terms)
+                literal_terms.append(_unicode_search_fold(query))
+            literal_terms = list(dict.fromkeys(term for term in literal_terms if term))
             clauses: list[str] = []
-            params: list[Any] = [current_user_id()]
-            for term in terms:
-                like = f"%{term}%"
-                clauses.append("(content LIKE ? OR tags LIKE ? OR namespace LIKE ?)")
-                params.extend([like, like, like])
+            params = [current_user_id()]
+            for term in literal_terms:
+                clauses.append(
+                    "(instr(jarvis_search_fold(content), ?) > 0 "
+                    "OR instr(jarvis_search_fold(tags), ?) > 0 "
+                    "OR instr(jarvis_search_fold(namespace), ?) > 0)"
+                )
+                params.extend([term, term, term])
             namespace_sql = ""
             if namespace_filter:
                 placeholders = ",".join("?" for _ in namespace_filter)
@@ -2129,11 +3384,12 @@ class JarvisStorage:
                     WHERE user_id = ? AND ({" OR ".join(clauses)}){namespace_sql}
                     {since_clause}
                     AND tags NOT LIKE '%compacted%'
+                    {privileged_plain_clause}
                     ORDER BY importance DESC, updated_at DESC
                     LIMIT ?
                 """
                 params.extend(since_params)
-                params.append(min(200, max(limit * 4, limit)))
+                params.append(min(500, max(limit * 8, limit)))
                 with self._lock:
                     rows = self.connect().execute(sql, tuple(params)).fetchall()
                 add_rows(rows)
@@ -2165,6 +3421,7 @@ class JarvisStorage:
             WHERE {where}
             {since_clause}
             AND tags NOT LIKE '%compacted%'
+            {privileged_plain_clause}
             ORDER BY importance DESC, updated_at DESC
             LIMIT ?
         """
@@ -2173,6 +3430,11 @@ class JarvisStorage:
         return [_decorate_memory_hit(dict(row), query) for row in rows]
 
     def consolidate_memories(self, limit: int = 1000) -> dict[str, int]:
+        privileged_clause = (
+            ""
+            if self._can_read_privileged_derived()
+            else f" AND tags NOT LIKE '%{_PRIVILEGED_DERIVED_TAG}%'"
+        )
         with self._lock:
             conn = self.connect()
             removed = 0
@@ -2184,10 +3446,11 @@ class JarvisStorage:
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 rows = conn.execute(
-                    """
+                    f"""
                     SELECT id, user_id, namespace, content, tags, importance, created_at, updated_at
                     FROM memories
                     WHERE user_id = ?
+                      {privileged_clause}
                     ORDER BY updated_at DESC
                     LIMIT ?
                     """,
@@ -3820,6 +5083,919 @@ class JarvisStorage:
             self.connect().commit()
         return row
 
+    def claim_file_ingest(
+        self,
+        *,
+        name: str,
+        stored_path: Path,
+        sha256: str,
+        size: int,
+        mime_type: str,
+        source_path: Path | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        """Claim one canonical durable record for a tenant/content hash.
+
+        The claim table provides a database-enforced serialization point without
+        deleting legacy duplicate rows (whose ids may still be referenced from old
+        conversations).  ``True`` means this caller created the canonical row and
+        therefore owns its synchronous indexing attempt.
+        """
+
+        now = utc_now()
+        row = {
+            "id": new_id("file"),
+            "user_id": current_user_id(),
+            "name": name[:260],
+            "source_path": str(source_path) if source_path else None,
+            "stored_path": str(stored_path),
+            "mime_type": mime_type[:120],
+            "size": int(size),
+            "sha256": str(sha256),
+            "status": "indexing",
+            "error": None,
+            "chunk_count": 0,
+            "created_at": now,
+            "updated_at": now,
+        }
+        select_columns = """
+            f.id, f.name, f.source_path, f.stored_path, f.mime_type, f.size,
+            f.sha256, f.status, f.error, f.chunk_count, f.created_at, f.updated_at
+        """
+        with self.transaction(immediate=True) as conn:
+            claimed = conn.execute(
+                f"""
+                SELECT {select_columns}
+                FROM file_ingest_claims claim
+                JOIN files f ON f.id = claim.file_id AND f.user_id = claim.user_id
+                WHERE claim.user_id = ? AND claim.sha256 = ?
+                """,
+                (row["user_id"], row["sha256"]),
+            ).fetchone()
+            if claimed is not None:
+                return dict(claimed), False
+
+            conn.execute(
+                """
+                DELETE FROM file_ingest_claims
+                WHERE user_id = ? AND sha256 = ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM files
+                      WHERE files.id = file_ingest_claims.file_id
+                        AND files.user_id = file_ingest_claims.user_id
+                  )
+                """,
+                (row["user_id"], row["sha256"]),
+            )
+            legacy = conn.execute(
+                f"""
+                SELECT {select_columns}
+                FROM files f
+                WHERE f.sha256 = ? AND f.user_id = ?
+                ORDER BY
+                    CASE WHEN f.status = 'indexed' THEN 0 ELSE 1 END,
+                    CASE WHEN f.mime_type = 'application/octet-stream' THEN 1 ELSE 0 END,
+                    f.created_at ASC,
+                    f.rowid ASC
+                LIMIT 1
+                """,
+                (row["sha256"], row["user_id"]),
+            ).fetchone()
+            if legacy is not None:
+                conn.execute(
+                    """
+                    INSERT INTO file_ingest_claims(user_id, sha256, file_id, claimed_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (row["user_id"], row["sha256"], legacy["id"], now),
+                )
+                return dict(legacy), False
+
+            conn.execute(
+                """
+                INSERT INTO files(
+                    id, name, source_path, stored_path, mime_type, size, sha256,
+                    status, error, chunk_count, created_at, updated_at, user_id
+                )
+                VALUES (
+                    :id, :name, :source_path, :stored_path, :mime_type, :size, :sha256,
+                    :status, :error, :chunk_count, :created_at, :updated_at, :user_id
+                )
+                """,
+                row,
+            )
+            conn.execute(
+                """
+                INSERT INTO file_ingest_claims(user_id, sha256, file_id, claimed_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (row["user_id"], row["sha256"], row["id"], now),
+            )
+        return row, True
+
+    def begin_file_reindex(
+        self,
+        file_id: str,
+        *,
+        name: str,
+        stored_path: Path,
+        size: int,
+        mime_type: str,
+        source_path: Path | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        """Acquire a failed/stored canonical record for one indexing attempt."""
+
+        user_id = current_user_id()
+        now = utc_now()
+        with self.transaction(immediate=True) as conn:
+            self._require_owned_resource(
+                conn,
+                table="files",
+                resource_id=file_id,
+                user_id=user_id,
+            )
+            cursor = conn.execute(
+                """
+                UPDATE files
+                SET name = ?, source_path = ?, stored_path = ?, mime_type = ?, size = ?,
+                    status = 'indexing', error = NULL, chunk_count = 0, updated_at = ?
+                WHERE id = ? AND user_id = ?
+                  AND status NOT IN ('indexed', 'indexing')
+                """,
+                (
+                    name[:260],
+                    str(source_path) if source_path else None,
+                    str(stored_path),
+                    mime_type[:120],
+                    int(size),
+                    now,
+                    file_id,
+                    user_id,
+                ),
+            )
+            if cursor.rowcount == 1:
+                self._replace_file_chunks(conn, file_id, [], now=now)
+                conn.execute(
+                    "DELETE FROM file_index_metadata WHERE file_id = ? AND user_id = ?",
+                    (file_id, user_id),
+                )
+            current = conn.execute(
+                """
+                SELECT id, name, source_path, stored_path, mime_type, size, sha256,
+                       status, error, chunk_count, created_at, updated_at
+                FROM files
+                WHERE id = ? AND user_id = ?
+                """,
+                (file_id, user_id),
+            ).fetchone()
+            if current is None:
+                raise KeyError(file_id)
+            return dict(current), cursor.rowcount == 1
+
+    def fail_file_indexing(self, file_id: str, error: str) -> dict[str, Any] | None:
+        """Move an owned transient record to an honest, retryable terminal state."""
+
+        user_id = current_user_id()
+        with self.transaction(immediate=True) as conn:
+            self._require_owned_resource(
+                conn,
+                table="files",
+                resource_id=file_id,
+                user_id=user_id,
+            )
+            conn.execute(
+                """
+                UPDATE files
+                SET status = 'failed', error = ?, chunk_count = 0, updated_at = ?
+                WHERE id = ? AND user_id = ? AND status = 'indexing'
+                """,
+                (str(error)[:4_000], utc_now(), file_id, user_id),
+            )
+        return self.get_file(file_id)
+
+    @staticmethod
+    def _extracted_text_chunks(
+        text: str,
+        *,
+        chunk_chars: int,
+        chunk_overlap: int,
+    ) -> list[str]:
+        content = str(text or "").strip()
+        if not content:
+            raise ValueError("extracted text cannot be empty")
+        bounded_chunk_chars = max(500, min(20_000, int(chunk_chars)))
+        bounded_overlap = max(0, min(bounded_chunk_chars // 2, int(chunk_overlap)))
+        chunks: list[str] = []
+        start = 0
+        while start < len(content):
+            end = min(len(content), start + bounded_chunk_chars)
+            chunk = content[start:end].strip()
+            if chunk:
+                chunks.append(chunk)
+            if end >= len(content):
+                break
+            start = max(start + 1, end - bounded_overlap)
+        if not chunks:
+            raise ValueError("extracted text produced no searchable chunks")
+        return chunks
+
+    def _persist_file_extracted_text_conn(
+        self,
+        conn: sqlite3.Connection,
+        file_id: str,
+        text: str,
+        *,
+        user_id: str,
+        source: str,
+        details: dict[str, Any] | None,
+        warning: str | None,
+        chunk_chars: int = 1_800,
+        chunk_overlap: int = 180,
+    ) -> dict[str, Any]:
+        extraction_source = str(source or "").strip()
+        if not extraction_source:
+            raise ValueError("extraction source is required")
+        chunks = self._extracted_text_chunks(
+            text,
+            chunk_chars=chunk_chars,
+            chunk_overlap=chunk_overlap,
+        )
+
+        now = utc_now()
+        self._require_owned_resource(
+            conn,
+            table="files",
+            resource_id=file_id,
+            user_id=user_id,
+        )
+        self._replace_file_chunks(conn, file_id, chunks, now=now)
+        conn.execute(
+            """
+            UPDATE files
+            SET status = 'indexed', error = ?, chunk_count = ?, updated_at = ?
+            WHERE id = ? AND user_id = ?
+            """,
+            (
+                str(warning)[:4_000] if warning else None,
+                len(chunks),
+                now,
+                file_id,
+                user_id,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO file_index_metadata(
+                file_id, user_id, source, details_json, updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(file_id) DO UPDATE SET
+                user_id = excluded.user_id,
+                source = excluded.source,
+                details_json = excluded.details_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                file_id,
+                user_id,
+                extraction_source[:120],
+                _json(details or {}),
+                now,
+            ),
+        )
+        updated = conn.execute(
+            """
+            SELECT id, name, source_path, stored_path, mime_type, size, sha256,
+                   status, error, chunk_count, created_at, updated_at
+            FROM files WHERE id = ? AND user_id = ?
+            """,
+            (file_id, user_id),
+        ).fetchone()
+        if updated is None:
+            raise KeyError(file_id)
+        record = dict(updated)
+        record["index_source"] = extraction_source[:120]
+        record["index_details"] = dict(details or {})
+        return record
+
+    def persist_file_extracted_text(
+        self,
+        file_id: str,
+        text: str,
+        *,
+        source: str,
+        details: dict[str, Any] | None = None,
+        warning: str | None = None,
+        chunk_chars: int = 1_800,
+        chunk_overlap: int = 180,
+    ) -> dict[str, Any]:
+        """Atomically replace an owned file's index with derived text."""
+
+        user_id = current_user_id()
+        with self.transaction(immediate=True) as conn:
+            record = self._persist_file_extracted_text_conn(
+                conn,
+                file_id,
+                text,
+                user_id=user_id,
+                source=source,
+                details=details,
+                warning=warning,
+                chunk_chars=chunk_chars,
+                chunk_overlap=chunk_overlap,
+            )
+        return record
+
+    def _merge_file_extracted_text_conn(
+        self,
+        conn: sqlite3.Connection,
+        file_id: str,
+        text: str,
+        *,
+        user_id: str,
+        source: str,
+        details: dict[str, Any] | None,
+        warning: str | None,
+        chunk_chars: int = 1_800,
+        chunk_overlap: int = 180,
+    ) -> dict[str, Any]:
+        """Append supplemental OCR chunks without discarding native PDF extraction."""
+
+        extraction_source = str(source or "").strip()
+        if not extraction_source:
+            raise ValueError("extraction source is required")
+        supplemental_chunks = self._extracted_text_chunks(
+            text,
+            chunk_chars=chunk_chars,
+            chunk_overlap=chunk_overlap,
+        )
+        file_record = conn.execute(
+            "SELECT * FROM files WHERE id = ? AND user_id = ?",
+            (file_id, user_id),
+        ).fetchone()
+        if file_record is None:
+            raise KeyError(file_id)
+        native_rows = conn.execute(
+            """
+            SELECT content FROM file_chunks
+            WHERE file_id = ? AND user_id = ?
+            ORDER BY position ASC, rowid ASC
+            """,
+            (file_id, user_id),
+        ).fetchall()
+        native_chunks = [str(row["content"]) for row in native_rows if str(row["content"]).strip()]
+        if not native_chunks:
+            return self._persist_file_extracted_text_conn(
+                conn,
+                file_id,
+                text,
+                user_id=user_id,
+                source=source,
+                details=details,
+                warning=warning,
+                chunk_chars=chunk_chars,
+                chunk_overlap=chunk_overlap,
+            )
+
+        def fingerprint(value: str) -> str:
+            return " ".join(value.casefold().split())
+
+        seen = {fingerprint(chunk) for chunk in native_chunks}
+        added_chunks: list[str] = []
+        for chunk in supplemental_chunks:
+            key = fingerprint(chunk)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            added_chunks.append(chunk)
+        combined_chunks = [*native_chunks, *added_chunks]
+
+        metadata_row = conn.execute(
+            """
+            SELECT source, details_json FROM file_index_metadata
+            WHERE file_id = ? AND user_id = ?
+            """,
+            (file_id, user_id),
+        ).fetchone()
+        native_source = str(metadata_row["source"]) if metadata_row else "native_extraction"
+        native_details = _loads(metadata_row["details_json"], {}) if metadata_row else {}
+        merged_source = f"{native_source}+{extraction_source}"[:120]
+        merged_details = {
+            **dict(details or {}),
+            "ocr_merge": {
+                "native_source": native_source,
+                "native_details": native_details,
+                "native_chunks_preserved": len(native_chunks),
+                "ocr_chunks_added": len(added_chunks),
+            },
+        }
+        warnings: list[str] = []
+        for item in (file_record["error"], warning):
+            clean = str(item or "").strip()
+            if clean and clean not in warnings:
+                warnings.append(clean)
+
+        now = utc_now()
+        self._replace_file_chunks(conn, file_id, combined_chunks, now=now)
+        conn.execute(
+            """
+            UPDATE files
+            SET status = 'indexed', error = ?, chunk_count = ?, updated_at = ?
+            WHERE id = ? AND user_id = ?
+            """,
+            (
+                "; ".join(warnings)[:4_000] or None,
+                len(combined_chunks),
+                now,
+                file_id,
+                user_id,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO file_index_metadata(
+                file_id, user_id, source, details_json, updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(file_id) DO UPDATE SET
+                user_id = excluded.user_id,
+                source = excluded.source,
+                details_json = excluded.details_json,
+                updated_at = excluded.updated_at
+            """,
+            (file_id, user_id, merged_source, _json(merged_details), now),
+        )
+        updated = conn.execute(
+            """
+            SELECT id, name, source_path, stored_path, mime_type, size, sha256,
+                   status, error, chunk_count, created_at, updated_at
+            FROM files WHERE id = ? AND user_id = ?
+            """,
+            (file_id, user_id),
+        ).fetchone()
+        if updated is None:
+            raise KeyError(file_id)
+        record = dict(updated)
+        record["index_source"] = merged_source
+        record["index_details"] = merged_details
+        return record
+
+    def merge_file_extracted_text(
+        self,
+        file_id: str,
+        text: str,
+        *,
+        source: str,
+        details: dict[str, Any] | None = None,
+        warning: str | None = None,
+        chunk_chars: int = 1_800,
+        chunk_overlap: int = 180,
+    ) -> dict[str, Any]:
+        """Atomically merge supplemental OCR text into an owned file index."""
+
+        user_id = current_user_id()
+        with self.transaction(immediate=True) as conn:
+            return self._merge_file_extracted_text_conn(
+                conn,
+                file_id,
+                text,
+                user_id=user_id,
+                source=source,
+                details=details,
+                warning=warning,
+                chunk_chars=chunk_chars,
+                chunk_overlap=chunk_overlap,
+            )
+
+    def get_file_index_metadata(self, file_id: str) -> dict[str, Any] | None:
+        """Return extraction provenance for one owned file."""
+
+        user_id = current_user_id()
+        with self._lock:
+            conn = self.connect()
+            self._require_owned_resource(
+                conn,
+                table="files",
+                resource_id=file_id,
+                user_id=user_id,
+            )
+            row = conn.execute(
+                """
+                SELECT file_id, source, details_json, updated_at
+                FROM file_index_metadata
+                WHERE file_id = ? AND user_id = ?
+                """,
+                (file_id, user_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "file_id": row["file_id"],
+            "source": row["source"],
+            "details": _loads(row["details_json"], {}),
+            "updated_at": row["updated_at"],
+        }
+
+    @staticmethod
+    def _decode_file_ocr_job(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+        item = dict(row)
+        item["result_metadata"] = _loads(item.pop("result_metadata_json", "{}"), {})
+        return item
+
+    def enqueue_file_ocr_job(
+        self,
+        file_id: str,
+        *,
+        reason: str,
+        max_attempts: int = 4,
+        max_generations: int = 3,
+        allow_existing_index: bool = False,
+        restart_failed: bool = False,
+    ) -> dict[str, Any] | None:
+        """Idempotently enqueue OCR, optionally restarting a verified failed generation."""
+
+        user_id = current_user_id()
+        now = utc_now()
+        with self.transaction(immediate=True) as conn:
+            self._require_owned_resource(
+                conn,
+                table="files",
+                resource_id=file_id,
+                user_id=user_id,
+            )
+            file_record = conn.execute(
+                """
+                SELECT status, chunk_count, sha256, stored_path, size
+                FROM files WHERE id = ? AND user_id = ?
+                """,
+                (file_id, user_id),
+            ).fetchone()
+            if file_record is None:
+                raise KeyError(file_id)
+            existing = conn.execute(
+                "SELECT * FROM file_ocr_jobs WHERE file_id = ? AND user_id = ?",
+                (file_id, user_id),
+            ).fetchone()
+            if existing is not None:
+                if not restart_failed or str(existing["status"]) != "failed":
+                    return self._decode_file_ocr_job(existing)
+                generation = int(existing["generation"])
+                generation_limit = int(existing["max_generations"])
+                if generation >= generation_limit:
+                    return self._decode_file_ocr_job(existing)
+                stored_path = Path(str(file_record["stored_path"]))
+                try:
+                    blob_verified = (
+                        stored_path.is_file()
+                        and stored_path.stat().st_size == int(file_record["size"])
+                        and _file_sha256(stored_path) == str(file_record["sha256"])
+                    )
+                except OSError:
+                    blob_verified = False
+                if not blob_verified:
+                    raise ValueError("OCR retry requires a verified source blob")
+                result_metadata = _loads(existing["result_metadata_json"], {})
+                retry_history = list(result_metadata.get("retry_history") or [])[-4:]
+                retry_history.append(
+                    {
+                        "generation": generation,
+                        "attempts": int(existing["attempt_count"]),
+                        "last_error": str(existing["last_error"] or "")[:1_000],
+                        "failed_at": str(existing["updated_at"]),
+                    }
+                )
+                conn.execute(
+                    """
+                    UPDATE file_ocr_jobs
+                    SET status = 'pending', reason = ?, source_sha256 = ?,
+                        attempt_count = 0, generation = generation + 1,
+                        available_at = ?, lease_token = NULL, lease_owner = NULL,
+                        lease_expires_at = NULL, completion_token = NULL,
+                        result_status = NULL, result_metadata_json = ?,
+                        last_error = NULL, updated_at = ?, completed_at = NULL
+                    WHERE id = ? AND user_id = ? AND status = 'failed'
+                      AND generation < max_generations
+                    """,
+                    (
+                        str(reason)[:240],
+                        str(file_record["sha256"]),
+                        now,
+                        _json(
+                            {
+                                "retry_history": retry_history,
+                                "retry_trigger": str(reason)[:240],
+                            }
+                        ),
+                        now,
+                        existing["id"],
+                        user_id,
+                    ),
+                )
+                restarted = conn.execute(
+                    "SELECT * FROM file_ocr_jobs WHERE id = ? AND user_id = ?",
+                    (existing["id"], user_id),
+                ).fetchone()
+                if restarted is None:
+                    raise KeyError(str(existing["id"]))
+                return self._decode_file_ocr_job(restarted)
+            if (
+                not allow_existing_index
+                and str(file_record["status"]) == "indexed"
+                and int(file_record["chunk_count"]) > 0
+            ):
+                return None
+            job_id = new_id("ocrjob")
+            conn.execute(
+                """
+                INSERT INTO file_ocr_jobs(
+                    id, user_id, file_id, status, reason, source_sha256,
+                    attempt_count, max_attempts, generation, max_generations,
+                    available_at, result_metadata_json, created_at, updated_at
+                ) VALUES (?, ?, ?, 'pending', ?, ?, 0, ?, 1, ?, ?, '{}', ?, ?)
+                """,
+                (
+                    job_id,
+                    user_id,
+                    file_id,
+                    str(reason)[:240],
+                    str(file_record["sha256"]),
+                    max(1, min(12, int(max_attempts))),
+                    max(1, min(5, int(max_generations))),
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            job = conn.execute(
+                "SELECT * FROM file_ocr_jobs WHERE id = ? AND user_id = ?",
+                (job_id, user_id),
+            ).fetchone()
+            if job is None:
+                raise KeyError(job_id)
+            return self._decode_file_ocr_job(job)
+
+    def retry_file_ocr_job(
+        self,
+        file_id: str,
+        *,
+        reason: str = "explicit_retry",
+    ) -> dict[str, Any] | None:
+        """Explicitly restart one terminal OCR generation after verifying its blob."""
+
+        return self.enqueue_file_ocr_job(
+            file_id,
+            reason=reason,
+            allow_existing_index=True,
+            restart_failed=True,
+        )
+
+    def get_file_ocr_job(self, job_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self.connect().execute(
+                "SELECT * FROM file_ocr_jobs WHERE id = ? AND user_id = ?",
+                (job_id, current_user_id()),
+            ).fetchone()
+        return self._decode_file_ocr_job(row) if row is not None else None
+
+    def get_file_ocr_job_for_file(self, file_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self.connect().execute(
+                "SELECT * FROM file_ocr_jobs WHERE file_id = ? AND user_id = ?",
+                (file_id, current_user_id()),
+            ).fetchone()
+        return self._decode_file_ocr_job(row) if row is not None else None
+
+    def claim_next_file_ocr_job(
+        self,
+        *,
+        worker_id: str,
+        lease_seconds: int = 300,
+        all_users: bool = False,
+    ) -> dict[str, Any] | None:
+        """Lease one ready OCR job; owner/system scope is required across tenants."""
+
+        if all_users:
+            self._require_system_scope("cross-tenant OCR queue claim")
+        worker = str(worker_id or "").strip()
+        if not worker:
+            raise ValueError("OCR worker_id is required")
+        now = utc_now()
+        now_dt = datetime.fromisoformat(now.replace("Z", "+00:00"))
+        expires_at = (
+            now_dt + timedelta(seconds=max(30, min(3_600, int(lease_seconds))))
+        ).isoformat()
+        token = new_id("ocrlease")
+        with self.transaction(immediate=True) as conn:
+            self._reconcile_file_ocr_jobs(conn)
+            user_clause = "" if all_users else "AND job.user_id = ?"
+            params: tuple[Any, ...] = (now,) if all_users else (now, current_user_id())
+            row = conn.execute(
+                f"""
+                SELECT job.id
+                FROM file_ocr_jobs job
+                JOIN files f ON f.id = job.file_id AND f.user_id = job.user_id
+                JOIN users u ON u.id = job.user_id AND u.status = 'active'
+                WHERE job.status IN ('pending', 'retry')
+                  AND job.available_at <= ?
+                  {user_clause}
+                ORDER BY job.available_at ASC, job.created_at ASC, job.rowid ASC
+                LIMIT 1
+                """,
+                params,
+            ).fetchone()
+            if row is None:
+                return None
+            cursor = conn.execute(
+                """
+                UPDATE file_ocr_jobs
+                SET status = 'leased', attempt_count = attempt_count + 1,
+                    lease_token = ?, lease_owner = ?, lease_expires_at = ?,
+                    updated_at = ?
+                WHERE id = ? AND status IN ('pending', 'retry')
+                """,
+                (token, worker[:160], expires_at, now, row["id"]),
+            )
+            if cursor.rowcount != 1:
+                return None
+            leased = conn.execute(
+                """
+                SELECT job.*, f.name AS file_name, f.stored_path, f.mime_type,
+                       f.size AS file_size, f.status AS file_status,
+                       f.chunk_count AS file_chunk_count
+                FROM file_ocr_jobs job
+                JOIN files f ON f.id = job.file_id AND f.user_id = job.user_id
+                WHERE job.id = ?
+                """,
+                (row["id"],),
+            ).fetchone()
+            if leased is None:
+                raise KeyError(str(row["id"]))
+            return self._decode_file_ocr_job(leased)
+
+    def fail_file_ocr_job(
+        self,
+        job_id: str,
+        lease_token: str,
+        error: str,
+        *,
+        retry_delay_seconds: int | None = None,
+    ) -> dict[str, Any]:
+        """Release a current lease to bounded retry/backoff without touching file text."""
+
+        user_id = current_user_id()
+        now = utc_now()
+        with self.transaction(immediate=True) as conn:
+            row = conn.execute(
+                "SELECT * FROM file_ocr_jobs WHERE id = ? AND user_id = ?",
+                (job_id, user_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(job_id)
+            if row["status"] != "leased" or row["lease_token"] != lease_token:
+                raise ValueError("OCR job lease is no longer current")
+            attempts = int(row["attempt_count"])
+            terminal = attempts >= int(row["max_attempts"])
+            delay = (
+                max(0, min(86_400, int(retry_delay_seconds)))
+                if retry_delay_seconds is not None
+                else min(3_600, 5 * (2 ** max(0, attempts - 1)))
+            )
+            now_dt = datetime.fromisoformat(now.replace("Z", "+00:00"))
+            available_at = (now_dt + timedelta(seconds=delay)).isoformat()
+            conn.execute(
+                """
+                UPDATE file_ocr_jobs
+                SET status = ?, available_at = ?, lease_token = NULL,
+                    lease_owner = NULL, lease_expires_at = NULL,
+                    last_error = ?, updated_at = ?
+                WHERE id = ? AND user_id = ? AND status = 'leased' AND lease_token = ?
+                """,
+                (
+                    "failed" if terminal else "retry",
+                    available_at,
+                    str(error)[:4_000],
+                    now,
+                    job_id,
+                    user_id,
+                    lease_token,
+                ),
+            )
+            updated = conn.execute(
+                "SELECT * FROM file_ocr_jobs WHERE id = ? AND user_id = ?",
+                (job_id, user_id),
+            ).fetchone()
+            if updated is None:
+                raise KeyError(job_id)
+            return self._decode_file_ocr_job(updated)
+
+    def complete_file_ocr_job(
+        self,
+        job_id: str,
+        lease_token: str,
+        text: str,
+        *,
+        source: str,
+        details: dict[str, Any] | None = None,
+        warning: str | None = None,
+    ) -> dict[str, Any]:
+        """Atomically persist OCR text and complete its lease, idempotently by token."""
+
+        user_id = current_user_id()
+        now = utc_now()
+        with self.transaction(immediate=True) as conn:
+            row = conn.execute(
+                "SELECT * FROM file_ocr_jobs WHERE id = ? AND user_id = ?",
+                (job_id, user_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(job_id)
+            if row["status"] == "completed" and row["completion_token"] == lease_token:
+                return self._decode_file_ocr_job(row)
+            if row["status"] != "leased" or row["lease_token"] != lease_token:
+                raise ValueError("OCR job lease is no longer current")
+            if str(row["lease_expires_at"] or "") <= now:
+                raise ValueError("OCR job lease expired before completion")
+            file_record = conn.execute(
+                "SELECT * FROM files WHERE id = ? AND user_id = ?",
+                (row["file_id"], user_id),
+            ).fetchone()
+            if file_record is None:
+                raise KeyError(str(row["file_id"]))
+            if str(file_record["sha256"]) != str(row["source_sha256"]):
+                raise ValueError("OCR source file changed after the job was queued")
+            source_path = Path(str(file_record["stored_path"]))
+            try:
+                source_verified = (
+                    source_path.is_file()
+                    and source_path.stat().st_size == int(file_record["size"])
+                    and _file_sha256(source_path) == str(row["source_sha256"])
+                )
+            except OSError:
+                source_verified = False
+            if not source_verified:
+                raise ValueError("OCR source blob failed content verification")
+            result_details = {
+                **_loads(row["result_metadata_json"], {}),
+                **dict(details or {}),
+                "ocr_job_id": job_id,
+                "attempt": int(row["attempt_count"]),
+                "generation": int(row["generation"]),
+            }
+            has_good_index = (
+                str(file_record["status"]) == "indexed"
+                and int(file_record["chunk_count"]) > 0
+            )
+            suffix = Path(str(file_record["name"] or "")).suffix.casefold()
+            mime_type = str(file_record["mime_type"] or "").casefold()
+            is_pdf = mime_type == "application/pdf" or suffix == ".pdf"
+            if has_good_index and is_pdf:
+                self._merge_file_extracted_text_conn(
+                    conn,
+                    str(row["file_id"]),
+                    text,
+                    user_id=user_id,
+                    source=source,
+                    details=result_details,
+                    warning=warning,
+                )
+                result_status = "augmented_existing_index"
+            elif has_good_index:
+                result_status = "skipped_existing_index"
+            else:
+                self._persist_file_extracted_text_conn(
+                    conn,
+                    str(row["file_id"]),
+                    text,
+                    user_id=user_id,
+                    source=source,
+                    details=result_details,
+                    warning=warning,
+                )
+                result_status = "indexed"
+            conn.execute(
+                """
+                UPDATE file_ocr_jobs
+                SET status = 'completed', lease_token = NULL, lease_owner = NULL,
+                    lease_expires_at = NULL, completion_token = ?, result_status = ?,
+                    result_metadata_json = ?, last_error = NULL,
+                    updated_at = ?, completed_at = ?
+                WHERE id = ? AND user_id = ? AND status = 'leased'
+                """,
+                (
+                    lease_token,
+                    result_status,
+                    _json(result_details),
+                    now,
+                    now,
+                    job_id,
+                    user_id,
+                ),
+            )
+            updated = conn.execute(
+                "SELECT * FROM file_ocr_jobs WHERE id = ? AND user_id = ?",
+                (job_id, user_id),
+            ).fetchone()
+            if updated is None:
+                raise KeyError(job_id)
+            return self._decode_file_ocr_job(updated)
+
     def add_file_chunks(
         self,
         file_id: str,
@@ -3831,34 +6007,38 @@ class JarvisStorage:
         now = utc_now()
         with self._lock:
             conn = self.connect()
-            self._require_owned_resource(conn, table="files", resource_id=file_id)
-            self._replace_file_chunks(conn, file_id, chunks, now=now)
-            if status is None:
-                conn.execute(
-                    """
-                    UPDATE files
-                    SET chunk_count = ?, updated_at = ?
-                    WHERE id = ? AND user_id = ?
-                    """,
-                    (len(chunks), now, file_id, current_user_id()),
-                )
-            else:
-                conn.execute(
-                    """
-                    UPDATE files
-                    SET chunk_count = ?, status = ?, error = ?, updated_at = ?
-                    WHERE id = ? AND user_id = ?
-                    """,
-                    (
-                        len(chunks),
-                        status[:40],
-                        error,
-                        now,
-                        file_id,
-                        current_user_id(),
-                    ),
-                )
-            conn.commit()
+            try:
+                self._require_owned_resource(conn, table="files", resource_id=file_id)
+                self._replace_file_chunks(conn, file_id, chunks, now=now)
+                if status is None:
+                    conn.execute(
+                        """
+                        UPDATE files
+                        SET chunk_count = ?, updated_at = ?
+                        WHERE id = ? AND user_id = ?
+                        """,
+                        (len(chunks), now, file_id, current_user_id()),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE files
+                        SET chunk_count = ?, status = ?, error = ?, updated_at = ?
+                        WHERE id = ? AND user_id = ?
+                        """,
+                        (
+                            len(chunks),
+                            status[:40],
+                            error,
+                            now,
+                            file_id,
+                            current_user_id(),
+                        ),
+                    )
+                conn.commit()
+            except BaseException:  # chunks and metadata are one transaction
+                conn.rollback()
+                raise
 
     def reindex_file(
         self,
@@ -3874,6 +6054,12 @@ class JarvisStorage:
         source_path: Path | None = None,
     ) -> dict[str, Any] | None:
         """Atomically replace a legacy file's metadata and searchable index."""
+
+        normalized_status = str(status).strip().casefold()
+        if normalized_status not in {"indexed", "stored", "failed"}:
+            raise ValueError("file index status must be indexed, stored, or failed")
+        if (normalized_status == "indexed") != bool(chunks):
+            raise ValueError("indexed status requires chunks; non-indexed status forbids chunks")
 
         now = utc_now()
         with self._lock:
@@ -3895,15 +6081,15 @@ class JarvisStorage:
                         mime_type[:120],
                         int(size),
                         len(chunks),
-                        status[:40],
-                        error,
+                        normalized_status,
+                        str(error)[:4_000] if error else None,
                         now,
                         file_id,
                         current_user_id(),
                     ),
                 )
                 conn.commit()
-            except Exception:  # noqa: BLE001 - transaction must roll back on any failure
+            except BaseException:  # transaction must roll back on any failure
                 conn.rollback()
                 raise
         return self.get_file(file_id)
@@ -3917,9 +6103,7 @@ class JarvisStorage:
         now: str,
     ) -> None:
         user_id = current_user_id()
-        self._require_owned_resource(
-            conn, table="files", resource_id=file_id, user_id=user_id
-        )
+        self._require_owned_resource(conn, table="files", resource_id=file_id, user_id=user_id)
         conn.execute(
             "DELETE FROM file_chunks WHERE file_id = ? AND user_id = ?",
             (file_id, user_id),
@@ -4171,68 +6355,111 @@ class JarvisStorage:
         return [dict(row) for row in rows]
 
     def search_file_chunks(self, query: str, limit: int = 20) -> list[dict[str, Any]]:
-        if query and self._file_fts_available:
-            match = _fts_query(query)
-            if match:
-                try:
-                    with self._lock:
-                        rows = self.connect().execute(
-                            """
-                            SELECT
-                                f.id AS file_id,
-                                f.name AS file_name,
-                                c.id AS chunk_id,
-                                c.position,
-                                c.content,
-                                c.created_at,
-                                bm25(file_chunks_fts) AS rank
-                            FROM file_chunks_fts
-                            JOIN file_chunks c
-                              ON c.id = file_chunks_fts.chunk_id
-                             AND c.user_id = file_chunks_fts.user_id
-                            JOIN files f ON f.id = c.file_id AND f.user_id = c.user_id
-                            WHERE file_chunks_fts MATCH ?
-                              AND file_chunks_fts.user_id = ?
-                              AND c.user_id = ?
-                              AND f.user_id = ?
-                            ORDER BY rank ASC, c.position ASC
-                            LIMIT ?
-                            """,
-                            (
-                                match,
-                                current_user_id(),
-                                current_user_id(),
-                                current_user_id(),
-                                limit,
-                            ),
-                        ).fetchall()
-                    return [_decorate_file_hit(dict(row), query) for row in rows]
-                except sqlite3.OperationalError as exc:
-                    if not _recoverable_fts_error(exc):
-                        raise
+        clean_query = " ".join(str(query or "").split()).strip()
+        requested_limit = max(0, int(limit))
+        if not clean_query or requested_limit == 0:
+            return []
+        user_id = current_user_id()
+        terms = _query_terms(clean_query, limit=8)
+        folded_terms = [_unicode_search_fold(term) for term in terms]
+        fts_terms = [term for term in terms if len(_unicode_search_fold(term)) >= 3]
+        seen_ids: set[str] = set()
+        results: list[dict[str, Any]] = []
 
-        like = f"%{query}%"
-        with self._lock:
-            rows = self.connect().execute(
-                """
-                SELECT
-                    f.id AS file_id,
-                    f.name AS file_name,
-                    c.id AS chunk_id,
-                    c.position,
-                    c.content,
-                    c.created_at,
-                    NULL AS rank
-                FROM file_chunks c
-                JOIN files f ON f.id = c.file_id AND f.user_id = c.user_id
-                WHERE c.user_id = ? AND f.user_id = ?
-                  AND (c.content LIKE ? OR f.name LIKE ?)
-                ORDER BY f.updated_at DESC, c.position ASC
-                LIMIT ?
-                """,
-                (current_user_id(), current_user_id(), like, like, limit),
-            ).fetchall()
-        return [_decorate_file_hit(dict(row), query) for row in rows]
+        def add_rows(rows: Iterable[sqlite3.Row]) -> None:
+            for row in rows:
+                item = dict(row)
+                chunk_id = str(item.get("chunk_id") or "")
+                if not chunk_id or chunk_id in seen_ids:
+                    continue
+                seen_ids.add(chunk_id)
+                results.append(_decorate_file_hit(item, clean_query))
+
+        fts_returned = False
+        if self._file_fts_available and fts_terms:
+            match = " OR ".join(f'"{term}"' for term in fts_terms)
+            try:
+                with self._lock:
+                    rows = self.connect().execute(
+                        """
+                        SELECT
+                            f.id AS file_id,
+                            f.name AS file_name,
+                            c.id AS chunk_id,
+                            c.position,
+                            c.content,
+                            c.created_at,
+                            bm25(file_chunks_fts) AS rank
+                        FROM file_chunks_fts
+                        JOIN file_chunks c
+                          ON c.id = file_chunks_fts.chunk_id
+                         AND c.user_id = file_chunks_fts.user_id
+                        JOIN files f ON f.id = c.file_id AND f.user_id = c.user_id
+                        WHERE file_chunks_fts MATCH ?
+                          AND file_chunks_fts.user_id = ?
+                          AND c.user_id = ?
+                          AND f.user_id = ?
+                        ORDER BY rank ASC, c.position ASC
+                        LIMIT ?
+                        """,
+                        (
+                            match,
+                            user_id,
+                            user_id,
+                            user_id,
+                            min(500, max(requested_limit * 4, requested_limit)),
+                        ),
+                    ).fetchall()
+                add_rows(rows)
+                fts_returned = bool(rows)
+            except sqlite3.OperationalError as exc:
+                if not _recoverable_fts_error(exc):
+                    raise
+
+        content_terms = [term for term in folded_terms if term and len(term) < 3]
+        if not self._file_fts_available or not fts_returned:
+            content_terms.extend(folded_terms)
+            content_terms.append(_unicode_search_fold(clean_query))
+        content_terms = list(dict.fromkeys(term for term in content_terms if term))
+        name_terms = list(
+            dict.fromkeys(
+                term
+                for term in [*folded_terms, _unicode_search_fold(clean_query)]
+                if term
+            )
+        )
+        clauses: list[str] = []
+        literal_params: list[Any] = [user_id, user_id]
+        for term in content_terms:
+            clauses.append("instr(jarvis_search_fold(c.content), ?) > 0")
+            literal_params.append(term)
+        for term in name_terms:
+            clauses.append("instr(jarvis_search_fold(f.name), ?) > 0")
+            literal_params.append(term)
+        if clauses:
+            literal_params.append(min(500, max(requested_limit * 8, requested_limit)))
+            with self._lock:
+                rows = self.connect().execute(
+                    f"""
+                    SELECT
+                        f.id AS file_id,
+                        f.name AS file_name,
+                        c.id AS chunk_id,
+                        c.position,
+                        c.content,
+                        c.created_at,
+                        NULL AS rank
+                    FROM file_chunks c
+                    JOIN files f ON f.id = c.file_id AND f.user_id = c.user_id
+                    WHERE c.user_id = ? AND f.user_id = ?
+                      AND ({" OR ".join(clauses)})
+                    ORDER BY f.updated_at DESC, c.position ASC
+                    LIMIT ?
+                    """,
+                    tuple(literal_params),
+                ).fetchall()
+            add_rows(rows)
+        return results[:requested_limit]
 
     def recent_file_chunks(self, limit: int = 20) -> list[dict[str, Any]]:
         """Chunks of the most recently updated files, as a semantic fallback pool.
@@ -5134,6 +7361,12 @@ CREATE TABLE IF NOT EXISTS runtime_kv (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS fts_index_metadata (
+    name TEXT PRIMARY KEY,
+    schema_version TEXT NOT NULL,
+    rebuilt_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS runtime_events (
     id TEXT PRIMARY KEY,
     ts TEXT NOT NULL,
@@ -5246,6 +7479,66 @@ CREATE TABLE IF NOT EXISTS file_chunks (
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT
 );
 
+CREATE TABLE IF NOT EXISTS file_ingest_claims (
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    sha256 TEXT NOT NULL,
+    file_id TEXT NOT NULL UNIQUE REFERENCES files(id) ON DELETE CASCADE,
+    claimed_at TEXT NOT NULL,
+    PRIMARY KEY(user_id, sha256)
+);
+
+CREATE TABLE IF NOT EXISTS file_index_metadata (
+    file_id TEXT PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    source TEXT NOT NULL,
+    details_json TEXT NOT NULL DEFAULT '{}',
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS file_upload_intents (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK(status IN ('receiving', 'ready', 'claimed', 'committed', 'failed')),
+    name TEXT NOT NULL,
+    source_path TEXT,
+    part_path TEXT NOT NULL,
+    ready_path TEXT NOT NULL,
+    final_path TEXT,
+    mime_type TEXT NOT NULL,
+    size INTEGER NOT NULL DEFAULT 0,
+    sha256 TEXT NOT NULL DEFAULT '',
+    file_id TEXT REFERENCES files(id) ON DELETE SET NULL,
+    created_file INTEGER NOT NULL DEFAULT 0,
+    error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    committed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS file_ocr_jobs (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    file_id TEXT NOT NULL UNIQUE REFERENCES files(id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK(status IN ('pending', 'leased', 'retry', 'completed', 'failed')),
+    reason TEXT NOT NULL,
+    source_sha256 TEXT NOT NULL,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 4,
+    generation INTEGER NOT NULL DEFAULT 1,
+    max_generations INTEGER NOT NULL DEFAULT 3,
+    available_at TEXT NOT NULL,
+    lease_token TEXT,
+    lease_owner TEXT,
+    lease_expires_at TEXT,
+    completion_token TEXT,
+    result_status TEXT,
+    result_metadata_json TEXT NOT NULL DEFAULT '{}',
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS health_snapshots (
     id TEXT PRIMARY KEY,
     ts TEXT NOT NULL,
@@ -5323,6 +7616,16 @@ CREATE INDEX IF NOT EXISTS idx_reminders_conversation ON reminders(conversation_
 CREATE INDEX IF NOT EXISTS idx_files_sha256 ON files(sha256);
 CREATE INDEX IF NOT EXISTS idx_files_updated ON files(updated_at);
 CREATE INDEX IF NOT EXISTS idx_file_chunks_file ON file_chunks(file_id, position);
+CREATE INDEX IF NOT EXISTS idx_file_ingest_claims_file ON file_ingest_claims(file_id);
+CREATE INDEX IF NOT EXISTS idx_file_index_metadata_user ON file_index_metadata(user_id);
+CREATE INDEX IF NOT EXISTS idx_file_upload_intents_status
+ON file_upload_intents(status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_file_upload_intents_user
+ON file_upload_intents(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_file_ocr_jobs_ready
+ON file_ocr_jobs(status, available_at, created_at);
+CREATE INDEX IF NOT EXISTS idx_file_ocr_jobs_user
+ON file_ocr_jobs(user_id, status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_health_component ON health_snapshots(component, ts);
 CREATE INDEX IF NOT EXISTS idx_tool_runs_ts ON tool_runs(ts);
 CREATE INDEX IF NOT EXISTS idx_tool_runs_mission ON tool_runs(mission_id, task_id);
@@ -5339,10 +7642,14 @@ CREATE INDEX IF NOT EXISTS idx_audit_log_ts ON audit_log(ts);
 
 def _migrate_messenger_schema(conn: sqlite3.Connection) -> None:
     for stmt in _MESSENGER_MIGRATIONS:
-        try:
+        with suppress(sqlite3.OperationalError):
             conn.execute(stmt)
-        except sqlite3.OperationalError:
-            pass  # column already exists
+
+
+def _migrate_file_reliability_schema(conn: sqlite3.Connection) -> None:
+    for stmt in _FILE_RELIABILITY_MIGRATIONS:
+        with suppress(sqlite3.OperationalError):
+            conn.execute(stmt)
 
 
 _MESSENGER_MIGRATIONS = [
@@ -5354,4 +7661,10 @@ _MESSENGER_MIGRATIONS = [
     "ALTER TABLE messages ADD COLUMN edited_at TEXT",
     "ALTER TABLE messages ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE messages ADD COLUMN reply_to_message_id TEXT",
+]
+
+
+_FILE_RELIABILITY_MIGRATIONS = [
+    "ALTER TABLE file_ocr_jobs ADD COLUMN generation INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE file_ocr_jobs ADD COLUMN max_generations INTEGER NOT NULL DEFAULT 3",
 ]

@@ -71,6 +71,10 @@ The IAM tables are stored in the same SQLite database as the current runtime:
 | `telegram_realms` | Persistent one-to-one binding between a canonical realm and immutable bot ID. |
 | `telegram_updates` | Telegram replay ledger keyed by bot realm/update with bounded attempts and CAS lease tokens. |
 | `telegram_owner_invitations` | Hashed, expiring, single-use owner invitations and their immutable claimant identity. |
+| `telegram_sources` | Tenant-scoped public-channel subscriptions keyed by canonical bot realm and immutable chat ID. |
+| `telegram_source_posts` | Normalized, versioned channel posts with timestamps, hashes, scripts, and provenance. |
+| `telegram_source_audit` | Hashed-query audit for source registration, search, and analysis. |
+| `material_access_audit` | Hashed-scope/query audit for privileged cross-user reads and searches. |
 | `ingress_rate_limits` | Hashed per-principal/global fixed-window ingress budgets. |
 | `iam_migrations` | Idempotent schema and capability-catalog migration markers. |
 
@@ -137,6 +141,35 @@ built-in default review, a policy-enforcement check before side effects, and tes
 allow and deny paths. A low tool danger label is not evidence of tenant isolation; only the
 small `TENANT_SAFE_TOOL_SECURITY_IDS` allowlist is seeded for ordinary users.
 
+## Privileged account and material access
+
+Canonical conversations, messages, memories, files, and file chunks remain tenant-bound.
+Cross-user reads exist only through the explicit `accounts.overview` and
+`materials.search/read/summarize` tools. Every one has a persisted
+`required_presets = [owner, admin]` floor. Direct grants and custom presets cannot bypass
+that floor, and each handler rechecks the requester's current active database role before
+reading another tenant.
+
+The caller must select an exact internal `user_id`, an immutable
+`provider + realm_id + provider_subject_id`, or explicitly request all active users. A
+username is display metadata: an ambiguous username fails closed. Results omit storage
+paths and credentials, retain account/source/timestamp provenance, and use stable
+`message:`, `memory:`, or `document:` citations. Model synthesis is accepted only when its
+citations belong to the supplied evidence. After one failed correction, the invalid draft
+remains hidden and the tool returns a bounded deterministic evidence digest with exact
+citations; if even that contract cannot be satisfied, the tool fails closed.
+
+`material_access_audit` stores the requester, action, result count, and SHA-256 digests of
+the target scope and query. It does not store the raw query. Retrieved user material is
+untrusted evidence and cannot grant capabilities or supply executable instructions.
+Privileged tool runs persist metadata only. A live role check runs again after embeddings or
+LLM synthesis and immediately before result delivery. Assistant turns derived from these
+tools are marked privileged; demotion hides both those turns and derived compacted memories
+from chat history, replay, and recall.
+Non-owner/admin prompts receive a reduced account-aware system context, never host paths,
+model endpoints, or the privileged tool catalog. Clear requests for other users' material
+or Jarvis internals are denied deterministically before model execution.
+
 ## Telegram identity and sessions
 
 The Telegram bridge accepts only messages where the sender is a real user, the chat is
@@ -175,9 +208,13 @@ newer result or publish its session. The bridge persists accepted updates before
 Telegram's polling offset, isolates conversation bindings by bot realm, and retries the same
 transport request ID idempotently after a crash. Ordinary HTTP/payload failures use 2/10-second
 backoff and stop after three attempts. A transport failure, or a backend `503` explicitly marked
-`X-Jarvis-Retry-Class: llm-outage`, uses 2/10/30/60/300-second backoff for at most 288 attempts
-and 24 hours. An exhausted outage row remains durable for diagnosis but stops blocking later
-updates from the same chat; an unmarked `5xx` never receives the extended budget.
+`X-Jarvis-Retry-Class: llm-outage`, uses bounded 2/10/30/60/300-second backoff without an
+age/attempt tombstone. The earliest transient update remains durable and ordered ahead of later
+updates from the same chat until it succeeds; stable request IDs make every retry idempotent.
+An unmarked `5xx` never receives this extended retry contract. If Telegram or the backend
+permanently rejects an attachment, its safe filename/type/size/failure provenance still enters
+canonical chat ingress as a searchable delivery record. File contents are explicitly marked
+unavailable and are never claimed as analyzed.
 
 `TELEGRAM_ALLOWED_CHAT_IDS` is an optional deployment restriction; an empty value allows
 every valid private Telegram user to register. `TELEGRAM_OWNER_CHAT_IDS` is compatibility
@@ -208,6 +245,39 @@ Required transport controls:
   cannot serialize every other user's turn or grow an unbounded in-memory backlog.
 - Never identify or authorize a user by Telegram username, name, chat title, or forwarded
   message metadata.
+
+### Telegram public-source feeds and voice delivery
+
+Owner/admin accounts can use `telegram.sources.add/list/remove/sync/search/analyze` to keep
+a separate tenant-scoped corpus of public channel posts. Registration uses the canonical
+bot realm and immutable negative channel `chat.id`; a username is only a display/permalink
+snapshot. The bot must already be present in the channel. `channel_post` and
+`edited_channel_post` updates are normalized and committed before the polling offset is
+acknowledged. Replays and edit versions are idempotent, and search uses Unicode
+NFKC/casefold plus explicit/default RU/EN/ZH/KO/JA query variants.
+
+The Bot API tier consumes new posts delivered to the bot. It cannot follow arbitrary
+personal accounts, read private history, resolve username-only subscriptions reliably, or
+backfill history. A separate `TelegramAuthorizedReader` adapter may import history and media
+metadata from public/private channels and supergroups after operator-side account authorization;
+Jarvis tools never accept that account's credentials. Pages are bounded to 500 posts, committed
+separately, and continued through a durable `before_message_id` checkpoint, so a crash or
+provider outage does not truncate a large backfill. The adapter is bound to one immutable hashed
+reader identity. Production can connect an already authenticated external CLI through
+`JARVIS_TELEGRAM_READER_COMMAND_JSON` (JSON argv, absolute executable) using protocol
+`jarvis.telegram-reader.v1`; the child receives no Jarvis tokens and owns its session itself.
+If no such authenticated reader exists, capability/sync reports `unconfigured` rather than
+pretending that history was imported.
+Personal-account monitoring remains forbidden on both tiers.
+
+Telegram voice preference is stored against the authenticated immutable user. `/voice on`
+forces voice delivery for text replies and `/voice auto` mirrors direct voice/audio input;
+forwarded voice remains text in auto mode. Explicit RU/EN/ZH/KO/JA requests for a voice
+answer are honored. Long replies are split into numbered TTS parts. Header-only/unplayable
+WAV output is rejected. If Telegram privacy forbids voice notes with
+`VOICE_MESSAGES_FORBIDDEN`, the bridge retries the same speech through `sendAudio`; a TTS or
+delivery failure is logged without answer text or secrets and falls back to the complete text
+with an explicit notice.
 
 ## Administration API and UI
 

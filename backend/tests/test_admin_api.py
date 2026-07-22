@@ -549,7 +549,100 @@ def test_telegram_registration_creates_scoped_session_and_denies_admin(client):
             """,
             (registered["user"]["id"],),
         ).fetchone()
-    assert dict(decision) == {"effect": "deny", "reason_code": "not_granted"}
+    assert dict(decision) == {
+        "effect": "deny",
+        "reason_code": "preset_not_eligible",
+    }
+
+
+def test_account_catalog_routes_require_owner_or_admin_after_direct_grants_and_demotion(
+    client,
+):
+    service = app.state.authorization
+    routes = {
+        "admin.users.list": "/api/admin/users",
+        "admin.security_ids.list": "/api/admin/security-ids",
+        "admin.presets.list": "/api/admin/presets",
+    }
+    identity = service.upsert_external_identity(
+        provider="test",
+        realm_id="account-catalog-floor",
+        provider_subject_id="moderator-with-direct-grants",
+        bootstrap_preset="moderator",
+    )
+    user_id = str(identity["user_id"])
+    for security_id in routes:
+        result = service.set_user_permission(
+            user_id=user_id,
+            security_id=security_id,
+            effect="grant",
+            can_delegate=False,
+            granted_by=LEGACY_OWNER_USER_ID,
+            reason="direct grant must remain below the hard role floor",
+        )
+        assert result["effect"] == "deny"
+        assert result["reason_code"] == "preset_not_eligible"
+
+    catalog = {
+        item["security_id"]: item for item in service.list_security_ids()
+    }
+    for security_id in routes:
+        assert catalog[security_id]["required_presets"] == ["admin", "owner"]
+
+    moderator_session = service.create_user_session(
+        user_id=user_id,
+        identity_id=str(identity["identity_id"]),
+        auth_method="test",
+    )
+    moderator_headers = {
+        "X-Jarvis-User-Session": str(moderator_session["session_token"])
+    }
+    for security_id, path in routes.items():
+        denied = client.get(path, headers=moderator_headers)
+        assert denied.status_code == 403, denied.text
+        assert denied.json()["detail"] == {
+            "error": "permission_denied",
+            "security_id": security_id,
+            "reason": "preset_not_eligible",
+            "decision_id": denied.json()["detail"]["decision_id"],
+        }
+
+    service.assign_preset(
+        user_id=user_id,
+        preset_key="admin",
+        assigned_by=LEGACY_OWNER_USER_ID,
+        reason="verify the eligible role can use the account catalog",
+    )
+    admin_session = service.create_user_session(
+        user_id=user_id,
+        identity_id=str(identity["identity_id"]),
+        auth_method="test",
+    )
+    admin_headers = {"X-Jarvis-User-Session": str(admin_session["session_token"])}
+    for path in routes.values():
+        allowed = client.get(path, headers=admin_headers)
+        assert allowed.status_code == 200, allowed.text
+
+    service.assign_preset(
+        user_id=user_id,
+        preset_key="user",
+        assigned_by=LEGACY_OWNER_USER_ID,
+        reason="demotion must revoke catalog access immediately",
+    )
+    assert client.get("/api/admin/users", headers=admin_headers).status_code == 401
+    demoted_session = service.create_user_session(
+        user_id=user_id,
+        identity_id=str(identity["identity_id"]),
+        auth_method="test",
+    )
+    demoted_headers = {
+        "X-Jarvis-User-Session": str(demoted_session["session_token"])
+    }
+    for security_id, path in routes.items():
+        denied = client.get(path, headers=demoted_headers)
+        assert denied.status_code == 403, denied.text
+        assert denied.json()["detail"]["security_id"] == security_id
+        assert denied.json()["detail"]["reason"] == "preset_not_eligible"
 
 
 def test_one_time_owner_invitation_claims_immutable_telegram_identity(client):
@@ -1128,6 +1221,40 @@ def test_admin_delete_permanently_purges_user_and_allows_clean_registration(clie
     assert replacement["user"]["preset_key"] == "guest"
     replacement_headers = {"X-Jarvis-User-Session": replacement["session_token"]}
     assert client.get("/api/conversations", headers=replacement_headers).json() == []
+
+
+def test_delete_user_purges_requester_material_access_audit(client):
+    service = app.state.authorization
+    identity = service.upsert_external_identity(
+        provider="test",
+        realm_id="material-audit-deletion",
+        provider_subject_id="admin-requester",
+        bootstrap_preset="admin",
+    )
+    user_id = str(identity["user_id"])
+    actor = service.actor_for_user(user_id, source="material-audit-deletion")
+    assert actor is not None
+
+    app.state.agent.tools.material_access.accounts(actor, limit=5)
+    with app.state.storage.locked_connection() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM material_access_audit WHERE requester_user_id = ?",
+            (user_id,),
+        ).fetchone()[0] == 1
+
+    deleted = service.delete_user(
+        user_id=user_id,
+        reason="privacy deletion must include privileged material access history",
+    )
+
+    assert deleted["ok"] is True
+    assert deleted["deleted_counts"]["material_access_audit"] == 1
+    with app.state.storage.locked_connection() as conn:
+        assert conn.execute("SELECT 1 FROM users WHERE id = ?", (user_id,)).fetchone() is None
+        assert conn.execute(
+            "SELECT 1 FROM material_access_audit WHERE requester_user_id = ?",
+            (user_id,),
+        ).fetchone() is None
 
 
 def test_admin_delete_rejects_owner_accounts(client):

@@ -1,5 +1,74 @@
 # Runtime
 
+## 2026-07-22 handoff - durable multilingual memory and account-aware retrieval
+
+- Chat ingress is written to canonical `messages` before transcription, retrieval,
+  planning, tools, or LLM I/O. Failed turns therefore remain searchable with
+  `ingress_status=accepted`; successful turns become `processed`. Service-mode and model
+  overload replies use the same durable, request-idempotent turn contract.
+- `messages_fts`, `memories_fts`, and `file_chunks_fts` use FTS5 trigram tokenization when
+  available, with Unicode literal fallback for short terms. Message lookup covers the
+  complete tenant history instead of a recent window and excludes the current persisted
+  turn from its own recall. RU/EN/ZH/KO/JA migration, edit/delete triggers, restart, and
+  tenant-isolation cases are covered. Schema markers prevent a full FTS rebuild on every
+  startup; rebuilds run only for a real tokenizer/schema migration.
+- File ingestion claims a content hash before extraction and commits chunks, status,
+  count, error, and provenance atomically. Startup fails interrupted indexes closed while
+  retaining uploaded bytes for retry. Every PDF receives a bounded completeness OCR pass;
+  native text is preserved and OCR text is appended atomically with page/truncation
+  provenance. Failed jobs can start at most three hash-verified retry generations, and a
+  corrupt managed blob is healed only by reuploading bytes with the canonical hash.
+  Generated documents use the same claim/reindex protocol.
+- `accounts.overview` and `materials.search/read/summarize` are owner/admin-only even under
+  direct grants or custom presets. They support exact immutable account selection,
+  fair per-account hybrid lexical/semantic retrieval, multilingual query variants,
+  full-corpus keyset-paged semantic scanning, provenance, hashed access audit, full-source
+  synthesis, and claim-level validated citations. Partial document/OCR indexes carry
+  sanitized completeness warnings into both API output and model evidence. Tool history is
+  metadata-only. If model prose still fails citation validation after correction, Jarvis
+  returns a deterministic, bounded evidence digest with exact citations instead of an
+  intermittent empty failure or the invalid draft. If the requester is demoted while retrieval or
+  synthesis is running, the result is withheld; previously generated privileged assistant
+  turns and compacted memories also disappear from normal-user recall.
+  Ordinary accounts receive a reduced system context and deterministic denial for clear
+  cross-user material or Jarvis-internal requests.
+- Public web search defaults to the global `wt-wt` region and accepts `languages` /
+  `translated_queries` for RU, EN, ZH, KO, and JA round-robin research. Explicit language
+  sets use independent regional requests and do not reuse another language corpus cache.
+  Every response exposes requested/covered/missing language status; partial coverage stays
+  explicit and failed/partial runs cannot poison a later complete-result cache entry.
+- Telegram channel/supergroup feeds have durable owner/admin registration, live
+  `channel_post`/edit ingestion before offset acknowledgement, RU/EN/ZH/KO/JA query variants,
+  Unicode search, and bounded provenance-preserving analysis. The Bot API tier covers future
+  posts delivered to the bot. Authorized-reader history uses durable `before_message_id`
+  checkpoints and resumes after failure beyond 500 posts. An optional JSON-over-stdio adapter
+  can use an already authenticated external CLI without passing Jarvis secrets or accepting
+  Telegram credentials in tools. Personal-account monitoring remains forbidden; an absent
+  external session reports `unconfigured` instead of claiming success. Private-chat transient
+  backend failures remain durably ordered and retry with bounded backoff without a 24-hour
+  tombstone; permanently rejected attachments still create a searchable delivery record.
+- Telegram `/voice on` is persistent and forces voice replies; `/voice auto` mirrors direct
+  voice/audio. RU/EN/ZH/KO/JA explicit voice requests are recognized, long output is split,
+  successful multipart delivery is logged without answer text, and header-only/unplayable WAV
+  renders are rejected. Telegram's per-recipient `VOICE_MESSAGES_FORBIDDEN` response retries
+  the same speech as ordinary audio; other synthesis/delivery failures fall back to complete
+  text with an explicit notice.
+
+Current safety bounds remain deliberate: uploads are capped at 50 MiB, automatic plain-text
+indexing at 5 MiB, structured extraction at 200k characters, OCR at 30 PDF pages processed
+one at a time with 8M pixels / 8192 px / 16 MiB PNG per page, and legacy `.doc`/`.xls`
+requires conversion. Stored-but-unindexed files remain
+discoverable by metadata and report an actionable status; Jarvis must not claim content
+searchability until conversion/OCR/reindex succeeds.
+
+To connect an existing authenticated Telegram history CLI, set
+`JARVIS_TELEGRAM_READER_COMMAND_JSON` to a JSON argv array whose first item is an absolute
+executable path. The command implements protocol `jarvis.telegram-reader.v1` on stdin/stdout;
+Jarvis invokes it without a shell and passes only a minimal OS environment. The executable
+must own and protect its session itself. `JARVIS_TELEGRAM_READER_TIMEOUT_SEC` is bounded to
+2-300 seconds. Without this command and its pre-existing authenticated session, private/history
+capability remains unavailable while Bot API live-channel subscriptions continue to work.
+
 ## 2026-07-10 handoff - web answer bugfix
 
 For the operator and the second model:

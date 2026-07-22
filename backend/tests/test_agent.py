@@ -8,6 +8,7 @@ from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from threading import Barrier
+from typing import Any
 
 import pytest
 from jarvis_gpt.agent import (
@@ -2053,7 +2054,10 @@ def test_agent_routes_same_turn_docx_attachment_to_document_memory(monkeypatch, 
 
     assert user_message["metadata"]["task_kernel"]["intent"] == "document_memory"
     assert record["id"] in rendered_prompt
-    assert "Answer ONLY from these files" in rendered_prompt or "documents.recall" in rendered_prompt
+    assert (
+        "Answer ONLY from these files" in rendered_prompt
+        or "documents.recall" in rendered_prompt
+    )
     assert any(
         event.payload.get("tool") == "documents.recall"
         and event.payload.get("prefetch") is True
@@ -2890,14 +2894,19 @@ def test_agent_returns_bounded_top_process_snapshot(monkeypatch, tmp_path):
     response = asyncio.run(agent.chat("покажи топ 3 процессов по памяти"))
 
     run = _operator_tool_run(storage, "system.inspect")
-    assert run["arguments"] == {
+    assert run["arguments"]["protocol"] == "jarvis.tool-history.metadata-only.v1"
+    assert run["arguments"]["content_omitted"] is True
+    assert len(run["arguments"]["arguments_sha256"]) == 64
+    assert captured == {
         "action": "process.top",
         "payload": {"limit": 3, "sort": "memory"},
         "timeout_sec": 30,
     }
-    assert captured["action"] == "process.top"
     assert "first" in response.answer
     assert "third" in response.answer
+    persisted = storage.get_message(response.message_id)
+    assert persisted["metadata"]["privileged_derived"] is True
+    assert persisted["metadata"]["required_presets"] == ["owner", "admin"]
     storage.close()
 
 
@@ -6047,7 +6056,8 @@ def test_underspecified_artifact_blocks_even_when_model_requests_generate(
     assert "?" in response.answer or "Уточните" in response.answer
     assert response.answer.count("?") >= 1
     assert "documents.generate" not in tool_calls
-    assert len(after) == len(before) + 1  # +1 for raw-message mem added by _capture_raw_user_message
+    # +1 for the raw-message memory added by _capture_raw_user_message.
+    assert len(after) == len(before) + 1
     assert storage.list_missions(limit=10) == []
     assert not any(event.type == "mission" for event in response.events)
     pending = storage.get_runtime_value(

@@ -139,8 +139,10 @@ def test_profile_public_dict_exposes_new_vllm_fields():
 def test_qwen_launcher_policy_is_exposed_from_the_canonical_profile():
     public = profile_public_dict(PROFILES["qwen36-vl"])
 
-    assert public["certification"] == "experimental"
-    assert public["research_only"] is True
+    assert public["certification"] == "certified"
+    assert public["interactive_certified"] is True
+    assert public["default_recommended"] is True
+    assert public["research_only"] is False
     assert public["readiness_deadline_sec"] == 900.0
     assert public["menu_visible"] is True
     assert public["requires_experimental_opt_in"] is False

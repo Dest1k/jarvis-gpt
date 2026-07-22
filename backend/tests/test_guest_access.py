@@ -209,7 +209,11 @@ def test_guest_transient_failure_retries_without_duplicate_messages(
 
     with pytest.raises(GuestChatUnavailableError):
         asyncio.run(agent.chat("Повтори безопасно", **kwargs))
-    assert storage.list_messages(conversation_id) == []
+    accepted = storage.list_messages(conversation_id)
+    assert [(item["role"], item["content"]) for item in accepted] == [
+        ("user", "Повтори безопасно")
+    ]
+    assert accepted[0]["metadata"]["ingress_status"] == "accepted"
 
     response = asyncio.run(agent.chat("Повтори безопасно", **kwargs))
     replay = asyncio.run(agent.chat("Повтори безопасно", **kwargs))

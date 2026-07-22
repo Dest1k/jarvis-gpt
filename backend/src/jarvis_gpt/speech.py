@@ -436,6 +436,25 @@ def _pick_sapi_voice_name(names: list[str], hint: str) -> str | None:
     return names[0]
 
 
+def _wav_has_playable_duration(path: Path, *, minimum_seconds: float = 0.05) -> bool:
+    """Reject header-only/truncated renders that audio transports cannot play."""
+
+    import wave
+
+    try:
+        with wave.open(str(path), "rb") as wav:
+            rate = wav.getframerate()
+            frames = wav.getnframes()
+            return bool(
+                rate > 0
+                and frames >= max(1, int(rate * minimum_seconds))
+                and wav.getnchannels() > 0
+                and wav.getsampwidth() > 0
+            )
+    except (EOFError, OSError, wave.Error):
+        return False
+
+
 def synthesize(
     text: str,
     out_path: str | Path,
@@ -497,8 +516,7 @@ def synthesize(
                 last_error = f"SAPI synthesis failed: {exc}"
     if used_engine is None:
         return SpeechResult(ok=False, error=last_error)
-    if not destination.exists() or destination.stat().st_size <= 44:
-        # 44 bytes == an empty WAV header; treat as a failed render.
+    if not destination.exists() or not _wav_has_playable_duration(destination):
         return SpeechResult(
             ok=False, engine=used_engine, voice=used_voice, error="Engine produced no audio."
         )
@@ -511,6 +529,13 @@ def synthesize(
             styled = True
         except Exception:  # noqa: BLE001 — styling is a nicety; keep the dry render
             styled = False
+    if not _wav_has_playable_duration(destination):
+        return SpeechResult(
+            ok=False,
+            engine=used_engine,
+            voice=used_voice,
+            error="Audio post-processing produced no playable output.",
+        )
     return SpeechResult(
         ok=True,
         path=destination,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 
 import pytest
 from jarvis_gpt.agent import AgentContext, AgentRuntime
@@ -8,6 +9,7 @@ from jarvis_gpt.authorization import (
     LEGACY_OWNER_USER_ID,
     ActorContext,
     AuthorizationError,
+    AuthorizationService,
     CapabilityDefinition,
     bind_actor,
 )
@@ -349,6 +351,320 @@ def test_catalog_sync_reconciles_tightened_builtin_grants_and_revokes_sessions(
             """
         ).fetchone()
     assert audit["action"] == "catalog.builtin_policy.reconcile"
+    storage.close()
+
+
+def test_catalog_sync_required_preset_change_revokes_direct_grant_sessions(
+    monkeypatch, tmp_path
+) -> None:
+    tools, storage = _registry(monkeypatch, tmp_path)
+    service = tools.permissions
+    security_id = "test.catalog.privileged"
+    unrestricted = CapabilityDefinition(
+        security_id,
+        "catalog privilege",
+        "test",
+        source="test_required_catalog",
+    )
+    service.sync_capabilities((unrestricted,), catalog_key="test.required_catalog.v1")
+    identity = service.upsert_external_identity(
+        provider="test",
+        realm_id="required-catalog",
+        provider_subject_id="direct-user",
+        bootstrap_preset="user",
+    )
+    service.set_user_permission(
+        user_id=str(identity["user_id"]),
+        security_id=security_id,
+        effect="grant",
+        can_delegate=False,
+        granted_by=LEGACY_OWNER_USER_ID,
+        reason="seed a direct grant before tightening the role floor",
+    )
+    session = service.create_user_session(
+        user_id=str(identity["user_id"]),
+        identity_id=str(identity["identity_id"]),
+        auth_method="test",
+    )
+    before = service.get_user(str(identity["user_id"]))
+    assert before is not None
+    assert service.authorize(
+        str(identity["user_id"]), security_id, record=False
+    ).allowed
+
+    restricted = CapabilityDefinition(
+        security_id,
+        "catalog privilege",
+        "test",
+        source="test_required_catalog",
+        required_presets=("owner", "admin"),
+    )
+    result = service.sync_capabilities(
+        (restricted,), catalog_key="test.required_catalog.v1"
+    )
+
+    assert result["reconciled_presets"] == 0
+    assert result["required_presets_changed"] == 1
+    denied = service.authorize(
+        str(identity["user_id"]), security_id, record=False
+    )
+    assert not denied.allowed
+    assert denied.reason_code == "preset_not_eligible"
+    assert service.authenticate_session(str(session["session_token"])) is None
+    after = service.get_user(str(identity["user_id"]))
+    assert after is not None
+    assert int(after["policy_epoch"]) == int(before["policy_epoch"]) + 1
+    storage.close()
+
+
+def test_required_presets_column_is_added_to_an_existing_catalog(
+    monkeypatch, tmp_path
+) -> None:
+    tools, storage = _registry(monkeypatch, tmp_path)
+    database_path = storage.database_path
+    with storage.transaction(immediate=True) as conn:
+        conn.execute("ALTER TABLE security_ids DROP COLUMN required_presets_json")
+        conn.execute(
+            "DELETE FROM iam_migrations WHERE key = 'capability_required_presets_v1'"
+        )
+    storage.close()
+
+    migrated_storage = JarvisStorage(database_path)
+    migrated_storage.initialize()
+    service = AuthorizationService(migrated_storage)
+    capability = CapabilityDefinition(
+        "test.migrated.privilege",
+        "migrated privilege",
+        "test",
+        source="test_required_migration",
+        default_presets=("admin",),
+        required_presets=("owner", "admin"),
+    )
+    service.sync_capabilities((capability,), catalog_key="test.required_migration.v1")
+
+    with migrated_storage.locked_connection() as conn:
+        columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(security_ids)")
+        }
+        row = conn.execute(
+            "SELECT required_presets_json FROM security_ids WHERE security_id = ?",
+            (capability.security_id,),
+        ).fetchone()
+        marker = conn.execute(
+            "SELECT 1 FROM iam_migrations "
+            "WHERE key = 'capability_required_presets_v1'"
+        ).fetchone()
+    assert "required_presets_json" in columns
+    assert row["required_presets_json"] == '["admin","owner"]'
+    assert marker is not None
+    migrated_storage.close()
+
+
+def test_required_presets_block_direct_and_custom_grants_and_follow_demotion(
+    monkeypatch, tmp_path
+) -> None:
+    tools, storage = _registry(monkeypatch, tmp_path)
+    service = tools.permissions
+    security_id = "test.privileged.read"
+    capability = CapabilityDefinition(
+        security_id,
+        "privileged read",
+        "test",
+        source="test_required_presets",
+        default_presets=("admin",),
+        required_presets=("owner", "admin"),
+    )
+    service.sync_capabilities((capability,), catalog_key="test.required_presets.v1")
+
+    catalog_entry = next(
+        item for item in service.list_security_ids() if item["security_id"] == security_id
+    )
+    assert catalog_entry["required_presets"] == ["admin", "owner"]
+
+    direct_identity = service.upsert_external_identity(
+        provider="test",
+        realm_id="required-presets",
+        provider_subject_id="direct-user",
+        bootstrap_preset="user",
+    )
+    direct_result = service.set_user_permission(
+        user_id=str(direct_identity["user_id"]),
+        security_id=security_id,
+        effect="grant",
+        can_delegate=False,
+        granted_by=LEGACY_OWNER_USER_ID,
+        reason="prove direct grants cannot cross the role floor",
+    )
+    assert direct_result["effect"] == "deny"
+    assert direct_result["reason_code"] == "preset_not_eligible"
+    assert direct_result["source"] == "capability_policy"
+
+    custom_identity = service.upsert_external_identity(
+        provider="test",
+        realm_id="required-presets",
+        provider_subject_id="custom-user",
+        bootstrap_preset="user",
+    )
+    now = datetime.now(UTC).isoformat(timespec="seconds")
+    with storage.transaction(immediate=True) as conn:
+        capability_row = conn.execute(
+            "SELECT id FROM security_ids WHERE security_id = ?",
+            (security_id,),
+        ).fetchone()
+        conn.execute(
+            """
+            INSERT INTO permission_presets(
+                id, preset_key, display_name, kind, active_version_id,
+                created_by, created_at, updated_at
+            ) VALUES (
+                'preset_test_privileged_custom', 'test_privileged_custom',
+                'Test privileged custom', 'custom', 'presetv_test_privileged_custom_1',
+                ?, ?, ?
+            )
+            """,
+            (LEGACY_OWNER_USER_ID, now, now),
+        )
+        conn.execute(
+            """
+            INSERT INTO permission_preset_versions(
+                id, preset_id, version, state, created_by, created_at,
+                published_at, change_reason
+            ) VALUES (
+                'presetv_test_privileged_custom_1', 'preset_test_privileged_custom',
+                1, 'published', ?, ?, ?, 'required preset regression'
+            )
+            """,
+            (LEGACY_OWNER_USER_ID, now, now),
+        )
+        conn.execute(
+            """
+            INSERT INTO preset_security_ids(
+                preset_version_id, security_id_id, effect, can_delegate
+            ) VALUES ('presetv_test_privileged_custom_1', ?, 'grant', 0)
+            """,
+            (capability_row["id"],),
+        )
+    service.assign_preset(
+        user_id=str(custom_identity["user_id"]),
+        preset_key="test_privileged_custom",
+        assigned_by=LEGACY_OWNER_USER_ID,
+        reason="prove custom presets cannot cross the role floor",
+    )
+    custom_decision = service.authorize(
+        str(custom_identity["user_id"]), security_id, record=False
+    )
+    assert not custom_decision.allowed
+    assert custom_decision.reason_code == "preset_not_eligible"
+
+    admin_identity = service.upsert_external_identity(
+        provider="test",
+        realm_id="required-presets",
+        provider_subject_id="admin-user",
+        bootstrap_preset="admin",
+    )
+    session = service.create_user_session(
+        user_id=str(admin_identity["user_id"]),
+        identity_id=str(admin_identity["identity_id"]),
+        auth_method="test",
+    )
+    assert service.authorize(
+        str(admin_identity["user_id"]), security_id, record=False
+    ).allowed
+
+    service.assign_preset(
+        user_id=str(admin_identity["user_id"]),
+        preset_key="user",
+        assigned_by=LEGACY_OWNER_USER_ID,
+        reason="demotion must revoke privileged access immediately",
+    )
+    demoted = service.authorize(
+        str(admin_identity["user_id"]), security_id, record=False
+    )
+    assert not demoted.allowed
+    assert demoted.reason_code == "preset_not_eligible"
+    assert service.authenticate_session(str(session["session_token"])) is None
+
+    storage.close()
+
+
+def test_admin_read_only_technical_tools_are_visible_revocable_and_metadata_only(
+    monkeypatch, tmp_path
+) -> None:
+    tools, storage = _registry(monkeypatch, tmp_path)
+    service = tools.permissions
+    identity = service.upsert_external_identity(
+        provider="test",
+        realm_id="admin-technical-tools",
+        provider_subject_id="admin-reader",
+        bootstrap_preset="admin",
+    )
+    user_id = str(identity["user_id"])
+    admin_actor = _actor(identity)
+    technical_tools = {
+        "runtime.status",
+        "environment.profile",
+        "system.inspect",
+    }
+    admin_native_reads = {
+        "native.capabilities.read",
+        "native.process.top.read",
+        "native.window.list.read",
+        "native.wmi.query",
+        "native.hardware.gpu.read",
+    }
+
+    with bind_actor(admin_actor):
+        listed = {item.name for item in tools.list()}
+        assert technical_tools <= listed
+        for tool_name in technical_tools:
+            spec = tools.get(tool_name)
+            assert spec is not None
+            assert spec.default_presets == ("admin",)
+            assert spec.required_presets == ("owner", "admin")
+            assert spec.history_persistence == "metadata_only"
+            assert service.authorize(user_id, spec.security_id, record=False).allowed
+        for security_id in admin_native_reads:
+            assert service.authorize(user_id, security_id, record=False).allowed
+        for security_id in ("privacy.clipboard.read", "privacy.screen.capture"):
+            privacy_denial = service.authorize(user_id, security_id, record=False)
+            assert not privacy_denial.allowed
+            assert privacy_denial.reason_code == "not_granted"
+
+        sentinel = "ADMIN_TECHNICAL_PROFILE_SENTINEL_91827"
+        storage.set_runtime_value("environment.host_profile", {"host": sentinel})
+        profile = asyncio.run(tools.run("environment.profile", {}))
+        runtime = asyncio.run(tools.run("runtime.status", {}))
+        assert profile.ok is True
+        assert sentinel in str(profile.data)
+        assert runtime.ok is True
+
+    service.assign_preset(
+        user_id=user_id,
+        preset_key="user",
+        assigned_by=LEGACY_OWNER_USER_ID,
+        reason="technical access must be revoked without retaining snapshots",
+    )
+    demoted_actor = service.actor_for_user(user_id, source="demoted-technical-test")
+    assert demoted_actor is not None
+    with bind_actor(demoted_actor):
+        assert technical_tools.isdisjoint({item.name for item in tools.list()})
+        for tool_name in technical_tools:
+            denial = service.authorize(
+                user_id,
+                f"tool.{tool_name}",
+                record=False,
+            )
+            assert not denial.allowed
+            assert denial.reason_code == "preset_not_eligible"
+        retained = {
+            "tool_runs": storage.list_tool_runs(limit=20),
+            "learning": storage.list_learning_observations(limit=20),
+            "audit": storage.list_audit(limit=20),
+        }
+    serialized = str(retained)
+    assert sentinel not in serialized
+    assert "settings" not in serialized
+    assert "jarvis.tool-history.metadata-only.v1" in serialized
     storage.close()
 
 

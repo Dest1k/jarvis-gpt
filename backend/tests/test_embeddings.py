@@ -25,6 +25,21 @@ def test_lexical_vector_matches_inflection_over_unrelated():
     assert sparse_cosine(query, related) > 0.0
 
 
+def test_lexical_vector_supports_cjk_and_korean_without_spaces():
+    cases = [
+        ("人工智能新闻", "今天的人工智能新闻与模型更新", "家庭烹饪食谱"),
+        ("인공지능 뉴스", "오늘의 인공지능뉴스와 모델 업데이트", "가정 요리법"),
+        ("人工知能ニュース", "今日の人工知能ニュースとモデル更新", "家庭料理のレシピ"),
+    ]
+
+    for query_text, related_text, unrelated_text in cases:
+        query = lexical_vector(query_text)
+        related = lexical_vector(related_text)
+        unrelated = lexical_vector(unrelated_text)
+        assert query
+        assert sparse_cosine(query, related) > sparse_cosine(query, unrelated)
+
+
 def test_reciprocal_rank_fusion_rewards_agreement():
     fused = reciprocal_rank_fusion([["a", "b", "c"], ["a", "c", "b"]])
     assert fused["a"] > fused["b"]
@@ -107,9 +122,8 @@ def test_hybrid_files_reranks_chunks_by_semantic_closeness(monkeypatch, tmp_path
 
 
 def test_hybrid_files_falls_back_to_recent_chunks_without_lexical_overlap(monkeypatch, tmp_path):
-    # The query shares no exact word form with any chunk, so lexical search finds
-    # nothing at all. The recent-chunk fallback must still surface the related
-    # chunk while the relatedness gate keeps the unrelated file out of the prompt.
+    # Force a lexical miss so this test isolates the recent semantic fallback.
+    # Trigram FTS intentionally matches inflected multilingual word forms now.
     monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
     monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
     settings = load_settings()
@@ -130,6 +144,7 @@ def test_hybrid_files_falls_back_to_recent_chunks_without_lexical_overlap(monkey
     hot = "Видеокарта перегревается под нагрузкой, нужно чистить кулер и менять термопасту."
     soup = "Рецепт борща с говядиной, свёклой и сметаной."
     storage.add_file_chunks(record["id"], [soup, hot])
+    monkeypatch.setattr(storage, "search_file_chunks", lambda *_args, **_kwargs: [])
     agent = AgentRuntime(
         settings=settings,
         storage=storage,

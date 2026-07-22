@@ -154,6 +154,10 @@ class CapabilityDefinition:
     # HTTP path spelling.  Owner is always granted by the bootstrap policy and must
     # therefore not be repeated here.
     default_presets: tuple[str, ...] = ()
+    # A non-empty hard floor is evaluated before direct or preset grants.  It is
+    # deliberately limited to built-in roles: assigning the capability to a custom
+    # preset must never turn that preset into a privileged system role.
+    required_presets: tuple[str, ...] = ()
 
     def validate(self) -> None:
         if not _SECURITY_ID_RE.fullmatch(self.security_id):
@@ -165,6 +169,15 @@ class CapabilityDefinition:
             raise ValueError(
                 "default_presets may only contain non-owner built-in preset keys"
             )
+        invalid_required = set(self.required_presets) - set(BUILTIN_PRESET_KEYS)
+        if invalid_required:
+            raise ValueError("required_presets may only contain built-in preset keys")
+        if self.required_presets and "owner" not in self.required_presets:
+            raise ValueError("required_presets must include owner")
+        if self.required_presets and not set(self.default_presets).issubset(
+            self.required_presets
+        ):
+            raise ValueError("default_presets must satisfy required_presets")
 
 
 @dataclass(frozen=True)
@@ -290,12 +303,16 @@ CORE_CAPABILITIES: tuple[CapabilityDefinition, ...] = (
         "Просмотр возможностей native host-bridge",
         "native",
         2,
+        default_presets=("admin",),
+        required_presets=("owner", "admin"),
     ),
     CapabilityDefinition(
         "native.process.top.read",
         "Чтение рейтинга локальных процессов",
         "native",
         3,
+        default_presets=("admin",),
+        required_presets=("owner", "admin"),
     ),
     CapabilityDefinition(
         "native.console.processes.show",
@@ -330,6 +347,8 @@ CORE_CAPABILITIES: tuple[CapabilityDefinition, ...] = (
         "Список видимых окон рабочего стола",
         "native",
         3,
+        default_presets=("admin",),
+        required_presets=("owner", "admin"),
     ),
     CapabilityDefinition(
         "native.keyboard.send",
@@ -343,12 +362,16 @@ CORE_CAPABILITIES: tuple[CapabilityDefinition, ...] = (
         "Запросы к локальному WMI/CIM",
         "native",
         3,
+        default_presets=("admin",),
+        required_presets=("owner", "admin"),
     ),
     CapabilityDefinition(
         "native.hardware.gpu.read",
         "Чтение телеметрии локального GPU",
         "native",
         3,
+        default_presets=("admin",),
+        required_presets=("owner", "admin"),
     ),
     CapabilityDefinition(
         "approvals.read.own",
@@ -421,6 +444,7 @@ CREATE TABLE IF NOT EXISTS security_ids (
     category TEXT NOT NULL,
     risk_level INTEGER NOT NULL DEFAULT 0 CHECK(risk_level BETWEEN 0 AND 4),
     default_requires_hitl INTEGER NOT NULL DEFAULT 0,
+    required_presets_json TEXT NOT NULL DEFAULT '[]',
     source TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'retired', 'disabled')),
     created_at TEXT NOT NULL,
@@ -627,6 +651,14 @@ PERSONAL_DELETE_ORDER: tuple[str, ...] = (
 if frozenset(PERSONAL_DELETE_ORDER) != frozenset(PERSONAL_TABLES):
     raise RuntimeError("Every personal table must participate in permanent user deletion")
 
+# Optional feature tables are owned outside the base IAM/storage schema, but their
+# user references must still participate in privacy deletion before ``users`` is
+# removed.  Keep the ownership column explicit so adding another feature table is
+# a deliberate deletion-policy decision rather than an implicit cascade assumption.
+OPTIONAL_USER_DELETE_TABLES: tuple[tuple[str, str], ...] = (
+    ("material_access_audit", "requester_user_id"),
+)
+
 
 TENANT_INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_runtime_events_user_ts
@@ -680,6 +712,25 @@ def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
 
+def _required_presets_json(presets: Iterable[str]) -> str:
+    return _json(sorted(set(presets)))
+
+
+def _decode_required_presets(value: object) -> tuple[str, ...] | None:
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(parsed, list) or any(not isinstance(item, str) for item in parsed):
+        return None
+    normalized = tuple(sorted(set(parsed)))
+    if set(normalized) - set(BUILTIN_PRESET_KEYS):
+        return None
+    if normalized and "owner" not in normalized:
+        return None
+    return normalized
+
+
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {str(row[1]) for row in conn.execute(f'PRAGMA table_info("{table}")').fetchall()}
 
@@ -701,6 +752,21 @@ def migrate_iam_schema(conn: sqlite3.Connection) -> None:
 
     conn.executescript(IAM_SCHEMA)
     now = _now()
+    security_id_columns = _table_columns(conn, "security_ids")
+    required_presets_added = "required_presets_json" not in security_id_columns
+    if required_presets_added:
+        conn.execute(
+            "ALTER TABLE security_ids "
+            "ADD COLUMN required_presets_json TEXT NOT NULL DEFAULT '[]'"
+        )
+    conn.execute(
+        """
+        INSERT INTO iam_migrations(key, applied_at, details_json)
+        VALUES ('capability_required_presets_v1', ?, ?)
+        ON CONFLICT(key) DO NOTHING
+        """,
+        (now, _json({"column_added": required_presets_added})),
+    )
     conn.execute(
         """
         INSERT INTO users(
@@ -854,6 +920,8 @@ class AuthorizationService:
             entry.validate()
         inserted = 0
         reconciled_presets: set[str] = set()
+        required_presets_changed: set[str] = set()
+        eligibility_changed_capability_ids: set[str] = set()
         now = _now()
         with self.storage.transaction(immediate=True) as conn:
             marker = conn.execute(
@@ -863,17 +931,19 @@ class AuthorizationService:
             first_catalog_sync = marker is None
             for entry in entries:
                 row = conn.execute(
-                    "SELECT id FROM security_ids WHERE security_id = ?",
+                    "SELECT id, required_presets_json FROM security_ids WHERE security_id = ?",
                     (entry.security_id,),
                 ).fetchone()
+                required_presets_json = _required_presets_json(entry.required_presets)
                 if row is None:
                     capability_id = _new_id("sec")
                     conn.execute(
                         """
                         INSERT INTO security_ids(
                             id, security_id, description, category, risk_level,
-                            default_requires_hitl, source, status, created_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+                            default_requires_hitl, required_presets_json, source,
+                            status, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
                         """,
                         (
                             capability_id,
@@ -882,6 +952,7 @@ class AuthorizationService:
                             entry.category,
                             int(entry.risk_level),
                             int(entry.default_requires_hitl),
+                            required_presets_json,
                             entry.source,
                             now,
                             now,
@@ -890,12 +961,18 @@ class AuthorizationService:
                     inserted += 1
                 else:
                     capability_id = str(row["id"])
+                    if _decode_required_presets(
+                        row["required_presets_json"]
+                    ) != tuple(sorted(set(entry.required_presets))):
+                        required_presets_changed.add(entry.security_id)
+                        eligibility_changed_capability_ids.add(capability_id)
                     conn.execute(
                         """
                         UPDATE security_ids
                         SET description = ?, category = ?, risk_level = ?,
-                            default_requires_hitl = ?, source = ?, status = 'active',
-                            updated_at = ?, retired_at = NULL
+                            default_requires_hitl = ?, required_presets_json = ?,
+                            source = ?, status = 'active', updated_at = ?,
+                            retired_at = NULL
                         WHERE id = ?
                         """,
                         (
@@ -903,6 +980,7 @@ class AuthorizationService:
                             entry.category,
                             int(entry.risk_level),
                             int(entry.default_requires_hitl),
+                            required_presets_json,
                             entry.source,
                             now,
                             capability_id,
@@ -931,6 +1009,7 @@ class AuthorizationService:
                     """,
                     (now, now, source, *source_ids),
                 )
+            affected_user_ids: set[str] = set()
             if reconciled_presets:
                 placeholders = ",".join("?" for _ in reconciled_presets)
                 affected = conn.execute(
@@ -942,26 +1021,53 @@ class AuthorizationService:
                     """,
                     tuple(sorted(reconciled_presets)),
                 ).fetchall()
-                affected_ids = [str(row["user_id"]) for row in affected]
-                if affected_ids:
-                    affected_placeholders = ",".join("?" for _ in affected_ids)
-                    conn.execute(
-                        f"""
-                        UPDATE users
-                        SET policy_epoch = policy_epoch + 1,
-                            row_version = row_version + 1,
-                            updated_at = ?
-                        WHERE id IN ({affected_placeholders})
-                        """,
-                        (now, *affected_ids),
-                    )
-                    conn.execute(
-                        f"""
-                        UPDATE user_sessions SET revoked_at = ?
-                        WHERE revoked_at IS NULL AND user_id IN ({affected_placeholders})
-                        """,
-                        (now, *affected_ids),
-                    )
+                affected_user_ids.update(str(row["user_id"]) for row in affected)
+            if eligibility_changed_capability_ids:
+                placeholders = ",".join("?" for _ in eligibility_changed_capability_ids)
+                affected = conn.execute(
+                    f"""
+                    SELECT DISTINCT upa.user_id
+                    FROM user_preset_assignments upa
+                    JOIN permission_presets p ON p.id = upa.preset_id
+                    JOIN preset_security_ids psi
+                      ON psi.preset_version_id = p.active_version_id
+                    WHERE upa.revoked_at IS NULL AND psi.effect = 'grant'
+                      AND psi.security_id_id IN ({placeholders})
+                    UNION
+                    SELECT DISTINCT up.user_id
+                    FROM user_permissions up
+                    WHERE up.revoked_at IS NULL AND up.effect = 'grant'
+                      AND (up.valid_until IS NULL OR up.valid_until > ?)
+                      AND up.security_id_id IN ({placeholders})
+                    """,
+                    (
+                        *sorted(eligibility_changed_capability_ids),
+                        now,
+                        *sorted(eligibility_changed_capability_ids),
+                    ),
+                ).fetchall()
+                affected_user_ids.update(str(row["user_id"]) for row in affected)
+            affected_ids = sorted(affected_user_ids)
+            if affected_ids:
+                affected_placeholders = ",".join("?" for _ in affected_ids)
+                conn.execute(
+                    f"""
+                    UPDATE users
+                    SET policy_epoch = policy_epoch + 1,
+                        row_version = row_version + 1,
+                        updated_at = ?
+                    WHERE id IN ({affected_placeholders})
+                    """,
+                    (now, *affected_ids),
+                )
+                conn.execute(
+                    f"""
+                    UPDATE user_sessions SET revoked_at = ?
+                    WHERE revoked_at IS NULL AND user_id IN ({affected_placeholders})
+                    """,
+                    (now, *affected_ids),
+                )
+            if reconciled_presets or required_presets_changed:
                 self.append_security_audit(
                     conn,
                     action="catalog.builtin_policy.reconcile",
@@ -972,6 +1078,7 @@ class AuthorizationService:
                     before={},
                     after={
                         "preset_keys": sorted(reconciled_presets),
+                        "required_presets_changed": sorted(required_presets_changed),
                         "affected_user_ids": affected_ids,
                     },
                 )
@@ -988,6 +1095,7 @@ class AuthorizationService:
             "seen": len(entries),
             "inserted": inserted,
             "reconciled_presets": len(reconciled_presets),
+            "required_presets_changed": len(required_presets_changed),
         }
 
     @staticmethod
@@ -1103,7 +1211,8 @@ class AuthorizationService:
                 (user_id,),
             ).fetchone()
             capability = conn.execute(
-                "SELECT id, status FROM security_ids WHERE security_id = ?",
+                "SELECT id, status, required_presets_json "
+                "FROM security_ids WHERE security_id = ?",
                 (security_id,),
             ).fetchone()
             preset = conn.execute(
@@ -1128,6 +1237,22 @@ class AuthorizationService:
                 effect, reason = "deny", "unknown_security_id"
             elif capability["status"] != "active":
                 effect, reason = "deny", f"security_id_{capability['status']}"
+            elif (
+                required_presets := _decode_required_presets(
+                    capability["required_presets_json"]
+                )
+            ) is None:
+                effect, reason, source = (
+                    "deny",
+                    "invalid_required_presets",
+                    "capability_policy",
+                )
+            elif required_presets and preset_key not in required_presets:
+                effect, reason, source = (
+                    "deny",
+                    "preset_not_eligible",
+                    "capability_policy",
+                )
             else:
                 cap_id = str(capability["id"])
                 overrides = conn.execute(
@@ -2214,12 +2339,23 @@ class AuthorizationService:
             rows = conn.execute(
                 """
                 SELECT id, security_id, description, category, risk_level,
-                       default_requires_hitl, source, status, created_at, updated_at
+                       default_requires_hitl, required_presets_json, source, status,
+                       created_at, updated_at
                 FROM security_ids
                 ORDER BY category, security_id
                 """
             ).fetchall()
-        return [dict(row) for row in rows]
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            required_presets = _decode_required_presets(
+                item.pop("required_presets_json")
+            )
+            item["required_presets"] = (
+                list(required_presets) if required_presets is not None else None
+            )
+            result.append(item)
+        return result
 
     def list_presets(self) -> list[dict[str, Any]]:
         with self.storage.locked_connection() as conn:
@@ -2683,6 +2819,15 @@ class AuthorizationService:
                         (user_id,),
                     ).fetchone()
                     deleted_counts[table] = int(row["count"])
+                for table, user_column in OPTIONAL_USER_DELETE_TABLES:
+                    if not _table_exists(conn, table):
+                        continue
+                    row = conn.execute(
+                        f'SELECT COUNT(*) AS count FROM "{table}" '
+                        f'WHERE "{user_column}" = ?',
+                        (user_id,),
+                    ).fetchone()
+                    deleted_counts[table] = int(row["count"])
                 runtime_row = conn.execute(
                     """
                     SELECT COUNT(*) AS count FROM runtime_kv
@@ -2714,6 +2859,12 @@ class AuthorizationService:
                             (realm_id, chat_id),
                         )
 
+                for table, user_column in OPTIONAL_USER_DELETE_TABLES:
+                    if _table_exists(conn, table):
+                        conn.execute(
+                            f'DELETE FROM "{table}" WHERE "{user_column}" = ?',
+                            (user_id,),
+                        )
                 for table in PERSONAL_DELETE_ORDER:
                     conn.execute(f'DELETE FROM "{table}" WHERE user_id = ?', (user_id,))
                 conn.execute(

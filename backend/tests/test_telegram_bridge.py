@@ -14,8 +14,6 @@ import httpx
 import pytest
 from jarvis_gpt.storage import JarvisStorage
 from jarvis_gpt.telegram_bridge import (
-    _INBOX_TRANSIENT_MAX_AGE_SEC,
-    _INBOX_TRANSIENT_MAX_ATTEMPTS,
     TelegramBridge,
     TelegramConfig,
     TelegramConversationIsolationError,
@@ -515,7 +513,12 @@ def test_non_owner_allowed_chat_uses_backend_scoped_surface():
     assert "access_mode" not in chat_bodies[0]
     assert chat_bodies[0]["notification_chat_id"] == 99
     assert chat_bodies[0]["conversation_id"].startswith("tg_")
-    assert api_calls == ["/api/files", "/api/chat", "/api/files"]
+    assert api_calls == [
+        "/api/preferences",
+        "/api/files",
+        "/api/chat",
+        "/api/files",
+    ]
 
 
 def test_bridge_does_not_make_permission_decisions_for_non_owner():
@@ -546,7 +549,7 @@ def test_bridge_does_not_make_permission_decisions_for_non_owner():
 
     # Authorization is enforced by the backend using the scoped user session. The bridge
     # neither elevates the user nor silently turns a non-owner into an owner.
-    assert api_calls == ["/api/files", "/api/chat"]
+    assert api_calls == ["/api/preferences", "/api/files", "/api/chat"]
 
 
 def test_reset_command_rotates_conversation_without_calling_agent():
@@ -1613,12 +1616,12 @@ def test_backend_retry_classifier_requires_machine_outage_marker_for_http_respon
     )
 
 
-@pytest.mark.parametrize("exhaustion", ["attempts", "age"])
-def test_exhausted_transient_update_is_retained_but_unblocks_same_chat(
+@pytest.mark.parametrize("history", ["many_attempts", "old"])
+def test_transient_update_never_expires_and_preserves_same_chat_order(
     tmp_path,
-    exhaustion,
+    history,
 ):
-    database_path = tmp_path / f"jarvis-{exhaustion}.sqlite3"
+    database_path = tmp_path / f"jarvis-{history}.sqlite3"
     store = TelegramConversationStore(database_path, realm_id="telegram:700001")
     first = {
         "update_id": 30,
@@ -1638,16 +1641,8 @@ def test_exhausted_transient_update_is_retained_but_unblocks_same_chat(
     }
     store.persist_updates([(30, 42, first), (31, 42, second)])
     now = time.time()
-    attempt_count = (
-        _INBOX_TRANSIENT_MAX_ATTEMPTS
-        if exhaustion == "attempts"
-        else _INBOX_TRANSIENT_MAX_ATTEMPTS - 1
-    )
-    received_at = (
-        now
-        if exhaustion == "attempts"
-        else now - _INBOX_TRANSIENT_MAX_AGE_SEC - 1
-    )
+    attempt_count = 10_000 if history == "many_attempts" else 25
+    received_at = now if history == "many_attempts" else now - (90 * 24 * 60 * 60)
     with sqlite3.connect(database_path) as conn:
         conn.execute(
             """
@@ -1661,14 +1656,14 @@ def test_exhausted_transient_update_is_retained_but_unblocks_same_chat(
 
     claimed = store.claim_pending_updates(limit=10, lease_seconds=60)
 
-    assert [payload["update_id"] for payload, _lease in claimed] == [31]
+    assert [payload["update_id"] for payload, _lease in claimed] == [30]
     with sqlite3.connect(database_path) as conn:
         retained = conn.execute(
             "SELECT status, attempt_count, payload_json FROM telegram_update_inbox "
             "WHERE realm_id = 'telegram:700001' AND update_id = 30"
         ).fetchone()
     assert retained is not None
-    assert retained[:2] == ("failed", attempt_count)
+    assert retained[:2] == ("processing", attempt_count + 1)
     assert json.loads(retained[2]) == first
 
 
@@ -2257,10 +2252,21 @@ def test_load_config_voice_replies_toggle():
     assert load_config({**common, "TELEGRAM_VOICE_REPLIES": "0"}).voice_replies is False
 
 
-def _voice_bridge(monkeypatch, *, ogg: bytes | None, speak_status: int = 200):
+def _voice_bridge(
+    monkeypatch,
+    *,
+    ogg: bytes | None,
+    speak_status: int = 200,
+    telegram_voice_status: int = 200,
+    telegram_voice_description: str = "voice rejected",
+    answer: str = "Готово, сэр.",
+    preference: bool = False,
+):
     monkeypatch.setattr("jarvis_gpt.telegram_bridge._wav_to_ogg_opus", lambda wav: ogg)
     tg_posts: list[str] = []
+    tg_messages: list[str] = []
     chat_bodies: list[dict] = []
+    speak_bodies: list[dict] = []
 
     def tg_handler(request):
         path = request.url.path
@@ -2269,6 +2275,13 @@ def _voice_bridge(monkeypatch, *, ogg: bytes | None, speak_status: int = 200):
         if "/file/botT/" in path:
             return httpx.Response(200, content=b"OggS-voice-bytes")
         tg_posts.append(path)
+        if path.endswith("/sendMessage"):
+            tg_messages.append(json.loads(request.content).get("text") or "")
+        if path.endswith("/sendVoice") and telegram_voice_status != 200:
+            return httpx.Response(
+                telegram_voice_status,
+                json={"ok": False, "description": telegram_voice_description},
+            )
         return httpx.Response(200, json={"ok": True, "result": {}})
 
     def api_handler(request):
@@ -2288,24 +2301,35 @@ def _voice_bridge(monkeypatch, *, ogg: bytes | None, speak_status: int = 200):
                 json={
                     "conversation_id": "c1",
                     "message_id": "m",
-                    "answer": "Готово, сэр.",
+                    "answer": answer,
                     "events": [],
                 },
             )
         if path == "/api/voice/speak":
+            speak_bodies.append(json.loads(request.content))
             return httpx.Response(
                 speak_status,
                 content=b"RIFFwav-bytes" if speak_status == 200 else b"",
             )
+        if path == "/api/preferences" and request.method == "GET":
+            return httpx.Response(200, json={"voice_reply": preference})
         if path == "/api/files":
             return httpx.Response(200, json=[])
         return httpx.Response(404, json={})
 
-    return _bridge(tg_handler, api_handler), tg_posts, chat_bodies
+    return (
+        _bridge(tg_handler, api_handler),
+        tg_posts,
+        tg_messages,
+        chat_bodies,
+        speak_bodies,
+    )
 
 
 def test_inbound_voice_transcribed_and_answered_with_voice(monkeypatch):
-    bridge, tg_posts, chat_bodies = _voice_bridge(monkeypatch, ogg=b"OggS-opus")
+    bridge, tg_posts, _, chat_bodies, _ = _voice_bridge(
+        monkeypatch, ogg=b"OggS-opus"
+    )
     update = {
         "update_id": 1,
         "message": {
@@ -2326,7 +2350,7 @@ def test_inbound_voice_transcribed_and_answered_with_voice(monkeypatch):
 
 
 def test_voice_reply_falls_back_to_audio_when_no_opus(monkeypatch):
-    bridge, tg_posts, _ = _voice_bridge(monkeypatch, ogg=None)
+    bridge, tg_posts, _, _, _ = _voice_bridge(monkeypatch, ogg=None)
     update = {
         "update_id": 1,
         "message": {
@@ -2341,8 +2365,37 @@ def test_voice_reply_falls_back_to_audio_when_no_opus(monkeypatch):
     assert not any(p.endswith("/sendMessage") for p in tg_posts)
 
 
-def test_voice_reply_falls_back_to_text_when_tts_is_unavailable(monkeypatch):
-    bridge, tg_posts, chat_bodies = _voice_bridge(
+def test_voice_reply_falls_back_to_audio_when_recipient_forbids_voice_notes(
+    monkeypatch, caplog
+):
+    bridge, tg_posts, tg_messages, _, _ = _voice_bridge(
+        monkeypatch,
+        ogg=b"OggS-opus",
+        telegram_voice_status=400,
+        telegram_voice_description="Bad Request: VOICE_MESSAGES_FORBIDDEN",
+    )
+    update = {
+        "update_id": 11,
+        "message": {
+            "chat": {"id": 42, "type": "private"},
+            "from": {"id": 42, "is_bot": False},
+            "voice": {"file_id": "vf", "mime_type": "audio/ogg"},
+        },
+    }
+
+    with caplog.at_level(logging.INFO, logger="jarvis.telegram"):
+        asyncio.run(bridge._handle(update))
+
+    assert sum(path.endswith("/sendVoice") for path in tg_posts) == 1
+    assert sum(path.endswith("/sendAudio") for path in tg_posts) == 1
+    assert not any(path.endswith("/sendMessage") for path in tg_posts)
+    assert tg_messages == []
+    assert "retrying as audio" in caplog.text
+    assert "voice delivery succeeded chat_id=42" in caplog.text
+
+
+def test_voice_reply_falls_back_to_text_when_tts_is_unavailable(monkeypatch, caplog):
+    bridge, tg_posts, tg_messages, chat_bodies, _ = _voice_bridge(
         monkeypatch,
         ogg=b"OggS-opus",
         speak_status=503,
@@ -2356,43 +2409,24 @@ def test_voice_reply_falls_back_to_text_when_tts_is_unavailable(monkeypatch):
         },
     }
 
-    asyncio.run(bridge._handle(update))
+    with caplog.at_level(logging.WARNING, logger="jarvis.telegram"):
+        asyncio.run(bridge._handle(update))
 
     assert chat_bodies[0]["response_modality"] == "voice"
     assert any(p.endswith("/sendMessage") for p in tg_posts)
     assert not any(p.endswith("/sendVoice") for p in tg_posts)
     assert not any(p.endswith("/sendAudio") for p in tg_posts)
+    assert any("Не удалось доставить голосовой ответ" in text for text in tg_messages)
+    assert "reason=http_status_503" in caplog.text
 
 
-def test_text_input_never_triggers_a_voice_reply():
-    speak_calls: list[str] = []
-    chat_bodies: list[dict] = []
-    tg_posts: list[str] = []
-
-    def tg_handler(request):
-        tg_posts.append(request.url.path)
-        return httpx.Response(200, json={"ok": True, "result": {}})
-
-    def api_handler(request):
-        if request.url.path == "/api/voice/speak":
-            speak_calls.append("speak")
-            return httpx.Response(200, content=b"wav")
-        if request.url.path == "/api/chat":
-            chat_bodies.append(json.loads(request.content))
-            return httpx.Response(
-                200,
-                json={
-                    "conversation_id": "c1",
-                    "message_id": "m",
-                    "answer": "просто текст",
-                    "events": [],
-                },
-            )
-        if request.url.path == "/api/files":
-            return httpx.Response(200, json=[])
-        return httpx.Response(404, json={})
-
-    bridge = _bridge(tg_handler, api_handler)
+def test_text_input_in_auto_mode_stays_text(monkeypatch):
+    bridge, tg_posts, _, chat_bodies, speak_bodies = _voice_bridge(
+        monkeypatch,
+        ogg=b"OggS-opus",
+        answer="просто текст",
+        preference=False,
+    )
     update = {
         "update_id": 1,
         "message": {
@@ -2402,11 +2436,226 @@ def test_text_input_never_triggers_a_voice_reply():
         },
     }
     asyncio.run(bridge._handle(update))
-    assert speak_calls == []  # text in -> text out, never voice
+    assert speak_bodies == []
     assert chat_bodies[0]["response_modality"] == "text"
     assert any(p.endswith("/sendMessage") for p in tg_posts)
     assert not any(p.endswith("/sendVoice") for p in tg_posts)
     assert not any(p.endswith("/sendAudio") for p in tg_posts)
+
+
+def test_explicit_text_request_triggers_one_voice_reply(monkeypatch):
+    bridge, tg_posts, _, chat_bodies, speak_bodies = _voice_bridge(
+        monkeypatch,
+        ogg=b"OggS-opus",
+        preference=False,
+    )
+    update = {
+        "update_id": 2,
+        "message": {
+            "chat": {"id": 42, "type": "private"},
+            "from": {"id": 42, "is_bot": False},
+            "text": "Ответь голосом: какой сейчас статус?",
+        },
+    }
+
+    asyncio.run(bridge._handle(update))
+
+    assert chat_bodies[0]["response_modality"] == "voice"
+    assert speak_bodies == [{"text": "Готово, сэр."}]
+    assert any(path.endswith("/sendVoice") for path in tg_posts)
+
+
+def test_persisted_on_preference_drives_text_voice_reply(monkeypatch):
+    bridge, tg_posts, _, chat_bodies, speak_bodies = _voice_bridge(
+        monkeypatch,
+        ogg=b"OggS-opus",
+        preference=True,
+    )
+    update = {
+        "update_id": 3,
+        "message": {
+            "chat": {"id": 42, "type": "private"},
+            "from": {"id": 42, "is_bot": False, "username": "renamed-user"},
+            "text": "привет",
+        },
+    }
+
+    asyncio.run(bridge._handle(update))
+
+    assert chat_bodies[0]["response_modality"] == "voice"
+    assert len(speak_bodies) == 1
+    assert any(path.endswith("/sendVoice") for path in tg_posts)
+
+
+def test_long_voice_reply_is_split_into_bounded_tts_chunks(monkeypatch, caplog):
+    answer = ("Длинная фраза. " * 260).strip()
+    bridge, tg_posts, _, _, speak_bodies = _voice_bridge(
+        monkeypatch,
+        ogg=b"OggS-opus",
+        answer=answer,
+        preference=True,
+    )
+    update = {
+        "update_id": 4,
+        "message": {
+            "chat": {"id": 42, "type": "private"},
+            "from": {"id": 42, "is_bot": False},
+            "text": "дай подробный ответ",
+        },
+    }
+
+    caplog.set_level(logging.INFO, logger="jarvis.telegram")
+    asyncio.run(bridge._handle(update))
+
+    spoken = [body["text"] for body in speak_bodies]
+    assert len(spoken) > 1
+    assert all(0 < len(chunk) <= 1500 for chunk in spoken)
+    assert " ".join(spoken) == answer
+    assert sum(path.endswith("/sendVoice") for path in tg_posts) == len(spoken)
+    assert not any(path.endswith("/sendMessage") for path in tg_posts)
+    assert "voice delivery succeeded chat_id=42" in caplog.text
+    assert answer not in caplog.text
+
+
+def test_send_voice_failure_is_logged_and_falls_back_to_full_text(monkeypatch, caplog):
+    bridge, tg_posts, tg_messages, _, _ = _voice_bridge(
+        monkeypatch,
+        ogg=b"OggS-opus",
+        telegram_voice_status=500,
+    )
+    update = {
+        "update_id": 5,
+        "message": {
+            "chat": {"id": 42, "type": "private"},
+            "from": {"id": 42, "is_bot": False},
+            "voice": {"file_id": "vf", "mime_type": "audio/ogg"},
+        },
+    }
+
+    with caplog.at_level(logging.WARNING, logger="jarvis.telegram"):
+        asyncio.run(bridge._handle(update))
+
+    assert any(path.endswith("/sendVoice") for path in tg_posts)
+    assert any("Готово, сэр." in text for text in tg_messages)
+    assert "voice delivery failed" in caplog.text
+    assert "reason=HTTPStatusError status=500" in caplog.text
+
+
+def test_forwarded_voice_is_source_material_and_stays_text_in_auto(monkeypatch):
+    bridge, tg_posts, _, chat_bodies, speak_bodies = _voice_bridge(
+        monkeypatch,
+        ogg=b"OggS-opus",
+        preference=False,
+    )
+    update = {
+        "update_id": 6,
+        "message": {
+            "chat": {"id": 42, "type": "private"},
+            "from": {"id": 42, "is_bot": False},
+            "forward_date": 1,
+            "voice": {"file_id": "vf", "mime_type": "audio/ogg"},
+        },
+    }
+
+    asyncio.run(bridge._handle(update))
+
+    assert chat_bodies[0]["response_modality"] == "text"
+    assert speak_bodies == []
+    assert any(path.endswith("/sendMessage") for path in tg_posts)
+    assert not any(path.endswith("/sendVoice") for path in tg_posts)
+
+
+def test_voice_command_persists_on_and_auto_for_internal_session(monkeypatch):
+    monkeypatch.setattr(
+        "jarvis_gpt.telegram_bridge._wav_to_ogg_opus", lambda wav: b"OggS-opus"
+    )
+    state = {"voice_reply": False}
+    patches: list[dict] = []
+    preference_headers: list[str] = []
+    chat_bodies: list[dict] = []
+    tg_posts: list[str] = []
+
+    def tg_handler(request):
+        tg_posts.append(request.url.path)
+        return httpx.Response(200, json={"ok": True, "result": {}})
+
+    def api_handler(request):
+        path = request.url.path
+        if path == "/api/preferences":
+            preference_headers.append(request.headers.get("X-Jarvis-User-Session", ""))
+            if request.method == "PATCH":
+                patch = json.loads(request.content)
+                patches.append(patch)
+                state.update(patch)
+            return httpx.Response(200, json=state)
+        if path == "/api/chat":
+            chat_bodies.append(json.loads(request.content))
+            return httpx.Response(
+                200,
+                json={
+                    "conversation_id": "c1",
+                    "message_id": "m",
+                    "answer": "ответ",
+                    "events": [],
+                },
+            )
+        if path == "/api/voice/speak":
+            return httpx.Response(200, content=b"wav")
+        if path == "/api/files":
+            return httpx.Response(200, json=[])
+        return httpx.Response(404)
+
+    bridge = _bridge(tg_handler, api_handler)
+
+    def update(update_id: int, text: str) -> dict:
+        return {
+            "update_id": update_id,
+            "message": {
+                "chat": {"id": 42, "type": "private"},
+                "from": {"id": 42, "is_bot": False, "username": "mutable-name"},
+                "text": text,
+            },
+        }
+
+    asyncio.run(bridge._handle(update(10, "/voice on")))
+    asyncio.run(bridge._handle(update(11, "обычный текст")))
+    asyncio.run(bridge._handle(update(12, "/voice auto")))
+    asyncio.run(bridge._handle(update(13, "ещё текст")))
+
+    assert patches == [{"voice_reply": True}, {"voice_reply": False}]
+    assert set(preference_headers) == {"session-42"}
+    assert [body["response_modality"] for body in chat_bodies] == ["voice", "text"]
+    assert sum(path.endswith("/sendVoice") for path in tg_posts) == 1
+
+
+def test_voice_off_does_not_fake_unpersistable_third_state():
+    patches: list[dict] = []
+    messages: list[str] = []
+
+    def tg_handler(request):
+        if request.url.path.endswith("/sendMessage"):
+            messages.append(json.loads(request.content).get("text") or "")
+        return httpx.Response(200, json={"ok": True, "result": {}})
+
+    def api_handler(request):
+        if request.url.path == "/api/preferences" and request.method == "PATCH":
+            patches.append(json.loads(request.content))
+        return httpx.Response(404)
+
+    bridge = _bridge(tg_handler, api_handler)
+    update = {
+        "update_id": 14,
+        "message": {
+            "chat": {"id": 42, "type": "private"},
+            "from": {"id": 42, "is_bot": False},
+            "text": "/voice off",
+        },
+    }
+
+    asyncio.run(bridge._handle(update))
+
+    assert patches == []
+    assert any("Настройку не менял" in text for text in messages)
 
 
 def test_quick_capture_body_parsers():

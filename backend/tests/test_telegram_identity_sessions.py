@@ -112,6 +112,8 @@ def test_empty_allowlist_auto_registers_and_scopes_every_user_backend_call():
         )
         if request.url.path == "/api/files":
             return httpx.Response(200, json=[])
+        if request.url.path == "/api/preferences":
+            return httpx.Response(200, json={"voice_reply": False})
         if request.url.path == "/api/chat":
             chat_payloads.append(json.loads(request.content))
             return httpx.Response(
@@ -145,6 +147,7 @@ def test_empty_allowlist_auto_registers_and_scopes_every_user_backend_call():
         }
     ]
     assert user_calls == [
+        ("/api/preferences", "short-lived-session"),
         ("/api/files", "short-lived-session"),
         ("/api/chat", "short-lived-session"),
         ("/api/files", "short-lived-session"),

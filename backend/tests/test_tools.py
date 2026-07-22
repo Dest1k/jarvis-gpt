@@ -30,11 +30,15 @@ from jarvis_gpt.tools import (
     OperatorTurnAuthorization,
     ToolRegistry,
     ToolSpec,
+    _multilingual_search_variants,
+    _normalize_search_languages,
+    _normalize_search_region,
     _parse_bing_results,
     _PublicOnlyAsyncNetworkBackend,
     _redact_native_payload,
     _store_web_evidence,
     _validate_native_payload,
+    _web_search_requests,
 )
 
 
@@ -66,6 +70,132 @@ def _guarded_browser_bridge_result(summary: str = "opened") -> dict:
             },
         },
     }
+
+
+def _complete_multilingual_coverage() -> dict:
+    regions = {
+        "ru": "ru-ru",
+        "en": "en-us",
+        "zh": "zh-cn",
+        "ko": "ko-kr",
+        "ja": "ja-jp",
+    }
+    languages = list(regions)
+    return {
+        "requested_languages": languages,
+        "complete": True,
+        "translation_complete": True,
+        "covered_languages": languages,
+        "missing_languages": [],
+        "translated_languages": languages,
+        "untranslated_languages": [],
+        "covered_count": len(languages),
+        "requested_count": len(languages),
+        "languages": {
+            language: {
+                "status": "results",
+                "translation": "translated",
+                "region": region,
+                "scheduled": True,
+                "result_count": 1,
+            }
+            for language, region in regions.items()
+        },
+    }
+
+
+def test_web_search_regions_cover_global_ru_en_zh_ko_ja():
+    assert _normalize_search_region(None) == "wt-wt"
+    assert [_normalize_search_region(item) for item in ("ru", "en", "cn", "kr", "jp")] == [
+        "ru-ru",
+        "en-us",
+        "zh-cn",
+        "ko-kr",
+        "ja-jp",
+    ]
+    assert _normalize_search_languages("all") == ["ru", "en", "zh", "ko", "ja"]
+
+    for region, language in (
+        ("ru-ru", "ru"),
+        ("en-us", "en"),
+        ("zh-cn", "zh"),
+        ("ko-kr", "ko"),
+        ("ja-jp", "ja"),
+    ):
+        requests = _web_search_requests(
+            "query",
+            region=region,
+            freshness="",
+            pages=1,
+            provider="bing",
+            vertical="web",
+            limit=2,
+        )
+        assert len(requests) == 1
+        assert f"setlang={language}" in requests[0]["url"]
+        assert requests[0]["headers"]["Accept-Language"].startswith(region)
+
+
+def test_multilingual_search_is_default_and_uses_real_translations():
+    class TranslationLLM:
+        async def complete(self, *_args, **_kwargs):
+            return SimpleNamespace(
+                ok=True,
+                content=json.dumps(
+                    {
+                        "ru": "запуск проекта",
+                        "en": "project launch",
+                        "zh": "项目启动",
+                        "ko": "프로젝트 시작",
+                        "ja": "プロジェクト開始",
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+
+    context = SimpleNamespace(
+        settings=SimpleNamespace(llm_enabled=True),
+        llm=TranslationLLM(),
+    )
+    variants = asyncio.run(
+        _multilingual_search_variants(context, "запуск проекта", {})
+    )
+
+    assert variants[0]["region"] == "wt-wt"
+    assert variants[0]["translation_status"] == "original"
+    assert variants[0]["untranslated_languages"] == []
+    assert {item["language"] for item in variants[1:]} == {
+        "ru",
+        "en",
+        "zh",
+        "ko",
+        "ja",
+    }
+    assert all(item["translation_status"] == "translated" for item in variants[1:])
+
+
+def test_failed_translation_is_reported_and_never_mislabeled_as_foreign_query():
+    class FailedTranslationLLM:
+        async def complete(self, *_args, **_kwargs):
+            return SimpleNamespace(ok=False, content="")
+
+    context = SimpleNamespace(
+        settings=SimpleNamespace(llm_enabled=True),
+        llm=FailedTranslationLLM(),
+    )
+    variants = asyncio.run(
+        _multilingual_search_variants(context, "только исходный запрос", {})
+    )
+
+    assert variants == [
+        {
+            "language": "",
+            "region": "wt-wt",
+            "query": "только исходный запрос",
+            "translation_status": "original",
+            "untranslated_languages": ["ru", "en", "zh", "ko", "ja"],
+        }
+    ]
 
 
 def test_operator_turn_authorization_is_exact_and_single_use(monkeypatch, tmp_path):
@@ -210,6 +340,33 @@ def test_tool_registry_runs_memory_tools(monkeypatch, tmp_path):
     assert search_result.ok is True
     assert search_result.data["items"]
     assert storage.counters()["tool_runs"] == 2
+    storage.close()
+
+
+def test_memory_search_finds_short_canonical_message_without_memory_duplicate(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    monkeypatch.setenv("JARVIS_LLM_ENABLED", "0")
+    settings = load_settings()
+    ensure_runtime_dirs(settings)
+    storage = JarvisStorage(settings.database_path)
+    storage.initialize()
+    tools = ToolRegistry(settings, storage, LLMRouter(settings))
+    conversation_id = storage.create_conversation("Short message")
+    message_id = storage.add_message(
+        conversation_id=conversation_id,
+        role="user",
+        content="OK",
+    )
+
+    result = asyncio.run(tools.run("memory.search", {"query": "OK"}))
+
+    assert result.ok is True
+    assert any(
+        item["source_type"] == "message" and item["id"] == message_id
+        for item in result.data["items"]
+    )
     storage.close()
 
 
@@ -3705,7 +3862,7 @@ def test_web_research_uses_archive_after_blocked_live_source(monkeypatch, tmp_pa
                         "url": "https://example.com/blocked",
                         "snippet": "Snippet",
                     }
-                ]
+                ],
             },
         )
 
@@ -4051,7 +4208,7 @@ def test_web_answer_news_fails_closed_when_only_undated_or_old_sources_exist(
                         "tool": "web.fetch",
                         "quality": "web-source",
                     }
-                ]
+                ],
             },
         )
 
@@ -4218,7 +4375,7 @@ def test_web_answer_uses_grounded_llm_synthesis(monkeypatch, tmp_path):
                         "quality": "vendor-docs",
                         "evidence_id": "ev_docs",
                     }
-                ]
+                ],
             },
         )
 
@@ -4366,7 +4523,8 @@ def test_web_answer_uses_answer_cache(monkeypatch, tmp_path):
                         "quality": "vendor-docs",
                         "evidence_id": "ev_docs",
                     }
-                ]
+                ],
+                "language_coverage": _complete_multilingual_coverage(),
             },
         )
 
@@ -4618,7 +4776,10 @@ def test_web_answer_caches_direct_store_search_link(monkeypatch, tmp_path):
             tool="web.research",
             ok=True,
             summary="Research ok.",
-            data={"sources": []},
+            data={
+                "sources": [],
+                "language_coverage": _complete_multilingual_coverage(),
+            },
         )
 
     async def fake_verify(_ctx, args):

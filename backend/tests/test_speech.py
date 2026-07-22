@@ -7,6 +7,7 @@ callables to exercise selection/degradation logic without a GPU or any model.
 
 from __future__ import annotations
 
+import wave
 from pathlib import Path
 
 import pytest
@@ -144,7 +145,11 @@ def test_transcribe_falls_back_to_cli(monkeypatch, tmp_path):
 
 
 def _write_fake_wav(path: Path) -> None:
-    path.write_bytes(b"RIFF" + b"\x00" * 60)  # > 44 bytes so it isn't treated as empty
+    with wave.open(str(path), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(16_000)
+        wav.writeframes(b"\x00\x00" * 1_600)
 
 
 def test_synthesize_empty_text(tmp_path):
@@ -187,6 +192,26 @@ def test_synthesize_falls_back_to_sapi(monkeypatch, tmp_path):
     result = speech.synthesize("Привет, сэр.", out, style="off")
     assert result.ok is True
     assert result.engine == "sapi"
+
+
+def test_synthesize_rejects_header_only_engine_success(monkeypatch, tmp_path):
+    out = tmp_path / "out.wav"
+
+    def _sapi(text, destination, **kwargs):
+        with wave.open(str(destination), "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(16_000)
+            wav.writeframes(b"\x00\x00")
+        return "Microsoft Irina"
+
+    monkeypatch.setattr(speech, "_silero_available", lambda: False)
+    monkeypatch.setattr(speech, "_sapi_available", lambda: True)
+    monkeypatch.setattr(speech, "_sapi_synthesize_to_wav", _sapi)
+    result = speech.synthesize("Привет, сэр.", out, engine="sapi", style="off")
+
+    assert result.ok is False
+    assert result.error == "Engine produced no audio."
 
 
 def test_synthesize_no_engine(monkeypatch, tmp_path):

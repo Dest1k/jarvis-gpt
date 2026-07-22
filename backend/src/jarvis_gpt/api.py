@@ -602,8 +602,6 @@ _HTTP_GUEST_ENDPOINTS = frozenset(
 # HTTP transport to reach that second, more specific authorization decision.
 _HTTP_PERSONAL_ENDPOINTS = frozenset(
     {
-        "agent_trace",
-        "agent_message_trace",
         "preferences",
         "update_preferences",
         "persona",
@@ -646,6 +644,8 @@ _HTTP_PERSONAL_ENDPOINTS = frozenset(
 # runtime, model inventory, dispatcher, diagnostics and recovery remain owner-only.
 _HTTP_ADMIN_READ_ENDPOINTS = frozenset(
     {
+        "agent_trace",
+        "agent_message_trace",
         "status",
         "runtime_security",
         "operator_queue",
@@ -770,6 +770,12 @@ def _http_default_presets(endpoint_name: str) -> tuple[str, ...]:
     return ()
 
 
+def _http_required_presets(endpoint_name: str) -> tuple[str, ...]:
+    if endpoint_name in _HTTP_ADMIN_READ_ENDPOINTS:
+        return ("owner", "admin")
+    return ()
+
+
 def _http_risk_level(endpoint_name: str, method: str) -> int:
     if endpoint_name in _HTTP_HIGH_RISK_ENDPOINTS:
         return 4
@@ -823,6 +829,7 @@ def _build_http_api_catalog(
                 default_requires_hitl=route.name in _HTTP_HIGH_RISK_ENDPOINTS,
                 source="http_api",
                 default_presets=_http_default_presets(route.name),
+                required_presets=_http_required_presets(route.name),
             )
             definitions.append(definition)
             policies.append(
@@ -1920,17 +1927,37 @@ async def ack_reminder(reminder_id: str) -> ReminderActionResponse:
 async def chat(request: ChatRequest) -> ChatResponse:
     from .runtime_notices import blocking_notice, user_facing_reply
 
+    actor = current_actor()
     notice = blocking_notice(Path(app.state.settings.state_dir))
     if notice and notice.get("kind") == "service_mode":
         # Maintenance fully blocks the agent turn for everyone.
-        return ChatResponse(
-            conversation_id=request.conversation_id or "service-mode",
-            message_id=f"svc-{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}",
-            answer=user_facing_reply(notice),
-            events=[],
-            mission_id=None,
-            duration_ms=0,
-        )
+        try:
+            response = await app.state.agent.record_notice_turn(
+                request.message,
+                answer=user_facing_reply(notice),
+                source="service_mode",
+                conversation_id=request.conversation_id,
+                attachments=[item.model_dump() for item in request.attachments],
+                mode=request.mode,
+                temperature=request.temperature,
+                max_tokens=request.max_tokens,
+                thinking_enabled=request.thinking_enabled,
+                access_mode=request.access_mode,
+                notification_chat_id=(
+                    request.notification_chat_id if current_actor().is_owner else None
+                ),
+                response_modality=request.response_modality,
+                transport_request_id=request.request_id,
+            )
+            return _sanitize_chat_response_for_actor(response, actor)
+        except (
+            AuthorizationError,
+            ChatRequestConflictError,
+            ChatRequestInProgressError,
+            ChatUnavailableError,
+            ResourceIsolationError,
+        ) as exc:
+            raise _chat_http_exception(exc) from exc
     if (
         notice
         and notice.get("kind") == "model_overload"
@@ -1938,16 +1965,35 @@ async def chat(request: ChatRequest) -> ChatResponse:
     ):
         # Guests/TG users get an immediate overload reply; the owner keeps
         # probing the model so the detector can clear when latency recovers.
-        return ChatResponse(
-            conversation_id=request.conversation_id or "model-overload",
-            message_id=f"ovl-{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}",
-            answer=user_facing_reply(notice),
-            events=[],
-            mission_id=None,
-            duration_ms=0,
-        )
+        try:
+            response = await app.state.agent.record_notice_turn(
+                request.message,
+                answer=user_facing_reply(notice),
+                source="model_overload",
+                conversation_id=request.conversation_id,
+                attachments=[item.model_dump() for item in request.attachments],
+                mode=request.mode,
+                temperature=request.temperature,
+                max_tokens=request.max_tokens,
+                thinking_enabled=request.thinking_enabled,
+                access_mode=request.access_mode,
+                notification_chat_id=(
+                    request.notification_chat_id if current_actor().is_owner else None
+                ),
+                response_modality=request.response_modality,
+                transport_request_id=request.request_id,
+            )
+            return _sanitize_chat_response_for_actor(response, actor)
+        except (
+            AuthorizationError,
+            ChatRequestConflictError,
+            ChatRequestInProgressError,
+            ChatUnavailableError,
+            ResourceIsolationError,
+        ) as exc:
+            raise _chat_http_exception(exc) from exc
     try:
-        return await app.state.agent.chat(
+        response = await app.state.agent.chat(
             request.message,
             conversation_id=request.conversation_id,
             mode=request.mode,
@@ -1962,6 +2008,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
             response_modality=request.response_modality,
             transport_request_id=request.request_id,
         )
+        return _sanitize_chat_response_for_actor(response, actor)
     except (
         AuthorizationError,
         ChatRequestConflictError,
@@ -1995,6 +2042,141 @@ def _chat_http_exception(exc: Exception) -> HTTPException:
     if isinstance(exc, ChatRequestConflictError):
         return HTTPException(status_code=409, detail=str(exc))
     return HTTPException(status_code=403, detail="Chat permission denied")
+
+
+_TENANT_TECHNICAL_EVENT_KEYS = frozenset(
+    {
+        "authorization_decision_id",
+        "base_url",
+        "endpoint",
+        "llm_base_url",
+        "llm_endpoint",
+        "llm_model",
+        "model",
+        "model_root",
+        "profile",
+        "security_id",
+        "task_kernel",
+    }
+)
+
+
+def _actor_has_live_privileged_role(actor: ActorContext) -> bool:
+    service = getattr(app.state, "authorization", None)
+    if not isinstance(service, AuthorizationService):
+        return False
+    try:
+        user = service.get_user(actor.user_id)
+    except Exception:  # noqa: BLE001 - disclosure must fail closed.
+        return False
+    return bool(
+        user
+        and str(user.get("status") or "") == "active"
+        and str(user.get("preset_key") or "") in {"owner", "admin"}
+    )
+
+
+def _sanitize_tenant_technical_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _sanitize_tenant_technical_value(item)
+            for key, item in value.items()
+            if str(key).casefold() not in _TENANT_TECHNICAL_EVENT_KEYS
+        }
+    if isinstance(value, list):
+        return [_sanitize_tenant_technical_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [_sanitize_tenant_technical_value(item) for item in value]
+    if isinstance(value, str):
+        redacted = value
+        settings = getattr(app.state, "settings", None)
+        for secret in (
+            str(getattr(settings, "llm_base_url", "") or ""),
+            str(getattr(settings, "llm_model", "") or ""),
+            str(getattr(getattr(settings, "profile", None), "name", "") or ""),
+        ):
+            if secret:
+                redacted = redacted.replace(secret, "[redacted]")
+        return redacted
+    return value
+
+
+def _sanitize_tenant_event(event: dict[str, Any]) -> dict[str, Any]:
+    clean = _sanitize_tenant_technical_value(dict(event))
+    title = str(event.get("title") or "")
+    event_type = str(event.get("type") or "")
+    if title == "LLM router":
+        clean.update(
+            {
+                "title": "Обработка запроса",
+                "content": None,
+                "payload": {},
+            }
+        )
+    elif event_type == "task_kernel" or title == "Task kernel":
+        clean.update(
+            {
+                "title": "План обработки",
+                "content": None,
+                "payload": {},
+            }
+        )
+    return clean
+
+
+def _sanitize_chat_response_for_actor(
+    response: ChatResponse,
+    actor: ActorContext,
+) -> ChatResponse:
+    if _actor_has_live_privileged_role(actor):
+        return response
+    payload = response.model_dump(mode="python")
+    payload["events"] = [
+        _sanitize_tenant_event(event)
+        for event in payload.get("events", [])
+        if isinstance(event, dict)
+    ]
+    return ChatResponse.model_validate(payload)
+
+
+def _sanitize_message_for_actor(
+    message: dict[str, Any],
+    actor: ActorContext,
+) -> dict[str, Any]:
+    if _actor_has_live_privileged_role(actor):
+        return message
+    clean = dict(message)
+    metadata = dict(clean.get("metadata") or {})
+    metadata.pop("task_kernel", None)
+    raw_events = metadata.get("events")
+    if isinstance(raw_events, list):
+        metadata["events"] = [
+            _sanitize_tenant_event(event)
+            for event in raw_events
+            if isinstance(event, dict)
+        ]
+    clean["metadata"] = _sanitize_tenant_technical_value(metadata)
+    return clean
+
+
+def _sanitize_stream_item_for_actor(
+    item: dict[str, Any],
+    actor: ActorContext,
+) -> dict[str, Any]:
+    if _actor_has_live_privileged_role(actor):
+        return item
+    clean = dict(item)
+    event = clean.get("event")
+    if isinstance(event, dict):
+        clean["event"] = _sanitize_tenant_event(event)
+    events = clean.get("events")
+    if isinstance(events, list):
+        clean["events"] = [
+            _sanitize_tenant_event(event)
+            for event in events
+            if isinstance(event, dict)
+        ]
+    return clean
 
 
 @app.get("/api/voice/status")
@@ -2054,8 +2236,18 @@ def _persist_interrupted_stream(
     partial: list[str],
     events: list[dict[str, Any]],
     request_id: str | None = None,
+    privileged_derived: bool = False,
 ) -> dict[str, Any] | None:
     if not conversation_id:
+        return None
+    if privileged_derived:
+        # A revocable owner/admin answer must never gain an unclassified plaintext
+        # recovery copy outside the canonical assistant-message visibility gate.
+        _clear_interrupted_stream(
+            storage,
+            conversation_id=conversation_id,
+            request_id=None,
+        )
         return None
     answer = "".join(partial).strip()
     if not answer:
@@ -2077,6 +2269,7 @@ def _persist_interrupted_stream(
         "answer": answer,
         "events": events,
         "terminal": False,
+        "required_presets": [],
         "saved_at": utc_now(),
         "chars": len(answer),
     }
@@ -2169,7 +2362,8 @@ def _stream_error_envelope(exc: Exception) -> dict[str, Any]:
 async def chat_stream(request: ChatRequest) -> StreamingResponse:
     from .runtime_notices import blocking_notice, user_facing_reply
 
-    if current_actor().preset_key == "guest":
+    actor = current_actor()
+    if actor.preset_key == "guest":
         raise HTTPException(status_code=403, detail="Guest streaming is not available")
 
     notice = blocking_notice(Path(app.state.settings.state_dir))
@@ -2177,10 +2371,34 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
         notice.get("kind") == "service_mode"
         or (notice.get("kind") == "model_overload" and not current_actor().is_owner)
     ):
-        answer = user_facing_reply(notice)
         kind = str(notice.get("kind") or "notice")
-        conversation_id = request.conversation_id or kind
-        message_id = f"{kind[:3]}-{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}"
+        try:
+            persisted = await app.state.agent.record_notice_turn(
+                request.message,
+                answer=user_facing_reply(notice),
+                source=kind,
+                conversation_id=request.conversation_id,
+                attachments=[item.model_dump() for item in request.attachments],
+                mode=request.mode,
+                temperature=request.temperature,
+                max_tokens=request.max_tokens,
+                thinking_enabled=request.thinking_enabled,
+                access_mode="owner",
+                notification_chat_id=None,
+                response_modality=request.response_modality,
+                transport_request_id=request.request_id,
+            )
+        except (
+            AuthorizationError,
+            ChatRequestConflictError,
+            ChatRequestInProgressError,
+            ChatUnavailableError,
+            ResourceIsolationError,
+        ) as exc:
+            raise _chat_http_exception(exc) from exc
+        answer = persisted.answer
+        conversation_id = persisted.conversation_id
+        message_id = persisted.message_id
 
         async def _notice_mode_lines():
             yield (
@@ -2258,6 +2476,7 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
         conversation_id = request.conversation_id
         partial: list[str] = []
         events: list[dict[str, Any]] = []
+        privileged_partial = False
         terminal_sent = False
         item = first_item
         try:
@@ -2268,6 +2487,9 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
                     )
                 elif item.get("type") == "delta":
                     partial.append(str(item.get("content") or ""))
+                    privileged_partial = bool(
+                        privileged_partial or item.get("privileged_derived") is True
+                    )
                 elif item.get("type") == "event" and isinstance(item.get("event"), dict):
                     events.append(item["event"])
                 elif item.get("type") == "done":
@@ -2283,9 +2505,11 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
                         partial=partial,
                         events=events,
                         request_id=request.request_id,
+                        privileged_derived=privileged_partial,
                     )
                 terminal_sent = item.get("type") in {"done", "error"}
-                yield f"{json.dumps(item, ensure_ascii=False)}\n".encode()
+                wire_item = _sanitize_stream_item_for_actor(item, actor)
+                yield f"{json.dumps(wire_item, ensure_ascii=False)}\n".encode()
                 if terminal_sent:
                     return
                 try:
@@ -2305,6 +2529,7 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
                         partial=partial,
                         events=events,
                         request_id=request.request_id,
+                        privileged_derived=privileged_partial,
                     )
                 except Exception:  # noqa: BLE001 - preserve cancellation semantics
                     LOGGER.exception("Failed to checkpoint cancelled chat stream")
@@ -2319,6 +2544,7 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
                         partial=partial,
                         events=events,
                         request_id=request.request_id,
+                        privileged_derived=privileged_partial,
                     )
                 terminal_sent = True
                 envelope = _stream_error_envelope(exc)
@@ -2344,7 +2570,19 @@ async def interrupted_stream(conversation_id: str) -> dict[str, Any]:
     )
     if not isinstance(item, dict):
         raise HTTPException(status_code=404, detail="Interrupted stream not found")
-    return item
+    actor = current_actor()
+    required_presets = item.get("required_presets")
+    if not _actor_has_live_privileged_role(actor) and (
+        required_presets is None
+        or (
+            isinstance(required_presets, list)
+            and any(str(preset) in {"owner", "admin"} for preset in required_presets)
+        )
+    ):
+        # Legacy checkpoints have no trustworthy provenance; fail closed after
+        # demotion instead of replaying a possibly privileged plaintext answer.
+        raise HTTPException(status_code=404, detail="Interrupted stream not found")
+    return _sanitize_stream_item_for_actor(item, actor)
 
 
 @app.get("/api/conversations", response_model=list[ConversationItem])
@@ -2362,7 +2600,8 @@ async def list_conversation_messages(
     messages = app.state.storage.list_messages(conversation_id, limit=limit)
     if not messages and app.state.storage.get_conversation(conversation_id) is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
-    return messages
+    actor = current_actor()
+    return [_sanitize_message_for_actor(message, actor) for message in messages]
 
 
 @app.post("/api/messages/{message_id}/feedback", response_model=MessageItem)
@@ -2383,7 +2622,9 @@ async def set_message_feedback(message_id: str, request: MessageFeedbackRequest)
                 "payload": {"message_id": message_id, "rating": request.rating},
             }
         )
-    return MessageItem.model_validate(updated)
+    return MessageItem.model_validate(
+        _sanitize_message_for_actor(updated, current_actor())
+    )
 
 
 @app.patch("/api/messages/{message_id}", response_model=MessageItem)
@@ -2394,7 +2635,9 @@ async def edit_message(message_id: str, payload: dict[str, Any]) -> MessageItem:
     updated = app.state.storage.edit_message(message_id, content)
     if updated is None:
         raise HTTPException(status_code=404, detail="Message not found or already deleted")
-    return MessageItem.model_validate(updated)
+    return MessageItem.model_validate(
+        _sanitize_message_for_actor(updated, current_actor())
+    )
 
 
 @app.delete("/api/messages/{message_id}")
@@ -2429,7 +2672,13 @@ async def export_conversation(conversation_id: str) -> dict[str, Any]:
     for msg in messages:
         if msg.get("is_deleted"):
             continue
-        role_label = "Вы" if msg["role"] == "user" else "Jarvis" if msg["role"] == "assistant" else msg["role"]
+        role_label = (
+            "Вы"
+            if msg["role"] == "user"
+            else "Jarvis"
+            if msg["role"] == "assistant"
+            else msg["role"]
+        )
         ts = str(msg.get("created_at") or "")[:19].replace("T", " ")
         lines.append(f"**{role_label}** ({ts}):\n{msg['content']}\n")
     return {
