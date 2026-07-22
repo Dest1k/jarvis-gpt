@@ -74,6 +74,45 @@ def _use_qwen_contract_stub(agent: AgentRuntime, answer: str = "Qwen contract an
     agent.llm.complete = complete
 
 
+def test_response_preference_direct_action_persists_without_llm(monkeypatch, tmp_path):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+
+    response = asyncio.run(
+        agent.chat("Джарвис, отвечай мне на голосовые текстом", mode="chat")
+    )
+
+    assert "буду отвечать текстом" in response.answer
+    assert storage.get_runtime_value("experience.preferences")[
+        "voice_input_reply_mode"
+    ] == "text"
+    storage.close()
+
+
+def test_transcribed_voice_can_change_response_preference(monkeypatch, tmp_path):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+
+    async def folded(_message, _attachments):
+        return "Отвечай мне на голосовые текстом"
+
+    monkeypatch.setattr(agent, "_fold_audio_attachment_transcripts", folded)
+    response = asyncio.run(
+        agent.chat(
+            " ",
+            mode="chat",
+            attachments=[
+                {"id": "file_voice", "name": "voice.ogg", "mime_type": "audio/ogg"}
+            ],
+            response_modality="voice",
+        )
+    )
+
+    assert "буду отвечать текстом" in response.answer
+    assert storage.get_runtime_value("experience.preferences")[
+        "voice_input_reply_mode"
+    ] == "text"
+    storage.close()
+
+
 def test_chat_request_cap_tracks_configured_api_admission(monkeypatch):
     monkeypatch.setenv("JARVIS_API_USER_RATE_LIMIT_PER_MINUTE", "240")
     assert _chat_request_hard_cap() == 240 * ((26 * 60) + 2)

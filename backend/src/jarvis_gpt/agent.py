@@ -54,7 +54,11 @@ from .executive_runtime import (
     validate_mission_decomposition,
     validate_mission_goal_coverage,
 )
-from .experience import DEFAULT_AUTONOMY_POLICY
+from .experience import (
+    DEFAULT_AUTONOMY_POLICY,
+    ExperienceManager,
+    parse_response_preference,
+)
 from .llm import LLMRouter
 from .models import (
     ChatEvent,
@@ -2368,6 +2372,32 @@ class AgentRuntime:
             self.storage.merge_message_metadata(
                 existing_user_message_id,
                 {"transcript_folded": True, "transcript_folded_at": utc_now()},
+            )
+
+        preference_action = self._response_preference_direct_action(clean_message)
+        if preference_action is not None:
+            self._finalize_accepted_user_message(
+                existing_user_message_id,
+                metadata=message_metadata,
+            )
+            duration_ms = _elapsed_ms(started_at)
+            message_id = self.storage.add_message(
+                conversation_id=conversation_id,
+                role="assistant",
+                content=preference_action.answer,
+                metadata={
+                    **message_metadata,
+                    "duration_ms": duration_ms,
+                    "source": "response_preference",
+                    "events": [event.model_dump() for event in preference_action.events],
+                },
+            )
+            return ChatResponse(
+                conversation_id=conversation_id,
+                message_id=message_id,
+                answer=preference_action.answer,
+                events=preference_action.events,
+                duration_ms=duration_ms,
             )
 
         policy_answer = self._restricted_tenant_request_answer(
@@ -6058,11 +6088,40 @@ class AgentRuntime:
         )
         return DirectAction(answer=answer, events=[event])
 
+    def _response_preference_direct_action(self, message: str) -> DirectAction | None:
+        directive = parse_response_preference(message)
+        if directive is None:
+            return None
+        if not self._capability_allowed("preferences.write.own", record=True):
+            return DirectAction(
+                answer="У этой учётной записи нет права менять настройки ответов.",
+                events=[],
+            )
+        updated = ExperienceManager(
+            settings=self.settings,
+            storage=self.storage,
+        ).update_preferences(directive.patch)
+        if any(updated.get(key) != value for key, value in directive.patch.items()):
+            return DirectAction(
+                answer="Не удалось подтвердить сохранение настройки ответа.",
+                events=[],
+            )
+        event = ChatEvent(
+            type="preference",
+            title="Настройка ответа сохранена",
+            content=directive.confirmation,
+            payload={"changed": sorted(directive.patch)},
+        )
+        return DirectAction(answer=directive.confirmation, events=[event])
+
     async def _try_direct_action(
         self,
         message: str,
         context: AgentContext | None = None,
     ) -> DirectAction | None:
+        preference_action = self._response_preference_direct_action(message)
+        if preference_action is not None:
+            return preference_action
         recent_account_request = _account_recent_messages_request(message)
         if recent_account_request is not None and context is not None:
             return await self._account_recent_messages_direct_action(

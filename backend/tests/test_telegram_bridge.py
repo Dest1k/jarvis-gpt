@@ -2393,7 +2393,8 @@ def _voice_bridge(
     telegram_voice_description: str = "voice rejected",
     telegram_audio_status: int = 200,
     answer: str = "Готово, сэр.",
-    preference: bool = False,
+    preference: bool | str = False,
+    preference_after_chat: str | None = None,
 ):
     monkeypatch.setattr("jarvis_gpt.telegram_bridge._wav_to_ogg_opus", lambda wav: ogg)
     monkeypatch.setattr("jarvis_gpt.telegram_bridge._wav_to_mp3", lambda wav: mp3)
@@ -2402,6 +2403,7 @@ def _voice_bridge(
     tg_uploads: list[bytes] = []
     chat_bodies: list[dict] = []
     speak_bodies: list[dict] = []
+    current_mode = preference if isinstance(preference, str) else "auto"
 
     def tg_handler(request):
         path = request.url.path
@@ -2427,6 +2429,7 @@ def _voice_bridge(
         return httpx.Response(200, json={"ok": True, "result": {}})
 
     def api_handler(request):
+        nonlocal current_mode
         path = request.url.path
         if path == "/api/files/upload":
             return httpx.Response(
@@ -2438,6 +2441,8 @@ def _voice_bridge(
             )
         if path == "/api/chat":
             chat_bodies.append(json.loads(request.content))
+            if preference_after_chat is not None:
+                current_mode = preference_after_chat
             return httpx.Response(
                 200,
                 json={
@@ -2454,7 +2459,13 @@ def _voice_bridge(
                 content=b"RIFFwav-bytes" if speak_status == 200 else b"",
             )
         if path == "/api/preferences" and request.method == "GET":
-            return httpx.Response(200, json={"voice_reply": preference})
+            return httpx.Response(
+                200,
+                json={
+                    "voice_reply": bool(preference),
+                    "voice_input_reply_mode": current_mode,
+                },
+            )
         if path == "/api/files":
             return httpx.Response(200, json=[])
         return httpx.Response(404, json={})
@@ -2490,6 +2501,54 @@ def test_inbound_voice_transcribed_and_answered_with_voice(monkeypatch):
     # Spoken input -> a synthesized voice note reply (inline OGG/Opus).
     assert any(p.endswith("/sendVoice") for p in tg_posts)
     assert not any(p.endswith("/sendMessage") for p in tg_posts)
+
+
+def test_inbound_voice_is_answered_with_text_when_user_preference_says_text(monkeypatch):
+    bridge, tg_posts, _, _, chat_bodies, speak_bodies = _voice_bridge(
+        monkeypatch,
+        ogg=b"OggS-opus",
+        preference="text",
+    )
+    update = {
+        "update_id": 101,
+        "message": {
+            "chat": {"id": 42, "type": "private"},
+            "from": {"id": 42, "is_bot": False},
+            "voice": {"file_id": "vf", "mime_type": "audio/ogg", "duration": 3},
+        },
+    }
+
+    asyncio.run(bridge._handle(update))
+
+    assert chat_bodies[0]["response_modality"] == "text"
+    assert speak_bodies == []
+    assert any(path.endswith("/sendMessage") for path in tg_posts)
+    assert not any(path.endswith(("/sendVoice", "/sendAudio")) for path in tg_posts)
+
+
+def test_spoken_preference_change_is_reloaded_before_delivery(monkeypatch):
+    bridge, tg_posts, _, _, chat_bodies, speak_bodies = _voice_bridge(
+        monkeypatch,
+        ogg=b"OggS-opus",
+        preference="auto",
+        preference_after_chat="text",
+        answer="Запомнил: на голосовые сообщения буду отвечать текстом.",
+    )
+    update = {
+        "update_id": 102,
+        "message": {
+            "chat": {"id": 42, "type": "private"},
+            "from": {"id": 42, "is_bot": False},
+            "voice": {"file_id": "vf", "mime_type": "audio/ogg", "duration": 3},
+        },
+    }
+
+    asyncio.run(bridge._handle(update))
+
+    assert chat_bodies[0]["response_modality"] == "voice"
+    assert speak_bodies == []
+    assert any(path.endswith("/sendMessage") for path in tg_posts)
+    assert not any(path.endswith(("/sendVoice", "/sendAudio")) for path in tg_posts)
 
 
 def test_direct_audio_without_caption_is_answered_with_voice(monkeypatch):
@@ -2828,36 +2887,24 @@ def test_forwarded_voice_is_source_material_and_stays_text_in_auto(monkeypatch):
     assert not any(path.endswith("/sendVoice") for path in tg_posts)
 
 
-def test_voice_command_enforces_auto_without_reading_or_writing_preferences():
-    preference_calls: list[str] = []
-    chat_bodies: list[dict] = []
-    tg_posts: list[str] = []
+def test_voice_command_persists_and_reports_scoped_mode():
+    current = {"voice_input_reply_mode": "auto"}
+    patches: list[dict] = []
     tg_messages: list[str] = []
 
     def tg_handler(request):
-        tg_posts.append(request.url.path)
         if request.url.path.endswith("/sendMessage"):
             tg_messages.append(json.loads(request.content).get("text") or "")
         return httpx.Response(200, json={"ok": True, "result": {}})
 
     def api_handler(request):
-        path = request.url.path
-        if path == "/api/preferences":
-            preference_calls.append(request.method)
-            return httpx.Response(500, json={})
-        if path == "/api/chat":
-            chat_bodies.append(json.loads(request.content))
-            return httpx.Response(
-                200,
-                json={
-                    "conversation_id": "c1",
-                    "message_id": "m",
-                    "answer": "ответ",
-                    "events": [],
-                },
-            )
-        if path == "/api/files":
-            return httpx.Response(200, json=[])
+        if request.url.path == "/api/preferences" and request.method == "GET":
+            return httpx.Response(200, json=current)
+        if request.url.path == "/api/preferences" and request.method == "PATCH":
+            patch = json.loads(request.content)
+            patches.append(patch)
+            current.update(patch)
+            return httpx.Response(200, json=current)
         return httpx.Response(404)
 
     bridge = _bridge(tg_handler, api_handler)
@@ -2872,21 +2919,26 @@ def test_voice_command_enforces_auto_without_reading_or_writing_preferences():
             },
         }
 
-    asyncio.run(bridge._handle(update(10, "/voice on")))
-    asyncio.run(bridge._handle(update(11, "обычный текст")))
-    asyncio.run(bridge._handle(update(12, "/voice auto")))
-    asyncio.run(bridge._handle(update(13, "ещё текст")))
+    asyncio.run(bridge._handle(update(10, "/voice text")))
+    asyncio.run(bridge._handle(update(11, "/voice")))
+    asyncio.run(bridge._handle(update(12, "/voice on")))
+    asyncio.run(bridge._handle(update(13, "/voice auto")))
 
-    assert preference_calls == []
-    assert [body["response_modality"] for body in chat_bodies] == ["text", "text"]
-    assert not any(path.endswith(("/sendVoice", "/sendAudio")) for path in tg_posts)
-    assert any("Режим <code>on</code> отключён" in text for text in tg_messages)
-    assert any("Голосовые ответы: <code>auto</code>" in text for text in tg_messages)
+    assert patches == [
+        {"voice_input_reply_mode": "text"},
+        {"voice_input_reply_mode": "voice"},
+        {"voice_input_reply_mode": "auto"},
+    ]
+    assert any("буду отвечать текстом" in text for text in tg_messages)
+    assert any("Голосовые ответы: <code>text</code>" in text for text in tg_messages)
+    assert any("буду отвечать голосом" in text for text in tg_messages)
+    assert any("автоматический режим" in text for text in tg_messages)
 
 
-def test_voice_off_does_not_fake_unpersistable_third_state():
+def test_natural_language_response_preferences_are_persisted_without_chat():
     patches: list[dict] = []
     messages: list[str] = []
+    chat_calls = 0
 
     def tg_handler(request):
         if request.url.path.endswith("/sendMessage"):
@@ -2895,23 +2947,36 @@ def test_voice_off_does_not_fake_unpersistable_third_state():
 
     def api_handler(request):
         if request.url.path == "/api/preferences" and request.method == "PATCH":
-            patches.append(json.loads(request.content))
+            patch = json.loads(request.content)
+            patches.append(patch)
+            return httpx.Response(200, json=patch)
+        if request.url.path == "/api/chat":
+            nonlocal chat_calls
+            chat_calls += 1
         return httpx.Response(404)
 
     bridge = _bridge(tg_handler, api_handler)
-    update = {
-        "update_id": 14,
-        "message": {
-            "chat": {"id": 42, "type": "private"},
-            "from": {"id": 42, "is_bot": False},
-            "text": "/voice off",
-        },
-    }
 
-    asyncio.run(bridge._handle(update))
+    def update(update_id: int, text: str) -> dict:
+        return {
+            "update_id": update_id,
+            "message": {
+                "chat": {"id": 42, "type": "private"},
+                "from": {"id": 42, "is_bot": False},
+                "text": text,
+            },
+        }
 
-    assert patches == []
-    assert any("Режим <code>off</code> отключён" in text for text in messages)
+    asyncio.run(bridge._handle(update(14, "Отвечай мне на голосовые текстом")))
+    asyncio.run(bridge._handle(update(15, "Пожалуйста, отвечай мне подробно")))
+
+    assert patches == [
+        {"voice_input_reply_mode": "text"},
+        {"communication_style": "detailed"},
+    ]
+    assert chat_calls == 0
+    assert any("буду отвечать текстом" in text for text in messages)
+    assert any("буду отвечать подробно" in text for text in messages)
 
 
 def test_quick_capture_body_parsers():

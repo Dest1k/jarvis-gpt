@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
+from dataclasses import dataclass
 from typing import Any
 
 from . import persona as persona_module
@@ -14,10 +16,126 @@ DEFAULT_PREFERENCES: dict[str, Any] = {
     "communication_style": "concise",
     "daily_briefing": True,
     "voice_reply": False,
+    "voice_input_reply_mode": "auto",
     "preferred_profile": "gemma4-turbo",
     "quiet_hours": "",
     "working_roots": [r"D:\jarvis", r"D:\jarvis-gpt"],
 }
+
+
+@dataclass(frozen=True)
+class ResponsePreferenceDirective:
+    """A high-confidence natural-language preference update."""
+
+    patch: dict[str, Any]
+    confirmation: str
+
+
+_VOICE_MODE_ALIASES = {
+    "auto": "auto",
+    "авто": "auto",
+    "автоматически": "auto",
+    "как обычно": "auto",
+    "text": "text",
+    "текст": "text",
+    "текстом": "text",
+    "off": "text",
+    "voice": "voice",
+    "голос": "voice",
+    "голосом": "voice",
+    "on": "voice",
+}
+_STYLE_ALIASES = {
+    "кратко": "concise",
+    "коротко": "concise",
+    "лаконично": "concise",
+    "concise": "concise",
+    "сбалансированно": "balanced",
+    "обычно": "balanced",
+    "balanced": "balanced",
+    "подробно": "detailed",
+    "детально": "detailed",
+    "развернуто": "detailed",
+    "detailed": "detailed",
+}
+_VOICE_TARGET = r"(?:мои\s+)?голосов(?:ые|ое)(?:\s+сообщени(?:я|е))?"
+_DIRECTIVE_PREFIX = (
+    r"(?:(?:запомни\s+это|джарвис|пожалуйста|запомни)[\s,:;\-]+)*"
+)
+
+
+def parse_response_preference(text: str) -> ResponsePreferenceDirective | None:
+    """Parse only explicit, durable response-choice wording.
+
+    One-shot requests use ``ответь`` and intentionally do not match. Persistent
+    directives use ``отвечай`` or the explicit ``/voice`` and ``/style`` commands.
+    """
+
+    normalized = " ".join(str(text or "").strip().casefold().replace("ё", "е").split())
+    normalized = normalized.strip(" .!?\t\r\n")
+    if not normalized:
+        return None
+
+    command = re.fullmatch(r"/voice(?:@[a-z0-9_]+)?\s+(.+)", normalized)
+    if command:
+        mode = _VOICE_MODE_ALIASES.get(command.group(1).strip())
+        return _voice_mode_directive(mode) if mode else None
+    command = re.fullmatch(r"/style(?:@[a-z0-9_]+)?\s+(.+)", normalized)
+    if command:
+        style = _STYLE_ALIASES.get(command.group(1).strip())
+        return _style_directive(style) if style else None
+
+    body = re.sub(rf"^{_DIRECTIVE_PREFIX}", "", normalized).strip(" ,:;-.")
+    voice_patterns = (
+        rf"(?:всегда\s+)?отвечай(?:\s+мне)?\s+на\s+{_VOICE_TARGET}\s+(.+)",
+        rf"на\s+{_VOICE_TARGET}\s+(?:всегда\s+)?отвечай(?:\s+мне)?\s+(.+)",
+        rf"{_VOICE_TARGET}\s+(?:всегда\s+)?отвечай(?:\s+мне)?\s+(.+)",
+    )
+    for pattern in voice_patterns:
+        match = re.fullmatch(pattern, body)
+        if match:
+            mode = _VOICE_MODE_ALIASES.get(match.group(1).strip())
+            return _voice_mode_directive(mode) if mode else None
+
+    style_match = re.fullmatch(
+        r"(?:всегда\s+)?(?:отвечай|пиши)(?:\s+мне)?\s+(.+)", body
+    )
+    if style_match:
+        style = _STYLE_ALIASES.get(style_match.group(1).strip())
+        return _style_directive(style) if style else None
+    return None
+
+
+def _voice_mode_directive(mode: str | None) -> ResponsePreferenceDirective | None:
+    if mode == "text":
+        confirmation = "Запомнил: на голосовые сообщения буду отвечать текстом."
+    elif mode == "voice":
+        confirmation = "Запомнил: на голосовые сообщения буду отвечать голосом."
+    elif mode == "auto":
+        confirmation = (
+            "Запомнил: автоматический режим — на прямые голосовые отвечаю голосом, "
+            "на текст — текстом."
+        )
+    else:
+        return None
+    return ResponsePreferenceDirective(
+        patch={"voice_input_reply_mode": mode},
+        confirmation=confirmation,
+    )
+
+
+def _style_directive(style: str | None) -> ResponsePreferenceDirective | None:
+    labels = {
+        "concise": "кратко",
+        "balanced": "сбалансированно",
+        "detailed": "подробно",
+    }
+    if style not in labels:
+        return None
+    return ResponsePreferenceDirective(
+        patch={"communication_style": style},
+        confirmation=f"Запомнил: буду отвечать {labels[style]}.",
+    )
 
 DEFAULT_AUTONOMY_POLICY: dict[str, Any] = {
     "mode": "balanced",
@@ -359,11 +477,15 @@ def _normalize_preferences(value: dict[str, Any]) -> dict[str, Any]:
         "gemma4-mono-perf",
     }:
         profile = DEFAULT_PREFERENCES["preferred_profile"]
+    voice_input_reply_mode = value.get("voice_input_reply_mode")
+    if voice_input_reply_mode not in {"auto", "text", "voice"}:
+        voice_input_reply_mode = DEFAULT_PREFERENCES["voice_input_reply_mode"]
     return {
         "operator_name": str(value.get("operator_name") or "Admin")[:80],
         "communication_style": style,
         "daily_briefing": bool(value.get("daily_briefing", True)),
         "voice_reply": bool(value.get("voice_reply", False)),
+        "voice_input_reply_mode": voice_input_reply_mode,
         "preferred_profile": profile,
         "quiet_hours": str(value.get("quiet_hours") or "")[:80],
         "working_roots": _clean_string_list(value.get("working_roots"), r"D:\jarvis"),

@@ -552,6 +552,7 @@ class RuntimePreferencesResponse(BaseModel):
     communication_style: Literal["concise", "balanced", "detailed"]
     daily_briefing: bool
     voice_reply: bool
+    voice_input_reply_mode: Literal["auto", "text", "voice"]
     preferred_profile: Literal[
         "gemma4-turbo",
         "gemma4-mono",
@@ -566,6 +567,7 @@ class RuntimePreferencesUpdateRequest(BaseModel):
     communication_style: Literal["concise", "balanced", "detailed"] | None = None
     daily_briefing: bool | None = None
     voice_reply: bool | None = None
+    voice_input_reply_mode: Literal["auto", "text", "voice"] | None = None
     preferred_profile: Literal[
         "gemma4-turbo",
         "gemma4-mono",

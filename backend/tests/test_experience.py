@@ -4,7 +4,7 @@ import asyncio
 from typing import Any
 
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
-from jarvis_gpt.experience import ExperienceManager
+from jarvis_gpt.experience import ExperienceManager, parse_response_preference
 from jarvis_gpt.models import DiagnosticCheck
 from jarvis_gpt.storage import JarvisStorage
 
@@ -77,6 +77,7 @@ def test_preferences_and_policy_are_persistent(monkeypatch, tmp_path):
         {
             "operator_name": "Operator",
             "communication_style": "detailed",
+            "voice_input_reply_mode": "text",
             "preferred_profile": "gemma4-mono-perf",
             "working_roots": ["D:/jarvis", "C:/work"],
         }
@@ -86,11 +87,32 @@ def test_preferences_and_policy_are_persistent(monkeypatch, tmp_path):
 
     assert preferences["operator_name"] == "Operator"
     assert reloaded.preferences()["communication_style"] == "detailed"
+    assert reloaded.preferences()["voice_input_reply_mode"] == "text"
     assert reloaded.preferences()["preferred_profile"] == "gemma4-mono-perf"
     assert policy["mode"] == "safe"
     assert policy["max_autonomous_steps"] == 1
     assert reloaded.autonomy_policy()["resource_guard"]["max_gpu_memory_ratio"] == 0.84
     storage.close()
+
+
+def test_response_preference_parser_accepts_durable_choices_only():
+    voice_text = parse_response_preference(
+        "Джарвис, запомни: отвечай мне на голосовые сообщения текстом!"
+    )
+    voice_auto = parse_response_preference("/voice auto")
+    detailed = parse_response_preference("Пожалуйста, отвечай мне подробно")
+    concise = parse_response_preference("Запомни это: отвечай кратко")
+
+    assert voice_text is not None
+    assert voice_text.patch == {"voice_input_reply_mode": "text"}
+    assert voice_auto is not None
+    assert voice_auto.patch == {"voice_input_reply_mode": "auto"}
+    assert detailed is not None
+    assert detailed.patch == {"communication_style": "detailed"}
+    assert concise is not None
+    assert concise.patch == {"communication_style": "concise"}
+    assert parse_response_preference("Ответь на это голосовое текстом") is None
+    assert parse_response_preference("Он просил отвечать на голосовые текстом") is None
 
 
 def test_daily_briefing_summarizes_risk_and_pending_approval(monkeypatch, tmp_path):

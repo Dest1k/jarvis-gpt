@@ -592,6 +592,8 @@ _HTTP_GUEST_ENDPOINTS = frozenset(
         "list_conversations",
         "list_conversation_messages",
         "set_message_feedback",
+        "preferences",
+        "update_preferences",
         "voice_status",
         "voice_speak",
     }
@@ -602,8 +604,6 @@ _HTTP_GUEST_ENDPOINTS = frozenset(
 # HTTP transport to reach that second, more specific authorization decision.
 _HTTP_PERSONAL_ENDPOINTS = frozenset(
     {
-        "preferences",
-        "update_preferences",
         "persona",
         "update_persona",
         "add_persona_insight",

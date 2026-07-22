@@ -181,6 +181,9 @@ def test_builtin_route_grants_are_least_privilege(client: TestClient):
     assert allowed("guest", "http.get.api.conversations") is True
     assert allowed("guest", "http.get.api.voice.status") is True
     assert allowed("guest", "http.post.api.voice.speak") is True
+    assert allowed("guest", "http.get.api.preferences") is True
+    assert allowed("guest", "http.patch.api.preferences") is True
+    assert allowed("guest", "preferences.write.own") is True
     assert allowed("guest", "http.get.api.memory") is False
     assert allowed("user", "http.get.api.memory") is True
     assert allowed("moderator", "http.post.api.files.upload") is True

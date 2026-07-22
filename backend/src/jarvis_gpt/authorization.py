@@ -238,6 +238,12 @@ CORE_CAPABILITIES: tuple[CapabilityDefinition, ...] = (
         "preferences",
     ),
     CapabilityDefinition(
+        "preferences.write.own",
+        "Обновление собственных настроек ответов и тихих часов",
+        "preferences",
+        1,
+    ),
+    CapabilityDefinition(
         "persona.read.own",
         "Чтение профиля оператора (роль, стек, постоянные инструкции)",
         "persona",
@@ -1114,6 +1120,7 @@ class AuthorizationService:
             "chat.use",
             "events.subscribe",
             "preferences.read.own",
+            "preferences.write.own",
         }:
             presets.update({"guest", "user", "moderator", "admin"})
         if entry.security_id.startswith(

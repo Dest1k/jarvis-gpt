@@ -43,6 +43,7 @@ from urllib.parse import quote, urlsplit
 import httpx
 
 from .config import default_home, load_local_env_file
+from .experience import ResponsePreferenceDirective, parse_response_preference
 from .notify import (
     answer_action_keyboard,
     operator_reply_keyboard,
@@ -391,6 +392,16 @@ def _voice_command_spec(text: str) -> str | None:
     return rest[1].strip().casefold() if len(rest) == 2 else ""
 
 
+def _voice_mode_status_text(mode: str) -> str:
+    descriptions = {
+        "text": "на прямые голосовые отвечаю текстом",
+        "voice": "на прямые голосовые отвечаю голосом",
+        "auto": "прямые голосовые зеркалю голосом, текст оставляю текстом",
+    }
+    normalized = mode if mode in descriptions else "auto"
+    return f"Голосовые ответы: `{normalized}` — {descriptions[normalized]}."
+
+
 def _is_forwarded_message(message: Mapping[str, object] | dict) -> bool:
     """True when Telegram marks the update as a user-forwarded message."""
 
@@ -471,7 +482,9 @@ def _help_text() -> str:
         "• /note … или `+ …` — быстрый захват в inbox\n"
         "• /quiet 23:00-08:00 — тихие часы (hold напоминаний)\n"
         "• /quiet off — выключить quiet hours\n"
-        "• /voice auto — текстом на текст, голосом на voice/audio\n"
+        "• /voice text|voice|auto — как отвечать на голосовые\n"
+        "• «отвечай на голосовые текстом» — запомнить выбор\n"
+        "• «отвечай кратко/подробно» — запомнить стиль\n"
         "• перешли сообщение боту — разберу как задачу\n"
         "• «каждое утро сводка» — ежедневный briefing"
     )
@@ -678,8 +691,8 @@ class TelegramConfig:
     # Admin-pre-provisioned Telegram chat ids (guest until first message), JSON file.
     pre_provisioned_path: Path | None = None
     max_files_out: int = 6
-    # Master switch for Telegram voice delivery. Routing itself is a non-overridable
-    # modality mirror: direct uncaptioned voice/audio speaks; text/captions stay text.
+    # Master switch for Telegram voice delivery. Direct uncaptioned voice/audio mirrors
+    # to voice by default, with a durable per-user text/voice override; text stays text.
     voice_replies: bool = True
     voice_reply_max_chars: int = 1500
     # The Telegram chat -> backend conversation binding must outlive the bridge process.
@@ -4015,6 +4028,10 @@ class TelegramBridge:
         if voice_spec is not None:
             await self._handle_voice_command(chat_id, voice_spec)
             return
+        response_preference = parse_response_preference(text)
+        if response_preference is not None:
+            await self._handle_response_preference(chat_id, response_preference)
+            return
         console_action = _console_action_for_text(text)
         if console_action == "start" or command in _START_COMMANDS:
             await self._send(
@@ -4098,11 +4115,13 @@ class TelegramBridge:
             return
         audio_in = any(_looks_like_audio(a) for a in attachments)
         visual_in = any(not _looks_like_audio(a) for a in attachments)
-        # Telegram delivery strictly mirrors the direct input modality for every account.
-        # A caption is an explicit textual request, while forwarded media is source
-        # material rather than a spoken turn. Legacy ``voice_reply=true`` preferences are
-        # intentionally ignored so they cannot turn later text messages into audio.
-        mirrored_voice = audio_in and not forwarded and not text.strip()
+        # Text, captions and forwarded media always stay text. For a direct voice/audio
+        # turn, the authenticated account can override the default modality mirror with a
+        # durable per-user preference.
+        direct_spoken_turn = audio_in and not forwarded and not text.strip()
+        voice_reply = direct_spoken_turn
+        if direct_spoken_turn:
+            voice_reply = await self._voice_input_reply_mode(chat_id) != "text"
         if forwarded:
             # Forward-as-task: any share into the bot becomes an actionable request.
             text = _build_forward_task_prompt(message, text)
@@ -4115,7 +4134,7 @@ class TelegramBridge:
             chat_id,
             text,
             attachments,
-            voice_reply=mirrored_voice,
+            voice_reply=voice_reply,
             request_id=f"{self._realm_id}:{update_id}",
             # No per-answer action chips (Inbox / +1ч / Ещё) — they clutter every
             # reply. Reminder snooze/done buttons still attach only to fired reminders.
@@ -4518,24 +4537,66 @@ class TelegramBridge:
             await self._send(chat_id, "Quiet hours выключены.")
 
     async def _handle_voice_command(self, chat_id: int, spec: str) -> None:
-        """Report the enforced direct-input modality mirror."""
+        """Show or persist the direct voice-input reply mode."""
 
         mode = str(spec or "").strip().casefold()
-        if mode in {"", "auto"}:
-            await self._send(
-                chat_id,
-                "Голосовые ответы: `auto` — прямые voice/audio без подписи "
-                "зеркалю голосом; текст, подписи и пересланные медиа — текстом.",
-            )
+        if not mode:
+            current = await self._voice_input_reply_mode(chat_id)
+            await self._send(chat_id, _voice_mode_status_text(current))
             return
-        if mode in {"on", "off"}:
-            await self._send(
-                chat_id,
-                f"Режим `{mode}` отключён: для всех учётных записей принудительно "
-                "действует `auto` — текстом на текст, голосом на прямой voice/audio.",
-            )
+        directive = parse_response_preference(f"/voice {mode}")
+        if directive is not None:
+            await self._handle_response_preference(chat_id, directive)
             return
-        await self._send(chat_id, "Формат: `/voice auto`.")
+        await self._send(chat_id, "Формат: `/voice text`, `/voice voice` или `/voice auto`.")
+
+    async def _handle_response_preference(
+        self,
+        chat_id: int,
+        directive: ResponsePreferenceDirective,
+    ) -> None:
+        """Persist and verify one scoped response preference before confirming it."""
+
+        try:
+            response = await self.api.patch(
+                "/api/preferences",
+                json=directive.patch,
+                headers=self._session_headers(chat_id),
+            )
+            response.raise_for_status()
+            preferences = response.json() if response.content else {}
+            if not isinstance(preferences, dict) or any(
+                preferences.get(key) != value for key, value in directive.patch.items()
+            ):
+                raise ValueError("preferences response did not confirm the requested values")
+        except (httpx.HTTPError, ValueError):
+            log.exception("response preference update failed chat_id=%s", chat_id)
+            await self._send(chat_id, "Не смог сохранить настройку ответа. Попробуй ещё раз.")
+            return
+        await self._send(chat_id, directive.confirmation)
+
+    async def _voice_input_reply_mode(self, chat_id: int) -> str:
+        """Read the scoped mode, falling back to the established auto mirror."""
+
+        try:
+            response = await self.api.get(
+                "/api/preferences", headers=self._session_headers(chat_id)
+            )
+            response.raise_for_status()
+            preferences = response.json() if response.content else {}
+            mode = (
+                str(preferences.get("voice_input_reply_mode") or "auto").strip().casefold()
+                if isinstance(preferences, dict)
+                else "auto"
+            )
+        except (httpx.HTTPError, ValueError):
+            log.warning(
+                "voice input preference unavailable chat_id=%s; using auto",
+                chat_id,
+                exc_info=True,
+            )
+            return "auto"
+        return mode if mode in {"auto", "text", "voice"} else "auto"
 
     async def _send_status_card(self, chat_id: int) -> None:
         try:
@@ -4695,6 +4756,10 @@ class TelegramBridge:
                 )
                 return
         answer = body.get("answer") or "(пустой ответ)"
+        # A spoken preference command can update the mode inside the backend after STT.
+        # Re-read before delivery so the confirmation itself already respects "text".
+        if voice_reply and await self._voice_input_reply_mode(chat_id) == "text":
+            voice_reply = False
         self._last_answers[chat_id] = str(answer)
         markup = answer_action_keyboard() if action_chips else None
         transport_metadata = (

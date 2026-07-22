@@ -605,6 +605,7 @@ type RuntimePreferences = {
   communication_style: "concise" | "balanced" | "detailed";
   daily_briefing: boolean;
   voice_reply: boolean;
+  voice_input_reply_mode: "auto" | "text" | "voice";
   preferred_profile:
     | "gemma4-turbo"
     | "gemma4-mono"
