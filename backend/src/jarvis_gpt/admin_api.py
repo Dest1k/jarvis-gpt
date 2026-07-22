@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import sqlite3
+import threading
 import uuid
 from collections.abc import Callable
 from contextlib import suppress
@@ -18,6 +19,7 @@ from .admin_models import (
     PermissionPresetCreateRequest,
     PermissionPresetUpdateRequest,
     ServiceModeUpdateRequest,
+    TelegramOperatorMessageRequest,
     TelegramOwnerInvitationCreateRequest,
     TelegramSessionRequest,
     TelegramSessionResponse,
@@ -44,12 +46,41 @@ from .runtime_notices import (
     get_service_mode,
     set_service_mode,
 )
+from .telegram_operator import (
+    TelegramOperatorConflictError,
+    TelegramOperatorNotFoundError,
+    TelegramOperatorService,
+)
 
 LOGGER = logging.getLogger(__name__)
+_TELEGRAM_PRE_PROVISION_LOCK = threading.RLock()
 
 
 def _telegram_pre_provision_path(request: Request) -> Path:
     return Path(request.app.state.settings.state_dir) / "telegram_pre_provisioned.json"
+
+
+def _read_telegram_pre_provision(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError("Telegram pre-provision file must contain an object")
+    return raw
+
+
+def _write_telegram_pre_provision(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        with suppress(OSError):
+            temporary.unlink()
 
 
 def _remember_telegram_pre_provision(
@@ -58,36 +89,23 @@ def _remember_telegram_pre_provision(
     """Persist pre-provisioned TG ids so the bridge allowlist can admit them."""
 
     path = _telegram_pre_provision_path(request)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
-    except (OSError, json.JSONDecodeError):
-        raw = {}
-    items = raw.get("chat_ids") if isinstance(raw, dict) else None
-    chat_ids = {
-        int(item)
-        for item in (items or [])
-        if str(item).lstrip("-").isdigit()
-    }
-    chat_ids.add(int(telegram_user_id))
-    users = dict(raw.get("users") or {}) if isinstance(raw, dict) else {}
-    users[str(telegram_user_id)] = {
-        "user_id": user_id,
-        "updated_at": _now(),
-    }
-    path.write_text(
-        json.dumps(
-            {
-                "chat_ids": sorted(chat_ids),
-                "users": users,
-            },
-            ensure_ascii=False,
-            indent=2,
-            sort_keys=True,
+    with _TELEGRAM_PRE_PROVISION_LOCK:
+        raw = _read_telegram_pre_provision(path)
+        chat_ids = {
+            int(item)
+            for item in (raw.get("chat_ids") or [])
+            if str(item).lstrip("-").isdigit()
+        }
+        chat_ids.add(int(telegram_user_id))
+        users = dict(raw.get("users") or {})
+        users[str(telegram_user_id)] = {
+            "user_id": user_id,
+            "updated_at": _now(),
+        }
+        _write_telegram_pre_provision(
+            path,
+            {"chat_ids": sorted(chat_ids), "users": users},
         )
-        + "\n",
-        encoding="utf-8",
-    )
 
 
 def _detach_telegram_pre_provisioned_user(
@@ -104,28 +122,24 @@ def _detach_telegram_pre_provisioned_user(
     if not ids:
         return True
     path = _telegram_pre_provision_path(request)
-    if not path.is_file():
-        return True
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False
-    if not isinstance(raw, dict):
-        return False
-    users = dict(raw.get("users") or {})
-    for key, value in list(users.items()):
-        mapped_user_id = str(value.get("user_id") or "") if isinstance(value, dict) else ""
-        if mapped_user_id == user_id or (
-            str(key).lstrip("-").isdigit() and int(key) in ids
-        ):
-            users.pop(key, None)
-    try:
-        path.write_text(
-            json.dumps(
+    with _TELEGRAM_PRE_PROVISION_LOCK:
+        if not path.is_file():
+            return True
+        try:
+            raw = _read_telegram_pre_provision(path)
+            users = dict(raw.get("users") or {})
+            for key, value in list(users.items()):
+                mapped_user_id = (
+                    str(value.get("user_id") or "") if isinstance(value, dict) else ""
+                )
+                if mapped_user_id == user_id or (
+                    str(key).lstrip("-").isdigit() and int(key) in ids
+                ):
+                    users.pop(key, None)
+            _write_telegram_pre_provision(
+                path,
                 {
-                    # Eligibility is a deployment access policy, not an account binding.
-                    # Keeping it lets a deliberately admitted person register a clean
-                    # least-privilege account if they contact the bot again.
+                    # Eligibility is deployment policy, not an account binding.
                     "chat_ids": sorted(
                         {
                             int(item)
@@ -135,15 +149,9 @@ def _detach_telegram_pre_provisioned_user(
                     ),
                     "users": users,
                 },
-                ensure_ascii=False,
-                indent=2,
-                sort_keys=True,
             )
-            + "\n",
-            encoding="utf-8",
-        )
-    except OSError:
-        return False
+        except (OSError, ValueError, json.JSONDecodeError):
+            return False
     return True
 
 
@@ -153,30 +161,25 @@ def _forget_telegram_pre_provision(request: Request, *, telegram_user_id: int | 
     if telegram_user_id is None:
         return
     path = _telegram_pre_provision_path(request)
-    if not path.is_file():
-        return
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return
-    chat_ids = {
-        int(item)
-        for item in (raw.get("chat_ids") or [])
-        if str(item).lstrip("-").isdigit()
-    }
-    chat_ids.discard(int(telegram_user_id))
-    users = dict(raw.get("users") or {})
-    users.pop(str(telegram_user_id), None)
-    path.write_text(
-        json.dumps(
-            {"chat_ids": sorted(chat_ids), "users": users},
-            ensure_ascii=False,
-            indent=2,
-            sort_keys=True,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+    with _TELEGRAM_PRE_PROVISION_LOCK:
+        if not path.is_file():
+            return
+        try:
+            raw = _read_telegram_pre_provision(path)
+            chat_ids = {
+                int(item)
+                for item in (raw.get("chat_ids") or [])
+                if str(item).lstrip("-").isdigit()
+            }
+            chat_ids.discard(int(telegram_user_id))
+            users = dict(raw.get("users") or {})
+            users.pop(str(telegram_user_id), None)
+            _write_telegram_pre_provision(
+                path,
+                {"chat_ids": sorted(chat_ids), "users": users},
+            )
+        except (OSError, ValueError, json.JSONDecodeError):
+            LOGGER.exception("Could not update Telegram pre-provision policy")
 
 ADMIN_API_CAPABILITIES: tuple[CapabilityDefinition, ...] = (
     CapabilityDefinition(
@@ -277,6 +280,22 @@ ADMIN_API_CAPABILITIES: tuple[CapabilityDefinition, ...] = (
         source="admin_api",
     ),
     CapabilityDefinition(
+        "admin.telegram.messages.read",
+        "Просмотр всех личных Telegram-диалогов и сообщений бота",
+        "admin",
+        4,
+        source="admin_api",
+        required_presets=("owner",),
+    ),
+    CapabilityDefinition(
+        "admin.telegram.messages.send",
+        "Ручная отправка сообщения пользователю от имени Telegram-бота",
+        "admin",
+        4,
+        source="admin_api",
+        required_presets=("owner",),
+    ),
+    CapabilityDefinition(
         "admin.presets.create",
         "Создание пользовательского пресета прав (вручную или на базе built-in)",
         "admin",
@@ -312,6 +331,14 @@ def _authorization(request: Request) -> AuthorizationService:
     if not isinstance(service, AuthorizationService):
         raise HTTPException(status_code=503, detail="Authorization service is unavailable")
     return service
+
+
+def _telegram_operator(request: Request) -> TelegramOperatorService:
+    authorization = _authorization(request)
+    return TelegramOperatorService(
+        storage=authorization.storage,
+        authorization=authorization,
+    )
 
 
 def require_security_id(
@@ -688,6 +715,103 @@ def _preset_payload(service: AuthorizationService, preset_key: str) -> dict[str,
         **dict(row),
         "description": str(row["change_reason"] or ""),
         "security_ids": [str(item["security_id"]) for item in permissions],
+    }
+
+
+@router.get(
+    "/api/admin/telegram/chats",
+    dependencies=[Depends(require_security_id("admin.telegram.messages.read"))],
+)
+def list_telegram_operator_chats(
+    request: Request,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    search: str = Query(default="", max_length=160),
+) -> dict[str, Any]:
+    return _telegram_operator(request).list_chats(
+        limit=limit,
+        offset=offset,
+        search=search,
+    )
+
+
+@router.get(
+    "/api/admin/telegram/chats/{realm_id}/{chat_id}/messages",
+    dependencies=[Depends(require_security_id("admin.telegram.messages.read"))],
+)
+def list_telegram_operator_messages(
+    request: Request,
+    realm_id: str,
+    chat_id: int,
+    limit: int = Query(default=200, ge=1, le=500),
+    before: str = Query(default="", max_length=512),
+) -> dict[str, Any]:
+    try:
+        return _telegram_operator(request).list_messages(
+            realm_id=realm_id,
+            chat_id=chat_id,
+            limit=limit,
+            before=before,
+        )
+    except TelegramOperatorNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post(
+    "/api/admin/telegram/chats/{realm_id}/{chat_id}/messages",
+    dependencies=[Depends(require_security_id("admin.telegram.messages.send"))],
+)
+async def send_telegram_operator_message(
+    request: Request,
+    response: Response,
+    realm_id: str,
+    chat_id: int,
+    payload: TelegramOperatorMessageRequest,
+) -> dict[str, Any]:
+    operator = _telegram_operator(request)
+    try:
+        prepared, created = operator.prepare_send(
+            realm_id=realm_id,
+            chat_id=chat_id,
+            content=payload.content,
+            client_request_id=payload.client_request_id,
+        )
+    except TelegramOperatorNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except TelegramOperatorConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    send, message = await operator.deliver(
+        send=prepared,
+        bot_token=os.environ.get("TELEGRAM_BOT_TOKEN", ""),
+    )
+
+    delivery_status = str(send.get("status") or "")
+    if delivery_status == "delivered":
+        response.status_code = status.HTTP_201_CREATED if created else status.HTTP_200_OK
+        return {"send": send, "message": message}
+    if delivery_status == "pending":
+        response.status_code = status.HTTP_202_ACCEPTED
+        return {"send": send, "message": message}
+
+    response.status_code = (
+        status.HTTP_504_GATEWAY_TIMEOUT
+        if delivery_status == "uncertain"
+        else status.HTTP_502_BAD_GATEWAY
+    )
+    return {
+        "detail": {
+            "error": "telegram_delivery_failed",
+            "status": delivery_status,
+            "code": send.get("error_code"),
+            "send_id": send.get("id"),
+        },
+        "send": send,
+        "message": message,
     }
 
 

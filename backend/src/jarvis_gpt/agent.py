@@ -4638,7 +4638,8 @@ class AgentRuntime:
         with suppress(Exception):
             await push_telegram_alert(
                 f"⚠️ Миссия «{title}» не смогла завершиться сама "
-                f"(шагов выполнено: {run.executed_steps}). Нужно вмешательство.{detail}"
+                f"(шагов выполнено: {run.executed_steps}). Нужно вмешательство.{detail}",
+                storage=self.storage,
             )
 
     def _mission_run_answer(

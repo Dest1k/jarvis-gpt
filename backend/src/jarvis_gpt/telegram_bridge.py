@@ -49,6 +49,11 @@ from .notify import (
     progress_stop_keyboard,
 )
 from .telegram_format import html_to_plain, render_telegram_html, split_telegram_html
+from .telegram_journal import (
+    record_telegram_outbound,
+    telegram_message_created_at,
+    telegram_message_log_id,
+)
 from .telegram_sources import TelegramSourceService
 
 log = logging.getLogger("jarvis.telegram")
@@ -324,11 +329,10 @@ def _quick_capture_body(text: str, command: str) -> str | None:
     if command in _CAPTURE_COMMANDS:
         rest = raw.split(maxsplit=1)
         return rest[1].strip() if len(rest) > 1 else ""
-    if raw.startswith("+ ") or raw.startswith("! "):
-        return raw[2:].strip()
-    if raw.startswith("+") or raw.startswith("!"):
-        body = raw[1:].strip()
-        return body if body else ""
+    if raw in {"+", "!"}:
+        return ""
+    if len(raw) > 1 and raw[0] in {"+", "!"} and raw[1].isspace():
+        return raw[1:].strip()
     return None
 
 
@@ -1047,6 +1051,8 @@ class TelegramConversationStore:
             "telegram_poll_checkpoints",
             "telegram_attachment_relay",
             "telegram_store_migrations",
+            "telegram_message_log",
+            "telegram_turn_deliveries",
         }:
             raise ValueError("Unsupported Telegram binding table")
         return {
@@ -1367,6 +1373,59 @@ class TelegramConversationStore:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS telegram_message_log (
+                id TEXT PRIMARY KEY,
+                realm_id TEXT NOT NULL,
+                chat_id INTEGER NOT NULL CHECK(chat_id > 0),
+                direction TEXT NOT NULL CHECK(direction IN ('inbound', 'outbound')),
+                sender_kind TEXT NOT NULL CHECK(sender_kind IN ('user', 'bot', 'operator')),
+                source_key TEXT NOT NULL,
+                telegram_message_id INTEGER,
+                update_id INTEGER,
+                latest_update_id INTEGER,
+                conversation_id TEXT,
+                user_id TEXT,
+                content TEXT NOT NULL,
+                content_type TEXT NOT NULL DEFAULT 'text',
+                metadata TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                edited_at TEXT,
+                UNIQUE(realm_id, source_key)
+            )
+            """
+        )
+        with suppress(sqlite3.OperationalError):
+            conn.execute(
+                "ALTER TABLE telegram_message_log ADD COLUMN latest_update_id INTEGER"
+            )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_telegram_message_log_chat
+            ON telegram_message_log(realm_id, chat_id, created_at DESC, id DESC)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_telegram_message_log_user
+            ON telegram_message_log(user_id, created_at DESC)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS telegram_turn_deliveries (
+                realm_id TEXT NOT NULL,
+                chat_id INTEGER NOT NULL CHECK(chat_id > 0),
+                request_hash TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('claimed', 'delivered', 'uncertain')),
+                claimed_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                completed_at REAL,
+                PRIMARY KEY(realm_id, chat_id, request_hash)
+            )
+            """
+        )
 
     @staticmethod
     def _primary_key_columns(conn: sqlite3.Connection, table: str) -> tuple[str, ...]:
@@ -1487,6 +1546,56 @@ class TelegramConversationStore:
         ):
             raise TelegramConversationMigrationError(
                 "main Telegram attachment relay schema is not realm-scoped"
+            )
+
+        required_message_log_columns = {
+            "id",
+            "realm_id",
+            "chat_id",
+            "direction",
+            "sender_kind",
+            "source_key",
+            "telegram_message_id",
+            "update_id",
+            "latest_update_id",
+            "conversation_id",
+            "user_id",
+            "content",
+            "content_type",
+            "metadata",
+            "created_at",
+            "edited_at",
+        }
+        if not required_message_log_columns.issubset(
+            cls._table_columns(conn, "telegram_message_log")
+        ) or cls._primary_key_columns(conn, "telegram_message_log") != ("id",):
+            raise TelegramConversationMigrationError(
+                "main Telegram message journal has an incompatible schema"
+            )
+        if ("realm_id", "source_key") not in cls._unique_indexes(
+            conn, "telegram_message_log"
+        ):
+            raise TelegramConversationMigrationError(
+                "main Telegram message journal uniqueness is not realm-scoped"
+            )
+
+        if not {
+            "realm_id",
+            "chat_id",
+            "request_hash",
+            "status",
+            "claimed_at",
+            "updated_at",
+            "completed_at",
+        }.issubset(
+            cls._table_columns(conn, "telegram_turn_deliveries")
+        ) or cls._primary_key_columns(conn, "telegram_turn_deliveries") != (
+            "realm_id",
+            "chat_id",
+            "request_hash",
+        ):
+            raise TelegramConversationMigrationError(
+                "main Telegram delivery receipt schema is not realm-scoped"
             )
 
         if not {"source_key", "realm_id", "migrated_at"}.issubset(
@@ -1635,6 +1744,9 @@ class TelegramConversationStore:
             ("telegram_update_inbox", ""),
             ("telegram_poll_checkpoints", ""),
             ("telegram_attachment_relay", ""),
+            ("telegram_message_log", ""),
+            ("telegram_turn_deliveries", ""),
+            ("telegram_operator_sends", ""),
             ("telegram_store_migrations", ""),
             ("telegram_updates", ""),
             ("external_identities", " AND provider = 'telegram'"),
@@ -1798,6 +1910,8 @@ class TelegramConversationStore:
             source_key, rows = external_migration
             self._apply_migration(conn, source_key=source_key, rows=rows)
         self._validate_all_realm_rows(conn)
+        self._backfill_message_log(conn)
+        self._prune_legacy_orphan_attachment_relay(conn)
 
     def _connect(self, *, configure_journal: bool = True) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=5.0)
@@ -1864,6 +1978,334 @@ class TelegramConversationStore:
                 return derived
             return int(row[0])
 
+    @staticmethod
+    def _inbound_message_content(message: Mapping[str, Any]) -> tuple[str, str, dict]:
+        text = str(message.get("text") or message.get("caption") or "").strip()
+        attachments: list[dict[str, str]] = []
+        content_type = "text"
+        document = message.get("document")
+        if isinstance(document, Mapping):
+            content_type = "document"
+            attachments.append(
+                {
+                    "kind": "document",
+                    "name": str(document.get("file_name") or "Файл")[:500],
+                }
+            )
+        photos = message.get("photo")
+        if isinstance(photos, list) and photos:
+            content_type = "photo"
+            attachments.append({"kind": "photo", "name": "Фото"})
+        for field, label in (
+            ("voice", "Голосовое сообщение"),
+            ("audio", "Аудио"),
+            ("video", "Видео"),
+            ("video_note", "Видеосообщение"),
+            ("animation", "Анимация"),
+            ("sticker", "Стикер"),
+        ):
+            if isinstance(message.get(field), Mapping):
+                content_type = field
+                attachments.append({"kind": field, "name": label})
+        if not text and attachments:
+            text = " · ".join(f"[{item['name']}]" for item in attachments)
+        metadata: dict[str, Any] = {}
+        if attachments:
+            metadata["attachments"] = attachments
+        if _is_forwarded_message(message):
+            metadata["forwarded"] = True
+            metadata["forward_source"] = _forward_source_label(dict(message))[:500]
+        return text or "[Служебное сообщение Telegram]", content_type, metadata
+
+    def _record_inbound_message(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        update_id: int,
+        chat_id: int,
+        update: Mapping[str, Any],
+    ) -> None:
+        edited = isinstance(update.get("edited_message"), Mapping)
+        message = update.get("edited_message") if edited else update.get("message")
+        if not isinstance(message, Mapping):
+            return
+        telegram_message_id = message.get("message_id")
+        if isinstance(telegram_message_id, bool) or not isinstance(
+            telegram_message_id, int
+        ):
+            telegram_message_id = None
+        source_key = (
+            f"in:{chat_id}:{telegram_message_id}"
+            if telegram_message_id is not None
+            else f"in-update:{update_id}"
+        )
+        original_update_id = update_id
+        request_hash = hashlib.sha256(f"{self.realm_id}:{update_id}".encode()).hexdigest()
+        if edited:
+            existing = conn.execute(
+                """
+                SELECT update_id, metadata FROM telegram_message_log
+                WHERE realm_id = ? AND source_key = ?
+                """,
+                (self.realm_id, source_key),
+            ).fetchone()
+            if existing is not None:
+                original_update_id = int(existing[0])
+                try:
+                    existing_metadata = json.loads(str(existing[1]))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    existing_metadata = {}
+                if isinstance(existing_metadata, dict):
+                    preserved_hash = str(
+                        existing_metadata.get("chat_request_hash") or ""
+                    ).strip()
+                    if preserved_hash:
+                        request_hash = preserved_hash
+        content, content_type, metadata = self._inbound_message_content(message)
+        if edited:
+            metadata["edited"] = True
+        metadata["chat_request_hash"] = request_hash
+        binding = conn.execute(
+            """
+            SELECT conversation_id, user_id FROM telegram_conversations
+            WHERE realm_id = ? AND chat_id = ?
+            """,
+            (self.realm_id, chat_id),
+        ).fetchone()
+        conversation_id = str(binding[0]) if binding is not None else None
+        user_id = (
+            str(binding[1])
+            if binding is not None and binding[1] is not None
+            else None
+        )
+        # Normal chat turns carry the same durable transport-request hash in the
+        # backend message. Prefer that exact historical conversation over today's
+        # binding when backfilling updates that predate a /new rotation.
+        if user_id is not None and self._table_exists(conn, "messages"):
+            matched = conn.execute(
+                """
+                SELECT conversation_id FROM messages
+                WHERE user_id = ?
+                  AND json_extract(metadata, '$.chat_request_hash') = ?
+                ORDER BY created_at DESC, rowid DESC
+                LIMIT 1
+                """,
+                (user_id, request_hash),
+            ).fetchone()
+            if matched is not None:
+                conversation_id = str(matched[0])
+        conn.execute(
+            """
+            INSERT INTO telegram_message_log(
+                id, realm_id, chat_id, direction, sender_kind, source_key,
+                telegram_message_id, update_id, latest_update_id,
+                conversation_id, user_id,
+                content, content_type, metadata, created_at, edited_at
+            ) VALUES (?, ?, ?, 'inbound', 'user', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(realm_id, source_key) DO UPDATE SET
+                latest_update_id = excluded.latest_update_id,
+                conversation_id = COALESCE(
+                    telegram_message_log.conversation_id,
+                    excluded.conversation_id
+                ),
+                user_id = COALESCE(
+                    telegram_message_log.user_id,
+                    excluded.user_id
+                ),
+                content = excluded.content,
+                content_type = excluded.content_type,
+                metadata = excluded.metadata,
+                edited_at = excluded.edited_at
+            WHERE excluded.latest_update_id >= COALESCE(
+                telegram_message_log.latest_update_id,
+                telegram_message_log.update_id,
+                -1
+            )
+            """,
+            (
+                telegram_message_log_id(self.realm_id, source_key),
+                self.realm_id,
+                chat_id,
+                source_key,
+                telegram_message_id,
+                original_update_id,
+                update_id,
+                conversation_id,
+                user_id,
+                content,
+                content_type,
+                json.dumps(metadata, ensure_ascii=False, separators=(",", ":")),
+                telegram_message_created_at(message),
+                (
+                    telegram_message_created_at(
+                        {"date": message.get("edit_date")}
+                    )
+                    if edited
+                    else None
+                ),
+            ),
+        )
+
+    def _backfill_message_log(self, conn: sqlite3.Connection) -> None:
+        marker = f"telegram_message_log_v1:{self.realm_id}"
+        if conn.execute(
+            "SELECT 1 FROM telegram_store_migrations WHERE source_key = ?",
+            (marker,),
+        ).fetchone() is not None:
+            return
+        rows = conn.execute(
+            """
+            SELECT update_id, chat_id, payload_json
+            FROM telegram_update_inbox
+            WHERE realm_id = ?
+            ORDER BY update_id
+            """,
+            (self.realm_id,),
+        ).fetchall()
+        for row in rows:
+            try:
+                update = json.loads(str(row[2]))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if isinstance(update, dict):
+                self._record_inbound_message(
+                    conn,
+                    update_id=int(row[0]),
+                    chat_id=int(row[1]),
+                    update=update,
+                )
+        conn.execute(
+            """
+            INSERT INTO telegram_store_migrations(source_key, realm_id)
+            VALUES (?, ?)
+            """,
+            (marker, self.realm_id),
+        )
+
+    def _prune_legacy_orphan_attachment_relay(self, conn: sqlite3.Connection) -> None:
+        """Remove pre-journal relay residue after its seven-day retry window."""
+
+        conn.execute(
+            """
+            DELETE FROM telegram_attachment_relay AS relay
+            WHERE relay.realm_id = ? AND relay.updated_at < ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM telegram_update_inbox inbox
+                  WHERE inbox.realm_id = relay.realm_id
+                    AND inbox.update_id = relay.update_id
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM telegram_message_log message_log
+                  WHERE message_log.realm_id = relay.realm_id
+                    AND message_log.update_id = relay.update_id
+              )
+            """,
+            (self.realm_id, time.time() - 7 * 86_400),
+        )
+
+    def _attach_message_log_binding(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        chat_id: int,
+        conversation_id: str,
+        user_id: str,
+    ) -> None:
+        conn.execute(
+            """
+            UPDATE telegram_message_log
+            SET conversation_id = COALESCE(conversation_id, ?),
+                user_id = COALESCE(user_id, ?)
+            WHERE realm_id = ? AND chat_id = ?
+              AND (conversation_id IS NULL OR user_id IS NULL)
+            """,
+            (conversation_id, user_id, self.realm_id, chat_id),
+        )
+
+    def claim_turn_delivery(self, chat_id: int, request_hash: str) -> bool:
+        """Claim a Telegram side effect once; a reclaimed claim is fail-closed."""
+
+        normalized_hash = str(request_hash or "").strip()
+        if not normalized_hash:
+            raise ValueError("Telegram turn request hash is required")
+        now = time.time()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT status FROM telegram_turn_deliveries
+                WHERE realm_id = ? AND chat_id = ? AND request_hash = ?
+                """,
+                (self.realm_id, chat_id, normalized_hash),
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    """
+                    INSERT INTO telegram_turn_deliveries(
+                        realm_id, chat_id, request_hash, status, claimed_at, updated_at
+                    ) VALUES (?, ?, ?, 'claimed', ?, ?)
+                    """,
+                    (self.realm_id, chat_id, normalized_hash, now, now),
+                )
+                return True
+            if str(row[0]) == "claimed":
+                conn.execute(
+                    """
+                    UPDATE telegram_turn_deliveries
+                    SET status = 'uncertain', updated_at = ?
+                    WHERE realm_id = ? AND chat_id = ? AND request_hash = ?
+                      AND status = 'claimed'
+                    """,
+                    (now, self.realm_id, chat_id, normalized_hash),
+                )
+            return False
+
+    def finalize_turn_delivery(
+        self,
+        chat_id: int,
+        request_hash: str,
+        *,
+        delivered: bool,
+    ) -> None:
+        now = time.time()
+        status = "delivered" if delivered else "uncertain"
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE telegram_turn_deliveries
+                SET status = ?, updated_at = ?, completed_at = ?
+                WHERE realm_id = ? AND chat_id = ? AND request_hash = ?
+                  AND status = 'claimed'
+                """,
+                (status, now, now, self.realm_id, chat_id, request_hash),
+            )
+
+    def record_outbound_message(
+        self,
+        chat_id: int,
+        *,
+        text: str,
+        telegram_message: Mapping[str, Any],
+        content_type: str = "text",
+        metadata: Mapping[str, Any] | None = None,
+    ) -> None:
+        telegram_message_id = telegram_message.get("message_id")
+        if isinstance(telegram_message_id, bool) or not isinstance(
+            telegram_message_id, int
+        ):
+            return
+        # Telegram message ids are only unique inside a chat, not across the bot.
+        with self._connect() as conn:
+            record_telegram_outbound(
+                conn,
+                realm_id=self.realm_id,
+                chat_id=chat_id,
+                text=text,
+                telegram_message=telegram_message,
+                content_type=content_type,
+                metadata=metadata,
+            )
+
     def persist_updates(
         self,
         updates: list[tuple[int, int, dict]],
@@ -1920,6 +2362,12 @@ class TelegramConversationStore:
                     ),
                 )
                 inserted += max(0, cursor.rowcount)
+                self._record_inbound_message(
+                    conn,
+                    update_id=update_id,
+                    chat_id=chat_id,
+                    update=durable_payload,
+                )
             if effective_offset is not None:
                 conn.execute(
                     """
@@ -1960,6 +2408,7 @@ class TelegramConversationStore:
                     now - 7 * 86_400,
                 ),
             )
+            self._prune_legacy_orphan_attachment_relay(conn)
         return inserted
 
     @staticmethod
@@ -2304,7 +2753,14 @@ class TelegramConversationStore:
                         """,
                         (user_id, access_mode, self.realm_id, chat_id, user_id),
                     )
-                return str(row[0])
+                conversation_id = str(row[0])
+                self._attach_message_log_binding(
+                    conn,
+                    chat_id=chat_id,
+                    conversation_id=conversation_id,
+                    user_id=user_id,
+                )
+                return conversation_id
 
             conversation_id = self._new_conversation_id()
             conn.execute(
@@ -2319,6 +2775,12 @@ class TelegramConversationStore:
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 (self.realm_id, chat_id, conversation_id, access_mode, user_id),
+            )
+            self._attach_message_log_binding(
+                conn,
+                chat_id=chat_id,
+                conversation_id=conversation_id,
+                user_id=user_id,
             )
             return conversation_id
 
@@ -2354,6 +2816,12 @@ class TelegramConversationStore:
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 (self.realm_id, chat_id, conversation_id, access_mode, user_id),
+            )
+            self._attach_message_log_binding(
+                conn,
+                chat_id=chat_id,
+                conversation_id=conversation_id,
+                user_id=user_id,
             )
         return conversation_id
 
@@ -2410,6 +2878,12 @@ class TelegramConversationStore:
                 """,
                 (self.realm_id, chat_id, conversation_id, access_mode, user_id),
             )
+            self._attach_message_log_binding(
+                conn,
+                chat_id=chat_id,
+                conversation_id=conversation_id,
+                user_id=user_id,
+            )
 
 
 class TelegramBridge:
@@ -2425,7 +2899,7 @@ class TelegramBridge:
         self._realm_id = cfg.realm_id
         self._bot_id = cfg.bot_id
         self._pre_provisioned_cache: frozenset[int] = frozenset()
-        self._pre_provisioned_mtime: float | None = None
+        self._pre_provisioned_mtime: tuple[int, int, int] | None = None
         self.tg = tg_client or httpx.AsyncClient(
             base_url=f"https://api.telegram.org/bot{cfg.bot_token}",
             timeout=cfg.poll_timeout + 15,
@@ -2536,7 +3010,8 @@ class TelegramBridge:
         if path is None:
             return frozenset()
         try:
-            mtime = path.stat().st_mtime
+            stat = path.stat()
+            mtime = (stat.st_mtime_ns, stat.st_size, stat.st_ino)
         except OSError:
             self._pre_provisioned_cache = frozenset()
             self._pre_provisioned_mtime = None
@@ -2551,7 +3026,9 @@ class TelegramBridge:
                 if str(item).lstrip("-").isdigit()
             )
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            ids = frozenset()
+            # Writers replace atomically, but retain the last known-good policy if a
+            # corrupt/manual file is observed. Do not cache its mtime as an empty ACL.
+            return self._pre_provisioned_cache
         self._pre_provisioned_cache = ids
         self._pre_provisioned_mtime = mtime
         return ids
@@ -3174,7 +3651,9 @@ class TelegramBridge:
         text: str,
         *,
         reply_markup: dict | None = None,
-    ) -> None:
+        journal: bool = True,
+        journal_metadata: Mapping[str, Any] | None = None,
+    ) -> bool:
         """Send a reply as Telegram HTML (code blocks, bold, links, tables).
 
         The model answers in Markdown; we render it to Telegram's HTML subset and
@@ -3187,18 +3666,37 @@ class TelegramBridge:
         pieces = list(split_telegram_html(html))
         if not pieces:
             pieces = [" "]
+        delivered = True
         for index, piece in enumerate(pieces):
             markup = reply_markup if index == len(pieces) - 1 else None
-            if await self._send_piece(chat_id, piece, html=True, reply_markup=markup):
+            if await self._send_piece(
+                chat_id,
+                piece,
+                html=True,
+                reply_markup=markup,
+                journal=journal,
+                journal_metadata=journal_metadata,
+            ):
                 continue
             plain_parts = list(_chunks(html_to_plain(piece)))
+            fallback_delivered = True
             for p_index, plain in enumerate(plain_parts):
                 plain_markup = (
                     markup if p_index == len(plain_parts) - 1 else None
                 )
-                await self._send_piece(
-                    chat_id, plain, html=False, reply_markup=plain_markup
+                fallback_delivered = (
+                    await self._send_piece(
+                        chat_id,
+                        plain,
+                        html=False,
+                        reply_markup=plain_markup,
+                        journal=journal,
+                        journal_metadata=journal_metadata,
+                    )
+                    and fallback_delivered
                 )
+            delivered = delivered and fallback_delivered
+        return delivered
 
     async def _send_piece(
         self,
@@ -3207,6 +3705,8 @@ class TelegramBridge:
         *,
         html: bool,
         reply_markup: dict | None = None,
+        journal: bool = True,
+        journal_metadata: Mapping[str, Any] | None = None,
     ) -> bool:
         params: dict[str, object] = {
             "chat_id": chat_id,
@@ -3218,7 +3718,26 @@ class TelegramBridge:
         if reply_markup is not None:
             params["reply_markup"] = reply_markup
         try:
-            await self._tg("sendMessage", **params)
+            result = await self._tg("sendMessage", **params)
+            if (
+                journal
+                and self._conversation_store is not None
+                and isinstance(result, Mapping)
+            ):
+                try:
+                    self._conversation_store.record_outbound_message(
+                        chat_id,
+                        text=html_to_plain(text) if html else text,
+                        telegram_message=result,
+                        metadata=journal_metadata,
+                    )
+                except sqlite3.Error:
+                    # Telegram already accepted the side effect. Never report failure and
+                    # retry the send merely because the local observability write failed.
+                    log.exception(
+                        "could not journal delivered Telegram message chat_id=%s",
+                        chat_id,
+                    )
             return True
         except (httpx.HTTPError, RuntimeError):
             return False
@@ -3302,6 +3821,7 @@ class TelegramBridge:
                         timeout=self.cfg.poll_timeout,
                         allowed_updates=[
                             "message",
+                            "edited_message",
                             "callback_query",
                             "channel_post",
                             "edited_channel_post",
@@ -3352,6 +3872,8 @@ class TelegramBridge:
                     staged.append((update_id, chat_id, update))
                     continue
                 message = update.get("message")
+                if not isinstance(message, dict):
+                    message = update.get("edited_message")
                 identity = (
                     self._telegram_identity(message) if isinstance(message, dict) else None
                 )
@@ -3412,6 +3934,10 @@ class TelegramBridge:
             if isinstance(chat_id, bool) or not isinstance(chat_id, int):
                 return
             await self._handle_callback_query(chat_id, lease_token=None, update=update)
+            return
+        if isinstance(update.get("edited_message"), dict):
+            # The durable transport journal already updated the original bubble.
+            # Editing a Telegram message must not execute a second agent turn.
             return
         message = update.get("message")
         if not isinstance(message, dict):
@@ -4171,10 +4697,39 @@ class TelegramBridge:
         answer = body.get("answer") or "(пустой ответ)"
         self._last_answers[chat_id] = str(answer)
         markup = answer_action_keyboard() if action_chips else None
+        transport_metadata = (
+            {"chat_request_hash": hashlib.sha256(request_id.encode()).hexdigest()}
+            if request_id
+            else None
+        )
+        request_hash = str((transport_metadata or {}).get("chat_request_hash") or "")
+        if self._conversation_store is not None and request_hash:
+            try:
+                if not self._conversation_store.claim_turn_delivery(
+                    chat_id,
+                    request_hash,
+                ):
+                    log.warning(
+                        "Telegram turn delivery replay fenced chat_id=%s request_hash=%s",
+                        chat_id,
+                        request_hash[:12],
+                    )
+                    return True
+            except sqlite3.Error:
+                log.exception(
+                    "could not durably claim Telegram turn delivery chat_id=%s",
+                    chat_id,
+                )
+                return False
         voice_delivery: _VoiceDeliveryResult | None = None
+        delivery_ok = True
         if voice_reply:
             if self.cfg.voice_replies:
-                voice_delivery = await self._reply_with_voice(chat_id, str(answer))
+                voice_delivery = await self._reply_with_voice(
+                    chat_id,
+                    str(answer),
+                    journal_metadata=transport_metadata,
+                )
             else:
                 log.warning(
                     "voice delivery skipped chat_id=%s reason=disabled_by_configuration",
@@ -4187,7 +4742,12 @@ class TelegramBridge:
                     reason="disabled_by_configuration",
                 )
         if voice_delivery is None:
-            await self._send(chat_id, str(answer), reply_markup=markup)
+            delivery_ok = await self._send(
+                chat_id,
+                str(answer),
+                reply_markup=markup,
+                journal_metadata=transport_metadata,
+            )
         elif not voice_delivery.ok:
             if voice_delivery.parts_sent:
                 notice = (
@@ -4198,17 +4758,42 @@ class TelegramBridge:
                 notice = "Голосовые ответы отключены; отправляю текст."
             else:
                 notice = "Не удалось доставить голосовой ответ; отправляю текст."
-            await self._send(
+            delivery_ok = await self._send(
                 chat_id,
                 f"{notice}\n\n{answer}",
                 reply_markup=markup,
+                journal_metadata=transport_metadata,
             )
 
         inbound_ids = {a["id"] for a in attachments}
-        await self._deliver_new_files(chat_id, before | inbound_ids)
+        await self._deliver_new_files(
+            chat_id,
+            before | inbound_ids,
+            journal_metadata=transport_metadata,
+        )
+        if self._conversation_store is not None and request_hash:
+            try:
+                self._conversation_store.finalize_turn_delivery(
+                    chat_id,
+                    request_hash,
+                    delivered=delivery_ok,
+                )
+            except sqlite3.Error:
+                # A successful Telegram side effect with an uncommitted receipt is
+                # intentionally left claimed; a replay will fence it as uncertain.
+                log.exception(
+                    "could not finalize Telegram turn delivery chat_id=%s",
+                    chat_id,
+                )
+                return False
+        return delivery_ok
 
     async def _reply_with_voice(
-        self, chat_id: int, answer: str
+        self,
+        chat_id: int,
+        answer: str,
+        *,
+        journal_metadata: Mapping[str, Any] | None = None,
     ) -> _VoiceDeliveryResult:
         """Synthesize and deliver every bounded TTS chunk, with diagnosable fallback."""
 
@@ -4366,6 +4951,24 @@ class TelegramBridge:
                     return _VoiceDeliveryResult(
                         False, parts_sent, total, "telegram_ok_false"
                     )
+                sent_result = sent_body.get("result")
+                if (
+                    self._conversation_store is not None
+                    and isinstance(sent_result, Mapping)
+                ):
+                    try:
+                        self._conversation_store.record_outbound_message(
+                            chat_id,
+                            text=chunks[index - 1],
+                            telegram_message=sent_result,
+                            content_type="voice" if method == "sendVoice" else "audio",
+                            metadata=journal_metadata,
+                        )
+                    except sqlite3.Error:
+                        log.exception(
+                            "could not journal delivered Telegram audio chat_id=%s",
+                            chat_id,
+                        )
             except (httpx.HTTPError, RuntimeError, ValueError) as exc:
                 status = (
                     exc.response.status_code
@@ -4406,7 +5009,13 @@ class TelegramBridge:
         except (httpx.HTTPError, KeyError, TypeError):
             return set()
 
-    async def _deliver_new_files(self, chat_id: int, known: set[str]) -> None:
+    async def _deliver_new_files(
+        self,
+        chat_id: int,
+        known: set[str],
+        *,
+        journal_metadata: Mapping[str, Any] | None = None,
+    ) -> None:
         try:
             response = await self.api.get(
                 "/api/files",
@@ -4424,9 +5033,19 @@ class TelegramBridge:
         ]
         for item in fresh[: self.cfg.max_files_out]:
             with suppress(httpx.HTTPError, RuntimeError):
-                await self._send_document(chat_id, item)
+                await self._send_document(
+                    chat_id,
+                    item,
+                    journal_metadata=journal_metadata,
+                )
 
-    async def _send_document(self, chat_id: int, item: dict) -> None:
+    async def _send_document(
+        self,
+        chat_id: int,
+        item: dict,
+        *,
+        journal_metadata: Mapping[str, Any] | None = None,
+    ) -> None:
         size = item.get("size") or 0
         if size and size > TG_DOC_CAP:
             await self._send(chat_id, f"Файл {item.get('name')} слишком большой для Telegram.")
@@ -4442,13 +5061,37 @@ class TelegramBridge:
         # Images open inline on the phone; documents require an extra tap.
         if _looks_like_image(name, mime) and (not size or size <= _TG_PHOTO_CAP):
             photo_mime = mime if mime.startswith("image/") else "image/jpeg"
-            await self.tg.post(
+            sent = await self.tg.post(
                 "/sendPhoto",
                 data={"chat_id": chat_id},
                 files={"photo": (name, content, photo_mime)},
             )
+            sent.raise_for_status()
+            body = sent.json()
+            result = body.get("result") if isinstance(body, dict) else None
+            if not isinstance(result, Mapping) or body.get("ok") is not True:
+                raise RuntimeError("Telegram sendPhoto returned no delivered message")
+            if self._conversation_store is not None:
+                try:
+                    self._conversation_store.record_outbound_message(
+                        chat_id,
+                        text=f"[Фото: {name}]",
+                        telegram_message=result,
+                        content_type="photo",
+                        metadata={
+                            **dict(journal_metadata or {}),
+                            "attachments": [
+                                {"kind": "photo", "name": name, "mime_type": photo_mime}
+                            ]
+                        },
+                    )
+                except sqlite3.Error:
+                    log.exception(
+                        "could not journal delivered Telegram photo chat_id=%s",
+                        chat_id,
+                    )
             return
-        await self.tg.post(
+        sent = await self.tg.post(
             "/sendDocument",
             data={"chat_id": chat_id},
             files={
@@ -4459,6 +5102,30 @@ class TelegramBridge:
                 )
             },
         )
+        sent.raise_for_status()
+        body = sent.json()
+        result = body.get("result") if isinstance(body, dict) else None
+        if not isinstance(result, Mapping) or body.get("ok") is not True:
+            raise RuntimeError("Telegram sendDocument returned no delivered message")
+        if self._conversation_store is not None:
+            try:
+                self._conversation_store.record_outbound_message(
+                    chat_id,
+                    text=f"[Файл: {name}]",
+                    telegram_message=result,
+                content_type="document",
+                metadata={
+                    **dict(journal_metadata or {}),
+                    "attachments": [
+                            {"kind": "document", "name": name, "mime_type": mime}
+                        ]
+                    },
+                )
+            except sqlite3.Error:
+                log.exception(
+                    "could not journal delivered Telegram document chat_id=%s",
+                    chat_id,
+                )
 
 
 async def _amain() -> None:

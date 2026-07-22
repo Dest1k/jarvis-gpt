@@ -17,10 +17,15 @@ import os
 import re
 from collections.abc import Iterable, Mapping
 from datetime import datetime, time, timedelta, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
+
+from .telegram_journal import record_telegram_outbound
+
+if TYPE_CHECKING:
+    from .storage import JarvisStorage
 
 _TIMEOUT_SEC = 8.0
 _QUIET_RANGE_RE = re.compile(
@@ -184,6 +189,7 @@ async def push_telegram_alert(
     client: httpx.AsyncClient | None = None,
     reply_markup: Mapping[str, Any] | dict[str, Any] | None = None,
     disable_notification: bool = False,
+    storage: JarvisStorage | None = None,
 ) -> bool:
     """Send ``text`` to authorised alert targets. Returns True if it reached ≥1 chat.
 
@@ -216,6 +222,29 @@ async def push_telegram_alert(
                 response = await http.post("/sendMessage", json=payload)
                 if response.status_code == 200:
                     delivered += 1
+                    if storage is not None:
+                        try:
+                            body = response.json()
+                            result = body.get("result") if isinstance(body, dict) else None
+                            token_match = re.match(r"^([1-9][0-9]{0,18}):", token)
+                            if (
+                                isinstance(result, dict)
+                                and body.get("ok") is True
+                                and token_match is not None
+                            ):
+                                with storage.transaction(immediate=True) as conn:
+                                    record_telegram_outbound(
+                                        conn,
+                                        realm_id=f"telegram:{token_match.group(1)}",
+                                        chat_id=chat_id,
+                                        text=text,
+                                        telegram_message=result,
+                                        metadata={"source": "notify"},
+                                    )
+                        except Exception:
+                            # Delivery already succeeded. A journal outage must not make
+                            # the supervisor retry and duplicate the Telegram alert.
+                            pass
             except httpx.HTTPError:
                 continue
     finally:

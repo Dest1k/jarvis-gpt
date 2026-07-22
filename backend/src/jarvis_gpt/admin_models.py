@@ -67,6 +67,15 @@ class TelegramOwnerInvitationCreateRequest(BaseModel):
     reason: str = Field(min_length=1, max_length=500)
 
 
+class TelegramOperatorMessageRequest(BaseModel):
+    content: str = Field(min_length=1, max_length=4096)
+    client_request_id: str = Field(
+        min_length=16,
+        max_length=80,
+        pattern=r"^[A-Za-z0-9._:-]+$",
+    )
+
+
 class ServiceModeUpdateRequest(BaseModel):
     enabled: bool
     message: str = Field(default="", max_length=500)

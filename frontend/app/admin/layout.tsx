@@ -3,6 +3,7 @@ import { redirect } from "next/navigation";
 import type { ReactNode } from "react";
 
 import { OWNER_SESSION_COOKIE, verifyOwnerSession } from "../../lib/owner-session.mjs";
+import AdminTabs from "./AdminTabs";
 import OwnerLogoutButton from "./OwnerLogoutButton";
 
 export const dynamic = "force-dynamic";
@@ -23,6 +24,7 @@ export default async function AdminLayout({ children }: Readonly<{ children: Rea
   return (
     <>
       <OwnerLogoutButton />
+      <AdminTabs />
       {children}
     </>
   );

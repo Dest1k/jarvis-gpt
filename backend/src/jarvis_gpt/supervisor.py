@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import time
@@ -773,6 +774,7 @@ class RuntimeSupervisor:
                 target_chat_ids=requested,
                 reply_markup=reply_markup,
                 disable_notification=False,
+                storage=self.storage,
             )
         if current_user_id() == LEGACY_OWNER_USER_ID:
             return await push_telegram_alert(
@@ -780,6 +782,7 @@ class RuntimeSupervisor:
                 target_chat_ids=None,
                 reply_markup=reply_markup,
                 disable_notification=False,
+                storage=self.storage,
             )
         return False
 
@@ -864,6 +867,7 @@ class RuntimeSupervisor:
                     str(item.get("text") or ""),
                     target_chat_ids=targets or None,
                     reply_markup=markup,
+                    storage=self.storage,
                 )
                 if not ok:
                     remaining.append(item)
@@ -891,6 +895,7 @@ class RuntimeSupervisor:
             ok = await push_telegram_alert(
                 "\n".join(lines)[:3900],
                 target_chat_ids=targets or None,
+                storage=self.storage,
             )
             if not ok:
                 remaining.extend(entries)
@@ -948,6 +953,7 @@ class RuntimeSupervisor:
                             f"📋 {label}\n\n{answer}"[:3900],
                             target_chat_ids=target_ids or None,
                             disable_notification=self._telegram_quiet_now(),
+                            storage=self.storage,
                         )
             conversation_id = reminder.get("conversation_id")
             if conversation_id:
@@ -956,7 +962,11 @@ class RuntimeSupervisor:
                         conversation_id=str(conversation_id),
                         role="assistant",
                         content=answer,
-                        metadata={"kind": "daily_briefing", "reminder_id": reminder["id"]},
+                        metadata={
+                            "kind": "daily_briefing",
+                            "reminder_id": reminder["id"],
+                            "telegram_transport_visible": False,
+                        },
                     )
         with suppress(Exception):
             self.storage.add_event(
@@ -998,9 +1008,31 @@ class RuntimeSupervisor:
             return
         answer = ""
         error: str | None = None
+        response_message_id: str | None = None
+        transport_request_id = (
+            f"scheduled:{reminder.get('id')}:{reminder.get('due_at') or reminder.get('updated_at')}"
+        )
+        transport_request_hash = hashlib.sha256(transport_request_id.encode()).hexdigest()
         try:
-            response = await agent.chat(prompt, conversation_id=reminder.get("conversation_id"))
+            response = await agent.chat(
+                prompt,
+                conversation_id=reminder.get("conversation_id"),
+                transport_request_id=transport_request_id,
+            )
             answer = (getattr(response, "answer", "") or "").strip()
+            response_message_id = str(getattr(response, "message_id", "") or "") or None
+            with self.storage.transaction(immediate=True) as conn:
+                conn.execute(
+                    """
+                    UPDATE messages
+                    SET metadata = json_set(
+                        metadata, '$.telegram_transport_visible', json('false')
+                    )
+                    WHERE user_id = ?
+                      AND json_extract(metadata, '$.chat_request_hash') = ?
+                    """,
+                    (current_user_id(), transport_request_hash),
+                )
         except Exception as exc:  # noqa: BLE001 — a task failure must not touch the loop
             error = str(exc) or exc.__class__.__name__
         delivered = False
@@ -1019,7 +1051,14 @@ class RuntimeSupervisor:
                             f"🕒 {label}\n\n{answer}"[:3900],
                             target_chat_ids=target_ids or None,
                             disable_notification=self._telegram_quiet_now(),
+                            storage=self.storage,
                         )
+            if response_message_id:
+                with suppress(Exception):
+                    self.storage.merge_message_metadata(
+                        response_message_id,
+                        {"telegram_transport_visible": False},
+                    )
             conversation_id = reminder.get("conversation_id")
             if conversation_id:
                 with suppress(Exception):
@@ -1027,7 +1066,11 @@ class RuntimeSupervisor:
                         conversation_id=str(conversation_id),
                         role="assistant",
                         content=answer,
-                        metadata={"kind": "scheduled_task", "reminder_id": reminder["id"]},
+                        metadata={
+                            "kind": "scheduled_task",
+                            "reminder_id": reminder["id"],
+                            "telegram_transport_visible": False,
+                        },
                     )
         with suppress(Exception):
             self.storage.add_event(
@@ -1297,7 +1340,9 @@ class RuntimeSupervisor:
                 delivered = False
                 with suppress(Exception):
                     delivered = await push_telegram_alert(
-                        f"👁 {text}"[:3900], target_chat_ids=(target_id,)
+                        f"👁 {text}"[:3900],
+                        target_chat_ids=(target_id,),
+                        storage=self.storage,
                     )
                 if delivered:
                     telegram_delivered_ids.add(target_id)
@@ -1451,7 +1496,7 @@ class RuntimeSupervisor:
                     }
                 )
         with suppress(Exception):
-            await push_telegram_alert(phone_text)
+            await push_telegram_alert(phone_text, storage=self.storage)
 
     async def _self_heal_loop(self) -> None:
         while True:
@@ -1760,7 +1805,7 @@ class RuntimeSupervisor:
 
     async def _push_owner(self, text: str) -> None:
         with suppress(Exception):
-            await push_telegram_alert(text)
+            await push_telegram_alert(text, storage=self.storage)
 
     async def _record_health(self) -> None:
         self._last_health_attempt_at = utc_now()

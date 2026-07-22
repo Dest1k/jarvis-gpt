@@ -113,6 +113,26 @@ def test_load_config_allows_empty_optional_allowlist():
     assert cfg.allowed_chat_ids == frozenset()
 
 
+def test_pre_provision_cache_retains_last_good_policy_on_parse_failure(tmp_path):
+    path = tmp_path / "telegram_pre_provisioned.json"
+    path.write_text('{"chat_ids":[99]}', encoding="utf-8")
+    bridge = _bridge(
+        lambda _request: httpx.Response(500),
+        lambda _request: httpx.Response(500),
+        pre_provisioned_path=path,
+    )
+
+    assert bridge._pre_provisioned_chat_ids() == frozenset({99})
+    cached_mtime = bridge._pre_provisioned_mtime
+    path.write_text("{", encoding="utf-8")
+    assert bridge._pre_provisioned_chat_ids() == frozenset({99})
+    assert bridge._pre_provisioned_mtime == cached_mtime
+    path.write_text('{"chat_ids":[99,100]}', encoding="utf-8")
+    assert bridge._pre_provisioned_chat_ids() == frozenset({99, 100})
+
+    asyncio.run(bridge.aclose())
+
+
 def test_load_config_parses_allowlist():
     cfg = load_config(
         {
@@ -1582,6 +1602,103 @@ def test_durable_update_inbox_advances_offset_only_after_commit_and_recovers_lea
     assert restarted.claim_pending_updates(limit=10, lease_seconds=60) == []
 
 
+def test_edited_inbound_updates_one_journal_row_and_preserves_original_identity(tmp_path):
+    database_path = tmp_path / "jarvis.sqlite3"
+    store = TelegramConversationStore(database_path, realm_id="telegram:700001")
+    original = {
+        "update_id": 70,
+        "message": {
+            "message_id": 9,
+            "date": 1_753_180_000,
+            "chat": {"id": 42, "type": "private"},
+            "from": {"id": 42, "is_bot": False},
+            "text": "до правки",
+        },
+    }
+    edited = {
+        "update_id": 71,
+        "edited_message": {
+            "message_id": 9,
+            "date": 1_753_180_000,
+            "edit_date": 1_753_180_100,
+            "chat": {"id": 42, "type": "private"},
+            "from": {"id": 42, "is_bot": False},
+            "text": "после правки",
+        },
+    }
+
+    store.persist_updates([(70, 42, original), (71, 42, edited)])
+
+    expected_hash = hashlib.sha256(b"telegram:700001:70").hexdigest()
+    with sqlite3.connect(database_path) as conn:
+        row = conn.execute(
+            """
+            SELECT source_key, update_id, latest_update_id, content, metadata,
+                   created_at, edited_at
+            FROM telegram_message_log
+            """
+        ).fetchone()
+    assert row is not None
+    assert row[:4] == ("in:42:9", 70, 71, "после правки")
+    assert json.loads(row[4]) == {
+        "chat_request_hash": expected_hash,
+        "edited": True,
+    }
+    assert row[5] == "2025-07-22T10:26:40+00:00"
+    assert row[6] == "2025-07-22T10:28:20+00:00"
+
+
+def test_outbound_message_journal_keeps_same_message_id_from_different_chats(tmp_path):
+    database_path = tmp_path / "jarvis.sqlite3"
+    store = TelegramConversationStore(database_path, realm_id="telegram:700001")
+
+    store.record_outbound_message(
+        42,
+        text="Первый чат",
+        telegram_message={"message_id": 77, "date": 1_753_180_000},
+    )
+    store.record_outbound_message(
+        84,
+        text="Второй чат",
+        telegram_message={"message_id": 77, "date": 1_753_180_001},
+    )
+
+    with sqlite3.connect(database_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT chat_id, source_key, content
+            FROM telegram_message_log
+            ORDER BY chat_id
+            """
+        ).fetchall()
+
+    assert rows == [
+        (42, "out:42:77", "Первый чат"),
+        (84, "out:84:77", "Второй чат"),
+    ]
+
+
+def test_turn_delivery_claim_fences_restart_replay(tmp_path):
+    database_path = tmp_path / "jarvis.sqlite3"
+    request_hash = hashlib.sha256(b"telegram:700001:77").hexdigest()
+    first = TelegramConversationStore(database_path, realm_id="telegram:700001")
+
+    assert first.claim_turn_delivery(42, request_hash) is True
+
+    restarted = TelegramConversationStore(database_path, realm_id="telegram:700001")
+    assert restarted.claim_turn_delivery(42, request_hash) is False
+    with sqlite3.connect(database_path) as conn:
+        status = conn.execute(
+            """
+            SELECT status FROM telegram_turn_deliveries
+            WHERE realm_id = 'telegram:700001' AND chat_id = 42
+              AND request_hash = ?
+            """,
+            (request_hash,),
+        ).fetchone()
+    assert status == ("uncertain",)
+
+
 def test_backend_retry_classifier_requires_machine_outage_marker_for_http_responses():
     request = httpx.Request("POST", "http://backend.test/api/chat")
 
@@ -2801,6 +2918,12 @@ def test_quick_capture_body_parsers():
     assert _quick_capture_body("/note купить молоко", "/note") == "купить молоко"
     assert _quick_capture_body("+ идея", "") == "идея"
     assert _quick_capture_body("! срочно", "") == "срочно"
+    assert _quick_capture_body("+", "") == ""
+    assert _quick_capture_body("!", "") == ""
+    assert _quick_capture_body("++", "") is None
+    assert _quick_capture_body("!!", "") is None
+    assert _quick_capture_body("+идея", "") is None
+    assert _quick_capture_body("!срочно", "") is None
     assert _quick_capture_body("обычный текст", "") is None
     assert _quick_capture_body("/note", "/note") == ""
 

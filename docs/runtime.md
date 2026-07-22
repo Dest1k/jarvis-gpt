@@ -1,5 +1,20 @@
 # Runtime
 
+## 2026-07-22 handoff - owner Telegram operator console
+
+- `/admin/telegram` is an owner-only Telegram-style console with searchable chats,
+  three-second polling, stable cursor pagination through the full retained timeline,
+  responsive mobile navigation, and literal 1-4096 character Bot API sends.
+- The transport journal records inbound messages and edits plus delivered text chunks,
+  voice/audio, files, proactive alerts, reminders, and manual operator sends. Telegram
+  `message_id` defines equal-second ordering; request hashes suppress synthetic backend
+  duplicates. A durable per-turn delivery receipt fences crash/restart replays.
+- Manual sends pin `telegram:<bot-id>` with `getMe`, use audited idempotency keys, never
+  expose the bot token to the browser, and fail closed on ambiguous delivery. Only owner
+  capabilities `admin.telegram.messages.read/send` can access the endpoints.
+- Bare quick capture requires a marker followed by whitespace (`+ idea`, `! urgent`), or
+  `/note`. Inputs such as `++`, `!!`, `+word`, and `!word` are ordinary chat messages.
+
 ## 2026-07-22 handoff - durable multilingual memory and account-aware retrieval
 
 - Chat ingress is written to canonical `messages` before transcription, retrieval,

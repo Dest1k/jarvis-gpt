@@ -657,6 +657,8 @@ if frozenset(PERSONAL_DELETE_ORDER) != frozenset(PERSONAL_TABLES):
 # a deliberate deletion-policy decision rather than an implicit cascade assumption.
 OPTIONAL_USER_DELETE_TABLES: tuple[tuple[str, str], ...] = (
     ("material_access_audit", "requester_user_id"),
+    ("telegram_message_log", "user_id"),
+    ("telegram_operator_sends", "user_id"),
 )
 
 
@@ -2737,6 +2739,38 @@ class AuthorizationService:
                         "Target user changed after authorization"
                     )
 
+                if _table_exists(conn, "telegram_operator_sends"):
+                    claim_cutoff = (
+                        datetime.now(UTC) - timedelta(seconds=120)
+                    ).isoformat()
+                    conn.execute(
+                        """
+                        UPDATE telegram_operator_sends
+                        SET status = 'uncertain',
+                            error_code = 'delivery_claim_expired',
+                            updated_at = ?
+                        WHERE status = 'pending'
+                          AND delivery_claimed_at IS NOT NULL
+                          AND delivery_claimed_at <= ?
+                          AND (user_id = ? OR operator_user_id = ?)
+                        """,
+                        (datetime.now(UTC).isoformat(), claim_cutoff, user_id, user_id),
+                    )
+                    in_flight = conn.execute(
+                        """
+                        SELECT 1 FROM telegram_operator_sends
+                        WHERE status = 'pending'
+                          AND delivery_claimed_at IS NOT NULL
+                          AND (user_id = ? OR operator_user_id = ?)
+                        LIMIT 1
+                        """,
+                        (user_id, user_id),
+                    ).fetchone()
+                    if in_flight is not None:
+                        raise AuthorizationError(
+                            "User deletion blocked while a Telegram delivery is in flight"
+                        )
+
                 identities = conn.execute(
                     """
                     SELECT id, provider, realm_id, provider_subject_id
@@ -2842,10 +2876,55 @@ class AuthorizationService:
                 if _table_exists(conn, "file_chunks_fts"):
                     conn.execute("DELETE FROM file_chunks_fts WHERE user_id = ?", (user_id,))
 
+                # Attachment relay records have no direct user/chat foreign key. Resolve
+                # their update ids while the scoped inbox/journal rows still exist, then
+                # purge them before those lookup rows are removed.
+                if _table_exists(conn, "telegram_attachment_relay"):
+                    deleted_counts["telegram_attachment_relay"] = 0
+                    for realm_id, chat_id in telegram_scope_keys:
+                        if _table_exists(conn, "telegram_update_inbox"):
+                            cursor = conn.execute(
+                                """
+                                DELETE FROM telegram_attachment_relay
+                                WHERE realm_id = ? AND update_id IN (
+                                    SELECT update_id FROM telegram_update_inbox
+                                    WHERE realm_id = ? AND chat_id = ?
+                                )
+                                """,
+                                (realm_id, realm_id, chat_id),
+                            )
+                            deleted_counts["telegram_attachment_relay"] += cursor.rowcount
+                        if _table_exists(conn, "telegram_message_log"):
+                            cursor = conn.execute(
+                                """
+                                DELETE FROM telegram_attachment_relay
+                                WHERE realm_id = ? AND update_id IN (
+                                    SELECT update_id FROM telegram_message_log
+                                    WHERE realm_id = ? AND chat_id = ?
+                                      AND update_id IS NOT NULL
+                                )
+                                """,
+                                (realm_id, realm_id, chat_id),
+                            )
+                            deleted_counts["telegram_attachment_relay"] += cursor.rowcount
+
                 if _table_exists(conn, "telegram_update_inbox"):
                     for realm_id, chat_id in telegram_scope_keys:
                         conn.execute(
                             "DELETE FROM telegram_update_inbox WHERE realm_id = ? AND chat_id = ?",
+                            (realm_id, chat_id),
+                        )
+                if _table_exists(conn, "telegram_message_log"):
+                    for realm_id, chat_id in telegram_scope_keys:
+                        conn.execute(
+                            "DELETE FROM telegram_message_log WHERE realm_id = ? AND chat_id = ?",
+                            (realm_id, chat_id),
+                        )
+                if _table_exists(conn, "telegram_turn_deliveries"):
+                    for realm_id, chat_id in telegram_scope_keys:
+                        conn.execute(
+                            "DELETE FROM telegram_turn_deliveries "
+                            "WHERE realm_id = ? AND chat_id = ?",
                             (realm_id, chat_id),
                         )
                 if _table_exists(conn, "telegram_conversations"):
@@ -2857,6 +2936,31 @@ class AuthorizationService:
                         conn.execute(
                             "DELETE FROM telegram_conversations WHERE realm_id = ? AND chat_id = ?",
                             (realm_id, chat_id),
+                        )
+
+                if _table_exists(conn, "telegram_operator_sends"):
+                    authored = conn.execute(
+                        """
+                        SELECT COUNT(*) AS count FROM telegram_operator_sends
+                        WHERE operator_user_id = ?
+                        """,
+                        (user_id,),
+                    ).fetchone()
+                    deleted_counts["telegram_operator_sends_authored"] = int(
+                        authored["count"]
+                    )
+                    conn.execute(
+                        "DELETE FROM telegram_operator_sends WHERE operator_user_id = ?",
+                        (user_id,),
+                    )
+                    if _table_exists(conn, "messages"):
+                        conn.execute(
+                            """
+                            UPDATE messages
+                            SET metadata = json_remove(metadata, '$.operator_user_id')
+                            WHERE json_extract(metadata, '$.operator_user_id') = ?
+                            """,
+                            (user_id,),
                         )
 
                 for table, user_column in OPTIONAL_USER_DELETE_TABLES:

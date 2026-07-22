@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -14,6 +14,7 @@ from jarvis_gpt.authorization import (
     current_actor,
 )
 from jarvis_gpt.telegram_bridge import TelegramConversationStore
+from jarvis_gpt.telegram_operator import TelegramDeliveryError
 from starlette.testclient import TestClient
 
 BRIDGE_SECRET = "bridge-test-secret-with-at-least-32-chars"
@@ -54,7 +55,8 @@ def _register_telegram_user(
             "telegram_user": {
                 "id": telegram_user_id,
                 "is_bot": False,
-                "username": username or (
+                "username": username
+                or (
                     "secure_user"
                     if telegram_user_id == 424242
                     else f"secure_user_{telegram_user_id}"
@@ -177,10 +179,7 @@ def test_first_telegram_registration_claims_history_without_trusting_legacy_mode
 
     assert user_id != LEGACY_OWNER_USER_ID
     assert registered["user"]["preset_key"] == "guest"
-    assert (
-        store.get_or_create(chat_id, "guest", user_id=user_id)
-        == conversation_id
-    )
+    assert store.get_or_create(chat_id, "guest", user_id=user_id) == conversation_id
     history = client.get(
         f"/api/conversations/{conversation_id}/messages",
         headers={"X-Jarvis-User-Session": registered["session_token"]},
@@ -205,10 +204,7 @@ def test_first_telegram_registration_claims_history_without_trusting_legacy_mode
         app.state.storage.database_path,
         realm_id="telegram:700001",
     )
-    assert (
-        restarted_store.get_or_create(chat_id, "guest", user_id=user_id)
-        == conversation_id
-    )
+    assert restarted_store.get_or_create(chat_id, "guest", user_id=user_id) == conversation_id
     registered_after_restart = _register_telegram_user(
         client,
         update_id=1_700_000 + chat_id,
@@ -216,9 +212,7 @@ def test_first_telegram_registration_claims_history_without_trusting_legacy_mode
     )
     second_turn = client.post(
         "/api/chat",
-        headers={
-            "X-Jarvis-User-Session": registered_after_restart["session_token"]
-        },
+        headers={"X-Jarvis-User-Session": registered_after_restart["session_token"]},
         json={
             "message": "turn after bridge restart",
             "conversation_id": restarted_store.get_or_create(
@@ -235,11 +229,7 @@ def test_first_telegram_registration_claims_history_without_trusting_legacy_mode
         owners = {
             table: conn.execute(
                 f'SELECT DISTINCT user_id FROM "{table}" WHERE '
-                + (
-                    "id = ?"
-                    if table == "conversations"
-                    else "conversation_id = ?"
-                ),
+                + ("id = ?" if table == "conversations" else "conversation_id = ?"),
                 (conversation_id,),
             ).fetchall()
             for table in (
@@ -263,10 +253,7 @@ def test_first_telegram_registration_claims_history_without_trusting_legacy_mode
                 (user_id,),
             ).fetchall()
         }
-    assert {
-        table: {str(row["user_id"]) for row in rows}
-        for table, rows in owners.items()
-    } == {
+    assert {table: {str(row["user_id"]) for row in rows} for table, rows in owners.items()} == {
         "conversations": {user_id},
         "messages": {user_id},
         "reminders": {user_id},
@@ -333,9 +320,10 @@ def test_backend_rejects_noncanonical_bridge_realm_before_persisting_identity(cl
     with app.state.storage.locked_connection() as conn:
         assert conn.execute("SELECT 1 FROM telegram_realms").fetchone() is None
         assert conn.execute("SELECT 1 FROM telegram_updates").fetchone() is None
-        assert conn.execute(
-            "SELECT 1 FROM external_identities WHERE provider = 'telegram'"
-        ).fetchone() is None
+        assert (
+            conn.execute("SELECT 1 FROM external_identities WHERE provider = 'telegram'").fetchone()
+            is None
+        )
 
 
 def test_legacy_history_claim_rolls_back_on_foreign_tenant_owner(client):
@@ -404,12 +392,8 @@ def test_legacy_history_claim_rolls_back_on_foreign_tenant_owner(client):
 
 
 def test_telegram_sessions_isolate_memory_preferences_persona_and_files(client, monkeypatch):
-    first = _register_telegram_user(
-        client, update_id=10_001, telegram_user_id=101_001
-    )
-    second = _register_telegram_user(
-        client, update_id=10_002, telegram_user_id=202_002
-    )
+    first = _register_telegram_user(client, update_id=10_001, telegram_user_id=101_001)
+    second = _register_telegram_user(client, update_id=10_002, telegram_user_id=202_002)
     for registered in (first, second):
         assigned = _approved_request(
             client,
@@ -421,12 +405,8 @@ def test_telegram_sessions_isolate_memory_preferences_persona_and_files(client, 
 
     # Preset changes revoke old sessions; authenticated Telegram updates issue fresh,
     # short-lived sessions with the new effective policy.
-    first = _register_telegram_user(
-        client, update_id=10_003, telegram_user_id=101_001
-    )
-    second = _register_telegram_user(
-        client, update_id=10_004, telegram_user_id=202_002
-    )
+    first = _register_telegram_user(client, update_id=10_003, telegram_user_id=101_001)
+    second = _register_telegram_user(client, update_id=10_004, telegram_user_id=202_002)
     first_headers = {"X-Jarvis-User-Session": first["session_token"]}
     second_headers = {"X-Jarvis-User-Session": second["session_token"]}
 
@@ -450,9 +430,12 @@ def test_telegram_sessions_isolate_memory_preferences_persona_and_files(client, 
         item["id"] != conversation_id
         for item in client.get("/api/conversations", headers=second_headers).json()
     )
-    assert client.get(
-        f"/api/conversations/{conversation_id}/messages", headers=second_headers
-    ).status_code == 404
+    assert (
+        client.get(
+            f"/api/conversations/{conversation_id}/messages", headers=second_headers
+        ).status_code
+        == 404
+    )
     foreign_chat = client.post(
         "/api/chat",
         headers=second_headers,
@@ -470,9 +453,7 @@ def test_telegram_sessions_isolate_memory_preferences_persona_and_files(client, 
         json={"content": "alpha-tenant-secret", "namespace": "private"},
     )
     assert saved_memory.status_code == 200, saved_memory.text
-    assert client.get(
-        "/api/memory?q=alpha-tenant-secret", headers=second_headers
-    ).json() == []
+    assert client.get("/api/memory?q=alpha-tenant-secret", headers=second_headers).json() == []
 
     updated_preferences = client.patch(
         "/api/preferences",
@@ -480,9 +461,10 @@ def test_telegram_sessions_isolate_memory_preferences_persona_and_files(client, 
         json={"operator_name": "Tenant Alpha"},
     )
     assert updated_preferences.status_code == 200, updated_preferences.text
-    assert client.get("/api/preferences", headers=second_headers).json()[
-        "operator_name"
-    ] != "Tenant Alpha"
+    assert (
+        client.get("/api/preferences", headers=second_headers).json()["operator_name"]
+        != "Tenant Alpha"
+    )
 
     updated_persona = client.patch(
         "/api/persona",
@@ -583,9 +565,7 @@ def test_account_catalog_routes_require_owner_or_admin_after_direct_grants_and_d
         assert result["effect"] == "deny"
         assert result["reason_code"] == "preset_not_eligible"
 
-    catalog = {
-        item["security_id"]: item for item in service.list_security_ids()
-    }
+    catalog = {item["security_id"]: item for item in service.list_security_ids()}
     for security_id in routes:
         assert catalog[security_id]["required_presets"] == ["admin", "owner"]
 
@@ -594,9 +574,7 @@ def test_account_catalog_routes_require_owner_or_admin_after_direct_grants_and_d
         identity_id=str(identity["identity_id"]),
         auth_method="test",
     )
-    moderator_headers = {
-        "X-Jarvis-User-Session": str(moderator_session["session_token"])
-    }
+    moderator_headers = {"X-Jarvis-User-Session": str(moderator_session["session_token"])}
     for security_id, path in routes.items():
         denied = client.get(path, headers=moderator_headers)
         assert denied.status_code == 403, denied.text
@@ -635,9 +613,7 @@ def test_account_catalog_routes_require_owner_or_admin_after_direct_grants_and_d
         identity_id=str(identity["identity_id"]),
         auth_method="test",
     )
-    demoted_headers = {
-        "X-Jarvis-User-Session": str(demoted_session["session_token"])
-    }
+    demoted_headers = {"X-Jarvis-User-Session": str(demoted_session["session_token"])}
     for security_id, path in routes.items():
         denied = client.get(path, headers=demoted_headers)
         assert denied.status_code == 403, denied.text
@@ -693,10 +669,13 @@ def test_one_time_owner_invitation_claims_immutable_telegram_identity(client):
     assert claimed["user"]["created"] is True
     assert claimed["user"]["preset_key"] == "owner"
     assert claimed["user"]["owner_invite_claimed"] is True
-    assert client.get(
-        "/api/admin/users",
-        headers={"X-Jarvis-User-Session": claimed["session_token"]},
-    ).status_code == 200
+    assert (
+        client.get(
+            "/api/admin/users",
+            headers={"X-Jarvis-User-Session": claimed["session_token"]},
+        ).status_code
+        == 200
+    )
 
     with app.state.storage.transaction(immediate=True) as conn:
         conn.execute(
@@ -761,9 +740,7 @@ def test_one_time_owner_invitation_claims_immutable_telegram_identity(client):
     assert claims["c"] == 1
 
     pre_provisioned = json.loads(
-        (app.state.settings.state_dir / "telegram_pre_provisioned.json").read_text(
-            encoding="utf-8"
-        )
+        (app.state.settings.state_dir / "telegram_pre_provisioned.json").read_text(encoding="utf-8")
     )
     assert 616_161 in pre_provisioned["chat_ids"]
 
@@ -949,10 +926,13 @@ def test_preset_assignment_refreshes_next_telegram_session_permissions(client):
     )
     assert assigned.status_code == 200, assigned.text
     assert assigned.json()["preset_key"] == "admin"
-    assert client.get(
-        "/api/conversations",
-        headers={"X-Jarvis-User-Session": old_token},
-    ).status_code == 401
+    assert (
+        client.get(
+            "/api/conversations",
+            headers={"X-Jarvis-User-Session": old_token},
+        ).status_code
+        == 401
+    )
 
     refreshed = client.post(
         "/api/integrations/telegram/session",
@@ -978,10 +958,13 @@ def test_preset_assignment_refreshes_next_telegram_session_permissions(client):
     refreshed_body = refreshed.json()
     assert refreshed_body["session_token"] != old_token
     assert refreshed_body["user"]["preset_key"] == "admin"
-    assert client.get(
-        "/api/admin/users",
-        headers={"X-Jarvis-User-Session": refreshed_body["session_token"]},
-    ).status_code == 200
+    assert (
+        client.get(
+            "/api/admin/users",
+            headers={"X-Jarvis-User-Session": refreshed_body["session_token"]},
+        ).status_code
+        == 200
+    )
 
 
 def test_status_change_revokes_existing_sessions(client):
@@ -1027,9 +1010,10 @@ def test_soft_deleted_telegram_user_stays_blocked_until_reactivated(client):
     assert retry.status_code == 403, retry.text
     assert retry.json()["detail"] == "Telegram user is inactive"
     with app.state.storage.locked_connection() as conn:
-        assert conn.execute(
-            "SELECT status FROM users WHERE id = ?", (user_id,)
-        ).fetchone()["status"] == "deleted"
+        assert (
+            conn.execute("SELECT status FROM users WHERE id = ?", (user_id,)).fetchone()["status"]
+            == "deleted"
+        )
         assert conn.execute(
             "SELECT 1 FROM external_identities WHERE user_id = ?", (user_id,)
         ).fetchone()
@@ -1070,9 +1054,7 @@ def test_admin_delete_permanently_purges_user_and_allows_clean_registration(clie
             namespace="private",
         )
         storage.set_runtime_value("preferences", {"private": True})
-        user_files_dir = (
-            app.state.settings.data_dir / "files" / "users" / user_id
-        )
+        user_files_dir = app.state.settings.data_dir / "files" / "users" / user_id
         user_files_dir.mkdir(parents=True, exist_ok=True)
         stored_path = user_files_dir / "private.txt"
         stored_path.write_text("private file", encoding="utf-8")
@@ -1093,11 +1075,45 @@ def test_admin_delete_permanently_purges_user_and_allows_clean_registration(clie
             outcome="success",
         )
 
+    owner_conversation_id = storage.create_conversation("operator attribution survivor")
+    owner_message_id = storage.add_message(
+        conversation_id=owner_conversation_id,
+        role="assistant",
+        content="message sent by the account being deleted",
+        metadata={"operator_user_id": user_id, "operator_authored": True},
+    )
+
     TelegramConversationStore(
         storage.database_path,
         realm_id="telegram:700001",
     )
     with storage.transaction(immediate=True) as conn:
+        authored_content = "authored send privacy row"
+        now = datetime.now(UTC).isoformat()
+        conn.execute(
+            """
+            INSERT INTO telegram_operator_sends(
+                id, operator_user_id, client_request_id, realm_id, chat_id,
+                conversation_id, user_id, content, content_sha256, status,
+                telegram_message_id, message_id, created_at, updated_at, delivered_at
+            ) VALUES (
+                'delete_authored_send', ?, 'delete-authored-request',
+                'telegram:700001', 101010, ?, ?, ?, ?, 'delivered',
+                700, ?, ?, ?, ?
+            )
+            """,
+            (
+                user_id,
+                owner_conversation_id,
+                LEGACY_OWNER_USER_ID,
+                authored_content,
+                hashlib.sha256(authored_content.encode()).hexdigest(),
+                owner_message_id,
+                now,
+                now,
+                now,
+            ),
+        )
         conn.execute(
             """
             INSERT INTO telegram_conversations(
@@ -1114,6 +1130,27 @@ def test_admin_delete_permanently_purges_user_and_allows_clean_registration(clie
             ) VALUES ('telegram:700001', 404040, 404040, '{"private":true}',
                       'completed', 1, 1.0, 1.0)
             """
+        )
+        conn.executemany(
+            """
+            INSERT INTO telegram_attachment_relay(
+                realm_id, update_id, file_key, status, record_json, updated_at
+            ) VALUES ('telegram:700001', ?, ?, 'success', '{"private":true}', 1.0)
+            """,
+            [(404040, "inbox-file"), (404041, "journal-file")],
+        )
+        conn.execute(
+            """
+            INSERT INTO telegram_message_log(
+                id, realm_id, chat_id, direction, sender_kind, source_key,
+                update_id, conversation_id, user_id, content, created_at
+            ) VALUES (
+                'tglog_delete_regression', 'telegram:700001', 404040,
+                'inbound', 'user', 'in:404041:1', 404041, ?, ?,
+                'private journal message', '2026-07-22T10:00:00+00:00'
+            )
+            """,
+            (conversation_id, user_id),
         )
 
     provisioned = _approved_request(
@@ -1143,12 +1180,17 @@ def test_admin_delete_permanently_purges_user_and_allows_clean_registration(clie
     assert body["deleted_counts"]["messages"] >= 1
     assert body["deleted_counts"]["memories"] == 1
     assert body["deleted_counts"]["execution_playbooks"] == 1
+    assert body["deleted_counts"]["telegram_attachment_relay"] == 2
+    assert body["deleted_counts"]["telegram_operator_sends_authored"] == 1
 
     with storage.locked_connection() as conn:
         assert conn.execute("SELECT 1 FROM users WHERE id = ?", (user_id,)).fetchone() is None
-        assert conn.execute(
-            "SELECT 1 FROM external_identities WHERE user_id = ?", (user_id,)
-        ).fetchone() is None
+        assert (
+            conn.execute(
+                "SELECT 1 FROM external_identities WHERE user_id = ?", (user_id,)
+            ).fetchone()
+            is None
+        )
         for table in (
             "runtime_events",
             "conversations",
@@ -1160,19 +1202,44 @@ def test_admin_delete_permanently_purges_user_and_allows_clean_registration(clie
             "approvals",
             "audit_log",
         ):
-            assert conn.execute(
-                f'SELECT 1 FROM "{table}" WHERE user_id = ?', (user_id,)
-            ).fetchone() is None
-        assert conn.execute(
-            "SELECT 1 FROM runtime_kv WHERE key LIKE ?",
-            (f"user.{user_id}.%",),
-        ).fetchone() is None
-        assert conn.execute(
-            "SELECT 1 FROM telegram_conversations WHERE chat_id = 404040"
-        ).fetchone() is None
-        assert conn.execute(
-            "SELECT 1 FROM telegram_update_inbox WHERE chat_id = 404040"
-        ).fetchone() is None
+            assert (
+                conn.execute(f'SELECT 1 FROM "{table}" WHERE user_id = ?', (user_id,)).fetchone()
+                is None
+            )
+        assert (
+            conn.execute(
+                "SELECT 1 FROM runtime_kv WHERE key LIKE ?",
+                (f"user.{user_id}.%",),
+            ).fetchone()
+            is None
+        )
+        assert (
+            conn.execute("SELECT 1 FROM telegram_conversations WHERE chat_id = 404040").fetchone()
+            is None
+        )
+        assert (
+            conn.execute("SELECT 1 FROM telegram_update_inbox WHERE chat_id = 404040").fetchone()
+            is None
+        )
+        assert (
+            conn.execute(
+                "SELECT 1 FROM telegram_attachment_relay "
+                "WHERE realm_id = 'telegram:700001' AND update_id IN (404040, 404041)"
+            ).fetchone()
+            is None
+        )
+        assert (
+            conn.execute(
+                "SELECT 1 FROM telegram_operator_sends WHERE id = 'delete_authored_send'"
+            ).fetchone()
+            is None
+        )
+        survivor = conn.execute(
+            "SELECT metadata FROM messages WHERE id = ?",
+            (owner_message_id,),
+        ).fetchone()
+        assert survivor is not None
+        assert "operator_user_id" not in json.loads(survivor["metadata"])
         audit = conn.execute(
             """
             SELECT target_id, target_user_id, after_json
@@ -1200,17 +1267,18 @@ def test_admin_delete_permanently_purges_user_and_allows_clean_registration(clie
     assert not vault_note.exists()
 
     pre_provisioned = json.loads(
-        (app.state.settings.state_dir / "telegram_pre_provisioned.json").read_text(
-            encoding="utf-8"
-        )
+        (app.state.settings.state_dir / "telegram_pre_provisioned.json").read_text(encoding="utf-8")
     )
     assert 404_040 in pre_provisioned["chat_ids"]
     assert "404040" not in pre_provisioned["users"]
 
-    assert client.get(
-        "/api/conversations",
-        headers={"X-Jarvis-User-Session": registered["session_token"]},
-    ).status_code == 401
+    assert (
+        client.get(
+            "/api/conversations",
+            headers={"X-Jarvis-User-Session": registered["session_token"]},
+        ).status_code
+        == 401
+    )
     replacement = _register_telegram_user(
         client,
         update_id=51,
@@ -1237,10 +1305,13 @@ def test_delete_user_purges_requester_material_access_audit(client):
 
     app.state.agent.tools.material_access.accounts(actor, limit=5)
     with app.state.storage.locked_connection() as conn:
-        assert conn.execute(
-            "SELECT COUNT(*) FROM material_access_audit WHERE requester_user_id = ?",
-            (user_id,),
-        ).fetchone()[0] == 1
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM material_access_audit WHERE requester_user_id = ?",
+                (user_id,),
+            ).fetchone()[0]
+            == 1
+        )
 
     deleted = service.delete_user(
         user_id=user_id,
@@ -1251,10 +1322,13 @@ def test_delete_user_purges_requester_material_access_audit(client):
     assert deleted["deleted_counts"]["material_access_audit"] == 1
     with app.state.storage.locked_connection() as conn:
         assert conn.execute("SELECT 1 FROM users WHERE id = ?", (user_id,)).fetchone() is None
-        assert conn.execute(
-            "SELECT 1 FROM material_access_audit WHERE requester_user_id = ?",
-            (user_id,),
-        ).fetchone() is None
+        assert (
+            conn.execute(
+                "SELECT 1 FROM material_access_audit WHERE requester_user_id = ?",
+                (user_id,),
+            ).fetchone()
+            is None
+        )
 
 
 def test_admin_delete_rejects_owner_accounts(client):
@@ -1294,18 +1368,19 @@ def test_user_delete_rolls_back_all_rows_when_final_account_delete_fails(client)
         assert conn.execute(
             "SELECT 1 FROM external_identities WHERE user_id = ?", (user_id,)
         ).fetchone()
-        assert conn.execute(
-            "SELECT 1 FROM user_sessions WHERE user_id = ?", (user_id,)
-        ).fetchone()
+        assert conn.execute("SELECT 1 FROM user_sessions WHERE user_id = ?", (user_id,)).fetchone()
         assert conn.execute(
             "SELECT 1 FROM user_preset_assignments WHERE user_id = ?", (user_id,)
         ).fetchone()
         conn.execute("DROP TRIGGER block_test_user_delete")
 
-    assert client.get(
-        "/api/conversations",
-        headers={"X-Jarvis-User-Session": registered["session_token"]},
-    ).status_code == 200
+    assert (
+        client.get(
+            "/api/conversations",
+            headers={"X-Jarvis-User-Session": registered["session_token"]},
+        ).status_code
+        == 200
+    )
 
 
 def test_admin_approval_is_invalidated_when_target_policy_state_changes(client):
@@ -1336,9 +1411,9 @@ def test_admin_approval_is_invalidated_when_target_policy_state_changes(client):
     )
     assert stale.status_code == 409
     with app.state.storage.locked_connection() as conn:
-        status_value = conn.execute(
-            "SELECT status FROM users WHERE id = ?", (user_id,)
-        ).fetchone()["status"]
+        status_value = conn.execute("SELECT status FROM users WHERE id = ?", (user_id,)).fetchone()[
+            "status"
+        ]
     assert status_value == "active"
 
 
@@ -1404,9 +1479,7 @@ def test_telegram_update_retry_is_idempotent_but_cannot_change_identity(client):
     assert replay.status_code == 409
 
 
-def test_stale_telegram_attempt_cannot_finalize_after_lease_is_reclaimed(
-    client, monkeypatch
-):
+def test_stale_telegram_attempt_cannot_finalize_after_lease_is_reclaimed(client, monkeypatch):
     service = app.state.authorization
     original = service.upsert_external_identity
     newer_lease = "tglease_newer_attempt"
@@ -1631,9 +1704,7 @@ def test_admin_user_catalog_is_server_paginated_and_never_duplicates_users(clien
             (now, now),
         )
 
-    response = client.get(
-        "/api/admin/users?limit=200&offset=400&search=bulk_"
-    )
+    response = client.get("/api/admin/users?limit=200&offset=400&search=bulk_")
     assert response.status_code == 200, response.text
     page = response.json()
     assert page["total"] == 505
@@ -1643,3 +1714,845 @@ def test_admin_user_catalog_is_server_paginated_and_never_duplicates_users(clien
     assert len({item["id"] for item in page["users"]}) == 105
     extra = next(item for item in page["users"] if item["id"] == "bulk_0450")
     assert len(extra["identities"]) == 2
+
+
+def test_owner_telegram_console_lists_cross_tenant_history_and_sends_idempotently(
+    client,
+    monkeypatch,
+):
+    chat_id = 919_191
+    realm_id = "telegram:700001"
+    registered = _register_telegram_user(
+        client,
+        update_id=91,
+        telegram_user_id=chat_id,
+        username="operator_console_guest",
+    )
+    user_id = str(registered["user"]["id"])
+    conversation_id = "tg_operator_console"
+    with app.state.storage.transaction(immediate=True) as conn:
+        conn.execute(
+            """
+            INSERT INTO conversations(
+                id, title, created_at, updated_at, last_message,
+                last_message_at, user_id
+            ) VALUES (?, 'Telegram console', ?, ?, 'Ответ Джарвиса', ?, ?)
+            """,
+            (
+                conversation_id,
+                "2026-07-22T10:00:00+00:00",
+                "2026-07-22T10:00:01+00:00",
+                "2026-07-22T10:00:01+00:00",
+                user_id,
+            ),
+        )
+        conn.executemany(
+            """
+            INSERT INTO messages(
+                id, conversation_id, role, content, metadata, created_at, user_id
+            ) VALUES (?, ?, ?, ?, '{}', ?, ?)
+            """,
+            [
+                (
+                    "msg_console_user",
+                    conversation_id,
+                    "user",
+                    "Привет из Telegram",
+                    "2026-07-22T10:00:00+00:00",
+                    user_id,
+                ),
+                (
+                    "msg_console_assistant",
+                    conversation_id,
+                    "assistant",
+                    "Ответ Джарвиса",
+                    "2026-07-22T10:00:01+00:00",
+                    user_id,
+                ),
+            ],
+        )
+    TelegramConversationStore(
+        app.state.storage.database_path,
+        realm_id=realm_id,
+    ).bind(chat_id, conversation_id, "guest", user_id=user_id)
+
+    guest_headers = {"X-Jarvis-User-Session": registered["session_token"]}
+    denied = client.get("/api/admin/telegram/chats", headers=guest_headers)
+    assert denied.status_code == 403, denied.text
+    assert denied.json()["detail"]["security_id"] == "admin.telegram.messages.read"
+
+    chats = client.get("/api/admin/telegram/chats?search=operator_console")
+    assert chats.status_code == 200, chats.text
+    payload = chats.json()
+    assert payload["total"] == 1
+    assert payload["chats"][0]["chat_id"] == chat_id
+    assert payload["chats"][0]["username"] == "operator_console_guest"
+    assert payload["chats"][0]["message_count"] == 2
+
+    history = client.get(f"/api/admin/telegram/chats/{realm_id}/{chat_id}/messages")
+    assert history.status_code == 200, history.text
+    assert [item["content"] for item in history.json()["messages"]] == [
+        "Привет из Telegram",
+        "Ответ Джарвиса",
+    ]
+
+    deliveries: list[dict] = []
+
+    async def fake_send_telegram_text(**kwargs):
+        deliveries.append(kwargs)
+        return {
+            "bot_id": 700001,
+            "message_id": 777,
+            "date": int(datetime(2026, 7, 22, 10, 0, 2, tzinfo=UTC).timestamp()),
+        }
+
+    monkeypatch.setattr(
+        "jarvis_gpt.telegram_operator.send_telegram_text",
+        fake_send_telegram_text,
+    )
+    request = {
+        "content": "Ручной ответ владельца",
+        "client_request_id": "console-request-0001",
+    }
+    sent = client.post(
+        f"/api/admin/telegram/chats/{realm_id}/{chat_id}/messages",
+        json=request,
+    )
+    assert sent.status_code == 201, sent.text
+    assert sent.json()["send"]["status"] == "delivered"
+    assert sent.json()["message"]["operator_authored"] is True
+    assert sent.json()["message"]["content"] == request["content"]
+    assert sent.json()["message"]["metadata"]["client_request_id"] == request[
+        "client_request_id"
+    ]
+    assert sent.json()["message"]["sort_sequence"] == 777
+    assert len(deliveries) == 1
+    assert deliveries[0]["realm_id"] == realm_id
+    assert deliveries[0]["chat_id"] == chat_id
+    assert deliveries[0]["content"] == request["content"]
+
+    replay = client.post(
+        f"/api/admin/telegram/chats/{realm_id}/{chat_id}/messages",
+        json=request,
+    )
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["send"]["telegram_message_id"] == 777
+    assert len(deliveries) == 1
+
+    conflict = client.post(
+        f"/api/admin/telegram/chats/{realm_id}/{chat_id}/messages",
+        json={**request, "content": "Другой текст"},
+    )
+    assert conflict.status_code == 409, conflict.text
+
+    updated_history = client.get(f"/api/admin/telegram/chats/{realm_id}/{chat_id}/messages").json()[
+        "messages"
+    ]
+    operator_message = updated_history[-1]
+    assert operator_message["content"] == request["content"]
+    assert operator_message["delivery_status"] == "delivered"
+    assert operator_message["metadata"]["client_request_id"] == request[
+        "client_request_id"
+    ]
+    with app.state.storage.locked_connection() as conn:
+        audit = conn.execute(
+            """
+            SELECT action, after_json FROM security_audit_log
+            WHERE action = 'telegram.operator.send'
+            ORDER BY ts DESC LIMIT 1
+            """
+        ).fetchone()
+    assert audit is not None
+    assert request["content"] not in str(audit["after_json"])
+
+
+def test_owner_telegram_console_fences_uncertain_delivery_retries(client, monkeypatch):
+    chat_id = 929_292
+    realm_id = "telegram:700001"
+    registered = _register_telegram_user(
+        client,
+        update_id=92,
+        telegram_user_id=chat_id,
+    )
+    user_id = str(registered["user"]["id"])
+    conversation_id = "tg_operator_uncertain"
+    now = datetime.now(UTC).isoformat()
+    with app.state.storage.transaction(immediate=True) as conn:
+        conn.execute(
+            """
+            INSERT INTO conversations(id, title, created_at, updated_at, user_id)
+            VALUES (?, 'Uncertain send', ?, ?, ?)
+            """,
+            (conversation_id, now, now, user_id),
+        )
+    TelegramConversationStore(
+        app.state.storage.database_path,
+        realm_id=realm_id,
+    ).bind(chat_id, conversation_id, "guest", user_id=user_id)
+    calls = 0
+
+    async def ambiguous_send(**_kwargs):
+        nonlocal calls
+        calls += 1
+        raise TelegramDeliveryError("telegram_send_transport_unknown", uncertain=True)
+
+    monkeypatch.setattr(
+        "jarvis_gpt.telegram_operator.send_telegram_text",
+        ambiguous_send,
+    )
+    request = {
+        "content": "Не дублировать при неизвестном результате",
+        "client_request_id": "console-request-uncertain-0001",
+    }
+    first = client.post(
+        f"/api/admin/telegram/chats/{realm_id}/{chat_id}/messages",
+        json=request,
+    )
+    assert first.status_code == 504, first.text
+    assert first.json()["send"]["status"] == "uncertain"
+
+    replay = client.post(
+        f"/api/admin/telegram/chats/{realm_id}/{chat_id}/messages",
+        json=request,
+    )
+    assert replay.status_code == 504, replay.text
+    assert replay.json()["send"]["status"] == "uncertain"
+    assert calls == 1
+
+
+def _seed_telegram_console_chat(
+    client: TestClient,
+    *,
+    chat_id: int,
+    conversation_id: str,
+    username: str,
+) -> tuple[str, str]:
+    realm_id = "telegram:700001"
+    registered = _register_telegram_user(
+        client,
+        update_id=chat_id,
+        telegram_user_id=chat_id,
+        username=username,
+    )
+    user_id = str(registered["user"]["id"])
+    now = datetime.now(UTC).isoformat()
+    with app.state.storage.transaction(immediate=True) as conn:
+        conn.execute(
+            """
+            INSERT INTO conversations(id, title, created_at, updated_at, user_id)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (conversation_id, username, now, now, user_id),
+        )
+    TelegramConversationStore(
+        app.state.storage.database_path,
+        realm_id=realm_id,
+    ).bind(chat_id, conversation_id, "guest", user_id=user_id)
+    return realm_id, user_id
+
+
+def test_telegram_console_history_cursor_retrieves_all_merged_messages(client):
+    chat_id = 939_391
+    conversation_id = "tg_console_cursor"
+    realm_id, user_id = _seed_telegram_console_chat(
+        client,
+        chat_id=chat_id,
+        conversation_id=conversation_id,
+        username="cursor_regression",
+    )
+    base = datetime(2026, 7, 1, tzinfo=UTC)
+    backend_count = 311
+    journal_count = 313
+    backend_ids = {f"cursor_backend_{index:04d}" for index in range(backend_count)}
+    journal_ids = {f"cursor_journal_{index:04d}" for index in range(journal_count)}
+    with app.state.storage.transaction(immediate=True) as conn:
+        conn.executemany(
+            """
+            INSERT INTO messages(
+                id, conversation_id, role, content, metadata, created_at, user_id
+            ) VALUES (?, ?, 'assistant', ?, '{}', ?, ?)
+            """,
+            [
+                (
+                    message_id,
+                    conversation_id,
+                    f"backend-{index}",
+                    (base + timedelta(seconds=index * 2)).isoformat(),
+                    user_id,
+                )
+                for index, message_id in enumerate(sorted(backend_ids))
+            ],
+        )
+        conn.executemany(
+            """
+            INSERT INTO telegram_message_log(
+                id, realm_id, chat_id, direction, sender_kind, source_key,
+                conversation_id, user_id, content, content_type, metadata,
+                created_at
+            ) VALUES (?, ?, ?, 'inbound', 'user', ?, ?, ?, ?, 'text', '{}', ?)
+            """,
+            [
+                (
+                    message_id,
+                    realm_id,
+                    chat_id,
+                    f"cursor-source-{index:04d}",
+                    conversation_id,
+                    user_id,
+                    f"journal-{index}",
+                    (base + timedelta(seconds=index * 2 + 1)).isoformat(),
+                )
+                for index, message_id in enumerate(sorted(journal_ids))
+            ],
+        )
+
+    path = f"/api/admin/telegram/chats/{realm_id}/{chat_id}/messages"
+    seen_ids: list[str] = []
+    before = ""
+    for _page_number in range(10):
+        params = {"limit": 113}
+        if before:
+            params["before"] = before
+        response = client.get(path, params=params)
+        assert response.status_code == 200, response.text
+        page = response.json()
+        page_ids = [item["id"] for item in page["messages"]]
+        assert len(page_ids) <= 113
+        assert not set(page_ids).intersection(seen_ids)
+        seen_ids.extend(page_ids)
+        if not page["has_more"]:
+            assert page["next_before"] is None
+            break
+        assert page["next_before"]
+        assert page["next_before"] != before
+        before = page["next_before"]
+    else:
+        pytest.fail("Telegram history pagination did not terminate")
+
+    expected_ids = backend_ids | journal_ids
+    assert len(expected_ids) > 500
+    assert len(seen_ids) == len(expected_ids)
+    assert set(seen_ids) == expected_ids
+
+
+def test_telegram_console_keeps_legacy_user_rows_and_deduplicates_exact_hash(client):
+    chat_id = 939_392
+    conversation_id = "tg_console_dedup"
+    realm_id, user_id = _seed_telegram_console_chat(
+        client,
+        chat_id=chat_id,
+        conversation_id=conversation_id,
+        username="dedup_regression",
+    )
+    exact_hash = "request-hash-exact"
+    with app.state.storage.transaction(immediate=True) as conn:
+        conn.executemany(
+            """
+            INSERT INTO messages(
+                id, conversation_id, role, content, metadata, created_at, user_id
+            ) VALUES (?, ?, 'user', ?, ?, ?, ?)
+            """,
+            [
+                (
+                    "dedup_legacy_backend",
+                    conversation_id,
+                    "legacy-without-hash",
+                    "{}",
+                    "2026-07-22T09:00:00+00:00",
+                    user_id,
+                ),
+                (
+                    "dedup_exact_backend",
+                    conversation_id,
+                    "exact-duplicate",
+                    json.dumps({"chat_request_hash": exact_hash}),
+                    "2026-07-22T09:01:00+00:00",
+                    user_id,
+                ),
+            ],
+        )
+        conn.executemany(
+            """
+            INSERT INTO telegram_message_log(
+                id, realm_id, chat_id, direction, sender_kind, source_key,
+                conversation_id, user_id, content, content_type, metadata,
+                created_at
+            ) VALUES (?, ?, ?, 'inbound', 'user', ?, ?, ?, ?, 'text', ?, ?)
+            """,
+            [
+                (
+                    "dedup_exact_journal",
+                    realm_id,
+                    chat_id,
+                    "dedup-source-exact",
+                    conversation_id,
+                    user_id,
+                    "exact-duplicate",
+                    json.dumps({"chat_request_hash": exact_hash}),
+                    "2026-07-22T09:01:01+00:00",
+                ),
+                (
+                    "dedup_newer_journal",
+                    realm_id,
+                    chat_id,
+                    "dedup-source-newer",
+                    conversation_id,
+                    user_id,
+                    "newer-journal-only",
+                    json.dumps({"chat_request_hash": "request-hash-newer"}),
+                    "2026-07-22T09:02:00+00:00",
+                ),
+            ],
+        )
+
+    response = client.get(
+        f"/api/admin/telegram/chats/{realm_id}/{chat_id}/messages",
+        params={"limit": 50},
+    )
+    assert response.status_code == 200, response.text
+    messages = response.json()["messages"]
+    ids = {item["id"] for item in messages}
+    assert "dedup_legacy_backend" in ids
+    assert "dedup_exact_journal" in ids
+    assert "dedup_newer_journal" in ids
+    assert "dedup_exact_backend" not in ids
+    assert [item["content"] for item in messages].count("exact-duplicate") == 1
+
+
+def test_telegram_console_uses_telegram_message_order_for_equal_timestamps(client):
+    chat_id = 939_397
+    conversation_id = "tg_console_equal_second"
+    realm_id, user_id = _seed_telegram_console_chat(
+        client,
+        chat_id=chat_id,
+        conversation_id=conversation_id,
+        username="equal_second_order",
+    )
+    created_at = "2026-07-22T09:30:00+00:00"
+    with app.state.storage.transaction(immediate=True) as conn:
+        conn.executemany(
+            """
+            INSERT INTO telegram_message_log(
+                id, realm_id, chat_id, direction, sender_kind, source_key,
+                telegram_message_id, conversation_id, user_id, content,
+                content_type, metadata, created_at
+            ) VALUES (?, ?, ?, 'inbound', 'user', ?, ?, ?, ?, ?, 'text', '{}', ?)
+            """,
+            [
+                (
+                    "tglog_hash_sorts_first_but_message_is_second",
+                    realm_id,
+                    chat_id,
+                    "equal-second-101",
+                    101,
+                    conversation_id,
+                    user_id,
+                    "second",
+                    created_at,
+                ),
+                (
+                    "zz_tglog_hash_sorts_last_but_message_is_first",
+                    realm_id,
+                    chat_id,
+                    "equal-second-100",
+                    100,
+                    conversation_id,
+                    user_id,
+                    "first",
+                    created_at,
+                ),
+            ],
+        )
+
+    response = client.get(
+        f"/api/admin/telegram/chats/{realm_id}/{chat_id}/messages",
+        params={"limit": 1},
+    )
+    assert response.status_code == 200, response.text
+    newest = response.json()
+    assert [item["content"] for item in newest["messages"]] == ["second"]
+    assert newest["messages"][0]["sort_sequence"] == 101
+    assert newest["messages"][0]["sort_rank"] == 0
+    assert newest["has_more"] is True
+
+    older = client.get(
+        f"/api/admin/telegram/chats/{realm_id}/{chat_id}/messages",
+        params={"limit": 1, "before": newest["next_before"]},
+    )
+    assert older.status_code == 200, older.text
+    assert [item["content"] for item in older.json()["messages"]] == ["first"]
+    assert older.json()["messages"][0]["sort_sequence"] == 100
+    assert older.json()["messages"][0]["sort_rank"] == 0
+
+    chats = client.get(
+        "/api/admin/telegram/chats",
+        params={"search": "equal_second_order"},
+    )
+    assert chats.status_code == 200, chats.text
+    assert chats.json()["chats"][0]["last_message"] == "second"
+
+
+def test_telegram_console_prefers_delivered_transport_over_backend_turn_rows(client):
+    chat_id = 939_398
+    conversation_id = "tg_console_transport_truth"
+    realm_id, user_id = _seed_telegram_console_chat(
+        client,
+        chat_id=chat_id,
+        conversation_id=conversation_id,
+        username="transport_truth",
+    )
+    request_hash = "transport-truth-hash"
+    metadata = json.dumps({"chat_request_hash": request_hash})
+    with app.state.storage.transaction(immediate=True) as conn:
+        conn.executemany(
+            """
+            INSERT INTO messages(
+                id, conversation_id, role, content, metadata, created_at, user_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    "transport_backend_user",
+                    conversation_id,
+                    "user",
+                    "synthetic callback prompt",
+                    metadata,
+                    "2026-07-22T09:40:00+00:00",
+                    user_id,
+                ),
+                (
+                    "transport_backend_assistant",
+                    conversation_id,
+                    "assistant",
+                    "one large backend answer",
+                    metadata,
+                    "2026-07-22T09:40:01+00:00",
+                    user_id,
+                ),
+            ],
+        )
+        conn.executemany(
+            """
+            INSERT INTO telegram_message_log(
+                id, realm_id, chat_id, direction, sender_kind, source_key,
+                telegram_message_id, conversation_id, user_id, content,
+                content_type, metadata, created_at
+            ) VALUES (?, ?, ?, 'outbound', 'bot', ?, ?, ?, ?, ?, 'text', ?, ?)
+            """,
+            [
+                (
+                    "transport_chunk_1",
+                    realm_id,
+                    chat_id,
+                    "transport-chunk-1",
+                    200,
+                    conversation_id,
+                    user_id,
+                    "chunk one",
+                    metadata,
+                    "2026-07-22T09:40:01+00:00",
+                ),
+                (
+                    "transport_chunk_2",
+                    realm_id,
+                    chat_id,
+                    "transport-chunk-2",
+                    201,
+                    conversation_id,
+                    user_id,
+                    "chunk two",
+                    metadata,
+                    "2026-07-22T09:40:01+00:00",
+                ),
+            ],
+        )
+
+    response = client.get(
+        f"/api/admin/telegram/chats/{realm_id}/{chat_id}/messages",
+        params={"limit": 50},
+    )
+    assert response.status_code == 200, response.text
+    messages = response.json()["messages"]
+    assert [item["content"] for item in messages] == ["chunk one", "chunk two"]
+
+
+def test_telegram_console_chat_order_prefers_newer_journal_activity(client):
+    older_chat_id = 939_393
+    journal_chat_id = 939_394
+    realm_id, _older_user_id = _seed_telegram_console_chat(
+        client,
+        chat_id=older_chat_id,
+        conversation_id="tg_console_order_older",
+        username="ordering_case_older",
+    )
+    _realm_id, journal_user_id = _seed_telegram_console_chat(
+        client,
+        chat_id=journal_chat_id,
+        conversation_id="tg_console_order_journal",
+        username="ordering_case_journal",
+    )
+    with app.state.storage.transaction(immediate=True) as conn:
+        conn.execute(
+            """
+            UPDATE conversations
+            SET last_message = 'newer conversation',
+                last_message_at = '2026-07-22T12:00:00+00:00'
+            WHERE id = 'tg_console_order_older'
+            """
+        )
+        conn.execute(
+            """
+            UPDATE conversations
+            SET last_message = 'older conversation',
+                last_message_at = '2026-07-22T10:00:00+00:00'
+            WHERE id = 'tg_console_order_journal'
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO telegram_message_log(
+                id, realm_id, chat_id, direction, sender_kind, source_key,
+                conversation_id, user_id, content, content_type, metadata,
+                created_at
+            ) VALUES (
+                'ordering_journal_message', ?, ?, 'inbound', 'user',
+                'ordering-journal-source', 'tg_console_order_journal', ?,
+                'journal wins', 'text', '{}', '2026-07-22T13:00:00+00:00'
+            )
+            """,
+            (realm_id, journal_chat_id, journal_user_id),
+        )
+
+    response = client.get(
+        "/api/admin/telegram/chats",
+        params={"search": "ordering_case"},
+    )
+    assert response.status_code == 200, response.text
+    chats = response.json()["chats"]
+    assert [item["chat_id"] for item in chats] == [journal_chat_id, older_chat_id]
+    assert chats[0]["last_message"] == "journal wins"
+    assert chats[0]["last_message_at"] == "2026-07-22T13:00:00+00:00"
+
+
+def test_telegram_console_claims_precreated_pending_send_exactly_once(
+    client,
+    monkeypatch,
+):
+    chat_id = 939_395
+    conversation_id = "tg_console_pending_claim"
+    realm_id, user_id = _seed_telegram_console_chat(
+        client,
+        chat_id=chat_id,
+        conversation_id=conversation_id,
+        username="pending_claim_regression",
+    )
+    content = "deliver precreated pending"
+    request_id = "precreated-pending-0001"
+    now = datetime.now(UTC).isoformat()
+    with app.state.storage.transaction(immediate=True) as conn:
+        conn.execute(
+            """
+            INSERT INTO telegram_operator_sends(
+                id, operator_user_id, client_request_id, realm_id, chat_id,
+                conversation_id, user_id, content, content_sha256, status,
+                delivery_claimed_at, delivery_attempt_count, created_at, updated_at
+            ) VALUES (
+                'precreated_pending_send', ?, ?, ?, ?, ?, ?, ?, ?, 'pending',
+                NULL, 0, ?, ?
+            )
+            """,
+            (
+                LEGACY_OWNER_USER_ID,
+                request_id,
+                realm_id,
+                chat_id,
+                conversation_id,
+                user_id,
+                content,
+                hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                now,
+                now,
+            ),
+        )
+    deliveries = 0
+
+    async def fake_delivery(**_kwargs):
+        nonlocal deliveries
+        deliveries += 1
+        return {
+            "bot_id": 700001,
+            "message_id": 939395,
+            "date": int(datetime(2026, 7, 22, 14, 0, tzinfo=UTC).timestamp()),
+        }
+
+    monkeypatch.setattr(
+        "jarvis_gpt.telegram_operator.send_telegram_text",
+        fake_delivery,
+    )
+    path = f"/api/admin/telegram/chats/{realm_id}/{chat_id}/messages"
+    request = {"content": content, "client_request_id": request_id}
+    first = client.post(path, json=request)
+    assert first.status_code == 200, first.text
+    assert first.json()["send"]["status"] == "delivered"
+    replay = client.post(path, json=request)
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["send"]["status"] == "delivered"
+    assert deliveries == 1
+    with app.state.storage.locked_connection() as conn:
+        stored = conn.execute(
+            """
+            SELECT status, delivery_attempt_count, delivery_claimed_at,
+                   telegram_message_id, message_id
+            FROM telegram_operator_sends WHERE id = 'precreated_pending_send'
+            """
+        ).fetchone()
+    assert stored is not None
+    assert stored["status"] == "delivered"
+    assert stored["delivery_attempt_count"] == 1
+    assert stored["delivery_claimed_at"]
+    assert stored["telegram_message_id"] == 939395
+    assert stored["message_id"]
+
+
+def test_telegram_console_fences_precreated_stale_claim_without_resend(
+    client,
+    monkeypatch,
+):
+    chat_id = 939_396
+    conversation_id = "tg_console_stale_claim"
+    realm_id, user_id = _seed_telegram_console_chat(
+        client,
+        chat_id=chat_id,
+        conversation_id=conversation_id,
+        username="stale_claim_regression",
+    )
+    content = "do not resend stale claim"
+    request_id = "precreated-stale-0001"
+    now = datetime.now(UTC)
+    stale_claimed_at = (now - timedelta(minutes=10)).isoformat()
+    with app.state.storage.transaction(immediate=True) as conn:
+        conn.execute(
+            """
+            INSERT INTO telegram_operator_sends(
+                id, operator_user_id, client_request_id, realm_id, chat_id,
+                conversation_id, user_id, content, content_sha256, status,
+                delivery_claimed_at, delivery_attempt_count, created_at, updated_at
+            ) VALUES (
+                'precreated_stale_send', ?, ?, ?, ?, ?, ?, ?, ?, 'pending',
+                ?, 1, ?, ?
+            )
+            """,
+            (
+                LEGACY_OWNER_USER_ID,
+                request_id,
+                realm_id,
+                chat_id,
+                conversation_id,
+                user_id,
+                content,
+                hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                stale_claimed_at,
+                stale_claimed_at,
+                now.isoformat(),
+            ),
+        )
+    deliveries = 0
+
+    async def unexpected_delivery(**_kwargs):
+        nonlocal deliveries
+        deliveries += 1
+        return {
+            "bot_id": 700001,
+            "message_id": 1,
+            "date": int(now.timestamp()),
+        }
+
+    monkeypatch.setattr(
+        "jarvis_gpt.telegram_operator.send_telegram_text",
+        unexpected_delivery,
+    )
+    path = f"/api/admin/telegram/chats/{realm_id}/{chat_id}/messages"
+    request = {"content": content, "client_request_id": request_id}
+    first = client.post(path, json=request)
+    assert first.status_code == 504, first.text
+    assert first.json()["send"]["status"] == "uncertain"
+    assert first.json()["send"]["error_code"] == "delivery_claim_expired"
+    replay = client.post(path, json=request)
+    assert replay.status_code == 504, replay.text
+    assert replay.json()["send"]["status"] == "uncertain"
+    assert deliveries == 0
+    with app.state.storage.locked_connection() as conn:
+        stored = conn.execute(
+            """
+            SELECT status, delivery_attempt_count, error_code
+            FROM telegram_operator_sends WHERE id = 'precreated_stale_send'
+            """
+        ).fetchone()
+    assert stored is not None
+    assert stored["status"] == "uncertain"
+    assert stored["delivery_attempt_count"] == 1
+    assert stored["error_code"] == "delivery_claim_expired"
+
+
+def test_user_delete_blocks_active_telegram_operator_delivery(client):
+    chat_id = 939_399
+    conversation_id = "tg_console_delete_inflight"
+    realm_id, user_id = _seed_telegram_console_chat(
+        client,
+        chat_id=chat_id,
+        conversation_id=conversation_id,
+        username="delete_inflight",
+    )
+    content = "in flight delete fence"
+    now = datetime.now(UTC)
+    with app.state.storage.transaction(immediate=True) as conn:
+        conn.execute(
+            """
+            INSERT INTO telegram_operator_sends(
+                id, operator_user_id, client_request_id, realm_id, chat_id,
+                conversation_id, user_id, content, content_sha256, status,
+                delivery_claimed_at, delivery_attempt_count, created_at, updated_at
+            ) VALUES (
+                'delete_inflight_send', ?, 'delete-inflight-request', ?, ?, ?, ?,
+                ?, ?, 'pending', ?, 1, ?, ?
+            )
+            """,
+            (
+                LEGACY_OWNER_USER_ID,
+                realm_id,
+                chat_id,
+                conversation_id,
+                user_id,
+                content,
+                hashlib.sha256(content.encode()).hexdigest(),
+                now.isoformat(),
+                now.isoformat(),
+                now.isoformat(),
+            ),
+        )
+
+    blocked = _approved_request(
+        client,
+        "DELETE",
+        f"/api/admin/users/{user_id}",
+        json={"reason": "must wait for active delivery"},
+    )
+    assert blocked.status_code == 409, blocked.text
+    assert "delivery is in flight" in blocked.json()["detail"]
+
+    with app.state.storage.transaction(immediate=True) as conn:
+        conn.execute(
+            """
+            UPDATE telegram_operator_sends
+            SET delivery_claimed_at = ?
+            WHERE id = 'delete_inflight_send'
+            """,
+            ((now - timedelta(minutes=10)).isoformat(),),
+        )
+    deleted = _approved_request(
+        client,
+        "DELETE",
+        f"/api/admin/users/{user_id}",
+        json={"reason": "stale delivery is safely fenced"},
+    )
+    assert deleted.status_code == 200, deleted.text

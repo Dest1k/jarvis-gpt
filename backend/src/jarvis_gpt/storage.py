@@ -7403,6 +7403,59 @@ CREATE TABLE IF NOT EXISTS messages (
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT
 );
 
+CREATE TABLE IF NOT EXISTS telegram_operator_sends (
+    id TEXT PRIMARY KEY,
+    operator_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    client_request_id TEXT NOT NULL,
+    realm_id TEXT NOT NULL,
+    chat_id INTEGER NOT NULL CHECK(chat_id > 0),
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    content TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('pending', 'delivered', 'failed', 'uncertain')),
+    telegram_message_id INTEGER,
+    message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+    error_code TEXT,
+    delivery_claimed_at TEXT,
+    delivery_attempt_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    delivered_at TEXT,
+    UNIQUE(operator_user_id, client_request_id)
+);
+
+CREATE TABLE IF NOT EXISTS telegram_message_log (
+    id TEXT PRIMARY KEY,
+    realm_id TEXT NOT NULL,
+    chat_id INTEGER NOT NULL CHECK(chat_id > 0),
+    direction TEXT NOT NULL CHECK(direction IN ('inbound', 'outbound')),
+    sender_kind TEXT NOT NULL CHECK(sender_kind IN ('user', 'bot', 'operator')),
+    source_key TEXT NOT NULL,
+    telegram_message_id INTEGER,
+    update_id INTEGER,
+    latest_update_id INTEGER,
+    conversation_id TEXT,
+    user_id TEXT,
+    content TEXT NOT NULL,
+    content_type TEXT NOT NULL DEFAULT 'text',
+    metadata TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    edited_at TEXT,
+    UNIQUE(realm_id, source_key)
+);
+
+CREATE TABLE IF NOT EXISTS telegram_turn_deliveries (
+    realm_id TEXT NOT NULL,
+    chat_id INTEGER NOT NULL CHECK(chat_id > 0),
+    request_hash TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('claimed', 'delivered', 'uncertain')),
+    claimed_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    completed_at REAL,
+    PRIMARY KEY(realm_id, chat_id, request_hash)
+);
+
 CREATE TABLE IF NOT EXISTS memories (
     id TEXT PRIMARY KEY,
     namespace TEXT NOT NULL,
@@ -7609,6 +7662,14 @@ CREATE TABLE IF NOT EXISTS audit_log (
 
 CREATE INDEX IF NOT EXISTS idx_runtime_kv_updated ON runtime_kv(updated_at);
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_telegram_operator_sends_chat
+ON telegram_operator_sends(realm_id, chat_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_telegram_operator_sends_user
+ON telegram_operator_sends(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_telegram_message_log_chat
+ON telegram_message_log(realm_id, chat_id, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_telegram_message_log_user
+ON telegram_message_log(user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_memories_namespace ON memories(namespace, importance);
 CREATE INDEX IF NOT EXISTS idx_mission_tasks_mission ON mission_tasks(mission_id, position);
 CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders(status, due_at);
@@ -7661,6 +7722,10 @@ _MESSENGER_MIGRATIONS = [
     "ALTER TABLE messages ADD COLUMN edited_at TEXT",
     "ALTER TABLE messages ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE messages ADD COLUMN reply_to_message_id TEXT",
+    "ALTER TABLE telegram_operator_sends ADD COLUMN delivery_claimed_at TEXT",
+    "ALTER TABLE telegram_operator_sends ADD COLUMN delivery_attempt_count "
+    "INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE telegram_message_log ADD COLUMN latest_update_id INTEGER",
 ]
 
 

@@ -295,6 +295,9 @@ The implemented administration endpoints are:
 | `PATCH /api/admin/users/{user_id}/status` | `admin.users.status.update` | Activate, suspend, or soft-delete a user. |
 | `POST /api/admin/users` | `admin.users.create` | Create a local account or pre-provision a Telegram identity. |
 | `POST /api/admin/telegram-owner-invitations` | `admin.users.owner.invite` | Issue an expiring, single-use Telegram owner invitation (active owner only). |
+| `GET /api/admin/telegram/chats` | `admin.telegram.messages.read` | Search and paginate registered private Telegram chats across tenants (active owner only). |
+| `GET /api/admin/telegram/chats/{realm_id}/{chat_id}/messages` | `admin.telegram.messages.read` | Read the cursor-paginated delivered transport timeline (active owner only). |
+| `POST /api/admin/telegram/chats/{realm_id}/{chat_id}/messages` | `admin.telegram.messages.send` | Send one audited, idempotent literal Bot API message (active owner only). |
 | `DELETE /api/admin/users/{user_id}` | `admin.users.delete` | Permanently delete a non-owner account, external identities, sessions, IAM assignments, and tenant-owned data. |
 | `PUT /api/admin/users/{user_id}/preset` | `admin.users.preset.assign` | Replace the active preset assignment. |
 | `PUT /api/admin/users/{user_id}/permissions/{security_id}` | `admin.users.permission.set` | Set a direct grant or deny. |
@@ -307,6 +310,12 @@ The implemented administration endpoints are:
 
 `/admin` provides loaded-user search, status and preset assignment, effective-permission inspection,
 direct grant/deny/inherit controls, security-ID filtering, and custom-preset creation.
+`/admin/telegram` inherits the same signed owner session. The browser receives neither
+`TELEGRAM_BOT_TOKEN` nor the backend API token. Delivery is server-side, bot-realm-pinned,
+audited without message bodies, and fenced against duplicate retries after ambiguous network
+results or process crashes. The timeline uses an append/update transport journal so commands,
+edited inbound messages, multipart text, voice/audio, documents/photos, reminders, alerts, and
+operator-authored messages reflect what Telegram actually carried rather than raw model turns.
 Setting the status to `deleted` is an access block: the account and immutable external
 identity remain, active sessions are revoked, and a later Telegram message cannot silently
 register around the block. The separate permanent-delete action is owner-protected and

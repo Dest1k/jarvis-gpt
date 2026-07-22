@@ -1,0 +1,55 @@
+.bar {
+  position: sticky;
+  z-index: 15;
+  top: 0;
+  width: 100%;
+  padding: 12px 138px 0 24px;
+  border-bottom: 1px solid color-mix(in srgb, var(--line) 78%, transparent);
+  background: color-mix(in srgb, var(--bg) 94%, transparent);
+  backdrop-filter: blur(14px);
+}
+
+.tabs {
+  display: flex;
+  width: min(1512px, 100%);
+  margin: 0 auto;
+  gap: 6px;
+}
+
+.tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 38px;
+  padding: 0 13px;
+  border: 1px solid transparent;
+  border-bottom: 0;
+  border-radius: var(--radius) var(--radius) 0 0;
+  color: var(--muted);
+  text-decoration: none;
+}
+
+.tab:hover,
+.tab:focus-visible {
+  outline: none;
+  color: var(--ink);
+  background: var(--surface-2);
+}
+
+.tab.active {
+  border-color: var(--line);
+  color: var(--ink);
+  background: var(--surface);
+  box-shadow: inset 0 2px 0 var(--teal);
+}
+
+@media (max-width: 680px) {
+  .bar {
+    padding: 8px 104px 0 12px;
+  }
+
+  .tab {
+    min-height: 36px;
+    padding: 0 10px;
+  }
+}
