@@ -147,7 +147,6 @@ def test_empty_allowlist_auto_registers_and_scopes_every_user_backend_call():
         }
     ]
     assert user_calls == [
-        ("/api/preferences", "short-lived-session"),
         ("/api/files", "short-lived-session"),
         ("/api/chat", "short-lived-session"),
         ("/api/files", "short-lived-session"),

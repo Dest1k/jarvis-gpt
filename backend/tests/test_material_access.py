@@ -175,6 +175,105 @@ def test_owner_admin_cross_user_material_search_and_user_denial(monkeypatch, tmp
     storage.close()
 
 
+def test_recent_messages_are_exact_role_scoped_and_deterministically_ordered(
+    monkeypatch, tmp_path
+):
+    tools, storage = _runtime(monkeypatch, tmp_path)
+    recent_info = {item.name: item for item in tools.list()}["materials.recent"]
+    assert recent_info.required_presets == ["owner", "admin"]
+    writer = tools.permissions.upsert_external_identity(
+        provider="telegram",
+        realm_id="bot-main",
+        provider_subject_id="recent-writer",
+        username="JBL61R",
+        bootstrap_preset="user",
+    )
+    with bind_actor(_actor(writer)):
+        conversation_id = storage.create_conversation("Recent messages")
+        first_id = storage.add_message(
+            conversation_id=conversation_id,
+            role="user",
+            content="Первое пользовательское сообщение.",
+        )
+        storage.add_message(
+            conversation_id=conversation_id,
+            role="assistant",
+            content="Промежуточный ответ Jarvis.",
+        )
+        second_id = storage.add_message(
+            conversation_id=conversation_id,
+            role="user",
+            content="Второе пользовательское сообщение.",
+        )
+        third_id = storage.add_message(
+            conversation_id=conversation_id,
+            role="user",
+            content="Третье пользовательское сообщение.",
+        )
+        denied = asyncio.run(
+            tools.run(
+                "materials.recent",
+                {"username": "@JBL61R", "limit": 2},
+            )
+        )
+        assert denied.ok is False
+        assert denied.data["authorization_denied"] is True
+
+    newest = asyncio.run(
+        tools.run(
+            "materials.recent",
+            {"username": "@JBL61R", "limit": 2},
+        )
+    )
+    assert newest.ok is True
+    assert newest.data["display_order"] == "newest_first"
+    assert newest.data["roles"] == ["user"]
+    assert [item["source_id"] for item in newest.data["messages"]] == [
+        third_id,
+        second_id,
+    ]
+    assert [item["citation"] for item in newest.data["messages"]] == [
+        f"message:{third_id}",
+        f"message:{second_id}",
+    ]
+    assert all(item["account"]["username"] == "JBL61R" for item in newest.data["messages"])
+
+    chronological = asyncio.run(
+        tools.run(
+            "materials.recent",
+            {
+                "username": "JBL61R",
+                "limit": 3,
+                "order": "oldest_first",
+            },
+        )
+    )
+    assert [item["source_id"] for item in chronological.data["messages"]] == [
+        first_id,
+        second_id,
+        third_id,
+    ]
+    missing = asyncio.run(
+        tools.run("materials.recent", {"username": "missing_recent_user", "limit": 2})
+    )
+    assert missing.ok is False
+    assert "No account matches" in missing.summary
+
+    tools.permissions.upsert_external_identity(
+        provider="telegram",
+        realm_id="bot-secondary",
+        provider_subject_id="recent-writer-duplicate",
+        username="JBL61R",
+        bootstrap_preset="user",
+    )
+    ambiguous = asyncio.run(
+        tools.run("materials.recent", {"username": "JBL61R", "limit": 2})
+    )
+    assert ambiguous.ok is False
+    assert "not unique" in ambiguous.summary
+    storage.close()
+
+
 def test_material_scoring_does_not_hold_storage_mutation_lock(monkeypatch, tmp_path):
     import jarvis_gpt.material_access as material_access_module
     from jarvis_gpt.authorization import current_actor

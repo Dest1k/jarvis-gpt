@@ -25,6 +25,7 @@ from jarvis_gpt.telegram_bridge import (
     _looks_like_image,
     _quick_capture_body,
     _retryable_backend_http_error,
+    _wav_to_mp3,
     load_config,
 )
 
@@ -514,7 +515,6 @@ def test_non_owner_allowed_chat_uses_backend_scoped_surface():
     assert chat_bodies[0]["notification_chat_id"] == 99
     assert chat_bodies[0]["conversation_id"].startswith("tg_")
     assert api_calls == [
-        "/api/preferences",
         "/api/files",
         "/api/chat",
         "/api/files",
@@ -549,7 +549,7 @@ def test_bridge_does_not_make_permission_decisions_for_non_owner():
 
     # Authorization is enforced by the backend using the scoped user session. The bridge
     # neither elevates the user nor silently turns a non-owner into an owner.
-    assert api_calls == ["/api/preferences", "/api/files", "/api/chat"]
+    assert api_calls == ["/api/files", "/api/chat"]
 
 
 def test_reset_command_rotates_conversation_without_calling_agent():
@@ -2240,6 +2240,20 @@ def test_looks_like_audio_detection():
     assert not _looks_like_audio({"mime_type": "text/plain", "name": "notes.txt"})
 
 
+def test_wav_to_mp3_accepts_only_mp3_framing(monkeypatch):
+    monkeypatch.setattr(
+        "jarvis_gpt.telegram_bridge._transcode_wav",
+        lambda wav, args: b"ID3\x04\x00\x00compressed",
+    )
+    assert _wav_to_mp3(b"RIFF") == b"ID3\x04\x00\x00compressed"
+
+    monkeypatch.setattr(
+        "jarvis_gpt.telegram_bridge._transcode_wav",
+        lambda wav, args: b"RIFF-not-compressed",
+    )
+    assert _wav_to_mp3(b"RIFF") is None
+
+
 def test_load_config_voice_replies_toggle():
     common = {
         "TELEGRAM_BOT_TOKEN": "T",
@@ -2256,15 +2270,19 @@ def _voice_bridge(
     monkeypatch,
     *,
     ogg: bytes | None,
+    mp3: bytes | None = b"ID3-mp3-bytes",
     speak_status: int = 200,
     telegram_voice_status: int = 200,
     telegram_voice_description: str = "voice rejected",
+    telegram_audio_status: int = 200,
     answer: str = "Готово, сэр.",
     preference: bool = False,
 ):
     monkeypatch.setattr("jarvis_gpt.telegram_bridge._wav_to_ogg_opus", lambda wav: ogg)
+    monkeypatch.setattr("jarvis_gpt.telegram_bridge._wav_to_mp3", lambda wav: mp3)
     tg_posts: list[str] = []
     tg_messages: list[str] = []
+    tg_uploads: list[bytes] = []
     chat_bodies: list[dict] = []
     speak_bodies: list[dict] = []
 
@@ -2275,12 +2293,19 @@ def _voice_bridge(
         if "/file/botT/" in path:
             return httpx.Response(200, content=b"OggS-voice-bytes")
         tg_posts.append(path)
+        if path.endswith(("/sendVoice", "/sendAudio")):
+            tg_uploads.append(request.content)
         if path.endswith("/sendMessage"):
             tg_messages.append(json.loads(request.content).get("text") or "")
         if path.endswith("/sendVoice") and telegram_voice_status != 200:
             return httpx.Response(
                 telegram_voice_status,
                 json={"ok": False, "description": telegram_voice_description},
+            )
+        if path.endswith("/sendAudio") and telegram_audio_status != 200:
+            return httpx.Response(
+                telegram_audio_status,
+                json={"ok": False, "description": "audio rejected"},
             )
         return httpx.Response(200, json={"ok": True, "result": {}})
 
@@ -2321,13 +2346,14 @@ def _voice_bridge(
         _bridge(tg_handler, api_handler),
         tg_posts,
         tg_messages,
+        tg_uploads,
         chat_bodies,
         speak_bodies,
     )
 
 
 def test_inbound_voice_transcribed_and_answered_with_voice(monkeypatch):
-    bridge, tg_posts, _, chat_bodies, _ = _voice_bridge(
+    bridge, tg_posts, _, _, chat_bodies, _ = _voice_bridge(
         monkeypatch, ogg=b"OggS-opus"
     )
     update = {
@@ -2349,8 +2375,62 @@ def test_inbound_voice_transcribed_and_answered_with_voice(monkeypatch):
     assert not any(p.endswith("/sendMessage") for p in tg_posts)
 
 
-def test_voice_reply_falls_back_to_audio_when_no_opus(monkeypatch):
-    bridge, tg_posts, _, _, _ = _voice_bridge(monkeypatch, ogg=None)
+def test_direct_audio_without_caption_is_answered_with_voice(monkeypatch):
+    bridge, tg_posts, _, _, chat_bodies, _ = _voice_bridge(
+        monkeypatch, ogg=b"OggS-opus"
+    )
+    update = {
+        "update_id": 2,
+        "message": {
+            "chat": {"id": 42, "type": "private"},
+            "from": {"id": 42, "is_bot": False},
+            "audio": {
+                "file_id": "af",
+                "file_name": "request.mp3",
+                "mime_type": "audio/mpeg",
+            },
+        },
+    }
+
+    asyncio.run(bridge._handle(update))
+
+    assert chat_bodies[0]["response_modality"] == "voice"
+    assert any(path.endswith("/sendVoice") for path in tg_posts)
+    assert not any(path.endswith("/sendMessage") for path in tg_posts)
+
+
+def test_audio_caption_is_a_text_request_and_gets_text_reply(monkeypatch):
+    bridge, tg_posts, _, _, chat_bodies, speak_bodies = _voice_bridge(
+        monkeypatch, ogg=b"OggS-opus", preference=True
+    )
+    update = {
+        "update_id": 3,
+        "message": {
+            "chat": {"id": 42, "type": "private"},
+            "from": {"id": 42, "is_bot": False},
+            "caption": "кратко опиши запись",
+            "audio": {
+                "file_id": "af",
+                "file_name": "source.mp3",
+                "mime_type": "audio/mpeg",
+            },
+        },
+    }
+
+    asyncio.run(bridge._handle(update))
+
+    assert chat_bodies[0]["message"] == "кратко опиши запись"
+    assert chat_bodies[0]["response_modality"] == "text"
+    assert speak_bodies == []
+    assert any(path.endswith("/sendMessage") for path in tg_posts)
+    assert not any(path.endswith("/sendVoice") for path in tg_posts)
+    assert not any(path.endswith("/sendAudio") for path in tg_posts)
+
+
+def test_voice_reply_falls_back_to_text_when_opus_is_unavailable(monkeypatch):
+    bridge, tg_posts, tg_messages, _, _, _ = _voice_bridge(
+        monkeypatch, ogg=None
+    )
     update = {
         "update_id": 1,
         "message": {
@@ -2360,15 +2440,16 @@ def test_voice_reply_falls_back_to_audio_when_no_opus(monkeypatch):
         },
     }
     asyncio.run(bridge._handle(update))
-    assert any(p.endswith("/sendAudio") for p in tg_posts)
+    assert any(p.endswith("/sendMessage") for p in tg_posts)
     assert not any(p.endswith("/sendVoice") for p in tg_posts)
-    assert not any(p.endswith("/sendMessage") for p in tg_posts)
+    assert not any(p.endswith("/sendAudio") for p in tg_posts)
+    assert any("Готово, сэр." in text for text in tg_messages)
 
 
 def test_voice_reply_falls_back_to_audio_when_recipient_forbids_voice_notes(
     monkeypatch, caplog
 ):
-    bridge, tg_posts, tg_messages, _, _ = _voice_bridge(
+    bridge, tg_posts, tg_messages, tg_uploads, _, _ = _voice_bridge(
         monkeypatch,
         ogg=b"OggS-opus",
         telegram_voice_status=400,
@@ -2390,12 +2471,73 @@ def test_voice_reply_falls_back_to_audio_when_recipient_forbids_voice_notes(
     assert sum(path.endswith("/sendAudio") for path in tg_posts) == 1
     assert not any(path.endswith("/sendMessage") for path in tg_posts)
     assert tg_messages == []
-    assert "retrying as audio" in caplog.text
+    assert b'filename="jarvis-01.mp3"' in tg_uploads[-1]
+    assert b"audio/mpeg" in tg_uploads[-1]
+    assert b".wav" not in tg_uploads[-1]
+    assert "retrying as compressed audio" in caplog.text
     assert "voice delivery succeeded chat_id=42" in caplog.text
 
 
+def test_forbidden_voice_note_falls_back_to_text_when_mp3_conversion_fails(
+    monkeypatch, caplog
+):
+    bridge, tg_posts, tg_messages, _, _, _ = _voice_bridge(
+        monkeypatch,
+        ogg=b"OggS-opus",
+        mp3=None,
+        telegram_voice_status=400,
+        telegram_voice_description="Bad Request: VOICE_MESSAGES_FORBIDDEN",
+    )
+    update = {
+        "update_id": 12,
+        "message": {
+            "chat": {"id": 42, "type": "private"},
+            "from": {"id": 42, "is_bot": False},
+            "voice": {"file_id": "vf", "mime_type": "audio/ogg"},
+        },
+    }
+
+    with caplog.at_level(logging.WARNING, logger="jarvis.telegram"):
+        asyncio.run(bridge._handle(update))
+
+    assert sum(path.endswith("/sendVoice") for path in tg_posts) == 1
+    assert not any(path.endswith("/sendAudio") for path in tg_posts)
+    assert sum(path.endswith("/sendMessage") for path in tg_posts) == 1
+    assert any("Готово, сэр." in text for text in tg_messages)
+    assert "reason=mp3_transcode_failed" in caplog.text
+
+
+def test_forbidden_voice_note_falls_back_to_text_when_mp3_delivery_fails(
+    monkeypatch, caplog
+):
+    bridge, tg_posts, tg_messages, _, _, _ = _voice_bridge(
+        monkeypatch,
+        ogg=b"OggS-opus",
+        telegram_voice_status=400,
+        telegram_voice_description="Bad Request: VOICE_MESSAGES_FORBIDDEN",
+        telegram_audio_status=503,
+    )
+    update = {
+        "update_id": 13,
+        "message": {
+            "chat": {"id": 42, "type": "private"},
+            "from": {"id": 42, "is_bot": False},
+            "voice": {"file_id": "vf", "mime_type": "audio/ogg"},
+        },
+    }
+
+    with caplog.at_level(logging.WARNING, logger="jarvis.telegram"):
+        asyncio.run(bridge._handle(update))
+
+    assert sum(path.endswith("/sendVoice") for path in tg_posts) == 1
+    assert sum(path.endswith("/sendAudio") for path in tg_posts) == 1
+    assert sum(path.endswith("/sendMessage") for path in tg_posts) == 1
+    assert any("Готово, сэр." in text for text in tg_messages)
+    assert "reason=HTTPStatusError status=503" in caplog.text
+
+
 def test_voice_reply_falls_back_to_text_when_tts_is_unavailable(monkeypatch, caplog):
-    bridge, tg_posts, tg_messages, chat_bodies, _ = _voice_bridge(
+    bridge, tg_posts, tg_messages, _, chat_bodies, _ = _voice_bridge(
         monkeypatch,
         ogg=b"OggS-opus",
         speak_status=503,
@@ -2421,7 +2563,7 @@ def test_voice_reply_falls_back_to_text_when_tts_is_unavailable(monkeypatch, cap
 
 
 def test_text_input_in_auto_mode_stays_text(monkeypatch):
-    bridge, tg_posts, _, chat_bodies, speak_bodies = _voice_bridge(
+    bridge, tg_posts, _, _, chat_bodies, speak_bodies = _voice_bridge(
         monkeypatch,
         ogg=b"OggS-opus",
         answer="просто текст",
@@ -2443,11 +2585,11 @@ def test_text_input_in_auto_mode_stays_text(monkeypatch):
     assert not any(p.endswith("/sendAudio") for p in tg_posts)
 
 
-def test_explicit_text_request_triggers_one_voice_reply(monkeypatch):
-    bridge, tg_posts, _, chat_bodies, speak_bodies = _voice_bridge(
+def test_explicit_voice_wording_in_text_does_not_override_text_modality(monkeypatch):
+    bridge, tg_posts, _, _, chat_bodies, speak_bodies = _voice_bridge(
         monkeypatch,
         ogg=b"OggS-opus",
-        preference=False,
+        preference=True,
     )
     update = {
         "update_id": 2,
@@ -2460,13 +2602,15 @@ def test_explicit_text_request_triggers_one_voice_reply(monkeypatch):
 
     asyncio.run(bridge._handle(update))
 
-    assert chat_bodies[0]["response_modality"] == "voice"
-    assert speak_bodies == [{"text": "Готово, сэр."}]
-    assert any(path.endswith("/sendVoice") for path in tg_posts)
+    assert chat_bodies[0]["response_modality"] == "text"
+    assert speak_bodies == []
+    assert any(path.endswith("/sendMessage") for path in tg_posts)
+    assert not any(path.endswith("/sendVoice") for path in tg_posts)
+    assert not any(path.endswith("/sendAudio") for path in tg_posts)
 
 
-def test_persisted_on_preference_drives_text_voice_reply(monkeypatch):
-    bridge, tg_posts, _, chat_bodies, speak_bodies = _voice_bridge(
+def test_legacy_voice_preference_cannot_override_text_modality(monkeypatch):
+    bridge, tg_posts, _, _, chat_bodies, speak_bodies = _voice_bridge(
         monkeypatch,
         ogg=b"OggS-opus",
         preference=True,
@@ -2482,14 +2626,16 @@ def test_persisted_on_preference_drives_text_voice_reply(monkeypatch):
 
     asyncio.run(bridge._handle(update))
 
-    assert chat_bodies[0]["response_modality"] == "voice"
-    assert len(speak_bodies) == 1
-    assert any(path.endswith("/sendVoice") for path in tg_posts)
+    assert chat_bodies[0]["response_modality"] == "text"
+    assert speak_bodies == []
+    assert any(path.endswith("/sendMessage") for path in tg_posts)
+    assert not any(path.endswith("/sendVoice") for path in tg_posts)
+    assert not any(path.endswith("/sendAudio") for path in tg_posts)
 
 
 def test_long_voice_reply_is_split_into_bounded_tts_chunks(monkeypatch, caplog):
     answer = ("Длинная фраза. " * 260).strip()
-    bridge, tg_posts, _, _, speak_bodies = _voice_bridge(
+    bridge, tg_posts, _, _, _, speak_bodies = _voice_bridge(
         monkeypatch,
         ogg=b"OggS-opus",
         answer=answer,
@@ -2500,7 +2646,7 @@ def test_long_voice_reply_is_split_into_bounded_tts_chunks(monkeypatch, caplog):
         "message": {
             "chat": {"id": 42, "type": "private"},
             "from": {"id": 42, "is_bot": False},
-            "text": "дай подробный ответ",
+            "voice": {"file_id": "vf", "mime_type": "audio/ogg"},
         },
     }
 
@@ -2518,7 +2664,7 @@ def test_long_voice_reply_is_split_into_bounded_tts_chunks(monkeypatch, caplog):
 
 
 def test_send_voice_failure_is_logged_and_falls_back_to_full_text(monkeypatch, caplog):
-    bridge, tg_posts, tg_messages, _, _ = _voice_bridge(
+    bridge, tg_posts, tg_messages, _, _, _ = _voice_bridge(
         monkeypatch,
         ogg=b"OggS-opus",
         telegram_voice_status=500,
@@ -2542,7 +2688,7 @@ def test_send_voice_failure_is_logged_and_falls_back_to_full_text(monkeypatch, c
 
 
 def test_forwarded_voice_is_source_material_and_stays_text_in_auto(monkeypatch):
-    bridge, tg_posts, _, chat_bodies, speak_bodies = _voice_bridge(
+    bridge, tg_posts, _, _, chat_bodies, speak_bodies = _voice_bridge(
         monkeypatch,
         ogg=b"OggS-opus",
         preference=False,
@@ -2565,29 +2711,23 @@ def test_forwarded_voice_is_source_material_and_stays_text_in_auto(monkeypatch):
     assert not any(path.endswith("/sendVoice") for path in tg_posts)
 
 
-def test_voice_command_persists_on_and_auto_for_internal_session(monkeypatch):
-    monkeypatch.setattr(
-        "jarvis_gpt.telegram_bridge._wav_to_ogg_opus", lambda wav: b"OggS-opus"
-    )
-    state = {"voice_reply": False}
-    patches: list[dict] = []
-    preference_headers: list[str] = []
+def test_voice_command_enforces_auto_without_reading_or_writing_preferences():
+    preference_calls: list[str] = []
     chat_bodies: list[dict] = []
     tg_posts: list[str] = []
+    tg_messages: list[str] = []
 
     def tg_handler(request):
         tg_posts.append(request.url.path)
+        if request.url.path.endswith("/sendMessage"):
+            tg_messages.append(json.loads(request.content).get("text") or "")
         return httpx.Response(200, json={"ok": True, "result": {}})
 
     def api_handler(request):
         path = request.url.path
         if path == "/api/preferences":
-            preference_headers.append(request.headers.get("X-Jarvis-User-Session", ""))
-            if request.method == "PATCH":
-                patch = json.loads(request.content)
-                patches.append(patch)
-                state.update(patch)
-            return httpx.Response(200, json=state)
+            preference_calls.append(request.method)
+            return httpx.Response(500, json={})
         if path == "/api/chat":
             chat_bodies.append(json.loads(request.content))
             return httpx.Response(
@@ -2599,8 +2739,6 @@ def test_voice_command_persists_on_and_auto_for_internal_session(monkeypatch):
                     "events": [],
                 },
             )
-        if path == "/api/voice/speak":
-            return httpx.Response(200, content=b"wav")
         if path == "/api/files":
             return httpx.Response(200, json=[])
         return httpx.Response(404)
@@ -2622,10 +2760,11 @@ def test_voice_command_persists_on_and_auto_for_internal_session(monkeypatch):
     asyncio.run(bridge._handle(update(12, "/voice auto")))
     asyncio.run(bridge._handle(update(13, "ещё текст")))
 
-    assert patches == [{"voice_reply": True}, {"voice_reply": False}]
-    assert set(preference_headers) == {"session-42"}
-    assert [body["response_modality"] for body in chat_bodies] == ["voice", "text"]
-    assert sum(path.endswith("/sendVoice") for path in tg_posts) == 1
+    assert preference_calls == []
+    assert [body["response_modality"] for body in chat_bodies] == ["text", "text"]
+    assert not any(path.endswith(("/sendVoice", "/sendAudio")) for path in tg_posts)
+    assert any("Режим <code>on</code> отключён" in text for text in tg_messages)
+    assert any("Голосовые ответы: <code>auto</code>" in text for text in tg_messages)
 
 
 def test_voice_off_does_not_fake_unpersistable_third_state():
@@ -2655,7 +2794,7 @@ def test_voice_off_does_not_fake_unpersistable_third_state():
     asyncio.run(bridge._handle(update))
 
     assert patches == []
-    assert any("Настройку не менял" in text for text in messages)
+    assert any("Режим <code>off</code> отключён" in text for text in messages)
 
 
 def test_quick_capture_body_parsers():

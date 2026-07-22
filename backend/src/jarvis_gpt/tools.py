@@ -2480,6 +2480,35 @@ class ToolRegistry:
         )
         self.add(
             ToolSpec(
+                name="materials.recent",
+                description=(
+                    "Return the newest canonical messages for exactly one Jarvis account. "
+                    "Use this for requests such as 'last two messages from @username'. "
+                    "An @username here identifies a Jarvis account, not a Telegram source; "
+                    "telegram.sources.* is only for registered channels/supergroups. "
+                    "Results have stable message citations and deterministic ordering. "
+                    "Owner/admin only."
+                ),
+                category="materials",
+                input_schema={
+                    "user_id": "Exact target Jarvis user id",
+                    "provider": "Immutable identity provider, e.g. telegram",
+                    "realm_id": "Immutable identity realm/bot id",
+                    "provider_subject_id": "Immutable provider subject",
+                    "username": "Exact account username; ambiguity fails closed",
+                    "roles": "Message roles: user by default; optionally assistant",
+                    "include_assistant": "Include Jarvis replies in addition to user messages",
+                    "limit": "Number of newest messages, 1..50",
+                    "order": "newest_first (default) or oldest_first display order",
+                },
+                handler=_materials_recent,
+                default_presets=("admin",),
+                required_presets=("owner", "admin"),
+                history_persistence="metadata_only",
+            )
+        )
+        self.add(
+            ToolSpec(
                 name="materials.read",
                 description=(
                     "Read one exact cross-user message, memory, or indexed document by id "
@@ -9632,6 +9661,36 @@ async def _materials_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRe
         summary=(
             f"Privileged material search returned {data['count']} evidence hit(s) "
             f"from {data['target_user_count']} account(s)."
+        ),
+        data=data,
+    )
+
+
+def _materials_recent(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
+    try:
+        target_user_ids = _material_target_ids(ctx, args)
+        roles = _string_list_arg(args.get("roles"), limit=2) or ["user"]
+        if _bool_arg(args.get("include_assistant"), default=False):
+            roles.append("assistant")
+        data = _material_service(ctx).recent_messages(
+            ctx.actor,
+            target_user_ids=target_user_ids,
+            roles=roles,
+            limit=_int_arg(args.get("limit"), default=2, minimum=1, maximum=50),
+            order=str(args.get("order") or "newest_first"),
+            expected_username=str(args.get("username") or ""),
+            expected_provider=str(args.get("provider") or ""),
+            expected_realm_id=str(args.get("realm_id") or ""),
+            expected_provider_subject_id=str(args.get("provider_subject_id") or ""),
+        )
+    except MaterialAccessError as exc:
+        return ToolRunResponse(tool="materials.recent", ok=False, summary=str(exc))
+    return ToolRunResponse(
+        tool="materials.recent",
+        ok=True,
+        summary=(
+            f"Returned {data['count']} newest canonical message(s) for one exact account "
+            f"in {data['display_order']} order."
         ),
         data=data,
     )

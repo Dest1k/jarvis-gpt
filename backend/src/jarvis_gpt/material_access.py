@@ -560,6 +560,149 @@ class MaterialAccessService:
             "total_matching": len(accounts),
         }
 
+    def recent_messages(
+        self,
+        actor: ActorContext,
+        *,
+        target_user_ids: Iterable[str],
+        roles: Iterable[str] = ("user",),
+        limit: int = 2,
+        order: str = "newest_first",
+        expected_username: str = "",
+        expected_provider: str = "",
+        expected_realm_id: str = "",
+        expected_provider_subject_id: str = "",
+    ) -> dict[str, Any]:
+        """Return an exact account's newest canonical messages deterministically.
+
+        This is intentionally separate from semantic material search: a request for
+        "the last two messages" has no lexical query and must not be approximated by
+        relevance scoring or confused with a Telegram channel feed.
+        """
+
+        self._require_privileged(actor)
+        selected = list(dict.fromkeys(str(item) for item in target_user_ids if item))
+        if len(selected) != 1:
+            raise MaterialAccessError(
+                "Recent message history requires exactly one explicit account."
+            )
+        requested_roles = tuple(
+            dict.fromkeys(
+                str(role).strip().casefold()
+                for role in roles
+                if str(role).strip().casefold() in {"user", "assistant"}
+            )
+        )
+        if not requested_roles:
+            raise MaterialAccessError("Select at least one supported message role.")
+        normalized_order = str(order or "newest_first").strip().casefold()
+        if normalized_order not in {"newest_first", "oldest_first"}:
+            raise MaterialAccessError(
+                "Message order must be newest_first or oldest_first."
+            )
+        bounded_limit = max(1, min(50, int(limit)))
+        target_user_id = selected[0]
+        accounts: dict[str, dict[str, Any]] = {}
+        messages: list[dict[str, Any]] = []
+
+        conn = self._open_search_connection()
+        try:
+            conn.execute("BEGIN")
+            self._require_privileged_on_connection(conn, actor)
+            accounts = self._account_map_on_connection(conn, selected)
+            account = accounts.get(target_user_id)
+            if account is None or str(account.get("status") or "") != "active":
+                raise MaterialTargetNotFoundError(
+                    "The selected account changed or is inactive."
+                )
+            normalized_username = str(expected_username or "").strip().lstrip("@").casefold()
+            normalized_provider = str(expected_provider or "").strip().casefold()
+            normalized_realm = str(expected_realm_id or "").strip()
+            normalized_subject = str(expected_provider_subject_id or "").strip()
+            identities = account.get("identities")
+            identity_rows = identities if isinstance(identities, list) else []
+            if normalized_username and not any(
+                str(identity.get("username") or "").casefold() == normalized_username
+                for identity in identity_rows
+                if isinstance(identity, dict)
+            ):
+                raise MaterialTargetNotFoundError(
+                    "The exact username no longer resolves to the selected account."
+                )
+            if any((normalized_provider, normalized_realm, normalized_subject)) and not any(
+                str(identity.get("provider") or "").casefold() == normalized_provider
+                and str(identity.get("realm_id") or "") == normalized_realm
+                and str(identity.get("provider_subject_id") or "") == normalized_subject
+                for identity in identity_rows
+                if isinstance(identity, dict)
+            ):
+                raise MaterialTargetNotFoundError(
+                    "The immutable identity no longer resolves to the selected account."
+                )
+            role_placeholders = ",".join("?" for _role in requested_roles)
+            rows = conn.execute(
+                f"""
+                SELECT m.id, m.user_id, m.conversation_id, m.role, m.content,
+                       m.created_at, m.edited_at,
+                       c.title AS conversation_title,
+                       m.rowid AS message_rowid
+                FROM messages m
+                JOIN conversations c
+                  ON c.id = m.conversation_id AND c.user_id = m.user_id
+                WHERE m.user_id = ?
+                  AND m.is_deleted = 0
+                  AND m.role IN ({role_placeholders})
+                ORDER BY m.created_at DESC, m.rowid DESC
+                LIMIT ?
+                """,
+                (target_user_id, *requested_roles, bounded_limit),
+            ).fetchall()
+            account_provenance = self._provenance(account)
+            for row in rows:
+                item = dict(row)
+                item.pop("message_rowid", None)
+                source_id = str(item.pop("id"))
+                messages.append(
+                    {
+                        "source_type": "message",
+                        "source_id": source_id,
+                        "citation": f"message:{source_id}",
+                        "account": account_provenance,
+                        **item,
+                    }
+                )
+        finally:
+            conn.close()
+
+        if normalized_order == "oldest_first":
+            messages.reverse()
+        # Close the snapshot before the final live-role recheck so a demotion that
+        # raced the read cannot release cross-user content.
+        self._require_privileged(actor)
+        self._audit(
+            actor,
+            action="materials.recent",
+            capability="tool.materials.recent",
+            target_user_ids=selected,
+            result_count=len(messages),
+            details={
+                "roles": list(requested_roles),
+                "limit": bounded_limit,
+                "order": normalized_order,
+            },
+        )
+        return {
+            "messages": messages,
+            "hits": messages,
+            "count": len(messages),
+            "target_user_count": 1,
+            "source_types": ["messages"],
+            "roles": list(requested_roles),
+            "requested_limit": bounded_limit,
+            "display_order": normalized_order,
+            "account": self._provenance(accounts[target_user_id]),
+        }
+
     def search(
         self,
         actor: ActorContext,

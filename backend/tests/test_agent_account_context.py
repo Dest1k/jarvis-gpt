@@ -11,6 +11,7 @@ from jarvis_gpt.agent import (
     SYSTEM_PROMPT,
     TENANT_SYSTEM_PROMPT,
     AgentRuntime,
+    _account_recent_messages_request,
     _AgenticResult,
     _ExecutedToolResult,
     _operator_effect_key,
@@ -104,12 +105,171 @@ def test_admin_prompt_has_explicit_privileged_material_tools(monkeypatch, tmp_pa
         assert {
             "accounts.overview",
             "materials.search",
+            "materials.recent",
             "materials.read",
             "materials.summarize",
             "telegram.sources.add",
             "telegram.sources.search",
             "telegram.sources.analyze",
         } <= tool_names
+    storage.close()
+
+
+def test_russian_recent_account_history_request_bypasses_telegram_sources(
+    monkeypatch, tmp_path
+):
+    agent, storage = _runtime(monkeypatch, tmp_path)
+    identity = agent.permissions.upsert_external_identity(
+        provider="telegram",
+        realm_id="bot-main",
+        provider_subject_id="2051783036",
+        username="JBL61R",
+        bootstrap_preset="user",
+    )
+    with bind_actor(_actor(identity)):
+        conversation_id = storage.create_conversation("JBL history")
+        older_id = storage.add_message(
+            conversation_id=conversation_id,
+            role="user",
+            content="Предпоследнее точное сообщение JBL.",
+        )
+        newer_id = storage.add_message(
+            conversation_id=conversation_id,
+            role="user",
+            content="Последнее точное сообщение JBL.",
+        )
+
+    called_tools: list[str] = []
+    original_run = agent.tools.run
+
+    async def tracked_run(name, *args, **kwargs):
+        called_tools.append(str(name))
+        return await original_run(name, *args, **kwargs)
+
+    monkeypatch.setattr(agent.tools, "run", tracked_run)
+    prompt = "напиши два последних сообщения в истории @JBL61R"
+    response = asyncio.run(agent.chat(prompt))
+
+    assert called_tools == ["materials.recent"]
+    assert not any(name.startswith("telegram.sources.") for name in called_tools)
+    assert "Последнее точное сообщение JBL." in response.answer
+    assert "Предпоследнее точное сообщение JBL." in response.answer
+    assert response.answer.index("Последнее точное") < response.answer.index(
+        "Предпоследнее точное"
+    )
+    assert f"[message:{newer_id}]" in response.answer
+    assert f"[message:{older_id}]" in response.answer
+    assert any(
+        event.payload.get("telegram_source_routed") is False
+        for event in response.events
+        if event.title == "materials.recent"
+    )
+    persisted = storage.get_message(response.message_id)
+    assert persisted is not None
+    assert persisted["metadata"]["privileged_derived"] is True
+    assert persisted["metadata"]["privileged_source_tools"] == ["materials.recent"]
+    missing = asyncio.run(
+        agent.chat("напиши два последних сообщения в истории @missing_recent_user")
+    )
+    assert "Активный аккаунт с точным username @missing_recent_user" in missing.answer
+    assert called_tools == ["materials.recent", "materials.recent"]
+    assert not any(name.startswith("telegram.sources.") for name in called_tools)
+    storage.close()
+
+
+def test_recent_handle_parser_leaves_explicit_channel_history_to_source_tools():
+    account = _account_recent_messages_request(
+        "напиши два последних сообщения в истории @JBL61R"
+    )
+    assert account is not None
+    assert account.username == "jbl61r"
+    assert account.limit == 2
+    assert _account_recent_messages_request(
+        "Покажи два последних сообщения канала @global_news"
+    ) is None
+
+
+def test_recent_account_result_is_withheld_if_admin_is_demoted_before_persistence(
+    monkeypatch, tmp_path
+):
+    agent, storage = _runtime(monkeypatch, tmp_path)
+    writer = agent.permissions.upsert_external_identity(
+        provider="telegram",
+        realm_id="bot-main",
+        provider_subject_id="recent-race-writer",
+        username="recent_race_writer",
+        bootstrap_preset="user",
+    )
+    admin_identity = agent.permissions.upsert_external_identity(
+        provider="test",
+        realm_id="recent-race",
+        provider_subject_id="admin",
+        username="recent_race_admin",
+        bootstrap_preset="admin",
+    )
+    sentinel = "RECENT_ACCOUNT_ROLE_RACE_SENTINEL"
+    with bind_actor(_actor(writer)):
+        writer_conversation = storage.create_conversation("Role race source")
+        storage.add_message(
+            conversation_id=writer_conversation,
+            role="user",
+            content=sentinel,
+        )
+
+    calls = 0
+    original_run = agent.tools.run
+
+    async def demote_after_read(name, *args, **kwargs):
+        nonlocal calls
+        result = await original_run(name, *args, **kwargs)
+        if name == "materials.recent":
+            calls += 1
+            agent.permissions.assign_preset(
+                user_id=str(admin_identity["user_id"]),
+                preset_key="user",
+                assigned_by=LEGACY_OWNER_USER_ID,
+                reason="recent result delivery race regression",
+            )
+        return result
+
+    monkeypatch.setattr(agent.tools, "run", demote_after_read)
+    prompt = "напиши одно последнее сообщение в истории @recent_race_writer"
+    with bind_actor(_actor(admin_identity)):
+        first = asyncio.run(
+            agent.chat(prompt, transport_request_id="recent-account-role-race")
+        )
+
+    assert calls == 1
+    assert first.answer == PRIVILEGED_RESULT_WITHHELD_ANSWER
+    assert sentinel not in first.model_dump_json()
+    with storage.locked_connection() as conn:
+        persisted = conn.execute(
+            "SELECT content, metadata FROM messages WHERE id = ?",
+            (first.message_id,),
+        ).fetchone()
+    assert persisted is not None
+    assert str(persisted["content"]) == PRIVILEGED_RESULT_WITHHELD_ANSWER
+    assert sentinel not in str(dict(persisted))
+    metadata = json.loads(str(persisted["metadata"]))
+    assert metadata["authorization_revoked"] is True
+    assert metadata["privileged_result_withheld"] is True
+
+    live = agent.permissions.get_user(str(admin_identity["user_id"]))
+    assert live is not None
+    demoted = ActorContext(
+        user_id=str(admin_identity["user_id"]),
+        preset_key="user",
+        source="fresh-demoted-session",
+        identity_id=str(admin_identity["identity_id"]),
+        policy_epoch=int(live["policy_epoch"]),
+    )
+    with bind_actor(demoted):
+        replay = asyncio.run(
+            agent.chat(prompt, transport_request_id="recent-account-role-race")
+        )
+    assert calls == 1
+    assert replay.answer == PRIVILEGED_RESULT_WITHHELD_ANSWER
+    assert sentinel not in replay.model_dump_json()
     storage.close()
 
 
@@ -177,6 +337,13 @@ def test_account_policy_denial_is_multilingual_and_admin_bypasses_it(
     assert "owner" in (
         agent._restricted_tenant_request_answer(
             "What did @alice upload?", privileged=False
+        )
+        or ""
+    )
+    assert "owner" in (
+        agent._restricted_tenant_request_answer(
+            "Отправить два последних сообщения из истории сообщений @JBL61R",
+            privileged=False,
         )
         or ""
     )

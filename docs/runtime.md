@@ -19,7 +19,7 @@
   provenance. Failed jobs can start at most three hash-verified retry generations, and a
   corrupt managed blob is healed only by reuploading bytes with the canonical hash.
   Generated documents use the same claim/reindex protocol.
-- `accounts.overview` and `materials.search/read/summarize` are owner/admin-only even under
+- `accounts.overview` and `materials.search/recent/read/summarize` are owner/admin-only even under
   direct grants or custom presets. They support exact immutable account selection,
   fair per-account hybrid lexical/semantic retrieval, multilingual query variants,
   full-corpus keyset-paged semantic scanning, provenance, hashed access audit, full-source
@@ -30,7 +30,10 @@
   intermittent empty failure or the invalid draft. If the requester is demoted while retrieval or
   synthesis is running, the result is withheld; previously generated privileged assistant
   turns and compacted memories also disappear from normal-user recall.
-  Ordinary accounts receive a reduced system context and deterministic denial for clear
+  Query-free requests for the latest messages of an exact Jarvis `@username` use
+  `materials.recent`, not Telegram channel search; results are snapshot-consistent,
+  deterministically ordered, and carry stable `message:<id>` citations. Ordinary accounts
+  receive a reduced system context and deterministic denial for clear
   cross-user material or Jarvis-internal requests.
 - Public web search defaults to the global `wt-wt` region and accepts `languages` /
   `translated_queries` for RU, EN, ZH, KO, and JA round-robin research. Explicit language
@@ -47,12 +50,14 @@
   external session reports `unconfigured` instead of claiming success. Private-chat transient
   backend failures remain durably ordered and retry with bounded backoff without a 24-hour
   tombstone; permanently rejected attachments still create a searchable delivery record.
-- Telegram `/voice on` is persistent and forces voice replies; `/voice auto` mirrors direct
-  voice/audio. RU/EN/ZH/KO/JA explicit voice requests are recognized, long output is split,
-  successful multipart delivery is logged without answer text, and header-only/unplayable WAV
-  renders are rejected. Telegram's per-recipient `VOICE_MESSAGES_FORBIDDEN` response retries
-  the same speech as ordinary audio; other synthesis/delivery failures fall back to complete
-  text with an explicit notice.
+- Telegram modality is fixed to `auto` for every account: direct text/captions receive text,
+  direct voice/audio without a caption receives speech, and forwarded media remains source
+  material answered in text. Legacy `voice_reply=true` cannot override this; `/voice on|off`
+  is deprecated and does not persist a mode. Long output is split, successful multipart
+  delivery is logged without answer text, and header-only/unplayable WAV renders are rejected.
+  Telegram's per-recipient `VOICE_MESSAGES_FORBIDDEN` response retries the same speech as a
+  compressed MP3 through `sendAudio`; failed Opus/MP3 conversion, synthesis, or delivery falls
+  back to the complete text with an explicit notice. Raw WAV is never sent to Telegram.
 
 Current safety bounds remain deliberate: uploads are capped at 50 MiB, automatic plain-text
 indexing at 5 MiB, structured extraction at 200k characters, OCR at 30 PDF pages processed

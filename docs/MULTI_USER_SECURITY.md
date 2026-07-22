@@ -145,14 +145,18 @@ small `TENANT_SAFE_TOOL_SECURITY_IDS` allowlist is seeded for ordinary users.
 
 Canonical conversations, messages, memories, files, and file chunks remain tenant-bound.
 Cross-user reads exist only through the explicit `accounts.overview` and
-`materials.search/read/summarize` tools. Every one has a persisted
+`materials.search/recent/read/summarize` tools. Every one has a persisted
 `required_presets = [owner, admin]` floor. Direct grants and custom presets cannot bypass
 that floor, and each handler rechecks the requester's current active database role before
 reading another tenant.
 
 The caller must select an exact internal `user_id`, an immutable
 `provider + realm_id + provider_subject_id`, or explicitly request all active users. A
-username is display metadata: an ambiguous username fails closed. Results omit storage
+username is display metadata: an ambiguous username fails closed. `materials.recent` handles
+query-free requests for the latest canonical messages from one exact Jarvis account in a
+single read snapshot; an `@username` in that context is not a Telegram channel subscription.
+Explicit channel/supergroup/feed requests remain in the separate `telegram.sources.*` corpus.
+Results omit storage
 paths and credentials, retain account/source/timestamp provenance, and use stable
 `message:`, `memory:`, or `document:` citations. Model synthesis is accepted only when its
 citations belong to the supplied evidence. After one failed correction, the invalid draft
@@ -270,14 +274,15 @@ If no such authenticated reader exists, capability/sync reports `unconfigured` r
 pretending that history was imported.
 Personal-account monitoring remains forbidden on both tiers.
 
-Telegram voice preference is stored against the authenticated immutable user. `/voice on`
-forces voice delivery for text replies and `/voice auto` mirrors direct voice/audio input;
-forwarded voice remains text in auto mode. Explicit RU/EN/ZH/KO/JA requests for a voice
-answer are honored. Long replies are split into numbered TTS parts. Header-only/unplayable
-WAV output is rejected. If Telegram privacy forbids voice notes with
-`VOICE_MESSAGES_FORBIDDEN`, the bridge retries the same speech through `sendAudio`; a TTS or
-delivery failure is logged without answer text or secrets and falls back to the complete text
-with an explicit notice.
+Telegram modality is a non-overridable `auto` contract for every authenticated user. Direct
+text/captions receive text; direct voice/audio without a caption receives speech; forwarded
+media remains source material answered in text. The legacy `voice_reply` preference is ignored
+by Telegram routing, `/voice auto` is idempotent, and `/voice on|off` cannot persist a different
+mode. Long replies are split into numbered TTS parts. Header-only/unplayable WAV output is
+rejected. If Telegram privacy forbids voice notes with `VOICE_MESSAGES_FORBIDDEN`, the bridge
+transcodes the same speech to MP3 and retries through `sendAudio`; it never sends raw WAV. An
+Opus/MP3 conversion, TTS, or delivery failure is logged without answer text or secrets and
+falls back to the complete text with an explicit notice.
 
 ## Administration API and UI
 

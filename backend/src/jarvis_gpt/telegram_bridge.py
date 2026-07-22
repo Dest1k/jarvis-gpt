@@ -378,35 +378,13 @@ def _quiet_command_spec(text: str) -> str | None:
 
 
 def _voice_command_spec(text: str) -> str | None:
-    """Extract a persisted voice-reply mode from ``/voice [auto|on|off]``."""
+    """Extract the requested Telegram voice-delivery mode."""
 
     raw = str(text or "").strip()
     if _telegram_command(raw) not in _VOICE_COMMANDS:
         return None
     rest = raw.split(maxsplit=1)
     return rest[1].strip().casefold() if len(rest) == 2 else ""
-
-
-_EXPLICIT_VOICE_REPLY_PATTERNS = tuple(
-    re.compile(pattern, re.IGNORECASE)
-    for pattern in (
-        r"\b(?:ответь(?:те)?|скажи(?:те)?|запиши(?:те)?)\s+(?:мне\s+)?(?:голосом|голосовым(?:\s+сообщением)?|аудиосообщением)\b",
-        r"\bозвучь(?:те)?(?:\s+(?:мне\s+)?(?:это|ответ|текст))?\b",
-        r"\b(?:reply|answer|respond|say|speak)\s+(?:to\s+me\s+)?(?:by|with|in)\s+(?:voice|audio)\b",
-        r"\b(?:voice|audio)\s+(?:reply|response|answer)\b",
-        r"\b(?:read|say)\s+(?:it|that|the\s+answer)\s+aloud\b",
-        r"(?:用语音回答|语音回复|音声で答えて|音声で返事|음성으로\s*답)",
-    )
-)
-
-
-def _explicit_voice_reply_requested(text: str) -> bool:
-    """Recognize an unambiguous one-turn request for spoken delivery."""
-
-    normalized = " ".join(str(text or "").split())
-    return bool(normalized) and any(
-        pattern.search(normalized) for pattern in _EXPLICIT_VOICE_REPLY_PATTERNS
-    )
 
 
 def _is_forwarded_message(message: Mapping[str, object] | dict) -> bool:
@@ -489,7 +467,7 @@ def _help_text() -> str:
         "• /note … или `+ …` — быстрый захват в inbox\n"
         "• /quiet 23:00-08:00 — тихие часы (hold напоминаний)\n"
         "• /quiet off — выключить quiet hours\n"
-        "• /voice auto|on — голос по типу входа или для всех ответов\n"
+        "• /voice auto — текстом на текст, голосом на voice/audio\n"
         "• перешли сообщение боту — разберу как задачу\n"
         "• «каждое утро сводка» — ежедневный briefing"
     )
@@ -599,11 +577,8 @@ def _build_forward_task_prompt(message: Mapping[str, object] | dict, text: str) 
     return "\n".join(lines)
 
 
-def _wav_to_ogg_opus(wav: bytes) -> bytes | None:
-    """Transcode WAV bytes to OGG/Opus so Telegram shows an inline voice note.
-
-    Returns None (caller falls back to sendAudio) when ffmpeg is absent or fails.
-    """
+def _transcode_wav(wav: bytes, output_args: tuple[str, ...]) -> bytes | None:
+    """Run a bounded ffmpeg transcode without shell expansion."""
 
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg or not wav:
@@ -617,12 +592,7 @@ def _wav_to_ogg_opus(wav: bytes) -> bytes | None:
                 "error",
                 "-i",
                 "pipe:0",
-                "-c:a",
-                "libopus",
-                "-b:a",
-                "48k",
-                "-f",
-                "ogg",
+                *output_args,
                 "pipe:1",
             ],
             input=wav,
@@ -634,6 +604,32 @@ def _wav_to_ogg_opus(wav: bytes) -> bytes | None:
     if proc.returncode != 0 or not proc.stdout:
         return None
     return proc.stdout
+
+
+def _wav_to_ogg_opus(wav: bytes) -> bytes | None:
+    """Transcode WAV bytes to OGG/Opus for Telegram's inline voice-note UI."""
+
+    return _transcode_wav(
+        wav,
+        ("-c:a", "libopus", "-b:a", "48k", "-f", "ogg"),
+    )
+
+
+def _wav_to_mp3(wav: bytes) -> bytes | None:
+    """Transcode WAV bytes to a compact ordinary Telegram audio attachment."""
+
+    encoded = _transcode_wav(
+        wav,
+        ("-c:a", "libmp3lame", "-b:a", "96k", "-f", "mp3"),
+    )
+    if not encoded or len(encoded) < 4:
+        return None
+    if not (
+        encoded.startswith(b"ID3")
+        or (encoded[0] == 0xFF and encoded[1] & 0xE0 == 0xE0)
+    ):
+        return None
+    return encoded
 
 
 def _telegram_voice_notes_forbidden(response: httpx.Response) -> bool:
@@ -678,8 +674,8 @@ class TelegramConfig:
     # Admin-pre-provisioned Telegram chat ids (guest until first message), JSON file.
     pre_provisioned_path: Path | None = None
     max_files_out: int = 6
-    # Master switch for Telegram voice delivery. Per-user mode is persisted by the
-    # authenticated preferences API; voice/audio input still mirrors in ``auto`` mode.
+    # Master switch for Telegram voice delivery. Routing itself is a non-overridable
+    # modality mirror: direct uncaptioned voice/audio speaks; text/captions stay text.
     voice_replies: bool = True
     voice_reply_max_chars: int = 1500
     # The Telegram chat -> backend conversation binding must outlive the bridge process.
@@ -3576,15 +3572,11 @@ class TelegramBridge:
             return
         audio_in = any(_looks_like_audio(a) for a in attachments)
         visual_in = any(not _looks_like_audio(a) for a in attachments)
-        # A forwarded voice/audio item is source material, not a spoken request from the
-        # current user. It therefore stays text in auto mode. A persisted ``on`` mode may
-        # still request voice delivery for it; natural-language voice requests are only
-        # trusted on non-forwarded messages so forwarded content cannot toggle modality.
-        mirrored_voice = audio_in and not forwarded
-        explicit_voice = not forwarded and _explicit_voice_reply_requested(text)
-        always_voice = False
-        if not mirrored_voice and not explicit_voice:
-            always_voice = bool(await self._read_always_voice_preference(chat_id))
+        # Telegram delivery strictly mirrors the direct input modality for every account.
+        # A caption is an explicit textual request, while forwarded media is source
+        # material rather than a spoken turn. Legacy ``voice_reply=true`` preferences are
+        # intentionally ignored so they cannot turn later text messages into audio.
+        mirrored_voice = audio_in and not forwarded and not text.strip()
         if forwarded:
             # Forward-as-task: any share into the bot becomes an actionable request.
             text = _build_forward_task_prompt(message, text)
@@ -3597,7 +3589,7 @@ class TelegramBridge:
             chat_id,
             text,
             attachments,
-            voice_reply=mirrored_voice or explicit_voice or always_voice,
+            voice_reply=mirrored_voice,
             request_id=f"{self._realm_id}:{update_id}",
             # No per-answer action chips (Inbox / +1ч / Ещё) — they clutter every
             # reply. Reminder snooze/done buttons still attach only to fired reminders.
@@ -3999,101 +3991,25 @@ class TelegramBridge:
         else:
             await self._send(chat_id, "Quiet hours выключены.")
 
-    async def _read_always_voice_preference(self, chat_id: int) -> bool | None:
-        """Read the tenant-scoped boolean: true=always voice, false=auto mirror."""
-
-        try:
-            response = await self.api.get(
-                "/api/preferences", headers=self._session_headers(chat_id)
-            )
-            response.raise_for_status()
-            prefs = response.json() if response.content else {}
-            if not isinstance(prefs, dict) or not isinstance(
-                prefs.get("voice_reply"), bool
-            ):
-                raise ValueError("preferences response has no boolean voice_reply")
-            return prefs["voice_reply"]
-        except (httpx.HTTPError, RuntimeError, ValueError) as exc:
-            status = (
-                exc.response.status_code
-                if isinstance(exc, httpx.HTTPStatusError)
-                else "none"
-            )
-            log.warning(
-                "voice preference read failed chat_id=%s reason=%s status=%s",
-                chat_id,
-                type(exc).__name__,
-                status,
-            )
-            return None
-
     async def _handle_voice_command(self, chat_id: int, spec: str) -> None:
-        """Show or persist deterministic Telegram voice delivery preferences."""
+        """Report the enforced direct-input modality mirror."""
 
         mode = str(spec or "").strip().casefold()
-        if not mode:
-            current = await self._read_always_voice_preference(chat_id)
-            if current is None:
-                await self._send(chat_id, "Не смог прочитать настройку голоса.")
-                return
-            mode = "on" if current else "auto"
+        if mode in {"", "auto"}:
             await self._send(
                 chat_id,
-                (
-                    "Голосовые ответы: `on` — отвечаю голосом на все запросы."
-                    if current
-                    else "Голосовые ответы: `auto` — voice/audio зеркалю голосом; "
-                    "текст и пересланные медиа — текстом."
-                ),
+                "Голосовые ответы: `auto` — прямые voice/audio без подписи "
+                "зеркалю голосом; текст, подписи и пересланные медиа — текстом.",
             )
             return
-        if mode == "off":
+        if mode in {"on", "off"}:
             await self._send(
                 chat_id,
-                "Режим `off` пока нельзя надёжно сохранить: серверная настройка "
-                "двоичная (`on`/`auto`). Настройку не менял. Используй `/voice auto`.",
+                f"Режим `{mode}` отключён: для всех учётных записей принудительно "
+                "действует `auto` — текстом на текст, голосом на прямой voice/audio.",
             )
             return
-        if mode not in {"auto", "on"}:
-            await self._send(chat_id, "Формат: `/voice auto` или `/voice on`.")
-            return
-        expected = mode == "on"
-        try:
-            response = await self.api.patch(
-                "/api/preferences",
-                json={"voice_reply": expected},
-                headers=self._session_headers(chat_id),
-            )
-            response.raise_for_status()
-            prefs = response.json() if response.content else {}
-            if not isinstance(prefs, dict) or prefs.get("voice_reply") is not expected:
-                raise ValueError("preferences response did not confirm voice_reply")
-        except (httpx.HTTPError, RuntimeError, ValueError) as exc:
-            status = (
-                exc.response.status_code
-                if isinstance(exc, httpx.HTTPStatusError)
-                else "none"
-            )
-            log.warning(
-                "voice preference update failed chat_id=%s mode=%s reason=%s status=%s",
-                chat_id,
-                mode,
-                type(exc).__name__,
-                status,
-            )
-            await self._send(chat_id, "Не смог сохранить настройку голоса.")
-            return
-        if expected:
-            await self._send(
-                chat_id,
-                "Голосовые ответы: `on`. Настройка сохранена для вашей учётной записи.",
-            )
-        else:
-            await self._send(
-                chat_id,
-                "Голосовые ответы: `auto`. Voice/audio зеркалю голосом; "
-                "текст и пересланные медиа — текстом.",
-            )
+        await self._send(chat_id, "Формат: `/voice auto`.")
 
     async def _send_status_card(self, chat_id: int) -> None:
         try:
@@ -4311,7 +4227,7 @@ class TelegramBridge:
             )
             return _VoiceDeliveryResult(False, 0, total, "session_unavailable")
 
-        rendered: list[tuple[bytes, bytes | None]] = []
+        rendered: list[tuple[bytes, bytes]] = []
         for index, chunk in enumerate(chunks, start=1):
             try:
                 response = await self.api.post(
@@ -4353,7 +4269,7 @@ class TelegramBridge:
                 return _VoiceDeliveryResult(False, 0, total, "synthesis_empty_audio")
             try:
                 ogg = await asyncio.to_thread(_wav_to_ogg_opus, wav)
-            except Exception as exc:  # noqa: BLE001 - delivery must fall back to WAV/text
+            except Exception as exc:  # noqa: BLE001 - delivery must fall back to text
                 log.warning(
                     "voice transcode failed chat_id=%s chunk=%s/%s reason=%s",
                     chat_id,
@@ -4362,56 +4278,77 @@ class TelegramBridge:
                     type(exc).__name__,
                 )
                 ogg = None
+            if not ogg:
+                log.warning(
+                    "voice delivery failed chat_id=%s chunk=%s/%s "
+                    "method=sendVoice reason=opus_transcode_failed",
+                    chat_id,
+                    index,
+                    total,
+                )
+                return _VoiceDeliveryResult(
+                    False, 0, total, "opus_transcode_failed"
+                )
             rendered.append((wav, ogg))
 
         parts_sent = 0
         for index, (wav, ogg) in enumerate(rendered, start=1):
-            method = "sendVoice" if ogg else "sendAudio"
+            method = "sendVoice"
             try:
-                if ogg:
-                    sent = await self.tg.post(
-                        "/sendVoice",
-                        data={"chat_id": chat_id},
-                        files={
-                            "voice": (
-                                f"jarvis-{index:02d}.ogg",
-                                ogg,
-                                "audio/ogg",
-                            )
-                        },
-                    )
-                    if _telegram_voice_notes_forbidden(sent):
-                        # Telegram privacy may forbid voice notes while still allowing
-                        # ordinary audio. Preserve the spoken answer instead of treating
-                        # a recipient preference as a TTS failure.
-                        method = "sendAudio"
-                        log.info(
-                            "voice-note delivery unavailable chat_id=%s chunk=%s/%s; "
-                            "retrying as audio",
+                sent = await self.tg.post(
+                    "/sendVoice",
+                    data={"chat_id": chat_id},
+                    files={
+                        "voice": (
+                            f"jarvis-{index:02d}.ogg",
+                            ogg,
+                            "audio/ogg",
+                        )
+                    },
+                )
+                if _telegram_voice_notes_forbidden(sent):
+                    # Some recipients disallow voice notes but accept ordinary audio.
+                    # Telegram does not present WAV consistently, so retry only with a
+                    # verified compressed MP3; conversion failure is a text fallback.
+                    method = "sendAudio"
+                    try:
+                        mp3 = await asyncio.to_thread(_wav_to_mp3, wav)
+                    except Exception as exc:  # noqa: BLE001 - preserve full text fallback
+                        log.warning(
+                            "voice audio transcode failed chat_id=%s chunk=%s/%s "
+                            "reason=%s",
+                            chat_id,
+                            index,
+                            total,
+                            type(exc).__name__,
+                        )
+                        mp3 = None
+                    if not mp3:
+                        log.warning(
+                            "voice delivery failed chat_id=%s chunk=%s/%s "
+                            "method=sendAudio reason=mp3_transcode_failed",
                             chat_id,
                             index,
                             total,
                         )
-                        sent = await self.tg.post(
-                            "/sendAudio",
-                            data={"chat_id": chat_id},
-                            files={
-                                "audio": (
-                                    f"jarvis-{index:02d}.wav",
-                                    wav,
-                                    "audio/wav",
-                                )
-                            },
+                        return _VoiceDeliveryResult(
+                            False, parts_sent, total, "mp3_transcode_failed"
                         )
-                else:  # no ffmpeg — fall back to a playable audio file
+                    log.info(
+                        "voice-note delivery unavailable chat_id=%s chunk=%s/%s; "
+                        "retrying as compressed audio",
+                        chat_id,
+                        index,
+                        total,
+                    )
                     sent = await self.tg.post(
                         "/sendAudio",
                         data={"chat_id": chat_id},
                         files={
                             "audio": (
-                                f"jarvis-{index:02d}.wav",
-                                wav,
-                                "audio/wav",
+                                f"jarvis-{index:02d}.mp3",
+                                mp3,
+                                "audio/mpeg",
                             )
                         },
                     )

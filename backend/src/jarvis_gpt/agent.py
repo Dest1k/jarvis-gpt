@@ -659,6 +659,14 @@ class DirectAction:
     events: list[ChatEvent]
 
 
+@dataclass(frozen=True)
+class AccountRecentMessagesRequest:
+    username: str
+    limit: int = 2
+    include_assistant: bool = False
+    order: str = "newest_first"
+
+
 @dataclass
 class NativeAction:
     action: str
@@ -6054,6 +6062,12 @@ class AgentRuntime:
         message: str,
         context: AgentContext | None = None,
     ) -> DirectAction | None:
+        recent_account_request = _account_recent_messages_request(message)
+        if recent_account_request is not None and context is not None:
+            return await self._account_recent_messages_direct_action(
+                recent_account_request,
+                context,
+            )
         task_plan = context.task_plan if context is not None else None
         document_task = task_plan is not None and task_plan.intent in {
             "archive_memory",
@@ -6548,6 +6562,69 @@ class AgentRuntime:
             return None
 
         return None
+
+    async def _account_recent_messages_direct_action(
+        self,
+        request: AccountRecentMessagesRequest,
+        context: AgentContext,
+    ) -> DirectAction:
+        """Resolve a clear account-history request before generic model routing."""
+
+        result = await self.tools.run(
+            "materials.recent",
+            {
+                "username": request.username,
+                "limit": request.limit,
+                "include_assistant": request.include_assistant,
+                "order": request.order,
+            },
+            conversation_id=context.conversation_id,
+            user_message_id=context.operator_message_id,
+        )
+        event = ChatEvent(
+            type="tool_call",
+            title="materials.recent",
+            content=result.summary,
+            payload={
+                "tool": result.tool,
+                "ok": result.ok,
+                "account_selector": "exact_username",
+                "requested_limit": request.limit,
+                "display_order": request.order,
+                "telegram_source_routed": False,
+            },
+        )
+        if not result.ok:
+            lowered = str(result.summary or "").casefold()
+            if "no account matches" in lowered:
+                answer = (
+                    f"Активный аккаунт с точным username @{request.username} "
+                    "в системе Jarvis не найден."
+                )
+            elif "not unique" in lowered:
+                answer = (
+                    f"Username @{request.username} принадлежит нескольким аккаунтам Jarvis; "
+                    "для безопасного чтения нужен точный user_id или неизменяемая "
+                    "Telegram-идентичность."
+                )
+            elif result.data.get("authorization_denied") is True:
+                answer = _localized_account_policy_denial(
+                    context.operator_message or "",
+                    "cross_user",
+                )
+            else:
+                answer = (
+                    f"Не удалось получить историю сообщений аккаунта "
+                    f"@{request.username}: {result.summary}"
+                )
+            return DirectAction(
+                answer=answer,
+                events=[event],
+            )
+        return DirectAction(
+            answer=_format_recent_account_messages(result.data, request=request),
+            events=[event],
+        )
 
     async def _execute_operator_requested_tool(
         self,
@@ -13170,7 +13247,9 @@ class AgentRuntime:
                 "are isolated to current_user_id.",
                 (
                     "- cross_user_scope: owner/admin explicit retrieval is permitted; use "
-                    "accounts.overview and materials.search/read/summarize and cite every hit."
+                    "accounts.overview and materials.search/recent/read/summarize and cite "
+                    "every hit. A request for recent/last messages from @username refers to "
+                    "that Jarvis account identity and must use materials.recent."
                     if privileged
                     else "- cross_user_scope: denied; explain that only owner/admin may inspect "
                     "accounts or other users' messages/documents."
@@ -13180,7 +13259,10 @@ class AgentRuntime:
                     "checking telegram.sources.capability. Bot API supports future public "
                     "channel posts only; a securely injected authenticated reader may also "
                     "support public/private channel or supergroup history and media. Personal "
-                    "accounts and credential input are never supported; runtime availability "
+                    "accounts and credential input are never supported. Never route a Jarvis "
+                    "account's message history to telegram.sources.* merely because its "
+                    "identity is written as @username; telegram.sources.* is only for an "
+                    "explicitly registered channel/supergroup corpus. Runtime availability "
                     "must be reported honestly."
                     if privileged
                     else "- telegram_source_scope: subscription and cross-source analysis are "
@@ -13270,6 +13352,8 @@ class AgentRuntime:
                 "найд",
                 "поищ",
                 "покаж",
+                "отправ",
+                "напиш",
                 "прочит",
                 "вывед",
                 "список",
@@ -13285,6 +13369,7 @@ class AgentRuntime:
                 "summar",
                 "analy",
                 "what did",
+                "write",
                 "查找",
                 "搜索",
                 "显示",
@@ -24653,6 +24738,176 @@ def _sendkeys_for_calculator(expression: str) -> str:
 
 def _contains_any(text: str, markers: tuple[str, ...]) -> bool:
     return any(marker in text for marker in markers)
+
+
+_ACCOUNT_HANDLE_RE = re.compile(r"(?<![\w@])@([a-z0-9_]{3,32})\b", re.IGNORECASE)
+
+
+def _account_recent_messages_request(
+    message: str,
+) -> AccountRecentMessagesRequest | None:
+    """Parse only high-confidence recent Jarvis-account history requests.
+
+    A bare ``@username`` is not enough: the turn must ask for recent messages.
+    Explicit channel/group/feed language is left to ``telegram.sources.*``.
+    """
+
+    text = " ".join(str(message or "").casefold().split())
+    handles = list(dict.fromkeys(_ACCOUNT_HANDLE_RE.findall(text)))
+    if len(handles) != 1:
+        return None
+    intent_text = _ACCOUNT_HANDLE_RE.sub("@account", text)
+    if _contains_any(
+        intent_text,
+        (
+            "канал",
+            "супергрупп",
+            "новостн",
+            "лента пост",
+            "посты",
+            "публикаци",
+            "channel",
+            "supergroup",
+            "news group",
+            "source feed",
+            "channel feed",
+            "posts from",
+        ),
+    ):
+        return None
+    if not _contains_any(intent_text, ("сообщен", "message")):
+        return None
+    if not _contains_any(
+        intent_text,
+        ("последн", "недавн", "крайн", "last ", "latest", "recent"),
+    ):
+        return None
+    if not (
+        _contains_any(
+            intent_text,
+            (
+                "покаж",
+                "отправ",
+                "пришл",
+                "напиш",
+                "вывед",
+                "дай ",
+                "получ",
+            ),
+        )
+        or re.search(r"\b(?:show|send|list|get|give|write)\b", intent_text)
+    ):
+        return None
+
+    limit = 2
+    numeric = re.search(
+        r"(?<![\w@])(\d{1,3})\s+(?:(?:сам\w+\s+)?(?:последн\w*|"
+        r"недавн\w*|крайн\w*|last|latest|recent)\s+)?(?:сообщен\w*|messages?)",
+        intent_text,
+    )
+    if numeric is not None:
+        limit = max(1, min(50, int(numeric.group(1))))
+    else:
+        number_words = {
+            "одно": 1,
+            "один": 1,
+            "одну": 1,
+            "два": 2,
+            "две": 2,
+            "двух": 2,
+            "три": 3,
+            "трех": 3,
+            "трёх": 3,
+            "четыре": 4,
+            "четырех": 4,
+            "четырёх": 4,
+            "пять": 5,
+            "пяти": 5,
+            "one": 1,
+            "two": 2,
+            "three": 3,
+            "four": 4,
+            "five": 5,
+        }
+        for word, value in number_words.items():
+            if re.search(
+                rf"\b{re.escape(word)}\b[^.!?]{{0,32}}(?:сообщен\w*|messages?)",
+                intent_text,
+            ):
+                limit = value
+                break
+
+    include_assistant = _contains_any(
+        intent_text,
+        (
+            "включая ответы джарвис",
+            "вместе с ответами джарвис",
+            "всю переписку",
+            "both sides",
+            "including jarvis replies",
+            "including assistant",
+        ),
+    )
+    oldest_first = _contains_any(
+        intent_text,
+        (
+            "от старых к новым",
+            "сначала старые",
+            "хронологическ",
+            "oldest first",
+            "chronological order",
+        ),
+    )
+    return AccountRecentMessagesRequest(
+        username=handles[0],
+        limit=limit,
+        include_assistant=include_assistant,
+        order="oldest_first" if oldest_first else "newest_first",
+    )
+
+
+def _format_recent_account_messages(
+    data: dict[str, Any],
+    *,
+    request: AccountRecentMessagesRequest,
+) -> str:
+    raw_messages = data.get("messages") if isinstance(data, dict) else []
+    messages = raw_messages if isinstance(raw_messages, list) else []
+    account = data.get("account") if isinstance(data.get("account"), dict) else {}
+    username = str(account.get("username") or request.username).lstrip("@")
+    if not messages:
+        role_scope = "пользовательских " if not request.include_assistant else ""
+        return f"В истории аккаунта @{username} {role_scope}сообщений не найдено."
+
+    order_label = (
+        "от старых к новым"
+        if str(data.get("display_order") or request.order) == "oldest_first"
+        else "от новых к старым"
+    )
+    role_label = (
+        "сообщения и ответы Jarvis"
+        if request.include_assistant
+        else "сообщения пользователя"
+    )
+    lines = [
+        f"Последние {len(messages)}: @{username}, {role_label}, {order_label}."
+    ]
+    for index, item in enumerate(messages, start=1):
+        if not isinstance(item, dict):
+            continue
+        created_at = str(item.get("created_at") or "время неизвестно")
+        role = str(item.get("role") or "user")
+        citation = str(item.get("citation") or "").strip()
+        content = str(item.get("content") or "")
+        quoted = "\n".join(f"> {line}" for line in content.split("\n"))
+        lines.extend(
+            [
+                "",
+                f"{index}. `{created_at}` · `{role}` · [{citation}]",
+                quoted,
+            ]
+        )
+    return "\n".join(lines)
 
 
 def _localized_account_policy_denial(message: str, reason: str) -> str:
