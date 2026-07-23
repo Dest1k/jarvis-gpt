@@ -2487,6 +2487,10 @@ def test_inbound_voice_transcribed_and_answered_with_voice(monkeypatch):
         "Ответь голосовым сообщением",
         "Проверка связи. Ответь голосом.",
         "Пожалуйста, пришли ответ войсом",
+        "Озвучь этот текст: Проверка точного чтения.",
+        "Пожалуйста, зачитай — Важная строка.",
+        "Прочитай вслух:\nПервая строка.\nВторая строка.",
+        "Прочти мне, пожалуйста, текст ниже: Ничего не меняй.",
     ],
 )
 def test_text_one_shot_voice_request_is_delivered_as_voice_despite_saved_text_mode(
@@ -2522,6 +2526,9 @@ def test_text_one_shot_voice_request_is_delivered_as_voice_despite_saved_text_mo
         "Почему ты ответил голосом?",
         "Не отвечай голосом",
         "Всегда отвечай на голосовые текстом",
+        "Не озвучивай этот текст: секрет",
+        "Можешь озвучить этот текст?",
+        "Озвучь этот текст?",
     ],
 )
 def test_text_voice_mentions_do_not_trigger_one_shot_voice_delivery(text):
@@ -2807,6 +2814,36 @@ def test_long_voice_reply_is_split_into_bounded_tts_chunks(monkeypatch, caplog):
     assert not any(path.endswith("/sendMessage") for path in tg_posts)
     assert "voice delivery succeeded chat_id=42" in caplog.text
     assert answer not in caplog.text
+
+
+def test_long_inline_read_aloud_request_uses_every_bounded_voice_chunk(monkeypatch):
+    body = ("Длинная фраза. " * 420).strip()
+    command = f"Озвучь этот текст: {body}"
+    bridge, tg_posts, _, _, chat_bodies, speak_bodies = _voice_bridge(
+        monkeypatch,
+        ogg=b"OggS-opus",
+        answer=body,
+        preference="text",
+    )
+    update = {
+        "update_id": 104,
+        "message": {
+            "chat": {"id": 42, "type": "private"},
+            "from": {"id": 42, "is_bot": False},
+            "text": command,
+        },
+    }
+
+    asyncio.run(bridge._handle(update))
+
+    spoken = [item["text"] for item in speak_bodies]
+    assert chat_bodies[0]["message"] == command
+    assert chat_bodies[0]["response_modality"] == "voice"
+    assert len(spoken) > 1
+    assert all(0 < len(chunk) <= 1500 for chunk in spoken)
+    assert " ".join(spoken) == body
+    assert sum(path.endswith("/sendVoice") for path in tg_posts) == len(spoken)
+    assert not any(path.endswith("/sendMessage") for path in tg_posts)
 
 
 def test_send_voice_failure_is_logged_and_falls_back_to_full_text(monkeypatch, caplog):

@@ -47,10 +47,72 @@ _DEFAULT_TTS_TEMPO = 1.08
 _MIN_TTS_TEMPO = 0.5
 _MAX_TTS_TEMPO = 2.0
 
+_EXPLICIT_READ_ALOUD_RE = re.compile(
+    r"""
+    \A[ \t]*
+    (?:пожалуйста(?:[ \t]*,[ \t]*|[ \t]+))?
+    (?:
+        озвучь(?:те)?
+        |зачитай(?:те)?
+        |прочитай(?:те)?
+        |прочти(?:те)?
+        |произнеси(?:те)?
+    )
+    \b
+    (?:[ \t]+мне)?
+    (?:[ \t]*,[ \t]*пожалуйста[ \t]*,?)?
+    (?:
+        [ \t]+
+        (?:
+            (?:вот[ \t]+)?(?:этот|следующий)[ \t]+текст(?:[ \t]+ниже)?
+            |текст(?:[ \t]+ниже)?
+            |вслух
+            |голосом
+        )
+    ){0,3}
+    (?:[ \t]*,[ \t]*пожалуйста[ \t]*,?)?
+    [ \t]*
+    (?P<separator>:|[—–-]|\r?\n)
+    (?P<body>[\s\S]+)
+    \Z
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
 # Loaded faster-whisper models are expensive to build; cache per (model, device,
 # compute) so repeated turns reuse the warm model.
 _WHISPER_MODELS: dict[tuple[str, str, str], Any] = {}
 _MAX_CACHED_STT_MODELS = 2
+
+
+def extract_explicit_read_aloud_text(text: str) -> str | None:
+    """Return the literal body of an unambiguous Russian read-aloud command.
+
+    The command must be an imperative at the start of the message and must have
+    an explicit separator. This deliberately excludes questions, negations and
+    prose that merely mentions voice output. Only one conventional padding
+    character after a punctuation separator is removed; the rest of the body,
+    including punctuation and line breaks, is preserved verbatim.
+    """
+
+    raw = str(text or "")
+    match = _EXPLICIT_READ_ALOUD_RE.fullmatch(raw)
+    if match is None:
+        return None
+
+    body = match.group("body")
+    if match.group("separator") not in {"\n", "\r\n"}:
+        if body.startswith("\r\n"):
+            body = body[2:]
+        elif body.startswith(("\n", "\r", " ", "\t")):
+            body = body[1:]
+    return body if body.strip() else None
+
+
+def requests_explicit_read_aloud(text: str) -> bool:
+    """Whether *text* contains a complete, explicit read-aloud command."""
+
+    return extract_explicit_read_aloud_text(text) is not None
 
 
 def _lru_evict(cache: dict, max_size: int) -> None:

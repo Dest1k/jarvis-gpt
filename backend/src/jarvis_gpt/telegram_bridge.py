@@ -42,6 +42,7 @@ from urllib.parse import quote, urlsplit
 
 import httpx
 
+from . import speech
 from .config import default_home, load_local_env_file
 from .experience import ResponsePreferenceDirective, parse_response_preference
 from .notify import (
@@ -409,7 +410,10 @@ _ONE_SHOT_VOICE_REPLY = re.compile(
 def _requests_one_shot_voice_reply(text: str) -> bool:
     """Recognize an explicit per-turn request for Telegram voice delivery."""
 
-    normalized = " ".join(str(text or "").strip().replace("ё", "е").split())
+    raw = str(text or "")
+    if speech.requests_explicit_read_aloud(raw):
+        return True
+    normalized = " ".join(raw.strip().replace("ё", "е").split())
     return bool(normalized and _ONE_SHOT_VOICE_REPLY.search(normalized))
 
 

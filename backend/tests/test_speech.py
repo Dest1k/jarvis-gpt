@@ -15,6 +15,56 @@ import pytest
 from jarvis_gpt import speech
 
 # --------------------------------------------------------------------------- #
+# Explicit read-aloud commands.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        (
+            "Озвучь этот текст: Сохрани: знаки!\nИ перенос строки.",
+            "Сохрани: знаки!\nИ перенос строки.",
+        ),
+        ("Пожалуйста, зачитай — Текст «как есть».", "Текст «как есть»."),
+        ("прочитай вслух:\nСтрока 1\nСтрока 2", "Строка 1\nСтрока 2"),
+        ("Произнесите следующий текст:  один пробел", " один пробел"),
+        ("Озвучьте текст, пожалуйста:\nТочно.", "Точно."),
+        (
+            "Прочти мне, пожалуйста, этот текст ниже: Дословно.",
+            "Дословно.",
+        ),
+    ],
+)
+def test_extract_explicit_read_aloud_text_preserves_literal_body(command, expected):
+    assert speech.extract_explicit_read_aloud_text(command) == expected
+    assert speech.requests_explicit_read_aloud(command) is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Не озвучивай этот текст: секрет",
+        "Почему ты озвучил этот текст?",
+        "Можешь озвучить этот текст?",
+        "Озвучь этот текст?",
+        "Я прошу: озвучь этот текст: пример",
+        "Прочитай документ и перескажи его",
+        "Зачитай:",
+    ],
+)
+def test_explicit_read_aloud_rejects_negations_questions_and_missing_body(text):
+    assert speech.extract_explicit_read_aloud_text(text) is None
+    assert speech.requests_explicit_read_aloud(text) is False
+
+
+def test_extract_explicit_read_aloud_text_has_no_length_based_truncation():
+    body = ("Абзац со знаками: один, два, три.\n" * 700).rstrip()
+
+    assert speech.extract_explicit_read_aloud_text(f"Озвучь этот текст:\n{body}") == body
+
+
+# --------------------------------------------------------------------------- #
 # _split_for_tts
 # --------------------------------------------------------------------------- #
 

@@ -260,13 +260,134 @@ def _load_web_news_timezone() -> Any:
 
 
 WEB_NEWS_TIMEZONE = _load_web_news_timezone()
+WEB_NEWS_TOPIC_PATTERNS: dict[str, tuple[str, ...]] = {
+    "ukraine": (
+        r"(?<!\w)украин[\w-]*",
+        r"(?<!\w)україн[\w-]*",
+        r"(?<![a-z])ukrain(?:e|ian|ians)?(?![a-z])",
+        r"اوکراین",
+    ),
+    "russia": (
+        r"(?<!\w)росси[\w-]*",
+        r"(?<!\w)росі[\w-]*",
+        r"(?<![a-z])russia(?:n|ns)?(?![a-z])",
+        r"(?<!\w)москв[\w-]*",
+        r"(?<!\w)кремл[\w-]*",
+        r"روسیه",
+    ),
+    "iran": (
+        r"(?<!\w)иран[\w-]*",
+        r"(?<![a-z])iran(?:ian|ians)?(?![a-z])",
+        r"(?<![a-z])persian(?:s)?(?![a-z])",
+        r"(?<!\w)тегеран[\w-]*",
+        r"(?<![a-z])tehran(?![a-z])",
+        r"ایران",
+    ),
+    "china": (
+        r"(?<!\w)кита[йяею][\w-]*",
+        r"(?<![a-z])china(?:ese)?(?![a-z])",
+        r"中国",
+    ),
+    "united_states": (
+        r"(?<!\w)сша(?!\w)",
+        r"(?<!\w)соедин[её]нн[\w-]*\s+штат[\w-]*",
+        r"(?<!\w)америк[\w-]*",
+        r"(?<![a-z])united\s+states(?![a-z])",
+        r"(?<![a-z])america(?:n|ns)?(?![a-z])",
+    ),
+    "israel": (
+        r"(?<!\w)израил[\w-]*",
+        r"(?<![a-z])israel(?:i|is)?(?![a-z])",
+        r"ישראל",
+    ),
+    "india": (
+        r"(?<!\w)инди[\w-]*",
+        r"(?<![a-z])india(?:n|ns)?(?![a-z])",
+        r"भारत",
+    ),
+    "pakistan": (
+        r"(?<!\w)пакистан[\w-]*",
+        r"(?<![a-z])pakistan(?:i|is)?(?![a-z])",
+        r"پاکستان",
+    ),
+    "european_union": (
+        r"(?<!\w)ес(?!\w)",
+        r"(?<!\w)евросоюз[\w-]*",
+        r"(?<![a-z])european\s+union(?![a-z])",
+    ),
+}
+WEB_NEWS_TOPIC_LABELS = {
+    "ukraine": "Украина",
+    "russia": "Россия",
+    "iran": "Иран",
+    "china": "Китай",
+    "united_states": "США",
+    "israel": "Израиль",
+    "india": "Индия",
+    "pakistan": "Пакистан",
+    "european_union": "ЕС",
+}
 WEB_NEWS_RSS_FEEDS = (
-    ("РИА Новости", "https://ria.ru/export/rss2/archive/index.xml"),
-    ("Интерфакс", "https://www.interfax.ru/rss.asp"),
-    ("РБК", "https://rssexport.rbc.ru/rbcnews/news/30/full.rss"),
-    ("ТАСС", "https://tass.ru/rss/v2.xml"),
-    ("Ведомости", "https://www.vedomosti.ru/rss/news"),
-    ("БФМ", "https://www.bfm.ru/news.rss"),
+    {
+        "name": "РИА Новости",
+        "url": "https://ria.ru/export/rss2/archive/index.xml",
+        "language": "ru",
+        "segment": "ru",
+    },
+    {
+        "name": "Интерфакс",
+        "url": "https://www.interfax.ru/rss.asp",
+        "language": "ru",
+        "segment": "ru",
+    },
+    {
+        "name": "РБК",
+        "url": "https://rssexport.rbc.ru/rbcnews/news/30/full.rss",
+        "language": "ru",
+        "segment": "ru",
+    },
+    {
+        "name": "ТАСС",
+        "url": "https://tass.ru/rss/v2.xml",
+        "language": "ru",
+        "segment": "ru",
+    },
+    {
+        "name": "Ведомости",
+        "url": "https://www.vedomosti.ru/rss/news",
+        "language": "ru",
+        "segment": "ru",
+    },
+    {
+        "name": "БФМ",
+        "url": "https://www.bfm.ru/news.rss",
+        "language": "ru",
+        "segment": "ru",
+    },
+    {
+        "name": "BBC News World",
+        "url": "https://feeds.bbci.co.uk/news/world/rss.xml",
+        "language": "en",
+        "segment": "non_ru",
+    },
+    {
+        "name": "Al Jazeera",
+        "url": "https://www.aljazeera.com/xml/rss/all.xml",
+        "language": "en",
+        "segment": "non_ru",
+    },
+    {
+        "name": "The Guardian World",
+        "url": "https://www.theguardian.com/world/rss",
+        "language": "en",
+        "segment": "non_ru",
+    },
+    {
+        "name": "DW English",
+        "url": "https://rss.dw.com/rdf/rss-en-all",
+        "language": "en",
+        "segment": "non_ru",
+    },
 )
 WEB_SEARCH_PROVIDER_STATS_KEY = "web.search.provider.stats"
 WEB_RATE_KEY_PREFIX = "web.rate."
@@ -2465,7 +2586,7 @@ class ToolRegistry:
                 input_schema={
                     "query": "Required search query",
                     "queries": "Optional additional query/translation list",
-                    "languages": "ru/en/zh/ko/ja list; all five are searched by default",
+                    "languages": "ru/en/zh/ko/ja/uk/fa; baseline five plus relevant uk/fa",
                     "translated_queries": "Optional explicit {language: query} map",
                     "user_id": "Exact target Jarvis user id",
                     "provider": "Immutable identity provider, e.g. telegram",
@@ -2557,7 +2678,7 @@ class ToolRegistry:
                 input_schema={
                     "query": "Summary subject/focus",
                     "queries": "Optional additional query/translation list",
-                    "languages": "ru/en/zh/ko/ja list; all five are searched by default",
+                    "languages": "ru/en/zh/ko/ja/uk/fa; baseline five plus relevant uk/fa",
                     "translated_queries": "Optional explicit {language: query} map",
                     "user_id": "Exact target Jarvis user id",
                     "provider": "Immutable identity provider",
@@ -2688,7 +2809,7 @@ class ToolRegistry:
                 category="telegram_sources",
                 input_schema={
                     "query": "Required Unicode search query",
-                    "languages": "ru/en/zh/ko/ja list; all five are searched by default",
+                    "languages": "ru/en/zh/ko/ja/uk/fa; baseline five plus relevant uk/fa",
                     "translated_queries": "Optional explicit {language: query} map",
                     "source_ids": "Optional exact registered source ids",
                     "limit": "Maximum evidence hits",
@@ -2730,8 +2851,9 @@ class ToolRegistry:
                 input_schema={
                     "query": "Search query",
                     "languages": (
-                        "Language list: ru, en, zh, ko, ja, or all. All five are "
-                        "searched by default; only verified translations are region-labeled."
+                        "Language list: ru, en, zh, ko, ja, uk, fa, or all. The five "
+                        "baseline languages are searched by default; uk/fa are added when "
+                        "relevant, and only verified translations are region-labeled."
                     ),
                     "translated_queries": "Optional explicit {language: query} map",
                     "mode": "FAST_FACT (default), DEEP_RESEARCH, or AGGRESSIVE_SHOPPING",
@@ -2955,7 +3077,7 @@ class ToolRegistry:
                 input_schema={
                     "query": "Search query or research question",
                     "claim": "Optional concrete claim to verify",
-                    "languages": "ru/en/zh/ko/ja list; all five are searched by default",
+                    "languages": "ru/en/zh/ko/ja/uk/fa; baseline five plus relevant uk/fa",
                     "translated_queries": "Optional explicit {language: query} map",
                     "mode": "DEEP_RESEARCH (default), FAST_FACT, or AGGRESSIVE_SHOPPING",
                     "deadline_sec": "Optional tighter total deadline for the whole research run",
@@ -2978,7 +3100,7 @@ class ToolRegistry:
                 input_schema={
                     "question": "User question to answer from the public web",
                     "query": "Optional explicit search query",
-                    "languages": "ru/en/zh/ko/ja list; all five are searched by default",
+                    "languages": "ru/en/zh/ko/ja/uk/fa; baseline five plus relevant uk/fa",
                     "translated_queries": "Optional explicit {language: query} map",
                     "mode": (
                         "FAST_FACT, DEEP_RESEARCH, or AGGRESSIVE_SHOPPING; "
@@ -9490,9 +9612,9 @@ async def _telegram_sources_search(ctx: ToolContext, args: dict[str, Any]) -> To
             source_ids=_telegram_source_ids(args),
             limit=_int_arg(args.get("limit"), default=30, minimum=1, maximum=100),
         )
-        requested_languages = _normalize_search_languages(args.get("languages")) or list(
-            _SEARCH_LANGUAGE_REGIONS
-        )
+        requested_languages = _normalize_search_languages(
+            args.get("languages")
+        ) or _default_search_languages(query)
         untranslated = list(variants[0].get("untranslated_languages") or []) if variants else []
         data["language_coverage"] = {
             "requested_languages": requested_languages,
@@ -9619,9 +9741,9 @@ async def _material_search_plan(
     material_queries = list(
         dict.fromkeys([*queries, *(str(variant["query"]) for variant in variants)])
     )
-    requested_languages = _normalize_search_languages(args.get("languages")) or list(
-        _SEARCH_LANGUAGE_REGIONS
-    )
+    requested_languages = _normalize_search_languages(
+        args.get("languages")
+    ) or _default_search_languages(queries[0])
     untranslated = list(variants[0].get("untranslated_languages") or []) if variants else []
     return {
         "queries": material_queries,
@@ -10380,6 +10502,7 @@ def _search_translation_matches_language(
     script_patterns = {
         "latin": r"[A-Za-z]",
         "cyrillic": r"[\u0400-\u052f]",
+        "arabic": r"[\u0600-\u06ff]",
         "han": r"[\u3400-\u4dbf\u4e00-\u9fff]",
         "hangul": r"[\u1100-\u11ff\u3130-\u318f\uac00-\ud7af]",
         "kana": r"[\u3040-\u30ff\u31f0-\u31ff]",
@@ -10394,9 +10517,11 @@ def _search_translation_matches_language(
     translated_script_count = sum(counts.values())
     if source_script_count == 0 and translated_script_count == 0:
         return True
-    if language == "ru":
+    if language in {"ru", "uk"}:
         expected_count = counts["cyrillic"]
         source_pattern = script_patterns["cyrillic"]
+        if language == "uk" and unchanged:
+            return False
     elif language == "en":
         expected_count = counts["latin"]
         source_pattern = script_patterns["latin"]
@@ -10414,6 +10539,9 @@ def _search_translation_matches_language(
             return False
         expected_count = counts["kana"] + counts["han"]
         source_pattern = script_patterns["kana"]
+    elif language == "fa":
+        expected_count = counts["arabic"]
+        source_pattern = script_patterns["arabic"]
     else:
         return False
     if expected_count == 0 or expected_count / max(1, translated_script_count) < 0.4:
@@ -10595,7 +10723,7 @@ async def _multilingual_search_variants(
     languages = _normalize_search_languages(args.get("languages"))
     if not languages:
         # Cross-language retrieval is the default contract, not an opt-in hint.
-        languages = list(_SEARCH_LANGUAGE_REGIONS)
+        languages = _default_search_languages(query)
 
     base_region = _normalize_search_region(args.get("region"))
     variants: list[dict[str, Any]] = [
@@ -10694,6 +10822,46 @@ def _round_robin_search_requests(groups: list[list[dict[str, Any]]]) -> list[dic
     return requests
 
 
+def _balanced_multilingual_search_results(
+    results: list[dict[str, Any]],
+    requested_languages: list[str],
+    *,
+    limit: int,
+) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    selected_urls: set[str] = set()
+
+    def languages(item: dict[str, Any]) -> set[str]:
+        values = (
+            item.get("search_languages")
+            if isinstance(item.get("search_languages"), list)
+            else []
+        )
+        return {
+            str(value)
+            for value in [*values, item.get("search_language")]
+            if str(value or "")
+        }
+
+    def add(item: dict[str, Any]) -> None:
+        url = str(item.get("url") or "")
+        if not url or url in selected_urls or len(selected) >= limit:
+            return
+        selected_urls.add(url)
+        selected.append(item)
+
+    for language in requested_languages:
+        for item in results:
+            if language in languages(item):
+                add(item)
+                break
+    for item in results:
+        add(item)
+    for rank, item in enumerate(selected, start=1):
+        item["rank"] = rank
+    return selected
+
+
 async def _web_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     query = " ".join(str(args.get("query") or "").split())
     region = _normalize_search_region(args.get("region"))
@@ -10707,7 +10875,7 @@ async def _web_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
         query = query[:300].rstrip()
     requested_languages = _normalize_search_languages(args.get("languages"))
     if not requested_languages:
-        requested_languages = list(_SEARCH_LANGUAGE_REGIONS)
+        requested_languages = _default_search_languages(query)
     variants = await _multilingual_search_variants(ctx, query, args)
     if len(variants) > 1:
         # Regional result sets cannot reuse a single-region evidence cache entry.
@@ -10761,7 +10929,13 @@ async def _web_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
             )
         request_groups.append(group)
     providers = _round_robin_search_requests(request_groups)
-    providers = providers[: orchestrator.limits.search_requests]
+    request_limit = _int_arg(
+        args.get("_search_request_limit"),
+        default=orchestrator.limits.search_requests,
+        minimum=1,
+        maximum=orchestrator.limits.search_requests,
+    )
+    providers = providers[:request_limit]
     if not providers:
         return ToolRunResponse(tool="web.search", ok=False, summary="Unsupported search provider.")
     scheduled_languages = {
@@ -10781,7 +10955,8 @@ async def _web_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
 
     last_failure: dict[str, Any] | None = None
     collected: list[dict[str, Any]] = []
-    seen_urls: set[str] = set()
+    collected_by_url: dict[str, dict[str, Any]] = {}
+    collection_limit = max(limit, min(120, limit * max(1, len(variants))))
     provider_stats: list[dict[str, Any]] = []
     try:
         async with httpx.AsyncClient(
@@ -10994,11 +11169,48 @@ async def _web_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
                 added = 0
                 for item in parsed:
                     result_url = str(item.get("url") or "")
-                    if not result_url or result_url in seen_urls:
+                    if not result_url:
                         continue
-                    seen_urls.add(result_url)
-                    collected.append(
-                        {
+                    provenance = {
+                        "providers": [source] if source else [],
+                        "search_queries": (
+                            [str(request.get("search_query") or "")]
+                            if request.get("search_query")
+                            else []
+                        ),
+                        "search_regions": (
+                            [str(request.get("search_region") or "")]
+                            if request.get("search_region")
+                            else []
+                        ),
+                        "search_languages": (
+                            [str(request.get("search_language") or "")]
+                            if request.get("search_language")
+                            else []
+                        ),
+                    }
+                    existing = collected_by_url.get(result_url)
+                    if existing is not None:
+                        for key, values in provenance.items():
+                            current_values = (
+                                existing.get(key) if isinstance(existing.get(key), list) else []
+                            )
+                            existing[key] = list(
+                                dict.fromkeys(
+                                    [
+                                        *(
+                                            str(value)
+                                            for value in current_values
+                                            if str(value or "")
+                                        ),
+                                        *(str(value) for value in values if str(value or "")),
+                                    ]
+                                )
+                            )[:12]
+                        continue
+                    if len(collected) >= collection_limit:
+                        continue
+                    result = {
                             **item,
                             "rank": len(collected) + 1,
                             "provider": source,
@@ -11008,10 +11220,12 @@ async def _web_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
                             "search_query": request.get("search_query"),
                             "search_region": request.get("search_region"),
                             "search_language": request.get("search_language"),
+                            **provenance,
                         }
-                    )
+                    collected_by_url[result_url] = result
+                    collected.append(result)
                     added += 1
-                    if len(collected) >= limit:
+                    if len(collected) >= collection_limit:
                         break
                 provider_stats.append(
                     {
@@ -11026,8 +11240,27 @@ async def _web_search(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
                 )
                 _web_rate_limit_record(ctx.storage, url, ok=True)
                 _web_provider_stats_record(ctx.storage, source, ok=True, vertical=vertical)
-            results = collected[:limit]
+            results = _balanced_multilingual_search_results(
+                collected,
+                requested_languages,
+                limit=limit,
+            )
             if results:
+                selected_language_counts: dict[str, int] = {}
+                for item in results:
+                    result_languages = (
+                        item.get("search_languages")
+                        if isinstance(item.get("search_languages"), list)
+                        else [item.get("search_language")]
+                    )
+                    for language in result_languages:
+                        normalized_language = str(language or "")
+                        if normalized_language:
+                            selected_language_counts[normalized_language] = (
+                                selected_language_counts.get(normalized_language, 0) + 1
+                            )
+                language_result_counts.clear()
+                language_result_counts.update(selected_language_counts)
                 coverage = language_coverage()
                 evidence_text = "\n".join(
                     f"{item.get('title', '')}\n{item.get('url', '')}\n{item.get('snippet', '')}"
@@ -11530,6 +11763,61 @@ async def _web_orchestrated_network_call(
             )
 
 
+def _web_search_result_provenance(result: dict[str, Any]) -> dict[str, Any]:
+    """Keep retrieval provenance across search, fetch and answer ranking."""
+
+    payload: dict[str, Any] = {}
+    for singular, plural in (
+        ("provider", "providers"),
+        ("search_query", "search_queries"),
+        ("search_region", "search_regions"),
+        ("search_language", "search_languages"),
+    ):
+        value = str(result.get(singular) or "").strip()
+        values = result.get(plural) if isinstance(result.get(plural), list) else []
+        normalized = list(
+            dict.fromkeys(
+                [
+                    *(str(item).strip() for item in values if str(item or "").strip()),
+                    *([value] if value else []),
+                ]
+            )
+        )[:12]
+        if value:
+            payload[singular] = value
+        if normalized:
+            payload[plural] = normalized
+    return payload
+
+
+def _merge_web_source_provenance(
+    target: dict[str, Any],
+    *sources: dict[str, Any],
+) -> dict[str, Any]:
+    for singular, plural in (
+        ("provider", "providers"),
+        ("search_query", "search_queries"),
+        ("search_region", "search_regions"),
+        ("search_language", "search_languages"),
+    ):
+        values: list[str] = []
+        for source in (target, *sources):
+            if value := str(source.get(singular) or "").strip():
+                values.append(value)
+            raw_values = source.get(plural)
+            if isinstance(raw_values, list):
+                values.extend(
+                    str(item).strip()
+                    for item in raw_values
+                    if str(item or "").strip()
+                )
+        normalized = list(dict.fromkeys(values))[:12]
+        if normalized:
+            target.setdefault(singular, normalized[0])
+            target[plural] = normalized
+    return target
+
+
 async def _web_research(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
     query = " ".join(str(args.get("query") or "").split())
     claim = " ".join(str(args.get("claim") or "").split())
@@ -11577,6 +11865,7 @@ async def _web_research(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
             "mode": orchestrator.mode.value,
             "use_cache": use_cache,
             "_web_orchestrator": orchestrator,
+            "_search_request_limit": args.get("_search_request_limit"),
         },
     )
     search_coverage = (
@@ -11623,6 +11912,7 @@ async def _web_research(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
                 "excerpt": _short_text(str(result.get("snippet") or ""), 900),
                 "quality": "snippet-only",
                 "extraction": None,
+                **_web_search_result_provenance(result),
             }
             for result in search_results
         ]
@@ -11646,6 +11936,17 @@ async def _web_research(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
             )
             fetched_text = (
                 str(fetched.data.get("text") or "") if isinstance(fetched.data, dict) else ""
+            )
+            initial_fetch_html_metadata = (
+                dict(fetched.data.get("html_metadata") or {})
+                if isinstance(fetched.data, dict)
+                and isinstance(fetched.data.get("html_metadata"), dict)
+                else {}
+            )
+            initial_fetch_content_language = (
+                str(fetched.data.get("content_language") or "")
+                if isinstance(fetched.data, dict)
+                else ""
             )
             content_type = str(fetched.data.get("content_type") or "").lower()
             should_render = render_fallback and (
@@ -11738,6 +12039,22 @@ async def _web_research(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
             except WebBudgetExceeded as exc:
                 orchestrator.budget.warn(str(exc))
             final_url = str(fetched.data.get("url") or result.get("url") or "")
+            html_metadata = (
+                fetched.data.get("html_metadata")
+                if isinstance(fetched.data, dict)
+                and isinstance(fetched.data.get("html_metadata"), dict)
+                else {}
+            )
+            document_language = _normalize_document_language(
+                (
+                    fetched.data.get("content_language")
+                    if isinstance(fetched.data, dict)
+                    else None
+                )
+                or html_metadata.get("language")
+                or initial_fetch_content_language
+                or initial_fetch_html_metadata.get("language")
+            )
             return {
                 "source": {
                     "rank": result.get("rank"),
@@ -11771,6 +12088,8 @@ async def _web_research(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
                     ),
                     "quality": _web_source_quality(final_url, fetched=fetched.ok),
                     "extraction": _compact_extraction(extraction),
+                    "document_language": document_language or None,
+                    **_web_search_result_provenance(result),
                     **(
                         {"_shopping_analysis_text": fetched_text}
                         if vertical == "shopping"
@@ -11822,6 +12141,7 @@ async def _web_research(ctx: ToolContext, args: dict[str, Any]) -> ToolRunRespon
                     "excerpt": _short_text(str(result.get("snippet") or ""), 900),
                     "quality": "snippet-only",
                     "extraction": None,
+                    **_web_search_result_provenance(result),
                 }
             )
 
@@ -11942,9 +12262,14 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
     vertical = _normalize_search_vertical(
         args.get("vertical") or _web_answer_infer_vertical(inference_text)
     )
+    news_time_window = (
+        _web_answer_news_time_window(args, inference_text) if vertical == "news" else None
+    )
     news_window = (
         _web_answer_news_date_window(args, inference_text) if vertical == "news" else None
     )
+    if news_time_window is not None and news_window is None:
+        news_window = (news_time_window[0].date(), news_time_window[1].date())
     if news_window is not None and (news_window[1] - news_window[0]).days > 30:
         date_from, date_to = news_window
         answer = (
@@ -12008,8 +12333,16 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
     explicit_search_languages = bool(search_languages)
     if not search_languages:
         # web.answer has the same cross-language default contract as web.search.
-        search_languages = list(_SEARCH_LANGUAGE_REGIONS)
+        search_languages = _default_search_languages(inference_text)
     use_cache = _bool_arg(args.get("use_cache"), default=True)
+    if news_time_window is not None:
+        # A moving 24-hour boundary must not reuse an older calendar-day cache entry.
+        use_cache = False
+    news_policy = (
+        _web_answer_global_news_policy(inference_text)
+        if vertical == "news"
+        else {"required": False, "min_non_ru_domains": 0, "required_topics": []}
+    )
     financial_market = _web_answer_looks_like_financial_market(
         _repair_mojibake(inference_text).lower()
     )
@@ -12021,10 +12354,10 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
     synthesis_enabled = (
         orchestrator.mode is not WebMode.FAST_FACT
         and _bool_arg(args.get("synthesis"), default=True)
-        and (news_window is None or _web_answer_news_needs_synthesis(resolved_question))
+        and (news_window is None or _web_answer_news_needs_synthesis(inference_text))
     )
     queries = _web_answer_queries(
-        resolved_question,
+        question,
         explicit_query=explicit_query,
         variants=query_variants,
         freshness=freshness,
@@ -12172,15 +12505,36 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
                     data=data,
                 )
 
+    global_news_plan = vertical == "news" and bool(news_policy["required"])
     active_queries = (
         queries[:1]
-        if explicit_search_languages or orchestrator.mode is WebMode.FAST_FACT
+        if (
+            (explicit_search_languages or orchestrator.mode is WebMode.FAST_FACT)
+            and not global_news_plan
+        )
         else queries[:4]
+    )
+    query_language_plan = (
+        _web_answer_balanced_query_languages(
+            active_queries,
+            search_languages,
+            required_topics=list(news_policy["required_topics"]),
+        )
+        if global_news_plan
+        else [list(search_languages) for _ in active_queries]
+    )
+    per_query_search_request_limit = max(
+        1,
+        orchestrator.limits.search_requests // max(1, len(active_queries)),
     )
 
     async def research_query(item: tuple[int, str]) -> ToolRunResponse:
         index, query = item
-        per_query_sources = max(2, min(5, max_sources + 2))
+        per_query_sources = (
+            max(1, len(query_language_plan[index]))
+            if global_news_plan
+            else max(2, min(5, max_sources + 2))
+        )
         return await _web_research(
             ctx,
             {
@@ -12188,11 +12542,11 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
                 "claim": resolved_question,
                 "max_sources": per_query_sources,
                 "region": region,
-                "languages": search_languages,
+                "languages": query_language_plan[index],
                 "translated_queries": args.get("translated_queries"),
                 "freshness": freshness,
                 "vertical": vertical,
-                "pages": 2 if index == 0 else 1,
+                "pages": 1 if global_news_plan or index > 0 else 2,
                 "render_fallback": orchestrator.mode is not WebMode.FAST_FACT,
                 "archive_fallback": (
                     orchestrator.mode is not WebMode.FAST_FACT and not financial_market
@@ -12200,13 +12554,18 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
                 "use_cache": use_cache,
                 "mode": orchestrator.mode.value,
                 "_web_orchestrator": orchestrator,
+                "_search_request_limit": (
+                    per_query_search_request_limit if global_news_plan else None
+                ),
             },
         )
 
     research_results = await orchestrator.bounded_map(
         list(enumerate(active_queries)),
         research_query,
-        concurrency=(1 if orchestrator.mode is WebMode.FAST_FACT else None),
+        concurrency=(
+            1 if orchestrator.mode is WebMode.FAST_FACT or global_news_plan else None
+        ),
     )
     for outcome in research_results:
         query = active_queries[outcome.index]
@@ -12241,23 +12600,48 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
             url = str(source.get("url") or "")
             if not url:
                 continue
-            if not _web_answer_source_relevant(
-                resolved_question,
-                source,
-                preferred_domains=preferred_domains,
-                vertical=vertical,
+            source_queries = (
+                source.get("search_queries")
+                if isinstance(source.get("search_queries"), list)
+                else []
+            )
+            relevance_queries = list(
+                dict.fromkeys(
+                    [
+                        resolved_question,
+                        query,
+                        *(str(item) for item in source_queries if str(item or "").strip()),
+                    ]
+                )
+            )
+            if not any(
+                _web_answer_source_relevant(
+                    candidate_query,
+                    source,
+                    preferred_domains=preferred_domains,
+                    vertical=vertical,
+                )
+                for candidate_query in relevance_queries
             ):
                 continue
             ranked = {
                 **source,
                 "answer_query": query,
-                "answer_score": _web_answer_source_score(resolved_question, source),
+                "answer_score": max(
+                    _web_answer_source_score(candidate_query, source)
+                    for candidate_query in relevance_queries
+                ),
             }
+            _web_answer_annotate_source(ranked)
             current = sources_by_url.get(url)
             if current is None or float(ranked["answer_score"]) > float(
                 current.get("answer_score") or 0
             ):
+                if current is not None:
+                    _merge_web_source_provenance(ranked, current)
                 sources_by_url[url] = ranked
+            elif current is not None:
+                _merge_web_source_provenance(current, ranked)
             evidence_id = str(source.get("evidence_id") or "")
             if evidence_id and evidence_id not in evidence_ids:
                 evidence_ids.append(evidence_id)
@@ -12276,28 +12660,54 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
                 source,
                 date_from=date_from,
                 date_to=date_to,
+                time_from=news_time_window[0] if news_time_window is not None else None,
+                time_to=news_time_window[1] if news_time_window is not None else None,
             )
             and (
-                not _web_answer_news_requires_domestic(resolved_question)
+                not _web_answer_news_requires_domestic(inference_text)
                 or _web_answer_news_domestic_relevant(source)
             )
         }
         source_domains = {
-            _url_domain(str(source.get("url") or "")) for source in sources_by_url.values()
+            _web_publisher_domain(str(source.get("url") or ""))
+            for source in sources_by_url.values()
         }
         source_domains.discard("")
         initial_coverage = _web_answer_news_coverage(
             list(sources_by_url.values()),
             date_from=date_from,
             date_to=date_to,
+            time_from=news_time_window[0] if news_time_window is not None else None,
+            time_to=news_time_window[1] if news_time_window is not None else None,
         )
-        if len(source_domains) < 2 or not initial_coverage["complete"]:
+        initial_sources = list(sources_by_url.values())
+        for source in initial_sources:
+            _web_answer_annotate_source(source)
+        initial_international_coverage = _web_answer_international_source_coverage(
+            initial_sources,
+            required=bool(news_policy["required"]),
+            min_non_ru_domains=int(news_policy["min_non_ru_domains"]),
+            required_topics=list(news_policy["required_topics"]),
+        )
+        initial_topic_coverage = _web_answer_topic_coverage(
+            initial_sources,
+            required_topics=list(news_policy["required_topics"]),
+        )
+        if (
+            len(source_domains) < 2
+            or not initial_coverage["complete"]
+            or not initial_international_coverage["complete"]
+            or not initial_topic_coverage["complete"]
+        ):
             feed_sources, feed_steps = await _web_answer_news_feed_sources(
                 ctx,
-                question=resolved_question,
+                question=inference_text,
                 date_from=date_from,
                 date_to=date_to,
                 max_sources=max_sources,
+                time_from=news_time_window[0] if news_time_window is not None else None,
+                time_to=news_time_window[1] if news_time_window is not None else None,
+                orchestrator=orchestrator,
             )
             steps.extend(feed_steps)
             for source in feed_sources:
@@ -12308,11 +12718,16 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
                 source["answer_score"] = _web_answer_source_score(
                     resolved_question, source
                 ) + float(source.get("news_relevance_score") or 0)
+                _web_answer_annotate_source(source)
                 current = sources_by_url.get(url)
                 if current is None or float(source["answer_score"]) > float(
                     current.get("answer_score") or 0
                 ):
+                    if current is not None:
+                        _merge_web_source_provenance(source, current)
                     sources_by_url[url] = source
+                elif current is not None:
+                    _merge_web_source_provenance(current, source)
                 evidence_id = str(source.get("evidence_id") or "")
                 if evidence_id and evidence_id not in evidence_ids:
                     evidence_ids.append(evidence_id)
@@ -12335,6 +12750,19 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
             max_sources=max_sources,
             date_from=news_window[0],
             date_to=news_window[1],
+            required_topics=list(news_policy["required_topics"]),
+            min_non_ru_domains=int(news_policy["min_non_ru_domains"]),
+            rolling_window=news_time_window is not None,
+        )
+    elif vertical == "news":
+        today = _web_news_today()
+        ranked_sources = _web_answer_news_balanced_sources(
+            ranked_candidates,
+            max_sources=max_sources,
+            date_from=today,
+            date_to=today,
+            required_topics=list(news_policy["required_topics"]),
+            min_non_ru_domains=int(news_policy["min_non_ru_domains"]),
         )
     elif financial_market:
         ranked_sources = _web_answer_financial_balanced_sources(
@@ -12358,11 +12786,28 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
         for item in ranked_sources
         if str(item.get("evidence_id") or "")
     ]
+    for source in ranked_sources:
+        _web_answer_annotate_source(source)
+    international_source_coverage = _web_answer_international_source_coverage(
+        ranked_sources,
+        required=bool(news_policy["required"]),
+        min_non_ru_domains=int(news_policy["min_non_ru_domains"]),
+        required_topics=list(news_policy["required_topics"]),
+    )
+    topic_coverage = _web_answer_topic_coverage(
+        ranked_sources,
+        required_topics=list(news_policy["required_topics"]),
+    )
+    news_policy_complete = (
+        international_source_coverage["complete"] and topic_coverage["complete"]
+    )
     if news_window is not None:
         verification_dict = _web_answer_news_verification(
             ranked_sources,
             date_from=news_window[0],
             date_to=news_window[1],
+            time_from=news_time_window[0] if news_time_window is not None else None,
+            time_to=news_time_window[1] if news_time_window is not None else None,
         )
         steps.append(
             {
@@ -12412,12 +12857,26 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
         sources=ranked_sources,
     )
     if news_window is not None:
-        fallback_answer = _format_web_news_answer(
-            sources=ranked_sources,
-            date_from=news_window[0],
-            date_to=news_window[1],
-        )
-        synthesis = {"attempted": False, "used": False, "reason": "deterministic_news"}
+        if not ranked_sources or news_policy_complete:
+            fallback_answer = _format_web_news_answer(
+                sources=ranked_sources,
+                date_from=news_window[0],
+                date_to=news_window[1],
+                time_from=news_time_window[0] if news_time_window is not None else None,
+                time_to=news_time_window[1] if news_time_window is not None else None,
+                required_topics=list(news_policy["required_topics"]),
+            )
+            synthesis = {"attempted": False, "used": False, "reason": "deterministic_news"}
+        else:
+            fallback_answer = _format_web_news_coverage_gap(
+                international_source_coverage,
+                topic_coverage,
+            )
+            synthesis = {
+                "attempted": False,
+                "used": False,
+                "reason": "source_coverage_incomplete",
+            }
     else:
         financial_kind = _web_answer_financial_instrument_kind(resolved_question)
         if financial_kind == "ambiguous_oil_security":
@@ -12444,7 +12903,7 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
             )
         synthesis = {"attempted": False, "used": False, "reason": "disabled"}
     answer = fallback_answer
-    if synthesis_enabled and _web_answer_should_synthesize(
+    if synthesis_enabled and news_policy_complete and _web_answer_should_synthesize(
         resolved_question,
         sources=ranked_sources,
         verification=verification_dict,
@@ -12463,6 +12922,9 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
                         verification=verification_dict,
                         fallback_answer=fallback_answer,
                         date_window=news_window,
+                        time_window=news_time_window,
+                        international_source_coverage=international_source_coverage,
+                        topic_coverage=topic_coverage,
                     ),
                     timeout=remaining,
                 )
@@ -12471,8 +12933,18 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
                 synthesis = {"attempted": True, "used": False, "reason": "deadline_exhausted"}
         if bool(synthesis.get("used")) and str(synthesis.get("answer") or "").strip():
             answer = str(synthesis["answer"]).strip()
-    elif synthesis_enabled:
+    elif synthesis_enabled and news_policy_complete:
         synthesis = {"attempted": False, "used": False, "reason": "weak_shopping_sources"}
+    if vertical == "news" and ranked_sources and not news_policy_complete:
+        answer = _format_web_news_coverage_gap(
+            international_source_coverage,
+            topic_coverage,
+        )
+        synthesis = {
+            "attempted": False,
+            "used": False,
+            "reason": "source_coverage_incomplete",
+        }
     financial_contract_rejection = ""
     if financial_market:
         financial_kind = _web_answer_financial_instrument_kind(resolved_question)
@@ -12571,6 +13043,8 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
             ranked_sources,
             date_from=news_window[0],
             date_to=news_window[1],
+            time_from=news_time_window[0] if news_time_window is not None else None,
+            time_to=news_time_window[1] if news_time_window is not None else None,
         )
         if news_window is not None
         else None
@@ -12602,6 +13076,17 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
                 "date_from": news_window[0].isoformat(),
                 "date_to": news_window[1].isoformat(),
                 "timezone": "Europe/Moscow",
+                "window_kind": news_status.get("window_kind") if news_status else None,
+                "time_from": (
+                    news_time_window[0].isoformat()
+                    if news_time_window is not None
+                    else None
+                ),
+                "time_to": (
+                    news_time_window[1].isoformat()
+                    if news_time_window is not None
+                    else None
+                ),
                 "dated_article_sources": len(ranked_sources),
                 "covered_dates": news_status["covered_dates"] if news_status else [],
                 "missing_dates": news_status["missing_dates"] if news_status else [],
@@ -12618,6 +13103,9 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
         else None,
         "orchestration": orchestrator.metadata(),
         "language_coverage": language_coverage,
+        "international_source_coverage": international_source_coverage,
+        "source_coverage": international_source_coverage,
+        "topic_coverage": topic_coverage,
         "cache": {
             "hit": False,
             "enabled": use_cache,
@@ -12626,8 +13114,12 @@ async def _web_answer(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
         "steps": steps,
     }
     evidence_completed = (
-        bool(news_status and news_status["complete"])
-        if news_window is not None
+        (
+            bool(news_status and news_status["complete"] and news_policy_complete)
+            if news_window is not None
+            else bool(ranked_sources or direct_links) and news_policy_complete
+        )
+        if vertical == "news"
         else bool(ranked_sources or direct_links) and not financial_contract_rejection
     )
     fully_completed = evidence_completed and _web_language_coverage_is_complete(
@@ -12987,6 +13479,7 @@ async def _web_fetch(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
                         max_chars,
                     )
                     content_type = response.headers.get("content-type")
+                    content_language = str(response.headers.get("content-language") or "").strip()
                     html_metadata = (
                         _extract_html_metadata(raw_text)
                         if _looks_like_html(raw_text, {"content_type": content_type})
@@ -13025,6 +13518,7 @@ async def _web_fetch(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
                         confidence=0.72 if ok else 0.22,
                         extra={
                             "status_code": response.status_code,
+                            "content_language": content_language,
                             "html_metadata": html_metadata or {},
                         },
                     )
@@ -13039,6 +13533,7 @@ async def _web_fetch(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
                         "requested_url": requested_url,
                         "status_code": response.status_code,
                         "content_type": content_type,
+                        "content_language": content_language,
                         "text": text,
                         "bytes_read": len(raw_text.encode("utf-8", errors="replace")),
                         "truncated": truncated,
@@ -13259,19 +13754,20 @@ async def _web_feed(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
             data={"url": feed_url},
         )
     _web_rate_limit_record(ctx.storage, feed_url, ok=status_code < 400, blocked=False)
+    bytes_read = len(raw_text.encode("utf-8", errors="replace"))
     if status_code >= 400:
         return ToolRunResponse(
             tool="web.feed",
             ok=False,
             summary=f"Feed responded with HTTP {status_code}.",
-            data={"url": feed_url, "status_code": status_code},
+            data={"url": feed_url, "status_code": status_code, "bytes_read": bytes_read},
         )
     if truncated:
         return ToolRunResponse(
             tool="web.feed",
             ok=False,
             summary="Feed is too large to parse safely.",
-            data={"url": feed_url},
+            data={"url": feed_url, "bytes_read": bytes_read},
         )
     try:
         feed_title, entries = _parse_feed_entries(raw_text, limit=limit)
@@ -13280,7 +13776,7 @@ async def _web_feed(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
             tool="web.feed",
             ok=False,
             summary=f"Feed parse failed: {exc}",
-            data={"url": feed_url},
+            data={"url": feed_url, "bytes_read": bytes_read},
         )
     digest_text = "\n".join(
         f"{item['title']} — {item['link']}" for item in entries
@@ -13305,6 +13801,7 @@ async def _web_feed(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse:
             "url": feed_url,
             "feed_title": feed_title,
             "entries": entries,
+            "bytes_read": bytes_read,
             "safety": safety,
             "evidence_id": evidence["id"],
         },
@@ -16445,7 +16942,25 @@ _SEARCH_LANGUAGE_REGIONS: dict[str, str] = {
     "zh": "zh-cn",
     "ko": "ko-kr",
     "ja": "ja-jp",
+    "uk": "uk-ua",
+    "fa": "fa-ir",
 }
+_DEFAULT_SEARCH_LANGUAGES = ("ru", "en", "zh", "ko", "ja")
+
+
+def _default_search_languages(query: str) -> list[str]:
+    """Use the five-language baseline and add languages relevant to named regions."""
+
+    normalized = _repair_mojibake(query).casefold()
+    languages = list(_DEFAULT_SEARCH_LANGUAGES)
+    if re.search(r"\b(?:украин\w*|україн\w*|ukrain\w*)\b", normalized):
+        languages.append("uk")
+    if re.search(
+        r"(?:\b(?:иран\w*|iran\w*|persian\w*|персид\w*)\b|ایران)",
+        normalized,
+    ):
+        languages.append("fa")
+    return languages
 
 
 def _normalize_search_languages(value: Any) -> list[str]:
@@ -16476,6 +16991,13 @@ def _normalize_search_languages(value: Any) -> list[str]:
         "jp": "ja",
         "jpn": "ja",
         "japanese": "ja",
+        "ua": "uk",
+        "ukr": "uk",
+        "ukrainian": "uk",
+        "per": "fa",
+        "fas": "fa",
+        "persian": "fa",
+        "farsi": "fa",
     }
     languages: list[str] = []
     for item in raw_items:
@@ -16952,6 +17474,8 @@ def _search_accept_language(region: str) -> str:
         "zh": "en-US;q=0.7,en;q=0.6",
         "ko": "en-US;q=0.7,en;q=0.6",
         "ja": "en-US;q=0.7,en;q=0.6",
+        "uk": "en-US;q=0.8,en;q=0.7",
+        "fa": "en-US;q=0.8,en;q=0.7",
     }
     return f"{locale},{language};q=0.9,{fallbacks.get(language, 'en;q=0.7')}"
 
@@ -18149,7 +18673,7 @@ def _web_answer_cache_key(
     date_window: tuple[date, date] | None = None,
 ) -> str:
     payload = {
-        "version": 8,
+        "version": 9,
         "question": question,
         "explicit_query": explicit_query,
         "queries": queries,
@@ -18297,6 +18821,151 @@ def _web_answer_news_date_window(
     return min(dates), max(dates)
 
 
+def _web_answer_news_time_window(
+    args: dict[str, Any],
+    text: str,
+    *,
+    now: datetime | None = None,
+) -> tuple[datetime, datetime] | None:
+    """Return an exact rolling interval when the request says "last 24 hours"."""
+
+    if str(args.get("date_from") or "").strip() or str(args.get("date_to") or "").strip():
+        return None
+    normalized = _repair_mojibake(text).casefold()
+    if not re.search(
+        r"(?:\bза\s+(?:последн\w*\s+)?сутки\b|\bпоследн\w*\s+сутки\b|"
+        r"\bпоследн\w*\s+24\s*(?:час\w*|ч\b)|\b24h\b|"
+        r"\blast\s+24\s*(?:hours?|hrs?)\b|\bpast\s+24\s*(?:hours?|hrs?)\b|"
+        r"\bpast\s+day\b)",
+        normalized,
+    ):
+        return None
+    end = now or datetime.now(WEB_NEWS_TIMEZONE)
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=WEB_NEWS_TIMEZONE)
+    end = end.astimezone(WEB_NEWS_TIMEZONE)
+    return end - timedelta(hours=24), end
+
+
+def _web_answer_requested_news_topics(text: str) -> list[str]:
+    normalized = _repair_mojibake(text).casefold()
+    return [
+        topic
+        for topic, patterns in WEB_NEWS_TOPIC_PATTERNS.items()
+        if any(re.search(pattern, normalized) for pattern in patterns)
+    ]
+
+
+def _web_answer_news_source_topics(source: dict[str, Any]) -> list[str]:
+    text = _repair_mojibake(
+        " ".join(
+            str(source.get(key) or "")
+            for key in (
+                "title",
+                "snippet",
+                "excerpt",
+            )
+        )
+    ).casefold()
+    return [
+        topic
+        for topic, patterns in WEB_NEWS_TOPIC_PATTERNS.items()
+        if any(re.search(pattern, text) for pattern in patterns)
+    ]
+
+
+def _web_answer_global_news_policy(question: str) -> dict[str, Any]:
+    normalized = _repair_mojibake(question).casefold()
+    required_topics = _web_answer_requested_news_topics(question)
+    global_markers = (
+        "доклад",
+        "сводк",
+        "обзор",
+        "основные новости",
+        "главные новости",
+        "миров",
+        "глобаль",
+        "международ",
+        "по странам",
+        "report",
+        "briefing",
+        "world news",
+        "global news",
+        "international news",
+    )
+    global_report = len(required_topics) >= 2 or any(
+        marker in normalized for marker in global_markers
+    )
+    unresolved_scopes = (
+        _web_answer_unresolved_news_scopes(question) if global_report else []
+    )
+    return {
+        "required": global_report,
+        "min_non_ru_domains": 2 if global_report else 0,
+        "required_topics": (
+            [
+                *required_topics,
+                *(f"unresolved:{scope}" for scope in unresolved_scopes),
+            ]
+            if global_report
+            else []
+        ),
+        "unresolved_scopes": unresolved_scopes,
+    }
+
+
+def _web_answer_unresolved_news_scopes(text: str) -> list[str]:
+    repaired = _repair_mojibake(text)
+    match = re.search(
+        r"(?is)\b(?:новост\w*|news)\s+(?:в\s+|по\s+|in\s+)?"
+        r"(?P<scopes>.+?)(?=\s+\b(?:за|for|over|during)\b|[.!?]?$)",
+        repaired,
+    )
+    if not match:
+        return []
+    raw_scopes = match.group("scopes")
+    parts = re.split(r"\s*(?:,|;|/|\s+и\s+|\s+and\s+)\s*", raw_scopes)
+    unresolved: list[str] = []
+    for raw_part in parts:
+        part = re.sub(
+            r"(?i)^(?:в|во|по|in|the)\s+",
+            "",
+            " ".join(raw_part.strip(" .!?()[]").split()),
+        )
+        normalized = part.casefold()
+        if (
+            not part
+            or len(part) > 60
+            or len(part.split()) > 4
+            or any(
+                marker in normalized
+                for marker in (
+                    "мир",
+                    "глобаль",
+                    "международ",
+                    "world",
+                    "global",
+                    "international",
+                )
+            )
+            or re.match(
+                r"^(?:за|последн|сегодня|вчера|сутки|today|yesterday|last|past)\b",
+                normalized,
+            )
+            or _web_answer_requested_news_topics(part)
+        ):
+            continue
+        if re.search(r"[A-Za-zА-Яа-яЁёІіЇїЄєҐґ\u0600-\u06ff]", part):
+            unresolved.append(normalized)
+    return list(dict.fromkeys(unresolved))[:6]
+
+
+def _web_answer_news_topic_label(topic: str) -> str:
+    if topic.startswith("unresolved:"):
+        return topic.partition(":")[2]
+    return WEB_NEWS_TOPIC_LABELS.get(topic, topic)
+
+
 def _web_answer_infer_freshness(question: str) -> str:
     normalized = _repair_mojibake(question).lower()
     if "вчера" in normalized or "yesterday" in normalized:
@@ -18378,24 +19047,39 @@ def _web_answer_queries(
 ) -> list[str]:
     base = explicit_query or question
     queries = [_web_answer_clean_query(base)]
-    for variant in variants or []:
-        queries.append(_web_answer_clean_query(variant))
     normalized = _repair_mojibake(question).lower()
     if vertical == "news":
-        if date_window is not None:
-            current = date_window[0]
-            while current <= date_window[1] and len(queries) < 4:
-                queries.append(
-                    _web_answer_clean_query(
-                        f"{question} Россия новости {current.isoformat()}"
-                    )
+        requested_topics = _web_answer_requested_news_topics(question)
+        for topic in requested_topics:
+            label = _web_answer_news_topic_label(topic)
+            date_hint = ""
+            if date_window is not None:
+                date_hint = (
+                    date_window[0].isoformat()
+                    if date_window[0] == date_window[1]
+                    else f"{date_window[0].isoformat()} {date_window[1].isoformat()}"
                 )
-                current += timedelta(days=1)
+            queries.append(
+                _web_answer_clean_query(
+                    f"{label} latest news international sources {date_hint}"
+                )
+            )
+        for variant in variants or []:
+            queries.append(_web_answer_clean_query(variant))
+        if date_window is not None and not requested_topics:
+            queries.append(
+                _web_answer_clean_query(
+                    f"{question} international sources "
+                    f"{date_window[0].isoformat()} {date_window[1].isoformat()}"
+                )
+            )
         result: list[str] = []
         for query in queries:
             if query and query not in result:
                 result.append(query[:300])
         return result[:4]
+    for variant in variants or []:
+        queries.append(_web_answer_clean_query(variant))
     preferred_domains = _web_answer_preferred_domains([question, explicit_query, *(variants or [])])
     if not any(marker in normalized for marker in ("site:", "официаль", "official")):
         for domain in preferred_domains:
@@ -18423,6 +19107,51 @@ def _web_answer_queries(
         if query and query not in result:
             result.append(query[:300])
     return result[:4]
+
+
+def _web_answer_balanced_query_languages(
+    queries: list[str],
+    languages: list[str],
+    *,
+    required_topics: list[str],
+) -> list[list[str]]:
+    """Distribute multilingual work deterministically across global-news queries."""
+
+    if not queries:
+        return []
+    plans: list[list[str]] = [[] for _ in queries]
+    available = list(dict.fromkeys(languages))
+    topic_languages = {
+        "ukraine": "uk",
+        "russia": "ru",
+        "iran": "fa",
+        "china": "zh",
+        "united_states": "en",
+        "israel": "en",
+        "india": "en",
+        "pakistan": "en",
+        "european_union": "en",
+    }
+    assigned: set[str] = set()
+    for index, query in enumerate(queries):
+        query_topics = _web_answer_requested_news_topics(query)
+        if len(query_topics) != 1:
+            continue
+        for topic in required_topics:
+            language = topic_languages.get(topic)
+            if topic in query_topics and language in available and language not in assigned:
+                plans[index].append(language)
+                assigned.add(language)
+                break
+    for language in (item for item in available if item not in assigned):
+        index = min(range(len(plans)), key=lambda item: (len(plans[item]), item))
+        plans[index].append(language)
+    fallback_language = "en" if "en" in available else (available[0] if available else "")
+    if fallback_language:
+        for plan in plans:
+            if not plan:
+                plan.append(fallback_language)
+    return plans
 
 
 def _web_answer_financial_query_variant(question: str) -> str:
@@ -19803,18 +20532,211 @@ def _web_answer_news_is_section_url(url: str) -> bool:
     return suffix in {".rss", ".xml"}
 
 
-def _web_answer_news_source_date(source: dict[str, Any]) -> date | None:
-    values: list[Any] = [source.get("published"), source.get("published_date")]
+def _normalize_document_language(value: Any) -> str:
+    raw = str(value or "").strip().casefold().replace("_", "-")
+    if not raw:
+        return ""
+    language = re.split(r"[,;\s-]+", raw, maxsplit=1)[0]
+    aliases = {"rus": "ru", "ukr": "uk", "eng": "en", "fas": "fa", "per": "fa"}
+    return aliases.get(language, language) if re.fullmatch(r"[a-z]{2,3}", language) else ""
+
+
+def _web_answer_source_segment(source: dict[str, Any]) -> tuple[str, str]:
+    """Classify conservatively; search locale alone is never source-origin proof."""
+
+    trusted_segment = str(source.get("source_segment") or "").strip()
+    trusted_reason = str(source.get("segment_reason") or "").strip()
+    if trusted_segment in {"ru", "non_ru"} and trusted_reason.startswith("trusted_feed:"):
+        return trusted_segment, trusted_reason
+
+    domain = _url_domain(str(source.get("url") or "")).casefold().rstrip(".")
+    if not domain:
+        return "unknown", "missing_domain"
+    if domain.endswith((".ru", ".su", ".xn--p1ai")) or domain in {
+        "rt.com",
+        "sputnikglobe.com",
+        "tass.com",
+    }:
+        return "ru", "domain_ru"
+    document_language = _normalize_document_language(source.get("document_language"))
+    if document_language == "ru":
+        return "ru", "document_language:ru"
+    tld = domain.rsplit(".", 1)[-1]
+    if len(tld) == 2 and tld not in {"ru", "su"}:
+        return "non_ru", "country_tld_non_ru"
+    if document_language and document_language != "ru":
+        return "non_ru", f"document_language:{document_language}"
+    return "unknown", "generic_domain_without_verified_language"
+
+
+def _web_answer_annotate_source(source: dict[str, Any]) -> dict[str, Any]:
+    segment, reason = _web_answer_source_segment(source)
+    source["source_segment"] = segment
+    source["segment_reason"] = reason
+    source["topic_matches"] = _web_answer_news_source_topics(source)
+    return source
+
+
+def _web_answer_international_source_coverage(
+    sources: list[dict[str, Any]],
+    *,
+    required: bool,
+    min_non_ru_domains: int,
+    required_topics: list[str] | None = None,
+) -> dict[str, Any]:
+    topic_scope = set(required_topics or [])
+    domains = sorted(
+        {
+            _web_publisher_domain(str(source.get("url") or ""))
+            for source in sources
+            if str(source.get("source_segment") or "") == "non_ru"
+            and (
+                not topic_scope
+                or bool(
+                    topic_scope.intersection(
+                        source.get("topic_matches")
+                        if isinstance(source.get("topic_matches"), list)
+                        else _web_answer_news_source_topics(source)
+                    )
+                )
+            )
+            and _web_publisher_domain(str(source.get("url") or ""))
+        }
+    )
+    missing = max(0, min_non_ru_domains - len(domains))
+    return {
+        "required": required,
+        "min_non_ru_domains": min_non_ru_domains,
+        "non_ru_domains": domains,
+        "missing_non_ru_domains": missing,
+        "complete": not required or missing == 0,
+    }
+
+
+def _web_answer_topic_coverage(
+    sources: list[dict[str, Any]],
+    *,
+    required_topics: list[str],
+) -> dict[str, Any]:
+    covered_set = {
+        str(topic)
+        for source in sources
+        for topic in (
+            source.get("topic_matches")
+            if isinstance(source.get("topic_matches"), list)
+            else _web_answer_news_source_topics(source)
+        )
+    }
+    covered = [topic for topic in required_topics if topic in covered_set]
+    missing = [topic for topic in required_topics if topic not in covered_set]
+    return {
+        "required_topics": list(required_topics),
+        "covered_topics": covered,
+        "missing_topics": missing,
+        "complete": not missing,
+    }
+
+
+def _format_web_news_coverage_gap(
+    international_source_coverage: dict[str, Any],
+    topic_coverage: dict[str, Any],
+) -> str:
+    missing_topics = [
+        _web_answer_news_topic_label(topic)
+        for topic in topic_coverage.get("missing_topics", [])
+    ]
+    gaps: list[str] = []
+    if missing_topics:
+        gaps.append(f"нет подтверждённых материалов по: {', '.join(missing_topics)}")
+    missing_domains = int(
+        international_source_coverage.get("missing_non_ru_domains") or 0
+    )
+    if missing_domains:
+        gaps.append(
+            f"не хватает {missing_domains} независимых источников вне RU-сегмента"
+        )
+    return (
+        "Не удалось подготовить полный доклад по заданному контракту источников: "
+        + "; ".join(gaps or ["недостаточно проверяемых источников"])
+        + ". Неполную RU-only подборку за полный результат не выдаю."
+    )
+
+
+def _web_answer_news_source_datetime(source: dict[str, Any]) -> datetime | None:
+    trusted_feed = str(source.get("segment_reason") or "").startswith("trusted_feed:")
+    values: list[Any] = (
+        [source.get("published_at"), source.get("published")]
+        if trusted_feed
+        else []
+    )
     extraction = source.get("extraction")
     if isinstance(extraction, dict):
         values.extend(extraction.get("article_dates") or [])
         for article in extraction.get("schema_articles") or []:
             if isinstance(article, dict):
                 values.append(article.get("date_published"))
+    if not trusted_feed:
+        values.extend(
+            [
+                source.get("published_at"),
+                source.get("published"),
+                source.get("published_date"),
+            ]
+        )
     for value in values:
         parsed = _web_answer_news_datetime(value)
         if parsed is not None:
-            return parsed.date()
+            return parsed
+    return None
+
+
+def _web_answer_news_source_timestamp(source: dict[str, Any]) -> datetime | None:
+    """Return publication time only when the evidence contains a time-of-day."""
+
+    trusted_feed = str(source.get("segment_reason") or "").startswith("trusted_feed:")
+    values: list[Any] = (
+        [source.get("published_at"), source.get("published")]
+        if trusted_feed
+        else []
+    )
+    extraction = source.get("extraction")
+    if isinstance(extraction, dict):
+        values.extend(extraction.get("article_dates") or [])
+        for article in extraction.get("schema_articles") or []:
+            if isinstance(article, dict):
+                values.append(article.get("date_published"))
+    if not trusted_feed:
+        values.extend([source.get("published_at"), source.get("published")])
+    for value in values:
+        raw = " ".join(str(value or "").strip().split())
+        if not raw or not re.search(r"[T\s]\d{1,2}:\d{2}(?::\d{2})?", raw):
+            continue
+        explicit_timezone = bool(
+            re.search(
+                r"(?:\b(?:UTC|GMT)\b|Z$|[+-]\d{2}:?\d{2}\b)",
+                raw,
+                flags=re.IGNORECASE,
+            )
+        )
+        trusted_timezone = str(source.get("publication_timezone") or "").strip()
+        if not explicit_timezone:
+            if not str(source.get("segment_reason") or "").startswith("trusted_feed:"):
+                continue
+            timezone_suffix = {
+                "Europe/Moscow": "+03:00",
+                "UTC": "+00:00",
+            }.get(trusted_timezone)
+            if not timezone_suffix:
+                continue
+            raw = f"{raw}{timezone_suffix}"
+        if parsed := _web_answer_news_datetime(raw):
+            return parsed
+    return None
+
+
+def _web_answer_news_source_date(source: dict[str, Any]) -> date | None:
+    if parsed_datetime := _web_answer_news_source_datetime(source):
+        return parsed_datetime.date()
     url = str(source.get("url") or "")
     for pattern in (
         r"/(20\d{2})(\d{2})(\d{2})(?:/|[-_.])",
@@ -19835,14 +20757,28 @@ def _web_answer_news_source_in_window(
     *,
     date_from: date,
     date_to: date,
+    time_from: datetime | None = None,
+    time_to: datetime | None = None,
 ) -> bool:
     url = str(source.get("url") or "")
     title = " ".join(str(source.get("title") or "").split())
     if not url or not title or _web_answer_news_is_section_url(url):
         return False
-    published = _web_answer_news_source_date(source)
-    if published is None or not (date_from <= published <= date_to):
-        return False
+    published_at = _web_answer_news_source_datetime(source)
+    if time_from is not None and time_to is not None:
+        published_at = _web_answer_news_source_timestamp(source)
+        if published_at is None or not (time_from <= published_at <= time_to):
+            return False
+        source["published_at"] = published_at.isoformat()
+        published = published_at.date()
+    else:
+        published = (
+            published_at.date()
+            if published_at is not None
+            else _web_answer_news_source_date(source)
+        )
+        if published is None or not (date_from <= published <= date_to):
+            return False
     source["published_date"] = published.isoformat()
     return True
 
@@ -19892,7 +20828,8 @@ def _web_answer_news_feed_score(question: str, source: dict[str, Any]) -> float:
 
 def _web_answer_news_requires_domestic(question: str) -> bool:
     normalized = _repair_mojibake(question).casefold()
-    return bool(
+    requested_topics = _web_answer_requested_news_topics(question)
+    return requested_topics == ["russia"] and bool(
         re.search(r"\b(?:в|по)\s+росси(?:и|ю)\b", normalized)
         or "российские новости" in normalized
         or "новости россии" in normalized
@@ -19938,18 +20875,67 @@ async def _web_answer_news_feed_sources(
     date_from: date,
     date_to: date,
     max_sources: int,
+    time_from: datetime | None = None,
+    time_to: datetime | None = None,
+    orchestrator: WebOrchestrator | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    async def read_feed(name_url: tuple[str, str]) -> ToolRunResponse:
-        _name, url = name_url
-        return await _web_feed(ctx, {"url": url, "limit": 120})
+    def feed_spec(raw: Any) -> dict[str, str]:
+        if isinstance(raw, dict):
+            return {
+                "name": str(raw.get("name") or ""),
+                "url": str(raw.get("url") or ""),
+                "language": _normalize_document_language(raw.get("language")),
+                "segment": str(raw.get("segment") or "unknown"),
+            }
+        name, url = raw
+        return {
+            "name": str(name),
+            "url": str(url),
+            "language": "",
+            "segment": "unknown",
+        }
 
-    outcomes = await asyncio.gather(
-        *(read_feed(item) for item in WEB_NEWS_RSS_FEEDS),
-        return_exceptions=True,
-    )
+    feed_specs = [feed_spec(item) for item in WEB_NEWS_RSS_FEEDS]
+    if _web_answer_global_news_policy(question)["required"]:
+        feed_specs.sort(key=lambda item: item["segment"] != "non_ru")
+
+    async def read_feed(spec: dict[str, str]) -> ToolRunResponse:
+        async def factory() -> ToolRunResponse:
+            return await _web_feed(ctx, {"url": spec["url"], "limit": 120})
+
+        if orchestrator is None:
+            return await factory()
+        return await _web_orchestrated_network_call(
+            orchestrator,
+            "fetches",
+            factory,
+            max_chars=WEB_FEED_MAX_BYTES_CHARS,
+        )
+
+    if orchestrator is None:
+        outcomes: list[Any] = list(
+            await asyncio.gather(
+                *(read_feed(item) for item in feed_specs),
+                return_exceptions=True,
+            )
+        )
+    else:
+        bounded = await orchestrator.bounded_map(
+            feed_specs,
+            read_feed,
+            concurrency=min(4, orchestrator.limits.concurrency),
+        )
+        outcomes = [
+            outcome.value
+            if outcome.ok
+            else RuntimeError(outcome.error or "Feed budget exhausted.")
+            for outcome in bounded
+        ]
     candidates: list[dict[str, Any]] = []
     steps: list[dict[str, Any]] = []
-    for (feed_name, feed_url), outcome in zip(WEB_NEWS_RSS_FEEDS, outcomes, strict=True):
+    for feed_spec_item, outcome in zip(feed_specs, outcomes, strict=True):
+        feed_name = feed_spec_item["name"]
+        feed_url = feed_spec_item["url"]
         if isinstance(outcome, BaseException):
             steps.append(
                 {
@@ -19988,6 +20974,22 @@ async def _web_answer_news_feed_sources(
                 or _web_answer_news_is_section_url(url)
                 or published_at is None
                 or not (date_from <= published_at.date() <= date_to)
+                or (
+                    time_from is not None
+                    and time_to is not None
+                    and (
+                        not re.search(
+                            r"[T\s]\d{1,2}:\d{2}(?::\d{2})?",
+                            published_raw,
+                        )
+                        or not re.search(
+                            r"(?:\b(?:UTC|GMT)\b|Z$|[+-]\d{2}:?\d{2}\b)",
+                            published_raw,
+                            flags=re.IGNORECASE,
+                        )
+                        or not (time_from <= published_at <= time_to)
+                    )
+                )
             ):
                 continue
             summary = _short_text(entry.get("summary") or "", 500)
@@ -19999,6 +21001,7 @@ async def _web_answer_news_feed_sources(
                 "excerpt": summary or title,
                 "vertical": "news",
                 "published": published_raw,
+                "published_at": published_at.isoformat(),
                 "published_date": published_at.date().isoformat(),
                 "fetched": True,
                 "tool": "web.feed",
@@ -20011,12 +21014,16 @@ async def _web_answer_news_feed_sources(
                 },
                 "feed_name": str(outcome.data.get("feed_title") or feed_name),
                 "feed_url": feed_url,
+                "document_language": feed_spec_item["language"] or None,
+                "source_segment": feed_spec_item["segment"],
+                "segment_reason": f"trusted_feed:{feed_url}",
             }
             if _web_answer_news_requires_domestic(question) and not (
                 _web_answer_news_domestic_relevant(source)
             ):
                 continue
             source["_news_feed_score"] = _web_answer_news_feed_score(question, source)
+            _web_answer_annotate_source(source)
             candidates.append(source)
 
     candidates.sort(
@@ -20026,8 +21033,50 @@ async def _web_answer_news_feed_sources(
         ),
         reverse=True,
     )
+    promoted_candidates: list[dict[str, Any]] = []
+    promoted_urls: set[str] = set()
+
+    def promote(source: dict[str, Any]) -> None:
+        url = str(source.get("url") or "")
+        if url and url not in promoted_urls:
+            promoted_urls.add(url)
+            promoted_candidates.append(source)
+
+    for topic in _web_answer_requested_news_topics(question):
+        for source in candidates:
+            if topic in (source.get("topic_matches") or []):
+                promote(source)
+                break
+    promoted_non_ru_domains: set[str] = set()
+    requested_topics = set(_web_answer_requested_news_topics(question))
+    for source in candidates:
+        if str(source.get("source_segment") or "") != "non_ru":
+            continue
+        if requested_topics and not requested_topics.intersection(
+            source.get("topic_matches") or []
+        ):
+            continue
+        domain = _web_publisher_domain(str(source.get("url") or ""))
+        if not domain or domain in promoted_non_ru_domains:
+            continue
+        promoted_non_ru_domains.add(domain)
+        promote(source)
+    for source in candidates:
+        if str(source.get("source_segment") or "") != "non_ru":
+            continue
+        domain = _web_publisher_domain(str(source.get("url") or ""))
+        if not domain or domain in promoted_non_ru_domains:
+            continue
+        promoted_non_ru_domains.add(domain)
+        promote(source)
+
     ordered_candidates: list[dict[str, Any]] = []
     ordered_urls: set[str] = set()
+    for source in promoted_candidates:
+        url = str(source.get("url") or "")
+        if url:
+            ordered_urls.add(url)
+            ordered_candidates.append(source)
     current_day = date_from
     while current_day <= date_to:
         day_candidates = [
@@ -20085,6 +21134,8 @@ async def _web_answer_news_feed_sources(
                 "feed_url": source.get("feed_url"),
                 "feed_name": source.get("feed_name"),
                 "published": source.get("published"),
+                "source_segment": source.get("source_segment"),
+                "segment_reason": source.get("segment_reason"),
             },
         )
         source["evidence_id"] = evidence["id"]
@@ -20100,9 +21151,14 @@ def _web_answer_news_balanced_sources(
     max_sources: int,
     date_from: date,
     date_to: date,
+    required_topics: list[str] | None = None,
+    min_non_ru_domains: int = 0,
+    rolling_window: bool = False,
 ) -> list[dict[str, Any]]:
-    """Keep at least one ranked article per requested day when evidence exists."""
+    """Balance requested topics, verified source segments, dates and domains."""
 
+    for source in candidates:
+        _web_answer_annotate_source(source)
     days: list[date] = []
     current = date_from
     while current <= date_to and len(days) < max_sources:
@@ -20117,6 +21173,51 @@ def _web_answer_news_balanced_sources(
             return
         seen_urls.add(url)
         selected.append(source)
+
+    for topic in required_topics or []:
+        for source in candidates:
+            topics = (
+                source.get("topic_matches")
+                if isinstance(source.get("topic_matches"), list)
+                else []
+            )
+            if topic in topics:
+                add(source)
+                break
+
+    non_ru_domains = {
+        _web_publisher_domain(str(source.get("url") or ""))
+        for source in selected
+        if str(source.get("source_segment") or "") == "non_ru"
+    }
+    required_topic_set = set(required_topics or [])
+    for source in candidates:
+        if len(non_ru_domains) >= min_non_ru_domains:
+            break
+        domain = _web_publisher_domain(str(source.get("url") or ""))
+        source_topics = (
+            source.get("topic_matches")
+            if isinstance(source.get("topic_matches"), list)
+            else []
+        )
+        if (
+            str(source.get("source_segment") or "") == "non_ru"
+            and (
+                not required_topic_set
+                or bool(required_topic_set.intersection(source_topics))
+            )
+            and domain
+            and domain not in non_ru_domains
+        ):
+            add(source)
+            non_ru_domains.add(domain)
+
+    if rolling_window:
+        for source in _web_answer_diverse_sources(candidates, max_sources=max_sources):
+            add(source)
+        for source in candidates:
+            add(source)
+        return selected
 
     per_day_limit = max(1, max_sources // max(1, len(days)))
     for day in days:
@@ -20142,9 +21243,30 @@ def _web_answer_news_coverage(
     *,
     date_from: date,
     date_to: date,
+    time_from: datetime | None = None,
+    time_to: datetime | None = None,
 ) -> dict[str, Any]:
     """Report whether every day in a bounded news window has dated evidence."""
 
+    if time_from is not None and time_to is not None:
+        covered_moments = sorted(
+            {
+                moment.isoformat()
+                for source in sources
+                if (moment := _web_answer_news_source_timestamp(source)) is not None
+                and time_from <= moment <= time_to
+            }
+        )
+        return {
+            "complete": bool(covered_moments),
+            "window_kind": "rolling_24h",
+            "time_from": time_from.isoformat(),
+            "time_to": time_to.isoformat(),
+            "covered_dates": sorted(
+                {datetime.fromisoformat(item).date().isoformat() for item in covered_moments}
+            ),
+            "missing_dates": [] if covered_moments else ["rolling_24h"],
+        }
     span_days = (date_to - date_from).days
     if span_days < 0 or span_days > 30:
         return {
@@ -20162,6 +21284,7 @@ def _web_answer_news_coverage(
     missing = [day for day in expected if day not in covered]
     return {
         "complete": bool(sources) and not missing,
+        "window_kind": "calendar_dates",
         "covered_dates": [day.isoformat() for day in sorted(covered)],
         "missing_dates": [day.isoformat() for day in missing],
     }
@@ -20172,10 +21295,12 @@ def _web_answer_news_verification(
     *,
     date_from: date,
     date_to: date,
+    time_from: datetime | None = None,
+    time_to: datetime | None = None,
 ) -> dict[str, Any]:
     domains = sorted(
         {
-            _url_domain(str(source.get("url") or ""))
+            _web_publisher_domain(str(source.get("url") or ""))
             for source in sources
             if source.get("url")
         }
@@ -20192,6 +21317,9 @@ def _web_answer_news_verification(
         "date_from": date_from.isoformat(),
         "date_to": date_to.isoformat(),
         "timezone": "Europe/Moscow",
+        "window_kind": "rolling_24h" if time_from is not None else "calendar_dates",
+        "time_from": time_from.isoformat() if time_from is not None else None,
+        "time_to": time_to.isoformat() if time_to is not None else None,
         "missing_terms": [] if sources else ["dated_article_sources"],
     }
 
@@ -20201,6 +21329,9 @@ def _format_web_news_answer(
     sources: list[dict[str, Any]],
     date_from: date,
     date_to: date,
+    time_from: datetime | None = None,
+    time_to: datetime | None = None,
+    required_topics: list[str] | None = None,
 ) -> str:
     if not sources:
         return (
@@ -20208,12 +21339,17 @@ def _format_web_news_answer(
             "календарное окно; недатированные главные страницы не считаю ответом."
         )
     window = (
-        date_from.isoformat()
-        if date_from == date_to
-        else f"{date_from.isoformat()} — {date_to.isoformat()}"
+        f"{time_from.isoformat()} — {time_to.isoformat()}"
+        if time_from is not None and time_to is not None
+        else (
+            date_from.isoformat()
+            if date_from == date_to
+            else f"{date_from.isoformat()} — {date_to.isoformat()}"
+        )
     )
     lines = [f"Наиболее заметные события за {window} (время и даты — Europe/Moscow):"]
-    for source in sources[:6]:
+
+    def source_line(source: dict[str, Any]) -> str:
         title = _markdown_link_label(str(source.get("title") or source.get("url") or "Источник"))
         url = str(source.get("url") or "")
         published = str(source.get("published_date") or source.get("published") or "")
@@ -20221,7 +21357,36 @@ def _format_web_news_answer(
         if summary.casefold() == str(source.get("title") or "").casefold():
             summary = ""
         detail = f" — {summary}" if summary else ""
-        lines.append(f"- **{published} — [{title}]({url})**{detail}")
+        segment = str(source.get("source_segment") or "unknown")
+        provenance = {
+            "ru": "RU-сегмент",
+            "non_ru": "вне RU-сегмента",
+            "unknown": "сегмент не подтверждён",
+        }.get(segment, "сегмент не подтверждён")
+        return f"- **{published} — [{title}]({url})** ({provenance}){detail}"
+
+    if required_topics:
+        for topic in required_topics:
+            lines.append(f"\n### {_web_answer_news_topic_label(topic)}")
+            topic_sources = [
+                source
+                for source in sources
+                if topic
+                in (
+                    source.get("topic_matches")
+                    if isinstance(source.get("topic_matches"), list)
+                    else _web_answer_news_source_topics(source)
+                )
+            ]
+            if not topic_sources:
+                lines.append("- Нет подтверждённых публикаций по теме.")
+                continue
+            topic_sources.sort(
+                key=lambda source: str(source.get("source_segment") or "") != "non_ru"
+            )
+            lines.extend(source_line(source) for source in topic_sources[:3])
+    else:
+        lines.extend(source_line(source) for source in sources[:6])
     lines.append("В подборку включены только датированные ссылки на отдельные публикации.")
     return "\n".join(lines)
 
@@ -20231,6 +21396,11 @@ def _web_answer_news_needs_synthesis(question: str) -> bool:
 
     normalized = _repair_mojibake(question).lower()
     analysis_markers = (
+        "доклад",
+        "обзор",
+        "сводк",
+        "report",
+        "briefing",
         "анализ",
         "вывод",
         "кто выигрывает",
@@ -24744,7 +25914,10 @@ def _source_extraction_has_price(source: dict[str, Any]) -> bool:
 
 def _web_answer_terms(text: str) -> list[str]:
     normalized = _repair_mojibake(text).lower()
-    tokens = re.findall(r"[a-zа-яё0-9]{3,}", normalized, flags=re.IGNORECASE)
+    # ``[^\W_]`` is the stdlib-regex equivalent of Unicode letters/digits.
+    # Restricting this boundary to Latin/Cyrillic made translated Ukrainian,
+    # Persian, Chinese, Korean and Japanese queries unusable for relevance.
+    tokens = re.findall(r"[^\W_]{3,}", normalized, flags=re.UNICODE)
     stopwords = set(WEB_VERIFY_STOPWORDS) | {
         "как",
         "что",
@@ -24968,6 +26141,9 @@ async def _web_answer_synthesis(
     verification: dict[str, Any],
     fallback_answer: str,
     date_window: tuple[date, date] | None = None,
+    time_window: tuple[datetime, datetime] | None = None,
+    international_source_coverage: dict[str, Any] | None = None,
+    topic_coverage: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not sources:
         return {"attempted": False, "used": False, "reason": "no_sources"}
@@ -24992,6 +26168,18 @@ async def _web_answer_synthesis(
             if date_window is not None
             else None
         ),
+        "requested_time_window": (
+            {
+                "time_from": time_window[0].isoformat(),
+                "time_to": time_window[1].isoformat(),
+                "timezone": "Europe/Moscow",
+                "kind": "rolling_24h",
+            }
+            if time_window is not None
+            else None
+        ),
+        "international_source_coverage": international_source_coverage,
+        "topic_coverage": topic_coverage,
         "queries": queries,
         "verification": verification,
         "sources": source_payload,
@@ -25008,8 +26196,13 @@ async def _web_answer_synthesis(
                 "the exact subject instead of reporting unrelated products or topics. "
                 "When requested_date_window is present, use only the supplied dated sources "
                 "inside that exact window for current-event conclusions. Treat the window and "
-                "published_date fields as authoritative. Distinguish claims by opposing sides, "
-                "and label forecasts as inferences rather than established facts. "
+                "published_date fields as authoritative. "
+                "When requested_time_window is present, enforce its exact rolling boundaries. "
+                "For multi-country reports, structure the answer by every required topic and "
+                "distinguish RU-segment from verified non-RU sources. Never claim complete "
+                "coverage when either supplied coverage object is incomplete. "
+                "Distinguish claims by opposing sides and label forecasts as inferences "
+                "rather than established facts. "
                 "Public-source reporting about wars, politics, and financial markets is "
                 "allowed; attribute disputed claims and uncertainty rather than inventing a "
                 "blanket refusal or claiming no live access. For financial-market questions, "
@@ -25091,6 +26284,19 @@ def _web_answer_synthesis_sources(sources: list[dict[str, Any]]) -> list[dict[st
             "excerpt": _short_text(source.get("excerpt") or source.get("snippet") or "", 900),
             "published_date": str(
                 source.get("published_date") or source.get("published") or ""
+            ),
+            "source_segment": str(source.get("source_segment") or "unknown"),
+            "segment_reason": str(source.get("segment_reason") or ""),
+            "document_language": str(source.get("document_language") or ""),
+            "search_languages": (
+                list(source.get("search_languages") or [])[:8]
+                if isinstance(source.get("search_languages"), list)
+                else []
+            ),
+            "topic_matches": (
+                list(source.get("topic_matches") or [])[:8]
+                if isinstance(source.get("topic_matches"), list)
+                else []
             ),
         }
         if extraction:
@@ -26083,6 +27289,32 @@ def _url_domain(url: str) -> str:
     return host.lower().strip(".")
 
 
+def _web_publisher_domain(url: str) -> str:
+    """Approximate registrable publisher domain without an external PSL dependency."""
+
+    host = _url_domain(url)
+    if not host or re.fullmatch(r"\d+(?:\.\d+){3}", host):
+        return host
+    labels = [label for label in host.split(".") if label]
+    if len(labels) <= 2:
+        return host.removeprefix("www.")
+    compound_suffixes = {
+        "ac.uk",
+        "co.in",
+        "co.jp",
+        "co.kr",
+        "co.uk",
+        "com.au",
+        "com.br",
+        "com.cn",
+        "net.au",
+        "org.uk",
+    }
+    suffix = ".".join(labels[-2:])
+    keep = 3 if suffix in compound_suffixes and len(labels) >= 3 else 2
+    return ".".join(labels[-keep:])
+
+
 def _epoch_seconds() -> float:
     import time
 
@@ -26164,6 +27396,9 @@ def _looks_like_html(raw_text: str, data: dict[str, Any]) -> bool:
 
 
 def _extract_html_metadata(html: str) -> dict[str, Any]:
+    html_match = re.search(r"(?is)<html\b(?P<attrs>[^>]*)>", html[:20_000])
+    html_attrs = _html_tag_attrs(html_match.group("attrs")) if html_match else {}
+    language = str(html_attrs.get("lang") or html_attrs.get("xml:lang") or "").strip()
     title_match = re.search(r"(?is)<title[^>]*>(?P<title>.*?)</title>", html)
     title = _html_to_text(title_match.group("title")) if title_match else ""
     meta: dict[str, str] = {}
@@ -26186,6 +27421,7 @@ def _extract_html_metadata(html: str) -> dict[str, Any]:
             break
     json_ld = _extract_json_ld(html)
     return {
+        "language": language,
         "title": title or open_graph.get("title") or meta.get("twitter:title") or "",
         "description": (
             meta.get("description")

@@ -59,10 +59,16 @@
   selected document with one cited bullet, and add a short cited conclusion; overlong or
   incomplete drafts are rewritten or rebuilt from evidence instead of being raw-truncated.
 - Public web search defaults to the global `wt-wt` region and accepts `languages` /
-  `translated_queries` for RU, EN, ZH, KO, and JA round-robin research. Explicit language
-  sets use independent regional requests and do not reuse another language corpus cache.
-  Every response exposes requested/covered/missing language status; partial coverage stays
-  explicit and failed/partial runs cannot poison a later complete-result cache entry.
+  `translated_queries` for RU, EN, ZH, KO, and JA round-robin research, adding UK and FA
+  searches when the requested geography calls for them. Explicit language sets use
+  independent regional requests and do not reuse another language corpus cache. Search
+  locale is diagnostic provenance, never proof that a source belongs to that language or
+  internet segment. Global and multi-country news reports measure every requested geography
+  and require verified non-RU evidence from at least two independent domains whose articles
+  match a requested geography; unrelated foreign news cannot satisfy the quota. A RU-only or
+  scope-incomplete result is reported as an evidence gap and is not cached as complete.
+  «За сутки» means an exact rolling 24-hour publication window. Every response exposes
+  requested/covered/missing language, geography, and source-segment status.
 - Telegram channel/supergroup feeds have durable owner/admin registration, live
   `channel_post`/edit ingestion before offset acknowledgement, RU/EN/ZH/KO/JA query variants,
   Unicode search, and bounded provenance-preserving analysis. The Bot API tier covers future
@@ -73,11 +79,15 @@
   external session reports `unconfigured` instead of claiming success. Private-chat transient
   backend failures remain durably ordered and retry with bounded backoff without a 24-hour
   tombstone; permanently rejected attachments still create a searchable delivery record.
-- Telegram modality is fixed to `auto` for every account: direct text/captions receive text,
-  direct voice/audio without a caption receives speech, and forwarded media remains source
-  material answered in text. Legacy `voice_reply=true` cannot override this; `/voice on|off`
-  is deprecated and does not persist a mode. Long output is split, successful multipart
-  delivery is logged without answer text, and header-only/unplayable WAV renders are rejected.
+- Telegram response modality defaults to `auto`: direct text/captions receive text, direct
+  voice/audio without a caption receives speech, and forwarded media remains source material
+  answered in text. `/voice text|voice|auto` stores the account-scoped choice durably, while
+  a one-shot request does not change that preference. Explicit inline commands such as
+  «озвучь этот текст: …», «зачитай: …» and «прочитай вслух: …» return the literal supplied
+  text without an LLM rewrite and deliver it as voice. The admitted chat text (up to the API's
+  20,000-character bound) is split into as many TTS/Telegram parts as required; no part is
+  silently dropped. Successful multipart delivery is logged without answer text, and
+  header-only/unplayable WAV renders are rejected.
   Telegram's per-recipient `VOICE_MESSAGES_FORBIDDEN` response is respected and falls back to
   the complete text with an explicit privacy notice; it is never bypassed through `sendAudio`.
   Silero retries presentation-free spoken text when its normalizer rejects Markdown, while

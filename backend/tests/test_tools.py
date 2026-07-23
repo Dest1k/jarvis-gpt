@@ -113,7 +113,15 @@ def test_web_search_regions_cover_global_ru_en_zh_ko_ja():
         "ko-kr",
         "ja-jp",
     ]
-    assert _normalize_search_languages("all") == ["ru", "en", "zh", "ko", "ja"]
+    assert _normalize_search_languages("all") == [
+        "ru",
+        "en",
+        "zh",
+        "ko",
+        "ja",
+        "uk",
+        "fa",
+    ]
 
     for region, language in (
         ("ru-ru", "ru"),

@@ -113,6 +113,48 @@ def test_transcribed_voice_can_change_response_preference(monkeypatch, tmp_path)
     storage.close()
 
 
+def test_explicit_long_read_aloud_is_exact_persisted_and_idempotent(monkeypatch, tmp_path):
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+    literal = "\n".join(
+        f"Абзац {index}: точный текст — цифры {index:03d}, знаки !?:; и перенос."
+        for index in range(180)
+    )
+    request_id = "telegram:owner:read-aloud-long-1"
+
+    async def must_not_generate(*_args, **_kwargs):
+        pytest.fail("literal read-aloud must bypass the model/chat generation path")
+
+    monkeypatch.setattr(agent, "_chat_impl", must_not_generate)
+    first = asyncio.run(
+        agent.chat(
+            f"Озвучь этот текст:\n{literal}",
+            response_modality="voice",
+            transport_request_id=request_id,
+        )
+    )
+    replay = asyncio.run(
+        agent.chat(
+            f"Озвучь этот текст:\n{literal}",
+            response_modality="voice",
+            transport_request_id=request_id,
+        )
+    )
+    messages = storage.list_messages(first.conversation_id)
+
+    assert len(literal) > 8_000
+    assert first.answer == literal
+    assert replay.answer == literal
+    assert replay.message_id == first.message_id
+    assert any(event.title == "Idempotent response replay" for event in replay.events)
+    assert [(item["role"], item["content"]) for item in messages] == [
+        ("user", f"Озвучь этот текст:\n{literal}"),
+        ("assistant", literal),
+    ]
+    assert messages[1]["metadata"]["source"] == "voice_read_aloud"
+    assert messages[1]["metadata"]["response_modality"] == "voice"
+    storage.close()
+
+
 def test_chat_request_cap_tracks_configured_api_admission(monkeypatch):
     monkeypatch.setenv("JARVIS_API_USER_RATE_LIMIT_PER_MINUTE", "240")
     assert _chat_request_hard_cap() == 240 * ((26 * 60) + 2)
@@ -1793,6 +1835,69 @@ def test_exact_russian_news_query_bypasses_fast_fact_and_passes_moscow_window(
     storage.close()
 
 
+def test_global_news_report_routes_directly_to_grounded_answer_engine(
+    monkeypatch,
+    tmp_path,
+):
+    captured = {}
+
+    async def fake_web_answer(_ctx, args):
+        captured.update(args)
+        return ToolRunResponse(
+            tool="web.answer",
+            ok=True,
+            summary="Grounded international report.",
+            data={
+                "query": args["query"],
+                "answer": (
+                    "## Украина\nИсточник: https://bbc.co.uk/world/ukraine\n\n"
+                    "## Россия\nИсточник: https://theguardian.com/world/russia\n\n"
+                    "## Иран\nИсточник: https://aljazeera.com/news/iran"
+                ),
+                "vertical": "news",
+                # Missing optional language-result coverage must not send this
+                # mandatory live-news request back into the free-form LLM loop.
+                "complete": False,
+                "sources": [
+                    {"url": "https://bbc.co.uk/world/ukraine"},
+                    {"url": "https://theguardian.com/world/russia"},
+                    {"url": "https://aljazeera.com/news/iran"},
+                ],
+                "international_source_coverage": {
+                    "required": True,
+                    "min_non_ru_domains": 2,
+                    "non_ru_domains": ["bbc.co.uk", "theguardian.com", "aljazeera.com"],
+                    "missing_non_ru_domains": 0,
+                    "complete": True,
+                },
+                "topic_coverage": {
+                    "required_topics": ["ukraine", "russia", "iran"],
+                    "covered_topics": ["ukraine", "russia", "iran"],
+                    "missing_topics": [],
+                    "complete": True,
+                },
+            },
+        )
+
+    monkeypatch.setattr("jarvis_gpt.tools._web_answer", fake_web_answer)
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+
+    response = asyncio.run(
+        agent.chat(
+            "Доклад по основным новостям в Украине, России и Иране за сутки"
+        )
+    )
+
+    assert captured["vertical"] == "news"
+    assert captured["max_sources"] == 9
+    assert captured["question"].startswith("Доклад по основным новостям")
+    assert "## Украина" in response.answer
+    runs = storage.list_tool_runs(limit=20)
+    assert [run["tool"] for run in runs].count("web.answer") == 1
+    assert "web.research" not in {run["tool"] for run in runs}
+    storage.close()
+
+
 def test_dns_catalog_failure_is_not_replaced_by_generic_web_answer(monkeypatch, tmp_path):
     import jarvis_gpt.agent as agent_module
 
@@ -1872,6 +1977,95 @@ def test_bounded_news_exception_does_not_fall_back_to_legacy_search(monkeypatch,
     storage.close()
 
 
+def test_rolling_global_news_exception_is_terminal_evidence_gap(monkeypatch, tmp_path):
+    from types import MethodType
+
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+
+    async def exploding_run(_registry, name, arguments=None, **_kwargs):
+        assert name == "web.answer"
+        assert arguments["vertical"] == "news"
+        raise RuntimeError("provider unavailable")
+
+    monkeypatch.setattr(agent.tools, "run", MethodType(exploding_run, agent.tools))
+    action = asyncio.run(
+        agent._run_web_answer_engine(
+            message=(
+                "Доклад по основным новостям в Украине, России и Иране за сутки"
+            ),
+            query="основные новости Украина Россия Иран за сутки",
+            conversation_id=None,
+        )
+    )
+
+    assert action is not None
+    assert "подтверждённый новостной ответ через live web-поиск" in action.answer
+    assert "знания модели не выдаю за актуальные новости" in action.answer
+    assert action.events[0].payload["evidence_gap"] is True
+    storage.close()
+
+
+def test_rolling_global_news_failed_result_is_terminal_evidence_gap(monkeypatch, tmp_path):
+    from types import MethodType
+
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+
+    async def failed_run(_registry, name, arguments=None, **_kwargs):
+        assert name == "web.answer"
+        return ToolRunResponse(
+            tool=name,
+            ok=False,
+            summary="No verified sources.",
+            data={"vertical": "news", "complete": False},
+        )
+
+    monkeypatch.setattr(agent.tools, "run", MethodType(failed_run, agent.tools))
+    action = asyncio.run(
+        agent._run_web_answer_engine(
+            message=(
+                "Доклад по основным новостям в Украине, России и Иране за сутки"
+            ),
+            query="основные новости Украина Россия Иран за сутки",
+            conversation_id=None,
+        )
+    )
+
+    assert action is not None
+    assert "подтверждённый новостной ответ через live web-поиск" in action.answer
+    assert action.events[0].payload["ok"] is False
+    assert action.events[0].payload["evidence_gap"] is True
+    storage.close()
+
+
+def test_news_empty_answer_is_terminal_evidence_gap(monkeypatch, tmp_path):
+    from types import MethodType
+
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+
+    async def empty_run(_registry, name, arguments=None, **_kwargs):
+        assert name == "web.answer"
+        return ToolRunResponse(
+            tool=name,
+            ok=True,
+            summary="Search completed without a grounded answer.",
+            data={"vertical": "news", "complete": True, "answer": "", "sources": []},
+        )
+
+    monkeypatch.setattr(agent.tools, "run", MethodType(empty_run, agent.tools))
+    action = asyncio.run(
+        agent._run_web_answer_engine(
+            message="Обзор главных новостей",
+            query="главные новости",
+            conversation_id=None,
+        )
+    )
+
+    assert action is not None
+    assert "подтверждённый новостной ответ через live web-поиск" in action.answer
+    assert action.events[0].payload["evidence_gap"] is True
+    storage.close()
+
+
 def test_bounded_news_partial_result_names_missing_date(monkeypatch, tmp_path):
     from types import MethodType
 
@@ -1913,6 +2107,137 @@ def test_bounded_news_partial_result_names_missing_date(monkeypatch, tmp_path):
     assert "Нет подтверждённых публикаций за: 2026-07-10" in action.answer
     assert "Частичная подтверждённая подборка" in action.answer
     storage.close()
+
+
+def test_global_news_incomplete_coverage_is_terminal_evidence_gap(monkeypatch, tmp_path):
+    from types import MethodType
+
+    agent, storage = _agent_without_llm(monkeypatch, tmp_path)
+
+    async def incomplete_global_news(_registry, name, arguments=None, **_kwargs):
+        assert name == "web.answer"
+        assert arguments["vertical"] == "news"
+        return ToolRunResponse(
+            tool=name,
+            ok=True,
+            summary="Only partial global-news coverage was verified.",
+            data={
+                "vertical": "news",
+                "complete": False,
+                "answer": "- Подтверждена только часть событий.",
+                "sources": [{"url": "https://bbc.example/world/item"}],
+                "international_source_coverage": {
+                    "required": True,
+                    "min_non_ru_domains": 2,
+                    "non_ru_domains": ["bbc.example"],
+                    "missing_non_ru_domains": 1,
+                    "complete": False,
+                },
+                "topic_coverage": {
+                    "required_topics": ["Украина", "Россия", "Иран"],
+                    "covered_topics": ["Украина", "Россия"],
+                    "missing_topics": ["Иран"],
+                    "complete": False,
+                },
+            },
+        )
+
+    monkeypatch.setattr(
+        agent.tools,
+        "run",
+        MethodType(incomplete_global_news, agent.tools),
+    )
+    action = asyncio.run(
+        agent._run_web_answer_engine(
+            message="Обзор событий в Украине, России и Иране",
+            query="события Украина Россия Иран",
+            conversation_id=None,
+        )
+    )
+
+    assert action is not None
+    assert "полный международный новостной доклад" in action.answer
+    assert "Не подтверждены темы: Иран" in action.answer
+    assert "не из RU-сегмента: 1" in action.answer
+    assert "Частичная подтверждённая подборка" in action.answer
+    assert action.events[0].payload["ok"] is False
+    storage.close()
+
+
+def test_bounded_news_with_coverage_contract_requires_top_level_complete():
+    import jarvis_gpt.agent as agent_module
+
+    data = {
+        "vertical": "news",
+        "sources": [{"url": "https://bbc.example/world/item"}],
+        "news": {
+            "complete": True,
+            "date_from": "2026-07-10",
+            "date_to": "2026-07-11",
+        },
+        "international_source_coverage": {
+            "required": True,
+            "min_non_ru_domains": 1,
+            "non_ru_domains": ["bbc.example"],
+            "complete": True,
+        },
+        "topic_coverage": {
+            "required_topics": ["Украина"],
+            "covered_topics": ["Украина"],
+            "missing_topics": [],
+            "complete": True,
+        },
+    }
+
+    assert not agent_module._web_news_answer_complete(
+        data,
+        expected_window=(date(2026, 7, 10), date(2026, 7, 11)),
+    )
+    data["complete"] = True
+    assert agent_module._web_news_answer_complete(
+        data,
+        expected_window=(date(2026, 7, 10), date(2026, 7, 11)),
+    )
+
+
+def test_top_level_incomplete_is_not_a_mandatory_coverage_gap():
+    import jarvis_gpt.agent as agent_module
+
+    data = {
+        "complete": False,
+        "international_source_coverage": {
+            "required": True,
+            "min_non_ru_domains": 2,
+            "non_ru_domains": ["bbc.example", "dw.example"],
+            "missing_non_ru_domains": 0,
+            "complete": True,
+        },
+        "topic_coverage": {
+            "required_topics": ["Украина", "Россия", "Иран"],
+            "covered_topics": ["Украина", "Россия", "Иран"],
+            "missing_topics": [],
+            "complete": True,
+        },
+    }
+
+    assert agent_module._web_news_mandatory_coverage_gap(data) is None
+
+
+def test_news_report_intent_and_prompts_require_structured_non_ru_evidence():
+    import jarvis_gpt.agent as agent_module
+
+    assert agent_module._looks_like_news_query(
+        "обзор событий в украине, россии и иране"
+    )
+    assert agent_module._looks_like_news_query(
+        "доклад по международной обстановке за сутки"
+    )
+    assert not agent_module._looks_like_news_query("обзор смартфона перед покупкой")
+    assert "проверенные\n  источники не из RU-сегмента" in agent_module.SYSTEM_PROMPT
+    assert "separate section for every requested country/topic" in (
+        agent_module.WEB_SYNTHESIS_PROMPT
+    )
+    assert "never present RU-only evidence" in agent_module.WEB_SYNTHESIS_PROMPT
 
 
 def test_agent_passes_chat_attachments_to_llm_context(monkeypatch, tmp_path):
@@ -5486,6 +5811,8 @@ def test_agent_voice_delivery_contract_is_in_model_context(monkeypatch, tmp_path
     rendered = "\n".join(str(message["content"]) for message in messages)
 
     assert "Telegram bridge will synthesize your final answer" in rendered
+    assert "reproduce the entire supplied text exactly" in rendered
+    assert "do not summarize, rewrite, or shorten it" in rendered
     assert "Do not claim that TTS is unavailable" in rendered
     assert "the user sent a Telegram voice message" not in rendered
     storage.close()

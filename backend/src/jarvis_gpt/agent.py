@@ -166,6 +166,10 @@ SYSTEM_PROMPT = """Ты Jarvis: локальный агент Windows/WSL/Docker
   оформляй через approval/tool gate, а не отказывайся целиком.
 - Для web-исследований работай только с публичными источниками, структурируй найденное,
   сохраняй ссылки, помечай confidence и не выдавай предположения за факты.
+- Для глобальных и мультистрановых новостных докладов обязательно используй проверенные
+  источники не из RU-сегмента, делай отдельный раздел по каждой запрошенной стране/теме,
+  ставь ссылки рядом с подтверждаемыми тезисами и явно называй пробелы покрытия. Не выдавай
+  RU-only подборку или пропущенную тему за полный международный доклад.
 - Если запрос требует актуальной информации из интернета: билеты, цены, расписания, новости,
   наличие, курсы, погоду, адреса, телефоны, часы работы, открыто ли место сейчас,
   ближайшие бытовые точки или "послезавтра/сегодня/завтра", сначала используй
@@ -275,7 +279,11 @@ WEB_SYNTHESIS_PROMPT = (
     "instead of summarizing the unrelated page. Public-source journalism and analysis of wars, "
     "markets, and politics are allowed: attribute contested claims and uncertainty, but do not "
     "invent a blanket refusal or claim that live access is unavailable after tools supplied "
-    "evidence. For finance, distinguish commodities, futures, company shares, indexes, and FX; "
+    "evidence. For global or multi-country news reports, require verified non-RU sources, make "
+    "a separate section for every requested country/topic, cite supported claims, and disclose "
+    "missing topic or source-segment coverage explicitly; never present RU-only evidence as a "
+    "complete international report. For finance, distinguish commodities, futures, company "
+    "shares, indexes, and FX; "
     "name the instrument, currency/unit, and source timestamp instead of merging unlike quotes. "
     "Put the conclusion first, then the key confirmed facts, "
     "then uncertainty/gaps if evidence is weak. Prefer fetched page excerpts over search "
@@ -848,7 +856,9 @@ def _response_delivery_prompt(response_modality: str) -> str:
         "voice message. "
         "The Telegram bridge will synthesize your final answer with the configured TTS "
         "engine and deliver it as audio. Answer the request directly in concise, "
-        "spoken-friendly language. Do not claim that TTS is unavailable, do not ask to "
+        "spoken-friendly language. If the operator explicitly supplied literal text to read "
+        "aloud, reproduce the entire supplied text exactly: do not summarize, rewrite, or "
+        "shorten it. Do not claim that TTS is unavailable, do not ask to "
         "transcribe an already-transcribed attachment, and do not describe transport details."
     )
 
@@ -1130,6 +1140,30 @@ class AgentRuntime:
         """Run one logical chat request behind a durable transport-id fence."""
 
         self._require_chat_capability()
+        read_aloud_text = (
+            speech.extract_explicit_read_aloud_text(message)
+            if response_modality == "voice"
+            else None
+        )
+        if read_aloud_text is not None:
+            # Literal read-aloud is a delivery instruction, not a generation request.
+            # Persist it through the normal transport ledger so retries cannot duplicate
+            # the turn or let an LLM paraphrase/truncate the supplied text.
+            return await self.record_notice_turn(
+                message,
+                answer=read_aloud_text,
+                source="voice_read_aloud",
+                conversation_id=conversation_id,
+                attachments=attachments,
+                mode=mode,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                thinking_enabled=thinking_enabled,
+                access_mode=access_mode,
+                notification_chat_id=notification_chat_id,
+                response_modality=response_modality,
+                transport_request_id=transport_request_id,
+            )
         request_id = str(transport_request_id or "").strip()
         cancel_key = self._register_turn_cancel(
             request_id=request_id or None,
@@ -6450,7 +6484,9 @@ class AgentRuntime:
         normalized_live_request = f"{message} {live_query_probe}".casefold()
         requires_live_web = _looks_like_financial_market_query(
             normalized_live_request
-        ) or _looks_like_current_public_events_query(normalized_live_request)
+        ) or _looks_like_current_public_events_query(
+            normalized_live_request
+        ) or _looks_like_news_query(normalized_live_request)
 
         # Reasoning-first arbiter: before any fuzzy web-ish branch (shopping,
         # weather, generic research) fires on keyword matches, let the model judge
@@ -7868,6 +7904,30 @@ class AgentRuntime:
                     )
                 ],
             )
+
+        def news_failure(detail: str) -> DirectAction:
+            return DirectAction(
+                answer=(
+                    "Не удалось собрать подтверждённый новостной ответ через live web-поиск. "
+                    "Неподтверждённые сниппеты и знания модели не выдаю за актуальные новости. "
+                    "Повтори запрос позже."
+                ),
+                events=[
+                    ChatEvent(
+                        type="tool_call",
+                        title="web.answer",
+                        content=detail[:500],
+                        payload={
+                            "tool": "web.answer",
+                            "ok": False,
+                            "query": query,
+                            "vertical": "news",
+                            "evidence_gap": True,
+                        },
+                    )
+                ],
+            )
+
         # A multi-event, date-bounded news request is not a two-second fact lookup.
         # Keep it in the structured answer engine, which can enforce publication
         # dates and fall back to publisher RSS feeds.
@@ -7924,6 +7984,8 @@ class AgentRuntime:
                     ),
                     events=[],
                 )
+            if news_request:
+                return news_failure("Live news answer tool is unavailable.")
             return None
         answer_arguments: dict[str, Any] = {
             "question": message,
@@ -7933,7 +7995,7 @@ class AgentRuntime:
         if financial_request:
             answer_arguments.update({"freshness": "day", "use_cache": False})
         if news_request:
-            answer_arguments["vertical"] = "news"
+            answer_arguments.update({"vertical": "news", "max_sources": 9})
             if news_window is not None:
                 date_from, date_to = news_window
                 answer_arguments.update(
@@ -7970,15 +8032,57 @@ class AgentRuntime:
                         )
                     ],
                 )
+            if news_request:
+                return news_failure(f"Live news lookup failed: {type(exc).__name__}")
             if financial_request:
                 return financial_failure(f"Live market lookup failed: {type(exc).__name__}")
             return None
+        data = result.data if isinstance(result.data, dict) else {}
+        coverage_gap = _web_news_mandatory_coverage_gap(data) if news_request else None
+        if coverage_gap is not None:
+            gap_answer = (
+                "Не удалось собрать доказательно полный международный новостной доклад: "
+                "обязательное покрытие тем или источников не выполнено."
+            )
+            missing_topics = coverage_gap["missing_topics"]
+            if missing_topics:
+                gap_answer += f" Не подтверждены темы: {', '.join(missing_topics)}."
+            missing_non_ru = coverage_gap["missing_non_ru_domains"]
+            if missing_non_ru:
+                gap_answer += (
+                    " Не хватает подтверждённых независимых источников не из RU-сегмента: "
+                    f"{missing_non_ru}."
+                )
+            partial_answer = str(data.get("answer") or "").strip()
+            if partial_answer and data.get("sources"):
+                gap_answer += f"\n\nЧастичная подтверждённая подборка:\n{partial_answer}"
+            return DirectAction(
+                answer=gap_answer,
+                events=[
+                    ChatEvent(
+                        type="tool_call",
+                        title="web.answer",
+                        content=result.summary,
+                        payload={
+                            "tool": result.tool,
+                            "ok": False,
+                            "query": query,
+                            "vertical": "news",
+                            "complete": data.get("complete"),
+                            "international_source_coverage": (
+                                data.get("international_source_coverage")
+                                or data.get("source_coverage")
+                            ),
+                            "topic_coverage": data.get("topic_coverage"),
+                        },
+                    )
+                ],
+            )
         if news_window is not None and (
             not result.ok
             or not isinstance(result.data, dict)
             or not _web_news_answer_complete(result.data, expected_window=news_window)
         ):
-            data = result.data if isinstance(result.data, dict) else {}
             news_meta = data.get("news") if isinstance(data.get("news"), dict) else {}
             missing_dates = [
                 str(item)
@@ -8014,11 +8118,15 @@ class AgentRuntime:
                 ],
             )
         if not result.ok or not isinstance(result.data, dict):
+            if news_request:
+                return news_failure(result.summary)
             if financial_request:
                 return financial_failure(result.summary)
             return None
         answer = str(result.data.get("answer") or "").strip()
         if not answer:
+            if news_request:
+                return news_failure("Live news lookup returned no grounded answer.")
             if financial_request:
                 return financial_failure("Live market lookup returned no grounded answer.")
             return None
@@ -16451,7 +16559,7 @@ def _web_surfer_mode_for_request(message: str) -> str:
 
 
 def _looks_like_news_query(normalized: str) -> bool:
-    return _contains_any(
+    if _contains_any(
         normalized,
         (
             "новост",
@@ -16462,7 +16570,98 @@ def _looks_like_news_query(normalized: str) -> bool:
             "headlines",
             "breaking",
         ),
+    ):
+        return True
+    report_request = bool(
+        re.search(r"\b(доклад|обзор|report|briefing)\b", normalized, re.IGNORECASE)
     )
+    report_subject = _contains_any(
+        normalized,
+        (
+            "событ",
+            "обстановк",
+            "международ",
+            "геополит",
+            "за сутки",
+            "24 час",
+            "ukraine",
+            "украин",
+            "russia",
+            "росси",
+            "iran",
+            "иран",
+        ),
+    )
+    return report_request and report_subject
+
+
+def _web_news_mandatory_coverage_gap(data: dict[str, Any]) -> dict[str, Any] | None:
+    """Return explicit mandatory global-news gaps declared by web.answer."""
+
+    source_coverage = data.get("international_source_coverage")
+    if not isinstance(source_coverage, dict):
+        source_coverage = data.get("source_coverage")
+    if not isinstance(source_coverage, dict):
+        source_coverage = {}
+    topic_coverage = data.get("topic_coverage")
+    if not isinstance(topic_coverage, dict):
+        topic_coverage = {}
+
+    required_non_ru = _optional_int(source_coverage.get("min_non_ru_domains"), default=0) or 0
+    source_required = bool(source_coverage.get("required")) or required_non_ru > 0
+    non_ru_value = source_coverage.get("non_ru_domains")
+    if isinstance(non_ru_value, list):
+        non_ru_count = len(
+            {
+                str(item).strip().casefold()
+                for item in non_ru_value
+                if str(item).strip()
+            }
+        )
+    else:
+        non_ru_count = _optional_int(non_ru_value, default=0) or 0
+    missing_non_ru_value = source_coverage.get("missing_non_ru_domains")
+    if isinstance(missing_non_ru_value, list):
+        missing_non_ru = len([item for item in missing_non_ru_value if str(item).strip()])
+    else:
+        missing_non_ru = _optional_int(missing_non_ru_value, default=0) or 0
+    missing_non_ru = max(missing_non_ru, required_non_ru - non_ru_count, 0)
+    source_incomplete = source_required and (
+        source_coverage.get("complete") is False or missing_non_ru > 0
+    )
+
+    required_topics = [
+        str(item).strip()
+        for item in (topic_coverage.get("required_topics") or [])
+        if str(item).strip()
+    ]
+    covered_topics = {
+        str(item).strip().casefold()
+        for item in (topic_coverage.get("covered_topics") or [])
+        if str(item).strip()
+    }
+    declared_missing_topics = [
+        str(item).strip()
+        for item in (topic_coverage.get("missing_topics") or [])
+        if str(item).strip()
+    ]
+    missing_topics = list(declared_missing_topics)
+    known_missing = {item.casefold() for item in missing_topics}
+    for topic in required_topics:
+        if topic.casefold() not in covered_topics and topic.casefold() not in known_missing:
+            missing_topics.append(topic)
+            known_missing.add(topic.casefold())
+    topic_required = bool(required_topics) or bool(topic_coverage.get("required"))
+    topic_incomplete = topic_required and (
+        topic_coverage.get("complete") is False or bool(missing_topics)
+    )
+
+    if not (source_incomplete or topic_incomplete):
+        return None
+    return {
+        "missing_non_ru_domains": missing_non_ru,
+        "missing_topics": missing_topics,
+    }
 
 
 def _web_news_answer_complete(
@@ -16470,6 +16669,16 @@ def _web_news_answer_complete(
     *,
     expected_window: tuple[date, date] | None,
 ) -> bool:
+    has_coverage_contract = any(
+        isinstance(data.get(key), dict)
+        for key in ("international_source_coverage", "source_coverage", "topic_coverage")
+    )
+    if data.get("complete") is False:
+        return False
+    if has_coverage_contract and data.get("complete") is not True:
+        return False
+    if _web_news_mandatory_coverage_gap(data) is not None:
+        return False
     news = data.get("news")
     if isinstance(news, dict):
         if not bool(news.get("complete")):
@@ -16736,6 +16945,7 @@ def _web_research_query_from_message(
         or _looks_like_shopping_query(normalized)
         or _looks_like_place_lookup_query(normalized)
         or _looks_like_financial_market_query(normalized)
+        or _looks_like_news_query(normalized)
         or _looks_like_current_public_events_query(normalized)
         or (_contains_any(normalized, osint_markers) and not _looks_like_local_query(normalized))
         or (_contains_any(normalized, search_verbs) and not _looks_like_local_query(normalized))
