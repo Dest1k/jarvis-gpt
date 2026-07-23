@@ -835,11 +835,12 @@ def _response_delivery_prompt(response_modality: str) -> str:
     if response_modality != "voice":
         return ""
     return (
-        "Delivery contract for this turn: the user sent a Telegram voice message. "
+        "Delivery contract for this turn: the final answer will be sent as a Telegram "
+        "voice message. "
         "The Telegram bridge will synthesize your final answer with the configured TTS "
-        "engine and deliver it as audio. Answer the transcribed request directly in concise, "
+        "engine and deliver it as audio. Answer the request directly in concise, "
         "spoken-friendly language. Do not claim that TTS is unavailable, do not ask to "
-        "transcribe the already-transcribed attachment, and do not describe transport details."
+        "transcribe an already-transcribed attachment, and do not describe transport details."
     )
 
 

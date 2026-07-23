@@ -393,6 +393,26 @@ def _voice_command_spec(text: str) -> str | None:
     return rest[1].strip().casefold() if len(rest) == 2 else ""
 
 
+_ONE_SHOT_VOICE_REPLY = re.compile(
+    r"(?:^|[.!?;:]\s*)"
+    r"(?:пожалуйста[,\s]+)?"
+    r"(?:"
+    r"ответь(?:\s+мне)?(?:,\s*пожалуйста)?"
+    r"|пришли(?:\s+мне)?\s+ответ"
+    r")"
+    r"\s+(?:голосом|голосовым\s+сообщением|аудиосообщением|войсом)"
+    r"\s*[.!?]*$",
+    re.IGNORECASE,
+)
+
+
+def _requests_one_shot_voice_reply(text: str) -> bool:
+    """Recognize an explicit per-turn request for Telegram voice delivery."""
+
+    normalized = " ".join(str(text or "").strip().replace("ё", "е").split())
+    return bool(normalized and _ONE_SHOT_VOICE_REPLY.search(normalized))
+
+
 def _voice_mode_status_text(mode: str) -> str:
     descriptions = {
         "text": "на прямые голосовые отвечаю текстом",
@@ -4128,11 +4148,14 @@ class TelegramBridge:
             return
         audio_in = any(_looks_like_audio(a) for a in attachments)
         visual_in = any(not _looks_like_audio(a) for a in attachments)
-        # Text, captions and forwarded media always stay text. For a direct voice/audio
-        # turn, the authenticated account can override the default modality mirror with a
-        # durable per-user preference.
+        # Direct voice/audio mirrors to voice unless the scoped preference says text.
+        # Ordinary text remains text, except for an explicit one-shot request such as
+        # "Ответь голосовым сообщением"; that request affects only this turn.
         direct_spoken_turn = audio_in and not forwarded and not text.strip()
-        voice_reply = direct_spoken_turn
+        one_shot_voice_reply = (
+            not forwarded and bool(text.strip()) and _requests_one_shot_voice_reply(text)
+        )
+        voice_reply = direct_spoken_turn or one_shot_voice_reply
         if direct_spoken_turn:
             voice_reply = await self._voice_input_reply_mode(chat_id) != "text"
         if forwarded:
@@ -4148,6 +4171,7 @@ class TelegramBridge:
             text,
             attachments,
             voice_reply=voice_reply,
+            voice_reply_preference_sensitive=direct_spoken_turn,
             request_id=f"{self._realm_id}:{update_id}",
             # No per-answer action chips (Inbox / +1ч / Ещё) — they clutter every
             # reply. Reminder snooze/done buttons still attach only to fired reminders.
@@ -4699,6 +4723,7 @@ class TelegramBridge:
         attachments: list[dict],
         *,
         voice_reply: bool = False,
+        voice_reply_preference_sensitive: bool = False,
         request_id: str | None = None,
         action_chips: bool = False,
     ) -> bool | None:
@@ -4780,7 +4805,11 @@ class TelegramBridge:
         answer = body.get("answer") or "(пустой ответ)"
         # A spoken preference command can update the mode inside the backend after STT.
         # Re-read before delivery so the confirmation itself already respects "text".
-        if voice_reply and await self._voice_input_reply_mode(chat_id) == "text":
+        if (
+            voice_reply
+            and voice_reply_preference_sensitive
+            and await self._voice_input_reply_mode(chat_id) == "text"
+        ):
             voice_reply = False
         self._last_answers[chat_id] = str(answer)
         markup = answer_action_keyboard() if action_chips else None

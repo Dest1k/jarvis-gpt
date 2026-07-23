@@ -24,6 +24,7 @@ from jarvis_gpt.telegram_bridge import (
     _looks_like_audio,
     _looks_like_image,
     _quick_capture_body,
+    _requests_one_shot_voice_reply,
     _retryable_backend_http_error,
     _wav_to_mp3,
     load_config,
@@ -2501,6 +2502,53 @@ def test_inbound_voice_transcribed_and_answered_with_voice(monkeypatch):
     # Spoken input -> a synthesized voice note reply (inline OGG/Opus).
     assert any(p.endswith("/sendVoice") for p in tg_posts)
     assert not any(p.endswith("/sendMessage") for p in tg_posts)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Ответь голосовым сообщением",
+        "Проверка связи. Ответь голосом.",
+        "Пожалуйста, пришли ответ войсом",
+    ],
+)
+def test_text_one_shot_voice_request_is_delivered_as_voice_despite_saved_text_mode(
+    monkeypatch,
+    text,
+):
+    bridge, tg_posts, _, _, chat_bodies, speak_bodies = _voice_bridge(
+        monkeypatch,
+        ogg=b"OggS-opus",
+        preference="text",
+    )
+    update = {
+        "update_id": 103,
+        "message": {
+            "chat": {"id": 42, "type": "private"},
+            "from": {"id": 42, "is_bot": False},
+            "text": text,
+        },
+    }
+
+    asyncio.run(bridge._handle(update))
+
+    assert chat_bodies[0]["message"] == text
+    assert chat_bodies[0]["response_modality"] == "voice"
+    assert speak_bodies == [{"text": "Готово, сэр."}]
+    assert any(path.endswith("/sendVoice") for path in tg_posts)
+    assert not any(path.endswith("/sendMessage") for path in tg_posts)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Почему ты ответил голосом?",
+        "Не отвечай голосом",
+        "Всегда отвечай на голосовые текстом",
+    ],
+)
+def test_text_voice_mentions_do_not_trigger_one_shot_voice_delivery(text):
+    assert _requests_one_shot_voice_reply(text) is False
 
 
 def test_inbound_voice_is_answered_with_text_when_user_preference_says_text(monkeypatch):

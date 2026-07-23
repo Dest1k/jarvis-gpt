@@ -5487,6 +5487,7 @@ def test_agent_voice_delivery_contract_is_in_model_context(monkeypatch, tmp_path
 
     assert "Telegram bridge will synthesize your final answer" in rendered
     assert "Do not claim that TTS is unavailable" in rendered
+    assert "the user sent a Telegram voice message" not in rendered
     storage.close()
 
 
