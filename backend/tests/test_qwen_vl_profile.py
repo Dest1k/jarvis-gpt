@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import fields
 from pathlib import Path
 
 from jarvis_gpt.cli import cmd_profiles
@@ -23,6 +24,42 @@ def test_qwen_vl_profile_is_registered_and_fits_vram():
     assert profile.tokenizer_mode == "auto"
     # The model dir name is auto-registered so identity binding accepts it.
     assert "qwen3.6-35b-a3b-nvfp4" in PROFILE_MODEL_DIR_NAMES
+
+
+def test_uncensored_qwen_profile_only_changes_identity_and_certification(monkeypatch, tmp_path):
+    base = PROFILES["qwen36-vl"]
+    uncensored = PROFILES["qwen36-vl-uncensored"]
+    non_runtime_fields = {
+        "name",
+        "title",
+        "description",
+        "model_dir_name",
+        "certification",
+        "interactive_certified",
+        "default_recommended",
+        "research_only",
+        "certification_reason",
+        "requires_experimental_opt_in",
+    }
+
+    for profile_field in fields(type(base)):
+        if profile_field.name not in non_runtime_fields:
+            assert getattr(uncensored, profile_field.name) == getattr(base, profile_field.name)
+
+    assert uncensored.model_dir_name == "qwen3.6-35b-a3b-uncensored-nvfp4"
+    assert uncensored.certification == "experimental"
+    assert uncensored.interactive_certified is False
+    assert uncensored.default_recommended is False
+    assert uncensored.research_only is True
+    assert uncensored.requires_experimental_opt_in is True
+    assert uncensored.model_dir_name in PROFILE_MODEL_DIR_NAMES
+
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path))
+    settings = load_settings("qwen36-vl-uncensored")
+    cfg = ModelCatalog(settings=settings).dispatcher_config()
+    assert settings.model_dir.name == uncensored.model_dir_name
+    assert cfg["docker_model_path"] == "/models/qwen3.6-35b-a3b-uncensored-nvfp4"
+    assert cfg["env"]["JARVIS_QWEN_MODEL_PATH"] == cfg["docker_model_path"]
 
 
 def test_qwen_vl_profile_starts_without_risky_parser_flags():

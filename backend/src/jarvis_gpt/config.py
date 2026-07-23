@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import platform
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 
@@ -339,6 +339,29 @@ PROFILES: dict[str, RuntimeProfile] = {
         requires_experimental_opt_in=False,
     ),
 }
+
+# Keep the uncensored checkpoint on the exact same runtime contract as the certified
+# Qwen profile. Only model identity and pre-certification product metadata differ; using
+# dataclasses.replace prevents serving knobs from drifting between the two profiles.
+PROFILES["qwen36-vl-uncensored"] = replace(
+    PROFILES["qwen36-vl"],
+    name="qwen36-vl-uncensored",
+    title="Qwen3.6-VL 35B-A3B Uncensored NVFP4",
+    description=(
+        "EXPERIMENTAL / research-only uncensored Qwen3.6 35B-A3B NVFP4 checkpoint "
+        "from NeuralNet-Hub. Runtime parameters mirror qwen36-vl."
+    ),
+    model_dir_name="qwen3.6-35b-a3b-uncensored-nvfp4",
+    certification="experimental",
+    interactive_certified=False,
+    default_recommended=False,
+    research_only=True,
+    certification_reason=(
+        "Live text, vision, and Jarvis API smoke passed on this host; remains "
+        "research-only because it is a third-party uncensored checkpoint."
+    ),
+    requires_experimental_opt_in=True,
+)
 
 
 def profile_public_dict(profile: RuntimeProfile) -> dict[str, object]:

@@ -1012,7 +1012,7 @@ def test_launcher_replaces_telegram_before_backend_mutation_and_after_readiness(
         '@("-3.11", ".\\jarvis.py", "--profile", $Profile, "init")',
         stop_backend,
     )
-    backend_ready = launcher.index("Wait-BackendApiReady -TimeoutSec 30", mutating_init)
+    backend_ready = launcher.index("Wait-BackendApiReady -TimeoutSec 60", mutating_init)
     start_telegram = launcher.index('-Name "Telegram bridge"', backend_ready)
     live_llm_ready = launcher.rindex(
         "Wait-LlmReady -TimeoutSec $readinessDeadlineSec",

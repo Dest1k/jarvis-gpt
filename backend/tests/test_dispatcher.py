@@ -1402,6 +1402,48 @@ def test_raw_compose_up_delegates_to_verified_mutation(monkeypatch, tmp_path):
     assert calls == ["up"]
 
 
+def test_compose_process_keeps_windows_plugin_discovery_environment(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("ProgramFiles", r"C:\Program Files")
+    monkeypatch.setenv(
+        "DOCKER_CLI_PLUGIN_EXTRA_DIRS",
+        r"C:\Program Files\Docker\cli-plugins",
+    )
+    monkeypatch.setenv("JARVIS_API_TOKEN", "required-compose-secret")
+    monkeypatch.setattr(
+        "jarvis_gpt.dispatcher.shutil.which",
+        lambda _name: r"C:\Program Files\Docker\docker.exe",
+    )
+    observed = {}
+
+    def fake_run(command, **kwargs):
+        observed["command"] = command
+        observed["env"] = kwargs["env"]
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("jarvis_gpt.dispatcher.subprocess.run", fake_run)
+    manager = DispatcherManager(load_settings("qwen36-vl"), repo_root=tmp_path)
+
+    result = manager._run_compose_with_env(
+        "logs",
+        {"JARVIS_QWEN_MODEL_PATH": "/models/qwen3.6-35b-a3b-nvfp4"},
+    )
+
+    assert result["ok"] is True
+    assert observed["command"][0] == r"C:\Program Files\Docker\docker.exe"
+    process_env = {key.upper(): value for key, value in observed["env"].items()}
+    assert process_env["PROGRAMFILES"] == r"C:\Program Files"
+    assert process_env["DOCKER_CLI_PLUGIN_EXTRA_DIRS"] == (
+        r"C:\Program Files\Docker\cli-plugins"
+    )
+    assert process_env["JARVIS_QWEN_MODEL_PATH"] == (
+        "/models/qwen3.6-35b-a3b-nvfp4"
+    )
+    assert process_env["JARVIS_API_TOKEN"] == "required-compose-secret"
+
+
 def test_dispatcher_cutover_spawn_failure_preserves_old_container_and_drops_pin(
     monkeypatch, tmp_path
 ):

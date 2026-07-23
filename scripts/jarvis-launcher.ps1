@@ -3390,7 +3390,7 @@ function Start-JarvisStack {
   if ($telegramLaunchRequested) {
     # This block must stay after Wait-LlmReady: run() drains the durable inbox before
     # its first getUpdates call, and a warming model would otherwise spend retries.
-    if (-not (Wait-BackendApiReady -TimeoutSec 30)) {
+    if (-not (Wait-BackendApiReady -TimeoutSec 60)) {
       throw "Telegram bridge requires the loopback backend API, but it did not become ready."
     }
     $telegramEntry = if ($previousState -and $previousState.services) {

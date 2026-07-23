@@ -26,6 +26,38 @@ DISPATCHER_OPERATION_NONCE_LABEL = "com.jarvis-gpt.dispatcher.operation-nonce"
 DISPATCHER_OWNERSHIP_JOURNAL = "dispatcher-ownership-journal.json"
 DISPATCHER_OPERATION_LOCK_TIMEOUT_SECONDS = 5.0
 LAUNCHER_STATE_LOCK_TIMEOUT_SECONDS = 5.0
+_COMPOSE_PROCESS_ENV_KEYS = {
+    "PATH",
+    "HOME",
+    "USER",
+    "USERNAME",
+    "SYSTEMDRIVE",
+    "SYSTEMROOT",
+    "COMPUTERNAME",
+    "DOCKER_HOST",
+    "DOCKER_CONTEXT",
+    "DOCKER_CERT_PATH",
+    "DOCKER_TLS_VERIFY",
+    "DOCKER_CLI_PLUGIN_EXTRA_DIRS",
+    "JARVIS_API_TOKEN",
+    "NVIDIA_VISIBLE_DEVICES",
+    "NVIDIA_DRIVER_CAPABILITIES",
+    "CUDA_VISIBLE_DEVICES",
+    "CUDA_HOME",
+    "NCCL_BN_DISABLE",
+    "TEMP",
+    "TMP",
+    "PROGRAMDATA",
+    "PROGRAMFILES",
+    "PROGRAMFILES(X86)",
+    "PROGRAMW6432",
+    "COMMONPROGRAMFILES",
+    "COMMONPROGRAMFILES(X86)",
+    "COMMONPROGRAMW6432",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "USERPROFILE",
+}
 _FULL_CONTAINER_ID = re.compile(r"^[0-9a-f]{64}$")
 _OPERATION_NONCE = re.compile(r"^[0-9a-f]{32}$")
 RUNTIME_COMPATIBILITY_FIELDS = (
@@ -735,14 +767,12 @@ class DispatcherManager:
         if docker is None:
             return {"ok": False, "summary": "Docker is not available in PATH.", "returncode": None}
         command = self.compose_command(action)
-        safe_keys = {
-            "PATH", "HOME", "USER", "USERNAME", "SYSTEMDRIVE", "SYSTEMROOT",
-            "COMPUTERNAME", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CERT_PATH",
-            "DOCKER_TLS_VERIFY", "NVIDIA_VISIBLE_DEVICES", "NVIDIA_DRIVER_CAPABILITIES",
-            "CUDA_VISIBLE_DEVICES", "CUDA_HOME", "NCCL_BN_DISABLE", "TEMP", "TMP",
-            "ProgramData", "APPDATA", "LOCALAPPDATA", "USERPROFILE",
+        command[0] = docker
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key.upper() in _COMPOSE_PROCESS_ENV_KEYS
         }
-        env = {k: v for k, v in os.environ.items() if k in safe_keys}
         env.update(compose_env)
         try:
             result = subprocess.run(
