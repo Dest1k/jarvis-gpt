@@ -51,6 +51,15 @@ def test_parse_relative_and_conclude_flag():
     assert scope.conclude is True
 
 
+def test_parse_short_digest_triggers_content_read():
+    scope = parse_document_date_scope(
+        "Какие сегодня документы были обработаны? дай краткую выжимку",
+        now=_NOW,
+    )
+    assert scope is not None
+    assert scope.conclude is True
+
+
 def test_parse_formats_iso_dotted_and_month_name():
     assert parse_document_date_scope("документы за 2026-07-10", now=_NOW).label == "2026-07-10"
     assert parse_document_date_scope("файлы 10.07.2026", now=_NOW).label == "10.07.2026"
@@ -140,6 +149,38 @@ def test_date_recall_lists_documents_without_reading(monkeypatch, tmp_path):
     assert result["mode"] == "list"
     assert [doc["name"] for doc in result["documents"]] == ["invoice-july.txt"]
     assert result["analyses"] == []  # listing does not read file contents
+    storage.close()
+
+
+def test_date_recall_generic_documents_excludes_audio(monkeypatch, tmp_path):
+    _settings, storage, surfer = _runtime(monkeypatch, tmp_path)
+    for name, mime_type in (
+        (
+            "report.docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ),
+        ("voice.ogg", "audio/ogg"),
+    ):
+        path = tmp_path / name
+        path.write_bytes(b"fixture")
+        storage.create_file_record(
+            name=name,
+            stored_path=path,
+            sha256=(name * 64)[:64],
+            size=path.stat().st_size,
+            mime_type=mime_type,
+            status="stored",
+            chunk_count=0,
+        )
+
+    result = DocumentMemory(storage=storage, surfer=surfer).recall(
+        "какие документы были",
+        date_from=_WIDE[0],
+        date_to=_WIDE[1],
+        list_only=True,
+    )
+
+    assert [item["name"] for item in result["documents"]] == ["report.docx"]
     storage.close()
 
 

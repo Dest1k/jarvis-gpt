@@ -671,6 +671,15 @@ class AccountRecentMessagesRequest:
     order: str = "newest_first"
 
 
+@dataclass(frozen=True)
+class AccountDocumentSummaryRequest:
+    date_from: str
+    date_to: str
+    username: str = ""
+    account_name: str = ""
+    selector_error: str = ""
+
+
 @dataclass
 class NativeAction:
     action: str
@@ -6123,6 +6132,12 @@ class AgentRuntime:
         preference_action = self._response_preference_direct_action(message)
         if preference_action is not None:
             return preference_action
+        account_document_request = _account_document_summary_request(message)
+        if account_document_request is not None and context is not None:
+            return await self._account_document_summary_direct_action(
+                account_document_request,
+                context,
+            )
         recent_account_request = _account_recent_messages_request(message)
         if recent_account_request is not None and context is not None:
             return await self._account_recent_messages_direct_action(
@@ -6623,6 +6638,100 @@ class AgentRuntime:
             return None
 
         return None
+
+    async def _account_document_summary_direct_action(
+        self,
+        request: AccountDocumentSummaryRequest,
+        context: AgentContext,
+    ) -> DirectAction:
+        """Route an explicit cross-user date query away from tenant-own file recall."""
+
+        if request.selector_error:
+            return DirectAction(
+                answer=request.selector_error,
+                events=[
+                    ChatEvent(
+                        type="thought",
+                        title="Требуется один точный аккаунт",
+                        content=request.selector_error,
+                        payload={"cross_user_material": True, "fail_closed": True},
+                    )
+                ],
+            )
+        selector: dict[str, str]
+        selector_kind: str
+        selector_label: str
+        if request.username:
+            selector = {"username": request.username}
+            selector_kind = "exact_username"
+            selector_label = f"@{request.username}"
+        else:
+            selector = {"account_name": request.account_name}
+            selector_kind = "exact_account_name"
+            selector_label = request.account_name
+        result = await self.tools.run(
+            "materials.summarize",
+            {
+                "query": context.operator_message or "",
+                **selector,
+                "source_types": ["documents"],
+                "date_from": request.date_from,
+                "date_to": request.date_to,
+                "max_hits": 60,
+                "max_tokens": 800,
+            },
+            conversation_id=context.conversation_id,
+            user_message_id=context.operator_message_id,
+        )
+        event = ChatEvent(
+            type="tool_call",
+            title="materials.summarize",
+            content=result.summary,
+            payload={
+                "tool": result.tool,
+                "ok": result.ok,
+                "account_selector": selector_kind,
+                "source_types": ["documents"],
+                "date_from": request.date_from,
+                "date_to": request.date_to,
+                "tenant_own_recall_routed": False,
+            },
+        )
+        if not result.ok:
+            lowered = str(result.summary or "").casefold()
+            if result.data.get("authorization_denied") is True:
+                answer = _localized_account_policy_denial(
+                    context.operator_message or "",
+                    "cross_user",
+                )
+            elif "no account matches" in lowered:
+                answer = (
+                    f"Активный аккаунт с точным идентификатором {selector_label} "
+                    "в системе Jarvis не найден."
+                )
+            elif "not unique" in lowered:
+                answer = (
+                    f"Идентификатор {selector_label} неоднозначен. Укажи точный "
+                    "@username или неизменяемый идентификатор аккаунта."
+                )
+            elif "no supported documents" in lowered:
+                answer = (
+                    f"У аккаунта {selector_label} в указанном периоде "
+                    "поддерживаемых документов не найдено."
+                )
+            else:
+                answer = (
+                    f"Не удалось подготовить выжимку документов аккаунта "
+                    f"{selector_label}: {result.summary}"
+                )
+            return DirectAction(answer=answer, events=[event])
+        summary = str(result.data.get("summary") or "").strip()
+        if not summary:
+            summary = (
+                f"Выжимка документов аккаунта {selector_label} не сформирована: "
+                "инструмент не вернул проверяемый текст."
+            )
+        return DirectAction(answer=summary, events=[event])
 
     async def _account_recent_messages_direct_action(
         self,
@@ -9467,6 +9576,26 @@ class AgentRuntime:
                     "report the matching file paths and lines, or say plainly nothing matched",
                 ),
                 rationale="The request targets a concrete on-disk file/content search.",
+            )
+
+        account_document_request = _account_document_summary_request(message)
+        if mode != "mission" and account_document_request is not None:
+            return TaskKernelPlan(
+                route="reasoning",
+                mode=task_mode,
+                intent="cross_user_document_summary",
+                confidence=0.99,
+                query=message,
+                tools=("materials.summarize", "materials.read", "accounts.overview"),
+                completion_criteria=(
+                    "resolve exactly one Jarvis account without using the selector as authority",
+                    "select only supported documents in the exact requested date range",
+                    "read document contents and ground every claim in stable document citations",
+                    "fail closed when the account selector is absent, ambiguous, or unauthorized",
+                ),
+                rationale=(
+                    "The request explicitly targets another Jarvis account's dated documents."
+                ),
             )
 
         if (
@@ -13309,8 +13438,10 @@ class AgentRuntime:
                 (
                     "- cross_user_scope: owner/admin explicit retrieval is permitted; use "
                     "accounts.overview and materials.search/recent/read/summarize and cite "
-                    "every hit. A request for recent/last messages from @username refers to "
-                    "that Jarvis account identity and must use materials.recent."
+                    "every hit. Exact @username or exact unique formal/display name may select "
+                    "an account but never grants authority. A request for recent/last messages "
+                    "from @username refers to that Jarvis account identity and must use "
+                    "materials.recent."
                     if privileged
                     else "- cross_user_scope: denied; explain that only owner/admin may inspect "
                     "accounts or other users' messages/documents."
@@ -13348,6 +13479,8 @@ class AgentRuntime:
         normalized = " ".join(str(message or "").casefold().split())
         if not normalized:
             return None
+        if _account_document_summary_request(message) is not None:
+            return _localized_account_policy_denial(message, "cross_user")
 
         cross_user_subject = _contains_any(
             normalized,
@@ -24802,6 +24935,241 @@ def _contains_any(text: str, markers: tuple[str, ...]) -> bool:
 
 
 _ACCOUNT_HANDLE_RE = re.compile(r"(?<![\w@])@([a-z0-9_]{3,32})\b", re.IGNORECASE)
+_ACCOUNT_DOCUMENT_HANDLE_RE = re.compile(
+    r"(?:пользовател(?:ь|ем|я|ю|е)?|аккаунт(?:ом|а|у|е)?|user|account)"
+    r"(?:\s+с\s+(?:именем|ником)|\s+named)?\s*[:—-]?\s*"
+    r"[\[«„“\"']?\s*@(?P<handle>[a-z0-9_]{3,32})\b",
+    re.IGNORECASE,
+)
+_ACCOUNT_FORMAL_NAME_RE = re.compile(
+    r"(?:пользовател(?:ь|ем|я|ю|е)?|аккаунт(?:ом|а|у|е)?|"
+    r"формальн\w*\s+(?:ник|имя)|display\s+name|user|account)"
+    r"(?:\s+с\s+(?:именем|ником)|\s+named)?\s+"
+    r"(?:[«„“\"](?P<quoted>[^»”“\"]{1,160})[»”“\"]|"
+    r"(?P<plain>[^@?!.:,;\n\r]{1,160}?))"
+    r"(?=\s+(?:за|сегодня|вчера|позавчера|на|с|со|между|"
+    r"today|yesterday|from|between)\b|[?!.:,;]|$)",
+    re.IGNORECASE,
+)
+_ACCOUNT_DOCUMENT_RETRIEVAL_RE = re.compile(
+    r"\b(?:какие|какой|покажи(?:те)?|перечисли(?:те)?|найди(?:те)?|"
+    r"выведи(?:те)?|дай(?:те)?|сделай(?:те)?|подготовь(?:те)?|"
+    r"выжимк\w*|сводк\w*|список|перечень|резюме|which|show|list|find|"
+    r"give|summari[sz]e|summary|digest)\b",
+    re.IGNORECASE,
+)
+_ACCOUNT_DOCUMENT_NOUN_RE = re.compile(
+    r"\b(?:документ\w*|файл\w*|document\w*|file\w*)\b",
+    re.IGNORECASE,
+)
+_ACCOUNT_DOCUMENT_ACTION_RE = re.compile(
+    r"\b(?:обработ\w*|загруз\w*|загруж\w*|добав\w*|созд\w*|"
+    r"отправ\w*|получ\w*|поступ\w*|принят\w*|проиндекс\w*|"
+    r"сохран\w*|подготов\w*|process\w*|upload\w*|add(?:ed|ing)?|"
+    r"creat\w*|send\w*|sent|receiv\w*|submit\w*|index\w*|stor\w*)\b",
+    re.IGNORECASE,
+)
+_ACCOUNT_DOCUMENT_MENTION_CONTEXT_RE = re.compile(
+    r"(?:\b(?:в|во)\s+(?:(?:этом|данном|сегодняшн\w*)\s+)?"
+    r"(?:документ|файл)\w*[^?!;\n\r]{0,96}\b"
+    r"(?:упомянут\w*|упомина\w*|написан\w*|указан\w*|содерж\w*|"
+    r"фигурир\w*|встреча\w*)\b|"
+    r"\bin\s+the\s+(?:document|file)[^?!;\n\r]{0,96}\b"
+    r"(?:mentions?|says?|contains?)\b)",
+    re.IGNORECASE,
+)
+_ACCOUNT_FORMAL_NAME_REJECTED_FIRST_TOKENS = frozenset(
+    {
+        "я",
+        "меня",
+        "мне",
+        "мной",
+        "мною",
+        "мы",
+        "нас",
+        "нам",
+        "нами",
+        "мой",
+        "моя",
+        "моё",
+        "мое",
+        "мои",
+        "наш",
+        "наша",
+        "наше",
+        "наши",
+        "себя",
+        "собой",
+        "в",
+        "во",
+        "на",
+        "из",
+        "с",
+        "со",
+        "к",
+        "по",
+        "от",
+        "до",
+        "для",
+        "при",
+        "про",
+        "о",
+        "об",
+        "обо",
+        "под",
+        "над",
+        "между",
+        "через",
+        "без",
+        "me",
+        "my",
+        "mine",
+        "myself",
+        "us",
+        "our",
+        "ours",
+        "in",
+        "on",
+        "from",
+        "to",
+        "for",
+        "at",
+        "by",
+        "about",
+    }
+)
+
+
+def _normalized_account_document_message(message: str) -> str:
+    text = re.sub(
+        r"\[(@[a-z0-9_]{3,32})\]\([^)]+\)",
+        r"\1",
+        str(message or ""),
+        flags=re.IGNORECASE,
+    )
+    return " ".join(text.split())
+
+
+def _account_document_actor_relationship(
+    message: str,
+    actor_span: tuple[int, int],
+) -> bool:
+    """Require the selected account to be the actor of a document lifecycle action."""
+
+    start, end = actor_span
+    clause_start = max(
+        (message.rfind(boundary, 0, start) for boundary in ("?", "!", ";", "\n", "\r")),
+        default=-1,
+    )
+    clause_end_candidates = [
+        position
+        for boundary in ("?", "!", ";", "\n", "\r")
+        if (position := message.find(boundary, end)) >= 0
+    ]
+    clause_end = min(clause_end_candidates, default=len(message))
+    before_actor = message[clause_start + 1 : start]
+    after_actor = message[end:clause_end]
+    if _ACCOUNT_DOCUMENT_MENTION_CONTEXT_RE.search(before_actor):
+        return False
+    if (
+        _ACCOUNT_DOCUMENT_NOUN_RE.search(before_actor)
+        and _ACCOUNT_DOCUMENT_ACTION_RE.search(before_actor)
+    ):
+        return True
+    if (
+        _ACCOUNT_DOCUMENT_NOUN_RE.search(after_actor)
+        and _ACCOUNT_DOCUMENT_ACTION_RE.search(after_actor)
+    ):
+        return True
+
+    # Also accept the unambiguous possessive form "документы пользователя X".
+    actor_text = message[start:end]
+    if not re.match(r"(?:пользователя|аккаунта|user|account)\b", actor_text):
+        return False
+    document_matches = list(_ACCOUNT_DOCUMENT_NOUN_RE.finditer(before_actor))
+    if not document_matches:
+        return False
+    return re.fullmatch(r"\s*", before_actor[document_matches[-1].end() :]) is not None
+
+
+def _formal_account_name_from_message(message: str) -> str:
+    match = _ACCOUNT_FORMAL_NAME_RE.search(" ".join(str(message or "").split()))
+    if match is None:
+        return ""
+    value = " ".join(str(match.group("quoted") or match.group("plain") or "").split())
+    value = value.strip(" «»„”“\"'")
+    first_token = value.casefold().split(maxsplit=1)[0] if value else ""
+    if (
+        len(value) < 2
+        or "@" in value
+        or first_token in _ACCOUNT_FORMAL_NAME_REJECTED_FIRST_TOKENS
+    ):
+        return ""
+    return value[:160]
+
+
+def _account_document_summary_request(
+    message: str,
+) -> AccountDocumentSummaryRequest | None:
+    """Parse a dated document retrieval explicitly bound to one other account."""
+
+    date_scope = parse_document_date_scope(message)
+    if date_scope is None:
+        return None
+    normalized = _normalized_account_document_message(message)
+    if _ACCOUNT_DOCUMENT_RETRIEVAL_RE.search(normalized) is None:
+        return None
+    related_handle_matches = [
+        match
+        for match in _ACCOUNT_DOCUMENT_HANDLE_RE.finditer(normalized)
+        if _account_document_actor_relationship(normalized, match.span())
+    ]
+    handles = list(
+        dict.fromkeys(
+            match.group("handle").casefold() for match in related_handle_matches
+        )
+    )
+    if len(handles) > 1:
+        return AccountDocumentSummaryRequest(
+            date_from=date_scope.start_utc,
+            date_to=date_scope.end_utc,
+            selector_error=(
+                "Для межпользовательского поиска укажи ровно один точный аккаунт."
+            ),
+        )
+    if handles:
+        return AccountDocumentSummaryRequest(
+            date_from=date_scope.start_utc,
+            date_to=date_scope.end_utc,
+            username=handles[0],
+        )
+    formal_matches = [
+        match
+        for match in _ACCOUNT_FORMAL_NAME_RE.finditer(normalized)
+        if _account_document_actor_relationship(normalized, match.span())
+    ]
+    account_names = list(
+        dict.fromkeys(
+            name
+            for match in formal_matches
+            if (name := _formal_account_name_from_message(match.group(0)))
+        )
+    )
+    if not account_names:
+        return None
+    if len(account_names) > 1:
+        return AccountDocumentSummaryRequest(
+            date_from=date_scope.start_utc,
+            date_to=date_scope.end_utc,
+            selector_error=(
+                "Для межпользовательского поиска укажи ровно один точный аккаунт."
+            ),
+        )
+    return AccountDocumentSummaryRequest(
+        date_from=date_scope.start_utc,
+        date_to=date_scope.end_utc,
+        account_name=account_names[0],
+    )
 
 
 def _account_recent_messages_request(

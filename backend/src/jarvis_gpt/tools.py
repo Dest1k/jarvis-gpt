@@ -20,6 +20,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import unicodedata
 import zipfile
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
@@ -113,7 +114,11 @@ from .host_bridge import HostBridgeClient, HostBridgeStatus
 from .ingest import extract_file_index
 from .learning import LearningEngine
 from .llm import LLMRouter
-from .material_access import MaterialAccessError, MaterialAccessService
+from .material_access import (
+    MaterialAccessError,
+    MaterialAccessService,
+    MaterialTargetNotFoundError,
+)
 from .model_catalog import ModelCatalog
 from .models import ToolInfo, ToolRunResponse
 from .ocr import _open_pdf_page_count, _rasterize_pdf_page
@@ -2467,6 +2472,9 @@ class ToolRegistry:
                     "realm_id": "Immutable identity realm/bot id",
                     "provider_subject_id": "Immutable provider subject, e.g. numeric Telegram id",
                     "username": "Exact username; ambiguity fails closed",
+                    "account_name": (
+                        "Exact Unicode-normalized formal/display name; ambiguity fails closed"
+                    ),
                     "all_users": "Search all active accounts when no target is supplied",
                     "source_types": "messages, memories, documents",
                     "include_assistant": "Also search assistant messages, default false",
@@ -2496,6 +2504,9 @@ class ToolRegistry:
                     "realm_id": "Immutable identity realm/bot id",
                     "provider_subject_id": "Immutable provider subject",
                     "username": "Exact account username; ambiguity fails closed",
+                    "account_name": (
+                        "Exact Unicode-normalized formal/display name; ambiguity fails closed"
+                    ),
                     "roles": "Message roles: user by default; optionally assistant",
                     "include_assistant": "Include Jarvis replies in addition to user messages",
                     "limit": "Number of newest messages, 1..50",
@@ -2524,6 +2535,9 @@ class ToolRegistry:
                     "realm_id": "Immutable identity realm/bot id",
                     "provider_subject_id": "Immutable provider subject",
                     "username": "Exact username; ambiguity fails closed",
+                    "account_name": (
+                        "Exact Unicode-normalized formal/display name; ambiguity fails closed"
+                    ),
                     "max_chars": "Bounded returned content size",
                 },
                 handler=_materials_read,
@@ -2550,8 +2564,17 @@ class ToolRegistry:
                     "realm_id": "Immutable identity realm/bot id",
                     "provider_subject_id": "Immutable provider subject",
                     "username": "Exact username; ambiguity fails closed",
+                    "account_name": (
+                        "Exact Unicode-normalized formal/display name; ambiguity fails closed"
+                    ),
                     "all_users": "Summarize all active accounts when no target is supplied",
                     "source_types": "messages, memories, documents",
+                    "date_from": (
+                        "Optional inclusive ISO-8601 start for exact document-date retrieval"
+                    ),
+                    "date_to": (
+                        "Optional exclusive ISO-8601 end for exact document-date retrieval"
+                    ),
                     "max_hits": "Maximum evidence hits",
                     "max_tokens": "Maximum synthesis tokens",
                 },
@@ -9533,6 +9556,7 @@ def _material_target_ids(ctx: ToolContext, args: dict[str, Any]) -> list[str]:
             "realm_id",
             "provider_subject_id",
             "username",
+            "account_name",
         )
     )
     if not selector_present and not _bool_arg(args.get("all_users"), default=False):
@@ -9546,6 +9570,7 @@ def _material_target_ids(ctx: ToolContext, args: dict[str, Any]) -> list[str]:
         realm_id=str(args.get("realm_id") or ""),
         provider_subject_id=str(args.get("provider_subject_id") or ""),
         username=str(args.get("username") or ""),
+        account_name=str(args.get("account_name") or ""),
         include_inactive=_bool_arg(args.get("include_inactive"), default=False),
     )
 
@@ -9679,6 +9704,7 @@ def _materials_recent(ctx: ToolContext, args: dict[str, Any]) -> ToolRunResponse
             limit=_int_arg(args.get("limit"), default=2, minimum=1, maximum=50),
             order=str(args.get("order") or "newest_first"),
             expected_username=str(args.get("username") or ""),
+            expected_account_name=str(args.get("account_name") or ""),
             expected_provider=str(args.get("provider") or ""),
             expected_realm_id=str(args.get("realm_id") or ""),
             expected_provider_subject_id=str(args.get("provider_subject_id") or ""),
@@ -9760,6 +9786,146 @@ def _material_summary_has_claim_citations(
     return True
 
 
+def _date_document_digest_max_chars(source_count: int) -> int:
+    """Keep ordinary daily digests compact while scaling for unusually busy days."""
+
+    return min(12_000, max(4_000, 800 + max(1, source_count) * 160))
+
+
+def _date_document_digest_is_valid(
+    text: str,
+    evidence: list[dict[str, Any]],
+    *,
+    max_chars: int,
+) -> bool:
+    """Require a bounded, one-bullet-per-document digest with full citation coverage."""
+
+    value = str(text or "").strip()
+    if not value or len(value) > max_chars:
+        return False
+    expected_files = {
+        str(item.get("citation") or "").strip(): " ".join(
+            unicodedata.normalize(
+                "NFKC",
+                str(item.get("file_name") or ""),
+            )
+            .casefold()
+            .split()
+        )
+        for item in evidence
+        if str(item.get("citation") or "").strip()
+    }
+    expected = set(expected_files)
+    bullet_citation_units: list[tuple[set[str], str]] = []
+    for line in value.splitlines():
+        if re.match(r"^\s*(?:[-*+] |\d+[.)] )", line):
+            cited = _material_summary_citations(line).intersection(expected)
+            if cited:
+                normalized_line = " ".join(
+                    unicodedata.normalize("NFKC", line).casefold().split()
+                )
+                bullet_citation_units.append((cited, normalized_line))
+    has_cited_conclusion = any(
+        _material_summary_citations(paragraph)
+        and not any(
+            re.match(r"^\s*(?:[-*+] |\d+[.)] )", line)
+            for line in paragraph.splitlines()
+        )
+        for paragraph in re.split(r"\n\s*\n", value)
+    )
+    return (
+        bool(expected)
+        and len(bullet_citation_units) == len(expected)
+        and all(len(citations) == 1 for citations, _line in bullet_citation_units)
+        and set().union(
+            *(citations for citations, _line in bullet_citation_units)
+        )
+        == expected
+        and all(
+            not expected_files[citation]
+            or expected_files[citation] in normalized_line
+            for citations, normalized_line in bullet_citation_units
+            for citation in citations
+        )
+        and has_cited_conclusion
+    )
+
+
+def _deterministic_date_document_digest(
+    focus: str,
+    evidence: list[dict[str, Any]],
+    *,
+    max_chars: int,
+) -> str:
+    """Build a compact complete daily-document digest without truncating a model draft."""
+
+    items = [
+        item
+        for item in evidence
+        if str(item.get("citation") or "").strip()
+    ]
+    if not items:
+        return ""
+    is_russian = bool(re.search(r"[\u0400-\u052f]", focus))
+    heading = (
+        "Документы за выбранный период:"
+        if is_russian
+        else "Documents in the selected period:"
+    )
+    empty_note = "Извлекаемый текст отсутствует." if is_russian else "No extractable text."
+    incomplete_note = (
+        "Индекс/OCR неполный. "
+        if is_russian
+        else "The index/OCR is incomplete. "
+    )
+    conclusion = (
+        f"Итого найдено документов: {len(items)}. Выжимка основана только на "
+        "доступном индексированном тексте; детали следует сверять по указанным источникам."
+        if is_russian
+        else (
+            f"Documents found: {len(items)}. This digest uses only the available indexed "
+            "text; verify details against the cited sources."
+        )
+    )
+    first_citation = str(items[0].get("citation") or "").strip()
+    conclusion = f"{conclusion} [{first_citation}]"
+    fixed_chars = len(heading) + len(conclusion) + 8
+    normalized: list[tuple[str, str, str, bool]] = []
+    for item in items:
+        citation = str(item.get("citation") or "").strip()
+        file_name = " ".join(str(item.get("file_name") or "").split())[:80]
+        content = re.sub(
+            r"\[(?:message|memory|document):[^\]\s]+\]",
+            "",
+            str(item.get("content") or ""),
+        )
+        excerpt = " ".join(content.split())
+        index = item.get("index") if isinstance(item.get("index"), dict) else {}
+        warnings = index.get("warnings") if isinstance(index, dict) else None
+        incomplete = bool(index and (index.get("complete") is False or warnings))
+        normalized.append((file_name, excerpt, citation, incomplete))
+        fixed_chars += (
+            len(file_name)
+            + len(citation)
+            + len(incomplete_note if incomplete else "")
+            + 8
+        )
+    excerpt_budget = max(16, min(180, (max_chars - fixed_chars) // len(normalized)))
+    lines = [heading]
+    for file_name, content, citation, incomplete in normalized:
+        excerpt = content[:excerpt_budget].rstrip()
+        if len(content) > excerpt_budget:
+            excerpt = f"{excerpt.rstrip(' .,:;')}…"
+        if not excerpt:
+            excerpt = empty_note
+        if incomplete:
+            excerpt = f"{incomplete_note}{excerpt}"
+        label = f"{file_name}: " if file_name else ""
+        lines.append(f"- {label}{excerpt} [{citation}]")
+    lines.extend(("", conclusion))
+    return "\n".join(lines)
+
+
 def _deterministic_material_digest(
     focus: str,
     evidence: list[dict[str, Any]],
@@ -9788,10 +9954,11 @@ def _deterministic_material_digest(
         empty_note = "No extractable text is available."
 
     lines = [heading]
-    for item in evidence[:8]:
+    for item in evidence[:12]:
         citation = str(item.get("citation") or "").strip()
         if not citation:
             continue
+        file_name = " ".join(str(item.get("file_name") or "").split())[:240]
         content = re.sub(
             r"\[(?:message|memory|document):[^\]\s]+\]",
             "",
@@ -9806,6 +9973,8 @@ def _deterministic_material_digest(
         warnings = index.get("warnings") if isinstance(index, dict) else None
         if index and (index.get("complete") is False or warnings):
             excerpt = f"{incomplete_note}{excerpt}"
+        if file_name:
+            excerpt = f"{file_name}: {excerpt}"
         lines.append(f"- {excerpt} [{citation}]")
     return "\n\n".join(lines) if len(lines) > 1 else ""
 
@@ -9820,49 +9989,104 @@ async def _materials_summarize(ctx: ToolContext, args: dict[str, Any]) -> ToolRu
         )
     try:
         target_user_ids = _material_target_ids(ctx, args)
-        search_plan = await _material_search_plan(ctx, args)
-        queries = [str(query) for query in search_plan["queries"]]
         source_types = _string_list_arg(args.get("source_types"), limit=3) or [
             "messages",
             "memories",
             "documents",
         ]
-        searched = await _material_service(ctx).search_semantic(
-            ctx.actor,
-            queries=queries,
-            target_user_ids=target_user_ids,
-            embedding_backend=ctx.embeddings,
-            source_types=source_types,
-            include_assistant=_bool_arg(args.get("include_assistant"), default=False),
-            limit=_int_arg(args.get("max_hits"), default=30, minimum=1, maximum=60),
-        )
-        searched["language_coverage"] = {
-            key: search_plan[key]
-            for key in (
-                "requested_languages",
-                "translated_languages",
-                "untranslated_languages",
-                "translation_complete",
-                "variants",
+        date_from = str(args.get("date_from") or "").strip()
+        date_to = str(args.get("date_to") or "").strip()
+        if bool(date_from) != bool(date_to):
+            raise MaterialAccessError(
+                "date_from and date_to must be supplied together."
             )
-        }
+        date_scoped = bool(date_from and date_to)
+        if date_scoped:
+            if set(source_types) != {"documents"}:
+                raise MaterialAccessError(
+                    "Date-scoped summaries support source_types=['documents'] only."
+                )
+            searched = _material_service(ctx).documents_by_date(
+                ctx.actor,
+                target_user_ids=target_user_ids,
+                date_from=date_from,
+                date_to=date_to,
+                limit=_int_arg(
+                    args.get("max_hits"),
+                    default=30,
+                    minimum=1,
+                    maximum=60,
+                ),
+                expected_username=str(args.get("username") or ""),
+                expected_account_name=str(args.get("account_name") or ""),
+            )
+        else:
+            search_plan = await _material_search_plan(ctx, args)
+            queries = [str(query) for query in search_plan["queries"]]
+            searched = await _material_service(ctx).search_semantic(
+                ctx.actor,
+                queries=queries,
+                target_user_ids=target_user_ids,
+                embedding_backend=ctx.embeddings,
+                source_types=source_types,
+                include_assistant=_bool_arg(
+                    args.get("include_assistant"),
+                    default=False,
+                ),
+                limit=_int_arg(
+                    args.get("max_hits"),
+                    default=30,
+                    minimum=1,
+                    maximum=60,
+                ),
+            )
+            searched["language_coverage"] = {
+                key: search_plan[key]
+                for key in (
+                    "requested_languages",
+                    "translated_languages",
+                    "untranslated_languages",
+                    "translation_complete",
+                    "variants",
+                )
+            }
         hits = searched.get("hits") if isinstance(searched.get("hits"), list) else []
         if not hits:
             return ToolRunResponse(
                 tool="materials.summarize",
                 ok=False,
-                summary="No matching material was found in the selected account scope.",
+                summary=(
+                    "No supported documents were found in the selected account and date range."
+                    if date_scoped
+                    else "No matching material was found in the selected account scope."
+                ),
                 data=searched,
             )
 
         evidence: list[dict[str, Any]] = []
         seen_sources: set[tuple[str, str]] = set()
         evidence_chars = 0
+        unique_source_count = len(
+            {
+                (
+                    str(hit.get("source_type") or "").rstrip("s"),
+                    str(hit.get("source_id") or ""),
+                )
+                for hit in hits
+                if isinstance(hit, dict) and hit.get("source_id")
+            }
+        )
+        date_source_cap = (
+            max(1_000, min(20_000, 60_000 // max(1, unique_source_count)))
+            if date_scoped
+            else None
+        )
         for hit in hits:
             if not isinstance(hit, dict) or evidence_chars >= 60_000:
                 break
             content = str(hit.get("snippet") or "")
             citation = str(hit.get("citation") or "")
+            file_name = str(hit.get("file_name") or "")
             index = hit.get("index") if isinstance(hit.get("index"), dict) else None
             source_type = str(hit.get("source_type") or "").rstrip("s")
             source_id = str(hit.get("source_id") or "")
@@ -9871,19 +10095,24 @@ async def _materials_summarize(ctx: ToolContext, args: dict[str, Any]) -> ToolRu
                 continue
             if source_id:
                 seen_sources.add(source_key)
-                with suppress(MaterialAccessError):
+                with suppress(MaterialTargetNotFoundError):
                     material = _material_service(ctx).read(
                         ctx.actor,
                         source_type=source_type,
                         source_id=source_id,
                         target_user_ids=target_user_ids,
-                        max_chars=max(
-                            1_000,
-                            min(20_000, 60_000 - evidence_chars),
+                        max_chars=(
+                            min(date_source_cap, 60_000 - evidence_chars)
+                            if date_source_cap is not None
+                            else max(
+                                1_000,
+                                min(20_000, 60_000 - evidence_chars),
+                            )
                         ),
                     )
                     content = str(material.get("content") or content)
                     citation = str(material.get("citation") or citation)
+                    file_name = str(material.get("file_name") or file_name)
                     if isinstance(material.get("index"), dict):
                         index = material["index"]
             remaining = max(0, 60_000 - evidence_chars)
@@ -9895,12 +10124,44 @@ async def _materials_summarize(ctx: ToolContext, args: dict[str, Any]) -> ToolRu
                     "account": hit.get("account"),
                     "created_at": hit.get("created_at"),
                     "source_type": source_type,
+                    "file_name": file_name or None,
                     "index": index,
                     "content": content,
                 }
             )
 
         synthesis_mode = "llm"
+        requested_max_tokens = _int_arg(
+            args.get("max_tokens"),
+            default=800 if date_scoped else 1400,
+            minimum=200,
+            maximum=3000,
+        )
+        summary_max_tokens = (
+            min(requested_max_tokens, 800)
+            if date_scoped
+            else requested_max_tokens
+        )
+        date_digest_max_chars = (
+            _date_document_digest_max_chars(len(evidence))
+            if date_scoped
+            else 0
+        )
+        date_digest_instruction = (
+            (
+                f" This is a compact date-scoped document digest. Produce exactly one short "
+                f"bullet for each of the {len(evidence)} evidence documents, naming its "
+                f"file_name and citing that document on the same bullet. Do not merge or omit "
+                f"documents. Then add a two- or three-sentence overall conclusion with exact "
+                f"citations. Keep the entire answer within {date_digest_max_chars} Unicode "
+                f"characters."
+            )
+            if date_scoped
+            else ""
+        )
+        # Material reads can race with a role change. Never disclose accumulated
+        # cross-user evidence to the model after the caller loses authority.
+        _material_service(ctx).recheck_privileged_actor(ctx.actor)
         result = await ctx.llm.complete(
             [
                 {
@@ -9913,7 +10174,9 @@ async def _materials_summarize(ctx: ToolContext, args: dict[str, Any]) -> ToolRu
                         "system details. For document evidence, inspect its index object: when "
                         "complete is false or warnings are present, explicitly state that the "
                         "document was only partially indexed/OCRed and do not generalize to the "
-                        "unseen remainder. Answer in the language of the requested focus."
+                        "unseen remainder. Name each document from file_name and keep its claims "
+                        "bound to that document's exact citation. Answer in the language of the "
+                        f"requested focus.{date_digest_instruction}"
                     ),
                 },
                 {
@@ -9925,11 +10188,12 @@ async def _materials_summarize(ctx: ToolContext, args: dict[str, Any]) -> ToolRu
                 },
             ],
             temperature=0.0,
-            max_tokens=_int_arg(
-                args.get("max_tokens"), default=1400, minimum=200, maximum=3000
-            ),
+            max_tokens=summary_max_tokens,
             thinking_enabled=True,
         )
+        # Synthesis is an authorization race window. Recheck before inspecting
+        # or returning any post-await result, including empty/failed model output.
+        _material_service(ctx).recheck_privileged_actor(ctx.actor)
         summary = result.content.strip() if result.ok else ""
         if not summary:
             return ToolRunResponse(
@@ -9941,7 +10205,18 @@ async def _materials_summarize(ctx: ToolContext, args: dict[str, Any]) -> ToolRu
         allowed_citations = {
             str(item.get("citation") or "") for item in evidence if item.get("citation")
         }
-        if not _material_summary_has_claim_citations(summary, allowed_citations):
+        summary_is_valid = _material_summary_has_claim_citations(
+            summary,
+            allowed_citations,
+        ) and (
+            not date_scoped
+            or _date_document_digest_is_valid(
+                summary,
+                evidence,
+                max_chars=date_digest_max_chars,
+            )
+        )
+        if not summary_is_valid:
             correction = await ctx.llm.complete(
                 [
                     {
@@ -9950,6 +10225,7 @@ async def _materials_summarize(ctx: ToolContext, args: dict[str, Any]) -> ToolRu
                             "Rewrite the draft using only the supplied evidence. Cite every "
                             "material paragraph with one or more exact allowed citations. Never "
                             "invent or alter an identifier. Return only the corrected answer."
+                            f"{date_digest_instruction}"
                         ),
                     },
                     {
@@ -9966,24 +10242,47 @@ async def _materials_summarize(ctx: ToolContext, args: dict[str, Any]) -> ToolRu
                     },
                 ],
                 temperature=0.0,
-                max_tokens=_int_arg(
-                    args.get("max_tokens"), default=1400, minimum=200, maximum=3000
-                ),
+                max_tokens=summary_max_tokens,
                 thinking_enabled=False,
             )
+            # Correction is a second authorization race window. A revoked actor
+            # must never receive the draft, search result, or evidence through a
+            # citation-validation failure response.
+            _material_service(ctx).recheck_privileged_actor(ctx.actor)
             corrected = correction.content.strip() if correction.ok else ""
-            if (
-                not corrected
-                or not _material_summary_has_claim_citations(
+            corrected_is_valid = bool(corrected) and _material_summary_has_claim_citations(
+                corrected,
+                allowed_citations,
+            ) and (
+                not date_scoped
+                or _date_document_digest_is_valid(
                     corrected,
-                    allowed_citations,
+                    evidence,
+                    max_chars=date_digest_max_chars,
                 )
-            ):
-                corrected = _deterministic_material_digest(focus, evidence)
-                if not _material_summary_has_claim_citations(
+            )
+            if not corrected_is_valid:
+                corrected = (
+                    _deterministic_date_document_digest(
+                        focus,
+                        evidence,
+                        max_chars=date_digest_max_chars,
+                    )
+                    if date_scoped
+                    else _deterministic_material_digest(focus, evidence)
+                )
+                fallback_is_valid = _material_summary_has_claim_citations(
                     corrected,
                     allowed_citations,
-                ):
+                ) and (
+                    not date_scoped
+                    or _date_document_digest_is_valid(
+                        corrected,
+                        evidence,
+                        max_chars=date_digest_max_chars,
+                    )
+                )
+                if not fallback_is_valid:
                     return ToolRunResponse(
                         tool="materials.summarize",
                         ok=False,
@@ -10007,13 +10306,26 @@ async def _materials_summarize(ctx: ToolContext, args: dict[str, Any]) -> ToolRu
         "sources": [
             {
                 key: item.get(key)
-                for key in ("citation", "account", "created_at", "source_type")
+                for key in (
+                    "citation",
+                    "account",
+                    "created_at",
+                    "source_type",
+                    "file_name",
+                )
             }
             for item in evidence
         ],
         "search": searched,
         "content_policy": "Other-user content was treated as untrusted evidence.",
     }
+    if date_scoped:
+        response_data["digest_contract"] = {
+            "max_chars": date_digest_max_chars,
+            "max_tokens": summary_max_tokens,
+            "one_bullet_per_document": True,
+            "source_count": len(evidence),
+        }
     try:
         # LLM synthesis/correction can take seconds. A demotion during that await
         # must revoke disclosure in this same request.

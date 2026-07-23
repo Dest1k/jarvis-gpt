@@ -11,6 +11,7 @@ from jarvis_gpt.agent import (
     SYSTEM_PROMPT,
     TENANT_SYSTEM_PROMPT,
     AgentRuntime,
+    _account_document_summary_request,
     _account_recent_messages_request,
     _AgenticResult,
     _ExecutedToolResult,
@@ -187,6 +188,124 @@ def test_recent_handle_parser_leaves_explicit_channel_history_to_source_tools():
     assert _account_recent_messages_request(
         "Покажи два последних сообщения канала @global_news"
     ) is None
+
+
+def test_cross_user_document_parser_rejects_unrelated_or_self_account_mentions():
+    rejected = (
+        "Какие сегодня документы были обработаны пользователем мной?",
+        "Какие сегодня документы обработаны пользователем в отчете?",
+        "Сегодня в документе упомянут пользователь Хамелион. Что это значит?",
+        "Сегодня в документе упомянут @hamelion55k. Что это значит?",
+        "Какие сегодня документы упоминают пользователя @hamelion55k?",
+        (
+            "Сегодня в документе написано, что пользователь @hamelion55k "
+            "обработал документы. Дай краткую выжимку этого документа."
+        ),
+    )
+
+    for prompt in rejected:
+        assert _account_document_summary_request(prompt) is None, prompt
+
+
+def test_cross_user_date_documents_route_to_privileged_summary_for_handle_and_name(
+    monkeypatch,
+    tmp_path,
+):
+    agent, storage = _runtime(monkeypatch, tmp_path)
+    calls: list[dict[str, object]] = []
+
+    async def tracked_run(name, arguments=None, **_kwargs):
+        assert name == "materials.summarize"
+        payload = dict(arguments or {})
+        calls.append(payload)
+        return ToolRunResponse(
+            tool="materials.summarize",
+            ok=True,
+            summary="Synthesized one privileged document.",
+            data={
+                "summary": (
+                    "Проверенная выжимка целевого документа "
+                    "[document:file-target]."
+                )
+            },
+        )
+
+    monkeypatch.setattr(agent.tools, "run", tracked_run)
+    handle_prompt = (
+        "Какие сегодня документы были обработаны пользователем "
+        "[@hamelion55k](https://t.me/hamelion55k)? дай краткую выжимку"
+    )
+    by_handle = asyncio.run(agent.chat(handle_prompt))
+    formal_prompt = (
+        "Какие сегодня документы были обработаны пользователем Хамелион? "
+        "дай краткую выжимку"
+    )
+    by_name = asyncio.run(agent.chat(formal_prompt))
+
+    assert [call.get("username") for call in calls] == ["hamelion55k", None]
+    assert calls[1]["account_name"] == "Хамелион"
+    assert all(call["source_types"] == ["documents"] for call in calls)
+    assert all(call.get("date_from") and call.get("date_to") for call in calls)
+    assert all(call["max_tokens"] == 800 for call in calls)
+    assert all(event.title != "documents.recall:prefetch" for event in by_handle.events)
+    assert any(
+        event.title == "materials.summarize"
+        and event.payload.get("tenant_own_recall_routed") is False
+        for event in by_handle.events
+    )
+    assert "[document:file-target]" in by_handle.answer
+    assert "[document:file-target]" in by_name.answer
+    assert any(
+        event.type == "task_kernel"
+        and event.payload.get("intent") == "cross_user_document_summary"
+        for event in by_handle.events
+    )
+    parsed_handle = _account_document_summary_request(handle_prompt)
+    assert parsed_handle is not None
+    assert parsed_handle.username == "hamelion55k"
+    for response in (by_handle, by_name):
+        persisted = storage.get_message(response.message_id)
+        assert persisted is not None
+        assert persisted["metadata"]["privileged_derived"] is True
+        assert persisted["metadata"]["privileged_source_tools"] == [
+            "materials.summarize"
+        ]
+
+    parsed = _account_document_summary_request(formal_prompt)
+    assert parsed is not None
+    assert parsed.account_name == "Хамелион"
+    storage.close()
+
+
+def test_normal_user_cross_user_date_documents_are_denied_before_tools_or_llm(
+    monkeypatch,
+    tmp_path,
+):
+    agent, storage = _runtime(monkeypatch, tmp_path)
+    ordinary = agent.permissions.upsert_external_identity(
+        provider="test",
+        realm_id="cross-user-date-policy",
+        provider_subject_id="ordinary",
+        bootstrap_preset="user",
+    )
+
+    async def forbidden(*_args, **_kwargs):
+        raise AssertionError("policy denial must happen before tools or the model")
+
+    monkeypatch.setattr(agent.tools, "run", forbidden)
+    monkeypatch.setattr(agent.llm, "complete", forbidden)
+    prompt = (
+        "Какие сегодня документы были обработаны пользователем Хамелион? "
+        "дай краткую выжимку"
+    )
+    with bind_actor(_actor(ordinary)):
+        response = asyncio.run(agent.chat(prompt))
+        messages = storage.list_messages(response.conversation_id)
+
+    assert "owner" in response.answer
+    assert "admin" in response.answer
+    assert messages[0]["metadata"]["policy_denial"] is True
+    storage.close()
 
 
 def test_recent_account_result_is_withheld_if_admin_is_demoted_before_persistence(

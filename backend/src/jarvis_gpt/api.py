@@ -2220,6 +2220,7 @@ async def voice_speak(request: VoiceSpeakRequest) -> Response:
     headers = {
         "X-Voice-Engine": str(result.engine or ""),
         "X-Voice-Style": str(result.extra.get("style") or ""),
+        "X-Voice-Tempo": str(result.extra.get("tempo") or 1.0),
         "Cache-Control": "no-store",
     }
     return Response(content=data, media_type="audio/wav", headers=headers)

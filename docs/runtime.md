@@ -36,6 +36,8 @@
   Generated documents use the same claim/reindex protocol.
 - `accounts.overview` and `materials.search/recent/read/summarize` are owner/admin-only even under
   direct grants or custom presets. They support exact immutable account selection,
+  exact `@username` or exact unique Unicode-normalized formal/display-name selection
+  (missing and ambiguous mutable selectors fail closed and never grant authority),
   fair per-account hybrid lexical/semantic retrieval, multilingual query variants,
   full-corpus keyset-paged semantic scanning, provenance, hashed access audit, full-source
   synthesis, and claim-level validated citations. Partial document/OCR indexes carry
@@ -50,6 +52,12 @@
   deterministically ordered, and carry stable `message:<id>` citations. Ordinary accounts
   receive a reduced system context and deterministic denial for clear
   cross-user material or Jarvis-internal requests.
+  Date-scoped cross-user document digests use `materials.summarize`, never tenant-own
+  `documents.recall`; only supported document types are selected, voice/audio rows are
+  excluded, short-digest wording still triggers content reads, and every source carries a
+  stable `document:<file_id>` citation. Compact date digests are bounded, cover every
+  selected document with one cited bullet, and add a short cited conclusion; overlong or
+  incomplete drafts are rewritten or rebuilt from evidence instead of being raw-truncated.
 - Public web search defaults to the global `wt-wt` region and accepts `languages` /
   `translated_queries` for RU, EN, ZH, KO, and JA round-robin research. Explicit language
   sets use independent regional requests and do not reuse another language corpus cache.
@@ -70,9 +78,12 @@
   material answered in text. Legacy `voice_reply=true` cannot override this; `/voice on|off`
   is deprecated and does not persist a mode. Long output is split, successful multipart
   delivery is logged without answer text, and header-only/unplayable WAV renders are rejected.
-  Telegram's per-recipient `VOICE_MESSAGES_FORBIDDEN` response retries the same speech as a
-  compressed MP3 through `sendAudio`; failed Opus/MP3 conversion, synthesis, or delivery falls
-  back to the complete text with an explicit notice. Raw WAV is never sent to Telegram.
+  Telegram's per-recipient `VOICE_MESSAGES_FORBIDDEN` response is respected and falls back to
+  the complete text with an explicit privacy notice; it is never bypassed through `sendAudio`.
+  Silero retries presentation-free spoken text when its normalizer rejects Markdown, while
+  `JARVIS_TTS_TEMPO=1.08` slightly speeds the same Aidar voice with pitch-preserving FFmpeg
+  `atempo`. Failed Opus conversion, synthesis, tempo processing, or delivery keeps a verified
+  WAV when possible and otherwise falls back to complete text. Raw WAV is never sent to Telegram.
 
 Current safety bounds remain deliberate: uploads are capped at 50 MiB, automatic plain-text
 indexing at 5 MiB, structured extraction at 200k characters, OCR at 30 PDF pages processed

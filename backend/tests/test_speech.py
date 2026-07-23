@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import wave
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from jarvis_gpt import speech
@@ -258,3 +259,175 @@ def test_stylize_radio_style(tmp_path):
     speech._write_wav_mono(src, tone, rate)
     out = speech.stylize_wav(src, tmp_path / "radio.wav", style="radio")
     assert Path(out).exists()
+
+
+# --------------------------------------------------------------------------- #
+# Silero input normalization and pitch-preserving tempo.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("value", ["invalid", "nan", "inf", "0.49", "2.01"])
+def test_tts_tempo_rejects_invalid_or_unsafe_values(monkeypatch, value):
+    monkeypatch.setenv("JARVIS_TTS_TEMPO", value)
+    assert speech.tts_tempo() == pytest.approx(1.08)
+
+
+@pytest.mark.parametrize("value", ["0.5", "1", "1.12", "2.0"])
+def test_tts_tempo_accepts_bounded_values(monkeypatch, value):
+    monkeypatch.setenv("JARVIS_TTS_TEMPO", value)
+    assert speech.tts_tempo() == pytest.approx(float(value))
+
+
+def test_tts_status_reports_default_tempo(monkeypatch):
+    monkeypatch.setattr(speech, "_silero_available", lambda: True)
+    monkeypatch.setattr(speech, "_sapi_available", lambda: False)
+    monkeypatch.delenv("JARVIS_TTS_TEMPO", raising=False)
+    assert speech.tts_status()["tempo"] == pytest.approx(1.08)
+
+
+_FORMATTED_VOICE_LIST_REPLY = (
+    "Принято. Прошу прощения за задержку. Сегодня на компьютер поступило три "
+    "голосовых сообщения: 1. **voice.ogg** — 23 июля, 10:03 (МСК) 2. "
+    "**voice.ogg** — 23 июля, 15:22 (МСК) 3. **voice.ogg** — 23 июля, 18:05 "
+    "(МСК) Также сегодня утром (в 10:03) было зафиксировано поступление еще "
+    "одного голосового сообщения (около 09:03 по Москве)."
+)
+
+
+def test_formatted_voice_list_stays_on_silero_aidar(monkeypatch, tmp_path):
+    np = pytest.importorskip("numpy")
+    calls: list[str] = []
+
+    class FakeTensor:
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return self
+
+        def numpy(self):
+            return np.full(4_800, 0.1, dtype="float32")
+
+    class FakeModel:
+        speakers = ["aidar"]
+
+        def apply_tts(self, *, text, **kwargs):
+            calls.append(text)
+            if "**" in text:
+                raise KeyError("v")
+            return FakeTensor()
+
+    monkeypatch.setattr(speech, "_load_silero_model", lambda: FakeModel())
+    monkeypatch.setattr(speech, "_silero_available", lambda: True)
+    monkeypatch.setattr(
+        speech,
+        "_sapi_synthesize_to_wav",
+        lambda *args, **kwargs: pytest.fail("recoverable markup must not switch to SAPI"),
+    )
+    monkeypatch.setenv("JARVIS_TTS_ENGINE", "auto")
+    monkeypatch.setenv("JARVIS_TTS_TEMPO", "1.0")
+
+    output = tmp_path / "formatted.wav"
+    result = speech.synthesize(_FORMATTED_VOICE_LIST_REPLY, output, style="off")
+
+    assert len(_FORMATTED_VOICE_LIST_REPLY) == 330
+    assert result.ok is True
+    assert result.engine == "silero"
+    assert result.voice == "silero:aidar"
+    assert calls[0] == _FORMATTED_VOICE_LIST_REPLY
+    assert "**" not in calls[1]
+    assert calls[1].count("voice.ogg") == 3
+    with wave.open(str(output), "rb") as rendered:
+        assert rendered.getframerate() == 48_000
+        assert rendered.getnframes() > 0
+
+
+def test_silero_does_not_silently_drop_a_failed_chunk(monkeypatch, tmp_path):
+    np = pytest.importorskip("numpy")
+
+    class FakeTensor:
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return self
+
+        def numpy(self):
+            return np.ones(1_000, dtype="float32")
+
+    class FakeModel:
+        speakers = ["aidar"]
+
+        def apply_tts(self, *, text, **kwargs):
+            if text == "bad":
+                raise RuntimeError("render failed")
+            return FakeTensor()
+
+    monkeypatch.setattr(speech, "_load_silero_model", lambda: FakeModel())
+    monkeypatch.setattr(speech, "_split_for_tts", lambda text, limit: ["good", "bad"])
+    output = tmp_path / "partial.wav"
+
+    with pytest.raises(RuntimeError, match="render failed"):
+        speech._silero_synthesize_to_wav(
+            "good bad",
+            output,
+            speaker="aidar",
+            sample_rate=48_000,
+        )
+    assert not output.exists()
+
+
+def test_apply_wav_tempo_failure_preserves_original(monkeypatch, tmp_path):
+    source = tmp_path / "source.wav"
+    _write_fake_wav(source)
+    original = source.read_bytes()
+    monkeypatch.setattr(speech.shutil, "which", lambda name: "ffmpeg")
+    monkeypatch.setattr(
+        speech.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=1),
+    )
+
+    assert speech._apply_wav_tempo(source, 1.08) is False
+    assert source.read_bytes() == original
+
+
+def test_apply_wav_tempo_uses_pitch_preserving_filter(monkeypatch, tmp_path):
+    source = tmp_path / "source.wav"
+    _write_fake_wav(source)
+    commands: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        _write_fake_wav(Path(command[-1]))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(speech.shutil, "which", lambda name: "ffmpeg")
+    monkeypatch.setattr(speech.subprocess, "run", fake_run)
+
+    assert speech._apply_wav_tempo(source, 1.08) is True
+    assert "-filter:a" in commands[0]
+    assert "atempo=1.0800" in commands[0]
+    assert speech._wav_has_playable_duration(source)
+
+
+def test_real_atempo_shortens_wav_without_pitch_shift(tmp_path):
+    if speech.shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg is not installed")
+    np = pytest.importorskip("numpy")
+    rate = 48_000
+    seconds = 5
+    timeline = np.arange(rate * seconds, dtype="float32") / rate
+    tone = (0.25 * np.sin(2 * np.pi * 440 * timeline)).astype("float32")
+    source = tmp_path / "tone.wav"
+    speech._write_wav_mono(source, tone, rate)
+
+    assert speech._apply_wav_tempo(source, 1.08) is True
+    rendered, rendered_rate = speech._read_wav_mono(source)
+    duration = len(rendered) / rendered_rate
+    zero_crossings = np.count_nonzero(np.diff(np.signbit(rendered)))
+    estimated_frequency = zero_crossings / (2 * duration)
+
+    assert rendered_rate == rate
+    assert duration == pytest.approx(seconds / 1.08, rel=0.02)
+    assert estimated_frequency == pytest.approx(440, rel=0.02)

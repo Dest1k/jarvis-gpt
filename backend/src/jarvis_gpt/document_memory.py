@@ -41,7 +41,7 @@ _DATE_SCOPE_DOC_NOUNS = (
 )
 _DATE_SCOPE_CONCLUDE_MARKERS = (
     "вывод", "выводы", "проанализир", "анализ", "что следует", "к чему",
-    "итог", "обобщ", "резюм", "подытож", "сделай вывод", "суть",
+    "итог", "обобщ", "резюм", "выжимк", "подытож", "сделай вывод", "суть",
     "summary", "summarize", "analyze", "analyse", "conclusion", "conclude",
     # Cross-document comparison verbs also require reading the documents (conclude mode).
     "сравн", "сопостав", "противоречи", "различи", "различа", "отличи", "отлича",
@@ -734,7 +734,14 @@ class DocumentMemory:
                 "status": str(record.get("status") or ""),
             }
             for record in records
-            if not wanted or _filename_extension(str(record.get("name") or "")) in wanted
+            if is_document_path_supported(
+                str(record.get("name") or ""),
+                str(record.get("mime_type") or ""),
+            )
+            and (
+                not wanted
+                or _filename_extension(str(record.get("name") or "")) in wanted
+            )
         ]
         if topic:
             # Keep only documents matching the topic by name or indexed content (FTS).

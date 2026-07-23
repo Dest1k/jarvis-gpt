@@ -1149,7 +1149,7 @@ def test_voice_speak_returns_wav_bytes(client, monkeypatch):
             path=Path(out_path),
             engine="silero",
             voice="silero:aidar",
-            extra={"style": "clean", "bytes": 64},
+            extra={"style": "clean", "tempo": 1.08, "bytes": 64},
         )
 
     monkeypatch.setattr("jarvis_gpt.speech.synthesize", fake_synth)
@@ -1159,6 +1159,7 @@ def test_voice_speak_returns_wav_bytes(client, monkeypatch):
     assert response.content.startswith(b"RIFF")
     assert response.headers.get("x-voice-engine") == "silero"
     assert response.headers.get("x-voice-style") == "clean"
+    assert response.headers.get("x-voice-tempo") == "1.08"
 
 
 def test_voice_speak_returns_503_when_unavailable(client, monkeypatch):

@@ -7,9 +7,9 @@ Two capabilities, both **local-first** and **optional**:
   legacy ``whisper`` CLI stays as a fallback. The engine is pluggable via
   ``JARVIS_STT_BACKEND`` so an OpenVINO/NPU backend can slot in later without
   touching callers.
-* **TTS** — synthesize speech to a WAV file. Default engine is the built-in
-  Windows SAPI5 voice (``comtypes``), which ships a Russian voice (Irina) with no
-  download; Piper can be wired later as a higher-quality engine.
+* **TTS** — synthesize speech to a WAV file. The default ``auto`` route prefers
+  local Silero ``v5_5_ru`` with the ``aidar`` speaker and keeps Windows SAPI5 as
+  an availability fallback.
 
 Every heavy dependency is imported lazily inside a ``try``. When a backend is
 missing the ``*_status`` helpers report it and callers degrade to text-only —
@@ -19,10 +19,14 @@ whisper CLI. Nothing here is a hard dependency of the runtime.
 
 from __future__ import annotations
 
+import html
+import math
 import os
+import re
 import shutil
 import subprocess
 import tempfile
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -39,6 +43,9 @@ _DEFAULT_STT_MODEL = "small"
 _DEFAULT_STT_DEVICE = "cpu"
 _DEFAULT_STT_COMPUTE = "int8"
 _MAX_TRANSCRIPT_CHARS = 20000
+_DEFAULT_TTS_TEMPO = 1.08
+_MIN_TTS_TEMPO = 0.5
+_MAX_TTS_TEMPO = 2.0
 
 # Loaded faster-whisper models are expensive to build; cache per (model, device,
 # compute) so repeated turns reuse the warm model.
@@ -160,6 +167,18 @@ def silero_sample_rate() -> int:
         return 48000
 
 
+def tts_tempo() -> float:
+    """Pitch-preserving playback tempo requested for synthesized speech."""
+
+    try:
+        value = float(_env("JARVIS_TTS_TEMPO", str(_DEFAULT_TTS_TEMPO)))
+    except ValueError:
+        return _DEFAULT_TTS_TEMPO
+    if not math.isfinite(value) or not (_MIN_TTS_TEMPO <= value <= _MAX_TTS_TEMPO):
+        return _DEFAULT_TTS_TEMPO
+    return value
+
+
 # --------------------------------------------------------------------------- #
 # Capability probing.
 # --------------------------------------------------------------------------- #
@@ -236,6 +255,7 @@ def tts_status() -> dict[str, Any]:
         "engine": engine,
         "engine_preference": preference,
         "style": tts_style(),
+        "tempo": tts_tempo(),
         "silero": silero,
         "silero_package": silero_package() if silero else None,
         "silero_speaker": silero_speaker() if silero else None,
@@ -537,6 +557,13 @@ def synthesize(
             styled = True
         except Exception:  # noqa: BLE001 — styling is a nicety; keep the dry render
             styled = False
+    requested_tempo = tts_tempo()
+    tempo_applied = False
+    if not math.isclose(requested_tempo, 1.0, abs_tol=1e-6):
+        try:
+            tempo_applied = _apply_wav_tempo(destination, requested_tempo)
+        except Exception:  # noqa: BLE001 - preserve the verified original WAV
+            tempo_applied = False
     if not _wav_has_playable_duration(destination):
         return SpeechResult(
             ok=False,
@@ -553,6 +580,9 @@ def synthesize(
             "bytes": destination.stat().st_size,
             "style": style_name if styled else "clean",
             "styled": styled,
+            "tempo": requested_tempo if tempo_applied else 1.0,
+            "tempo_requested": requested_tempo,
+            "tempo_applied": tempo_applied,
         },
     )
 
@@ -601,6 +631,8 @@ def _sapi_synthesize_to_wav(
 _SILERO_MODELS: dict[tuple[str, str], Any] = {}
 _MAX_CACHED_TTS_MODELS = 2
 _SILERO_CHAR_LIMIT = 900
+_MARKDOWN_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\([^)]+\)")
+_MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]+\)")
 
 
 def _load_silero_model(language: str = "ru", package: str | None = None) -> Any:
@@ -624,8 +656,6 @@ def _load_silero_model(language: str = "ru", package: str | None = None) -> Any:
 
 
 def _split_for_tts(text: str, limit: int) -> list[str]:
-    import re
-
     text = text.strip()
     if len(text) <= limit:
         return [text] if text else []
@@ -652,6 +682,62 @@ def _split_for_tts(text: str, limit: int) -> list[str]:
     return chunks
 
 
+def _normalize_silero_text(text: str) -> str:
+    """Flatten presentation markup that Silero's Russian normalizer cannot tokenize."""
+
+    value = unicodedata.normalize("NFKC", html.unescape(str(text or "")))
+    value = _MARKDOWN_IMAGE_RE.sub(lambda match: match.group(1) or "изображение", value)
+    value = _MARKDOWN_LINK_RE.sub(lambda match: match.group(1), value)
+    value = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", value)
+    value = re.sub(r"(?m)^\s{0,3}>\s?", "", value)
+    value = re.sub(r"(?m)^\s{0,3}[-+*]\s+", "", value)
+    for marker in ("```", "**", "__", "~~", "`"):
+        value = value.replace(marker, "")
+    value = value.replace("*", " ")
+    value = (
+        value.replace("\u00a0", " ")
+        .replace("\u2014", "-")
+        .replace("\u2013", "-")
+        .replace("\u2212", "-")
+        .replace("\u2018", "'")
+        .replace("\u2019", "'")
+        .replace("\u201c", '"')
+        .replace("\u201d", '"')
+        .replace("\u2026", "...")
+    )
+    value = "".join(
+        character
+        for character in value
+        if character in "\n\t" or not unicodedata.category(character).startswith("C")
+    )
+    return " ".join(value.split())
+
+
+def _silero_apply_tts(
+    model: Any,
+    text: str,
+    *,
+    speaker: str,
+    sample_rate: int,
+) -> Any:
+    kwargs = {
+        "speaker": speaker,
+        "sample_rate": sample_rate,
+        "put_accent": True,
+        "put_yo": True,
+    }
+    try:
+        return model.apply_tts(text=text, **kwargs)
+    except (KeyError, ValueError) as original_error:
+        normalized = _normalize_silero_text(text)
+        if not normalized or normalized == text:
+            raise
+        try:
+            return model.apply_tts(text=normalized, **kwargs)
+        except Exception as retry_error:
+            raise retry_error from original_error
+
+
 def _silero_synthesize_to_wav(
     text: str, destination: Path, *, speaker: str, sample_rate: int
 ) -> str:
@@ -665,19 +751,16 @@ def _silero_synthesize_to_wav(
 
     parts: list[Any] = []
     for chunk in _split_for_tts(text, _SILERO_CHAR_LIMIT):
-        try:
-            wav = model.apply_tts(
-                text=chunk,
-                speaker=chosen,
-                sample_rate=sample_rate,
-                put_accent=True,
-                put_yo=True,
-            )
-        except Exception:  # noqa: BLE001 — skip an unpronounceable fragment
-            continue
+        wav = _silero_apply_tts(
+            model,
+            chunk,
+            speaker=chosen,
+            sample_rate=sample_rate,
+        )
         arr = wav.detach().cpu().numpy().astype("float32")
-        if arr.size:
-            parts.append(arr)
+        if not arr.size:
+            raise ValueError("Silero produced no audio for a text fragment.")
+        parts.append(arr)
     if not parts:
         raise ValueError("Silero produced no audio for the given text.")
     audio = np.concatenate(parts)
@@ -688,6 +771,43 @@ def _silero_synthesize_to_wav(
 # --------------------------------------------------------------------------- #
 # WAV I/O + DSP stylizer (numpy only, no external audio deps).
 # --------------------------------------------------------------------------- #
+
+
+def _apply_wav_tempo(path: str | Path, tempo: float) -> bool:
+    """Apply FFmpeg ``atempo`` atomically; keep the original WAV on any failure."""
+
+    source = Path(path)
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None or math.isclose(tempo, 1.0, abs_tol=1e-6):
+        return False
+    with tempfile.TemporaryDirectory(prefix="jarvis-tempo-", dir=str(source.parent)) as tmp:
+        rendered = Path(tmp) / "tempo.wav"
+        try:
+            process = subprocess.run(
+                [
+                    ffmpeg,
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-i",
+                    str(source),
+                    "-filter:a",
+                    f"atempo={tempo:.4f}",
+                    "-c:a",
+                    "pcm_s16le",
+                    str(rendered),
+                ],
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        if process.returncode != 0 or not _wav_has_playable_duration(rendered):
+            return False
+        os.replace(rendered, source)
+    return True
 
 
 def _read_wav_mono(path: str | Path) -> tuple[Any, int]:

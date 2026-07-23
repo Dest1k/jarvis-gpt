@@ -151,12 +151,19 @@ that floor, and each handler rechecks the requester's current active database ro
 reading another tenant.
 
 The caller must select an exact internal `user_id`, an immutable
-`provider + realm_id + provider_subject_id`, or explicitly request all active users. A
-username is display metadata: an ambiguous username fails closed. `materials.recent` handles
+`provider + realm_id + provider_subject_id`, an exact `@username`, an exact unique
+Unicode-normalized formal/display name, or explicitly request all active users. Usernames and
+formal names are mutable display metadata: missing or ambiguous matches fail closed, and a
+selector never grants authority. `materials.recent` handles
 query-free requests for the latest canonical messages from one exact Jarvis account in a
 single read snapshot; an `@username` in that context is not a Telegram channel subscription.
 Explicit channel/supergroup/feed requests remain in the separate `telegram.sources.*` corpus.
-Results omit storage
+Date-scoped cross-user document summaries route through `materials.summarize`, not the
+requester's tenant-bound `documents.recall`; the range is canonicalized before retrieval,
+unsupported file types such as voice/audio are excluded, and short-digest requests still read
+the selected document bodies. A compact digest must include one cited bullet per selected
+document plus a short cited conclusion within a bounded output contract; overlong or incomplete
+model drafts are rewritten or replaced by a citation-safe evidence digest. Results omit storage
 paths and credentials, retain account/source/timestamp provenance, and use stable
 `message:`, `memory:`, or `document:` citations. Model synthesis is accepted only when its
 citations belong to the supplied evidence. After one failed correction, the invalid draft
@@ -280,9 +287,12 @@ media remains source material answered in text. The legacy `voice_reply` prefere
 by Telegram routing, `/voice auto` is idempotent, and `/voice on|off` cannot persist a different
 mode. Long replies are split into numbered TTS parts. Header-only/unplayable WAV output is
 rejected. If Telegram privacy forbids voice notes with `VOICE_MESSAGES_FORBIDDEN`, the bridge
-transcodes the same speech to MP3 and retries through `sendAudio`; it never sends raw WAV. An
-Opus/MP3 conversion, TTS, or delivery failure is logged without answer text or secrets and
-falls back to the complete text with an explicit notice.
+respects the restriction, sends no `sendAudio` bypass, and returns the complete text with an
+explicit privacy notice. When Silero rejects presentation markup, it retries normalized visible
+text without dropping a chunk; the default `JARVIS_TTS_TEMPO=1.08` uses pitch-preserving FFmpeg
+`atempo`, leaving the Aidar speaker, package, clean style, 48 kHz sample rate, and pitch unchanged.
+An Opus conversion, TTS, tempo-processing, or delivery failure is logged without answer text or
+secrets and falls back to the complete text when needed.
 
 ## Administration API and UI
 

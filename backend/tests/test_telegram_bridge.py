@@ -26,7 +26,6 @@ from jarvis_gpt.telegram_bridge import (
     _quick_capture_body,
     _requests_one_shot_voice_reply,
     _retryable_backend_http_error,
-    _wav_to_mp3,
     load_config,
 )
 
@@ -2358,20 +2357,6 @@ def test_looks_like_audio_detection():
     assert not _looks_like_audio({"mime_type": "text/plain", "name": "notes.txt"})
 
 
-def test_wav_to_mp3_accepts_only_mp3_framing(monkeypatch):
-    monkeypatch.setattr(
-        "jarvis_gpt.telegram_bridge._transcode_wav",
-        lambda wav, args: b"ID3\x04\x00\x00compressed",
-    )
-    assert _wav_to_mp3(b"RIFF") == b"ID3\x04\x00\x00compressed"
-
-    monkeypatch.setattr(
-        "jarvis_gpt.telegram_bridge._transcode_wav",
-        lambda wav, args: b"RIFF-not-compressed",
-    )
-    assert _wav_to_mp3(b"RIFF") is None
-
-
 def test_load_config_voice_replies_toggle():
     common = {
         "TELEGRAM_BOT_TOKEN": "T",
@@ -2388,17 +2373,14 @@ def _voice_bridge(
     monkeypatch,
     *,
     ogg: bytes | None,
-    mp3: bytes | None = b"ID3-mp3-bytes",
     speak_status: int = 200,
     telegram_voice_status: int = 200,
     telegram_voice_description: str = "voice rejected",
-    telegram_audio_status: int = 200,
     answer: str = "Готово, сэр.",
     preference: bool | str = False,
     preference_after_chat: str | None = None,
 ):
     monkeypatch.setattr("jarvis_gpt.telegram_bridge._wav_to_ogg_opus", lambda wav: ogg)
-    monkeypatch.setattr("jarvis_gpt.telegram_bridge._wav_to_mp3", lambda wav: mp3)
     tg_posts: list[str] = []
     tg_messages: list[str] = []
     tg_uploads: list[bytes] = []
@@ -2421,11 +2403,6 @@ def _voice_bridge(
             return httpx.Response(
                 telegram_voice_status,
                 json={"ok": False, "description": telegram_voice_description},
-            )
-        if path.endswith("/sendAudio") and telegram_audio_status != 200:
-            return httpx.Response(
-                telegram_audio_status,
-                json={"ok": False, "description": "audio rejected"},
             )
         return httpx.Response(200, json={"ok": True, "result": {}})
 
@@ -2670,14 +2647,16 @@ def test_voice_reply_falls_back_to_text_when_opus_is_unavailable(monkeypatch):
     assert any("Готово, сэр." in text for text in tg_messages)
 
 
-def test_voice_reply_falls_back_to_audio_when_recipient_forbids_voice_notes(
+def test_voice_reply_falls_back_to_full_text_when_recipient_forbids_voice_notes(
     monkeypatch, caplog
 ):
+    answer = "Полный ответ с деталями."
     bridge, tg_posts, tg_messages, tg_uploads, _, _ = _voice_bridge(
         monkeypatch,
         ogg=b"OggS-opus",
         telegram_voice_status=400,
         telegram_voice_description="Bad Request: VOICE_MESSAGES_FORBIDDEN",
+        answer=answer,
     )
     update = {
         "update_id": 11,
@@ -2692,72 +2671,15 @@ def test_voice_reply_falls_back_to_audio_when_recipient_forbids_voice_notes(
         asyncio.run(bridge._handle(update))
 
     assert sum(path.endswith("/sendVoice") for path in tg_posts) == 1
-    assert sum(path.endswith("/sendAudio") for path in tg_posts) == 1
-    assert not any(path.endswith("/sendMessage") for path in tg_posts)
-    assert tg_messages == []
-    assert b'filename="jarvis-01.mp3"' in tg_uploads[-1]
-    assert b"audio/mpeg" in tg_uploads[-1]
-    assert b".wav" not in tg_uploads[-1]
-    assert "retrying as compressed audio" in caplog.text
-    assert "voice delivery succeeded chat_id=42" in caplog.text
-
-
-def test_forbidden_voice_note_falls_back_to_text_when_mp3_conversion_fails(
-    monkeypatch, caplog
-):
-    bridge, tg_posts, tg_messages, _, _, _ = _voice_bridge(
-        monkeypatch,
-        ogg=b"OggS-opus",
-        mp3=None,
-        telegram_voice_status=400,
-        telegram_voice_description="Bad Request: VOICE_MESSAGES_FORBIDDEN",
-    )
-    update = {
-        "update_id": 12,
-        "message": {
-            "chat": {"id": 42, "type": "private"},
-            "from": {"id": 42, "is_bot": False},
-            "voice": {"file_id": "vf", "mime_type": "audio/ogg"},
-        },
-    }
-
-    with caplog.at_level(logging.WARNING, logger="jarvis.telegram"):
-        asyncio.run(bridge._handle(update))
-
-    assert sum(path.endswith("/sendVoice") for path in tg_posts) == 1
     assert not any(path.endswith("/sendAudio") for path in tg_posts)
     assert sum(path.endswith("/sendMessage") for path in tg_posts) == 1
-    assert any("Готово, сэр." in text for text in tg_messages)
-    assert "reason=mp3_transcode_failed" in caplog.text
-
-
-def test_forbidden_voice_note_falls_back_to_text_when_mp3_delivery_fails(
-    monkeypatch, caplog
-):
-    bridge, tg_posts, tg_messages, _, _, _ = _voice_bridge(
-        monkeypatch,
-        ogg=b"OggS-opus",
-        telegram_voice_status=400,
-        telegram_voice_description="Bad Request: VOICE_MESSAGES_FORBIDDEN",
-        telegram_audio_status=503,
-    )
-    update = {
-        "update_id": 13,
-        "message": {
-            "chat": {"id": 42, "type": "private"},
-            "from": {"id": 42, "is_bot": False},
-            "voice": {"file_id": "vf", "mime_type": "audio/ogg"},
-        },
-    }
-
-    with caplog.at_level(logging.WARNING, logger="jarvis.telegram"):
-        asyncio.run(bridge._handle(update))
-
-    assert sum(path.endswith("/sendVoice") for path in tg_posts) == 1
-    assert sum(path.endswith("/sendAudio") for path in tg_posts) == 1
-    assert sum(path.endswith("/sendMessage") for path in tg_posts) == 1
-    assert any("Готово, сэр." in text for text in tg_messages)
-    assert "reason=HTTPStatusError status=503" in caplog.text
+    assert len(tg_uploads) == 1
+    assert tg_messages == [
+        "Telegram не разрешает отправить голосовое из-за настроек приватности; "
+        f"отправляю полный текст.\n\n{answer}"
+    ]
+    assert "reason=voice_messages_forbidden" in caplog.text
+    assert "falling back to text" in caplog.text
 
 
 def test_voice_reply_falls_back_to_text_when_tts_is_unavailable(monkeypatch, caplog):

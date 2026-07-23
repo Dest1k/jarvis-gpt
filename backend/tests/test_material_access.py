@@ -5,6 +5,7 @@ import json
 import threading
 from types import SimpleNamespace
 
+import jarvis_gpt.tools as tools_module
 import pytest
 from jarvis_gpt.authorization import (
     LEGACY_OWNER_USER_ID,
@@ -13,9 +14,12 @@ from jarvis_gpt.authorization import (
     current_actor,
 )
 from jarvis_gpt.config import ensure_runtime_dirs, load_settings
-from jarvis_gpt.material_access import MaterialAccessDeniedError
+from jarvis_gpt.material_access import (
+    MaterialAccessDeniedError,
+    MaterialTargetNotFoundError,
+)
 from jarvis_gpt.storage import JarvisStorage
-from jarvis_gpt.tools import ToolRegistry
+from jarvis_gpt.tools import ToolContext, ToolRegistry
 
 
 class _GroundedLLM:
@@ -463,6 +467,149 @@ class _PagedSemanticBackend(_SemanticBackend):
             callback, self.on_document_page = self.on_document_page, None
             callback()
         return await super().embed(texts)
+
+
+def test_exact_formal_name_date_summary_filters_audio_and_cites_documents(
+    monkeypatch,
+    tmp_path,
+):
+    tools, storage = _runtime(monkeypatch, tmp_path)
+    target = tools.permissions.upsert_external_identity(
+        provider="telegram",
+        realm_id="bot-main",
+        provider_subject_id="formal-target",
+        username="hamelion55k",
+        first_name="Хамелион",
+        bootstrap_preset="user",
+    )
+    admin = tools.permissions.upsert_external_identity(
+        provider="test",
+        realm_id="formal-reader",
+        provider_subject_id="admin",
+        bootstrap_preset="admin",
+    )
+
+    with bind_actor(_actor(target)):
+        document_path = tmp_path / "report.docx"
+        document_path.write_bytes(b"document fixture")
+        document = storage.create_file_record(
+            name=document_path.name,
+            stored_path=document_path,
+            sha256="d" * 64,
+            size=document_path.stat().st_size,
+            mime_type=(
+                "application/vnd.openxmlformats-officedocument."
+                "wordprocessingml.document"
+            ),
+            status="indexed",
+            chunk_count=1,
+        )
+        storage.add_file_chunks(
+            document["id"],
+            ["SHARED_DATE_SENTINEL verified document contents."],
+        )
+
+        voice_path = tmp_path / "voice.ogg"
+        voice_path.write_bytes(b"voice fixture")
+        voice = storage.create_file_record(
+            name=voice_path.name,
+            stored_path=voice_path,
+            sha256="e" * 64,
+            size=voice_path.stat().st_size,
+            mime_type="audio/ogg",
+            status="indexed",
+            chunk_count=1,
+        )
+        storage.add_file_chunks(
+            voice["id"],
+            ["SHARED_DATE_SENTINEL must never be document evidence."],
+        )
+
+    admin_actor = _actor(admin)
+    with bind_actor(admin_actor):
+        summarized = asyncio.run(
+            tools.run(
+                "materials.summarize",
+                {
+                    "query": "Дай краткую выжимку документов.",
+                    "account_name": "  ХАМЕЛИОН  ",
+                    "source_types": ["documents"],
+                    "date_from": "2000-01-01T00:00:00+00:00",
+                    "date_to": "2100-01-01T00:00:00+00:00",
+                    "max_hits": 10,
+                },
+            )
+        )
+        searched = tools.material_access.search(
+            admin_actor,
+            queries=["SHARED_DATE_SENTINEL"],
+            target_user_ids=[str(target["user_id"])],
+            source_types=["documents"],
+            limit=10,
+        )
+        with pytest.raises(MaterialTargetNotFoundError):
+            tools.material_access.read(
+                admin_actor,
+                source_type="document",
+                source_id=str(voice["id"]),
+                target_user_ids=[str(target["user_id"])],
+            )
+
+    assert summarized.ok is True
+    assert summarized.data["search"]["count"] == 1
+    assert summarized.data["sources"] == [
+        {
+            "citation": f"document:{document['id']}",
+            "account": summarized.data["sources"][0]["account"],
+            "created_at": summarized.data["sources"][0]["created_at"],
+            "source_type": "document",
+            "file_name": "report.docx",
+        }
+    ]
+    assert f"[document:{document['id']}]" in summarized.data["summary"]
+    assert str(voice["id"]) not in json.dumps(summarized.data, ensure_ascii=False)
+    assert {item["source_id"] for item in searched["hits"]} == {document["id"]}
+
+    duplicate = tools.permissions.upsert_external_identity(
+        provider="telegram",
+        realm_id="bot-secondary",
+        provider_subject_id="formal-duplicate",
+        username="another_formal_target",
+        first_name="Хамелион",
+        bootstrap_preset="user",
+    )
+    assert duplicate["user_id"] != target["user_id"]
+    with bind_actor(admin_actor):
+        ambiguous = asyncio.run(
+            tools.run(
+                "materials.summarize",
+                {
+                    "query": "Дай краткую выжимку документов.",
+                    "account_name": "Хамелион",
+                    "source_types": ["documents"],
+                    "date_from": "2000-01-01T00:00:00+00:00",
+                    "date_to": "2100-01-01T00:00:00+00:00",
+                },
+            )
+        )
+        missing = asyncio.run(
+            tools.run(
+                "materials.summarize",
+                {
+                    "query": "Дай краткую выжимку документов.",
+                    "account_name": "Хамел",
+                    "source_types": ["documents"],
+                    "date_from": "2000-01-01T00:00:00+00:00",
+                    "date_to": "2100-01-01T00:00:00+00:00",
+                },
+            )
+        )
+
+    assert ambiguous.ok is False
+    assert "not unique" in ambiguous.summary
+    assert missing.ok is False
+    assert "No account matches" in missing.summary
+    storage.close()
 
 
 def test_semantic_paraphrase_retrieval_covers_every_material_source(monkeypatch, tmp_path):
@@ -976,6 +1123,253 @@ class _SummaryInspectionLLM(_GroundedLLM):
         return SimpleNamespace(ok=True, content=content)
 
 
+class _DateDigestContractLLM(_GroundedLLM):
+    def __init__(self, *, valid_correction: bool):
+        self.valid_correction = valid_correction
+        self.calls: list[dict[str, object]] = []
+        self.max_tokens: list[int] = []
+
+    async def complete(self, messages, **kwargs):
+        payload = json.loads(str(messages[-1].get("content") or "{}"))
+        self.calls.append(payload)
+        self.max_tokens.append(int(kwargs.get("max_tokens") or 0))
+        evidence = payload.get("evidence") if isinstance(payload, dict) else []
+        if not isinstance(evidence, list) or not evidence:
+            raise AssertionError("date digest requires document evidence")
+        if "draft" not in payload:
+            bullets = [
+                (
+                    f"- {item.get('file_name')}: "
+                    f"{'OVERLONG_DRAFT_SENTINEL ' * 60}"
+                    f"[{item.get('citation')}]"
+                )
+                for item in evidence
+            ]
+            citation = str(evidence[0].get("citation") or "")
+            return SimpleNamespace(
+                ok=True,
+                content=(
+                    "\n".join(bullets)
+                    + f"\n\nOverlong overall conclusion. [{citation}]"
+                ),
+            )
+        if not self.valid_correction:
+            return SimpleNamespace(
+                ok=True,
+                content="INVALID_OVERLONG_CORRECTION " * 300,
+            )
+        bullets = [
+            (
+                f"- {item.get('file_name')}: compact verified point "
+                f"[{item.get('citation')}]"
+            )
+            for item in evidence
+        ]
+        citation = str(evidence[0].get("citation") or "")
+        return SimpleNamespace(
+            ok=True,
+            content=(
+                "\n".join(bullets)
+                + "\n\nTen documents were processed. The digest is intentionally compact. "
+                f"[{citation}]"
+            ),
+        )
+
+
+class _PostAwaitRevocationLLM(_GroundedLLM):
+    def __init__(self, mode: str):
+        self.mode = mode
+        self.demote = None
+        self.synthesis_calls = 0
+        self.correction_calls = 0
+        self.evidence_payloads: list[dict[str, object]] = []
+
+    def _demote_once(self) -> None:
+        if self.demote is None:
+            raise AssertionError("demotion callback was not configured")
+        callback, self.demote = self.demote, None
+        callback()
+
+    async def complete(self, messages, **_kwargs):
+        text = str(messages[-1].get("content") or "")
+        if '"languages"' in text:
+            return await super().complete(messages, **_kwargs)
+        payload = json.loads(text)
+        if "allowed_citations" in payload:
+            self.correction_calls += 1
+            if self.mode != "invalid_correction":
+                raise AssertionError("unexpected citation-correction request")
+            self._demote_once()
+            return SimpleNamespace(
+                ok=True,
+                content="Invalid corrected draft without a citation.",
+            )
+
+        self.synthesis_calls += 1
+        evidence = payload.get("evidence") if isinstance(payload, dict) else []
+        if not isinstance(evidence, list) or not evidence:
+            raise AssertionError("summary evidence was not supplied")
+        self.evidence_payloads.append(payload)
+        if self.mode == "empty_synthesis":
+            self._demote_once()
+            return SimpleNamespace(ok=False, content="")
+        if self.mode == "invalid_correction":
+            return SimpleNamespace(ok=True, content="Uncited synthesis draft.")
+        raise AssertionError(f"unsupported revocation mode: {self.mode}")
+
+
+class _ForbiddenSynthesisLLM:
+    def __init__(self):
+        self.calls = 0
+
+    async def complete(self, _messages, **_kwargs):
+        self.calls += 1
+        raise AssertionError("revoked cross-user evidence must not reach the model")
+
+
+def _direct_material_context(tools: ToolRegistry, actor: ActorContext) -> ToolContext:
+    return ToolContext(
+        settings=tools.settings,
+        storage=tools.storage,
+        llm=tools.llm,
+        execution=tools.execution,
+        verifier=tools.verifier,
+        safe_gate=tools.safe_gate,
+        actor=actor,
+        material_access=tools.material_access,
+        embeddings=tools.embeddings,
+    )
+
+
+def test_date_document_digest_binds_each_filename_to_its_own_citation():
+    evidence = [
+        {"citation": "document:file-a", "file_name": "Alpha Report.docx"},
+        {"citation": "document:file-b", "file_name": "Beta Report.docx"},
+    ]
+    correct = (
+        "- Alpha Report.docx: first point [document:file-a]\n"
+        "- Beta Report.docx: second point [document:file-b]\n\n"
+        "Two documents were reviewed. [document:file-a]"
+    )
+    omitted = (
+        "- First point [document:file-a]\n"
+        "- Second point [document:file-b]\n\n"
+        "Two documents were reviewed. [document:file-a]"
+    )
+    swapped = (
+        "- Beta Report.docx: first point [document:file-a]\n"
+        "- Alpha Report.docx: second point [document:file-b]\n\n"
+        "Two documents were reviewed. [document:file-a]"
+    )
+
+    assert tools_module._date_document_digest_is_valid(
+        correct,
+        evidence,
+        max_chars=4000,
+    )
+    assert not tools_module._date_document_digest_is_valid(
+        omitted,
+        evidence,
+        max_chars=4000,
+    )
+    assert not tools_module._date_document_digest_is_valid(
+        swapped,
+        evidence,
+        max_chars=4000,
+    )
+
+
+@pytest.mark.parametrize(
+    ("valid_correction", "expected_mode"),
+    [
+        (True, "llm_corrected"),
+        (False, "deterministic_evidence_digest"),
+    ],
+)
+def test_date_document_digest_rewrites_overlong_answer_without_losing_sources(
+    monkeypatch,
+    tmp_path,
+    valid_correction,
+    expected_mode,
+):
+    llm = _DateDigestContractLLM(valid_correction=valid_correction)
+    tools, storage = _runtime(monkeypatch, tmp_path, llm)
+    target = tools.permissions.upsert_external_identity(
+        provider="telegram",
+        realm_id="date-digest-contract",
+        provider_subject_id="writer",
+        username="date_digest_writer",
+        bootstrap_preset="user",
+    )
+    admin = tools.permissions.upsert_external_identity(
+        provider="test",
+        realm_id="date-digest-contract",
+        provider_subject_id="admin",
+        bootstrap_preset="admin",
+    )
+    documents: dict[str, str] = {}
+    with bind_actor(_actor(target)):
+        for index in range(10):
+            path = tmp_path / f"daily-report-{index + 1:02d}.docx"
+            path.write_bytes(f"document fixture {index}".encode())
+            document = storage.create_file_record(
+                name=path.name,
+                stored_path=path,
+                sha256=f"{index + 1:064x}",
+                size=path.stat().st_size,
+                mime_type=(
+                    "application/vnd.openxmlformats-officedocument."
+                    "wordprocessingml.document"
+                ),
+                status="indexed",
+                chunk_count=1,
+            )
+            storage.add_file_chunks(
+                document["id"],
+                [f"Daily verified point {index + 1}."],
+            )
+            documents[str(document["id"])] = path.name
+
+    with bind_actor(_actor(admin)):
+        result = asyncio.run(
+            tools.run(
+                "materials.summarize",
+                {
+                    "query": "Дай краткую выжимку документов за сегодня.",
+                    "username": "date_digest_writer",
+                    "source_types": ["documents"],
+                    "date_from": "2000-01-01T00:00:00+00:00",
+                    "date_to": "2100-01-01T00:00:00+00:00",
+                    "max_hits": 60,
+                    "max_tokens": 1400,
+                },
+            )
+        )
+
+    assert result.ok is True
+    assert result.data["synthesis_mode"] == expected_mode
+    assert result.data["digest_contract"] == {
+        "max_chars": 4000,
+        "max_tokens": 800,
+        "one_bullet_per_document": True,
+        "source_count": 10,
+    }
+    summary = str(result.data["summary"])
+    assert len(summary) <= 4000
+    assert "OVERLONG_DRAFT_SENTINEL" not in summary
+    assert "INVALID_OVERLONG_CORRECTION" not in summary
+    bullets = [line for line in summary.splitlines() if line.startswith("- ")]
+    assert len(bullets) == 10
+    for document_id, file_name in documents.items():
+        assert any(
+            file_name in line and f"[document:{document_id}]" in line
+            for line in bullets
+        )
+    assert len(llm.calls) == 2
+    assert llm.max_tokens == [800, 800]
+    storage.close()
+
+
 def test_summary_reads_late_message_content_and_rejects_uncited_claims(monkeypatch, tmp_path):
     inspecting_llm = _SummaryInspectionLLM()
     tools, storage = _runtime(monkeypatch, tmp_path, inspecting_llm)
@@ -1079,4 +1473,175 @@ def test_summary_fails_closed_when_admin_is_demoted_during_synthesis(monkeypatch
     assert result.ok is False
     assert result.data["authorization_denied"] is True
     assert result.data["result_withheld"] is True
+    storage.close()
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_correction_calls"),
+    [
+        ("empty_synthesis", 0),
+        ("invalid_correction", 1),
+    ],
+)
+def test_summary_post_await_failure_hides_evidence_after_admin_demotion(
+    monkeypatch,
+    tmp_path,
+    mode,
+    expected_correction_calls,
+):
+    llm = _PostAwaitRevocationLLM(mode)
+    tools, storage = _runtime(monkeypatch, tmp_path, llm)
+    writer = tools.permissions.upsert_external_identity(
+        provider="test",
+        realm_id=f"summary-post-await-{mode}",
+        provider_subject_id="writer",
+        bootstrap_preset="user",
+    )
+    admin = tools.permissions.upsert_external_identity(
+        provider="test",
+        realm_id=f"summary-post-await-{mode}",
+        provider_subject_id="admin",
+        bootstrap_preset="admin",
+    )
+    sentinel = f"POST_AWAIT_PRIVATE_EVIDENCE_{mode.upper()}"
+    with bind_actor(_actor(writer)):
+        conversation_id = storage.create_conversation("Post-await revocation evidence")
+        storage.add_message(
+            conversation_id=conversation_id,
+            role="user",
+            content=sentinel,
+        )
+
+    def demote_admin() -> None:
+        tools.permissions.assign_preset(
+            user_id=str(admin["user_id"]),
+            preset_key="user",
+            assigned_by=LEGACY_OWNER_USER_ID,
+            reason=f"test {mode} material synthesis revocation",
+        )
+
+    llm.demote = demote_admin
+    if mode == "invalid_correction":
+        monkeypatch.setattr(
+            tools_module,
+            "_deterministic_material_digest",
+            lambda *_args, **_kwargs: "Invalid digest without a citation.",
+        )
+
+    spec = tools.get("materials.summarize")
+    assert spec is not None
+    admin_actor = _actor(admin)
+    with bind_actor(admin_actor):
+        result = asyncio.run(
+            spec.handler(
+                _direct_material_context(tools, admin_actor),
+                {
+                    "query": sentinel,
+                    "user_id": str(writer["user_id"]),
+                    "source_types": ["messages"],
+                },
+            )
+        )
+
+    serialized = json.dumps(
+        {"summary": result.summary, "data": result.data},
+        ensure_ascii=False,
+    )
+    assert result.ok is False
+    assert result.data == {}
+    assert sentinel not in serialized
+    assert '"search"' not in serialized
+    assert '"evidence"' not in serialized
+    assert llm.synthesis_calls == 1
+    assert llm.correction_calls == expected_correction_calls
+    assert sentinel in json.dumps(llm.evidence_payloads, ensure_ascii=False)
+    live_admin = tools.permissions.get_user(str(admin["user_id"]))
+    assert live_admin is not None
+    assert live_admin["preset_key"] == "user"
+    storage.close()
+
+
+def test_summary_demotion_during_material_read_never_reaches_synthesis(
+    monkeypatch,
+    tmp_path,
+):
+    llm = _ForbiddenSynthesisLLM()
+    tools, storage = _runtime(monkeypatch, tmp_path, llm)
+    writer = tools.permissions.upsert_external_identity(
+        provider="test",
+        realm_id="summary-read-revocation",
+        provider_subject_id="writer",
+        bootstrap_preset="user",
+    )
+    admin = tools.permissions.upsert_external_identity(
+        provider="test",
+        realm_id="summary-read-revocation",
+        provider_subject_id="admin",
+        bootstrap_preset="admin",
+    )
+    sentinel = "READ_REVOCATION_PRIVATE_DOCUMENT_SENTINEL"
+    with bind_actor(_actor(writer)):
+        path = tmp_path / "revocation-report.docx"
+        path.write_bytes(b"document fixture")
+        document = storage.create_file_record(
+            name=path.name,
+            stored_path=path,
+            sha256="f" * 64,
+            size=path.stat().st_size,
+            mime_type=(
+                "application/vnd.openxmlformats-officedocument."
+                "wordprocessingml.document"
+            ),
+            status="indexed",
+            chunk_count=1,
+        )
+        storage.add_file_chunks(document["id"], [sentinel])
+
+    original_read = tools.material_access.read
+    demoted = False
+
+    def demoting_read(*args, **kwargs):
+        nonlocal demoted
+        if not demoted:
+            demoted = True
+            tools.permissions.assign_preset(
+                user_id=str(admin["user_id"]),
+                preset_key="user",
+                assigned_by=LEGACY_OWNER_USER_ID,
+                reason="test material read revocation",
+            )
+        return original_read(*args, **kwargs)
+
+    monkeypatch.setattr(tools.material_access, "read", demoting_read)
+    spec = tools.get("materials.summarize")
+    assert spec is not None
+    admin_actor = _actor(admin)
+    with bind_actor(admin_actor):
+        result = asyncio.run(
+            spec.handler(
+                _direct_material_context(tools, admin_actor),
+                {
+                    "query": "Summarize the selected daily documents.",
+                    "user_id": str(writer["user_id"]),
+                    "source_types": ["documents"],
+                    "date_from": "2000-01-01T00:00:00+00:00",
+                    "date_to": "2100-01-01T00:00:00+00:00",
+                },
+            )
+        )
+
+    serialized = json.dumps(
+        {"summary": result.summary, "data": result.data},
+        ensure_ascii=False,
+    )
+    assert demoted is True
+    assert result.ok is False
+    assert result.data == {}
+    assert sentinel not in serialized
+    assert '"search"' not in serialized
+    assert '"evidence"' not in serialized
+    assert llm.calls == 0
+    live_admin = tools.permissions.get_user(str(admin["user_id"]))
+    assert live_admin is not None
+    assert live_admin["preset_key"] == "user"
     storage.close()

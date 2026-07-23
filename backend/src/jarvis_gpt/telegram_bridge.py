@@ -659,23 +659,6 @@ def _wav_to_ogg_opus(wav: bytes) -> bytes | None:
     )
 
 
-def _wav_to_mp3(wav: bytes) -> bytes | None:
-    """Transcode WAV bytes to a compact ordinary Telegram audio attachment."""
-
-    encoded = _transcode_wav(
-        wav,
-        ("-c:a", "libmp3lame", "-b:a", "96k", "-f", "mp3"),
-    )
-    if not encoded or len(encoded) < 4:
-        return None
-    if not (
-        encoded.startswith(b"ID3")
-        or (encoded[0] == 0xFF and encoded[1] & 0xE0 == 0xE0)
-    ):
-        return None
-    return encoded
-
-
 def _telegram_voice_notes_forbidden(response: httpx.Response) -> bool:
     """Recognize Telegram's explicit per-recipient voice-note privacy denial."""
 
@@ -4865,7 +4848,12 @@ class TelegramBridge:
                 journal_metadata=transport_metadata,
             )
         elif not voice_delivery.ok:
-            if voice_delivery.parts_sent:
+            if voice_delivery.reason == "voice_messages_forbidden":
+                notice = (
+                    "Telegram не разрешает отправить голосовое из-за настроек "
+                    "приватности; отправляю полный текст."
+                )
+            elif voice_delivery.parts_sent:
                 notice = (
                     "Не удалось доставить голосовой ответ полностью; "
                     "отправляю полный текст."
@@ -4928,7 +4916,7 @@ class TelegramBridge:
             )
             return _VoiceDeliveryResult(False, 0, total, "session_unavailable")
 
-        rendered: list[tuple[bytes, bytes]] = []
+        rendered: list[bytes] = []
         for index, chunk in enumerate(chunks, start=1):
             try:
                 response = await self.api.post(
@@ -4990,10 +4978,10 @@ class TelegramBridge:
                 return _VoiceDeliveryResult(
                     False, 0, total, "opus_transcode_failed"
                 )
-            rendered.append((wav, ogg))
+            rendered.append(ogg)
 
         parts_sent = 0
-        for index, (wav, ogg) in enumerate(rendered, start=1):
+        for index, ogg in enumerate(rendered, start=1):
             method = "sendVoice"
             try:
                 sent = await self.tg.post(
@@ -5008,50 +4996,15 @@ class TelegramBridge:
                     },
                 )
                 if _telegram_voice_notes_forbidden(sent):
-                    # Some recipients disallow voice notes but accept ordinary audio.
-                    # Telegram does not present WAV consistently, so retry only with a
-                    # verified compressed MP3; conversion failure is a text fallback.
-                    method = "sendAudio"
-                    try:
-                        mp3 = await asyncio.to_thread(_wav_to_mp3, wav)
-                    except Exception as exc:  # noqa: BLE001 - preserve full text fallback
-                        log.warning(
-                            "voice audio transcode failed chat_id=%s chunk=%s/%s "
-                            "reason=%s",
-                            chat_id,
-                            index,
-                            total,
-                            type(exc).__name__,
-                        )
-                        mp3 = None
-                    if not mp3:
-                        log.warning(
-                            "voice delivery failed chat_id=%s chunk=%s/%s "
-                            "method=sendAudio reason=mp3_transcode_failed",
-                            chat_id,
-                            index,
-                            total,
-                        )
-                        return _VoiceDeliveryResult(
-                            False, parts_sent, total, "mp3_transcode_failed"
-                        )
                     log.info(
-                        "voice-note delivery unavailable chat_id=%s chunk=%s/%s; "
-                        "retrying as compressed audio",
+                        "voice delivery unavailable chat_id=%s chunk=%s/%s "
+                        "reason=voice_messages_forbidden; falling back to text",
                         chat_id,
                         index,
                         total,
                     )
-                    sent = await self.tg.post(
-                        "/sendAudio",
-                        data={"chat_id": chat_id},
-                        files={
-                            "audio": (
-                                f"jarvis-{index:02d}.mp3",
-                                mp3,
-                                "audio/mpeg",
-                            )
-                        },
+                    return _VoiceDeliveryResult(
+                        False, parts_sent, total, "voice_messages_forbidden"
                     )
                 sent.raise_for_status()
                 sent_body = sent.json()
