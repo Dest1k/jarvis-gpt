@@ -74,7 +74,9 @@ def test_tts_status_prefers_silero(monkeypatch):
     status = speech.tts_status()
     assert status["available"] is True
     assert status["engine"] == "silero"
-    assert status["silero_speaker"] == "eugene"
+    assert status["silero_package"] == "v5_5_ru"
+    assert status["silero_speaker"] == "aidar"
+    assert status["style"] == "clean"
 
 
 def test_tts_status_forced_sapi(monkeypatch):
@@ -159,10 +161,12 @@ def test_synthesize_empty_text(tmp_path):
 
 def test_synthesize_prefers_silero(monkeypatch, tmp_path):
     out = tmp_path / "out.wav"
+    speakers: list[str] = []
 
     def _silero(text, destination, **k):
+        speakers.append(k["speaker"])
         _write_fake_wav(Path(destination))
-        return "silero:eugene"
+        return f"silero:{k['speaker']}"
 
     monkeypatch.setattr(speech, "_silero_available", lambda: True)
     monkeypatch.setattr(speech, "_silero_synthesize_to_wav", _silero)
@@ -171,7 +175,8 @@ def test_synthesize_prefers_silero(monkeypatch, tmp_path):
     result = speech.synthesize("Привет, сэр.", out, style="off")
     assert result.ok is True
     assert result.engine == "silero"
-    assert result.voice == "silero:eugene"
+    assert result.voice == "silero:aidar"
+    assert speakers == ["aidar"]
 
 
 def test_synthesize_falls_back_to_sapi(monkeypatch, tmp_path):

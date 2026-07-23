@@ -136,15 +136,21 @@ def tts_engine() -> str:
 
 
 def tts_style() -> str:
-    """Post-processing style: ``jarvis`` (default cinematic), ``radio``, ``clean``/``off``."""
+    """Post-processing style: ``clean`` (default), ``jarvis`` or ``radio``."""
 
-    return _env("JARVIS_TTS_STYLE", "jarvis").lower()
+    return _env("JARVIS_TTS_STYLE", "clean").lower()
 
 
 def silero_speaker() -> str:
-    """Silero v4_ru speaker; defaults to the male 'eugene' for a Jarvis-like timbre."""
+    """Silero speaker; defaults to the natural male ``aidar`` voice."""
 
-    return _env("JARVIS_TTS_SILERO_SPEAKER", "eugene")
+    return _env("JARVIS_TTS_SILERO_SPEAKER", "aidar")
+
+
+def silero_package() -> str:
+    """Silero Russian model package used for synthesis."""
+
+    return _env("JARVIS_TTS_SILERO_PACKAGE", "v5_5_ru")
 
 
 def silero_sample_rate() -> int:
@@ -231,6 +237,7 @@ def tts_status() -> dict[str, Any]:
         "engine_preference": preference,
         "style": tts_style(),
         "silero": silero,
+        "silero_package": silero_package() if silero else None,
         "silero_speaker": silero_speaker() if silero else None,
         "sapi": bool(sapi and voices),
         "voices": voices,
@@ -468,8 +475,9 @@ def synthesize(
 
     Engine order comes from ``engine`` (or ``JARVIS_TTS_ENGINE``): the neural
     ``silero`` (male Russian by default) preferred, falling back to Windows
-    ``sapi``. After the dry render the ``style`` post-processor (``JARVIS_TTS_STYLE``,
-    default ``jarvis``) shapes it into the cinematic assistant voice. Never raises.
+    ``sapi``. The optional ``style`` post-processor (``JARVIS_TTS_STYLE``) can
+    shape the dry render; the default ``clean`` mode preserves a human timbre.
+    Never raises.
     """
 
     text = (text or "").strip()
@@ -595,7 +603,8 @@ _MAX_CACHED_TTS_MODELS = 2
 _SILERO_CHAR_LIMIT = 900
 
 
-def _load_silero_model(language: str = "ru", package: str = "v4_ru") -> Any:
+def _load_silero_model(language: str = "ru", package: str | None = None) -> Any:
+    package = package or silero_package()
     key = (language, package)
     model = _SILERO_MODELS.get(key)
     if model is None:
@@ -652,7 +661,7 @@ def _silero_synthesize_to_wav(
     valid = set(getattr(model, "speakers", []) or [])
     chosen = speaker if speaker in valid else silero_speaker()
     if chosen not in valid:
-        chosen = "eugene" if "eugene" in valid else (sorted(valid)[0] if valid else "eugene")
+        chosen = "aidar" if "aidar" in valid else (sorted(valid)[0] if valid else "aidar")
 
     parts: list[Any] = []
     for chunk in _split_for_tts(text, _SILERO_CHAR_LIMIT):

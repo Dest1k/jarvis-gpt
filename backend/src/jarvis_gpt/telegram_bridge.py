@@ -46,8 +46,8 @@ from .config import default_home, load_local_env_file
 from .experience import ResponsePreferenceDirective, parse_response_preference
 from .notify import (
     answer_action_keyboard,
-    operator_reply_keyboard,
     progress_stop_keyboard,
+    remove_reply_keyboard,
 )
 from .telegram_format import html_to_plain, render_telegram_html, split_telegram_html
 from .telegram_journal import (
@@ -158,6 +158,7 @@ _CONSOLE_LABEL_TO_ACTION: dict[str, str] = {
 _USER_SESSION_HEADER = "X-Jarvis-User-Session"
 _BRIDGE_SECRET_HEADER = "X-Jarvis-Bridge-Secret"
 _BRIDGE_HOT_CACHE_SIZE = 4_096
+_OPERATOR_CONSOLE_PRESETS = frozenset({"owner", "admin"})
 _INBOX_MAX_ATTEMPTS = 3
 # Transient backend outages are retried durably without an age/attempt tombstone.
 # The stable Telegram request id makes every replay idempotent, while the bounded
@@ -469,24 +470,30 @@ def _forward_source_label(message: Mapping[str, object] | dict) -> str:
     return hidden or "unknown"
 
 
-def _help_text() -> str:
+def _operator_console_allowed(session: TelegramUserSession) -> bool:
+    return session.preset_key in _OPERATOR_CONSOLE_PRESETS
+
+
+def _help_text(*, operator_console: bool) -> str:
+    privileged_commands = ""
+    if operator_console:
+        privileged_commands = (
+            "• /status · /briefing — операторские данные без LLM\n"
+            "• «каждое утро сводка» — ежедневный briefing\n"
+        )
     return (
         "Джарвис на связи.\n"
-        "Пульт внизу: Сводка · Статус · Inbox · Стоп · Новый чат · Помощь.\n"
-        "Жесты: 📋 📊 📥 🛑 📌 · ⏰ — quiet hours.\n"
-        "\n"
         "Команды:\n"
         "• /new — новый разговор\n"
         "• /stop — отменить текущий запрос\n"
-        "• /status · /briefing — без LLM\n"
+        f"{privileged_commands}"
         "• /note … или `+ …` — быстрый захват в inbox\n"
         "• /quiet 23:00-08:00 — тихие часы (hold напоминаний)\n"
         "• /quiet off — выключить quiet hours\n"
         "• /voice text|voice|auto — как отвечать на голосовые\n"
         "• «отвечай на голосовые текстом» — запомнить выбор\n"
         "• «отвечай кратко/подробно» — запомнить стиль\n"
-        "• перешли сообщение боту — разберу как задачу\n"
-        "• «каждое утро сводка» — ежедневный briefing"
+        "• перешли сообщение боту — разберу как задачу"
     )
 
 
@@ -3675,13 +3682,19 @@ class TelegramBridge:
         ``reply_markup`` (inline or reply keyboard) is attached to the *last* piece.
         """
 
+        effective_reply_markup = reply_markup
+        session = self._sessions.get(chat_id)
+        if effective_reply_markup is None and session is not None:
+            # Telegram reply keyboards persist client-side. Remove a stale operator
+            # console from every chat on the next ordinary bot message.
+            effective_reply_markup = remove_reply_keyboard()
         html = render_telegram_html(text)
         pieces = list(split_telegram_html(html))
         if not pieces:
             pieces = [" "]
         delivered = True
         for index, piece in enumerate(pieces):
-            markup = reply_markup if index == len(pieces) - 1 else None
+            markup = effective_reply_markup if index == len(pieces) - 1 else None
             if await self._send_piece(
                 chat_id,
                 piece,
@@ -4014,7 +4027,7 @@ class TelegramBridge:
                 await self._send(
                     chat_id,
                     "Готово: учётная запись создана или обновлена, статус owner активирован.",
-                    reply_markup=operator_reply_keyboard(),
+                    reply_markup=remove_reply_keyboard(),
                 )
             else:
                 await self._send(
@@ -4036,8 +4049,8 @@ class TelegramBridge:
         if console_action == "start" or command in _START_COMMANDS:
             await self._send(
                 chat_id,
-                _help_text(),
-                reply_markup=operator_reply_keyboard(),
+                _help_text(operator_console=_operator_console_allowed(session)),
+                reply_markup=remove_reply_keyboard(),
             )
             return
         if console_action in {
@@ -4080,7 +4093,7 @@ class TelegramBridge:
             await self._send(
                 chat_id,
                 "Начал новый разговор.",
-                reply_markup=operator_reply_keyboard(),
+                reply_markup=remove_reply_keyboard(),
             )
             return
 
@@ -4428,6 +4441,13 @@ class TelegramBridge:
     ) -> None:
         """Day-console buttons and slash shortcuts that skip the full agent loop."""
 
+        if action in {"status", "briefing"} and not _operator_console_allowed(session):
+            await self._send(
+                chat_id,
+                "Операторская команда доступна только владельцу или администратору.",
+                reply_markup=remove_reply_keyboard(),
+            )
+            return
         if action == "stop":
             backend_cancelled = await self._backend_cancel_turn(chat_id)
             active = self._active_turn_tasks.get(chat_id)
@@ -4448,12 +4468,14 @@ class TelegramBridge:
             await self._send(
                 chat_id,
                 "Начал новый разговор.",
-                reply_markup=operator_reply_keyboard(),
+                reply_markup=remove_reply_keyboard(),
             )
             return
         if action == "help":
             await self._send(
-                chat_id, _help_text(), reply_markup=operator_reply_keyboard()
+                chat_id,
+                _help_text(operator_console=_operator_console_allowed(session)),
+                reply_markup=remove_reply_keyboard(),
             )
             return
         if action == "status":

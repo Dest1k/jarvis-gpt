@@ -11,9 +11,9 @@ import httpx
 from jarvis_gpt.notify import (
     answer_action_keyboard,
     in_quiet_hours,
-    operator_reply_keyboard,
     parse_quiet_hours,
     progress_stop_keyboard,
+    remove_reply_keyboard,
 )
 from jarvis_gpt.telegram_bridge import (
     _build_forward_task_prompt,
@@ -85,10 +85,101 @@ def test_console_action_mapping():
 
 
 def test_keyboard_shapes():
-    assert "keyboard" in operator_reply_keyboard()
-    assert operator_reply_keyboard()["resize_keyboard"] is True
+    assert remove_reply_keyboard() == {"remove_keyboard": True}
     assert answer_action_keyboard()["inline_keyboard"][0][0]["callback_data"] == "a:inbox"
     assert progress_stop_keyboard()["inline_keyboard"][0][0]["callback_data"] == "a:stop"
+
+
+def test_guest_start_removes_operator_console():
+    sent: list[dict] = []
+
+    def tg_handler(request):
+        if request.url.path.endswith("/sendMessage"):
+            sent.append(json.loads(request.content))
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 1}})
+
+    bridge = _bridge(
+        tg_handler,
+        lambda _request: httpx.Response(404),
+        session_presets={42: "user"},
+    )
+    update = {
+        "update_id": 70,
+        "message": {
+            "chat": {"id": 42, "type": "private"},
+            "from": {"id": 42, "is_bot": False},
+            "text": "/start",
+        },
+    }
+
+    asyncio.run(bridge._handle(update))
+
+    assert sent[-1]["reply_markup"] == {"remove_keyboard": True}
+    assert "Пульт внизу" not in sent[-1]["text"]
+    assert "Статус" not in sent[-1]["text"]
+
+
+def test_admin_start_also_removes_operator_console():
+    sent: list[dict] = []
+
+    def tg_handler(request):
+        if request.url.path.endswith("/sendMessage"):
+            sent.append(json.loads(request.content))
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 1}})
+
+    bridge = _bridge(
+        tg_handler,
+        lambda _request: httpx.Response(404),
+        session_presets={42: "admin"},
+    )
+    update = {
+        "update_id": 71,
+        "message": {
+            "chat": {"id": 42, "type": "private"},
+            "from": {"id": 42, "is_bot": False},
+            "text": "/start",
+        },
+    }
+
+    asyncio.run(bridge._handle(update))
+
+    assert sent[-1]["reply_markup"] == {"remove_keyboard": True}
+    assert "Пульт внизу" not in sent[-1]["text"]
+    assert "/status" in sent[-1]["text"]
+
+
+def test_guest_stale_status_button_is_rejected_before_backend():
+    api_paths: list[str] = []
+    sent: list[dict] = []
+
+    def tg_handler(request):
+        if request.url.path.endswith("/sendMessage"):
+            sent.append(json.loads(request.content))
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 1}})
+
+    def api_handler(request):
+        api_paths.append(request.url.path)
+        return httpx.Response(500)
+
+    bridge = _bridge(
+        tg_handler,
+        api_handler,
+        session_presets={42: "user"},
+    )
+    update = {
+        "update_id": 72,
+        "message": {
+            "chat": {"id": 42, "type": "private"},
+            "from": {"id": 42, "is_bot": False},
+            "text": "📊 Статус",
+        },
+    }
+
+    asyncio.run(bridge._handle(update))
+
+    assert "/api/status" not in api_paths
+    assert sent[-1]["reply_markup"] == {"remove_keyboard": True}
+    assert "владельцу или администратору" in sent[-1]["text"]
 
 
 def test_status_and_briefing_formatters():

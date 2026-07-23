@@ -167,18 +167,10 @@ def progress_stop_keyboard() -> dict[str, Any]:
     }
 
 
-def operator_reply_keyboard() -> dict[str, Any]:
-    """Persistent day-console reply keyboard for the phone operator."""
+def remove_reply_keyboard() -> dict[str, Any]:
+    """Remove a previously attached persistent Telegram reply keyboard."""
 
-    return {
-        "keyboard": [
-            [{"text": "📋 Сводка"}, {"text": "📊 Статус"}],
-            [{"text": "📥 Inbox"}, {"text": "🛑 Стоп"}],
-            [{"text": "🆕 Новый чат"}, {"text": "❓ Помощь"}],
-        ],
-        "resize_keyboard": True,
-        "is_persistent": True,
-    }
+    return {"remove_keyboard": True}
 
 
 async def push_telegram_alert(
